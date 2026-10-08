@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use cordelia_core::claude_code::is_safe_file_name;
 use cordelia_core::protocol::HISTORY_TURN_WAIT_SECS;
+use cordelia_crypto::entry::Value;
 use cordelia_storage::atomic::write_atomic;
 use cordelia_storage::history::{About, Change, Id, Record, Replacement, Store, Whose, kept};
 use cordelia_storage::meta;
@@ -169,9 +170,13 @@ pub struct RestoreResponse {
 pub enum Syncs {
     /// Its folder synced in that cycle, with nothing to report.
     Yes,
-    /// Sync is off, or that cycle did not have the folder.
+    /// Sync is off, that cycle did not have the folder, or the device
+    /// publishes nothing: it follows no recovery phrase yet, or it has
+    /// stopped (decision 2026-10-04 §5.2).
     No,
-    /// The folder is to sync, and waits to join its channel.
+    /// The folder is to sync, and waits for its channel to be fetched
+    /// from a relay before its first cycle there (decision 2026-10-04
+    /// §6).
     Waits,
     /// The text does not fit in an entry, so it stays on this device
     /// whatever its folder does.
@@ -413,6 +418,10 @@ fn syncs(state: &AppState, folder: &str) -> Syncs {
     if report["generation"].as_u64() != Some(state.sync_control.generation_under(&db)) {
         return Syncs::Unknown;
     }
+    // A device that publishes nothing syncs no folder, whatever it lists.
+    if report["publishes_nothing"].is_string() {
+        return Syncs::No;
+    }
     let Some(folders) = report["folders"].as_array() else {
         return Syncs::Unknown;
     };
@@ -495,7 +504,8 @@ fn restore_one(
     // A text that fits in no entry stays on this device, whether or not
     // its folder syncs: a record keeps a text of any size (what a restore
     // replaced, say), and a restore puts back whatever it kept.
-    let syncs = match crate::entries::fits(&about.file, &serde_json::json!(text)) {
+    let fits = crate::publish::fits(&about.file, &Value::Text(text.clone()));
+    let syncs = match fits {
         true => syncs(state, &about.folder),
         false => Syncs::TooLarge,
     };
@@ -801,7 +811,8 @@ mod tests {
             outbox_refused: Default::default(),
             relist: Default::default(),
             sync_control: Default::default(),
-            usable_keys: Default::default(),
+            own_channels: Default::default(),
+            held: Default::default(),
             history: Default::default(),
         };
         state.history.open(Store::new(&home, 30, 1 << 20));
@@ -1314,9 +1325,15 @@ mod tests {
             listed(json!({ "error": "the database is locked" })),
         );
         assert_eq!(syncs(), Syncs::Unknown);
-        // It waits to join its channel.
+        // It waits for its channel to be fetched from a relay.
         report(generation, listed(json!({ "waiting": true })));
         assert_eq!(syncs(), Syncs::Waits);
+        // The device publishes nothing: it follows no recovery phrase
+        // yet, or has stopped. No folder syncs, whatever the cycle lists.
+        let stays = json!({ "generation": generation, "folders": [synced.clone()],
+            "publishes_nothing": "no recovery phrase yet: memory stays on this machine." });
+        set(meta::SYNC_CLAUDE_REPORT, Some(stays.to_string()));
+        assert_eq!(syncs(), Syncs::No);
         // The cycle did not have it: it is not mapped.
         report(
             generation,
@@ -1348,11 +1365,9 @@ mod tests {
 
         // A text that fits in no entry stays on this device, though its
         // folder syncs: the largest that fits goes, and one byte more
-        // does not. (An entry holds the file's name and the text.)
-        let envelope = json!({ "key": "notes.md", "content": "", "metadata": null });
-        let room = cordelia_core::protocol::MAX_ITEM_BYTES
-            - cordelia_core::protocol::ITEM_SEAL_OVERHEAD_BYTES
-            - serde_json::to_vec(&envelope).unwrap().len();
+        // does not. (A file's name and its text may together be 60 KB:
+        // decision 2026-10-04 §2.3.)
+        let room = cordelia_core::protocol::MAX_ENTRY_NAME_AND_VALUE_BYTES - "notes.md".len();
         let fits = n.kept("notes.md", Change::Restored, Some(&"x".repeat(room)), 2);
         let too_large = n.kept("notes.md", Change::Restored, Some(&"x".repeat(room + 1)), 3);
         assert_eq!(n.restore(&[&fits])[0].syncs, Syncs::Yes);

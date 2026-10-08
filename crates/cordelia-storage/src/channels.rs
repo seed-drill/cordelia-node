@@ -1174,13 +1174,17 @@ mod tests {
         }
     }
 
-    /// The tables that have a `channel_id` column, as the schema has them,
-    /// and how many rows each holds for `channel_id`.
+    /// The tables that refer to a channel by an ID that is text, as the
+    /// schema has them, and how many rows each holds for `channel_id`. An
+    /// ID that is text can hold a name. A channel from its secret is
+    /// known by 32 bytes, which hold none: the tables of those are not
+    /// among these.
     fn rows_by_table(conn: &Connection, channel_id: &str) -> Vec<(String, i64)> {
         let tables: Vec<String> = conn
             .prepare(
                 "SELECT m.name FROM sqlite_master m, pragma_table_info(m.name) c
-                 WHERE m.type = 'table' AND c.name = 'channel_id' ORDER BY m.name",
+                 WHERE m.type = 'table' AND c.name = 'channel_id' AND c.type = 'TEXT'
+                 ORDER BY m.name",
             )
             .unwrap()
             .query_map([], |row| row.get(0))

@@ -4,6 +4,9 @@
 
 use super::*;
 use crate::memory_md::INDEX_FILE as INDEX;
+use cordelia_api::publish::Kind;
+use cordelia_crypto::entry::EntryError;
+use cordelia_crypto::version::Version;
 use cordelia_storage::index_lines;
 
 /// The time the tests begin at, in seconds: any time will do.
@@ -52,7 +55,12 @@ fn rows(p: &Pair) -> Vec<(String, bool, bool, bool)> {
 }
 
 const NOTES: &str = "- [Notes](notes.md) what was noted\n";
-const OTHER_LINE: &str = "- [Other](other.md) the other one\n";
+/// The line of the memory that stays. Its words are chosen for the hash
+/// of an index that is this line alone, which is above that of every
+/// text these tests put beside such an index: a tie at one revision goes
+/// to the higher hash of the text (decision 2026-10-04 §2.3), so each of
+/// those loses it. [`stands_beside`] says where one does not.
+const OTHER_LINE: &str = "- [Others](other.md) something else\n";
 
 /// A folder with two memories and an index that lists both, agreed with
 /// the channel at the beginning.
@@ -258,15 +266,21 @@ fn what_this_device_publishes_is_written_down() {
     std::fs::remove_file(p.mem.join(INDEX)).unwrap();
     let report = cycle_at(&p, 80);
     assert_eq!(report.published, 1, "{report:?}");
-    // (What the channel holds for the index is a delete: it has no text.)
-    assert_eq!(
-        p.held(INDEX).as_deref(),
-        Some(""),
-        "the delete was published"
-    );
+    // (What the channel holds for the index is a delete.)
+    assert_eq!(p.held(INDEX), None);
+    assert!(is_deleted(&p, INDEX), "the delete was published");
     assert_eq!(p.read(INDEX), None);
     assert!(rows(&p).iter().all(|(file, ..)| file != INDEX));
     assert_eq!(rows(&p).len(), 2);
+}
+
+/// Whether the channel's version of `name`, as this device holds it, is a
+/// delete.
+fn is_deleted(p: &Pair, name: &str) -> bool {
+    let db = p.st.db.lock().unwrap();
+    let slot = publish::read(&db, NAME, name).unwrap().slot;
+    slot.current
+        .is_some_and(|version| version.value == Value::Delete)
 }
 
 /// A cycle at `t`, with `between` done once it has read the folder and
@@ -673,7 +687,8 @@ fn hooked_at(p: &Pair, t: i64, hooks: &Hooks) -> FolderReport {
 /// minute is not put back in a cycle in which the index or the file has
 /// changed here since the cycle listed them, or in which the index's
 /// entry, the file's entry or the settings have changed since the cycle
-/// read them. The next looks decide again.
+/// read them. The index's version with one entry more held of it is not
+/// what the cycle read either. The next looks decide again.
 #[test]
 fn nothing_is_put_back_over_what_changed_during_the_cycle() {
     let due = || {
@@ -734,6 +749,33 @@ fn nothing_is_put_back_over_what_changed_during_the_cycle() {
     );
     not_put_back(&p, &report);
     assert_eq!(p.held(INDEX).as_deref(), Some(theirs.as_str()));
+
+    // The index's version is held in one entry more there: another device
+    // wrote the same index apart, at the same revision. It is the same
+    // text, and it is not what the cycle read: a version is planned
+    // against with every entry held of it (decision 2026-10-04 §2.3). The
+    // next look decides again, and the line goes back.
+    let p = due();
+    let before_hold = || {
+        let device = third(&p);
+        entry_at(&device, NAME, INDEX, text(OTHER_LINE), 2, Some(Vec::new()));
+        deliver(&device, &p.st, NAME);
+    };
+    let (read, ..) = version(&p.st, NAME, INDEX).unwrap();
+    let report = hooked_at(
+        &p,
+        85,
+        &Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        },
+    );
+    not_put_back(&p, &report);
+    let (now, rev, same) = version(&p.st, NAME, INDEX).unwrap();
+    assert_eq!((rev, same.as_str()), (2, OTHER_LINE));
+    assert_ne!(now, read);
+    assert_eq!(cycle_at(&p, 90).published, 1);
+    assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 
     // The file's entry changed in the channel there.
     let p = due();
@@ -963,104 +1005,119 @@ fn a_line_is_put_back_three_times_and_no_more() {
 }
 
 /// An index that is too large to take the line back: nothing is
-/// published, the record goes, and nothing is tried at the next cycle.
-/// The same where it would fit only by saying less of what it was
-/// written after.
+/// published, the record goes, and nothing is tried at the next cycle. A
+/// text and its name may be 60 KB together, and room for what an entry
+/// says is kept in every entry (decision 2026-10-04 §2.3): an index that
+/// fits with the line to the last byte takes it back, in an entry that
+/// says all that it was written after.
 #[test]
 fn a_line_that_does_not_fit_is_not_put_back() {
-    let limit = cordelia_core::protocol::MAX_ITEM_BYTES;
-    // An index that fills an entry to within a few bytes, with no line
-    // for the memory. (Each byte of it is one byte in the entry.) With 4
-    // bytes of room the line does not fit. With 100 the line would, and
-    // what the entry says it was written after would not go in with it.
-    for short_by in [4, 100] {
+    let bound = cordelia_core::protocol::MAX_ENTRY_NAME_AND_VALUE_BYTES;
+    // An index with no line for the memory, which is `over` bytes over
+    // the bound with its name once the line is after it.
+    for over in [1, 0] {
         let p = listed();
         std::fs::remove_file(p.mem.join("notes.md")).unwrap();
-        let mut index = OTHER_LINE.to_string();
-        // Fill it until an entry with nothing said of what it was written
-        // after would be `short_by` bytes under the limit.
-        let fits = |text: &str| {
-            entries::fits(
-                INDEX,
-                &Value::String(format!("{text}{}", "x".repeat(short_by))),
-            )
-        };
-        let mut filler = limit;
-        while filler > 0 {
-            let candidate = format!("{index}{}\n", "y".repeat(filler));
-            if fits(&candidate) {
-                index = candidate;
-            }
-            filler /= 2;
-        }
+        let filled = bound + over - INDEX.len() - NOTES.len() - OTHER_LINE.len() - 1;
+        let index = format!("{OTHER_LINE}{}\n", "y".repeat(filled));
+        assert_eq!(INDEX.len() + index.len() + NOTES.len(), bound + over);
         p.file(INDEX, &index);
         let report = cycle_at(&p, 10);
         assert_eq!(report.published, 2, "{report:?}");
         comes_back_to(&p, 20, &index);
         let last = a_minute_from(&p, 25);
-        assert_eq!(last.published, 0, "short by {short_by}: {last:?}");
         assert!(last.failed.is_empty() && last.error.is_none(), "{last:?}");
-        assert_eq!(p.read(INDEX).unwrap(), index);
-        assert_eq!(rows(&p), [], "short by {short_by}");
-        // Nothing is tried again.
-        assert_eq!(a_minute_from(&p, 90).published, 0);
+        if over > 0 {
+            assert_eq!(last.published, 0, "{last:?}");
+            assert_eq!(p.read(INDEX).unwrap(), index);
+            assert_eq!(p.held(INDEX).unwrap(), index);
+            assert_eq!(rows(&p), []);
+            // Nothing is tried again.
+            assert_eq!(a_minute_from(&p, 90).published, 0);
+            continue;
+        }
+        // At the bound: the line goes back, and the entry says what it
+        // was written over, and what that was written over.
+        assert_eq!(last.published, 1, "{last:?}");
+        let back = format!("{index}{NOTES}");
+        assert_eq!(p.read(INDEX).unwrap(), back);
+        assert_eq!(p.held(INDEX).unwrap(), back);
+        assert_eq!(
+            records(&p),
+            [("notes.md".into(), NOTES.trim_end().into(), 1)]
+        );
+        let first = format!("{NOTES}{OTHER_LINE}");
+        assert_eq!(
+            said(&p.st, NAME, INDEX),
+            Some(vec![link(Some(&index), &p.st), link(Some(&first), &p.st)])
+        );
     }
 }
 
-/// A new device of the same person in the pair's channel.
+/// A new device of the same person, which holds the pair's name: this
+/// device adds it, as it added the other.
 fn third(p: &Pair) -> AppState {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, Ordering::SeqCst);
     let dir = p.mem.parent().unwrap().join(format!("third-{n}"));
-    another_device(&p.st, &dir, &p.channel)
+    another_device(&p.st, &dir, NAME)
 }
 
-/// The hash by which a tie is decided, of the entry `id` as `st` holds it.
-fn hash_of(st: &AppState, channel: &str, id: &str) -> Vec<u8> {
-    let it = held(st, channel).into_iter().find(|it| it.item_id == id);
-    it.unwrap().content_hash
+/// The versions that stand beside the channel's version of `name` on this
+/// device: those that lost the tie at its revision.
+fn lost(p: &Pair, name: &str) -> Vec<Version> {
+    let db = p.st.db.lock().unwrap();
+    publish::read(&db, NAME, name).unwrap().slot.lost
 }
 
 /// Another device's version of `name`, with `text`, comes to stand beside
 /// the channel's on this device: an entry at the channel's revision that
-/// loses the tie. Returns that device.
+/// loses the tie. A tie goes to the higher hash of the text, so `text` is
+/// one whose hash is the lower. Returns that device.
 fn stands_beside(p: &Pair, name: &str, text: &str) -> AppState {
-    stands_beside_as(p, name, text, false)
+    stands_beside_as(p, name, Value::Text(text.into()))
 }
 
-/// [`stands_beside`], as a delete if `deleted`: one that carries `text`,
-/// which no device that follows the code writes.
-fn stands_beside_as(p: &Pair, name: &str, text: &str, deleted: bool) -> AppState {
-    let (current, rev, _) = version(&p.st, &p.channel, name).unwrap();
-    let counts = hash_of(&p.st, &p.channel, &current);
-    loop {
-        let device = third(p);
-        let id = entry_at(&device, &p.channel, name, text, rev, deleted);
-        if hash_of(&device, &p.channel, &id) < counts {
-            deliver(&device, &p.st, &p.channel);
-            assert_eq!(version(&p.st, &p.channel, name).unwrap().0, current);
-            return device;
-        }
-    }
+/// [`stands_beside`], for any value: a delete loses to every text, and
+/// bytes that are no text rank by their hash, as a text does.
+fn stands_beside_as(p: &Pair, name: &str, value: Value) -> AppState {
+    let (current, rev, _) = version(&p.st, NAME, name).unwrap();
+    let entries = |lost: &[Version]| lost.iter().map(|v| v.entries.len()).sum::<usize>();
+    let before = entries(&lost(p, name));
+    let device = third(p);
+    entry_at(&device, NAME, name, value.clone(), rev, Some(Vec::new()));
+    deliver(&device, &p.st, NAME);
+    assert_eq!(
+        version(&p.st, NAME, name).unwrap().0,
+        current,
+        "it won the tie: choose a text whose hash is the lower"
+    );
+    let now = lost(p, name);
+    assert_eq!(entries(&now), before + 1);
+    assert!(now.iter().any(|version| version.value == value));
+    device
 }
 
 /// Another device's version of `name`, with `text`, takes the place of
 /// the channel's on this device at a tie: an entry at the channel's
-/// revision that wins it. What was the channel's version then stands
-/// beside. Returns that device.
+/// revision that wins it, the hash of `text` being the higher. What was
+/// the channel's version then stands beside. Returns that device.
 fn overtakes_at_a_tie(p: &Pair, name: &str, text: &str) -> AppState {
-    let (current, rev, _) = version(&p.st, &p.channel, name).unwrap();
-    let counts = hash_of(&p.st, &p.channel, &current);
-    loop {
-        let device = third(p);
-        let id = entry_at(&device, &p.channel, name, text, rev, false);
-        if hash_of(&device, &p.channel, &id) > counts {
-            deliver(&device, &p.st, &p.channel);
-            assert_eq!(version(&p.st, &p.channel, name).unwrap().0, id);
-            return device;
-        }
-    }
+    let (_, rev, was) = version(&p.st, NAME, name).unwrap();
+    let device = third(p);
+    let value = Value::Text(text.into());
+    entry_at(&device, NAME, name, value, rev, Some(Vec::new()));
+    deliver(&device, &p.st, NAME);
+    let (_, at, now) = version(&p.st, NAME, name).unwrap();
+    assert_eq!(
+        (at, now.as_str()),
+        (rev, text),
+        "it lost the tie: choose a text whose hash is the higher"
+    );
+    let was = Value::Text(was);
+    assert!(lost(p, name).iter().any(|version| version.value == was));
+    device
 }
 
 const EXTRA: &str = "- [Extra](extra.md) listed on another device\n";
@@ -1120,18 +1177,18 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
         "- [Notes, one](notes.md) on one device\n",
         "- [Notes, two](notes.md) on another\n",
     );
-    // (Made until this device holds the two in another order than that
-    // of their writers' keys: the order of the lines is then the rule's
-    // doing, and not the order in which they happen to be held.)
+    // (Made until the slot gives the two in another order than that of
+    // their writers' keys: it gives them by the hashes of their texts.
+    // The order of the lines is then the rule's doing, and not the order
+    // in which the two happen to be given.)
     let (p, one, two) = loop {
         let p = back_unlisted();
         let one = stands_beside(&p, INDEX, &format!("{first}{EXTRA}"));
         let two = stands_beside(&p, INDEX, &format!("{EXTRA}{second}"));
-        let held: Vec<[u8; 32]> = {
-            let db = p.st.db.lock().unwrap();
-            let entry = entries::current_of(&p.st, &db, &p.channel, INDEX).unwrap();
-            entry.unwrap().conflicts.iter().map(|v| v.author).collect()
-        };
+        let held: Vec<[u8; 32]> = lost(&p, INDEX)
+            .iter()
+            .map(|version| version.entries[0].author)
+            .collect();
         assert_eq!(held.len(), 2);
         if held[0] > held[1] {
             break (p, one, two);
@@ -1159,9 +1216,13 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
         format!("{OTHER_LINE}{EXTRA}{NOTES}")
     );
 
-    // What stands beside as a delete has no lines, whatever it carries.
+    // What stands beside as a delete has no lines, and nor has what is
+    // no text, whatever bytes it holds.
     let p = back_unlisted();
-    stands_beside_as(&p, INDEX, &format!("{OTHER_LINE}{EXTRA}"), true);
+    stands_beside_as(&p, INDEX, Value::Delete);
+    let bytes = format!("{OTHER_LINE}{EXTRA}").into_bytes();
+    stands_beside_as(&p, INDEX, Value::Other(bytes));
+    assert_eq!(lost(&p, INDEX).len(), 2);
     assert_eq!(a_minute_from(&p, 25).published, 1);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 
@@ -1182,17 +1243,18 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
     std::fs::remove_file(p.mem.join("notes.md")).unwrap();
     p.file(INDEX, &format!("{OTHER_LINE}{EXTRA}"));
     assert_eq!(cycle_at(&p, 10).published, 2);
-    let mine = version(&p.st, &p.channel, INDEX).unwrap().0;
+    let PlannedAgainst::Version { entries: mine, .. } = version(&p.st, NAME, INDEX).unwrap().0
+    else {
+        panic!("the index has a version");
+    };
     overtakes_at_a_tie(&p, INDEX, OTHER_LINE);
     let report = cycle_at(&p, 15);
     assert_eq!((report.published, report.conflicts), (0, 0), "{report:?}");
     assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
-    let beside: Vec<String> = {
-        let db = p.st.db.lock().unwrap();
-        let entry = entries::current_of(&p.st, &db, &p.channel, INDEX).unwrap();
-        let beside = entry.unwrap().conflicts;
-        beside.into_iter().map(|v| v.item_id).collect()
-    };
+    let beside: Vec<Vec<[u8; 32]>> = lost(&p, INDEX)
+        .iter()
+        .map(|version| version.entries.iter().map(|entry| entry.id).collect())
+        .collect();
     assert_eq!(beside, [mine], "this device's own version stands beside");
     p.other_writes("notes.md", Some("two\n"));
     p.other_writes("extra.md", Some("again\n"));
@@ -1270,54 +1332,174 @@ fn a_put_back_takes_the_lines_of_the_versions_beside() {
     );
 }
 
-/// The other device moves to a new key, which this one has not got yet.
-/// Returns what gives this device the key.
-fn other_moves_to_a_new_key(p: &Pair) -> impl Fn(&AppState) + '_ {
-    use cordelia_storage::psk;
-    let key = [7u8; 32];
-    let other = p.other.identity.public_key();
-    let now_at = move |st: &AppState| {
-        psk::rotate_psk(&st.home_dir, &p.channel, &key, "2026-10-04T00:00:00Z").unwrap();
-        let db = st.db.lock().unwrap();
-        let hash = cordelia_crypto::sha256(&key);
-        channels::set_state(&db, &p.channel, 2, &other, 2, &hash).unwrap();
+/// Two devices that wrote one text apart, at one revision, made one
+/// version, whoever signed its entries (decision 2026-10-04 §2.3). Where
+/// it stands beside the index's, its lines are taken once. And it is
+/// another thing to stand there once a second entry of it arrives: the
+/// minute starts again, and a put-back under whose hold it arrives is not
+/// made.
+#[test]
+fn a_version_beside_that_two_devices_wrote_is_one_version() {
+    let beside = format!("{OTHER_LINE}{EXTRA}");
+    // The entries held of the versions beside the index's, for each.
+    let held = |p: &Pair| -> Vec<usize> {
+        let lost = lost(p, INDEX);
+        lost.iter().map(|version| version.entries.len()).collect()
     };
-    now_at(&p.other);
-    now_at
+
+    // The second entry arrives in the middle of the line's minute.
+    let p = back_unlisted();
+    stands_beside(&p, INDEX, &beside);
+    for look in 1..7 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    stands_beside(&p, INDEX, &beside);
+    assert_eq!(held(&p), [2]);
+    for look in 7..19 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0, "look {look}");
+    }
+    assert_eq!(cycle_at(&p, 115).published, 1);
+    assert_eq!(
+        p.read(INDEX).unwrap(),
+        format!("{OTHER_LINE}{EXTRA}{NOTES}")
+    );
+
+    // It arrives between the cycle's read and the hold, at the look at
+    // which the line would go back: nothing is published in that cycle.
+    let p = back_unlisted();
+    stands_beside(&p, INDEX, &beside);
+    for look in 1..13 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    let before_hold = || {
+        stands_beside(&p, INDEX, &beside);
+    };
+    let report = hooked_at(
+        &p,
+        85,
+        &Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        },
+    );
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(held(&p), [2]);
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+    assert_eq!(a_minute_from(&p, 90).published, 1);
+    assert_eq!(
+        p.read(INDEX).unwrap(),
+        format!("{OTHER_LINE}{EXTRA}{NOTES}")
+    );
 }
 
-/// An entry of the index that this device cannot read (it waits for a
-/// key) is passed over when the channel's version is worked out, and may
-/// be above it. While the index's slot holds one, by a device that
-/// counts, at the revision the cycle read or above it, nothing is put
-/// back and the minute does not run. Once the key comes, the entry is
-/// taken as it would have been.
+/// This device of the pair is given `entry`, as from a relay, and stores
+/// it.
+fn arrives(p: &Pair, entry: &CheckedEntry) {
+    let db = p.st.db.lock().unwrap();
+    let taken = take::take(&db, &p.st.identity, entry, now()).unwrap();
+    let stored = stored::Outcome::Stored;
+    assert!(
+        matches!(taken, take::Taken::Own { stored: s, .. } if s == stored),
+        "{taken:?}"
+    );
+}
+
+/// The secret of the pair's channel, and the slot of `file` in it.
+fn secret_and_slot(p: &Pair, file: &str) -> ([u8; 32], [u8; 32]) {
+    let secret = name_secret(&p.st, NAME);
+    let slot = cordelia_crypto::slots::slot_id(&derive::slot_key(&secret).unwrap(), file);
+    (secret, slot)
+}
+
+/// An entry under `file`'s name in the pair's channel, at `rev`, that `by`
+/// and the channel signed, and that is no version: its content was sealed
+/// under another secret, and does not open.
+fn does_not_open(p: &Pair, by: &AppState, file: &str, rev: u64) -> CheckedEntry {
+    let (secret, slot) = secret_and_slot(p, file);
+    let inside = Inside {
+        name: file.into(),
+        value: text("sealed elsewhere\n"),
+        chain: Some(Vec::new()),
+    };
+    let elsewhere = Entry::seal(&[7u8; 32], &by.identity, rev, &inside).unwrap();
+    let entry = signed_in(&secret, &by.identity, slot, rev, elsewhere.content);
+    assert_eq!(entry.open(&secret), Err(EntryError::DidNotOpen));
+    entry
+}
+
+/// The same, for one that the channel's secret opens and that is not an
+/// entry's content: it says a name that is no text.
+fn no_entry_at(p: &Pair, by: &AppState, file: &str, rev: u64) -> CheckedEntry {
+    use cordelia_core::protocol::{
+        ITEM_SEAL_OVERHEAD_BYTES, LABEL_ENTRY_CONTENT, MIN_ENTRY_CONTENT_BYTES,
+    };
+    let (secret, slot) = secret_and_slot(p, file);
+    // What a content says, filled up to the smallest size, and sealed as
+    // an entry's is: under the channel's entry key, and bound to the
+    // channel, the slot and the revision.
+    let mut said = vec![0, 8, 0xff, 0xfe];
+    said.resize(MIN_ENTRY_CONTENT_BYTES - ITEM_SEAL_OVERHEAD_BYTES, 0);
+    let channel = derive::channel_id(&secret).unwrap();
+    let bound = [LABEL_ENTRY_CONTENT, &channel, &slot, &rev.to_be_bytes()].concat();
+    let key = derive::entry_key(&secret).unwrap();
+    let content = cordelia_crypto::item_encrypt(&key, &said, &bound).unwrap();
+    let entry = signed_in(&secret, &by.identity, slot, rev, content);
+    assert_eq!(entry.open(&secret), Err(EntryError::NotThisForm));
+    entry
+}
+
+/// How many entries the slot of `file` holds, on this device of the pair,
+/// that it cannot read: see [`publish::not_read`].
+fn not_read(p: &Pair, file: &str) -> usize {
+    publish::not_read(&p.st.db.lock().unwrap(), NAME, file).unwrap()
+}
+
+/// The ID, as it is written, of the channel that `st` holds for the
+/// pair's name now: after a statement it is another than before.
+fn channel_of(st: &AppState) -> String {
+    let db = st.db.lock().unwrap();
+    let id = held_rows::channel_of_name(&db, NAME).unwrap().unwrap();
+    encode_channel_id(&id).unwrap()
+}
+
+/// An entry of the index that this device cannot read (it is no version:
+/// here it does not open) is passed over when the channel's version is
+/// worked out, and may be above it. While the index's slot holds one, by
+/// a key that counts, at the revision the cycle read or above it, nothing
+/// is put back and the minute does not run. It stands there until its
+/// writer writes the index again, the index is edited here, or a
+/// statement moves the name to a new channel.
 #[test]
 fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
-    let theirs = format!("{OTHER_LINE}- [Theirs](theirs.md) under the new key\n");
+    let theirs = format!("{OTHER_LINE}- [Theirs](theirs.md) written again\n");
+    // The look finds neither, so nothing is tried: no put-back comes as
+    // far as its hold, in any of the cycles before the `looks`th.
+    let none_tried = |p: &Pair, looks: i64| {
+        let tried = std::cell::Cell::new(0);
+        let before_hold = || tried.set(tried.get() + 1);
+        for look in 1..looks {
+            let hooks = Hooks {
+                before_hold: &before_hold,
+                ..Hooks::NONE
+            };
+            let report = hooked_at(p, 20 + 5 * look, &hooks);
+            assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+        }
+        assert_eq!(tried.get(), 0);
+        assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+    };
 
     // Above the entry this device reads.
     let p = back_unlisted();
-    let key_comes = other_moves_to_a_new_key(&p);
-    p.other_writes(INDEX, Some(&theirs));
+    arrives(&p, &does_not_open(&p, &p.other, INDEX, 3));
     assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
-    // The look finds neither, so nothing is tried: no put-back comes as
-    // far as its hold, in any cycle.
-    let tried = std::cell::Cell::new(0);
-    let before_hold = || tried.set(tried.get() + 1);
-    for look in 1..40 {
-        let hooks = Hooks {
-            before_hold: &before_hold,
-            ..Hooks::NONE
-        };
-        let report = hooked_at(&p, 20 + 5 * look, &hooks);
-        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
-    }
-    assert_eq!(tried.get(), 0);
-    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
-    // The key comes: the entry is taken, with nothing put back over it,
-    // and the minute starts from there.
-    key_comes(&p.st);
+    assert_eq!(not_read(&p, INDEX), 1);
+    none_tried(&p, 40);
+    // Its writer writes the index again, above it: that entry has the
+    // place of the one that could not be read. It is taken, with nothing
+    // put back over it, and the minute starts from there.
+    p.other_writes(INDEX, Some(&theirs));
+    assert_eq!(not_read(&p, INDEX), 0);
     let report = cycle_at(&p, 220);
     assert_eq!((report.published, report.pulled), (0, 1), "{report:?}");
     assert_eq!(p.read(INDEX).as_deref(), Some(theirs.as_str()));
@@ -1330,10 +1512,7 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     for look in 1..13 {
         assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
     }
-    let before_hold = || {
-        let _key_comes = other_moves_to_a_new_key(&p);
-        p.other_writes(INDEX, Some(&theirs));
-    };
+    let before_hold = || arrives(&p, &does_not_open(&p, &p.other, INDEX, 3));
     let report = hooked_at(
         &p,
         85,
@@ -1347,27 +1526,16 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     assert_eq!(a_minute_from(&p, 90).published, 0);
 
     // At the revision this device reads, and not above it (this device
-    // reads its own entry, at 2): the same. It is a version that stands
-    // beside, which this device cannot see there.
+    // reads its own entry, at 2): the same. It is beside the version that
+    // this device reads, and is no version to stand there.
     let p = back_unlisted();
-    let key_comes = other_moves_to_a_new_key(&p);
-    entry_at(&p.other, &p.channel, INDEX, &theirs, 2, false);
-    deliver(&p.other, &p.st, &p.channel);
+    arrives(&p, &does_not_open(&p, &p.other, INDEX, 2));
     assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
+    assert_eq!(lost(&p, INDEX), []);
+    assert_eq!(not_read(&p, INDEX), 1);
     // Here too the look finds neither, and no put-back comes as far as
     // its hold.
-    let tried = std::cell::Cell::new(0);
-    let before_hold = || tried.set(tried.get() + 1);
-    for look in 1..20 {
-        let hooks = Hooks {
-            before_hold: &before_hold,
-            ..Hooks::NONE
-        };
-        let report = hooked_at(&p, 20 + 5 * look, &hooks);
-        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
-    }
-    assert_eq!(tried.get(), 0);
-    key_comes(&p.st);
+    none_tried(&p, 20);
 
     // And arriving at that revision between the cycle's read and the
     // hold: nothing is published.
@@ -1375,11 +1543,7 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     for look in 1..13 {
         assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
     }
-    let before_hold = || {
-        let _key_comes = other_moves_to_a_new_key(&p);
-        entry_at(&p.other, &p.channel, INDEX, &theirs, 2, false);
-        deliver(&p.other, &p.st, &p.channel);
-    };
+    let before_hold = || arrives(&p, &does_not_open(&p, &p.other, INDEX, 2));
     let report = hooked_at(
         &p,
         85,
@@ -1391,14 +1555,11 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
 
-    // An entry that says it is under a key this device holds, and does
-    // not open under it, is one it cannot read: by a device that counts,
-    // above the entry read.
+    // By any key that counts: here a third device's, which this device
+    // added, above the entry read.
     let p = back_unlisted();
-    let sealed_otherwise = third(&p);
-    cordelia_storage::psk::write_psk(&sealed_otherwise.home_dir, &p.channel, &[9u8; 32]).unwrap();
-    entry_at(&sealed_otherwise, &p.channel, INDEX, &theirs, 3, false);
-    deliver(&sealed_otherwise, &p.st, &p.channel);
+    let another = third(&p);
+    arrives(&p, &does_not_open(&p, &another, INDEX, 3));
     assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
     for look in 1..20 {
         let report = cycle_at(&p, 20 + 5 * look);
@@ -1406,165 +1567,335 @@ fn nothing_is_put_back_over_an_entry_that_cannot_be_read() {
     }
 
     // Below the revision this device reads: the line goes back. (The
-    // other device's first entry for the index, at revision 1, under the
-    // new key: this device reads its own, at 2.)
+    // other device's entry for the index is at revision 1: this device
+    // reads its own, at 2.)
     let p = back_unlisted();
-    let _key_comes = other_moves_to_a_new_key(&p);
-    entry_at(&p.other, &p.channel, INDEX, &theirs, 1, false);
-    deliver(&p.other, &p.st, &p.channel);
+    arrives(&p, &does_not_open(&p, &p.other, INDEX, 1));
+    assert_eq!(not_read(&p, INDEX), 0);
     assert_eq!(a_minute_from(&p, 25).published, 1);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 
-    // By a device that does not count (it is no member here): the line
-    // goes back.
+    // By a key that does not count: it is refused where it arrives. One
+    // that the store holds all the same counts for nothing: the line goes
+    // back, and at the revision above the index's version, which is not
+    // above that entry.
     let p = back_unlisted();
-    let stranger = third(&p);
+    let stranger = state(&p.mem.parent().unwrap().join("stranger"));
+    let entry = does_not_open(&p, &stranger, INDEX, 7);
     {
         let db = p.st.db.lock().unwrap();
-        let key = stranger.identity.public_key();
-        channels::remove_member(&db, &p.channel, &key).unwrap();
+        let taken = take::take(&db, &p.st.identity, &entry, now()).unwrap();
+        let refused = take::Taken::Refused(take::NotTaken::SignerDoesNotCount);
+        assert_eq!(taken, refused);
+        let put = stored::store(&db, &entry, now()).unwrap();
+        assert_eq!(put, stored::Outcome::Stored);
     }
-    cordelia_storage::psk::rotate_psk(
-        &stranger.home_dir,
-        &p.channel,
-        &[9u8; 32],
-        "2026-10-04T00:00:00Z",
-    )
-    .unwrap();
-    entry_at(&stranger, &p.channel, INDEX, &theirs, 7, false);
-    deliver(&stranger, &p.st, &p.channel);
+    assert_eq!(not_read(&p, INDEX), 0);
     assert_eq!(a_minute_from(&p, 25).published, 1);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 3);
+
+    // The device that wrote it is removed. This device applies the
+    // statement, and carries what it holds into the name's new channel:
+    // the index's version, and the memory as the removed device last
+    // wrote it, but nothing of an entry that is no version. The folder's
+    // records move with them, and the line goes back there.
+    let mut p = back_unlisted();
+    arrives(&p, &does_not_open(&p, &p.other, INDEX, 3));
+    none_tried(&p, 20);
+    removes(&p.st, &p.phrase, &p.other.identity.public_key());
+    let left = std::mem::replace(&mut p.channel, channel_of(&p.st));
+    assert_ne!(p.channel, left);
+    assert_eq!(not_read(&p, INDEX), 0);
+    assert_eq!(
+        records(&p),
+        [("notes.md".into(), NOTES.trim_end().into(), 0)]
+    );
+    // (The first cycle there notes that the memory's version is this
+    // device's own entry now, which is an action on the file.)
+    let report = cycle_at(&p, 120);
+    assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+    let last = a_minute_from(&p, 125);
+    assert_eq!(last.published, 1, "{last:?}");
+    assert!(last.conflict_files.is_empty(), "{last:?}");
+    assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+    assert_eq!(p.held(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
+    assert_eq!(p.read("notes.md").as_deref(), Some("two\n"));
 }
 
 /// The question is asked of the index's slot, and not of the file's. An
 /// entry of the file's slot that this device cannot read, above a text by
 /// another device, holds nothing back: the file looks at rest, and the
-/// line goes back. Here that entry is a delete. When the key comes the
-/// file goes, and the line stays, pointing at no file: the cost that the
-/// decision record states.
+/// line goes back. Where its writer then writes the memory again, as a
+/// delete, the file goes, and the line stays, pointing at no file: the
+/// cost that the decision record states.
 #[test]
 fn an_entry_of_the_files_slot_that_cannot_be_read_holds_nothing_back() {
     let p = back_unlisted();
     // A third device, which the other device knows too, edits the memory,
     // and this one takes that.
     let third = third(&p);
-    {
-        let db = p.other.db.lock().unwrap();
-        let key = third.identity.public_key();
-        channels::add_member(&db, &p.channel, &key, "owner").unwrap();
-    }
-    let (_, rev, _) = version(&p.st, &p.channel, "notes.md").unwrap();
-    entry_at(&third, &p.channel, "notes.md", "three\n", rev + 1, false);
-    deliver(&third, &p.st, &p.channel);
-    deliver(&third, &p.other, &p.channel);
+    deliver(&p.st, &third, NAME);
+    deliver(&p.st, &p.other, NAME);
+    let (_, rev, _) = version(&p.st, NAME, "notes.md").unwrap();
+    write(&third, NAME, "notes.md", text("three\n"));
+    deliver(&third, &p.st, NAME);
+    deliver(&third, &p.other, NAME);
+    assert_eq!(version(&p.st, NAME, "notes.md").unwrap().1, rev + 1);
     assert_eq!(cycle_at(&p, 25).pulled, 1);
     assert_eq!(p.read("notes.md").as_deref(), Some("three\n"));
 
-    // The other device moves to a new key, and deletes the memory under
-    // it, above the third device's text. This device passes that over:
-    // it reads the third device's text.
-    let key_comes = other_moves_to_a_new_key(&p);
-    p.other_writes("notes.md", None);
-    let (_, deleted_at, _) = version(&p.other, &p.channel, "notes.md").unwrap();
-    assert_eq!(deleted_at, rev + 2);
+    // An entry of the other device's arrives above the third device's
+    // text, and does not open. This device passes that over: it reads the
+    // third device's text.
+    arrives(&p, &does_not_open(&p, &p.other, "notes.md", rev + 2));
     assert_eq!(
         p.held("notes.md").as_deref(),
         Some("three\n"),
         "passed over"
     );
+    assert_eq!((not_read(&p, "notes.md"), not_read(&p, INDEX)), (1, 0));
     assert_eq!(a_minute_from(&p, 30).published, 1);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 
-    // The key comes: the delete is read, the file goes, and the line
-    // that was put back stays.
-    key_comes(&p.st);
+    // The other device writes the memory again, above that entry, as a
+    // delete: the file goes, and the line that was put back stays.
+    p.other_writes("notes.md", None);
+    let (_, deleted_at, _) = version(&p.st, NAME, "notes.md").unwrap();
+    assert_eq!(deleted_at, rev + 3);
+    assert!(is_deleted(&p, "notes.md"));
     let report = cycle_at(&p, 95);
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(p.read("notes.md"), None);
     assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
 }
 
-/// The other device, which counts, stores under the index's name, at
-/// `rev`, an entry that the key both devices hold opens and that is not an
-/// entry's content: bytes that are no JSON.
-fn no_entry_at(p: &Pair, rev: u64) {
-    use cordelia_crypto::signing::ItemMetadata;
-    use cordelia_crypto::slots::{item_aad, slot_id};
-    use cordelia_storage::{items, psk};
-    let st = &p.other;
-    let author = st.identity.public_key();
-    let slot = slot_id(
-        &psk::read_slot_key(&st.home_dir, &p.channel).unwrap(),
-        INDEX,
-    );
-    let blob = cordelia_crypto::item_encrypt(
-        &psk::read_psk(&st.home_dir, &p.channel).unwrap(),
-        b"not an entry",
-        &item_aad(&p.channel, Some(&slot), Some(rev)),
-    )
-    .unwrap();
-    let content_hash = cordelia_crypto::sha256(&blob);
-    {
-        let db = st.db.lock().unwrap();
-        let key_version = channels::get_by_id(&db, &p.channel).unwrap().key_version;
-        let item_id = items::generate_item_id();
-        let published_at = chrono::Utc::now().to_rfc3339();
-        let signed = ItemMetadata {
-            author_id: &author,
-            channel_id: &p.channel,
-            content_hash: &content_hash,
-            is_tombstone: false,
-            item_id: &item_id,
-            key_version,
-            published_at: &published_at,
-            slot: Some(&slot),
-            rev: Some(rev),
-        }
-        .encode()
-        .unwrap();
-        let stored = items::insert_item(
-            &db,
-            &items::NewItem {
-                item_id: &item_id,
-                channel_id: &p.channel,
-                author_id: &author,
-                item_type: ITEM_TYPE,
-                published_at: &published_at,
-                parent_id: None,
-                key_version,
-                content_hash: &content_hash,
-                signature: &st.identity.sign(&signed),
-                encrypted_blob: &blob,
-                is_tombstone: false,
-                slot: Some(&slot),
-                rev: Some(rev),
-            },
-        )
-        .unwrap();
-        assert!(stored);
-    }
+/// One cycle of a memory folder of the other device's, at `dir`.
+fn other_cycle(p: &Pair, dir: &Path) -> FolderReport {
+    let generation = p.other.sync_control.generation();
+    let channel = channel_of(&p.other);
+    sync_folder(&p.other, dir, &channel, NAME, "ef01", generation).unwrap()
 }
 
-/// An entry of the index's slot that a key this device holds opens, and
-/// that is not an entry's content, is not one that cannot be read: it
-/// counts for nothing, and the line goes back.
+/// A put-back is published as any edit of the index is (decision
+/// 2026-10-04 §7.3): its chain is that of an entry written over the
+/// index's version, as the cycle read it, and the folder's record is of
+/// that entry. So a device whose index is that version takes the put-back
+/// with nothing kept beside it.
 #[test]
-fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
+fn a_put_back_is_an_edit_of_the_indexes_version() {
+    let p = back_unlisted();
+    // The other device has the folder too, and lists a memory more there.
+    let theirs = p.mem.parent().unwrap().join("the other's memory");
+    std::fs::create_dir_all(&theirs).unwrap();
+    deliver(&p.st, &p.other, NAME);
+    assert_eq!(other_cycle(&p, &theirs).pulled, 3);
+    let longer = format!("{OTHER_LINE}- [More](more.md) more\n");
+    std::fs::write(theirs.join(INDEX), &longer).unwrap();
+    assert_eq!(other_cycle(&p, &theirs).published, 1);
+    deliver(&p.other, &p.st, NAME);
+    assert_eq!(cycle_at(&p, 25).pulled, 1);
+
+    // A minute of looks later this device puts the line back, over the
+    // other device's version of the index.
+    assert_eq!(a_minute_from(&p, 30).published, 1);
+    let back = format!("{longer}{NOTES}");
+    let first = format!("{NOTES}{OTHER_LINE}");
+    let chain = vec![
+        link(Some(&longer), &p.other),
+        link(Some(OTHER_LINE), &p.st),
+        link(Some(&first), &p.st),
+    ];
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 4);
+    assert_eq!(said(&p.st, NAME, INDEX), Some(chain.clone()));
+    let recorded = {
+        let db = p.st.db.lock().unwrap();
+        let folder = p.mem.display().to_string();
+        let mut all = sync_state::load(&db, &folder, &p.channel).unwrap();
+        all.remove(INDEX)
+    };
+    let agreed = Agreed {
+        hash: Some(Content::new(back.as_str()).hash),
+        rev: 4,
+        signer: Some(p.st.identity.public_key()),
+        chain: Some(chain),
+    };
+    assert_eq!(recorded, Some(agreed));
+
+    // The other device's index is the version that the put-back was
+    // written over: it takes the put-back, and keeps nothing beside it.
+    deliver(&p.st, &p.other, NAME);
+    let report = other_cycle(&p, &theirs);
+    assert_eq!(
+        (report.pulled, report.conflicts, report.published),
+        (1, 0, 0),
+        "{report:?}"
+    );
+    assert!(report.conflict_files.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read_to_string(theirs.join(INDEX)).unwrap(), back);
+}
+
+/// A device is removed by a statement, and what it wrote does not go with
+/// it: a device that applies the statement carries each version it holds
+/// into the name's new channel, as its own entry (decision 2026-10-04
+/// §7.3), and the folder's records move there, those of index lines among
+/// them (§4.2). So a memory that came back by the removed device's edit
+/// stays back, and its line is put back in the new channel, a minute of
+/// looks after the move, as an edit of the index's version as this device
+/// carried it. It is so where this device makes the statement, and where
+/// it is shown one that another device made.
+#[test]
+fn after_a_statement_the_line_goes_back_in_the_names_new_channel() {
+    let mut p = back_unlisted();
+    for look in 1..7 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    removes(&p.st, &p.phrase, &p.other.identity.public_key());
+    let left = std::mem::replace(&mut p.channel, channel_of(&p.st));
+    assert_ne!(p.channel, left);
+
+    // What this device holds of the name is in the new channel, and is
+    // all its own: among it the memory as the removed device wrote it, in
+    // an entry that says first which key signed that.
+    let me = p.st.identity.public_key();
+    assert!(held(&p.st, NAME).iter().all(|entry| entry.author == me));
+    let (_, rev, text) = version(&p.st, NAME, "notes.md").unwrap();
+    assert_eq!((rev, text.as_str()), (3, "two\n"));
+    let carried = said(&p.st, NAME, "notes.md").unwrap();
+    assert_eq!(carried[0], link(Some("two\n"), &p.other));
+    // The record of the memory deleted with its line has moved too.
+    assert_eq!(
+        records(&p),
+        [("notes.md".into(), NOTES.trim_end().into(), 0)]
+    );
+
+    // The first cycle there changes no file and publishes nothing: it
+    // notes that the memory's version is this device's own entry now. The
+    // minute of looking begins again after it.
+    let report = cycle_at(&p, 50);
+    assert_eq!(
+        (report.published, report.pulled, report.conflicts),
+        (0, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(p.read("notes.md").as_deref(), Some("two\n"));
+    let last = a_minute_from(&p, 55);
+    assert_eq!(last.published, 1, "{last:?}");
+    assert!(last.conflict_files.is_empty(), "{last:?}");
+    let back = format!("{OTHER_LINE}{NOTES}");
+    assert_eq!(p.read(INDEX).unwrap(), back);
+    assert_eq!(p.held(INDEX).unwrap(), back);
+    // It is an edit of the index's version, which was this device's own
+    // and was carried with its chain.
+    let first = format!("{NOTES}{OTHER_LINE}");
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 3);
+    assert_eq!(
+        said(&p.st, NAME, INDEX),
+        Some(vec![
+            link(Some(OTHER_LINE), &p.st),
+            link(Some(&first), &p.st)
+        ])
+    );
+    assert_eq!(
+        records(&p),
+        [("notes.md".into(), NOTES.trim_end().into(), 1)]
+    );
+
+    // The same where this device is shown a statement that another
+    // device made: here the other device removes a third. Each of the two
+    // that stay has carried what it held, so the index's version is held
+    // in two entries, which are one version, and the line goes back over
+    // it.
+    let mut p = back_unlisted();
+    let third = third(&p);
+    deliver(&p.st, &p.other, NAME);
+    for look in 1..7 {
+        assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
+    }
+    let change = removes(&p.other, &p.phrase, &third.identity.public_key());
+    {
+        let db = p.st.db.lock().unwrap();
+        let shown = take::take(&db, &p.st.identity, &change, now()).unwrap();
+        let applied = matches!(shown, take::Taken::Shown(person::Shown::Applied(_)));
+        assert!(applied, "{shown:?}");
+    }
+    let left = std::mem::replace(&mut p.channel, channel_of(&p.st));
+    assert_ne!(p.channel, left);
+    deliver(&p.other, &p.st, NAME);
+    let PlannedAgainst::Version { rev, entries, .. } = version(&p.st, NAME, INDEX).unwrap().0
+    else {
+        panic!("the index has a version");
+    };
+    assert_eq!((rev, entries.len()), (2, 2));
+    assert_eq!(lost(&p, INDEX), []);
+    assert_eq!(
+        records(&p),
+        [("notes.md".into(), NOTES.trim_end().into(), 0)]
+    );
+    let report = cycle_at(&p, 50);
+    assert_eq!(
+        (report.published, report.pulled, report.conflicts),
+        (0, 0, 0),
+        "{report:?}"
+    );
+    let last = a_minute_from(&p, 55);
+    assert_eq!(last.published, 1, "{last:?}");
+    assert!(last.conflict_files.is_empty(), "{last:?}");
+    assert_eq!(p.read(INDEX).unwrap(), back);
+    assert_eq!(p.held(INDEX).unwrap(), back);
+    assert_eq!(p.read("notes.md").as_deref(), Some("two\n"));
+    // It is written from this device's own entry of that version.
+    assert_eq!(
+        said(&p.st, NAME, INDEX),
+        Some(vec![
+            link(Some(OTHER_LINE), &p.st),
+            link(Some(&first), &p.st)
+        ])
+    );
+}
+
+/// An entry of the index's slot that the channel's secret opens, and that
+/// is not an entry's content, is no version (decision 2026-10-04 §2.3),
+/// and so one that this device cannot read, as one that does not open is.
+/// While it stands at the revision read or above it, nothing is put back.
+/// Once the index is written above it, the line goes back.
+#[test]
+fn an_entry_that_opens_and_is_no_entry_is_one_that_cannot_be_read() {
     let p = back_unlisted();
     // Above the entry this device reads.
     let rev = 9;
-    no_entry_at(&p, rev);
-    deliver(&p.other, &p.st, &p.channel);
-    assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE));
-    assert_eq!(a_minute_from(&p, 25).published, 1);
-    assert_eq!(p.read(INDEX).unwrap(), format!("{OTHER_LINE}{NOTES}"));
-    // Above the entry that counts for nothing.
-    assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, rev + 1);
+    arrives(&p, &no_entry_at(&p, &p.other, INDEX, rev));
+    assert_eq!(p.held(INDEX).as_deref(), Some(OTHER_LINE), "passed over");
+    assert_eq!(not_read(&p, INDEX), 1);
+    // The look finds neither: no put-back comes as far as its hold.
+    let tried = std::cell::Cell::new(0);
+    let before_hold = || tried.set(tried.get() + 1);
+    for look in 1..20 {
+        let hooks = Hooks {
+            before_hold: &before_hold,
+            ..Hooks::NONE
+        };
+        let report = hooked_at(&p, 20 + 5 * look, &hooks);
+        assert_eq!((report.published, report.pulled), (0, 0), "{report:?}");
+    }
+    assert_eq!(tried.get(), 0);
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+
+    // The index is edited here: the edit is published above the entry,
+    // which counts for the next revision though it is no version.
+    let edited = format!("{OTHER_LINE}- [Mine](mine.md) added here\n");
+    p.file(INDEX, &edited);
+    assert_eq!(cycle_at(&p, 120).published, 1);
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, rev + 1);
+    assert_eq!(not_read(&p, INDEX), 0);
+    // A minute of looks later the line goes back, above that.
+    assert_eq!(a_minute_from(&p, 125).published, 1);
+    assert_eq!(p.read(INDEX).unwrap(), format!("{edited}{NOTES}"));
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, rev + 2);
 }
 
 /// A file is not at rest where the channel has no version of it: what is
-/// under its name there is neither a text nor a delete (something written
+/// under its name there is neither a text nor a delete (bytes written
 /// through the API). The plan has nothing to do for such a file, and it
 /// is still no file that the channel and the folder agree. No line goes
 /// back for it, and none goes back into an index that is in that state:
@@ -1574,9 +1905,15 @@ fn an_entry_that_opens_and_is_no_entry_holds_nothing_back() {
 fn a_file_with_no_version_in_the_channel_is_not_at_rest() {
     for name in ["notes.md", INDEX] {
         let (p, store) = back_unlisted().with_history();
-        write(&p.other, &p.channel, name, serde_json::json!({ "a": 1 }));
-        deliver(&p.other, &p.st, &p.channel);
-        assert_eq!(version(&p.st, &p.channel, name).unwrap().2, "", "{name}");
+        write(&p.other, NAME, name, Value::Other(b"{\"a\":1}".to_vec()));
+        deliver(&p.other, &p.st, NAME);
+        let (planned, _, text) = version(&p.st, NAME, name).unwrap();
+        let other = Kind::Other;
+        assert!(
+            matches!(planned, PlannedAgainst::Version { kind, .. } if kind == other),
+            "{name}: {planned:?}"
+        );
+        assert_eq!(text, "", "{name}");
         for look in 1..20 {
             let report = cycle_at(&p, 20 + 5 * look);
             assert_eq!(
@@ -1621,7 +1958,7 @@ fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
     );
     let put_back = history::Entry { device: me, rev: 3 };
     assert_eq!(about.replaced_by, Replacement::Entry(put_back));
-    assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, 3);
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 3);
 
     // Refused under the hold (the memory's entry changed in the channel
     // meanwhile): nothing is published, and no record stays.
@@ -1640,14 +1977,11 @@ fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
 
     // An entry arrives under the index's name after the text was kept,
     // one that this device passes over when it reads the channel (it
-    // opens and is no entry), so that only the revision shows it: the
-    // record names a revision that the put-back would no longer have.
-    // Nothing is published, and no record stays.
+    // opens and is no entry), so that the channel's version does not
+    // show it: the record names a revision that a put-back would no
+    // longer have. Nothing is published, and no record stays.
     let (p, store) = due();
-    let before_hold = || {
-        no_entry_at(&p, 9);
-        deliver(&p.other, &p.st, &p.channel);
-    };
+    let before_hold = || arrives(&p, &no_entry_at(&p, &p.other, INDEX, 9));
     let report = hooked_at(
         &p,
         85,
@@ -1659,18 +1993,34 @@ fn the_index_as_it_was_is_kept_before_its_lines_are_put_back() {
     assert_eq!(report.published, 0, "{report:?}");
     assert_eq!(kept_in(&store), []);
     assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
-    // The next cycle's put-back is made above that entry, and its record
-    // names the revision it has.
-    assert_eq!(cycle_at(&p, 90).published, 1);
+    // Nothing is put back while that entry stands above the index's
+    // version, and nothing is kept for it.
+    assert_eq!(cycle_at(&p, 90).published, 0);
+    assert_eq!(kept_in(&store), []);
+    // The index is edited here, above that entry. The put-back that
+    // follows is made above the edit, and its record names the revision
+    // it has.
+    let edited = format!("{OTHER_LINE}- [Mine](mine.md) added here\n");
+    p.file(INDEX, &edited);
+    assert_eq!(cycle_at(&p, 95).published, 1);
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 10);
+    assert_eq!(a_minute_from(&p, 100).published, 1);
     let kept = kept_in(&store);
-    assert_eq!(briefly(&kept), [(INDEX, Change::Merged, Some(OTHER_LINE))]);
+    let merged: Vec<&Kept4> = kept.iter().filter(|r| r.1 == Change::Merged).collect();
+    assert_eq!(merged.len(), 1, "{kept:?}");
+    assert_eq!(merged[0].2.as_deref(), Some(edited.as_str()));
+    let about = &merged[0].3;
+    assert_eq!(
+        about.kept.as_ref().unwrap().whose,
+        Whose::Here { agreed: Some(10) }
+    );
     let me = Pair::shown(&p.st.identity.public_key());
     let put_back = history::Entry {
         device: me,
-        rev: 10,
+        rev: 11,
     };
-    assert_eq!(kept[0].3.replaced_by, Replacement::Entry(put_back));
-    assert_eq!(version(&p.st, &p.channel, INDEX).unwrap().1, 10);
+    assert_eq!(about.replaced_by, Replacement::Entry(put_back));
+    assert_eq!(version(&p.st, NAME, INDEX).unwrap().1, 11);
 }
 
 /// A failure while lines are put back is the index's, reported as any
@@ -1686,6 +2036,7 @@ fn a_failure_while_lines_are_put_back_leaves_the_other_files_done() {
     for look in 1..13 {
         assert_eq!(cycle_at(&p, 20 + 5 * look).published, 0);
     }
+    std::fs::create_dir_all(&p.st.home_dir).unwrap();
     std::fs::write(p.st.home_dir.join("history"), "in the way").unwrap();
     p.other_writes("later.md", Some("l\n"));
     let report = cycle_at(&p, 85);

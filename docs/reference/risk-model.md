@@ -12,7 +12,9 @@ and asks whether that lowers or raises the risks from AI. What is built is in
 - **Capture.** Agents' memory collects in plaintext at a few providers, where
   it can be read under compulsion, used to lock people in, or quietly changed
   [1]. Cordelia is a defence: memory is encrypted on the device that wrote it,
-  relays hold ciphertext and no keys, and anyone can run a relay.
+  relays hold ciphertext and no keys, and anyone can run a relay. What opens
+  a person's memory is a secret that only their devices hold, and a recovery
+  phrase that only they hold.
 - **Autonomy.** A model pursues goals that the person running it did not
   intend, and is not caught [1, 2]. Cordelia does nothing for this, and is
   slightly worse at the margin: memory that no relay can read is also memory
@@ -41,7 +43,9 @@ more than the oversight it gives up.
   the memory an agent chose to write and says which device wrote each version.
   It does not show why the model did what it did [3].
 - It gives no authority a way to inspect or override an agent's memory. That
-  is the price of no provider being able to.
+  is the price of no provider being able to. Nor can any provider give a
+  person their memory back: a person who loses every device and the recovery
+  phrase has lost it.
 - It does not align agents. Memory is not shared between people, so nothing in
   Cordelia passes one agent's values to another. What it does give is a
   security property: another person has no way to put notes of theirs into
@@ -63,8 +67,11 @@ more than the oversight it gives up.
 3. **Relays are run by many.** While relays are few, or most are run by one
    operator, the third argument describes the design more than the network.
    Such an operator can be made to hand over ciphertext and the metadata the
-   whitepaper lists (§4), or to stop. It cannot hand over what it does not
-   hold.
+   whitepaper lists (§4), or to stop. That metadata includes one identifier
+   that stays the same for a person for as long as their recovery phrase
+   does, and which of a person's channels change together when a device is
+   removed. It cannot hand over what it does not hold: a key, a recovery
+   phrase, or the list of a person's devices.
 
 ## What would change our view
 

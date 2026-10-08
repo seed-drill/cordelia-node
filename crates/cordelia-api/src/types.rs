@@ -342,89 +342,6 @@ fn default_limit() -> u32 {
     50
 }
 
-// ── Devices and invites (decision 2026-09-30-agent-memory-sync §4.1) ──
-
-#[derive(Deserialize)]
-pub struct AddDeviceRequest {
-    /// Bech32 Ed25519 key of the device being added.
-    pub device: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct AddDeviceResponse {
-    pub device: String,
-    /// This node's key: the other device runs `cordelia accept <this_device>`.
-    pub this_device: String,
-    pub personal_channel_id: String,
-    pub channels: Vec<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AcceptRequest {
-    /// Bech32 Ed25519 key of the device that ran `add-device` for this node.
-    pub key: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct InboxSummaryResponse {
-    pub applied: Vec<String>,
-    pub pending: usize,
-    pub superseded: usize,
-    pub invalid: usize,
-    /// States kept because they name a key that is not yet known as one of
-    /// this person's devices.
-    pub held: usize,
-    /// What the person should be told.
-    pub notes: Vec<String>,
-}
-
-#[derive(Deserialize)]
-pub struct RemoveDeviceRequest {
-    pub device: String,
-}
-
-#[derive(Serialize)]
-pub struct RemoveDeviceResponse {
-    pub device: String,
-    pub channels_rotated: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub struct DeviceEntry {
-    pub key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub this_device: bool,
-    pub in_personal_channel: bool,
-    pub explicitly_trusted: bool,
-    /// When this device sent the oldest change that the other device has
-    /// not confirmed yet (RFC 3339). Absent when it has confirmed them all.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unconfirmed_since: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ListDevicesResponse {
-    pub devices: Vec<DeviceEntry>,
-}
-
-#[derive(Serialize)]
-pub struct PendingInviteEntry {
-    pub item_id: String,
-    pub from: String,
-    pub channel_id: String,
-    pub received_at: String,
-}
-
-#[derive(Serialize)]
-pub struct ListInvitesResponse {
-    pub pending: Vec<PendingInviteEntry>,
-}
-
 // ── Keyed entries (decision 2026-09-30-agent-memory-sync §4.3) ──
 
 #[derive(Deserialize)]
@@ -483,19 +400,25 @@ pub struct SyncClaudeRequest {
     /// Claude Code directory; defaults to ~/.claude of the user running the node.
     #[serde(default)]
     pub dir: Option<String>,
-    /// Project remotes this device never syncs (`host/owner/repo`, or a
-    /// prefix ending in `*`). Replaces the current list when given.
+    /// A list of exclusions, as a panel that is not yet brought up to
+    /// date sends one. It is stored in the place of the current list, and
+    /// nothing reads it to say what syncs: only mapped folders do
+    /// (decision 2026-10-04 §10.1).
     #[serde(default)]
     pub exclude: Option<Vec<String>>,
-    /// Whether home-folder memory syncs on this device (default: yes).
+    /// The switch for home memory. `false` unmaps the home directory and
+    /// stores the switch off; `true` stores it on. Home memory syncs
+    /// where the home directory is mapped.
     #[serde(default)]
     pub home: Option<bool>,
-    /// Sync everything found (home and git projects), now and later, as
-    /// well as the declared mappings. Default when first enabled: no.
+    /// `true` asked for everything found to sync, and is refused where
+    /// the request turns sync on or leaves it on: nothing is changed.
+    /// `false` is taken: only mapped folders sync, which is the only
+    /// scope there is.
     #[serde(default)]
     pub all: Option<bool>,
-    /// Put the directory, home and exclude settings back to their defaults.
-    /// Without it, a setting not given keeps its stored value.
+    /// Put the Claude Code directory back to its default. Nothing else is
+    /// touched: a setting that is not given keeps its stored value.
     #[serde(default)]
     pub reset: bool,
 }
@@ -531,16 +454,19 @@ pub struct SyncStatusResponse {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
-    /// Whether everything found syncs, or only the declared mappings.
+    /// Always false: only the declared mappings sync (decision 2026-10-04
+    /// §10.1). It is kept for whoever reads a status as an earlier
+    /// version wrote it.
     pub all: bool,
     pub mappings: Vec<SyncMapping>,
-    /// Never found by `all`: project names or prefixes, and folders
-    /// (absolute paths) that were unmapped.
+    /// The list of exclusions that is stored, as a panel sent it:
+    /// nothing reads it to say what syncs.
     pub exclude: Vec<String>,
+    /// The switch for home memory, as it is stored.
     pub home: bool,
     /// The name home memory syncs under on this device, or last did: the
-    /// name the home directory is or was mapped under, or `~` where it was
-    /// found and not mapped. Turning home memory on again uses it.
+    /// name the home directory is or was mapped under. Turning home
+    /// memory on again uses it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_name: Option<String>,
     /// How many times the settings have changed since the node started.
@@ -548,7 +474,57 @@ pub struct SyncStatusResponse {
     pub generation: u64,
     /// The last cycle's report, once one has run.
     pub report: Option<serde_json::Value>,
+    /// For how long the node has stored no report, in seconds, by its
+    /// own clock, which does not run while the machine sleeps: since the
+    /// later of its start and the last report it stored (decision
+    /// 2026-10-04 §10.1). A status says by this that the cycle has
+    /// stalled.
+    pub no_report_secs: u64,
     /// When a cycle last sent or received a memory (RFC 3339).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<String>,
+    /// Where the device stands under a recovery phrase (decision
+    /// 2026-10-04 §5.2): `no_phrase`, `applied`, or why it has stopped
+    /// (`fork`, `removed`, `not_listed`, `not_opened`). Only a device
+    /// that has applied a statement publishes anything.
+    pub stands: &'static str,
+    /// Why the node is held up, where it is (decision 2026-10-04 §10.1):
+    /// it runs no cycle and no pass until it is so no longer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
+    /// Whether this device took this version with what an earlier one
+    /// held: the step of its first start was made here (decision
+    /// 2026-10-04 §10.1). With no phrase, such a device is "not added
+    /// yet".
+    pub moved_on: bool,
+    /// What a device whose stored scope was on is told, while it is
+    /// stored (decision 2026-10-04 §10.1): the folders that stopped
+    /// syncing when only mapped folders came to sync, each with whether
+    /// `cordelia sync map` would sync it now. It is there with sync on
+    /// and with it off, until a person says that it has been seen
+    /// (`POST /api/v1/sync/seen`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<crate::found::NoticeShown>,
+    /// What a mapping carried for the name that the device came to sync
+    /// by it (decision 2026-10-04 §7.3): only in the answer to the
+    /// request that mapped the folder, and only where a carry was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried: Option<serde_json::Value>,
+    /// The name that this device let go of (decision 2026-10-04 §7.3):
+    /// one that it held by a carry or a recovery, with no folder mapped
+    /// to it. Only in the answer to the request that unmapped it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go: Option<String>,
+    /// Beside `let_go`: whether the statement that this device has
+    /// applied lists it alone (decision 2026-10-04 §9, step 4). No other
+    /// device of the person's then holds anything of the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go_alone: Option<bool>,
+    /// The name that a folder was mapped to, where this device still
+    /// holds it once the folder is unmapped (decision 2026-10-04 §16): a
+    /// carry or a recovery brought it, and it is held as it was before
+    /// the folder. Only in the answer to the request that unmapped the
+    /// folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub still_held: Option<String>,
 }

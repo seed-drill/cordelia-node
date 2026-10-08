@@ -16,18 +16,8 @@ pub fn open(path: &Path) -> Result<Connection, StorageError> {
     Ok(conn)
 }
 
-/// How much the database holds: its pages in use, in bytes. This is what a
-/// relay's storage cap counts. It costs two pragmas whatever the size, and
-/// it falls when items are deleted, which the size of the file does not.
-pub fn used_bytes(conn: &Connection) -> Result<u64, StorageError> {
-    let pragma = |name: &str| -> Result<u64, StorageError> {
-        Ok(conn.pragma_query_value(None, name, |row| row.get::<_, i64>(0))? as u64)
-    };
-    let pages = pragma("page_count")?.saturating_sub(pragma("freelist_count")?);
-    Ok(pages * pragma("page_size")?)
-}
-
-/// Open an in-memory database with schema initialised. For testing.
+/// Open an in-memory database with schema initialised: for testing, and
+/// for what a command reads in its own process and keeps in no file.
 pub fn open_in_memory() -> Result<Connection, StorageError> {
     let conn = Connection::open_in_memory()?;
     schema::init_db(&conn)?;

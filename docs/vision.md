@@ -14,6 +14,14 @@ encrypted, readable only by them, portable between their machines and between
 agents, and never readable by the infrastructure that carries it. Everything
 below extends that idea outwards; none of it relaxes it.
 
+A person holds their memory with two things, and nobody else holds either.
+Their devices share one secret, from which every channel of their memory is
+derived, so that a device is one of theirs because it holds it. And they keep
+a recovery phrase of twelve words: it is what removes a device that is lost,
+and what brings memory back to a machine that has only the phrase. No relay
+and no service holds the secret or the phrase, and none decides which
+devices are a person's.
+
 ## 1. Between people: shared channels, not shared memory
 
 Memory moves between one person's devices and stops there. An agent's memory is
@@ -27,9 +35,11 @@ What people working together need from their agents is shared on purpose:
   as authority, so that people stop copying text from one session to another;
 - **secrets**, which an agent uses by name and never sees.
 
-These travel in channels shared between people, built on the same keys and the
-same relays. The rule has two halves: automatic between your own devices,
-deliberate between people.
+These travel in channels shared between people, carried by the same relays.
+Such a channel's secret is handed to whoever is to be in it, where the
+channels of a person's own are derived from that person's secret. The rule
+has two halves: automatic between your own devices, deliberate between
+people.
 
 **Skills** that people share travel in a repository, where a change is reviewed
 before anyone runs it, and not in a channel.
@@ -47,15 +57,25 @@ follows the project from one coding agent to another.
 
 ## 3. Relays run by many
 
-Relays are simple on purpose: they store and forward ciphertext, verify
-signatures, and hold no keys. Anyone can run one, and a node's configuration
-lists the relays it uses. They are meant to be run by many, so that no single
-operator, including us, is necessary.
+Relays are simple on purpose. A channel's ID is a public key made from the
+channel's secret, and every entry is signed with it: so a relay can check,
+with no key and no list of members, that an entry was written from inside
+its channel, and it hands a channel only to a connection that proves it
+holds that key. It stores and forwards ciphertext and holds no keys. Anyone
+can run one, and a node's configuration lists the relays it uses. They are
+meant to be run by many, so that no single operator, including us, is
+necessary.
 
-A relay promises best effort and nothing more. It is a cache: each device holds
-its channels whole, and a relay fetches again from a device whatever it no
-longer holds. Anyone who needs a guarantee runs their own relay, for themselves
-or for their team.
+A relay promises best effort and nothing more. It is a cache, not a backup:
+each device holds what it syncs, and sends a relay again whatever the relay
+no longer holds. A relay keeps for a time what nobody uses, so the recovery
+phrase brings back what the relays still hold, and no more. Anyone who needs
+a guarantee runs their own relay, for themselves or for their team.
+
+What a relay learns is who connects, how much they send and when, which
+entries are revisions of one another, and that a person's channels change
+together when a device is removed. It learns no content, no name of a file
+or a project, and no key.
 
 ## 4. Paying for relays
 
@@ -101,7 +121,7 @@ are on one page in [`docs/reference/risk-model.md`](reference/risk-model.md).
 ## 6. What we will not build
 
 - A service that holds anyone's memory in plaintext.
-- A service that holds keys on anyone's behalf.
+- A service that holds keys on anyone's behalf, or a recovery phrase.
 - A required token, or a global reputation score.
 - Channels that anyone can join or write to. Everyone in a channel holds its
   key, so a channel open to anyone could be read by the relays that carry it

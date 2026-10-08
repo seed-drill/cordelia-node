@@ -6,6 +6,7 @@ pub mod claude_code;
 pub mod config;
 pub mod error;
 pub mod protocol;
+pub mod revision;
 pub mod sync_name;
 pub mod types;
 

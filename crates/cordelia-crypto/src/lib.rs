@@ -3,19 +3,49 @@
 //!
 //! Spec: seed-drill/specs/ecies-envelope-encryption.md
 //! Port source: cordelia-core/crates/cordelia-crypto (adapted for new spec)
+//!
+//! Also here, and not yet used by the node, is a channel from its secret
+//! (decision 2026-10-04): what is derived from a channel's secret and where
+//! each kind's secret comes from ([`derive`]), the recovery phrase
+//! ([`phrase`]), the statement of a person's devices ([`statement`]), and
+//! the entry that carries a statement to a device ([`change_entry`]). Each
+//! is pure functions, with vectors in
+//! `docs/reference/step4-test-vectors.json`. Beside them are an entry in
+//! the form such a channel has, with its seal, its two signatures and its
+//! chain ([`entry`]), the one place that builds a chain ([`chain`]), and
+//! how a slot's current version is read ([`version`]); and, for a device that is added, the record of its
+//! addition ([`addition`]) and what it is handed ([`hand_over`]). An entry
+//! travels in one form ([`wire`]), and a connection proves that it holds a
+//! channel's key with a signature of its own ([`proof`]). A key is shown
+//! to a person beside the first words of its fingerprint ([`fingerprint`]).
 
+pub mod addition;
 pub mod aes_gcm;
 pub mod bech32;
+pub mod chain;
+pub mod change_entry;
 pub mod channel_state;
+pub mod derive;
 pub mod ecies;
+pub mod entry;
+pub mod fingerprint;
+pub mod hand_over;
 pub mod identity;
+pub mod phrase;
+pub mod proof;
 pub mod psk_envelope;
 pub mod signing;
 pub mod slots;
+pub mod statement;
+pub mod version;
+pub mod wire;
+
+#[cfg(test)]
+mod vectors;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};
-pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256};
+pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256, hkdf_sha256_of};
 pub use identity::{NodeIdentity, verify_swarm_child, x25519_from_ed25519_seed};
 
 use ring::rand::{SecureRandom, SystemRandom};

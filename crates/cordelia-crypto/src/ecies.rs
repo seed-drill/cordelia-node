@@ -101,20 +101,42 @@ pub fn hkdf_sha256(
     salt: &[u8],
     info: &[u8],
 ) -> Result<[u8; 32], CryptoError> {
+    hkdf_sha256_of(shared_secret, salt, info)
+}
+
+/// [`hkdf_sha256`] from key material of any length: the 16 bytes that a
+/// recovery phrase encodes, or two secrets together (decision 2026-10-04
+/// §2.2, §5, §11).
+pub fn hkdf_sha256_of(
+    key_material: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<[u8; 32], CryptoError> {
+    Ok(*hkdf_sha256_wiped(key_material, salt, info)?)
+}
+
+/// [`hkdf_sha256_of`], given back in memory that is overwritten when it is
+/// dropped, and filled where it lies: for what comes from a recovery
+/// phrase (decision 2026-10-04 §16).
+pub fn hkdf_sha256_wiped(
+    key_material: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
     let effective_salt = if salt.is_empty() {
         &[0u8; 32][..]
     } else {
         salt
     };
     let hkdf_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, effective_salt);
-    let prk = hkdf_salt.extract(shared_secret);
+    let prk = hkdf_salt.extract(key_material);
     let info_refs = [info];
     let okm_material = prk
         .expand(&info_refs, WrapKeyLen)
         .map_err(|_| CryptoError::KeyDerivationFailed("HKDF expand failed".into()))?;
-    let mut okm = [0u8; 32];
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
     okm_material
-        .fill(&mut okm)
+        .fill(&mut *okm)
         .map_err(|_| CryptoError::KeyDerivationFailed("HKDF fill failed".into()))?;
     Ok(okm)
 }
@@ -126,6 +148,23 @@ pub fn ecies_encrypt(
     recipient_pk: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<EciesEnvelope, CryptoError> {
+    ecies_encrypt_for(recipient_pk, plaintext, HKDF_INFO)
+}
+
+/// [`ecies_encrypt`] for one purpose: the wrapping key is derived under
+/// `info`, which says what the envelope is for. An envelope sealed so
+/// opens only for whoever asks for that purpose
+/// ([`ecies_decrypt_for`]): it is no envelope for any other use of the
+/// recipient's key, and what was sealed for another use is none for this
+/// one.
+///
+/// [`ecies_encrypt`] seals under the general key-wrap info, as it always
+/// has.
+pub fn ecies_encrypt_for(
+    recipient_pk: &[u8; 32],
+    plaintext: &[u8],
+    info: &[u8],
+) -> Result<EciesEnvelope, CryptoError> {
     let rng = SystemRandom::new();
     let mut eph_sk = [0u8; 32];
     rng.fill(&mut eph_sk)
@@ -133,15 +172,28 @@ pub fn ecies_encrypt(
     let mut iv = [0u8; IV_LEN];
     rng.fill(&mut iv)
         .map_err(|_| CryptoError::EncryptionFailed("RNG failure".into()))?;
-    ecies_seal(&eph_sk, &iv, recipient_pk, plaintext)
+    ecies_seal_for(&eph_sk, &iv, recipient_pk, plaintext, info)
 }
 
 /// Seal with explicit ephemeral key and IV (deterministic, for test vectors).
+#[cfg(test)]
 fn ecies_seal(
     ephemeral_sk: &[u8; 32],
     iv: &[u8; IV_LEN],
     recipient_pk: &[u8; 32],
     plaintext: &[u8],
+) -> Result<EciesEnvelope, CryptoError> {
+    ecies_seal_for(ephemeral_sk, iv, recipient_pk, plaintext, HKDF_INFO)
+}
+
+/// Seal with an explicit ephemeral key and IV, under the wrapping key
+/// that `info` gives.
+fn ecies_seal_for(
+    ephemeral_sk: &[u8; 32],
+    iv: &[u8; IV_LEN],
+    recipient_pk: &[u8; 32],
+    plaintext: &[u8],
+    info: &[u8],
 ) -> Result<EciesEnvelope, CryptoError> {
     let eph_secret = StaticSecret::from(*ephemeral_sk);
     let eph_public = PublicKey::from(&eph_secret);
@@ -156,7 +208,7 @@ fn ecies_seal(
         ));
     }
 
-    let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
+    let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], info)?;
 
     let unbound = UnboundKey::new(&AES_256_GCM, &wrapping_key)
         .map_err(|_| CryptoError::EncryptionFailed("invalid wrapping key".into()))?;
@@ -186,6 +238,16 @@ pub fn ecies_decrypt(
     recipient_sk: &[u8; 32],
     envelope: &EciesEnvelope,
 ) -> Result<Vec<u8>, CryptoError> {
+    ecies_decrypt_for(recipient_sk, envelope, HKDF_INFO)
+}
+
+/// [`ecies_decrypt`] for one purpose: opens an envelope that was sealed
+/// under `info` ([`ecies_encrypt_for`]), and no other.
+pub fn ecies_decrypt_for(
+    recipient_sk: &[u8; 32],
+    envelope: &EciesEnvelope,
+    info: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let secret = StaticSecret::from(*recipient_sk);
     let eph_pk = PublicKey::from(envelope.ephemeral_pk);
 
@@ -199,7 +261,7 @@ pub fn ecies_decrypt(
         ));
     }
 
-    let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], HKDF_INFO)?;
+    let wrapping_key = hkdf_sha256(shared.as_bytes(), &[], info)?;
 
     let unbound =
         UnboundKey::new(&AES_256_GCM, &wrapping_key).map_err(|_| CryptoError::DecryptionFailed)?;
@@ -301,6 +363,29 @@ mod tests {
         );
     }
 
+    /// RFC 5869, test cases 1 and 3: key material that is not 32 bytes,
+    /// with a salt and with none. The first 32 bytes of each output.
+    #[test]
+    fn hkdf_from_key_material_of_any_length_gives_the_rfc_5869_vectors() {
+        let key_material = [0x0b_u8; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        assert_eq!(
+            hex::encode(hkdf_sha256_of(&key_material, &salt, &info).unwrap()),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+        assert_eq!(
+            hex::encode(hkdf_sha256_of(&key_material, &[], &[]).unwrap()),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+        );
+        // From 32 bytes it is the function that was here before.
+        let secret = [0x4a_u8; 32];
+        assert_eq!(
+            hkdf_sha256_of(&secret, &[], HKDF_INFO).unwrap(),
+            hkdf_sha256(&secret, &[], HKDF_INFO).unwrap()
+        );
+    }
+
     #[test]
     fn test_ecies_full_tv() {
         // Recipient: RFC 8032 TV1
@@ -362,6 +447,56 @@ mod tests {
         // Round-trip
         let decrypted = ecies_decrypt(&recipient_sk, &envelope).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// An envelope sealed for one purpose opens for that purpose, and for
+    /// no other: not for another purpose, and not as a general envelope.
+    /// The general sealing is what it was: under the key-wrap info.
+    #[test]
+    fn an_envelope_sealed_for_one_purpose_opens_for_no_other() {
+        let (sk, pk) = x25519_from_ed25519_seed(&[7u8; 32]);
+        let secret = [0x42u8; 32];
+        let purpose = b"one purpose, with a number 3";
+
+        let sealed = ecies_encrypt_for(&pk, &secret, purpose).unwrap();
+        assert_eq!(sealed.to_bytes().len(), 92);
+        assert_eq!(ecies_decrypt_for(&sk, &sealed, purpose).unwrap(), secret);
+        for other in [
+            &b"one purpose, with a number 4"[..],
+            b"one purpose",
+            b"",
+            HKDF_INFO,
+        ] {
+            assert!(matches!(
+                ecies_decrypt_for(&sk, &sealed, other),
+                Err(CryptoError::DecryptionFailed)
+            ));
+        }
+        assert!(matches!(
+            ecies_decrypt(&sk, &sealed),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        // And for nobody else under that purpose.
+        let (other_sk, _) = x25519_from_ed25519_seed(&[8u8; 32]);
+        assert!(ecies_decrypt_for(&other_sk, &sealed, purpose).is_err());
+
+        // A general envelope is no envelope for a purpose.
+        let general = ecies_encrypt(&pk, &secret).unwrap();
+        assert_eq!(ecies_decrypt(&sk, &general).unwrap(), secret);
+        assert!(ecies_decrypt_for(&sk, &general, purpose).is_err());
+        // It is sealed under the key-wrap info, as it always was: the two
+        // ways of sealing and of opening are one under that info.
+        assert_eq!(HKDF_INFO, b"cordelia-key-wrap-v1");
+        assert_eq!(
+            ecies_decrypt_for(&sk, &general, b"cordelia-key-wrap-v1").unwrap(),
+            secret
+        );
+        let under_it = ecies_encrypt_for(&pk, &secret, b"cordelia-key-wrap-v1").unwrap();
+        assert_eq!(ecies_decrypt(&sk, &under_it).unwrap(), secret);
+
+        // The same checks as the general one: a key of small order seals
+        // nothing.
+        assert!(ecies_encrypt_for(&[0u8; 32], &secret, purpose).is_err());
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub const WRITES_PER_PEER_PER_MINUTE: u32 = protocol::WRITES_PER_PEER_PER_MINUTE
 pub const WRITES_PER_CHANNEL_PER_MINUTE: u32 = protocol::WRITES_PER_CHANNEL_PER_MINUTE;
 pub const SYNCS_PER_PEER_PER_MINUTE: u32 = protocol::SYNCS_PER_PEER_PER_MINUTE;
 pub const PEER_SHARES_PER_PEER_PER_MINUTE: u32 = protocol::PEER_SHARES_PER_PEER_PER_MINUTE;
+pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = protocol::ENTRY_REQUESTS_PER_PEER_PER_MINUTE;
 
 /// Number of rate limit breaches before ban.
 pub const BAN_THRESHOLD: u32 = protocol::BAN_THRESHOLD;
@@ -167,6 +168,10 @@ pub struct PeerRateLimiter {
     pub fetch_bytes: ByteCounter,
     pub syncs: RateCounter,
     pub peer_shares: RateCounter,
+    /// Requests on the streams of entries of channels from their secrets
+    /// (decision 2026-10-04 §16): show, prove, pull, push and the stream
+    /// between relays, all counted together.
+    pub entry_requests: RateCounter,
     pub breach_count: u32,
     pub first_breach: Option<Instant>,
 }
@@ -201,6 +206,10 @@ impl PeerRateLimiter {
             ),
             syncs: RateCounter::new(minute, SYNCS_PER_PEER_PER_MINUTE * connections),
             peer_shares: RateCounter::new(minute, PEER_SHARES_PER_PEER_PER_MINUTE * connections),
+            entry_requests: RateCounter::new(
+                minute,
+                ENTRY_REQUESTS_PER_PEER_PER_MINUTE * connections,
+            ),
             breach_count: 0,
             first_breach: None,
         }
@@ -211,6 +220,7 @@ impl PeerRateLimiter {
         self.writes.count() == 0
             && self.syncs.count() == 0
             && self.peer_shares.count() == 0
+            && self.entry_requests.count() == 0
             && self.write_bytes.total() == 0
             && self.fetch_bytes.total() == 0
     }

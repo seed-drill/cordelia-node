@@ -31,8 +31,24 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# The recovery phrase, typed at a terminal, is in memory that is
+# overwritten.
+zeroize = { workspace = true }
+
+# The terminal that a command asks at: echo off while the recovery phrase
+# is typed, and the machine's name for a device's label. And the free room
+# on a volume, before a copy of the database is begun there (`fs`: a
+# feature of the same crate, which adds none to the build).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["termios", "stdio", "system", "process", "fs"] }
+
+# A process that holds a recovery phrase denies that it be attached to.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A terminal of a test's own, to run a command at as a person does.
+rustix = { version = "1", features = ["pty"] }
 # A clock that tests can run ahead, for the waits in a node's stopping.
 tokio = { workspace = true, features = ["test-util"] }

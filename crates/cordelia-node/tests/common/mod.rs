@@ -81,6 +81,16 @@ impl Node {
     /// [`Self::binary`], given the names of the variables it would
     /// inherit: the environment's, except in the test of this.
     pub fn binary_given(&self, inherited: impl Iterator<Item = std::ffi::OsString>) -> Command {
+        self.binary_at(&self.config(), inherited)
+    }
+
+    /// [`Self::binary_given`], told to use the configuration at `config`
+    /// in the place of this node's own.
+    fn binary_at(
+        &self,
+        config: &std::path::Path,
+        inherited: impl Iterator<Item = std::ffi::OsString>,
+    ) -> Command {
         let mut command = Command::new(BIN);
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
@@ -95,7 +105,7 @@ impl Node {
         }
         command
             .arg("--config")
-            .arg(self.config())
+            .arg(config)
             .env("CORDELIA_DATA_DIR", self.data_dir())
             .env("HOME", self.home());
         command
@@ -148,6 +158,139 @@ impl Node {
             String::from_utf8_lossy(&out.stdout)
         );
         String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Run a CLI command against this node at a terminal of its own, as
+    /// a person runs it: what it says is read, and what a person types
+    /// is typed, through [`AtTerminal`].
+    ///
+    /// A command that asks a yes, or the recovery phrase, asks at a
+    /// terminal, and refuses where its input is not one (decision
+    /// 2026-10-04 §5). A program that has a shell can give a command a
+    /// terminal, and this does.
+    pub fn at_terminal(&self, args: &[&str]) -> AtTerminal {
+        AtTerminal::running(self.name, self.binary(), args)
+    }
+
+    /// Run a CLI command against this node with a terminal for its input,
+    /// and with what it writes sent down a pipe, as `cordelia phrase |
+    /// tee log` runs it. It is given twenty seconds to end by itself, and
+    /// is stopped then: whether it ended by itself and succeeded, and
+    /// what it wrote to its output and to its errors.
+    pub fn at_terminal_into_a_pipe(&self, args: &[&str]) -> (Option<bool>, String, String) {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        use std::io::Read;
+        let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
+        grantpt(&ours).unwrap();
+        unlockpt(&ours).unwrap();
+        let theirs = ptsname(&ours, Vec::new()).unwrap();
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(theirs.to_str().unwrap())
+            .unwrap();
+        let mut child = self
+            .binary()
+            .args(args)
+            .stdin(input)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reads = |mut from: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut said = Vec::new();
+                let _ = from.read_to_end(&mut said);
+                String::from_utf8_lossy(&said).into_owned()
+            })
+        };
+        let out = reads(Box::new(child.stdout.take().unwrap()));
+        let err = reads(Box::new(child.stderr.take().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let ended = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status.success()),
+                None if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        drop(ours);
+        (ended, out.join().unwrap(), err.join().unwrap())
+    }
+
+    /// [`Self::at_terminal`], for a command that reaches this node's API
+    /// at `port` on this machine, and not at the node's own port: where
+    /// a test listens there, and passes on what it is sent. The command
+    /// is given a copy of the node's configuration that differs in that
+    /// port, and in nothing else.
+    pub fn at_terminal_through(&self, port: u16, args: &[&str]) -> AtTerminal {
+        let own = std::fs::read_to_string(self.config()).unwrap();
+        let through = own.replace(
+            &format!("http_port = {}", self.http),
+            &format!("http_port = {port}"),
+        );
+        assert_ne!(own, through);
+        let config = self.dir.path().join("config-through.toml");
+        std::fs::write(&config, through).unwrap();
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
+    }
+
+    /// Start a second node on this node's data directory, with ports of
+    /// its own: it is given a copy of the node's configuration that
+    /// differs in its two ports, and in nothing else. It is given thirty
+    /// seconds to end by itself, and is stopped then: whether it ended
+    /// by itself and succeeded, and what it wrote. Its relays are this
+    /// node's, which are on this machine.
+    pub fn second_on_its_data_dir(&self) -> (Option<bool>, String) {
+        for host in self.will_dial() {
+            assert_on_this_machine(self.name, &host);
+        }
+        let (http, p2p) = (free_port(), free_port());
+        let own = std::fs::read_to_string(self.config()).unwrap();
+        let second = own
+            .replace(
+                &format!("http_port = {}", self.http),
+                &format!("http_port = {http}"),
+            )
+            .replace(
+                &format!("p2p_port = {}", self.p2p),
+                &format!("p2p_port = {p2p}"),
+            )
+            .replace(
+                &format!("listen_addr = \"0.0.0.0:{}\"", self.p2p),
+                &format!("listen_addr = \"0.0.0.0:{p2p}\""),
+            );
+        assert_ne!(own, second);
+        let config = self.dir.path().join("config-second.toml");
+        std::fs::write(&config, second).unwrap();
+        let log_path = self.dir.path().join("second.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        let mut child = self
+            .binary_at(&config, inherited)
+            .arg("start")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let ended = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break Some(status.success()),
+                None if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        (ended, std::fs::read_to_string(log_path).unwrap_or_default())
     }
 
     /// This node's stand-in home directory (for the sync adapter): a real
@@ -312,6 +455,25 @@ impl Node {
         resp.body_mut().read_json().unwrap()
     }
 
+    /// POST `body` to the node's API with its token, as any program that
+    /// holds the token can, and give back what it answered whether or
+    /// not it refused: the HTTP status, and the answer.
+    pub fn post_told(&self, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        let url = format!("http://127.0.0.1:{}{path}", self.http);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut resp = agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", self.token()))
+            .send_json(body)
+            .unwrap_or_else(|e| panic!("{}: POST {path} failed: {e}", self.name));
+        let status = resp.status().as_u16();
+        (status, resp.body_mut().read_json().unwrap_or_default())
+    }
+
     /// Set `max_storage_bytes` for this node, before it is started: the
     /// most a relay's database may hold.
     pub fn max_storage_bytes(&self, bytes: u64) {
@@ -324,6 +486,29 @@ impl Node {
             format!("{before}max_storage_bytes = {bytes}\n\n[network]{after}"),
         )
         .unwrap();
+    }
+
+    /// How often this node's governor ticks, in seconds, for before the
+    /// node starts: at each tick it looks at its connections again.
+    pub fn governor_tick_secs(&self, secs: u64) {
+        let config = std::fs::read_to_string(self.config()).unwrap();
+        let ticks = "tick_interval_secs = 2\n";
+        assert_eq!(config.matches(ticks).count(), 1, "{config}");
+        let ticks_now = format!("tick_interval_secs = {secs}\n");
+        std::fs::write(self.config(), config.replace(ticks, &ticks_now)).unwrap();
+    }
+
+    /// The most channels whose keys one connection proves, for before
+    /// the node starts: what a relay remembers for a connection, and what
+    /// a device sends on one. A test gives a relay and its devices one
+    /// number.
+    pub fn proofs_on_a_connection(&self, most: usize) {
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        assert!(!config.contains("[limits]"), "{config}");
+        config.push_str(&format!(
+            "\n[limits]\nchannels_proved_on_a_connection = {most}\n"
+        ));
+        std::fs::write(self.config(), config).unwrap();
     }
 
     /// How long this relay waits before it asks a device again which
@@ -388,15 +573,33 @@ pub fn node(name: &'static str, role: &str, relay_p2p: Option<u16>) -> Node {
 /// channels behind. So no test node is ever left with none.
 pub const NOWHERE: &str = "127.0.0.1:9";
 
+/// A relay's name under which nothing can be looked up, on any machine:
+/// it has no port, and a name with none is refused where it is read,
+/// before any lookup is made. A test gives a node this relay where it
+/// needs one whose name does not resolve: the node is set up with it, and
+/// dials nothing for it.
+pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve";
+
 /// A test node dials nothing that is not on this machine, whatever a test
 /// gives it: a loopback address with its port, read as the node first
 /// reads what it is given (so `[::1]:9474` is one, and `[127.0.0.1]:9`,
 /// which the node would take for a name, is not); or `localhost` where
 /// the machine's own resolver gives that name loopback addresses and no
 /// other. No other name is looked up to find out, so none passes,
-/// wherever it leads.
+/// wherever it leads: but for [`NO_SUCH_NAME`], under which nothing can
+/// be looked up, and which so leads nowhere.
 pub fn assert_on_this_machine(name: &str, addr: &str) {
     use std::net::{SocketAddr, ToSocketAddrs};
+    if addr == NO_SUCH_NAME {
+        // It has no port: it is refused as no address, with no lookup.
+        let read = addr.to_socket_addrs().map(|_| ());
+        let no_address = matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::InvalidInput);
+        assert!(
+            !addr.contains(':') && no_address,
+            "the test node {name} was given {addr}, under which something could be looked up"
+        );
+        return;
+    }
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
     let here = match addr.parse::<SocketAddr>() {
         Ok(literal) => literal.ip().is_loopback(),
@@ -526,6 +729,266 @@ level = "debug"
     n
 }
 
+/// A command that runs at a terminal of its own: a pseudo-terminal,
+/// whose other end the test holds. What the command says is read from
+/// that end, and what a person would type is written to it.
+pub struct AtTerminal {
+    name: &'static str,
+    args: String,
+    child: Child,
+    /// The test's end of the terminal, to type at.
+    types: std::fs::File,
+    /// What the command says, as it arrives.
+    reads: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Everything it has said so far, and what was typed where the
+    /// terminal showed it.
+    pub said: String,
+    /// How far into `said` what was waited for has been found.
+    found_to: usize,
+}
+
+/// What came of waiting for more of what a command says at its terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// Something more.
+    More,
+    /// Nothing in the time that was waited.
+    Nothing,
+    /// Nothing, and nothing more can come: the command's end of the
+    /// terminal is closed, which it is once the command has ended, and
+    /// everything that was written there has been taken in.
+    All,
+}
+
+impl AtTerminal {
+    fn running(name: &'static str, mut command: Command, args: &[&str]) -> Self {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
+        grantpt(&ours).unwrap();
+        unlockpt(&ours).unwrap();
+        let theirs = ptsname(&ours, Vec::new()).unwrap();
+        let theirs = std::path::PathBuf::from(theirs.to_str().unwrap());
+        let end = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&theirs)
+                .unwrap()
+        };
+        let child = command
+            .args(args)
+            .stdin(end())
+            .stdout(end())
+            .stderr(end())
+            .spawn()
+            .unwrap();
+        // The command holds its end, and the test none of it: when the
+        // command ends, there is nothing more to read.
+        drop(command);
+        let ours = std::fs::File::from(ours);
+        let mut reads_from = ours.try_clone().unwrap();
+        let (tx, reads) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reads_from.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            name,
+            args: args.join(" "),
+            child,
+            types: ours,
+            reads,
+            said: String::new(),
+            found_to: 0,
+        }
+    }
+
+    /// The process that the command runs in, as the system numbers it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Take in what the command has said since, waiting up to `wait` for
+    /// more. Says whether anything came, and where nothing did, whether
+    /// anything more can come ([`Heard`]).
+    fn hears(&mut self, wait: Duration) -> Heard {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.reads.recv_timeout(wait) {
+            Ok(bytes) => {
+                self.said.push_str(&String::from_utf8_lossy(&bytes));
+                Heard::More
+            }
+            Err(RecvTimeoutError::Timeout) => Heard::Nothing,
+            Err(RecvTimeoutError::Disconnected) => Heard::All,
+        }
+    }
+
+    /// Wait until the command has said `what`, after whatever was waited
+    /// for before. Fails, with everything it said, where three minutes
+    /// go by first, or the command has ended without saying it.
+    ///
+    /// **A command that has ended has said nothing more only once its
+    /// end of the terminal is closed and everything it wrote there was
+    /// taken in** ([`Heard::All`]). This waits for that, and for no
+    /// length of silence: on a loaded machine what a command said last
+    /// can arrive after the command has ended.
+    pub fn says(&mut self, what: &str) -> &mut Self {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if let Some(at) = self.said[self.found_to..].find(what) {
+                self.found_to += at + what.len();
+                return self;
+            }
+            let no_more = self.hears(Duration::from_millis(200)) == Heard::All;
+            if no_more || Instant::now() > deadline {
+                panic!(
+                    "{}: cordelia {} did not say {what:?}. It said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+        }
+    }
+
+    /// Go on reading what the command says for `long`, and give back
+    /// everything it has said so far.
+    pub fn hears_for(&mut self, long: Duration) -> &str {
+        let until = Instant::now() + long;
+        while Instant::now() < until {
+            // Nothing more can come: the rest of the time is waited out.
+            if self.hears(Duration::from_millis(100)) == Heard::All {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        &self.said
+    }
+
+    /// Type `line` and press Enter, as a person does.
+    pub fn types(&mut self, line: &str) -> &mut Self {
+        use std::io::Write;
+        // A moment, as a person takes: the command has set the terminal
+        // as it wants it for this answer by then.
+        std::thread::sleep(Duration::from_millis(150));
+        self.types
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        self.types.flush().unwrap();
+        self
+    }
+
+    /// Press keys that are no line: `bytes` go to the terminal as they
+    /// are, with no Enter after them.
+    pub fn presses(&mut self, bytes: &[u8]) -> &mut Self {
+        use std::io::Write;
+        std::thread::sleep(Duration::from_millis(150));
+        self.types.write_all(bytes).unwrap();
+        self.types.flush().unwrap();
+        self
+    }
+
+    /// Whether the terminal shows what is typed, and makes signals of the
+    /// keys that are for them (Ctrl-C among them): as a terminal is that
+    /// no program has set otherwise.
+    pub fn is_as_it_was(&self) -> (bool, bool) {
+        use rustix::termios::{LocalModes, tcgetattr};
+        let set = tcgetattr(&self.types).expect("the terminal says how it is set");
+        (
+            set.local_modes.contains(LocalModes::ECHO),
+            set.local_modes.contains(LocalModes::ISIG),
+        )
+    }
+
+    /// End the input, as Ctrl-D does at the start of a line.
+    pub fn ends_the_input(&mut self) -> &mut Self {
+        self.presses(&[0x04])
+    }
+
+    /// Wait for the command to end: whether it succeeded, and everything
+    /// that its terminal showed. Fails where it does not end in five
+    /// minutes.
+    pub fn ends(self) -> (bool, String) {
+        self.ends_within(Duration::from_secs(300))
+    }
+
+    /// [`Self::ends`], for a command that must end within `long`.
+    pub fn ends_within(mut self, long: Duration) -> (bool, String) {
+        let deadline = Instant::now() + long;
+        let status = loop {
+            let heard = self.hears(Duration::from_millis(100));
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!(
+                    "{}: cordelia {} did not end. It said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+            // Its end of the terminal is closed, and it has not ended
+            // yet: it is asked again in a moment.
+            if heard == Heard::All {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Everything that it said, to the end: the command has ended, so
+        // its end of the terminal is closed, and what it wrote there is
+        // read up to that. This waits for that, and for no length of
+        // silence: on a loaded machine what a command said last can
+        // arrive after the command has ended, and whoever looks at what
+        // it said would not find its last lines. It is given as long
+        // again, at most: it takes a moment.
+        let all_by = Instant::now() + long;
+        while self.hears(Duration::from_millis(200)) != Heard::All {
+            if Instant::now() > all_by {
+                panic!(
+                    "{}: cordelia {} ended, and its terminal was not read to its end. It \
+                     said:\n{}",
+                    self.name, self.args, self.said
+                );
+            }
+        }
+        (status.success(), std::mem::take(&mut self.said))
+    }
+
+    /// [`Self::ends`], for a command that must succeed: what it said.
+    pub fn done(self) -> String {
+        let (name, args) = (self.name, self.args.clone());
+        let (success, said) = self.ends();
+        assert!(success, "{name}: cordelia {args} failed:\n{said}");
+        said
+    }
+
+    /// [`Self::ends`], for a command that must be refused: what it said.
+    pub fn refused(self) -> String {
+        self.refused_within(Duration::from_secs(300))
+    }
+
+    /// [`Self::refused`], for a command that must be refused with nothing
+    /// typed: it ends within `long`. One that asks something would wait
+    /// for an answer, and is not waited for longer.
+    pub fn refused_within(self, long: Duration) -> String {
+        let (name, args) = (self.name, self.args.clone());
+        let (success, said) = self.ends_within(long);
+        assert!(
+            !success,
+            "{name}: cordelia {args} should have been refused:\n{said}"
+        );
+        said
+    }
+}
+
+impl Drop for AtTerminal {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Poll `check` until it returns Some, or fail with every node's log tail.
 pub fn wait_for<T>(
     what: &str,
@@ -549,7 +1012,22 @@ pub fn wait_for<T>(
     }
 }
 
+/// Whether the node answers, and is not in the middle of the copy of its
+/// first start on this version. A node answers from the moment its port
+/// is bound, while that copy is still being made (decision 2026-10-04
+/// §10.1): a test that goes on from here finds the node as its start
+/// leaves it. ([`answers`] is the first half alone.)
 pub fn healthy(n: &Node) -> Option<()> {
+    answers(n)?;
+    let status = n.get("/api/v1/status")?;
+    let under_way = status["held"]["why"]
+        .as_str()
+        .is_some_and(|why| why.contains("is under way"));
+    (!under_way).then_some(())
+}
+
+/// Whether the node answers at all.
+pub fn answers(n: &Node) -> Option<()> {
     let url = format!("http://127.0.0.1:{}/api/v1/health", n.http);
     direct().get(&url).call().ok().map(|_| ())
 }
@@ -566,35 +1044,183 @@ pub fn has_hot_peer(n: &Node) -> Option<()> {
     (status["peers_hot"].as_u64()? >= 1).then_some(())
 }
 
-/// Pair `b` with `a` as the documented flow does, one key copied in each
-/// direction; `a` labels `b` with `label`. Returns the personal channel,
-/// once `b` has joined it.
-pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> String {
-    let b_key = b.cli(&["id"]).trim().to_string();
-    let added = a.cli(&["add-device", &b_key, "--name", label]);
-    let a_key = added
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("cordelia accept "))
-        .unwrap_or_else(|| panic!("add-device output lacks the accept line:\n{added}"))
-        .to_string();
-    b.cli(&["accept", &a_key]);
-    let personal = groups(a)
-        .into_iter()
-        .next()
-        .expect("a has a personal channel");
-    wait_for("b joins a's personal channel", all, 90, || {
-        groups(b).contains(&personal).then_some(())
-    });
-    personal
+/// A relay of the test's own, started.
+pub fn relay_started() -> Node {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    relay
 }
 
-pub fn groups(n: &Node) -> Vec<String> {
-    n.post("/api/v1/channels/list-groups", serde_json::json!({}))["groups"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|g| g["channel_id"].as_str().map(String::from))
-        .collect()
+/// A device whose one relay is `relay`, started, and connected to it.
+pub fn device_started(name: &'static str, relay: &Node) -> Node {
+    let mut device = node(name, "personal", Some(relay.p2p));
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("device reaches its relay", &[&device, relay], 60, || {
+        has_hot_peer(&device)
+    });
+    device
+}
+
+pub fn key_of(node: &Node) -> String {
+    node.cli(&["id"]).trim().to_string()
+}
+
+// ── Commands, as a person runs them ──────────────────────────────────
+
+/// The twelve words that `cordelia phrase` showed, read off its
+/// terminal.
+pub fn words_shown(said: &str) -> String {
+    let after = said
+        .split("shown once:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no phrase was shown:\n{said}"));
+    let words = after
+        .lines()
+        .map(str::trim)
+        .find(|line| line.split_whitespace().count() == 12)
+        .unwrap_or_else(|| panic!("no twelve words were shown:\n{said}"));
+    words.to_string()
+}
+
+/// `cordelia phrase` on a device that follows none: the words are read
+/// off the terminal, as a person writes them down, and typed back.
+/// Returns the words.
+pub fn makes_a_phrase(device: &Node, label: &str) -> String {
+    let mut at = device.at_terminal(&["phrase", "--name", label]);
+    at.says("Press Enter when they are written down");
+    let words = words_shown(&at.said);
+    at.types("");
+    at.says("Type the twelve words back");
+    at.types(&words);
+    let said = at.done();
+    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    words
+}
+
+/// `cordelia add-device` on `adder`, for `new` under `label`, and
+/// `cordelia accept` on `new`, each with its yes. Returns what each said.
+pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
+    let mut at = adder.at_terminal(&["add-device", &key_of(new), "--name", label]);
+    at.says("Type yes to go on").types("yes");
+    let added = at.done();
+    let accept = added
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("cordelia accept "))
+        .unwrap_or_else(|| panic!("add-device printed no accept line:\n{added}"))
+        .trim()
+        .to_string();
+    assert_eq!(accept, key_of(adder));
+    let mut at = new.at_terminal(&["accept", &accept]);
+    at.says("Type yes to go on").types("yes");
+    let accepted = became_of_the_key(new, &accept, at.done());
+    (added, accepted)
+}
+
+/// What became of a key typed at `cordelia accept` on `device`, given
+/// what the command said: where the command ended with nothing taken yet
+/// (it stays a minute, and the node goes on asking for the rest of the
+/// hour), this waits until the node says that a hand-over was read with
+/// the key, and gives back what the command said with what the node says
+/// became of it. It waits for that state, and for no length of time: on
+/// a loaded machine a hand-over can arrive after the command has ended,
+/// and a test that went on at once would go on before the device stands
+/// where the test takes it to stand.
+pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
+    if !said.contains("Nothing was taken yet") {
+        return said;
+    }
+    let became = wait_for(
+        "a hand-over is read with the key typed at accept",
+        &[device],
+        600,
+        || {
+            let seen = person_of(device);
+            let of_the_key = seen["accepting"]
+                .as_array()?
+                .iter()
+                .find(|typed| typed["key"] == key)?
+                .clone();
+            let became = of_the_key["said"].as_str().unwrap_or_default().to_string();
+            (of_the_key["taken"] == true || !became.is_empty()).then_some(became)
+        },
+    );
+    format!("{said}\n{became}.")
+}
+
+/// `cordelia remove-device` on `device`, for the device whose key is
+/// `key`, at a terminal: of each other device added since the last
+/// change, in the order it is asked, the answer in `answers` (`stays` or
+/// `removed`); then the yes, and the recovery phrase `words`. Returns the
+/// command, still running, after the phrase was typed: whoever calls this
+/// reads on (it says that the change is made, and then stays and says
+/// what is still missing), or drops the terminal.
+pub fn removes(device: &Node, key: &str, answers: &[&str], words: &str) -> AtTerminal {
+    let mut at = device.at_terminal(&["remove-device", key]);
+    changes(&mut at, answers, words);
+    at
+}
+
+/// `cordelia renew` on `device`, at a terminal, as [`removes`] is.
+pub fn renews(device: &Node, answers: &[&str], words: &str) -> AtTerminal {
+    let mut at = device.at_terminal(&["renew"]);
+    changes(&mut at, answers, words);
+    at
+}
+
+/// Answer a command that makes a change: of each device it asks about,
+/// then its yes, then the phrase.
+fn changes(at: &mut AtTerminal, answers: &[&str], words: &str) {
+    for answer in answers {
+        at.says("Type `stays` or `removed`").types(answer);
+    }
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words").types(words);
+}
+
+/// What the node says of its device and its person
+/// (`POST /api/v1/devices/list`).
+pub fn person_of(node: &Node) -> serde_json::Value {
+    node.post("/api/v1/devices/list", serde_json::json!({}))
+}
+
+/// Wait until `device` has applied change `number`.
+pub fn has_applied(device: &Node, number: u64, all: &[&Node]) {
+    wait_for("the device applies the change", all, 90, || {
+        (person_of(device)["change"].as_u64() == Some(number)).then_some(())
+    });
+}
+
+/// Make `a` and `b` two devices of one person, as the documented flow
+/// does (decision 2026-10-04 §5.2, §6): `a` makes a recovery phrase where
+/// it follows none yet, `cordelia add-device` on `a` and `cordelia accept`
+/// on `b`, each at a terminal with its yes; `a` labels `b` with `label`.
+/// It comes back once `b` has joined: it follows `a`'s phrase and has
+/// applied its change. Returns the twelve words where `a` made a phrase
+/// here.
+pub fn pair(a: &Node, b: &Node, label: &str, all: &[&Node]) -> Option<String> {
+    let words = (person_of(a)["state"] == "no_phrase").then(|| makes_a_phrase(a, "desktop"));
+    adds(a, b, label);
+    let change = person_of(a)["change"]
+        .as_u64()
+        .expect("a has applied a change");
+    has_applied(b, change, all);
+    words
+}
+
+/// A person clears, at a terminal and with a yes, the one thing that `n`
+/// has to tell them (`cordelia devices --clear`): after a device was
+/// added, each device tells of it until it is cleared there, and the
+/// status line is amber meanwhile (decision 2026-10-04 §10.1).
+pub fn clears_what_it_tells(n: &Node) {
+    let told = person_of(n)["notices"].as_array().map_or(0, Vec::len);
+    assert_eq!(told, 1, "{}: one thing to clear", n.name);
+    let mut at = n.at_terminal(&["devices", "--clear"]);
+    at.says("Type yes to go on").types("yes");
+    assert!(at.done().contains("Cleared on this device."));
 }
 
 /// The folder Claude Code keeps for a session started in `dir`.
@@ -635,4 +1261,148 @@ pub fn relays_of(n: &Node) -> Vec<serde_json::Value> {
         .ok()
         .and_then(|v| v["relays"].as_array().cloned())
         .unwrap_or_default()
+}
+
+// ── What a test of a recovery phrase searches ───────────────────────
+
+/// A phrase of twelve words that are words of nothing this program
+/// says, so that a search for any one of them finds only the phrase.
+pub fn a_phrase_of_words_that_nothing_else_says() -> String {
+    let first = [
+        "giraffe", "kangaroo", "squirrel", "dolphin", "elephant", "lobster", "mushroom", "pumpkin",
+        "sausage", "walnut", "banana",
+    ];
+    let last = [
+        "cactus", "coconut", "dinosaur", "gorilla", "hamster", "lizard", "monkey", "oyster",
+        "pelican", "pigeon", "rabbit", "raccoon", "salmon", "spider", "turkey", "turtle", "tomato",
+        "potato", "peanut", "pepper", "noodle", "muffin", "garlic", "ginger", "cherry", "cereal",
+        "butter", "bamboo", "avocado", "tornado", "volcano", "umbrella", "trumpet", "violin",
+        "guitar",
+    ];
+    // The last word carries the checksum: one in sixteen fits.
+    last.iter()
+        .map(|last| format!("{} {last}", first.join(" ")))
+        .find(|words| cordelia_crypto::phrase::Phrase::parse(words).is_ok())
+        .expect("one of these words ends a phrase that begins with those")
+}
+
+/// Everything that is sent to a port on this machine is passed on to
+/// another, and kept: for a test that reads what a node was sent.
+pub struct PassesOn {
+    pub port: u16,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl PassesOn {
+    pub fn to(port: u16) -> Self {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let at = listener.local_addr().unwrap().port();
+        let kept = sent.clone();
+        std::thread::spawn(move || {
+            for from in listener.incoming().flatten() {
+                let Ok(to) = TcpStream::connect(("127.0.0.1", port)) else {
+                    continue;
+                };
+                let (mut asks, mut node) = (from.try_clone().unwrap(), to.try_clone().unwrap());
+                let kept = kept.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = asks.read(&mut buf) {
+                        if n == 0 || node.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        kept.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                    let _ = node.shutdown(Shutdown::Write);
+                });
+                let (mut node, mut asks) = (to, from);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = node.read(&mut buf) {
+                        if n == 0 || asks.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = asks.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        Self { port: at, sent }
+    }
+
+    /// The body of each request that was POSTed to `path` through here,
+    /// as JSON, in the order they were sent: what a program that sees
+    /// the requests cross to the node has seen of them.
+    pub fn bodies(&self, path: &str) -> Vec<serde_json::Value> {
+        let sent = self.sent();
+        let text = String::from_utf8_lossy(&sent).to_string();
+        let asked = format!("POST {path} HTTP/1.1\r\n");
+        let mut bodies = Vec::new();
+        for (at, _) in text.match_indices(&asked) {
+            let request = &text[at..];
+            let Some((head, rest)) = request.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            });
+            let body = length.and_then(|length| rest.get(..length));
+            bodies.extend(body.and_then(|body| serde_json::from_str(body).ok()));
+        }
+        bodies
+    }
+
+    pub fn sent(&self) -> Vec<u8> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// Every file under `dir`, with its bytes.
+pub fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            found.push((path, bytes));
+        }
+    }
+    found
+}
+
+/// The words in `bytes`: each run of letters, in lower case.
+pub fn words_in(bytes: &[u8]) -> std::collections::HashSet<String> {
+    bytes
+        .split(|byte| !byte.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).to_lowercase())
+        .collect()
+}
+
+/// Two words of `phrase` that follow one another there and stand one
+/// after the other in `bytes`, where there are two.
+///
+/// It is what is asked of what a terminal showed: the terminal shows the
+/// first words of keys' fingerprints, which are from the list that a
+/// phrase's words are from, and one of them can be a word of the phrase
+/// by chance. Two in a row are not.
+pub fn two_words_in_a_row(bytes: &[u8], phrase: &[&str]) -> Option<(String, String)> {
+    let said: Vec<String> = bytes
+        .split(|byte| !byte.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).to_lowercase())
+        .collect();
+    said.windows(2)
+        .find(|pair| {
+            phrase
+                .windows(2)
+                .any(|two| two[0] == pair[0] && two[1] == pair[1])
+        })
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
 }

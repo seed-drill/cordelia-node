@@ -7,9 +7,26 @@
 **Implements**: WP3 (Pub/Sub API network layer), WP12 (Bootnode DNS)
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md
 
-> **v1 status (2026-09-30).** Transport, framing, handshake, keep-alive,
-> peer-sharing, channel-announce, the governor and relay forwarding stand.
-> Changes, per the [decision record](../decisions/2026-09-30-agent-memory-sync.md) §4.3 and §4.4a:
+> **v1 status.** Transport, framing, handshake, keep-alive, peer-sharing, the
+> governor and relay forwarding stand. Two kinds of channel travel:
+>
+> - **A channel from its secret,** on five streams of its own, `0x10` to
+>   `0x14` (§4.9), per the
+>   [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)
+>   §2.4. Every channel of a person's own is of this kind. These streams run
+>   between a device and a relay, and between relays that work together, and
+>   nowhere else.
+> - **The older kind,** on Channel-Announce, Item-Sync and Item-Push (§4.4 to
+>   §4.6, §6, §7), per the
+>   [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)
+>   §4.3 and §4.4a. **Relays carry it, for one version more. A personal node
+>   carries none of it** (decision 2026-10-04 §10): it pushes no item of that
+>   kind, fetches and announces no channel of it, answers an Item-Sync with
+>   nothing, and refuses an Item-Push and a Channel-Announce. A device that is
+>   still on the version before goes on in the older channels through the
+>   relays.
+>
+> For the older kind, as a relay carries it:
 >
 > - **Swarm (§8.2.2) is not part of v1.** A node makes no swarm channel, removes
 >   one that an earlier version made when it starts, tells no peer a channel ID
@@ -23,16 +40,22 @@
 >   tombstones. `SyncRequest` gains optional `after_seq` and `SyncResponse`
 >   optional `last_seq`, for paging in arrival order; peers that omit them get
 >   the `since` behaviour.
-> - **Item-Push (0x06).** A personal node pushes its own new items to one relay
->   from an outbox, at most every 2 s, and marks them relayed when the relay
->   acknowledges them.
+> - **Item-Push (0x06).** A node that writes items of this kind pushes its own
+>   new ones to one relay from an outbox, at most every 2 s, and marks them
+>   relayed when the relay acknowledges them.
 > - **PSK-Exchange (0x07)** is deferred and **Pairing (§4.8)** is dropped. Keys
->   travel as sealed channel states in inbox channels (decision §4.1).
+>   of the older kind travel as sealed channel states in inbox channels
+>   (decision 2026-09-30 §4.1). A channel from its secret has no key to hand
+>   over for each channel: a device is added by a hand-over in a pair channel
+>   (decision 2026-10-04 §6), which is an entry like any other (§4.9).
 > - **Secret keepers (§8.5)** are deferred. The bootnodes (§8.3, §10) are the
 >   two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`
 >   (`FALLBACK_PEERS`).
 > - Specs this one cites that are now archived (`sdk-api-reference.md`, the
 >   identity ADR) are in [`docs/archive/`](../archive/README.md).
+>
+> The TLA+ model (`network-protocol.tla`) is of the governor and of the
+> replication of items (§4.4 to §4.6). It has no model of §4.9.
 
 ---
 
@@ -228,8 +251,17 @@ The first byte of each new QUIC stream identifies the mini-protocol:
 | `0x07` | PSK-Exchange | Request-Response | §4.7 |
 | `0x08` | Pairing | Request-Response | §4.8 |
 | `0x09` | RouteACK | Sender-initiated (push) | §7.4 |
+| `0x10` | Entry-Show | Request-Response | §4.9.2 |
+| `0x11` | Channel-Prove | Request-Response | §4.9.1 |
+| `0x12` | Entry-Pull | Request-Response (pull) | §4.9.3 |
+| `0x13` | Entry-Push | Request-Response (push) | §4.9.4 |
+| `0x14` | Relay-Entries | Request-Response, between relays that work together | §4.9.5 |
 
 Stream lifecycle: the initiator opens a bidirectional QUIC stream, writes the protocol byte, then the first message. The responder reads the protocol byte to determine the handler. Unknown protocol bytes (0x0A+) cause the stream to be reset with application error code `0x02` (unknown protocol).
+
+> **v1 status.** `0x10` to `0x14` are the streams of a channel from its secret
+> (§4.9). They begin at `0x10`, apart from the streams of the older kind, so
+> that neither is read as the other. Only a relay serves them.
 
 ---
 
@@ -849,6 +881,465 @@ Pairing codes are single-use. Bootnodes delete the registration after one succes
 
 ---
 
+### 4.9 Entries of a Channel From Its Secret (0x10 to 0x14)
+
+Five streams carry the channels of the
+[decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)
+(§2.4 there): a channel is a secret, its ID is a public key derived from that
+secret, and every entry is signed by its author and by the channel's key. A
+relay needs no list of members and no state of a channel to serve them.
+
+| Byte | Stream | Who opens it | What it carries |
+|------|--------|--------------|-----------------|
+| `0x10` | Entry-Show | A device, to a relay | One entry shown, whole or in short; the answer says what the relay holds |
+| `0x11` | Channel-Prove | A device, to a relay | A proof that the connection holds a channel's key |
+| `0x12` | Entry-Pull | A device, to a relay | A request for a page of a channel proved on this connection |
+| `0x13` | Entry-Push | A device, to a relay | Entries to be stored |
+| `0x14` | Relay-Entries | A relay, to a relay its operator lists | Which channels it holds, a page of one without the proof, and entries passed on |
+
+They begin at `0x10`, apart from the streams of the older kind. A peer that
+does not know them refuses the stream, and reads none of them as one of its
+own. Nothing of §4.1 to §4.8 is changed by them.
+
+**Only a relay serves them.** A personal node and a bootnode answer none of
+the five. In this version these channels travel between a device and a relay,
+and between relays that work together, and nowhere else: a connection between
+two personal nodes carries nothing of them (decision §4.6).
+
+**One request on a stream, and one answer.** The opener writes the protocol
+byte and one framed message (§3.1); the receiver writes one framed message
+back. A relay serves these streams to peers that are Warm or Hot (§5.4.2).
+
+**An entry travels as its bytes** (data-formats.md §9.2), inside a CBOR byte
+string: 237 bytes and its content. Whoever receives one reads it strictly and
+checks both signatures before it does anything else with it. A channel's ID
+is 32 bytes and a proof 64: a message that holds one of another length is not
+read.
+
+#### 4.9.1 The Proof (0x11)
+
+A relay hands a channel's entries only to a connection that has proved it
+holds the channel's key (decision §2.4, item 3).
+
+```
+ChannelProve {
+    channel: bytes(32)          // The channel's ID
+    proof:   bytes(64)          // Signature by the channel's signing key
+}
+
+ChannelProved {
+    proved:  bool               // Yes: the proof holds, and the relay holds the channel
+}
+```
+
+The proof is an Ed25519 signature by the channel's signing key over:
+
+```
+"cordelia v2 proof"       the proof's own label
+session's value     32    what both ends export from this one TLS session
+prover's key        32    the node key of the end that proves
+channel's ID        32
+```
+
+- **The session's value** is 32 bytes of keying material that both ends
+  export from the connection's TLS session (RFC 8446 §7.5), under the label
+  `EXPORTER-cordelia v2 session` with no context. The two ends of one
+  connection get the same bytes, and no other connection gets them. So a
+  proof cannot be replayed on another connection or later, and it needs no
+  clock.
+- **The prover's key is in what is signed** because both ends export the
+  same value: without it, a proof sent back to the end that made it would
+  hold there. It is not in the message. The relay takes it from the
+  certificate that the peer presented (§2.2), and from nothing the peer says.
+- **The signature is checked before the channel is looked up.** A channel
+  that the relay does not hold and a proof that fails are answered alike:
+  `proved: false`. A relay tells nobody which channels it holds, the relays
+  it works with aside (§4.9.5).
+- **A relay remembers a proof that held** for as long as the connection
+  lasts, whether or not it held the channel then: a channel that arrives
+  later is handed with no proof more. It remembers at most 1,024 channels
+  for one connection (`MAX_CHANNELS_PROVED_ON_A_CONNECTION`). A proof for one
+  more is answered as one that fails, and is not looked at.
+- **A proof is use of a channel** (decision §2.5): a relay drops a channel
+  whose key nobody has proved, and of which nobody has shown an entry it
+  holds, for 90 days. A device proves the personal channel, and the channel
+  of each name it holds, once on a connection and again after a day; and
+  once a day the channel of every name that its personal channel lists,
+  whether or not it syncs the name.
+
+#### 4.9.2 Show (0x10), and Its Short Form
+
+A connection shows a relay an entry, and is told what the relay holds from
+that author in that slot (decision §2.4, item 5). It is how a change reaches
+a device (§4.9.6), and it is the one thing a relay hands to a connection that
+has proved no key.
+
+```
+EntryShow {
+    entry:   bytes              // The entry, as its bytes on the wire
+}
+
+EntryShowShort {
+    channel: bytes(32)
+    author:  bytes(32)
+    slot:    bytes(32)
+    rev:     u64
+    id:      bytes(32)          // SHA-256 of what is signed of the entry
+}
+
+EntryShown {
+    answer:  ShowAnswer
+}
+
+ShowAnswer =
+    "held"                              // The relay holds that very entry
+  / "taken"                             // It held none from that author in that slot,
+                                        //   or an earlier one, and took this one
+  / { "another": bytes }                // It holds another, at that revision or a later
+                                        //   one: here it is, as its bytes on the wire
+  / { "refused": EntryRefused }         // It would have taken the entry, and did not
+  / "whole"                             // Short form only: show it whole
+  / { "other": { rev: u64, id: bytes(32) } }
+                                        // Short form only: it holds another at that
+                                        //   revision or a later one; no more is said
+
+EntryRefused = "not_signed" / "no_room" / "over_limit"
+```
+
+**A whole show.** The entry is read from its bytes and both signatures are
+checked before the store is looked at. What is shown may be taken, so it
+counts against what the connection may push (§4.9.7). An entry that answers
+(`another`) is signed like any entry, and counts against what the asker may
+be handed, as anything fetched does.
+
+**After the first time on a connection, a show can be short.** A relay
+remembers, for a connection, the last entry that it was shown whole there in
+each author's slot, where the two signatures held, whatever it answered. It
+remembers at most 8 slots (`MAX_SLOTS_SHOWN_ON_A_CONNECTION`): a ninth is not
+remembered, and all are forgotten when the connection closes.
+
+- **A short show of anything else,** a slot that the relay does not remember
+  included, is answered `whole` from the connection's memory alone. The
+  store is not looked at. So the short form tells nothing, and hands
+  nothing, to anyone who has not shown that very entry whole.
+- **A short show of the entry remembered** is answered from the store:
+  `held`; `whole`, where the relay holds none or an earlier one; or `other`,
+  with the revision and ID of the one it holds. The answer to a short show
+  never carries an entry. A device that is told of another which it does not
+  keep shows its own whole, and is answered with the entry.
+- **Why.** The entry of the phrase's channel is 32 KB and a device shows it
+  on every pass. Whole each time, that is some 280 MB a day from each idle
+  device to each relay.
+
+**A show is use of a channel** where the relay holds the entry shown, as a
+proof is.
+
+#### 4.9.3 Pull (0x12)
+
+```
+EntryPull {
+    channel: bytes(32)
+    mark:    bytes(8)           // The mark of the holding that `after` is a place in;
+                                //   all zeros where the asker has no place yet
+    after:   u64                // The place after which the page starts; 0 is before the first
+    limit:   u32                // The most entries to hand
+}
+
+EntryPulled {
+    entries: [bytes]            // Each as its bytes on the wire, in the order the relay
+                                //   stored them. At most 100
+    next:    u64                // The place to ask after next
+    mark:    bytes(8)           // The mark of the holding that `next` is a place in
+}
+```
+
+- **A place is a count of the channel's own:** the order in which the relay
+  stored that channel's entries, from 1. It says nothing of any other
+  channel.
+- **A mark is 8 random bytes that are one holding's own.** A relay that
+  drops a channel and takes it again counts from 1 again, under another
+  mark. Where the mark asked with is not the mark of the holding the relay
+  has now, the channel is handed from the start, whatever `after` says.
+- **A channel that was not proved on this connection** is answered as one
+  that is not held: no entries, and the place and the mark that were asked
+  with. The store is not looked at.
+- **A channel that was proved and is not held** is answered with no
+  entries, the mark of no holding (all zeros) and `next` 0: whoever holds its
+  key then knows that nothing it sent is there.
+- **A page** holds at most 100 entries (`ENTRY_PAGE_MAX_ENTRIES`) and at
+  most 896 KB of them on the wire (`ENTRY_PAGE_MAX_BYTES`, which leaves 128
+  KB of the 1 MB message for what is around them). It always has room for
+  one entry, whatever its size. A page that holds more than 100 entries is
+  not read.
+
+#### 4.9.4 Push (0x13)
+
+```
+EntryPush {
+    entries: [bytes]            // Each as its bytes on the wire. At most 100
+}
+
+EntryPushed {
+    answers: [PushAnswer]       // One for each entry, in the order they were sent
+}
+
+PushAnswer =
+    "stored"
+  / "held"                      // The relay holds that very entry
+  / "older"                     // It holds a later one from that author in that slot
+  / { "refused": EntryRefused }
+  / "another"                   // It holds another entry from that author in that slot
+                                //   at that revision: the author signed two
+```
+
+A relay stores an entry only if both signatures hold and it is within the
+limits (decision §2.4, items 1 and 2). It keeps the newest revision for each
+author in each slot, and compares no author's entries with another's.
+
+- **`not_signed`:** the bytes are not an entry's, or a signature does not
+  hold, or a key is one that anyone can sign for.
+- **`no_room`:** with the entry the relay would hold more than its cap for
+  this kind of channel, or the entry's channel more than one channel may (16
+  MB, `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`). A write that would take a relay
+  past its cap is refused and drops nothing. A newer revision of an entry it
+  holds, that is no larger, is never refused for room.
+- **`over_limit`:** the sender's address has made the relay take as many new
+  channels as one address may in an hour (256,
+  `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR`).
+- **`another`:** the entry was not stored, and is not sent again: no
+  receiver takes it over the other. The author's next entry in the slot goes
+  above both.
+
+A push is taken as one write: every entry is answered for, or the push is
+not answered and nothing of it is stored. A push or an answer that holds
+more than 100 things is not read. An answer that does not say one thing for
+each entry says nothing of any.
+
+**A device goes on past what a relay refuses for room.** What follows the
+refused entry in a channel is still offered, since a delete, or a
+replacement that is no larger, makes room. The refused entry is kept apart
+and sent again after a wait that doubles.
+
+**A relay sweeps old deletes** (decision §2.3). An entry says in clear
+whether it is a delete, and a relay reads nothing else of it. Once an hour a
+relay drops each slot in which every entry that it holds, of every author,
+is a delete that it has held for 90 days (`KEYED_TOMBSTONE_RETENTION_DAYS`).
+A slot in which one author's delete stands beside another author's text
+stays whole: no key's delete sweeps away what another key wrote. The
+channel's room follows, and a channel of which nothing is left is held no
+more: a pull of it is then answered as for a channel that is not held. A
+device sweeps its own store by a rule of its own (data-formats.md §10.1).
+
+#### 4.9.5 Between Relays That Work Together (0x14)
+
+Relays that their operator lists together pass entries between them without
+the proof (decision §2.4, item 6). **A listed relay is one whose key the
+operator configured** (`key` of a `[[network.bootnodes]]` entry, or one of
+the two default relays, whose keys are compiled in), once its name has
+resolved. The key is the one in the peer's certificate. A relay that is configured by address alone is not
+listed: whoever came from that address would be handed every channel. The
+stream is refused for every other peer, and a node that is no relay refuses
+it from everyone.
+
+```
+RelayChannelsAsk {
+    after:  bytes(32)           // The ID after which the page starts; all zeros is
+                                //   before the first
+    limit:  u32
+}
+
+RelayChannelsHeld {
+    channels: [RelayChannel]    // In the order of their IDs. At most 1,000
+}
+
+RelayChannel {
+    channel:    bytes(32)
+    mark:       bytes(8)        // The mark of the sender's holding of it
+    held_since: i64             // Since when the sender has held it
+    used_at:    i64             // When it was last used, here or at a relay that told it
+    places:     u64             // The place of the entry stored last in this holding
+}
+
+RelayPull {                     // Answered with EntryPulled; needs no proof
+    channel: bytes(32)
+    mark:    bytes(8)
+    after:   u64
+    limit:   u32
+}
+
+RelayPush {                     // Answered with EntryPushed
+    entries: [RelayEntry]       // At most 100
+}
+
+RelayEntry {
+    entry:      bytes           // The entry, as its bytes on the wire
+    held_since: i64             // Since when the sender has held the entry's channel
+    used_at:    i64             // When that channel was last used, as far as the sender knows
+}
+```
+
+Each time is in seconds, in UTC, by the clock of the relay that says it.
+
+- **What is passed on.** An entry that a relay takes, from anyone, is passed
+  on to the listed relays that are connected, but for the one it came from,
+  every 5 seconds (`ENTRY_OFFER_INTERVAL_SECS`). Nothing is tried again:
+  what did not arrive is pulled.
+- **What is pulled.** Every 10 seconds (`RELAY_ENTRY_PULL_INTERVAL_SECS`) a
+  relay asks each listed relay which channels it holds, and pulls what it
+  lacks of them: at most 10 pages of one channel in a pass, and at most 10
+  pages of the list (10,000 channels), going on in the next pass from where
+  this one stopped.
+- **How long a channel has been held travels with it.** A relay counts a
+  channel as held from the earlier of two times: when it took it itself, and
+  when a listed relay says that it took it, also for a channel it already
+  holds. A relay over its cap drops the channels it has held for the
+  shortest time first. So the phrase's channel, which is the channel of a
+  person's that a relay has held longest, is still the last of that person's
+  to go at a relay that took them from one it works with.
+- **When a channel was last used travels with it too.** A relay that has a
+  channel only from a relay it works with sees no proof and no show of it.
+  The later of two "last used" is kept, never later than the relay's own
+  clock. A channel that is new at a relay from a listed relay was last used
+  when that relay says: taking it from a relay is no use of it.
+- **Only a listed relay can say either,** and a listed relay is not counted
+  against the limits of §4.9.7 or the allowance of new channels.
+
+#### 4.9.6 What a Device Does: the Show First
+
+A device is a personal node that follows a recovery phrase. One that follows
+none opens none of these streams, but for the pair channel at the end of this
+section.
+
+**A show comes before everything, and it is a rule of the connection**
+(decision §4.6). Each device keeps the latest change entry it has seen (the
+one entry of the phrase's channel, which carries the statement of the
+person's devices). On a connection to a relay, until the device has shown
+that entry there and dealt with what it was answered, it sends nothing in a
+channel of its own and takes nothing from one. The rule is kept as a rule of
+time, called **leave**:
+
+- **A device has leave on a connection for 10 seconds** (`SHOW_LEAVE_SECS`)
+  from an answer there which says that the relay holds no later change than
+  the one the device keeps: `held`; `taken`; or `refused` for room or for the
+  address's allowance (the relay would have taken it).
+- **No other answer gives leave:** not `another`, or `other` (the device
+  deals with the entry, and shows again what it then keeps); not `whole` (it
+  shows it whole); not a stream that is reset or that times out.
+- **A stream to prove, pull or push is opened only with leave,** and leave
+  is asked again before what came back on it is taken: what arrives after
+  the leave has run out is dropped, and asked for again.
+- **Leave ends at once, at every relay, when the entry that the device keeps
+  changes.** A request is sent only under the change entry that it was built
+  under.
+- **A device in a fork has no leave anywhere,** and nor has one that has
+  stopped, or one that was answered with a change and could not apply it.
+- **Whatever finds no leave shows again by itself:** the pass, the timer
+  that sends, and a publish. The first show on a connection is whole, and
+  the later ones are short. A show that gets no leave is made again after a
+  wait that doubles.
+
+**A device that wakes asks every relay first.** When the node starts, or
+reaches a relay after having reached none, it neither takes from a channel
+of its own nor sends to one until each relay it is set up with has answered
+a show, or 30 seconds have gone since the first of them was reached
+(`WAKE_WAIT_SECS`). A machine that slept wakes: where the time of day has
+run ahead of the clock that leave is measured on by more than a leave lasts,
+every leave is dropped.
+
+**A pass.** Every 10 seconds, at each relay where it has leave, for the
+personal channel and the channel of each name it holds: it proves the
+channel's key (once on a connection, and again after a day), pulls from the
+place it keeps, and pushes what that relay has not been sent. In a pair
+channel in which it has something to send it only pushes: it reads nothing
+there but with a typed key (below). Every 2 seconds, and when something is
+written, it pushes what waits. Each relay has its turn by itself, and one
+relay never holds up another once the device is awake.
+
+**What a device checks.** The same two signatures, on what a relay sends it.
+Further, in a channel of its own it stores an entry only if its signer
+counts: a device of the statement it has applied, or one added since under
+that statement (decision §4.4). It takes nothing from a channel of a
+generation it has left.
+
+**A carry that a person asks for reads through one door** (decision §7.3,
+§9). `cordelia sync carry` and `cordelia recover` read, at each relay, a
+channel of a generation that the device has left, or never held: the device
+proves that channel's key and pulls it, page by page, within what it takes
+from a relay in a minute, and for two minutes at most (`CARRY_READ_MAX_SECS`).
+It stores nothing of what it pulls there, keeps no place, and pushes nothing.
+The proof is the node's own where it holds the channel's secret; where it
+does not, a command that was typed the recovery phrase makes the proof for
+each connection, over the session's value, and the node is handed no secret.
+What is read comes into the device's own channels only through the one
+function that judges a version for a carry.
+
+**One channel is read without leave:** the pair channel of a key typed at
+`cordelia accept`, for the hour that `accept` allows. A device that follows
+no phrase has nothing to show, and one that has stopped has no leave, and
+each has to be handed a change. It proves that channel and pulls its first
+page, and writes nothing there.
+
+**A device paces itself.** It makes at most 2,250 requests a minute of one
+relay on the streams that prove, pull and push
+(`OWN_ENTRY_REQUESTS_PER_MINUTE`, three quarters of what a relay allows),
+pushes at most 1.5 MB a minute (`OUTBOX_BYTES_PER_MINUTE`), and takes from
+one relay in a minute no more than a relay may hand a connection. Its shows
+are not held back by this, and are few.
+
+#### 4.9.7 The Limits on These Streams
+
+The limits on bytes are the ones the older kind of channel has, with the
+same numbers, and the two kinds are counted together against them. Bytes and
+requests are each counted for the connection and for its address: all the
+connections from one address share 5 times a connection's allowance
+(`MAX_CONNECTIONS_PER_IP`). Requests on these streams have a count of their
+own. New channels are counted by address alone, each kind apart.
+
+| What | Limit | Counted as | Over it |
+|------|-------|-----------|---------|
+| Requests on the five streams, all together | 3,000 a minute for a connection (`ENTRY_REQUESTS_PER_PEER_PER_MINUTE`) | One for each stream opened | The stream is reset; a breach |
+| Bytes pushed and shown | 2 MB a minute (`PUSH_BYTES_PER_PEER_PER_MINUTE`) | Each entry as its content and 1 KB (`ENTRY_OVERHEAD_BYTES`). A short show, and a frame that is no request for its stream, as bytes that are no entry's: every one of them beyond an entry's clear fields, and 1 KB | The request is refused whole; a breach |
+| Bytes handed in a page | The same 2 MB a minute, less the room below | Each entry as its content and 1 KB | The pull is refused as "not now"; no breach |
+| Bytes handed in the answer to a show | The same 2 MB a minute | The entry as its content and 1 KB | "Not now" once the asker is over; no breach |
+| New channels from one address | 256 an hour (`NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR`) | One for each channel the relay takes that it did not hold | `over_limit` for the entry |
+
+- **3,000 requests a minute** is sized for a device with 256 names, which
+  is what an address may make a relay take in an hour: a pull of each every
+  ten seconds, and of the personal channel (1,542 a minute); its day's
+  proofs in one burst, as many as a relay remembers for a connection
+  (1,024); a show for each pass and each time it sends; and what it pushes.
+- **Three breaches in ten minutes cut a peer off,** and its address is
+  refused for fifteen minutes (`BAN_TRANSIENT_SECS`, §5.6), as for the older
+  kind.
+- **A pull that is refused for the asker's bytes is no breach:** the relay
+  sized the page, and the asker cannot know its room. The stream is reset
+  with the rate limit's code (`0x03`), and nothing is counted. Where the
+  asker has no room for even the smallest entry, that is decided before the
+  store is read.
+- **The room kept for the answer to a show.** A relay sizes a page so that
+  66,560 bytes are left in the key's allowance and in the address's
+  (`SHOW_ANSWER_ROOM_BYTES`: one entry of the largest size, as it is
+  counted), and of the requests on these streams only the entry that answers
+  a show uses that room. So a device that pulls at its full rate, or shares
+  its address with one that does, is still told of a removal. (What a relay
+  fetches of the older kind from a node at that address is counted against
+  the same allowance, with no room kept.)
+- **The answer to a show is handed while the asker is not yet over its
+  bytes,** so it can take the asker over by one entry and no more. After
+  that a show that would be answered with an entry is refused as "not now",
+  with no breach, until the minute frees. The answers that carry no entry
+  are always given.
+- **A relay writes that a channel was used at most once an hour**
+  (`ENTRY_CHANNEL_USED_STEP_SECS`), and never an earlier time than the one it
+  has: a proof, or a show, is otherwise a write to its disk for whoever
+  asks.
+- **Not defended** (decision §2.5): the allowance, the limit on connections
+  and the limit on bytes are all by address. Whoever is at the same address
+  as a device can use each up, and a change and the channels that follow it
+  then wait at that relay.
+
+---
+
 ## 5. Peer Governor
 
 Background tokio task, ticks every 10 seconds.
@@ -1000,8 +1491,17 @@ This prevents Sybil attacks: an attacker connecting many identities can only get
 | Item-Push (0x06) | -- | -- | YES | YES |
 | PSK-Exchange (0x07) | -- | -- | -- | YES |
 | Pairing (0x08) | Bootnode only | -- | -- | -- |
+| Entries (0x10 to 0x14, §4.9) | -- | Not served | YES | Relay: YES. Personal: not served |
 
 **Relay inbound gating (§7.2):** Relays are public infrastructure and MUST accept data protocols (Item-Push, Item-Sync, Channel-Announce) from Warm peers. Hot sets are asymmetric in sparse meshes (`hot_max < R`): peer A may have B as Hot while B has A as Warm. Without Warm acceptance, B rejects A's forwarded items and sync requests, partitioning the network. Personal nodes retain Hot-only gating for data protocols (they are private and serve only their chosen hot peers). PSK-Exchange remains Hot-only for all roles (security boundary).
+
+> **v1 status.** For the older kind, a personal node of this version serves
+> none of the data protocols, whatever a peer's state: it answers an Item-Sync
+> with nothing, as a device that holds no such channel would, so that a relay
+> which asks its devices what they hold asks again at its usual pace; and it
+> refuses an Item-Push and a Channel-Announce at once. The streams of §4.9 are
+> served by a relay alone, to peers that are Warm or Hot, and
+> `0x14` only to a relay that its operator lists by key.
 
 **Outbound vs inbound:** The Hot-only rule applies to *outbound* decisions -- nodes only push/sync to peers they have promoted to Hot. The gating table above governs *inbound* acceptance. This distinction matters because governor promotion is local: two nodes may disagree on each other's state.
 
@@ -1389,10 +1889,23 @@ Phase 1 defines four node roles. Each role determines which mini-protocols the n
 | Item-Sync (0x05) | Yes (pull, primary delivery) | No | Yes (serve + pull) | Yes (pull, primary delivery) |
 | Item-Push (0x06) | Originator push to relays only | No | Single-hop re-push to relays | Originator push to relays only |
 | PSK-Exchange (0x07) | Yes (if holds PSK) | No | No | Yes |
+| Entry-Show, Channel-Prove, Entry-Pull, Entry-Push (0x10 to 0x13) | Yes (opens them, to a relay) | No | Yes (serves them) | -- |
+| Relay-Entries (0x14) | No | No | Yes (with relays its operator lists by key) | -- |
 | Stores items | Own channels only | No | Ciphertext (store-and-forward) | Yes (can decrypt anchored) |
 | Holds PSKs | Own channels | Never | Never | Anchored channels |
 | Receives items via | Pull-sync (§4.5) | Never | Push + pull-sync | Pull-sync (§4.5) |
 | Phase | 1 | 1 | 1 | 2+ |
+
+> **v1 status.** In this version a personal node's rows for Channel-Announce,
+> Item-Sync, Item-Push and PSK-Exchange read "No": it carries no channel of
+> the older kind (decision 2026-10-04 §10). What it stores is the entries of
+> its own channels: the personal channel, one for each name it holds, and in
+> a pair channel the hand-over that it wrote itself. It receives the first
+> two by Entry-Pull from a relay, and the change entry, which it keeps, in
+> the answer to an Entry-Show. It holds one secret for the person, from
+> which every channel of its own is derived, and no key for each channel. A
+> relay stores both kinds, each within a cap of its own, and holds no key of
+> either.
 
 ### 8.1 Network Topology
 
@@ -1423,6 +1936,15 @@ The user's local node. Runs as a daemon on the user's machine. Its job is reliab
 - `dial_policy = "relays_only"`
 
 **Governor profile:** `hot_min=2, hot_max=2, hot_min_relays=1, warm_min=3, warm_max=10, cold_max=50`
+
+> **v1 status.** A personal node's own channels are channels from their
+> secrets. It shows, proves, pulls and pushes them at each relay it is set up
+> with (§4.9.6), every 10 seconds, and sends what waits every 2 seconds. It
+> subscribes to nothing through the local API, which serves the names the
+> device holds (channels-api.md). Until a person gives it a recovery phrase,
+> or adds it from a device that has one, it publishes nothing, and opens
+> those streams only to fetch what a device whose key was typed at
+> `cordelia accept` hands over.
 
 #### 8.2.1 Push Policy
 
@@ -1542,6 +2064,15 @@ The `hot_min_relays=5` ensures each relay maintains connections to at least 5 ot
 
 **Phase 1 relay posture:** Transparent. Accept all channels. No access control on which channels to relay.
 
+> **v1 status.** A relay carries both kinds of channel for one version. It
+> stores an entry of a channel from its secret only if both of its signatures
+> hold, hands a channel only to a connection that proved the channel's key,
+> and tells nobody which channels it holds, the relays its operator lists by
+> key aside (§4.9). Each kind is counted against a cap of its own
+> (`max_storage_bytes` each), so for that one version a relay can hold twice
+> its cap. Its room, and what is not defended, are in the decision record of
+> 2026-10-04, §2.5, and in `deploy/relay/README.md`.
+
 **Phase 2+:** Dynamic and explicit relay postures (accept only learned or explicitly configured channels).
 
 **Relay is an explicit infrastructure role.** A personal node never becomes a relay by default. Operators must set `role = "relay"` in config.toml. This prevents the Skype supernode problem where user machines silently become transit nodes for strangers' traffic.
@@ -1619,6 +2150,7 @@ Beyond limits: new connections receive QUIC `CONNECTION_CLOSE` with application 
 | Writes per channel per minute | 100 | Drop, log warning |
 | Sync streams per peer per minute | 18 | Ignore excess, log |
 | Peer-share requests per peer per minute | 6 | Ignore excess |
+| Requests on the streams of entries (§4.9) per peer per minute, all five together | 3,000 | Stream reset; a breach (§4.9.7) |
 
 Exceeding rate limits 3 times in 10 minutes → ban (§5.6).
 
@@ -1645,6 +2177,9 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | an item's other fields | ID and parent 64 bytes, channel 96, type 32, time 40 | The same; so an item as it travels is at most its ciphertext and 1 KB (`ENTRY_OVERHEAD_BYTES`) |
 | `max_message_bytes` | 1 MB (1,048,576) | Wire codec (length prefix check) |
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
+| an entry of a channel from its secret | A content that is a power of two from 256 bytes to 64 KB, and 237 bytes beside it | Whoever writes it, each relay, the device that receives it (§4.9, data-formats.md §9.2) |
+| a text and its name in such an entry | 60 KB together (`MAX_ENTRY_NAME_AND_VALUE_BYTES`) | The device that writes it; one that is over is no version to a device that reads it |
+| a page, and a push, of such entries | 100 entries; 896 KB of entries | 100: sender and receiver (a message that holds more is not read). 896 KB: whoever builds the page or the push; a receiver's bound on bytes is the 1 MB message |
 
 Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
 
@@ -1731,6 +2266,19 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 ---
 
 ## 11. Security Model
+
+> **v1 status.** §11.1 to §11.5 are written of the older kind of channel. For
+> a channel from its secret: a relay holds no key, checks two signatures on
+> every entry, and hands a channel only to a connection that proved the
+> channel's key (§4.9.1). What a relay still learns is listed in the decision
+> record of 2026-10-04, §2.4: channel IDs (all of a person's change at once
+> when a device is removed), authors' keys, slots, revisions, which entries
+> are deletes, sizes by class, timing, which connection proved which
+> channel, each pair of devices that meet in a pair channel, each time a
+> phrase is used, and the ID of the phrase's channel, which stays the same
+> for a person for as long as the phrase does. The threats, each with the
+> tests that keep the claim, are in
+> [`docs/security/threat-model.md`](../security/threat-model.md).
 
 ### 11.1 Trust Boundaries
 
@@ -1996,6 +2544,9 @@ CBOR's extensibility (unknown fields preserved) means message types can gain new
 - **specs/ecies-envelope-encryption.md**: Cryptographic primitives, ECIES construction, item signatures
 - **specs/channels-api.md**: REST API endpoints (local node API, not P2P)
 - **specs/channel-naming.md**: Channel ID derivation, naming rules
+- **decisions/2026-10-04-a-persons-devices.md**: A channel from its secret, what a relay does and its room (§2.4, §2.5), how a statement reaches a device (§4.6)
+- **specs/data-formats.md §9**: An entry on the wire and inside its ciphertext, the statement, the change entry, the hand-over
+- **RFC 5705**: Keying Material Exporters for TLS (the value a proof is made over, §4.9.1)
 - **specs/sdk-api-reference.md**: TypeScript SDK interface
 - **cordelia-core/docs/architecture/network-model.md**: Scaling analysis, adversarial model, TLA+ specs (reference)
 - **Coutts, D. et al.**: "The Shelley Networking Protocol" -- Cardano's Ouroboros networking design (peer governor, mini-protocol multiplexing)

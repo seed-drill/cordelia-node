@@ -1,5 +1,9 @@
-//! Keyed (replaceable) items: publishing revisions and resolving each key's
-//! current value (decision 2026-09-30-agent-memory-sync §4.3).
+//! Keyed (replaceable) items of the older kind of channel: publishing
+//! revisions and resolving each key's current value (decision
+//! 2026-09-30-agent-memory-sync §4.3). The Channels API of a node that is
+//! no personal device reads and writes through these. A device's own
+//! channels, from its person's secret, are read and written through
+//! [`crate::publish`], and nothing here touches them.
 //!
 //! A keyed item lives in a slot derived from its key with the channel's slot
 //! key, so relays see slots, never keys. Each author has at most one stored
@@ -9,9 +13,8 @@
 //! slot; the highest revision wins, ties going to the higher content hash.
 //! Other items at the winning revision are concurrent edits, returned as
 //! conflicts. An item at a lower revision is not returned, though it too
-//! may have been written without sight of the winner. A reader that
-//! minds says so itself: the sync adapter has each of its entries say
-//! what it was written after (`Write::after`, decision 2026-09-30 §4.5).
+//! may have been written without sight of the winner. A writer that
+//! minds can say what its entry was written after (`Write::after`).
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -39,9 +42,9 @@ pub struct Write<'a> {
     pub deleted: bool,
     /// What the writer says this revision was written after, carried
     /// beside the content and sealed with it, for a delete as for a
-    /// text. `None` puts no such member in the entry. Only the sync
-    /// adapter sets it, and only its readers take anything from it
-    /// (decision 2026-09-30 §4.5).
+    /// text. `None` puts no such member in the entry. Nothing in the node
+    /// sets it or takes anything from it now: it is read back as it was
+    /// written.
     pub after: Option<&'a Value>,
 }
 
@@ -299,8 +302,8 @@ fn publish_at(
 enum Opened {
     /// What is inside, as JSON.
     Content(Value),
-    /// No key this device holds opens it. It may be waiting for one: after
-    /// a removal, the device that removed writes under the new key at once.
+    /// No key this node holds opens it. It may be waiting for one: after a
+    /// key is rotated, a member writes under the new key at once.
     NoKey,
     /// It opens, and what is inside is not an entry's content.
     NotContent,
@@ -496,77 +499,4 @@ pub fn unread_of(
         .iter()
         .filter_map(|item| reading.unread(item))
         .collect())
-}
-
-/// Publish again, under this device's name, every key in `channel_id` whose
-/// current value was written by `leaving`: its content, or its delete.
-/// Returns how many were published.
-///
-/// Called by the device that removes `leaving` from the channel, just
-/// before it does, while `leaving`'s entries still count. Once it is
-/// removed they count for nothing, so without this the channel would go
-/// back to whatever the others last wrote: a file it edited would revert
-/// for a new device, and a file it deleted would come back.
-///
-/// Each entry is published at the revision `leaving` gave it, so it takes
-/// that entry's place: a device that already holds the entry has the same
-/// text at the same revision, and changes no file for it; one that is
-/// behind sees a newer revision. (The new entry is one more entry at its
-/// revision. Where another remaining device has an entry there, which of
-/// the two counts is decided between them as any tie is, whatever counted
-/// before, and a device that had agreed an entry at that revision, and
-/// whose file holds the text that counted before, treats the other as it
-/// treats any tie.) Two cases differ:
-///
-/// - This device already has a revision that high for the key (it lost a
-///   tie to `leaving`): the next one up is used.
-/// - `leaving`'s revision is in the upper half of the range, which editing
-///   never reaches. That is an attempt to use the numbers up. The entry is
-///   published at the next revision after the remaining members' instead,
-///   which keeps its content and gives the name its revisions back.
-///
-/// A key that cannot be published again (it has grown past a limit, say)
-/// is skipped with a warning; the removal goes ahead.
-pub fn take_over(
-    state: &AppState,
-    db: &Connection,
-    channel_id: &str,
-    leaving: &[u8; 32],
-) -> Result<usize, CordeliaError> {
-    let pk = state.identity.public_key();
-    let slot_key = slot_key(state, channel_id)?;
-    let mut taken = 0;
-    for entry in current(state, db, channel_id)? {
-        if &entry.current.author != leaving {
-            continue;
-        }
-        let slot = slot_id(&slot_key, &entry.key);
-        let own = items::author_rev(db, channel_id, &slot, &pk)?;
-        let at = if entry.current.rev > cordelia_core::protocol::MAX_REV / 2 {
-            let others = items::max_rev_except(db, channel_id, &slot, leaving)?;
-            others.unwrap_or(0) + 1
-        } else {
-            entry.current.rev.max(own.map_or(0, |rev| rev + 1))
-        };
-        let write = Write {
-            key: &entry.key,
-            content: &entry.current.content,
-            metadata: entry.current.metadata.as_ref(),
-            item_type: &entry.current.item_type,
-            deleted: entry.current.deleted,
-            // Not carried over from the entry this takes the place of:
-            // this device did not write the text over anything. A reader
-            // takes an entry without it by its revision alone, as before.
-            after: None,
-        };
-        match publish_at(state, db, channel_id, &write, Some(at)) {
-            Ok(_) => taken += 1,
-            Err(e) => tracing::warn!(
-                channel = %channel_id,
-                error = %e,
-                "could not publish again an entry that a removed device last wrote"
-            ),
-        }
-    }
-    Ok(taken)
 }

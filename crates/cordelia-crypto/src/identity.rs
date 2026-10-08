@@ -9,6 +9,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256, Sha512};
 use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::CryptoError;
 
@@ -16,28 +17,64 @@ use crate::CryptoError;
 ///
 /// The canonical identifier is the Ed25519 public key (32 bytes),
 /// encoded as Bech32 `cordelia_pk1...` for human-readable contexts.
+///
+/// **It is overwritten when it is dropped:** the seed, and the key pair
+/// that the signing code made of it (decision 2026-10-04 §16). The key
+/// that a recovery phrase signs with is one of these, and nothing of it
+/// is left where it was.
 pub struct NodeIdentity {
     keypair: Ed25519KeyPair,
     seed: [u8; 32],
+}
+
+// The key pair is overwritten where it lies when an identity is dropped.
+// That is sound only while nothing is run for the key pair itself when
+// it is dropped, which would read what was overwritten.
+const _: () = assert!(!std::mem::needs_drop::<Ed25519KeyPair>());
+
+impl Drop for NodeIdentity {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        // SAFETY: the key pair is a value of this struct, which is being
+        // dropped and is never read again; it is as large as its type, and
+        // nothing is run for it when it is dropped (checked above), so the
+        // zeros that are written over it are read by nobody.
+        unsafe { zeroize::zeroize_flat_type(&mut self.keypair as *mut Ed25519KeyPair) };
+    }
 }
 
 impl NodeIdentity {
     /// Generate a new random identity from CSPRNG.
     pub fn generate() -> Result<Self, CryptoError> {
         let rng = SystemRandom::new();
-        let mut seed = [0u8; 32];
-        rng.fill(&mut seed)
+        // The seed is made in memory that is overwritten when it is
+        // dropped: no copy of it is left here.
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rng.fill(&mut seed[..])
             .map_err(|_| CryptoError::IdentityError("RNG failure".into()))?;
-        Self::from_seed(seed)
+        Self::from_wiped_seed(&seed)
     }
 
     /// Create identity from a raw 32-byte Ed25519 seed.
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, CryptoError> {
+        Self::from_wiped_seed(&Zeroizing::new(seed))
+    }
+
+    /// [`NodeIdentity::from_seed`], from a seed that is in memory which is
+    /// overwritten when it is dropped: the seed is copied into the
+    /// identity, which is overwritten likewise, and its encoded form, which
+    /// the signing code is given, is overwritten here.
+    pub fn from_wiped_seed(seed: &Zeroizing<[u8; 32]>) -> Result<Self, CryptoError> {
         // ring requires PKCS#8 DER, so we wrap the seed
-        let pkcs8 = seed_to_pkcs8(&seed)?;
+        let pkcs8 = seed_to_pkcs8(seed)?;
         let keypair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8)
             .map_err(|e| CryptoError::IdentityError(e.to_string()))?;
-        Ok(Self { keypair, seed })
+        let mut identity = Self {
+            keypair,
+            seed: [0u8; 32],
+        };
+        identity.seed.copy_from_slice(&seed[..]);
+        Ok(identity)
     }
 
     /// Load identity from file (raw 32-byte seed).
@@ -233,8 +270,11 @@ pub fn is_usable_public_key(ed_pk: &[u8; 32]) -> bool {
 /// This constructs the minimal v1 DER envelope around the seed.
 /// We use `from_pkcs8_maybe_unchecked` since ring 0.17's `from_pkcs8`
 /// requires v2 (with public key embedded).
-fn seed_to_pkcs8(seed: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
-    let mut der = Vec::with_capacity(48);
+fn seed_to_pkcs8(seed: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    // It holds the seed: it is overwritten when it is dropped, and has
+    // its whole size from the start, so that it is never moved as it
+    // grows.
+    let mut der = Zeroizing::new(Vec::with_capacity(48));
     // SEQUENCE (outer)
     der.push(0x30);
     der.push(0x2e); // length = 46 bytes

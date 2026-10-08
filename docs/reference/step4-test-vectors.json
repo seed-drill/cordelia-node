@@ -1,0 +1,103 @@
+{
+  "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret of each kind of channel, the recovery phrase, and the statement. Bytes are in hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. This file is written by crates/cordelia-crypto/src/vectors.rs, and a test there checks the code against it.",
+  "channel": {
+    "entry_key": "58e1ccacc2fdae6fec33cf8af19b484e052c963ff95ac682270a79e55ba9e4da",
+    "id": "6c889e0c623433aa409db1bdaea7502809124f0170181a1dca682bf1ff28eab1",
+    "id_text": "cordelia_ch1djyfurrzxse65syakx76af6s9qy3yncpwqvp58w2dq4lrlega2csg7fs3w",
+    "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "signing_key_seed": "a8a93c2d4b118c13bff9203cff7cee75e70ec970615442237836c6710bab0fd7",
+    "slot_key": "bf751ebded7197a072c21337ad0db0cb3efe18c385a879c98a26a03f61143b24"
+  },
+  "commitment": {
+    "commitment": "4a38dced045cd33201b9dad8259049fe42c4d85f912cb0bb0c7f16592289cfcc",
+    "secret": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+  },
+  "kinds": {
+    "locked": {
+      "lock_key": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "name": "notes",
+      "secret": "3479bc7eaeb7a1a634447437cd1988a8dea0e86be61f8ae899b957755d939a72"
+    },
+    "own": [
+      {
+        "name": "~",
+        "secret": "4097f08484cdc8b051be8220b8bb50c9a1b1751a28091252365b3a9a49f945f5"
+      },
+      {
+        "name": "github.com/owner/repo",
+        "secret": "e6d86f6f081ad9b49e35e3d11658e46ac6b8bc3adad541b9cbadea1cf35fad41"
+      }
+    ],
+    "pair": {
+      "one_key": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+      "one_seed": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "other_key": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+      "other_seed": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "secret": "b7b52ff6e3696e2302ca4b5d20aeae3884ce9d37eff4ee8da0a3f0dcb5ac2ec4",
+      "x25519": "0d90b633b5693f7105aa5af568168de7134f1d02506aa6f64635ba3f5892670d"
+    },
+    "person_secret": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "personal": "f33a27dda2fbd6ef8316ffc2b5bc3dc62c7143aec25fcd8032671e03c18f1183"
+  },
+  "phrase": {
+    "bytes": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+    "channel_id": "b0c8f738d1b7e066047f1085ca87a6f8a9d434b78a7afe998f863e295706c121",
+    "channel_id_text": "cordelia_ch1kry0wwx3klsxvprlzzzu4paxlz5agd9h3fa0axv0sclzj4cxcysscgk6ul",
+    "channel_secret": "e1c28850fe841eb479f2100aac11ed956d2e3848678f23532e68be9afe1d6c84",
+    "public_key": "6547c45efe6c023cb2530724aa7c5afd352725148c38432dd2c3fcff1557e96b",
+    "public_key_text": "cordelia_pk1v4rughh7dsprevjnquj25lz6l56jwfg53suyxtwjc070792ha94sz9hnmg",
+    "seal_key": "6255d05830bf1742a435083ce7adeb618b0df21ea537452450b92b8dece0fcab",
+    "signing_key_seed": "1296e6734811d8af5bc94e6202e4c19bff426179732b07cd36180aba89103f1c",
+    "statement_key": "deaa9f3ec75543044dcbd026432f391bb9d6fd84ed54394b1ba5aa6f0aa8a1e4",
+    "words": "legal winner thank year wave sausage worth useful legal winner thank yellow"
+  },
+  "statements": [
+    {
+      "bytes": "0000000000000001174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd500004a38dced045cd33201b9dad8259049fe42c4d85f912cb0bb0c7f16592289cfcc0001174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd500076465736b746f7000006547c45efe6c023cb2530724aa7c5afd352725148c38432dd2c3fcff1557e96b0000",
+      "chain": [],
+      "commitment": "4a38dced045cd33201b9dad8259049fe42c4d85f912cb0bb0c7f16592289cfcc",
+      "devices": [
+        {
+          "key": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+          "label": "desktop"
+        }
+      ],
+      "hash": "91008d49dd020f7d8051859afe674fc7",
+      "maker": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+      "number": 1,
+      "phrase_key": "6547c45efe6c023cb2530724aa7c5afd352725148c38432dd2c3fcff1557e96b",
+      "removed": [],
+      "secret": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "signature": "14d01151434e04b020167945ba8b7efaff1bb206e11b594c0d04292fb22921d40a8c37c031f869f1c9229c96a913e3fc5a86bcc0bf6ec0d834b7c6ecd631e107"
+    },
+    {
+      "bytes": "0000000000000002174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd50001000000000000000191008d49dd020f7d8051859afe674fc70da112fab7e2e2fab8892dfcb6f943fe79cb746a87cbfe527cc9367bedc439df0002174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd500076465736b746f70cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa00066c6170746f70000113d9908a70925992ed546007d27f50da68ba7217ef62ac3cca784529ff10471c6547c45efe6c023cb2530724aa7c5afd352725148c38432dd2c3fcff1557e96b0000",
+      "chain": [
+        {
+          "hash": "91008d49dd020f7d8051859afe674fc7",
+          "number": 1
+        }
+      ],
+      "commitment": "0da112fab7e2e2fab8892dfcb6f943fe79cb746a87cbfe527cc9367bedc439df",
+      "devices": [
+        {
+          "key": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+          "label": "desktop"
+        },
+        {
+          "key": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+          "label": "laptop"
+        }
+      ],
+      "hash": "d1f56cd52c2b0258e571ecd36900e811",
+      "maker": "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5",
+      "number": 2,
+      "phrase_key": "6547c45efe6c023cb2530724aa7c5afd352725148c38432dd2c3fcff1557e96b",
+      "removed": [
+        "13d9908a70925992ed546007d27f50da68ba7217ef62ac3cca784529ff10471c"
+      ],
+      "secret": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "signature": "0ae0391a4e65f7b0a54d7ecc7dee4c1e3fcde05753e4cb3e5a4c434fc896c0e6c3abffd32d3000ff1846eb07add4011e487ea9dec4ecdd9474555978eb94aa0a"
+    }
+  ]
+}

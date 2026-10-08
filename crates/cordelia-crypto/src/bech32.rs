@@ -6,6 +6,9 @@
 //!   cordelia_xpk1  -- X25519 public key (32 bytes)
 //!   cordelia_sig1  -- Ed25519 signature (64 bytes)
 //!   cordelia_psk1  -- Pre-Shared Key (32 bytes)
+//!   cordelia_ch1   -- Channel ID: the public half of the signing key that
+//!                     is derived from a channel's secret (32 bytes;
+//!                     decision 2026-10-04 §2.1)
 //!
 //! Spec: seed-drill/specs/identity.md §10
 
@@ -17,6 +20,7 @@ pub const HRP_SECRET_KEY: &str = "cordelia_sk";
 pub const HRP_X25519_PK: &str = "cordelia_xpk";
 pub const HRP_SIGNATURE: &str = "cordelia_sig";
 pub const HRP_PSK: &str = "cordelia_psk";
+pub const HRP_CHANNEL: &str = "cordelia_ch";
 
 /// Encode bytes to Bech32 (BIP-173) with the given HRP.
 /// Per spec §3.5: use Bech32, NOT Bech32m (BIP-350). Aligned with Cardano CIP-19.
@@ -34,6 +38,7 @@ const VALID_HRPS: &[&str] = &[
     HRP_X25519_PK,
     HRP_SIGNATURE,
     HRP_PSK,
+    HRP_CHANNEL,
 ];
 
 /// Decode Bech32 (BIP-173) string, returning (hrp, data).
@@ -55,10 +60,26 @@ pub fn encode_public_key(pk: &[u8; 32]) -> Result<String, CryptoError> {
 
 /// Decode a cordelia_pk1... string to raw bytes.
 pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], CryptoError> {
+    decode_32(encoded, HRP_PUBLIC_KEY)
+}
+
+/// Encode a channel's ID to cordelia_ch1... (decision 2026-10-04 §2.1).
+pub fn encode_channel_id(id: &[u8; 32]) -> Result<String, CryptoError> {
+    bech32_encode(HRP_CHANNEL, id)
+}
+
+/// Decode a cordelia_ch1... string to raw bytes. A device's key, written
+/// cordelia_pk1..., is no channel's ID, and the other way round.
+pub fn decode_channel_id(encoded: &str) -> Result<[u8; 32], CryptoError> {
+    decode_32(encoded, HRP_CHANNEL)
+}
+
+/// Decode 32 bytes written under the prefix `expected`, and no other.
+fn decode_32(encoded: &str, expected: &str) -> Result<[u8; 32], CryptoError> {
     let (hrp, data) = bech32_decode(encoded)?;
-    if hrp != HRP_PUBLIC_KEY {
+    if hrp != expected {
         return Err(CryptoError::Bech32Error(format!(
-            "expected HRP '{HRP_PUBLIC_KEY}', got '{hrp}'"
+            "expected HRP '{expected}', got '{hrp}'"
         )));
     }
     if data.len() != 32 {
@@ -67,9 +88,9 @@ pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], CryptoError> {
             data.len()
         )));
     }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&data);
-    Ok(pk)
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&data);
+    Ok(out)
 }
 
 /// Encode a PSK to cordelia_psk1...
@@ -95,6 +116,41 @@ mod tests {
         let psk = [0x42u8; 32];
         let encoded = encode_psk(&psk).unwrap();
         assert!(decode_public_key(&encoded).is_err());
+    }
+
+    /// A channel's ID is written `cordelia_ch1...`, beside a device's key,
+    /// and neither is read as the other.
+    #[test]
+    fn a_channels_id_has_a_text_form_of_its_own() {
+        let id = hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+            .unwrap();
+        let id: [u8; 32] = id.try_into().unwrap();
+        let text = encode_channel_id(&id).unwrap();
+        assert!(text.starts_with("cordelia_ch1"), "{text}");
+        assert_eq!(text.len(), 70);
+        assert_eq!(decode_channel_id(&text).unwrap(), id);
+        assert_eq!(
+            bech32_decode(&text).unwrap(),
+            (HRP_CHANNEL.into(), id.to_vec())
+        );
+
+        // The same 32 bytes as a device's key: another text, and each is
+        // refused where the other is asked for.
+        let as_key = encode_public_key(&id).unwrap();
+        assert_ne!(as_key, text);
+        assert!(decode_channel_id(&as_key).is_err());
+        assert!(decode_public_key(&text).is_err());
+        assert_eq!(decode_public_key(&as_key).unwrap(), id);
+
+        // Not 32 bytes, and a text that is damaged.
+        for length in [0, 31, 33, 64] {
+            let other = bech32_encode(HRP_CHANNEL, &vec![7u8; length]).unwrap();
+            assert!(decode_channel_id(&other).is_err(), "{length}");
+        }
+        let mut damaged = text.clone();
+        damaged.pop();
+        damaged.push(if text.ends_with('q') { 'p' } else { 'q' });
+        assert!(decode_channel_id(&damaged).is_err());
     }
 
     #[test]
@@ -136,6 +192,11 @@ mod tests {
             bech32_encode(HRP_SIGNATURE, &data64)
                 .unwrap()
                 .starts_with("cordelia_sig1")
+        );
+        assert!(
+            bech32_encode(HRP_CHANNEL, &data32)
+                .unwrap()
+                .starts_with("cordelia_ch1")
         );
     }
 

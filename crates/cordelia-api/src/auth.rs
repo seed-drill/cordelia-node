@@ -8,6 +8,11 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 /// Verify the bearer token from the Authorization header.
+///
+/// A request with the node's token is then refused where the node is
+/// held up and does not answer it ([`crate::first_start::
+/// refuse_while_held`], decision 2026-10-04 §10.1): every handler comes
+/// through here before it does anything.
 pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     let header = req
         .headers()
@@ -25,5 +30,5 @@ pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
         return Err(ApiError::Unauthorized);
     }
 
-    Ok(())
+    crate::first_start::refuse_while_held(req, state)
 }

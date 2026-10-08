@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use cordelia_network::messages::{ChannelDescriptor, Protocol, WireMessage};
+use cordelia_crypto::entry::Entry;
+use cordelia_crypto::identity::NodeIdentity;
+use cordelia_network::messages::{Protocol, WireMessage};
 
 use common::*;
 
@@ -285,9 +287,10 @@ async fn it_holds_async() {}
 // ── Claims that need real processes ──────────────────────────────────
 
 /// Every file under `dir` that contains `needle`, as raw bytes: SQLite
-/// keeps text as it was written, so this finds it in a database, in the
-/// write-ahead log beside it, and in a log file alike.
-fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+/// keeps text and bytes as they were written, so this finds it in a
+/// database, in the write-ahead log beside it, and in a log file alike.
+fn files_containing(dir: &Path, needle: impl AsRef<[u8]>) -> Vec<PathBuf> {
+    let needle = needle.as_ref();
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -296,7 +299,7 @@ fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
             if path.is_dir() {
                 stack.push(path);
             } else if let Ok(bytes) = std::fs::read(&path)
-                && bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+                && bytes.windows(needle.len()).any(|w| w == needle)
             {
                 found.push(path);
             }
@@ -305,58 +308,181 @@ fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
     found
 }
 
-/// T1. A relay holds nothing it can read. Two devices pair through a relay
-/// and exchange a named entry. Afterwards nothing the relay wrote to disk
-/// (its database, the write-ahead log beside it, its own log) contains the
-/// entry's name, its content, or the label one device gave the other. The
-/// relay did carry the entry: the channel's ID is there.
+/// A node's database, opened for reading: while the node runs, or once
+/// it has stopped.
+fn store_of(n: &Node) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+    db
+}
+
+/// The person secret of the statement that the device `n` has applied,
+/// read from its database: every channel of its own comes from it
+/// (decision 2026-10-04 §2.2).
+fn person_secret_of(n: &Node) -> [u8; 32] {
+    cordelia_storage::person::applied_secret(&store_of(n))
+        .unwrap()
+        .unwrap_or_else(|| panic!("{} has applied no statement", n.name))
+        .secret
+}
+
+/// The secret of the channel in which the device `n` syncs the name
+/// `name`, under the statement it has applied.
+fn name_secret_of(n: &Node, name: &str) -> [u8; 32] {
+    cordelia_crypto::derive::own_secret(&person_secret_of(n), name).unwrap()
+}
+
+/// The ID of the channel whose secret is `secret`.
+fn channel_of(secret: &[u8; 32]) -> [u8; 32] {
+    cordelia_crypto::derive::channel_id(secret).unwrap()
+}
+
+/// The ID of the personal channel of the device `n`, under the statement
+/// it has applied.
+fn personal_channel_of(n: &Node) -> [u8; 32] {
+    channel_of(&cordelia_crypto::derive::personal_secret(&person_secret_of(n)).unwrap())
+}
+
+/// Turn sync on for `n`, with a folder `notes` of its own mapped to the
+/// name `name`: the device holds the name once it follows a recovery
+/// phrase. Returns the memory folder that Claude Code keeps for the
+/// folder.
+fn syncs_notes_as(n: &Node, name: &str) -> PathBuf {
+    let notes = n.home().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let memory = claude_folder(&n.home(), &notes);
+    let claude_dir = n.home().join(".claude");
+    n.cli(&["sync", "claude", "--dir", claude_dir.to_str().unwrap()]);
+    n.cli(&["sync", "map", notes.to_str().unwrap(), name]);
+    memory
+}
+
+/// Ask a node's local API for something that it may refuse: the status
+/// of its answer, and what it says.
+fn asks(n: &Node, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut answer = agent
+        .post(format!("http://127.0.0.1:{}{path}", n.http))
+        .header("Authorization", &format!("Bearer {}", n.token()))
+        .send_json(&body)
+        .unwrap_or_else(|e| panic!("{}: POST {path} failed: {e}", n.name));
+    let status = answer.status().as_u16();
+    let said = answer.body_mut().read_json();
+    (status, said.unwrap_or(serde_json::Value::Null))
+}
+
+/// Publish the text `text` under `key` in the name `name`, through the
+/// local API of the device `n`. What it answers: the revision, what the
+/// entry is named by, and what it was published over.
+fn publishes(n: &Node, name: &str, key: &str, text: &str) -> serde_json::Value {
+    n.post(
+        "/api/v1/channels/publish",
+        serde_json::json!({ "channel": name, "key": key, "content": text }),
+    )
+}
+
+/// What the device `n` reads under each key of the name `name`: its
+/// text, or `None` once it is deleted. Nothing where the device does not
+/// hold the name.
+fn reads(n: &Node, name: &str) -> BTreeMap<String, Option<String>> {
+    let (status, answer) = asks(
+        n,
+        "/api/v1/channels/entries",
+        serde_json::json!({ "channel": name }),
+    );
+    if status != 200 {
+        return BTreeMap::new();
+    }
+    answer["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let text = e["content"].as_str().map(String::from);
+            Some((e["key"].as_str()?.to_string(), text))
+        })
+        .collect()
+}
+
+/// Whether the device `n` holds the name `name`: its local API lists
+/// what the name holds.
+fn holds_name(n: &Node, name: &str) -> Option<()> {
+    let body = serde_json::json!({ "channel": name });
+    (asks(n, "/api/v1/channels/entries", body).0 == 200).then_some(())
+}
+
+/// How many entries the node `n` holds that the key `author` signed, in
+/// channels from their secrets.
+fn entries_by(n: &Node, author: &[u8; 32]) -> i64 {
+    store_of(n)
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE author = ?1",
+            [author.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// T1. A relay holds nothing it can read. Two devices of one person sync
+/// a folder under a name through a relay, and exchange a named entry.
+/// Afterwards nothing the relay wrote to disk (its database, the
+/// write-ahead log beside it, its own log) contains the entry's name, its
+/// content, the name the folder syncs under, or the label one device gave
+/// the other. The relay did carry the entry: the channel's ID is there.
 #[test]
 fn t01_a_relay_holds_nothing_it_can_read() {
+    const PROJECT: &str = "t01-canary-project";
     const NAME: &str = "t01-canary-name.md";
     const CONTENT: &str = "t01 canary content: prefers short answers";
     const LABEL: &str = "t01-canary-label";
 
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut a = node("a", "personal", Some(relay.p2p));
-    let mut b = node("b", "personal", Some(relay.p2p));
-    a.start();
-    b.start();
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let b = device_started("b", &relay);
     let all = [&relay, &a, &b];
+    let memory = syncs_notes_as(&a, PROJECT);
+    syncs_notes_as(&b, PROJECT);
+    pair(&a, &b, LABEL, &all);
     for n in [&a, &b] {
-        wait_for("node healthy", &all, 30, || healthy(n));
-        wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
+        wait_for("the device holds the name", &all, 60, || {
+            holds_name(n, PROJECT)
+        });
     }
-    let personal = pair(&a, &b, LABEL, &all);
 
-    a.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "key": NAME, "content": { "text": CONTENT } }),
-    );
+    publishes(&a, PROJECT, NAME, CONTENT);
     // B reads it, so it went through the relay: the two devices have no
     // other path to each other.
     wait_for("b reads a's entry", &all, 90, || {
-        let resp = b.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        );
-        resp["entries"]
-            .as_array()?
-            .iter()
-            .any(|e| e["key"] == NAME && e["content"]["text"] == CONTENT)
-            .then_some(())
+        (reads(&b, PROJECT).get(NAME)? == &Some(CONTENT.to_string())).then_some(())
     });
+    // And A's own folder takes it, as a memory file.
+    wait_for("a's folder takes the entry", &all, 90, || {
+        (std::fs::read_to_string(memory.join(NAME)).ok()? == CONTENT).then_some(())
+    });
+    let channel = channel_of(&name_secret_of(&a, PROJECT));
 
     // Stop the relay as a service manager would, so everything it holds
     // is on disk.
     relay.stop();
     let dir = relay.dir.path();
     assert!(
-        !files_containing(dir, &personal).is_empty(),
+        !files_containing(dir, channel).is_empty(),
         "the relay carried the channel, so its ID should be on its disk"
     );
-    for (what, needle) in [("name", NAME), ("content", CONTENT), ("label", LABEL)] {
+    for (what, needle) in [
+        ("name", NAME),
+        ("content", CONTENT),
+        ("label", LABEL),
+        ("folder's name", PROJECT),
+    ] {
         let found = files_containing(dir, needle);
         assert!(
             found.is_empty(),
@@ -366,39 +492,65 @@ fn t01_a_relay_holds_nothing_it_can_read() {
     // The same search does find them where they are allowed to be: on the
     // device that wrote them. So an empty result above means something.
     a.stop();
-    assert!(
-        !files_containing(a.dir.path(), LABEL).is_empty(),
-        "the label should be on the device that gave it"
-    );
+    for (what, needle) in [
+        ("name", NAME),
+        ("content", CONTENT),
+        ("label", LABEL),
+        ("folder's name", PROJECT),
+    ] {
+        assert!(
+            !files_containing(a.dir.path(), needle).is_empty(),
+            "the {what} should be on the device that gave it"
+        );
+    }
 }
 
-/// A stand-in for a relay. It completes the handshake as a relay does, and
-/// records what each node that connects does: the protocol of every stream
-/// it opens, what it says when announcing channels, and the items of each
-/// push.
+/// What a stand-in for a relay was sent on a stream of entries: the
+/// stream it came on, its bytes as they travelled, and the request that
+/// they are, where they are one.
+#[derive(Clone)]
+struct Heard {
+    protocol: Protocol,
+    bytes: Vec<u8>,
+    request: Option<WireMessage>,
+}
+
+/// What a stand-in for a relay holds, and how it answers.
+struct Script {
+    /// Whether it has room. Without room it takes no entry: one that is
+    /// shown or pushed is refused for room, as a relay that is full
+    /// refuses it.
+    has_room: bool,
+    /// How many pushes it still answers with an answer that says nothing
+    /// of any entry: fewer things than the push held entries.
+    says_nothing_of: usize,
+    /// The entries it took, each by what it is named by.
+    holds: BTreeSet<[u8; 32]>,
+}
+
+/// A stand-in for a relay. It completes the handshake as a relay does,
+/// and records what each node that connects does: the protocol of every
+/// stream it opens, and every request it makes on a stream of entries
+/// (decision 2026-10-04 §2.4).
+///
+/// It answers those requests as a relay with room does, until a test
+/// says otherwise: an entry that is shown, it takes; a proof it answers
+/// with no, as a relay that holds nothing of the channel yet; a pull,
+/// with a page of nothing; and a push, with "stored" for each entry.
 struct StandIn {
     port: u16,
     /// The stand-in's own key, as a device would be configured with it.
     key: String,
-    told: Arc<Mutex<Vec<ChannelDescriptor>>>,
     streams: Arc<Mutex<Vec<Protocol>>>,
-    /// The item IDs of each push, in the order the pushes arrived.
-    pushes: Arc<Mutex<Vec<Vec<String>>>>,
+    heard: Arc<Mutex<Vec<Heard>>>,
+    script: Arc<Mutex<Script>>,
 }
 
-/// How a stand-in answers its `n`th push (from 1), given the items in it.
-type PushAnswer =
-    Arc<dyn Fn(usize, &[String]) -> cordelia_network::messages::PushAck + Send + Sync>;
-
-/// A stand-in relay that answers no push.
+/// A stand-in relay that has room.
 fn stand_in_relay() -> StandIn {
-    stand_in(None)
-}
+    use cordelia_network::{connection, transport};
 
-fn stand_in(answer: Option<PushAnswer>) -> StandIn {
-    use cordelia_network::{codec, connection, transport};
-
-    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let identity = Arc::new(NodeIdentity::generate().unwrap());
     let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
@@ -410,127 +562,315 @@ fn stand_in(answer: Option<PushAnswer>) -> StandIn {
         port,
     );
     let ctx = manager.connect_context();
-    let told = Arc::new(Mutex::new(Vec::new()));
-    let streams = Arc::new(Mutex::new(Vec::new()));
-    let pushes = Arc::new(Mutex::new(Vec::new()));
+    let relay = StandIn {
+        port,
+        key,
+        streams: Arc::default(),
+        heard: Arc::default(),
+        script: Arc::new(Mutex::new(Script {
+            has_room: true,
+            says_nothing_of: 0,
+            holds: BTreeSet::new(),
+        })),
+    };
 
-    let (record, opened, pushed) = (told.clone(), streams.clone(), pushes.clone());
+    let (streams, heard, script) = (
+        relay.streams.clone(),
+        relay.heard.clone(),
+        relay.script.clone(),
+    );
     tokio::spawn(async move {
         let _manager = manager; // keeps the endpoint's context alive
         while let Some(incoming) = endpoint.accept().await {
-            let (ctx, record, opened) = (ctx.clone(), record.clone(), opened.clone());
-            let (pushed, answer) = (pushed.clone(), answer.clone());
+            let ctx = ctx.clone();
+            let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
             tokio::spawn(async move {
                 let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
                     return;
                 };
-                while let Ok((mut send, mut recv)) = outcome.conn.accept_bi().await {
-                    let (record, opened) = (record.clone(), opened.clone());
-                    let (pushed, answer) = (pushed.clone(), answer.clone());
-                    tokio::spawn(async move {
-                        let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
-                            return;
-                        };
-                        opened.lock().unwrap().push(protocol);
-                        if protocol == Protocol::ItemPush {
-                            let Some(answer) = answer else { return };
-                            let Ok(WireMessage::PushPayload(payload)) =
-                                codec::read_frame(&mut recv).await
-                            else {
-                                return;
-                            };
-                            let ids: Vec<String> =
-                                payload.items.iter().map(|i| i.item_id.clone()).collect();
-                            let n = {
-                                let mut pushed = pushed.lock().unwrap();
-                                pushed.push(ids.clone());
-                                pushed.len()
-                            };
-                            let ack = WireMessage::PushAck(answer(n, &ids));
-                            let _ = codec::write_frame(&mut send, &ack).await;
-                            let _ = send.finish();
-                            return;
-                        }
-                        if protocol != Protocol::ChannelAnnounce {
-                            return;
-                        }
-                        while let Ok(WireMessage::ChannelJoined(joined)) =
-                            codec::read_frame(&mut recv).await
-                        {
-                            record.lock().unwrap().push(joined.descriptor);
-                        }
-                    });
+                while let Ok((send, recv)) = outcome.conn.accept_bi().await {
+                    let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
+                    tokio::spawn(StandIn::answers(streams, heard, script, send, recv));
                 }
             });
         }
     });
-    StandIn {
-        port,
-        key,
-        told,
-        streams,
-        pushes,
+    relay
+}
+
+impl StandIn {
+    /// Answer one stream.
+    async fn answers(
+        streams: Arc<Mutex<Vec<Protocol>>>,
+        heard: Arc<Mutex<Vec<Heard>>>,
+        script: Arc<Mutex<Script>>,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
+        use cordelia_network::codec;
+        use cordelia_network::messages::{
+            ChannelProved, EntryPulled, EntryPushed, EntryRefused, EntryShown, PushAnswer,
+            ShowAnswer,
+        };
+
+        let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
+            return;
+        };
+        streams.lock().unwrap().push(protocol);
+        let of_entries = [
+            Protocol::EntryShow,
+            Protocol::ChannelProve,
+            Protocol::EntryPull,
+            Protocol::EntryPush,
+        ];
+        if !of_entries.contains(&protocol) {
+            return;
+        }
+        let Ok(bytes) = codec::read_raw_frame(&mut recv).await else {
+            return;
+        };
+        let request = codec::decode_message(&bytes).ok();
+        // What an entry that is shown or pushed is answered with, where
+        // its bytes are an entry's: it is held, or taken, or refused for
+        // room.
+        let taken = |script: &mut Script, bytes: &[u8]| -> Option<PushAnswer> {
+            let id = Entry::from_wire(bytes).ok()?.id();
+            Some(if script.holds.contains(&id) {
+                PushAnswer::Held
+            } else if script.has_room {
+                script.holds.insert(id);
+                PushAnswer::Stored
+            } else {
+                PushAnswer::Refused(EntryRefused::NoRoom)
+            })
+        };
+        let answer = {
+            let mut script = script.lock().unwrap();
+            match &request {
+                Some(WireMessage::EntryShow(show)) => {
+                    taken(&mut script, &show.entry).map(|became| {
+                        let answer = match became {
+                            PushAnswer::Stored => ShowAnswer::Taken,
+                            PushAnswer::Refused(why) => ShowAnswer::Refused(why),
+                            _ => ShowAnswer::Held,
+                        };
+                        WireMessage::EntryShown(EntryShown { answer })
+                    })
+                }
+                // It holds the entry, or holds none: "show it whole".
+                Some(WireMessage::EntryShowShort(short)) => {
+                    let answer = match script.holds.contains(&short.id) {
+                        true => ShowAnswer::Held,
+                        false => ShowAnswer::Whole,
+                    };
+                    Some(WireMessage::EntryShown(EntryShown { answer }))
+                }
+                Some(WireMessage::ChannelProve(_)) => {
+                    Some(WireMessage::ChannelProved(ChannelProved { proved: false }))
+                }
+                Some(WireMessage::EntryPull(pull)) => Some(WireMessage::EntryPulled(EntryPulled {
+                    entries: Vec::new(),
+                    next: pull.after,
+                    mark: pull.mark,
+                })),
+                Some(WireMessage::EntryPush(push)) if script.says_nothing_of > 0 => {
+                    script.says_nothing_of -= 1;
+                    let answers = vec![PushAnswer::Stored; push.entries.len().saturating_sub(1)];
+                    Some(WireMessage::EntryPushed(EntryPushed { answers }))
+                }
+                Some(WireMessage::EntryPush(push)) => {
+                    let answers: Option<Vec<PushAnswer>> = push
+                        .entries
+                        .iter()
+                        .map(|bytes| taken(&mut script, bytes))
+                        .collect();
+                    answers.map(|answers| WireMessage::EntryPushed(EntryPushed { answers }))
+                }
+                _ => None,
+            }
+        };
+        heard.lock().unwrap().push(Heard {
+            protocol,
+            bytes,
+            request,
+        });
+        // What is no request for a stream of entries is answered nothing.
+        if let Some(answer) = answer {
+            let _ = codec::write_frame(&mut send, &answer).await;
+            let _ = send.finish();
+        }
+    }
+
+    /// From now on it has room, or has none, as `has_room` says.
+    fn has_room(&self, has_room: bool) {
+        self.script.lock().unwrap().has_room = has_room;
+    }
+
+    /// Every request it was sent on a stream of entries, in the order
+    /// they arrived.
+    fn heard(&self) -> Vec<Heard> {
+        self.heard.lock().unwrap().clone()
+    }
+
+    /// The entries that it was shown whole, in the order they were
+    /// shown, each by what it is named by.
+    fn shown_whole(&self) -> Vec<[u8; 32]> {
+        self.heard()
+            .iter()
+            .filter_map(|heard| match &heard.request {
+                Some(WireMessage::EntryShow(show)) => {
+                    Some(Entry::from_wire(&show.entry).ok()?.id())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The entries of each push, in the order the pushes arrived.
+    fn pushes(&self) -> Vec<Vec<Entry>> {
+        self.heard()
+            .iter()
+            .filter_map(|heard| match &heard.request {
+                Some(WireMessage::EntryPush(push)) => Some(
+                    push.entries
+                        .iter()
+                        .filter_map(|bytes| Entry::from_wire(bytes).ok())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many pushes held the entry that is named by `id`, in hex.
+    fn pushes_of(&self, id: &str) -> usize {
+        let holds = |push: &Vec<Entry>| push.iter().any(|entry| hex::encode(entry.id()) == id);
+        self.pushes().iter().filter(|push| holds(push)).count()
     }
 }
 
+/// Whether the device `n` has nothing left to send to the relays it
+/// reaches: of no channel of its own, and of no name.
+fn has_sent_everything(n: &Node) -> Option<()> {
+    let seen = person_of(n);
+    let waiting = seen["waiting"].as_array()?;
+    let sent = seen["names"]["to_go"].as_array()?.is_empty()
+        && waiting.iter().all(|relay| relay["waits"] == 0);
+    (!waiting.is_empty() && sent).then_some(())
+}
+
 /// T1. A device tells a relay a channel's ID and nothing else about it. A
-/// real node, with its personal channel and a project mapped under a name,
-/// connects to a stand-in relay that records every announcement. None
-/// carries a name, a date, a key version or anything derived from a key.
+/// real node that follows a recovery phrase, with its personal channel
+/// and a folder mapped under a name, connects to a stand-in relay that
+/// records every request. Each names a channel by its ID alone, and each
+/// entry in one is an entry that a relay accepts: none carries the name,
+/// a file's name or text, or a label, and none carries anything beyond
+/// what its form has. The device announces no channel at all: it opens no
+/// stream of the older kind (decision 2026-10-04 §2.3, §2.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t01_a_device_tells_a_relay_only_a_channels_id() {
     const PROJECT: &str = "t01-canary-project-name";
+    const FILE: &str = "t01-canary-file.md";
+    const TEXT: &str = "t01 canary text: a thought.\n";
+    const LABEL: &str = "t01-canary-label";
 
     let relay = stand_in_relay();
-    let told = relay.told.clone();
     let mut a = node("a", "personal", Some(relay.port));
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
 
-    // Sync on, and one folder mapped under a name: the node now has its
-    // personal channel and a channel for the project.
-    let folder = a.home().join("notes");
-    std::fs::create_dir_all(&folder).unwrap();
-    let memory = claude_folder(&a.home(), &folder);
-    std::fs::write(memory.join("idea.md"), "A thought.\n").unwrap();
-    let claude_dir = a.home().join(".claude");
-    a.cli(&["sync", "claude", "--dir", claude_dir.to_str().unwrap()]);
-    a.cli(&["sync", "map", folder.to_str().unwrap(), PROJECT]);
-    let channels = wait_for("the node has both channels", &[&a], 60, || {
-        let ids = groups(&a);
-        (ids.len() >= 2).then_some(ids)
+    // Sync on, one folder mapped under a name, and a recovery phrase: the
+    // node now has its personal channel and a channel for the name.
+    let memory = syncs_notes_as(&a, PROJECT);
+    std::fs::write(memory.join(FILE), TEXT).unwrap();
+    makes_a_phrase(&a, LABEL);
+    wait_for("the node publishes its folder", &[&a], 90, || {
+        (reads(&a, PROJECT).get(FILE)? == &Some(TEXT.to_string())).then_some(())
     });
+    let (personal, named) = (
+        personal_channel_of(&a),
+        channel_of(&name_secret_of(&a, PROJECT)),
+    );
+    let change = cordelia_api::at_relays::to_show(&store_of(&a))
+        .unwrap()
+        .expect("the node keeps a change entry")
+        .entry
+        .channel;
+    let own = [change, personal, named];
 
-    // The relay hears of each of them.
-    let heard = wait_for("the relay is told of both channels", &[&a], 60, || {
-        let told = told.lock().unwrap().clone();
-        channels
+    // The relay hears of each of them: it is sent what the node holds of
+    // each.
+    fn entry_of(bytes: &[u8]) -> cordelia_crypto::entry::CheckedEntry {
+        Entry::from_wire(bytes)
+            .expect("what the node sent as an entry is one")
+            .check()
+            .expect("a relay accepts the entry")
+    }
+    let channels_of = |heard: &Heard| -> Vec<[u8; 32]> {
+        match &heard.request {
+            Some(WireMessage::EntryShow(show)) => vec![entry_of(&show.entry).channel],
+            Some(WireMessage::EntryShowShort(short)) => vec![short.channel],
+            Some(WireMessage::ChannelProve(prove)) => vec![prove.channel],
+            Some(WireMessage::EntryPull(pull)) => vec![pull.channel],
+            Some(WireMessage::EntryPush(push)) => push
+                .entries
+                .iter()
+                .map(|bytes| entry_of(bytes).channel)
+                .collect(),
+            other => panic!("the node told its relay something else: {other:?}"),
+        }
+    };
+    let heard = wait_for("the relay is told of both channels", &[&a], 90, || {
+        has_sent_everything(&a)?;
+        let heard = relay.heard();
+        let pushed: BTreeSet<[u8; 32]> = heard
             .iter()
-            .all(|id| told.iter().any(|d| &d.channel_id == id))
-            .then_some(told)
+            .filter(|heard| heard.protocol == Protocol::EntryPush)
+            .flat_map(&channels_of)
+            .collect();
+        (pushed.contains(&personal) && pushed.contains(&named)).then_some(heard)
     });
+    assert!(
+        heard.iter().any(|heard| channels_of(heard) == [change]),
+        "the relay was not shown the change entry"
+    );
 
-    for d in &heard {
-        let what = format!("the announcement of {}", d.channel_id);
-        assert_eq!(d.channel_name, None, "{what} carries a name");
-        assert_eq!(d.created_at, "", "{what} says when the channel was made");
-        assert_eq!(d.key_version, 0, "{what} carries a key version");
-        assert!(
-            d.psk_hash.iter().all(|b| *b == 0),
-            "{what} carries something derived from the channel's key"
+    for one in &heard {
+        let what = format!("a request on a stream of {:?}", one.protocol);
+        // It speaks of the node's own channels, each by its ID.
+        for channel in channels_of(one) {
+            assert!(own.contains(&channel), "{what} names another channel");
+        }
+        // It carries what its form has, and nothing else.
+        let request = one.request.as_ref().expect("it is a request");
+        assert_eq!(
+            cordelia_network::codec::encode_message(request).unwrap(),
+            one.bytes,
+            "{what} carries more than its form has"
         );
-        assert_eq!((d.access.as_str(), d.mode.as_str()), ("", ""), "{what}");
-        // Whatever the fields are called, the name is nowhere in it.
-        let bytes = serde_json::to_vec(d).unwrap();
-        for needle in [PROJECT, "personal", "project:"] {
+        // Whatever the fields are called, no name is anywhere in it.
+        for needle in [PROJECT, FILE, TEXT, LABEL, "personal", "notes"] {
             assert!(
-                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                !one.bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes()),
                 "{what} contains {needle:?}"
             );
         }
-        // It is still an announcement a relay accepts.
-        cordelia_network::channel_announce::validate_descriptor(d).unwrap();
+    }
+    // And it announced no channel, under any name: a personal node opens
+    // no stream of the older kind.
+    let opened = relay.streams.lock().unwrap().clone();
+    for older in [
+        Protocol::ChannelAnnounce,
+        Protocol::ItemPush,
+        Protocol::ItemSync,
+    ] {
+        assert!(
+            !opened.contains(&older),
+            "the node opened a stream of {older:?} to its relay"
+        );
     }
 }
 
@@ -607,7 +947,9 @@ async fn t19_a_device_asks_no_peer_for_addresses_to_dial() {
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
-    // The device is at work with this relay: it opens streams to it.
+    // The device is at work with this relay: it follows a recovery
+    // phrase, and opens streams to it.
+    makes_a_phrase(&a, "laptop");
     wait_for("the device talks to the relay", &[&a], 60, || {
         (!relay.streams.lock().unwrap().is_empty()).then_some(())
     });
@@ -623,42 +965,45 @@ async fn t19_a_device_asks_no_peer_for_addresses_to_dial() {
 
 /// T19. Being a relay is a property of configuration. A stranger that
 /// connects to a relay and says it is a relay is treated as an ordinary
-/// peer: the relay does not tell it which channels it holds.
+/// peer: the relay does not tell it which channels it holds, of either
+/// kind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
+    use cordelia_crypto::entry::{Inside, Value};
+    use cordelia_network::messages::{EntryPush, PushAnswer, RelayChannelsAsk};
     use cordelia_network::{codec, connection, item_sync, transport};
 
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let relay_key = relay.cli(&["id"]).trim().to_string();
     let relay_addr = format!("127.0.0.1:{}", relay.p2p);
+    let all = [&relay];
 
-    // A device gives the relay something to hold.
-    let mut a = node_with_relays("a", "personal", &[(relay_addr.clone(), Some(relay_key))]);
-    a.start();
-    let all = [&relay, &a];
-    wait_for("node healthy", &all, 30, || healthy(&a));
-    wait_for("connected to the relay", &all, 60, || has_hot_peer(&a));
-    let folder = a.home().join("notes");
-    std::fs::create_dir_all(&folder).unwrap();
-    let memory = claude_folder(&a.home(), &folder);
-    std::fs::write(memory.join("idea.md"), "A thought.\n").unwrap();
-    a.cli(&[
-        "sync",
-        "claude",
-        "--dir",
-        a.home().join(".claude").to_str().unwrap(),
-    ]);
-    a.cli(&["sync", "map", folder.to_str().unwrap(), "t19-notes"]);
-    wait_for("the relay holds the device's entries", &all, 90, || {
-        let stats: serde_json::Value =
-            serde_json::from_str(&relay.cli(&["stats", "--json"])).ok()?;
-        (stats["items_stored"].as_u64()? > 0).then_some(())
+    // A client gives the relay something to hold, of each kind of
+    // channel: an item of the older kind, and an entry of a channel from
+    // its secret.
+    let holder = client_of(&relay).await.expect("the holder connects");
+    let ack = holder.push(&[holder.entry(64)]).await.unwrap();
+    assert_eq!(ack.stored, 1, "{ack:?}");
+    let inside = Inside {
+        name: "idea.md".into(),
+        value: Value::Text("A thought.\n".into()),
+        chain: Some(Vec::new()),
+    };
+    let entry = Entry::seal(&[0x19; 32], &holder.identity, 1, &inside).unwrap();
+    let push = WireMessage::EntryPush(EntryPush {
+        entries: vec![entry.to_wire().into()],
     });
+    match holder.ask(Protocol::EntryPush, push).await.unwrap() {
+        WireMessage::EntryPushed(pushed) => assert_eq!(pushed.answers, [PushAnswer::Stored]),
+        other => panic!("not an answer to a push: {other:?}"),
+    }
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], 1, "{stats}");
+    assert_eq!(entries_by(&relay, &holder.identity.public_key()), 1);
 
     // The stranger: its own key, and "relay" in its handshake.
-    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
+    let identity = Arc::new(NodeIdentity::generate().unwrap());
     let stranger_key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
@@ -689,6 +1034,18 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
         "the relay told a stranger which channels it holds: {:?}",
         listed.channel_ids
     );
+    // And as a relay asks one that it works with, for the channels from
+    // their secrets: that is answered to nobody but a relay that the
+    // operator lists by key.
+    let ask = WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+        after: [0; 32],
+        limit: 100,
+    });
+    let answered = ask_on(&conn, Protocol::RelayEntries, ask).await;
+    assert!(
+        answered.is_err(),
+        "the relay answered a stranger that asked as a relay it works with: {answered:?}"
+    );
 
     // And the relay does not count it as a relay.
     let seen = wait_for("the relay lists the stranger", &all, 30, || {
@@ -703,330 +1060,409 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     assert_eq!(seen["role"], "node", "{seen}");
 }
 
-/// The newest entry a stopped node holds in `channel`, as it would travel:
-/// what anyone carrying it sees.
-fn newest_entry_on_disk(n: &Node, channel: &str) -> cordelia_network::messages::Item {
-    let db = rusqlite::Connection::open_with_flags(
-        n.data_dir().join("cordelia.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    db.query_row(
-        "SELECT item_id, item_type, encrypted_blob, content_hash, author_id, signature,
-                key_version, published_at, slot, rev
-         FROM items WHERE channel_id = ?1 AND slot IS NOT NULL ORDER BY seq DESC LIMIT 1",
-        [channel],
-        |row| {
-            let blob: Vec<u8> = row.get(2)?;
-            Ok(cordelia_network::messages::Item {
-                item_id: row.get(0)?,
-                channel_id: channel.to_string(),
-                item_type: row.get(1)?,
-                content_length: blob.len() as u32,
-                encrypted_blob: blob,
-                content_hash: row.get(3)?,
-                author_id: row.get(4)?,
-                signature: row.get(5)?,
-                key_version: row.get(6)?,
-                published_at: row.get(7)?,
-                is_tombstone: false,
-                parent_id: None,
-                slot: row.get(8)?,
-                rev: row.get::<_, Option<i64>>(9)?.map(|r| r as u64),
-            })
-        },
-    )
-    .unwrap()
+/// The newest entry that the key `author` signed in `channel`, as the
+/// node `n` holds it: as it travels, and as anyone who carries it sees
+/// it.
+fn newest_entry_by(n: &Node, channel: &[u8; 32], author: &[u8; 32]) -> Entry {
+    cordelia_storage::entries::channel_entries_after(&store_of(n), channel, 0, 10_000)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|held| held.entry.author == *author)
+        .unwrap_or_else(|| panic!("{} holds no entry by that key in the channel", n.name))
+        .entry
 }
 
-/// T2. A stranger who knows a channel's ID and has seen one of its entries
-/// in transit stores a copy of it at the relay before the entry itself
-/// arrives: the same ciphertext, in the same slot, under the stranger's own
-/// key and with the highest revision there is. The relay still stores the
-/// entry, the channel's other device still reads it, and both devices go on
-/// writing that name.
+/// The node key of `n`, as its bytes.
+fn key_bytes_of(n: &Node) -> [u8; 32] {
+    cordelia_crypto::bech32::decode_public_key(&key_of(n)).expect("a node prints its key")
+}
+
+/// A device says nothing to its relay of a channel of the older kind,
+/// though its database holds one (decision 2026-10-04 §10): a personal
+/// node carries no channel of that kind. Its store is given a group
+/// channel that it is a member of, with an item of its own that no relay
+/// has taken, as a build from before the first start on this version
+/// left them: on a device that follows a phrase, in a database with no
+/// mark, whose start writes the mark and steps nothing (§10.1). So the
+/// rows are there while the node runs. It follows a phrase, so it does
+/// talk to its relay: of its own channels, on the streams of entries. It
+/// announces no channel, asks for none, and pushes no item, however long
+/// the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices() {
-    use cordelia_network::{connection, item_sync, transport};
-    const NAME: &str = "t02-notes.md";
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut a = node("a", "personal", Some(relay.p2p));
-    let mut b = node("b", "personal", Some(relay.p2p));
+async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
+    use cordelia_storage::{channels, first_start, items, meta};
+    let relay = stand_in_relay();
+    let mut a = node("a", "personal", Some(relay.port));
+    let own = key_bytes_of(&a);
+    let group = "grp_550e8400-e29b-41d4-a716-446655440000";
     a.start();
-    b.start();
-    for n in [&a, &b] {
-        wait_for("node healthy", &[&relay, &a, &b], 30, || healthy(n));
-        wait_for("connected to the relay", &[&relay, &a, &b], 60, || {
-            has_hot_peer(n)
-        });
-    }
-    let personal = pair(&a, &b, "b", &[&relay, &a, &b]);
-    let entries_of = |n: &Node| {
-        n.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        )["entries"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-    };
-    let reads = |n: &Node, text: &str| {
-        entries_of(n)
-            .iter()
-            .any(|e| e["key"] == NAME && e["content"]["text"] == text)
-            .then_some(())
-    };
-
-    // A writes an entry while the relay is away, so the entry waits on A.
-    // A then stops, so that the stranger's copy gets to the relay first.
-    relay.stop();
-    a.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "key": NAME, "content": { "text": "one" } }),
-    );
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    makes_a_phrase(&a, "desktop");
+    wait_for("the device talks to its relay", &[&a], 60, || {
+        (!relay.heard().is_empty()).then_some(())
+    });
     a.stop();
-    let entry = newest_entry_on_disk(&a, &personal);
-    assert_eq!(entry.rev, Some(1));
-
-    // The copy: the stranger's key and signature on the same ciphertext.
-    let stranger = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let slot: [u8; 32] = entry.slot.clone().unwrap().try_into().unwrap();
-    let hash: [u8; 32] = entry.content_hash.clone().try_into().unwrap();
-    let rev = cordelia_core::protocol::MAX_REV;
-    let item_id = cordelia_storage::items::generate_item_id();
-    let cbor = cordelia_crypto::signing::ItemMetadata {
-        author_id: &stranger.public_key(),
-        channel_id: &personal,
-        content_hash: &hash,
-        is_tombstone: false,
-        item_id: &item_id,
-        key_version: entry.key_version as i64,
-        published_at: &entry.published_at,
-        slot: Some(&slot),
-        rev: Some(rev),
+    {
+        let db = cordelia_storage::db::open(&a.data_dir().join("cordelia.db")).unwrap();
+        // No mark, and no guard, as such a build left the database.
+        assert!(first_start::remove_guard(&db).unwrap());
+        meta::remove(&db, meta::FIRST_START).unwrap();
+        channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
+        channels::add_member(&db, group, &own, "owner").unwrap();
+        let blob = b"what an earlier version sealed".to_vec();
+        let item = items::NewItem {
+            item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
+            channel_id: group,
+            author_id: &own,
+            item_type: "memory",
+            published_at: "2026-10-01T00:00:00Z",
+            parent_id: None,
+            key_version: 1,
+            content_hash: &cordelia_crypto::sha256(&blob),
+            signature: &[7u8; 64],
+            encrypted_blob: &blob,
+            is_tombstone: false,
+            slot: None,
+            rev: None,
+        };
+        assert!(items::insert_item(&db, &item).unwrap());
     }
-    .encode()
-    .unwrap();
-    let copy_author = stranger.public_key();
-    let copy = cordelia_network::messages::Item {
-        item_id,
-        author_id: stranger.public_key().to_vec(),
-        signature: stranger.sign(&cbor).to_vec(),
-        rev: Some(rev),
-        ..entry.clone()
-    };
-
-    relay.start();
-    wait_for("relay healthy again", &[&relay, &b], 30, || healthy(&relay));
-    let endpoint = transport::create_endpoint(&stranger, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = endpoint.local_addr().unwrap().port();
-    let mut manager = connection::ConnectionManager::new(
-        stranger,
-        endpoint,
-        vec![],
-        vec!["personal".into()],
-        port,
-    );
-    let relay_id = manager
-        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
-        .await
-        .expect("the stranger connects, as any node may");
-    let conn = manager.get_connection(&relay_id).unwrap().clone();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-    let ack = item_sync::send_push(&mut stream, &[copy]).await.unwrap();
-    assert_eq!(
-        ack.stored, 1,
-        "the copy has to be at the relay first, or this proves nothing: {ack:?}"
-    );
-
-    // A comes back and sends the entry itself. B reads it, so the relay
-    // stored it beside the copy and passed it on.
-    a.start();
-    let all = [&relay, &a, &b];
-    wait_for("a healthy again", &all, 30, || healthy(&a));
-    wait_for("b reads a's entry", &all, 120, || reads(&b, "one"));
-
-    // The name is not out of reach: B writes it again as the next revision,
-    // and A reads that.
-    let published = b.post(
-        "/api/v1/channels/publish",
-        serde_json::json!({ "channel": personal, "key": NAME, "content": { "text": "two" } }),
-    );
-    assert_eq!(published["rev"], 2, "{published}");
-    wait_for("a reads b's edit", &all, 120, || reads(&a, "two"));
-
-    // The relay holds the stranger's copy: it cannot tell a channel's
-    // members from anyone else. The devices do not: a device stores only
-    // what members of its channels wrote.
-    let stranger_key = copy_author;
-    let held_by = |n: &mut Node| -> i64 {
-        n.stop();
+    // What the older outbox, fetch and announcement would each have gone
+    // by: it is there while the node runs.
+    let held = |a: &Node| {
         let db = rusqlite::Connection::open_with_flags(
-            n.data_dir().join("cordelia.db"),
+            a.data_dir().join("cordelia.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        db.query_row(
-            "SELECT COUNT(*) FROM items WHERE author_id = ?1",
-            [stranger_key.as_slice()],
-            |row| row.get(0),
+        db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        (
+            items::outbox_len(&db, &own).unwrap(),
+            channels::list_for_entity(&db, &own).unwrap().len(),
+            first_start::mark(&db).unwrap().map(|mark| mark.stepped),
         )
-        .unwrap()
     };
-    assert_eq!(held_by(&mut relay), 1, "the copy never reached the relay");
-    assert_eq!(held_by(&mut a), 0, "a stored what a stranger wrote");
-    assert_eq!(held_by(&mut b), 0, "b stored what a stranger wrote");
+    assert_eq!(held(&a), (1, 1, None));
+    let before = relay.streams.lock().unwrap().len();
+    a.start();
+    wait_for("node healthy again", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay again", &[&a], 60, || {
+        has_hot_peer(&a)
+    });
+    wait_for("the device talks to its relay again", &[&a], 60, || {
+        (relay.streams.lock().unwrap().len() > before).then_some(())
+    });
+    // The start wrote the mark, and stepped nothing: the rows are there.
+    assert_eq!(held(&a), (1, 1, Some(false)));
+
+    // Long enough for each of the three: an announcement goes when a
+    // peer is promoted and when a node connects, a fetch is made every
+    // ten seconds, and the outbox was flushed every two.
+    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+    let opened = relay.streams.lock().unwrap()[before..].to_vec();
+    assert!(!opened.is_empty());
+    for older in [
+        Protocol::ChannelAnnounce,
+        Protocol::ItemSync,
+        Protocol::ItemPush,
+    ] {
+        assert!(
+            !opened.contains(&older),
+            "the device opened a stream of {older:?} to its relay"
+        );
+    }
+    // And it does not count the item as waiting to be sent: what waits
+    // is of its own channels alone.
+    wait_for("nothing waits to be sent", &[&a], 60, || {
+        let status = a.get("/api/v1/status")?;
+        (status["outbox_waiting"] == 0).then_some(())
+    });
+    assert_eq!(held(&a), (1, 1, Some(false)));
 }
 
-/// T20. A key that is no device's key, stored as one of this person's
-/// devices by a version that did not refuse them, is taken off the list
-/// when the node starts, and the log says so. No channel's key is changed
-/// on its account, by the node or by `remove-device`: removing such a key
-/// is refused, and no command shows anything about it afterwards.
-#[test]
-fn t20_a_key_that_is_no_devices_goes_when_the_node_starts() {
-    use cordelia_storage::{channels, db, trust};
+/// T2. A stranger who knows a channel's ID and has seen one of its entries
+/// in transit makes a copy of it: the same ciphertext, in the same slot,
+/// under the stranger's own key and with the highest revision there is.
+/// The channel's own signature the stranger cannot make, so the relay
+/// stores no copy, whichever signature the copy carries in its place
+/// (decision 2026-10-04 §2.4, item 1). The relay stores the entry itself
+/// when it arrives, the channel's other device reads it, and both devices
+/// go on writing that name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t02_a_strangers_copy_at_a_relay_changes_nothing_for_a_channels_devices() {
+    use cordelia_core::protocol::{LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL};
+    use cordelia_network::messages::{EntryPush, EntryRefused, EntryShow, PushAnswer, ShowAnswer};
+    const PROJECT: &str = "t02";
+    const NAME: &str = "t02-notes.md";
 
-    let mut a = node("a", "personal", None);
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-    // A second device, so that there is a personal channel. It never runs.
-    let b = node("b", "personal", None);
-    let b_key = b.cli(&["id"]).trim().to_string();
-    a.cli(&["add-device", &b_key, "--name", "laptop"]);
-    let personal = groups(&a).into_iter().next().expect("a personal channel");
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let mut b = device_started("b", &relay);
+    for n in [&a, &b] {
+        syncs_notes_as(n, PROJECT);
+    }
+    pair(&a, &b, "b", &[&relay, &a, &b]);
+    for n in [&a, &b] {
+        wait_for("the device holds the name", &[&relay, &a, &b], 60, || {
+            holds_name(n, PROJECT)
+        });
+    }
+    let reads_text = |n: &Node, text: &str| {
+        (reads(n, PROJECT).get(NAME)? == &Some(text.to_string())).then_some(())
+    };
+    let a_key = key_bytes_of(&a);
+
+    // A writes an entry while the relay is away, so the entry waits on A.
+    // A then stops, so that the stranger gets to the relay first.
+    relay.stop();
+    let published = publishes(&a, PROJECT, NAME, "one");
+    assert_eq!(published["rev"], 1, "{published}");
     a.stop();
+    let channel = channel_of(&name_secret_of(&a, PROJECT));
+    let entry = newest_entry_by(&a, &channel, &a_key);
+    assert_eq!(entry.rev, 1);
+    assert_eq!(published["entry"], hex::encode(entry.id()), "{published}");
+
+    // The copy: the stranger's key and signature on the same ciphertext.
+    // In the place of the channel's signature it has the one it saw, or
+    // one that it makes with its own key.
+    let stranger = Arc::new(NodeIdentity::generate().unwrap());
+    let copy = |by_channel: Option<&NodeIdentity>| -> Vec<u8> {
+        let mut copy = Entry {
+            author: stranger.public_key(),
+            rev: cordelia_core::protocol::MAX_REV,
+            ..entry.clone()
+        };
+        let form = copy.signed_bytes();
+        let under = |label: &[u8]| [label, form.as_slice()].concat();
+        copy.author_signature = stranger.sign(&under(LABEL_ENTRY_AUTHOR));
+        if let Some(key) = by_channel {
+            copy.channel_signature = key.sign(&under(LABEL_ENTRY_CHANNEL));
+        }
+        copy.to_wire()
+    };
+    let copies = [copy(None), copy(Some(&stranger))];
+
+    relay.start();
+    wait_for("relay healthy again", &[&relay, &b], 30, || healthy(&relay));
+    let client = client_as(stranger.clone(), &relay)
+        .await
+        .expect("the stranger connects, as any node may");
+    let push = WireMessage::EntryPush(EntryPush {
+        entries: copies.iter().map(|copy| copy.clone().into()).collect(),
+    });
+    let refused = EntryRefused::NotSigned;
+    match client.ask(Protocol::EntryPush, push).await.unwrap() {
+        WireMessage::EntryPushed(pushed) => assert_eq!(
+            pushed.answers,
+            [PushAnswer::Refused(refused), PushAnswer::Refused(refused)],
+            "the relay took a stranger's copy"
+        ),
+        other => panic!("not an answer to a push: {other:?}"),
+    }
+    for copy in &copies {
+        let show = WireMessage::EntryShow(EntryShow {
+            entry: copy.clone(),
+        });
+        match client.ask(Protocol::EntryShow, show).await.unwrap() {
+            WireMessage::EntryShown(shown) => {
+                assert_eq!(shown.answer, ShowAnswer::Refused(refused))
+            }
+            other => panic!("not an answer to a show: {other:?}"),
+        }
+    }
+
+    // A comes back and sends the entry itself. B reads it, so the relay
+    // stored it and passed it on.
+    a.start();
+    let all = [&relay, &a, &b];
+    wait_for("a healthy again", &all, 30, || healthy(&a));
+    wait_for("b reads a's entry", &all, 120, || reads_text(&b, "one"));
+
+    // The name is not out of reach: B writes it again as the next revision,
+    // and A reads that.
+    let published = publishes(&b, PROJECT, NAME, "two");
+    assert_eq!(published["rev"], 2, "{published}");
+    wait_for("a reads b's edit", &all, 120, || reads_text(&a, "two"));
+
+    // Nobody holds anything that the stranger signed: not the relay, which
+    // holds the channel's entries without its secret, and not a device.
+    let stranger_key = stranger.public_key();
+    let held_by = |n: &mut Node, author: &[u8; 32]| -> i64 {
+        n.stop();
+        entries_by(n, author)
+    };
+    assert_eq!(
+        held_by(&mut relay, &stranger_key),
+        0,
+        "the relay stored what a stranger wrote"
+    );
+    assert_eq!(
+        held_by(&mut a, &stranger_key),
+        0,
+        "a stored what a stranger wrote"
+    );
+    assert_eq!(
+        held_by(&mut b, &stranger_key),
+        0,
+        "b stored what a stranger wrote"
+    );
+    // The same count does find what a device of the channel signed, at
+    // each of the three.
+    for n in [&mut relay, &mut a, &mut b] {
+        assert!(
+            held_by(n, &a_key) > 0,
+            "{} holds nothing that a signed",
+            n.name
+        );
+    }
+}
+
+/// Every list in which a node shows a key of its person's: the devices of
+/// the change it has applied, those added since, the keys removed and
+/// left out, the keys typed at `cordelia accept`, and its notices; with
+/// where the device stands.
+fn keys_shown_by(n: &Node) -> serde_json::Value {
+    let seen = person_of(n);
+    let devices: Vec<&serde_json::Value> = seen["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|device| &device["key"])
+        .collect();
+    serde_json::json!({
+        "state": seen["state"],
+        "change": seen["change"],
+        "devices": devices,
+        "added": seen["added"],
+        "removed": seen["removed"],
+        "left_out": seen["left_out"],
+        "accepting": seen["accepting"],
+        "notices": seen["notices"],
+    })
+}
+
+/// T20. A key that is no device's key (a point of small order, under
+/// which anyone can sign and the secret is one anyone can work out) is
+/// never one of this person's devices. `add-device` refuses it, `accept`
+/// refuses it on a device that follows no phrase, and `remove-device`
+/// refuses it. Nothing is kept of it, and no command shows anything
+/// about it afterwards. A real device is added as it always is (decision
+/// 2026-10-04 §2.2, §6).
+#[test]
+fn t20_a_key_that_is_no_devices_is_not_added_accepted_or_removed() {
+    let relay = relay_started();
+    let a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let all = [&relay, &a, &b];
+    makes_a_phrase(&a, "desktop");
 
     // The identity of the curve: a point of small order.
     let mut nobody = [0u8; 32];
     nobody[0] = 1;
     let listed_as = cordelia_crypto::bech32::encode_public_key(&nobody).unwrap();
-    let database = a.data_dir().join("cordelia.db");
-    let version_before = {
-        let conn = db::open(&database).unwrap();
-        channels::add_member(&conn, &personal, &nobody, "owner").unwrap();
-        let kind = trust::TrustKind::Device;
-        trust::trust(&conn, &nobody, kind, Some("stored before")).unwrap();
-        channels::get_by_id(&conn, &personal).unwrap().key_version
-    };
-    // What the node holds for the key and the channel, read while it is
-    // stopped: whether the key is a member, and the channel's key version.
-    let held = || -> (bool, i64) {
-        let conn = db::open(&database).unwrap();
-        assert!(!trust::is_trusted(&conn, &nobody).unwrap());
-        (
-            channels::is_member(&conn, &personal, &nobody).unwrap(),
-            channels::get_by_id(&conn, &personal).unwrap().key_version,
-        )
-    };
-    let taken_off = "a key that is no device's was stored among this person's devices";
+    let (a_before, b_before) = (keys_shown_by(&a), keys_shown_by(&b));
 
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-    // The devices are the real ones, and nothing else is said of the key:
-    // not where the person looks at their devices, and not in the status
-    // that panels read.
-    let devices = a.post("/api/v1/devices/list", serde_json::json!({}));
-    let keys: Vec<&str> = devices["devices"]
+    // It is not added: the device that is in refuses it before it asks
+    // its yes, and writes nothing.
+    let no_devices_key = "that is this device's own key, or no device's key";
+    let said = a
+        .at_terminal(&["add-device", &listed_as, "--name", "laptop"])
+        .refused();
+    assert!(said.contains(no_devices_key), "{said}");
+    // It is not accepted: after its yes, a device that follows no phrase
+    // keeps no such key to ask its relays with.
+    let mut at = b.at_terminal(&["accept", &listed_as]);
+    at.says("Type yes to go on").types("yes");
+    let said = at.refused();
+    assert!(said.contains(no_devices_key), "{said}");
+    // And it is not removed: it is no device of this person's.
+    let said = a.at_terminal(&["remove-device", &listed_as]).refused();
+    assert!(said.contains("no device of yours"), "{said}");
+
+    // Nothing is kept of it, and nothing is said of it: not where the
+    // person looks at their devices, and not in the status that panels
+    // read.
+    assert_eq!(keys_shown_by(&a), a_before);
+    assert_eq!(keys_shown_by(&b), b_before);
+    let commands: [&[&str]; 3] = [&["devices"], &["status"], &["status", "--json"]];
+    for n in [&a, &b] {
+        for command in commands {
+            let said = n.cli(command);
+            assert!(!said.contains(&listed_as), "{said}");
+        }
+    }
+
+    // A real device is added as it always is.
+    pair(&a, &b, "laptop", &all);
+    let seen = person_of(&a);
+    let added: Vec<&str> = seen["added"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|d| d["key"].as_str())
+        .filter_map(|device| device["key"].as_str())
         .collect();
-    assert!(keys.contains(&b_key.as_str()), "{devices}");
-    assert!(!keys.contains(&listed_as.as_str()), "{devices}");
-    assert!(devices["not_devices"].is_null(), "{devices}");
-    let status = a.cli(&["status", "--json"]);
-    assert!(!status.contains(&listed_as), "{status}");
-    let said = a.cli(&["devices"]);
-    assert!(!said.contains(&listed_as), "{said}");
-    // The log says what was done, that the channels keep their keys, and
-    // which channels, by name: no command shows them afterwards.
-    let log = std::fs::read_to_string(a.log()).unwrap();
-    let said: Vec<&str> = log.lines().filter(|l| l.contains(taken_off)).collect();
-    assert_eq!(said.len(), 1, "{log}");
-    assert!(
-        said[0].contains("The channels that listed it keep the keys they had")
-            && said[0].contains(&format!("personal ({personal})"))
-            && said[0].contains(&listed_as),
-        "{log}"
-    );
-    // Taken off, and no key changed.
-    a.stop();
-    assert_eq!(held(), (false, version_before));
-
-    // At the next start (a log of its own) there is nothing to take off.
-    // Removing the key is refused, and changes nothing.
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-    let log = std::fs::read_to_string(a.log()).unwrap();
-    assert!(!log.contains(taken_off), "{log}");
-    let said = a.refused(&["remove-device", &listed_as]);
-    assert!(
-        said.contains("not a usable public key, so it is no device's key")
-            && said.contains("nothing is removed")
-            && said.contains("The channels that listed it keep their keys"),
-        "{said}"
-    );
-
-    // A real device is removed as it always was.
-    let said = a.cli(&["remove-device", &b_key]);
-    assert!(
-        said.contains("from 1 channel and rotated its key"),
-        "{said}"
-    );
-    a.stop();
-    assert_eq!(held(), (false, version_before + 1));
+    assert_eq!(added, [key_of(&b).as_str()], "{seen}");
 }
 
-/// T16. A device is removed. What it last wrote is still in the channel
-/// for the device that removed it and for one added afterwards: a file it
-/// edited keeps its edit, a file it created is there, and a file it deleted
-/// stays deleted. What it writes after its removal reaches nobody, and the
-/// names it wrote stay writable.
-#[test]
-fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut a = node("a", "personal", Some(relay.p2p));
-    let mut r = node("r", "personal", Some(relay.p2p));
-    let mut d = node("d", "personal", Some(relay.p2p));
-    for n in [&mut a, &mut r, &mut d] {
-        n.start();
-    }
-    let all = [&relay, &a, &r, &d];
-    for n in [&a, &r, &d] {
-        wait_for("node healthy", &all, 30, || healthy(n));
-        wait_for("connected to the relay", &all, 60, || has_hot_peer(n));
-    }
-    let personal = pair(&a, &r, "r", &all);
+/// The keys that the device `n` counts as its person's devices: those of
+/// the change it has applied, and those added since that count.
+fn devices_of(n: &Node) -> BTreeSet<String> {
+    let seen = person_of(n);
+    ["devices", "added"]
+        .iter()
+        .flat_map(|list| seen[*list].as_array().cloned().unwrap_or_default())
+        .filter(|device| device["counted"] != false)
+        .filter_map(|device| device["key"].as_str().map(String::from))
+        .collect()
+}
 
-    let publish = |n: &Node, key: &str, text: &str| {
-        n.post(
-            "/api/v1/channels/publish",
-            serde_json::json!({ "channel": personal, "key": key, "content": { "text": text } }),
-        )
-    };
-    // What a node reads for each name: its text, or `None` once deleted.
-    let reads = |n: &Node| -> BTreeMap<String, Option<String>> {
-        n.post(
-            "/api/v1/channels/entries",
-            serde_json::json!({ "channel": personal }),
-        )["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let text = e["content"]["text"].as_str().map(String::from);
-                Some((e["key"].as_str()?.to_string(), text))
-            })
-            .collect()
-    };
+/// The number of the change that the device `n` has heard the device
+/// whose key is `key` say it has applied.
+fn applied_as_heard_by(n: &Node, key: &str) -> Option<u64> {
+    let seen = person_of(n);
+    ["devices", "added"]
+        .iter()
+        .flat_map(|list| seen[*list].as_array().cloned().unwrap_or_default())
+        .find(|device| device["key"] == key)?["applied"]
+        .as_u64()
+}
+
+/// T16. A device is removed. What it last wrote is still in the name's
+/// channel for the device that removed it and for one added afterwards: a
+/// file it edited keeps its edit, a file it created is there, and a file
+/// it deleted stays deleted. What it writes after its removal reaches
+/// nobody, and the names it wrote stay writable.
+///
+/// The removed device stops once it hears, and its own node then
+/// publishes nothing. A removed device that does not stop still holds its
+/// key and the secret of the channel that the others have left: what it
+/// writes there, a relay stores, and nobody reads. In the channel that
+/// the others moved to it can sign nothing (decision 2026-10-04 §7.3,
+/// §7.5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
+    use cordelia_core::protocol::{LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, MAX_REV};
+    use cordelia_crypto::entry::{Inside, Value};
+    use cordelia_network::messages::{EntryPush, EntryRefused, PushAnswer};
+    const PROJECT: &str = "t16";
+
+    let relay = relay_started();
+    let a = device_started("a", &relay);
+    let mut r = device_started("r", &relay);
+    let d = device_started("d", &relay);
+    for n in [&a, &r, &d] {
+        syncs_notes_as(n, PROJECT);
+    }
+    let words = pair(&a, &r, "r", &[&relay, &a, &r, &d]).expect("a makes the phrase");
+    for n in [&a, &r] {
+        wait_for("the device holds the name", &[&relay, &a, &r], 60, || {
+            holds_name(n, PROJECT)
+        });
+    }
+
     let text = |s: &str| Some(s.to_string());
     let held: BTreeMap<String, Option<String>> = [
         ("created.md".to_string(), text("by r")),
@@ -1036,82 +1472,148 @@ fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not() {
     .into();
 
     // A writes two files. R edits one, deletes the other and creates a third.
-    publish(&a, "edited.md", "by a");
-    publish(&a, "deleted.md", "by a");
-    wait_for("r reads a's files", &all, 90, || {
-        (reads(&r).len() == 2).then_some(())
+    publishes(&a, PROJECT, "edited.md", "by a");
+    publishes(&a, PROJECT, "deleted.md", "by a");
+    wait_for("r reads a's files", &[&relay, &a, &r], 90, || {
+        (reads(&r, PROJECT).len() == 2).then_some(())
     });
-    publish(&r, "edited.md", "by r");
+    publishes(&r, PROJECT, "edited.md", "by r");
     r.post(
         "/api/v1/channels/delete-key",
-        serde_json::json!({ "channel": personal, "key": "deleted.md" }),
+        serde_json::json!({ "channel": PROJECT, "key": "deleted.md" }),
     );
-    publish(&r, "created.md", "by r");
-    wait_for("a reads what r wrote", &all, 90, || {
-        (reads(&a) == held).then_some(())
+    publishes(&r, PROJECT, "created.md", "by r");
+    wait_for("a reads what r wrote", &[&relay, &a, &r], 90, || {
+        (reads(&a, PROJECT) == held).then_some(())
     });
+    let left = name_secret_of(&a, PROJECT);
 
-    // A removes R. R is not told, and writes on.
-    let r_key = r.cli(&["id"]).trim().to_string();
-    a.cli(&["remove-device", &r_key]);
-    assert_eq!(reads(&a), held, "removing r changed what the channel holds");
-    publish(&r, "edited.md", "after removal");
-    publish(&r, "created.md", "after removal");
+    // A removes R, with the phrase. What the name holds is as it was: A
+    // carried it into the channel that the name moved to.
+    let r_key = key_of(&r);
+    let mut at = removes(&a, &r_key, &[], &words);
+    at.says("The change is made (change 2)");
+    assert_eq!(
+        reads(&a, PROJECT),
+        held,
+        "removing r changed what the channel holds"
+    );
+    let moved_to = name_secret_of(&a, PROJECT);
+    assert_ne!(channel_of(&left), channel_of(&moved_to));
+    let said = at.done();
+    assert!(said.contains("this machine may be closed"), "{said}");
+
+    // R hears that it was removed, and stops: what it writes now, its own
+    // node refuses, and writes nowhere.
+    wait_for("r hears that it was removed", &[&relay, &a, &r], 90, || {
+        (person_of(&r)["state"] == "removed").then_some(())
+    });
+    for key in ["edited.md", "created.md"] {
+        let (status, said) = asks(
+            &r,
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": PROJECT, "key": key, "content": "after removal" }),
+        );
+        assert_eq!(status, 400, "{said}");
+        let why = said["error"]["message"].as_str().unwrap_or_default();
+        assert!(why.contains("has stopped, and publishes nothing"), "{said}");
+    }
+
+    // A removed device that does not stop writes on with its key, in the
+    // channel that the others have left: above everything there, and as
+    // high as a revision goes. That is at the relay.
+    r.stop();
+    let rogue = Arc::new(NodeIdentity::from_file(&r.data_dir().join("identity.key")).unwrap());
+    assert_eq!(rogue.public_key(), key_bytes_of(&r));
+    let later = |key: &str, rev: u64| -> Entry {
+        let inside = Inside {
+            name: key.to_string(),
+            value: Value::Text("after removal".into()),
+            chain: Some(Vec::new()),
+        };
+        Entry::seal(&left, &rogue, rev, &inside).unwrap()
+    };
+    // In the channel that the others moved to it can make no entry: it
+    // signs as the author, and for the channel with the key of the one
+    // it still holds.
+    let mut in_the_new = Entry {
+        channel: channel_of(&moved_to),
+        ..later("edited.md", 3)
+    };
+    let form = in_the_new.signed_bytes();
+    let under = |label: &[u8]| [label, form.as_slice()].concat();
+    in_the_new.author_signature = rogue.sign(&under(LABEL_ENTRY_AUTHOR));
+    in_the_new.channel_signature = cordelia_crypto::derive::signing_key(&left)
+        .unwrap()
+        .sign(&under(LABEL_ENTRY_CHANNEL));
+    let client = client_as(rogue.clone(), &relay)
+        .await
+        .expect("the removed device's key still connects");
+    let push = WireMessage::EntryPush(EntryPush {
+        entries: vec![
+            later("edited.md", MAX_REV).to_wire().into(),
+            later("created.md", 2).to_wire().into(),
+            in_the_new.to_wire().into(),
+        ],
+    });
+    match client.ask(Protocol::EntryPush, push).await.unwrap() {
+        WireMessage::EntryPushed(pushed) => assert_eq!(
+            pushed.answers,
+            [
+                PushAnswer::Stored,
+                PushAnswer::Stored,
+                PushAnswer::Refused(EntryRefused::NotSigned)
+            ]
+        ),
+        other => panic!("not an answer to a push: {other:?}"),
+    }
 
     // A device added afterwards gets what the channel held.
+    let all = [&relay, &a, &d];
     pair(&a, &d, "d", &all);
     wait_for(
         "the new device reads what the channel held",
         &all,
         120,
-        || (reads(&d) == held).then_some(()),
+        || (reads(&d, PROJECT) == held).then_some(()),
     );
-    // Long enough for what R wrote afterwards to have reached both: it is
-    // at the relay, and they fetch from it every ten seconds.
-    std::thread::sleep(std::time::Duration::from_secs(25));
-    assert_eq!(reads(&a), held, "a shows what r wrote after its removal");
-    assert_eq!(reads(&d), held, "d shows what r wrote after its removal");
+    // Long enough for what R wrote afterwards to have reached both, were
+    // it to: it is at the relay, and they fetch from it every ten seconds.
+    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+    assert_eq!(
+        reads(&a, PROJECT),
+        held,
+        "a shows what r wrote after its removal"
+    );
+    assert_eq!(
+        reads(&d, PROJECT),
+        held,
+        "d shows what r wrote after its removal"
+    );
 
-    // The names stay writable, at the next revision: what R stored after
-    // its removal does not count on the device that knew it either.
-    let published = publish(&a, "edited.md", "by a again");
+    // The names stay writable, at the next revision: what R wrote after
+    // its removal counts for nothing, on the device that knew it either.
+    let published = publishes(&a, PROJECT, "edited.md", "by a again");
     assert_eq!(published["rev"], 3, "{published}");
     wait_for("d reads a's edit", &all, 90, || {
-        (reads(&d).get("edited.md") == Some(&text("by a again"))).then_some(())
+        (reads(&d, PROJECT).get("edited.md") == Some(&text("by a again"))).then_some(())
     });
 }
 
-/// T16. A relay's refusal is not delivery. A device's relay refuses an item:
-/// first as a relay from before 0.2.0-alpha.4 does, with a count and no
-/// list; then with the list. Each time the item stays in the device's
-/// outbox and is offered again. Only when the relay stores it does the
-/// outbox empty.
+/// T16. A relay's refusal is not delivery. A device's relay has no room:
+/// it refuses the device's change entry, and each entry that the device
+/// sends it; and its first answer to a push says nothing of any entry.
+/// Each time, what was refused is kept and offered again, and the device
+/// says that its relay does not hold the change and that something waits
+/// there. Only when the relay stores it does nothing wait (decision
+/// 2026-10-04 §4.6, §16).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
-    use cordelia_network::messages::{PushAck, REFUSED_STORAGE, Refusal};
+    const PROJECT: &str = "t16-refused";
 
-    let relay = stand_in(Some(Arc::new(|n, ids: &[String]| match n {
-        1 => PushAck {
-            verification_failed: ids.len() as u32,
-            ..Default::default()
-        },
-        2 => PushAck {
-            verification_failed: ids.len() as u32,
-            refused: ids
-                .iter()
-                .map(|id| Refusal {
-                    item_id: id.clone(),
-                    why: REFUSED_STORAGE.into(),
-                })
-                .collect(),
-            ..Default::default()
-        },
-        _ => PushAck {
-            stored: ids.len() as u32,
-            ..Default::default()
-        },
-    })));
-    let pushes = relay.pushes.clone();
+    let relay = stand_in_relay();
+    relay.has_room(false);
+    relay.script.lock().unwrap().says_nothing_of = 1;
     let mut a = node_with_relays(
         "a",
         "personal",
@@ -1121,137 +1623,159 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
     let status = |n: &Node| n.get("/api/v1/status").unwrap_or_default();
+    let at_its_relay = |n: &Node| person_of(n)["relays"][0].clone();
 
-    // Adding a device writes one item for the relay: the offer to it.
-    let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
-    let other = cordelia_crypto::bech32::encode_public_key(&other.public_key()).unwrap();
-    a.cli(&["add-device", &other]);
-
-    // Refused twice: the item is still waiting, and status says a relay
-    // refused it and why.
-    let refused = wait_for("status shows the refusal", &[&a], 60, || {
-        let s = status(&a);
-        let refused = s["outbox_refused"].as_array()?.first()?.clone();
-        (s["outbox_waiting"].as_u64()? >= 1).then_some(refused)
+    // A phrase, and an entry under a name: the device has its change
+    // entry to show its relay, and entries of its own channels to send.
+    syncs_notes_as(&a, PROJECT);
+    makes_a_phrase(&a, "desktop");
+    wait_for("the device holds the name", &[&a], 60, || {
+        holds_name(&a, PROJECT)
     });
-    assert_eq!(refused["why"], REFUSED_STORAGE, "{refused}");
-    let item = refused["item_id"].as_str().unwrap().to_string();
-    {
-        let pushes = pushes.lock().unwrap();
-        assert!(pushes.len() >= 2, "{pushes:?}");
-        assert!(
-            pushes[0].contains(&item) && pushes[1].contains(&item),
-            "{pushes:?}"
-        );
-    }
+    let published = publishes(&a, PROJECT, "note.md", "a note");
+    let item = published["entry"].as_str().unwrap().to_string();
+    let change = cordelia_api::at_relays::to_show(&store_of(&a))
+        .unwrap()
+        .expect("the device keeps a change entry")
+        .entry
+        .id();
 
-    // Offered a third time and stored: nothing waits any more.
+    // Refused, and refused again: the entry is still waiting, and the
+    // device says that its relay refused for room and does not hold the
+    // change.
+    let refused = wait_for("the device says what its relay refused", &[&a], 90, || {
+        let shown = relay.shown_whole();
+        let shown = shown.iter().filter(|id| **id == change).count();
+        (relay.pushes_of(&item) >= 3 && shown >= 2).then(|| at_its_relay(&a))
+    });
+    assert_eq!(refused["holds_latest"], false, "{refused}");
+    let why = refused["no_room"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("had no room for") && why.contains("it is full"),
+        "{refused}"
+    );
+    assert!(status(&a)["outbox_waiting"].as_u64().unwrap() >= 1);
+    let waiting = person_of(&a)["waiting"][0]["waits"].as_u64();
+    assert!(waiting.unwrap() >= 1, "{}", person_of(&a));
+    let said = a.cli(&["devices"]);
+    assert!(
+        said.contains("does not hold the latest change yet"),
+        "{said}"
+    );
+    let offered_while_refused = relay.pushes_of(&item);
+
+    // The relay has room: what was refused is offered once more, and
+    // stored. Nothing waits any more, and the relay holds the change.
+    relay.has_room(true);
     wait_for(
-        "the outbox empties once the relay stores it",
+        "nothing waits once the relay stores what it refused",
         &[&a],
-        60,
+        120,
         || {
             let s = status(&a);
-            (s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty()).then_some(())
+            let held = at_its_relay(&a)["holds_latest"] == true;
+            has_sent_everything(&a)?;
+            (held && s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty())
+                .then_some(())
         },
     );
-    let pushes = pushes.lock().unwrap();
+    assert!(relay.pushes_of(&item) > offered_while_refused);
+    // The first push of all was answered with an answer that said nothing
+    // of any entry: each entry of it was offered again, or a later one
+    // that the device wrote in its place.
+    let pushes = relay.pushes();
+    for first in &pushes[0] {
+        let again = |later: &Entry| {
+            (later.channel, later.slot, later.author) == (first.channel, first.slot, first.author)
+                && later.rev >= first.rev
+        };
+        assert!(
+            pushes[1..].iter().flatten().any(again),
+            "an entry that the relay said nothing of was not offered again"
+        );
+    }
+    assert!(relay.script.lock().unwrap().holds.contains(&change));
+    let shown = relay.shown_whole();
     assert!(
-        pushes.iter().filter(|ids| ids.contains(&item)).count() >= 3,
-        "{pushes:?}"
+        shown.iter().filter(|id| **id == change).count() >= 3,
+        "the change was not shown again"
     );
 }
 
 /// T16. A removal reaches the devices that remain even when the relay loses
 /// it. One device is away while another removes a third, and the relay then
-/// loses everything it held. The device that removed goes on offering the
-/// change, the one that was away applies it when it is back, and answers;
-/// until then `cordelia devices` on the remover shows it as not confirmed.
+/// loses everything it held. The device that removed goes on showing the
+/// change, the one that was away applies it when it is back, and says so;
+/// until then `cordelia devices` on the remover shows it as not having
+/// applied the change (decision 2026-10-04 §4.6, §8).
 #[test]
 fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut a = node("a", "personal", Some(relay.p2p));
-    let mut b = node("b", "personal", Some(relay.p2p));
-    let mut r = node("r", "personal", Some(relay.p2p));
-    for n in [&mut a, &mut b, &mut r] {
-        n.start();
-    }
-    for n in [&a, &b, &r] {
-        wait_for("node healthy", &[&relay, &a, &b, &r], 30, || healthy(n));
-        wait_for("connected to the relay", &[&relay, &a, &b, &r], 60, || {
-            has_hot_peer(n)
-        });
-    }
-    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let mut relay = relay_started();
+    let a = device_started("a", &relay);
+    let mut b = device_started("b", &relay);
+    let r = device_started("r", &relay);
     let (b_key, r_key) = (key_of(&b), key_of(&r));
-    // The devices a node lists, by key.
-    let devices = |n: &Node| -> BTreeMap<String, serde_json::Value> {
-        n.post("/api/v1/devices/list", serde_json::json!({}))["devices"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|d| Some((d["key"].as_str()?.to_string(), d.clone())))
-            .collect()
-    };
-    let status = |n: &Node| n.get("/api/v1/status").unwrap_or_default();
 
-    pair(&a, &b, "b", &[&relay, &a, &b, &r]);
+    let words = pair(&a, &b, "b", &[&relay, &a, &b, &r]).expect("a makes the phrase");
     pair(&a, &r, "r", &[&relay, &a, &b, &r]);
     wait_for("b knows r as a device", &[&relay, &a, &b, &r], 90, || {
-        devices(&b).get(&r_key)?["in_personal_channel"]
-            .as_bool()?
-            .then_some(())
+        devices_of(&b).contains(&r_key).then_some(())
     });
     wait_for(
-        "b and r have confirmed to a",
+        "b and r have said to a that they applied",
         &[&relay, &a, &b, &r],
         90,
         || {
-            let listed = devices(&a);
             [&b_key, &r_key]
                 .iter()
-                .all(|key| listed[*key]["unconfirmed_since"].is_null())
+                .all(|key| applied_as_heard_by(&a, key) == Some(1))
                 .then_some(())
         },
     );
 
-    // B goes away. A removes R, and the relay has it.
+    // B goes away. A removes R, and the relay has it: the command stays
+    // until it does, and says of B that it has not applied the change.
     b.stop();
-    a.cli(&["remove-device", &r_key]);
-    wait_for("the removal reached the relay", &[&relay, &a], 60, || {
-        (status(&a)["outbox_waiting"] == 0).then_some(())
-    });
+    let mut at = removes(&a, &r_key, &["stays"], &words);
+    at.says("The change is made (change 2)");
+    let said = at.done();
+    assert!(said.contains("holds the change"), "{said}");
+    assert!(said.contains("has not applied the change yet"), "{said}");
     // The relay loses everything it held.
     relay.stop();
     for file in ["cordelia.db", "cordelia.db-wal", "cordelia.db-shm"] {
         let _ = std::fs::remove_file(relay.data_dir().join(file));
     }
-    relay.start();
-    wait_for("relay healthy again", &[&relay, &a], 30, || healthy(&relay));
 
     // B is back, and has not heard: it still counts R as a device. A shows
-    // that B has not confirmed.
+    // that B has not applied the change.
     b.start();
-    let all = [&relay, &a, &b, &r];
-    wait_for("b healthy again", &all, 30, || healthy(&b));
-    assert!(devices(&b).contains_key(&r_key), "b heard of the removal");
-    assert!(
-        devices(&a)[&b_key]["unconfirmed_since"].is_string(),
-        "a does not show b as waiting: {:?}",
-        devices(&a)
+    wait_for("b healthy again", &[&a, &b, &r], 30, || healthy(&b));
+    assert_eq!(person_of(&b)["change"], 1, "b heard of the removal");
+    assert!(devices_of(&b).contains(&r_key), "b heard of the removal");
+    assert_ne!(
+        applied_as_heard_by(&a, &b_key),
+        Some(2),
+        "a does not show b as waiting: {}",
+        person_of(&a)
     );
+    let said = a.cli(&["devices"]);
+    assert!(said.contains("has not applied change 2 yet"), "{said}");
 
-    // A offers the removal again. B applies it and answers.
+    // The relay is back, with nothing. A shows it the removal again. B
+    // applies it and says so.
+    relay.start();
+    let all = [&relay, &a, &b, &r];
+    wait_for("relay healthy again", &all, 30, || healthy(&relay));
     wait_for("b drops r", &all, 240, || {
-        (!devices(&b).contains_key(&r_key)).then_some(())
+        (person_of(&b)["change"] == 2 && !devices_of(&b).contains(&r_key)).then_some(())
     });
     wait_for("a hears that b holds it", &all, 120, || {
-        devices(&a)[&b_key]["unconfirmed_since"]
-            .is_null()
-            .then_some(())
+        (applied_as_heard_by(&a, &b_key) == Some(2)).then_some(())
     });
+    let said = a.cli(&["devices"]);
+    assert!(said.contains("has applied change 2"), "{said}");
+    assert!(!said.contains("has not applied change 2 yet"), "{said}");
 }
 
 /// T3. A relay refuses an entry over the size limit. A client pushes two
@@ -1391,8 +1915,12 @@ struct Client {
 
 /// Connect a new client, with a key of its own, to `relay`.
 async fn client_of(relay: &Node) -> Result<Client, String> {
+    client_as(Arc::new(NodeIdentity::generate().unwrap()), relay).await
+}
+
+/// Connect a client with the key `identity` to `relay`.
+async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, String> {
     use cordelia_network::{connection, transport};
-    let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager = connection::ConnectionManager::new(
@@ -1414,7 +1942,28 @@ async fn client_of(relay: &Node) -> Result<Client, String> {
     })
 }
 
+/// Ask one thing on a new stream of `protocol` on `conn`, and read the
+/// answer. `Err` where the stream was refused, or nothing was answered.
+async fn ask_on(
+    conn: &quinn::Connection,
+    protocol: Protocol,
+    request: WireMessage,
+) -> Result<WireMessage, String> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let answer = cordelia_network::codec::send_request(&mut stream, protocol, &request)
+        .await
+        .map_err(|e| e.to_string());
+    let _ = send.finish();
+    answer
+}
+
 impl Client {
+    /// Ask one thing on a new stream of `protocol`, and read the answer.
+    async fn ask(&self, protocol: Protocol, request: WireMessage) -> Result<WireMessage, String> {
+        ask_on(&self.conn, protocol, request).await
+    }
+
     /// An entry of `bytes` bytes, signed by this client, as it travels.
     fn entry(&self, bytes: usize) -> cordelia_network::messages::Item {
         // Distinct content for each entry.
@@ -2567,4 +3116,39 @@ async fn t03_a_page_longer_than_the_one_asked_for_is_not_taken() {
         "the relay fetched from a page it did not ask for"
     );
     assert_eq!(relay_holds(&relay), (0, 0));
+}
+
+/// A device answers its relay's request of the older kind with nothing,
+/// as a device that holds no channel of that kind would (decision
+/// 2026-10-04 §10.1). A relay asks each of its devices which channels it
+/// holds: answered, it asks again at its usual pace, which this relay is
+/// set up to make short. A device that refused the request would be asked
+/// again only a minute later, as a peer that failed to answer is.
+#[test]
+fn a_device_answers_its_relays_request_of_the_older_kind_with_nothing() {
+    let mut relay = node("relay", "relay", None);
+    relay.relay_ask_again_secs(1);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let a = device_started("a", &relay);
+
+    let answered = || {
+        let log = std::fs::read_to_string(a.log()).unwrap_or_default();
+        log.matches("answered a sync of the older kind with nothing")
+            .count()
+    };
+    // Asked, answered, and asked again within the relay's own pace: three
+    // times in well under the minute that a failure would cost.
+    let began = std::time::Instant::now();
+    wait_for(
+        "the relay asks its device again and again",
+        &[&relay, &a],
+        50,
+        || (answered() >= 3).then_some(()),
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(55),
+        "{:?}",
+        began.elapsed()
+    );
 }

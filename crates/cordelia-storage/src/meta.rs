@@ -7,12 +7,6 @@ use cordelia_core::CordeliaError;
 /// Key under which the ID of this node's personal channel is stored.
 pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
 
-/// The device whose offer of its personal channel this device has decided
-/// to take, and when it decided: `<hex key> <unix seconds>`. Set by
-/// `cordelia accept` on a device that is not in use; cleared when the offer
-/// is taken. Nothing a device is sent can set it.
-pub const ACCEPTED_PERSONAL_FROM: &str = "membership.accepted_personal_from";
-
 /// Claude Code directory to sync; sync is off when absent.
 pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 
@@ -54,6 +48,68 @@ pub const SYNC_CLAUDE_LAST_CHANGE: &str = "sync.claude.last_change";
 /// JSON object, per synced name, of when this device last received and
 /// last sent a memory under it: `{"<name>": {"pulled": "...", "published": "..."}}`.
 pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
+
+/// The files whose record in a folder could not be carried when this
+/// device applied the statement it has applied (decision 2026-10-04
+/// §4.2), as JSON: each as the name it syncs under and the file. Replaced
+/// at each statement applied.
+pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
+
+/// Present where the statement that this device has applied removes a key
+/// that the statement it held before did not (decision 2026-10-04
+/// §10.1), as the device found it at the moment it applied the
+/// statement: a renewal removes nobody, though its list of removed keys
+/// names every key removed so far. Written at each statement applied.
+pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
+
+/// JSON array of the names that this device holds by a carry that a
+/// person asked for, or by a recovery, with no folder of its own mapped
+/// to them (decision 2026-10-04 §7.3, §9): it holds each, and lists it
+/// in the personal channel, whether or not sync is on here. A name goes
+/// from the list when the device stops it, and the list goes when the
+/// device leaves its phrase.
+pub const PERSON_NAMES_CARRIED: &str = "person.names_carried";
+
+/// Whether the look of a recovery that was made on this machine has not
+/// ended (decision 2026-10-04 §8, §9): it is set where the recovery's
+/// statement is applied, and goes when the look has carried what it
+/// takes. While it is set the machine does not write that it has sent
+/// what it carried: a recovery whose look was interrupted was cut short,
+/// and the next recovery says so.
+pub const PERSON_LOOK_PENDING: &str = "person.look_pending";
+
+/// JSON object of what this device called each key that a statement it
+/// applied removed, by the key in hex (decision 2026-10-04 §7.3): a
+/// statement lists removed keys bare, and a person names one by its
+/// label at `cordelia sync carry --from`. A key that the device never
+/// knew by a label is not in it.
+pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
+
+/// JSON array of the keys, each in hex, that a recovery made on this
+/// machine left out without showing them (decision 2026-10-04 §9, step
+/// 3): rows beyond the 256 that its prompt shows. Each is kept as left
+/// out, and `cordelia devices` shows it with its key, since the person
+/// was shown it nowhere else. It goes when the device leaves its phrase.
+pub const PERSON_NOT_SHOWN: &str = "person.not_shown";
+
+/// JSON array of the words of the recovery phrase that this device has
+/// taken and that are not void yet (decision 2026-10-04 §16): each by its
+/// signature in hex, with until when it stands and the numbers of the
+/// batches that were taken under it. A word is taken once, and so is each
+/// batch handed under one. A word goes from the list once its time has
+/// gone by, and the list goes when the device leaves its phrase.
+pub const PERSON_WORDS_TAKEN: &str = "person.words_taken";
+
+/// The mark that the first start on a version that carries no channel of
+/// the older kind is done, with whether the step was made and the version
+/// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).
+pub const FIRST_START: &str = "first_start.done";
+
+/// JSON array of what a device whose stored scope was on has been told:
+/// one record for each time, with the date, the Claude Code directory and
+/// the folders that stopped syncing (`crate::first_start::Notice`,
+/// decision 2026-10-04 §10.1).
+pub const SYNC_CLAUDE_NOTICE: &str = "sync.claude.notice";
 
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
