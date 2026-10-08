@@ -105,9 +105,23 @@ Of each, say one of three things. No answer is suggested: each is typed.
            what it means.";
 
 /// What is said of a record that does not count, in the place of a
-/// question (decision 2026-10-04 §9, step 3).
-const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
-    brought back, and its key is not removed.";
+/// question (decision 2026-10-04 §9, step 3). `removed` is whether the
+/// change recovered from, or one made apart from it that the recovery
+/// settles, lists the record's key as removed: a removed key stays
+/// removed in every change after, and in the one that this recovery
+/// makes.
+fn not_asked_says(removed: bool) -> &'static str {
+    match removed {
+        false => {
+            "  It is no device: nothing is asked of it, nothing that it wrote is brought \
+             back, and its key is not removed."
+        }
+        true => {
+            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
+             back. Its key was removed before this recovery, and stays removed."
+        }
+    }
+}
 
 /// What is said, in the place of nothing, of a key that is asked about
 /// though it does not count (decision 2026-10-04 §9, step 3): its record
@@ -633,7 +647,10 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         // in someone else's hands.
         if !rows[at_row].counts {
             let Some((under, _)) = recover::asked_for_room(rows, &answers, at_row) else {
-                println!("{says}\n{NOT_ASKED}");
+                let key = &rows[at_row].key;
+                let removed = statement.removes(key)
+                    || apart_statement.is_some_and(|other| other.removes(key));
+                println!("{says}\n{}", not_asked_says(removed));
                 answers.push(Answer::NotAsked);
                 continue;
             };
@@ -969,6 +986,8 @@ pub fn recover_made(
     number: u64,
     cut_short: Option<String>,
 ) -> anyhow::Result<()> {
+    // The change was made a moment before this process began.
+    let began = std::time::Instant::now();
     println!(
         "Looking at what the relays hold of each name. The look is made once, and this command \
          stays until it has ended. Stopping it stops nothing: the node goes on."
@@ -1018,10 +1037,44 @@ pub fn recover_made(
         );
     }
     let seen = look(config_path)?;
-    for line in after_lines(&seen) {
+    // What a folder that is mapped here has still to publish is in no
+    // store yet: whether one has still to sync for the first time is
+    // asked of the node's sync status. Where that cannot be had, each
+    // mapped folder is taken to.
+    let mapped = seen["folders"].as_u64().unwrap_or(0) as usize;
+    let first_syncs = match seen["sync_on"] == true && mapped > 0 {
+        true => crate::api_post(config_path, "/api/v1/sync/status", json!({}))
+            .map_or(mapped, |sync| first_syncs_to_come(&sync, began.elapsed())),
+        false => 0,
+    };
+    for line in after_lines(&seen, first_syncs) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// How many folders that this machine maps have still to sync for the
+/// first time since the recovery (decision 2026-10-04 §9, step 5), as
+/// the node's sync status `sync` says, `since` the change was made. A
+/// folder's first cycle in a name waits until the look has read that
+/// name. What it then publishes is to be sent, and until that cycle has
+/// run none of it is in the store, where what waits is counted.
+///
+/// None where sync is off, or no folder is mapped. Otherwise every
+/// mapped folder, where no cycle has reported since the change was made:
+/// the node says for how long it has had no report. And where one has,
+/// each folder of which the report says that it waits.
+fn first_syncs_to_come(sync: &Value, since: Duration) -> usize {
+    let mapped = list(sync, "mappings").count();
+    if sync["enabled"] != true || mapped == 0 {
+        return 0;
+    }
+    let no_report_for = sync["no_report_secs"].as_u64().unwrap_or(u64::MAX);
+    if sync["report"].is_null() || no_report_for >= since.as_secs() {
+        return mapped;
+    }
+    let waits = |folder: &&Value| folder["waiting"] == true;
+    list(&sync["report"], "folders").filter(waits).count()
 }
 
 /// What is said once the look has ended, of what the node says of this
@@ -1029,7 +1082,15 @@ pub fn recover_made(
 /// the change; "keep this machine on" with how many names are still to
 /// send; and, for each device that the person still has, how it is added
 /// again.
-fn after_lines(seen: &Value) -> Vec<String> {
+///
+/// **That nothing is waiting is said only where nothing is.** Beside
+/// the names, the machine's personal channel is to be sent, which lists
+/// them: the node says how many of the machine's channels wait at each
+/// relay, and where no name does and a channel does, that is said. And
+/// `first_syncs` folders that are mapped here have still to sync for the
+/// first time since the recovery ([`first_syncs_to_come`]): what they
+/// publish is not in the store yet.
+fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for relay in list(seen, "relays") {
         lines.push(match relay["holds_latest"].as_bool() {
@@ -1047,15 +1108,42 @@ fn after_lines(seen: &Value) -> Vec<String> {
         ));
     }
     let to_go = list(&seen["names"], "to_go").count();
-    lines.push(match to_go {
-        0 => "Nothing is waiting to be sent to a relay that is connected. `cordelia devices` \
-              shows what each relay holds."
-            .to_string(),
-        to_go => format!(
+    // The channels of this machine's own that wait at a relay which is
+    // connected: its personal channel among them.
+    let channels = |relay: &Value| relay["waits"].as_u64().unwrap_or(0);
+    let channels_wait = list(seen, "waiting").any(|relay| channels(relay) > 0);
+    match (to_go, channels_wait) {
+        (0, false) if first_syncs == 0 => lines.push(
+            "Nothing is waiting to be sent to a relay that is connected. `cordelia devices` \
+             shows what each relay holds."
+                .to_string(),
+        ),
+        (0, false) => {}
+        (0, true) => lines.push(
+            "keep this machine on: its personal channel, which lists the names, is still to \
+             send"
+                .to_string(),
+        ),
+        (to_go, _) => lines.push(format!(
             "keep this machine on: {} still to send",
             counted(to_go, "name")
-        ),
-    });
+        )),
+    }
+    if first_syncs > 0 {
+        lines.push(format!(
+            "keep this machine on: {} mapped here {} still to sync for the first time since \
+             the recovery, and what {} is then to send",
+            counted(first_syncs, "folder"),
+            match first_syncs {
+                1 => "has",
+                _ => "have",
+            },
+            match first_syncs {
+                1 => "it publishes",
+                _ => "they publish",
+            }
+        ));
+    }
     // A key that could not be shown is left out too, and is no device
     // that the person said they still have.
     let (not_shown, still): (Vec<&Value>, Vec<&Value>) =
@@ -1637,7 +1725,7 @@ mod tests {
                 { "label": "", "words": "m1 m2 m3 m4", "number": 3, "key": "cordelia_pk1y" },
             ],
         });
-        let lines = after_lines(&seen);
+        let lines = after_lines(&seen, 0);
         let all = lines.join("\n");
         // What could not be shown is no device that the person said they
         // still have: it is said apart, and is not to be added again.
@@ -1680,13 +1768,126 @@ mod tests {
             "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
             "names": { "to_go": [], "sent": ["a"] }, "left_out": [],
         });
-        let all = after_lines(&done).join("\n");
+        let all = after_lines(&done, 0).join("\n");
         assert!(all.contains("Nothing is waiting to be sent"), "{all}");
         assert!(!all.contains("keep this machine on"), "{all}");
         assert!(!all.contains("added again"), "{all}");
         let one = json!({ "relays": [], "names": { "to_go": ["a"] } });
         assert!(
-            after_lines(&one).contains(&"keep this machine on: 1 name still to send".to_string())
+            after_lines(&one, 0)
+                .contains(&"keep this machine on: 1 name still to send".to_string())
+        );
+    }
+
+    /// That nothing is waiting to be sent is said only where nothing is
+    /// (decision 2026-10-04 §9, step 5). The machine's personal channel,
+    /// which lists the names, is to be sent too: where no name waits and
+    /// a channel of the machine's own does, that is said. And a folder
+    /// that is mapped here has its first cycle once the look has read
+    /// its name: until it has synced, what it publishes is still to
+    /// come, and that is said.
+    #[test]
+    fn test_nothing_is_said_to_wait_only_where_nothing_does() {
+        let seen = |to_go: Value, waits: u64| {
+            json!({
+                "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
+                "names": { "to_go": to_go, "sent": [] }, "left_out": [],
+                "waiting": [{ "relay": "one", "waits": 0 }, { "relay": "two", "waits": waits }],
+            })
+        };
+        let nothing = "Nothing is waiting to be sent to a relay that is connected. `cordelia \
+                       devices` shows what each relay holds.";
+        let list_waits = "keep this machine on: its personal channel, which lists the names, is \
+                          still to send";
+        // Nothing waits anywhere.
+        let all = after_lines(&seen(json!([]), 0), 0);
+        assert!(all.contains(&nothing.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("keep this machine on"), "{all:?}");
+        // No name waits, and a channel of the machine's own does, at one
+        // relay: its personal channel.
+        let all = after_lines(&seen(json!([]), 1), 0);
+        assert!(all.contains(&list_waits.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
+        // Names wait: they are counted, as before.
+        let all = after_lines(&seen(json!(["a", "b"]), 3), 0);
+        assert!(
+            all.contains(&"keep this machine on: 2 names still to send".to_string()),
+            "{all:?}"
+        );
+        assert!(!all.contains(&list_waits.to_string()), "{all:?}");
+        // A folder has still to sync for the first time: nothing is said
+        // to be done, whatever waits in the store.
+        let first = "keep this machine on: 1 folder mapped here has still to sync for the first \
+                     time since the recovery, and what it publishes is then to send";
+        let all = after_lines(&seen(json!([]), 0), 1);
+        assert!(all.contains(&first.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
+        let all = after_lines(&seen(json!(["a"]), 1), 2).join("\n");
+        assert!(
+            all.contains("keep this machine on: 1 name still to send"),
+            "{all}"
+        );
+        assert!(
+            all.contains(
+                "keep this machine on: 2 folders mapped here have still to sync for the first \
+                 time since the recovery, and what they publish is then to send"
+            ),
+            "{all}"
+        );
+
+        // Which folders have still to sync, as the node's sync status
+        // says. Sync is off, or nothing is mapped: none.
+        let status = |enabled: bool, mapped: usize, no_report_secs: u64, report: Value| {
+            let mappings: Vec<Value> = (0..mapped).map(|n| json!({ "name": n })).collect();
+            json!({
+                "enabled": enabled, "mappings": mappings, "no_report_secs": no_report_secs,
+                "report": report,
+            })
+        };
+        let folders = |waiting: &[bool]| {
+            let folders: Vec<Value> = waiting.iter().map(|w| json!({ "waiting": w })).collect();
+            json!({ "folders": folders })
+        };
+        let since = Duration::from_secs(10);
+        let cycled = folders(&[false, false]);
+        let one_waits = folders(&[false, true]);
+        let to_come = |status: Value| first_syncs_to_come(&status, since);
+        assert_eq!(to_come(status(false, 2, 1, one_waits.clone())), 0);
+        assert_eq!(to_come(status(false, 2, 11, Value::Null)), 0);
+        assert_eq!(to_come(status(true, 0, 1, one_waits.clone())), 0);
+        // A cycle has reported since the change: each folder that it
+        // says waits.
+        assert_eq!(to_come(status(true, 2, 1, cycled.clone())), 0);
+        assert_eq!(to_come(status(true, 2, 9, one_waits.clone())), 1);
+        // None has, or there is no report: each mapped folder.
+        assert_eq!(
+            first_syncs_to_come(&status(true, 2, 10, cycled.clone()), since),
+            2
+        );
+        assert_eq!(first_syncs_to_come(&status(true, 2, 11, cycled), since), 2);
+        assert_eq!(
+            first_syncs_to_come(&status(true, 3, 1, Value::Null), since),
+            3
+        );
+        let unsaid = json!({ "enabled": true, "mappings": [{}], "report": one_waits });
+        assert_eq!(first_syncs_to_come(&unsaid, since), 1);
+    }
+
+    /// Of a record that does not count nothing is asked, and its key is
+    /// not removed by the recovery (decision 2026-10-04 §9, step 3):
+    /// unless the change recovered from had removed that key already,
+    /// and then it is said to stay removed.
+    #[test]
+    fn test_what_is_said_of_a_record_of_which_nothing_is_asked() {
+        assert_eq!(
+            not_asked_says(false),
+            "  It is no device: nothing is asked of it, nothing that it wrote is brought back, \
+             and its key is not removed."
+        );
+        assert_eq!(
+            not_asked_says(true),
+            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
+             back. Its key was removed before this recovery, and stays removed."
         );
     }
 }

@@ -346,8 +346,15 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
     ] {
         assert!(said.contains(shown), "{shown}: {said}");
     }
+    // What is still to send, as it stood when the look ended: the name;
+    // or, with the name sent, the machine's personal channel, in which
+    // it then writes that it has sent what it carried; or nothing.
     assert!(
         said.contains("keep this machine on: 1 name still to send")
+            || said.contains(
+                "keep this machine on: its personal channel, which lists the names, is still \
+                 to send"
+            )
             || said.contains("Nothing is waiting to be sent to a relay that is connected."),
         "{said}"
     );
