@@ -66,14 +66,16 @@ impl Node {
     }
 
     /// The binary, told to use this node's configuration, data directory
-    /// and home, and without four things of whoever runs the tests: any
+    /// and home, and without five things of whoever runs the tests: any
     /// `CORDELIA_` variable and `RUST_LOG` (either would stand in place of
     /// the node's configuration), any proxy (the tests of what a command
-    /// does with one set their own), and git's own variables (the binary
+    /// does with one set their own), git's own variables (the binary
     /// hands its environment to `git` where it asks which repository a
-    /// folder is in, and `GIT_DIR` would answer for the caller's). The
-    /// rest of the environment is left. Of it the binary reads `NO_COLOR`
-    /// and the user's name.
+    /// folder is in, and `GIT_DIR` would answer for the caller's), and
+    /// `STY`, which says that the tests themselves are run inside GNU
+    /// `screen` (a command that shows something once reads it: the test
+    /// of that sets its own). The rest of the environment is left. Of it
+    /// the binary reads `NO_COLOR` and the user's name.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -97,6 +99,7 @@ impl Node {
                 name.starts_with("CORDELIA_")
                     || name.starts_with("GIT_")
                     || name == "RUST_LOG"
+                    || name == "STY"
                     || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
@@ -169,7 +172,22 @@ impl Node {
     /// 2026-10-04 §5). A program that has a shell can give a command a
     /// terminal, and this does.
     pub fn at_terminal(&self, args: &[&str]) -> AtTerminal {
-        AtTerminal::running(self.name, self.binary(), args)
+        AtTerminal::running(self.name, self.binary(), args, None)
+    }
+
+    /// [`Self::at_terminal`], with `vars` set for the command: the
+    /// caller's own are taken out first, as for any command.
+    pub fn at_terminal_given(&self, vars: &[(&str, &str)], args: &[&str]) -> AtTerminal {
+        let mut command = self.binary();
+        command.envs(vars.iter().copied());
+        AtTerminal::running(self.name, command, args, None)
+    }
+
+    /// [`Self::at_terminal`], at a terminal that says it has this many
+    /// columns and lines. (The terminal that the others are run at says
+    /// nothing of its size.)
+    pub fn at_terminal_of(&self, columns: u16, lines: u16, args: &[&str]) -> AtTerminal {
+        AtTerminal::running(self.name, self.binary(), args, Some((columns, lines)))
     }
 
     /// Run a CLI command against this node with a terminal for its input,
@@ -237,7 +255,7 @@ impl Node {
         let config = self.dir.path().join("config-through.toml");
         std::fs::write(&config, through).unwrap();
         let inherited = std::env::vars_os().map(|(name, _)| name);
-        AtTerminal::running(self.name, self.binary_at(&config, inherited), args)
+        AtTerminal::running(self.name, self.binary_at(&config, inherited), args, None)
     }
 
     /// Start a second node on this node's data directory, with ports of
@@ -738,6 +756,9 @@ pub struct AtTerminal {
     child: Child,
     /// The test's end of the terminal, to type at.
     types: std::fs::File,
+    /// The command's end of the terminal, by its name: for whoever reads
+    /// the terminal once the command has ended.
+    theirs: PathBuf,
     /// What the command says, as it arrives.
     reads: std::sync::mpsc::Receiver<Vec<u8>>,
     /// Everything it has said so far, and what was typed where the
@@ -782,11 +803,28 @@ enum Heard {
 }
 
 impl AtTerminal {
-    fn running(name: &'static str, mut command: Command, args: &[&str]) -> Self {
+    /// Run `command` with `args` at a terminal of its own, which says
+    /// that it has `size` columns and lines where one is given, and
+    /// nothing of its size otherwise.
+    fn running(
+        name: &'static str,
+        mut command: Command,
+        args: &[&str],
+        size: Option<(u16, u16)>,
+    ) -> Self {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
         grantpt(&ours).unwrap();
         unlockpt(&ours).unwrap();
+        if let Some((columns, lines)) = size {
+            let size = rustix::termios::Winsize {
+                ws_row: lines,
+                ws_col: columns,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            rustix::termios::tcsetwinsize(&ours, size).expect("the terminal takes its size");
+        }
         let theirs = ptsname(&ours, Vec::new()).unwrap();
         let theirs = std::path::PathBuf::from(theirs.to_str().unwrap());
         let end = || {
@@ -823,6 +861,7 @@ impl AtTerminal {
             args: args.join(" "),
             child,
             types: ours,
+            theirs,
             reads,
             said: String::new(),
             begun: Vec::new(),
@@ -941,11 +980,21 @@ impl AtTerminal {
     /// Press keys that are no line: `bytes` go to the terminal as they
     /// are, with no Enter after them.
     pub fn presses(&mut self, bytes: &[u8]) -> &mut Self {
-        use std::io::Write;
         std::thread::sleep(Duration::from_millis(150));
+        self.sends(bytes);
+        self
+    }
+
+    /// Send `bytes` to the terminal at once, with no moment taken before
+    /// them, as a person does who goes on typing: when they were sent.
+    /// The command cannot have read them before then, so what it says of
+    /// them is timed from then.
+    pub fn sends(&mut self, bytes: &[u8]) -> Instant {
+        use std::io::Write;
+        let sent = Instant::now();
         self.types.write_all(bytes).unwrap();
         self.types.flush().unwrap();
-        self
+        sent
     }
 
     /// Whether the terminal shows what is typed, and makes signals of the
@@ -972,8 +1021,23 @@ impl AtTerminal {
         self.ends_within(Duration::from_secs(300))
     }
 
+    /// [`Self::ends`], and what the command left at its terminal: what
+    /// was typed there and is still waiting, unread, for whoever reads
+    /// the terminal next, as a shell does once a command has ended.
+    pub fn ends_and_leaves(mut self) -> (bool, String, String) {
+        let (success, said) = self.has_ended_within(Duration::from_secs(300));
+        // The terminal is there for as long as the test holds its end.
+        (success, said, left_typed_at(&self.theirs))
+    }
+
     /// [`Self::ends`], for a command that must end within `long`.
     pub fn ends_within(mut self, long: Duration) -> (bool, String) {
+        self.has_ended_within(long)
+    }
+
+    /// Wait for the command to end, within `long`: whether it succeeded,
+    /// and everything that its terminal showed.
+    fn has_ended_within(&mut self, long: Duration) -> (bool, String) {
         let deadline = Instant::now() + long;
         let status = loop {
             let heard = self.hears(Duration::from_millis(100));
@@ -1038,6 +1102,37 @@ impl AtTerminal {
         );
         said
     }
+}
+
+/// What waits, typed and unread, at the terminal named `theirs`: read as
+/// the next reader of the terminal would read it, a key at a time and
+/// without waiting for more.
+fn left_typed_at(theirs: &std::path::Path) -> String {
+    use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
+    use std::io::Read;
+    let mut end = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(theirs)
+        .unwrap();
+    // Each key as it lies there, whether or not a line was ended: and a
+    // read that finds none comes back at once.
+    let mut reads = tcgetattr(&end).expect("the terminal says how it is set");
+    reads
+        .local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO);
+    reads.special_codes[SpecialCodeIndex::VMIN] = 0;
+    reads.special_codes[SpecialCodeIndex::VTIME] = 0;
+    tcsetattr(&end, OptionalActions::Now, &reads).expect("the terminal is set");
+    let mut left = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = end.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        left.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&left).into_owned()
 }
 
 impl Drop for AtTerminal {
