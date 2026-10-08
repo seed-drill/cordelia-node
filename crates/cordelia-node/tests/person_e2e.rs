@@ -707,7 +707,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let said = at.refused_within(soon);
     assert!(
         said.contains(
-            "Three words did not match. Nothing was made, and the words you were shown are not a \
+            "Three tries did not match. Nothing was made, and the words you were shown are not a \
              recovery phrase: do not keep them. Run `cordelia phrase` again."
         ),
         "{said}"
@@ -2551,7 +2551,7 @@ fn a_word_that_is_not_in_the_list_is_asked_again_and_is_no_miss() {
     ] {
         at.types(typed);
         // Either cross ends so, and the first number is asked again.
-        let asked_again = at.says_one_of(&["again.\r\n   1. ", "Three words did not match"]);
+        let asked_again = at.says_one_of(&["again.\r\n   1. ", "Three tries did not match"]);
         assert_eq!(asked_again, 0, "after {typed:?}:\n{}", at.said);
         crosses.push_str(&match is_of_the_list {
             true => does_not_match(1),
@@ -2565,7 +2565,7 @@ fn a_word_that_is_not_in_the_list_is_asked_again_and_is_no_miss() {
         );
     }
     at.types(&words);
-    let typed_back = at.says_one_of(&["All twelve match.", "Three words did not match"]);
+    let typed_back = at.says_one_of(&["All twelve match.", "Three tries did not match"]);
     assert_eq!(typed_back, 0, "{}", at.said);
     let said = at.done();
     assert!(
@@ -2800,7 +2800,7 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
                      again.\r\n  {number:>2}. "
                 ),
                 "\u{2713}",
-                "Three words did not match",
+                "Three tries did not match",
             ]);
             assert_eq!(said, 0, "at word {number}:\n{}", at.said);
             // The word as it was shown, and the ones after it: each
@@ -2827,7 +2827,7 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
     let to_the_ninth = two_misses(&mut at, &shown);
     at.types(another_word_than(shown[8]));
     let stopped = at.says_one_of(&[
-        "Three words did not match.",
+        "Three tries did not match.",
         "That does not match word 9.",
         "\u{2713}",
     ]);
@@ -2835,7 +2835,7 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
     let said = at.refused_within(std::time::Duration::from_secs(60));
     assert!(
         said.contains(&format!(
-            "{to_the_ninth}   9. \u{2717}\r\nError: Three words did not match. Nothing was made, \
+            "{to_the_ninth}   9. \u{2717}\r\nError: Three tries did not match. Nothing was made, \
              and the words you were shown are not a recovery phrase: do not keep them. Run \
              `cordelia phrase` again."
         )),
@@ -2860,7 +2860,7 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
     let shown: Vec<&str> = words.split(' ').collect();
     let to_the_ninth = two_misses(&mut at, &shown);
     at.types(&shown[8..].join(" "));
-    let typed_back = at.says_one_of(&["All twelve match.", "Three words did not match"]);
+    let typed_back = at.says_one_of(&["All twelve match.", "Three tries did not match"]);
     assert_eq!(typed_back, 0, "{}", at.said);
     let said = at.done();
     assert!(
@@ -2959,7 +2959,7 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
 
     // Each word from the fourth on, as it was shown.
     at.types(&shown[3..].join(" "));
-    let typed_back = at.says_one_of(&["All twelve match.", "Three words did not match"]);
+    let typed_back = at.says_one_of(&["All twelve match.", "Three tries did not match"]);
     assert_eq!(typed_back, 0, "{}", at.said);
     let said = at.done();
     let all = format!(
@@ -3023,7 +3023,7 @@ fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
     at.types(&shown[1..].join(" "));
     let typed_back = at.says_one_of(&[
         "All twelve match.",
-        "Three words did not match",
+        "Three tries did not match",
         "That is not a word from the list. Type word 2 again.",
         "That does not match word",
     ]);

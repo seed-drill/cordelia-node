@@ -383,7 +383,7 @@ fn alone_says(seen: &Value, from: &str) -> String {
 /// **Each word typed back is held against the word that was shown at its
 /// number** (decision 2026-10-04 §16), here and at no other command: a
 /// phrase written down wrongly is found out word by word. The third
-/// word that is not the word shown stops the command, and nothing is
+/// try that is not the word shown stops the command, and nothing is
 /// made ([`Terminal::phrase_back`]).
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
@@ -447,7 +447,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         )?;
         if !typed_back {
             anyhow::bail!(
-                "Three words did not match. Nothing was made, and the words you were shown are \
+                "Three tries did not match. Nothing was made, and the words you were shown are \
                  not a recovery phrase: do not keep them. Run `cordelia phrase` again."
             );
         }
