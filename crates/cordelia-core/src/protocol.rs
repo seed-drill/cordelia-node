@@ -1027,6 +1027,17 @@ pub const PHRASE_TYPED_BACK_MISSES: usize = 3;
 /// Nothing waits where a phrase is proved: no word is judged there.
 pub const PHRASE_MISS_PAUSE_SECS: u64 = 2;
 
+/// For how long nothing must have been typed, once a command has said of
+/// a word of a recovery phrase that it is not in the list, or at
+/// `cordelia phrase` that it is not the word shown, before it asks for
+/// the same number again (decision 2026-10-04 §16): what is typed until
+/// then is dropped. A person who types the words from paper without
+/// looking goes on typing after a slip. The words they go on with are
+/// not taken for the number that is asked again, where each would be a
+/// miss: one slip then spends one miss, and not all three. A second with
+/// no key is a person who has stopped typing.
+pub const PHRASE_QUIET_AFTER_CROSS_SECS: u64 = 1;
+
 /// The label under which a channel's entry key is derived from its secret
 /// (decision 2026-10-04 §2.1). Every label below is the `info` of
 /// HKDF-SHA256 unless it says otherwise, and no label begins another, so
@@ -2415,6 +2426,10 @@ mod tests {
         // said and of four before the second.
         assert_eq!(PHRASE_TYPED_BACK_MISSES, 3);
         assert_eq!(PHRASE_MISS_PAUSE_SECS, 2);
+        // After a cross, what is typed is dropped until a second has gone
+        // by with no key: no longer than a miss waits to be said.
+        assert_eq!(PHRASE_QUIET_AFTER_CROSS_SECS, 1);
+        const { assert!(PHRASE_QUIET_AFTER_CROSS_SECS <= PHRASE_MISS_PAUSE_SECS) };
         let longest = PHRASE_MISS_PAUSE_SECS << (PHRASE_TYPED_BACK_MISSES - 2);
         assert_eq!(longest, 4);
         // Fewer misses than words: a typing back that misses at every

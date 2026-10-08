@@ -701,7 +701,8 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let another = another_word_than(words.split(' ').next().unwrap());
     for _ in 0..2 {
         at.types(another);
-        at.says("That does not match word 1. Check what you wrote, and type it again.");
+        // It is said, and the number is asked again.
+        at.says("That does not match word 1. Check what you wrote, and type it again.\r\n   1. ");
     }
     at.types(another);
     let said = at.refused_within(soon);
@@ -720,7 +721,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     at.says("Press Enter when you have").types("");
     at.says("Now type the words back")
         .types("these are not twelve words");
-    at.says("That is not a word from the list. Type word 1 again.")
+    at.says("That is not a word from the list. Type word 1 again.\r\n   1. ")
         .ends_the_input();
     let said = at.refused_within(soon);
     assert!(said.contains("nothing was typed"), "{said}");
@@ -1035,7 +1036,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .find(|mistyped| cordelia_crypto::phrase::Phrase::parse(mistyped).is_err())
         .expect("one of six words in the place of another fails the checksum");
     let mut at = removes(&[&mistyped, "xyzzy"]);
-    at.says("That is not a word from the list. Type word 1 again.")
+    at.says("That is not a word from the list. Type word 1 again.\r\n   1. ")
         .types(&words);
     at.says("The change is made (change 2).");
     at.says(
@@ -2951,7 +2952,7 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
     // What follows a cross: its words, and the same number asked again.
     // (The number before the cross is not in these: it was said, and
     // waited for, before its word was typed.)
-    let no_word_says = "That is not a word from the list. Type word 1 again.\r\n   1. ";
+    let no_word_says = "That is not a word from the list. Type word 1 again.\r\n";
     let a_miss_says =
         "That does not match word 4. Check what you wrote, and type it again.\r\n   4. ";
 
@@ -2962,6 +2963,9 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
         at.types(no_word);
         at.says(no_word_says);
         quickest = quickest.min(typed.elapsed());
+        // The number is asked again once nothing has been typed for a
+        // second.
+        at.says("   1. ");
     }
     assert!(
         quickest < pause,
@@ -3198,6 +3202,137 @@ fn the_words_are_shown_numbered_and_are_gone_from_the_screen_afterwards() {
         )),
         "{afterwards:?}"
     );
+}
+
+/// **After a cross, the command waits for the person to stop typing**
+/// (decision 2026-10-04 §16): what is typed is dropped until nothing has
+/// been typed for a second, and only then is the same number asked
+/// again. A person who types the words from paper without looking goes
+/// on typing after a slip, and the words they go on with are not taken
+/// for the number that is asked again.
+///
+/// Here, at `cordelia phrase`, the third word typed back is another word
+/// of the list, and the words that were shown for the fourth, fifth and
+/// sixth follow it with no waiting: the fourth while the miss waits to
+/// be said, and the others once it is said. One miss is spent, and not
+/// three: nothing is answered, the third number is asked again no
+/// sooner than a second after the last of them was typed, and the words
+/// typed then, from the third on, are the phrase.
+#[test]
+fn a_person_who_goes_on_typing_after_a_miss_spends_one_miss_and_not_three() {
+    use cordelia_core::protocol::PHRASE_QUIET_AFTER_CROSS_SECS;
+    use std::time::{Duration, Instant};
+    let quiet = Duration::from_secs(PHRASE_QUIET_AFTER_CROSS_SECS);
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+
+    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
+    let shown: Vec<&str> = words.split(' ').collect();
+    let line = |word: &str| format!("{word}\n").into_bytes();
+    at.types(&shown[..2].join(" "));
+    at.says("\u{2713}\r\n   3. ");
+    // The slip, and the next word at once.
+    at.sends(&line(another_word_than(shown[2])));
+    at.sends(&line(shown[3]));
+    // The miss is said: and the person types on.
+    at.says("That does not match word 3. Check what you wrote, and type it again.\r\n");
+    at.sends(&line(shown[4]));
+    std::thread::sleep(Duration::from_millis(300));
+    let last = at.sends(&line(shown[5]));
+    // The third number is asked again, a second after they stopped.
+    at.says("   3. ");
+    let asked_again = Instant::now();
+    assert!(
+        asked_again.duration_since(last) >= quiet,
+        "the number was asked again {:?} after the last word was typed",
+        asked_again.duration_since(last)
+    );
+    let so_far = format!(
+        "{ASKS_THE_WORDS_BACK}\r\n\r\n{}{}   3. ",
+        ticks(1, 2),
+        does_not_match(3)
+    );
+    assert!(at.said.ends_with(&so_far), "{:?}", at.said);
+    // Each word from the third on, as it was shown.
+    at.types(&shown[2..].join(" "));
+    let typed_back = at.says_one_of(&[
+        "All twelve match.",
+        "Three tries did not match",
+        "That does not match word",
+    ]);
+    assert_eq!(typed_back, 0, "{}", at.said);
+    let said = at.done();
+    let all = format!(
+        "{ASKS_THE_WORDS_BACK}\r\n\r\n{}{}{}\r\nAll twelve match.\r\n",
+        ticks(1, 2),
+        does_not_match(3),
+        ticks(3, 12),
+    );
+    assert!(said.contains(&all), "{said:?}");
+    assert_eq!(look(&laptop)["change"], 1);
+}
+
+/// The same where a phrase is proved, after the one cross that is said
+/// there, which is for a word that is not in the list and says nothing
+/// of right or wrong (decision 2026-10-04 §16). Here at `cordelia
+/// renew` the third word is no word of the list, and the device's own
+/// fourth, fifth and sixth words follow the cross with no waiting. None
+/// is taken for the third: it is asked again no sooner than a second
+/// after the last of them was typed, and the words typed then, from the
+/// third on, are the phrase.
+#[test]
+fn where_a_phrase_is_proved_what_is_typed_on_after_a_cross_is_not_taken_for_the_word() {
+    use cordelia_core::protocol::PHRASE_QUIET_AFTER_CROSS_SECS;
+    use std::time::{Duration, Instant};
+    let quiet = Duration::from_secs(PHRASE_QUIET_AFTER_CROSS_SECS);
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let own: Vec<&str> = words.split(' ').collect();
+    let line = |word: &str| format!("{word}\n").into_bytes();
+
+    let mut at = renews_to_the_phrase(&laptop);
+    at.types(&own[..2].join(" "));
+    at.says("\u{2713}\r\n   3. ");
+    at.sends(&line("xyzzy"));
+    at.says("That is not a word from the list. Type word 3 again.\r\n");
+    at.sends(&line(own[3]));
+    std::thread::sleep(Duration::from_millis(300));
+    at.sends(&line(own[4]));
+    std::thread::sleep(Duration::from_millis(300));
+    let last = at.sends(&line(own[5]));
+    at.says("   3. ");
+    let asked_again = Instant::now();
+    assert!(
+        asked_again.duration_since(last) >= quiet,
+        "the number was asked again {:?} after the last word was typed",
+        asked_again.duration_since(last)
+    );
+    let so_far = format!(
+        "{ASKS_THE_PHRASE}\r\n\r\n{}{}   3. ",
+        ticks(1, 2),
+        not_in_the_list(3)
+    );
+    assert!(at.said.ends_with(&so_far), "{:?}", at.said);
+    at.types(&own[2..].join(" "));
+    let judged = at.says_one_of(&[
+        "The change is made (change 2).",
+        "It was mistyped",
+        "it is not the one that this device follows",
+        "Type word",
+    ]);
+    assert_eq!(judged, 0, "{}", at.said);
+    let all = format!(
+        "{ASKS_THE_PHRASE}\r\n\r\n{}{}{}\r\nThe change is made (change 2).",
+        ticks(1, 2),
+        not_in_the_list(3),
+        ticks(3, 12)
+    );
+    assert!(at.said.contains(&all), "{:?}", at.said);
+    drop(at);
+    assert_eq!(look(&laptop)["change"], 2);
 }
 
 /// **A prompt for the phrase ends with the line that the twelfth word

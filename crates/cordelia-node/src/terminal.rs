@@ -56,7 +56,9 @@
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use cordelia_core::protocol::{PHRASE_MISS_PAUSE_SECS, PHRASE_TYPED_BACK_MISSES, PHRASE_WORDS};
+use cordelia_core::protocol::{
+    PHRASE_MISS_PAUSE_SECS, PHRASE_QUIET_AFTER_CROSS_SECS, PHRASE_TYPED_BACK_MISSES, PHRASE_WORDS,
+};
 use cordelia_crypto::phrase::{PhraseError, place_in_list};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -144,6 +146,21 @@ impl ReadsKeys {
     /// other key is dropped as it is read: it is no part of what is
     /// typed next.
     fn waits(&self, long: Duration) -> anyhow::Result<()> {
+        self.drops_keys(long, false)
+    }
+
+    /// Wait until nothing has been typed for `quiet`, with nothing said:
+    /// what is typed until then is dropped as it is read, and each key
+    /// begins the wait again. So what a person goes on typing after a
+    /// cross is no answer to the number that is asked again (decision
+    /// 2026-10-04 §16). Ctrl-C ends it at once, with [`INTERRUPTED`].
+    fn waits_for_quiet(&self, quiet: Duration) -> anyhow::Result<()> {
+        self.drops_keys(quiet, true)
+    }
+
+    /// [`Self::waits`], or, where `a_key_begins_it_again`,
+    /// [`Self::waits_for_quiet`].
+    fn drops_keys(&self, long: Duration, a_key_begins_it_again: bool) -> anyhow::Result<()> {
         use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
         // How long one read waits for a key: a tenth of a second, which
         // is the terminal's own unit for it.
@@ -156,7 +173,7 @@ impl ReadsKeys {
         waits.special_codes[SpecialCodeIndex::VTIME] = 1;
         tcsetattr(stdin, OptionalActions::Now, &waits)
             .map_err(|e| anyhow::anyhow!("could not set the terminal for a wait: {e}"))?;
-        let until = Instant::now() + long;
+        let mut until = Instant::now() + long;
         let mut key = Zeroizing::new([0u8; 1]);
         let mut interrupted = false;
         while !interrupted {
@@ -167,6 +184,9 @@ impl ReadsKeys {
             let asked = Instant::now();
             if matches!(rustix::io::read(stdin, &mut *key), Ok(1..)) {
                 interrupted = INTERRUPT_KEYS.contains(&key[0]);
+                if a_key_begins_it_again {
+                    until = Instant::now() + long;
+                }
             } else if asked.elapsed() < a_read / 2 {
                 // A read that comes back with no key sooner than it
                 // waits for one is of a terminal that is gone: the wait
@@ -489,13 +509,15 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
 /// The number is said, right-aligned, and nothing that is typed after
 /// it is shown. **A word that is not in the list gets a cross and a few
 /// words, at once, and the same number is asked again**, with no bound:
-/// it is no guess at a word (decision 2026-10-04 §16). What was typed
-/// ahead of that is dropped first, as before any prompt: the rest of a
-/// line that was pasted is not taken for the word that is asked again.
+/// it is no guess at a word (decision 2026-10-04 §16). It is asked again
+/// once nothing has been typed for a second: the rest of a line that
+/// was pasted, and what a person goes on typing, are dropped, and not
+/// taken for the word that is asked again ([`ReadsKeys::waits_for_quiet`]).
 ///
 /// Where the input ends, this fails, and says how many words there were.
 #[cfg(unix)]
 fn word_of_the_list(
+    hidden: &ReadsKeys,
     number: usize,
     word: &mut Zeroizing<String>,
 ) -> anyhow::Result<(Zeroizing<u16>, Ended)> {
@@ -520,10 +542,10 @@ fn word_of_the_list(
             return Ok((Zeroizing::new(place), ended));
         }
         word.zeroize();
-        drop_what_was_typed_ahead();
         say(&format!(
             "✗  That is not a word from the list. Type word {number} again.\n"
         ))?;
+        hidden.waits_for_quiet(Duration::from_secs(PHRASE_QUIET_AFTER_CROSS_SECS))?;
     }
 }
 
@@ -649,7 +671,7 @@ impl Terminal {
     pub fn phrase(&self, asks: &str) -> anyhow::Result<Zeroizing<String>> {
         // Echo goes off before anything is asked: nothing typed here is
         // ever shown. What was typed before it is dropped.
-        let _hidden = ReadsKeys::set()?;
+        let hidden = ReadsKeys::set()?;
         say(&format!("{asks}\n\n"))?;
         // Room for twelve of the longest words, which are eight letters,
         // and the spaces between them; and for a word as it is typed,
@@ -659,7 +681,7 @@ impl Terminal {
         let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
         let mut last = Ended::Line;
         for number in 1..=PHRASE_WORDS {
-            (_, last) = word_of_the_list(number, &mut word)?;
+            (_, last) = word_of_the_list(&hidden, number, &mut word)?;
             // A word of the list: that is all the tick says, and all
             // that is known of the word here.
             say("✓\n")?;
@@ -699,11 +721,15 @@ impl Terminal {
     ///   it is dropped: it is not taken for the word that is asked
     ///   again. So each answer costs time, and neither a key held down
     ///   nor a line that was pasted spends every miss at once.
+    /// - After a miss is said, what is typed goes on being dropped until
+    ///   nothing has been typed for `PHRASE_QUIET_AFTER_CROSS_SECS`: a
+    ///   person who types on without looking spends one miss on a slip,
+    ///   and not one for each word that follows it.
     /// - At the miss numbered `PHRASE_TYPED_BACK_MISSES`, counted over
     ///   the whole typing back and not for each word, this stops, at
     ///   once, and gives back `false`.
-    /// - A word that is not in the list is no miss, and is asked again
-    ///   at once ([`word_of_the_list`]).
+    /// - A word that is not in the list is no miss: it is said at once,
+    ///   and asked again as after any cross ([`word_of_the_list`]).
     #[cfg(unix)]
     pub fn phrase_back(&self, asks: &str, shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
         let hidden = ReadsKeys::set()?;
@@ -713,7 +739,7 @@ impl Terminal {
         let mut number = 1;
         while number <= PHRASE_WORDS {
             // What is kept of the word is its place in the list.
-            let (place, ended) = word_of_the_list(number, &mut word)?;
+            let (place, ended) = word_of_the_list(&hidden, number, &mut word)?;
             word.zeroize();
             if *place == shown[number - 1] {
                 say("✓\n")?;
@@ -737,12 +763,14 @@ impl Terminal {
                 say("\n")?;
             }
             waited?;
-            // Whatever was typed while it waited answers nothing.
-            drop_what_was_typed_ahead();
             say(&format!(
                 "✗  That does not match word {number}. Check what you wrote, and type it \
                  again.\n"
             ))?;
+            // What was typed while it waited, and what is typed on,
+            // answers nothing: the number is asked again once a person
+            // has stopped typing.
+            hidden.waits_for_quiet(Duration::from_secs(PHRASE_QUIET_AFTER_CROSS_SECS))?;
         }
         Ok(true)
     }

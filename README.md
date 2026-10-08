@@ -68,7 +68,9 @@ them where only you can read them.
   outside `screen`.
 - A command asks for them by number, one word at a time, and shows nothing
   of what you type. After each word it puts a tick beside the number, or, for
-  a word that is not in the list, a cross, and asks for that number again.
+  a word that is not in the list, a cross, and asks for that number again
+  once you have stopped typing for a second: what you type on after a cross
+  is dropped.
   Twelve words typed on one line are taken in their order, and anything
   more on that line is dropped, unseen.
   - **Where the phrase is typed to prove it** (`remove-device`, `renew`,
