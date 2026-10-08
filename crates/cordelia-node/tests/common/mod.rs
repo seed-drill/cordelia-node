@@ -743,8 +743,29 @@ pub struct AtTerminal {
     /// Everything it has said so far, and what was typed where the
     /// terminal showed it.
     pub said: String,
+    /// The first bytes of a character that has arrived in part: they are
+    /// in `said` once the rest has come.
+    begun: Vec<u8>,
     /// How far into `said` what was waited for has been found.
     found_to: usize,
+}
+
+/// How many bytes at the end of `bytes` begin a character and do not end
+/// it: what a command says arrives in pieces, and a piece can end in the
+/// middle of a character that takes more than one byte.
+pub fn begun_at_the_end(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let needs = match bytes[bytes.len() - back] {
+            // A byte in the middle of a character: its first is before it.
+            0x80..=0xbf => continue,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => return 0,
+        };
+        return if needs > back { back } else { 0 };
+    }
+    0
 }
 
 /// What came of waiting for more of what a command says at its terminal.
@@ -804,6 +825,7 @@ impl AtTerminal {
             types: ours,
             reads,
             said: String::new(),
+            begun: Vec::new(),
             found_to: 0,
         }
     }
@@ -820,11 +842,23 @@ impl AtTerminal {
         use std::sync::mpsc::RecvTimeoutError;
         match self.reads.recv_timeout(wait) {
             Ok(bytes) => {
-                self.said.push_str(&String::from_utf8_lossy(&bytes));
+                // A character that has arrived in part waits for its
+                // rest: a mark of three bytes is one mark in `said`,
+                // however it arrived.
+                self.begun.extend_from_slice(&bytes);
+                let whole = self.begun.len() - begun_at_the_end(&self.begun);
+                self.said
+                    .push_str(&String::from_utf8_lossy(&self.begun[..whole]));
+                self.begun.drain(..whole);
                 Heard::More
             }
             Err(RecvTimeoutError::Timeout) => Heard::Nothing,
-            Err(RecvTimeoutError::Disconnected) => Heard::All,
+            Err(RecvTimeoutError::Disconnected) => {
+                // Nothing more can come: what had begun is all there is.
+                let rest = std::mem::take(&mut self.begun);
+                self.said.push_str(&String::from_utf8_lossy(&rest));
+                Heard::All
+            }
         }
     }
 
@@ -838,16 +872,40 @@ impl AtTerminal {
     /// length of silence: on a loaded machine what a command said last
     /// can arrive after the command has ended.
     pub fn says(&mut self, what: &str) -> &mut Self {
+        self.says_one_of(&[what]);
+        self
+    }
+
+    /// Wait until the command has said one of `whats`, after whatever was
+    /// waited for before, and say which: the one that it said first.
+    /// Fails as [`Self::says`] does where it says none of them.
+    ///
+    /// It is for a test that goes one of two ways by what a command says:
+    /// the test then fails on what was said, at once, and not on what
+    /// was never said, after three minutes.
+    pub fn says_one_of(&mut self, whats: &[&str]) -> usize {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
-            if let Some(at) = self.said[self.found_to..].find(what) {
-                self.found_to += at + what.len();
-                return self;
+            let first = whats
+                .iter()
+                .enumerate()
+                .filter_map(|(which, what)| {
+                    let at = self.said[self.found_to..].find(what)?;
+                    Some((at, which, what.len()))
+                })
+                .min();
+            if let Some((at, which, long)) = first {
+                self.found_to += at + long;
+                return which;
             }
             let no_more = self.hears(Duration::from_millis(200)) == Heard::All;
             if no_more || Instant::now() > deadline {
+                let none_of = match whats {
+                    [what] => format!("{what:?}"),
+                    _ => format!("any of {whats:?}"),
+                };
                 panic!(
-                    "{}: cordelia {} did not say {what:?}. It said:\n{}",
+                    "{}: cordelia {} did not say {none_of}. It said:\n{}",
                     self.name, self.args, self.said
                 );
             }

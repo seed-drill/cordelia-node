@@ -1377,6 +1377,36 @@ fn the_harness_starts_a_node_with_no_variable_it_does_not_know() {
     n.start_given(&[("CORDELIA_BOOTNODES", "relay.example:9474")]);
 }
 
+/// What a command says at its terminal arrives in pieces, and a piece can
+/// end in the middle of a character of several bytes, as a mark is. The
+/// harness keeps the bytes that begin one until the rest has come: they
+/// are never read as two characters that are none.
+#[test]
+fn the_harness_keeps_a_character_that_arrived_in_part_for_its_rest() {
+    let tick = "\u{2713}".as_bytes();
+    assert_eq!(tick.len(), 3);
+    let said = [b"   1. ", tick, b"\r\n"].concat();
+    // Whole: nothing is kept back, after plain text or after a mark.
+    for whole in [&b""[..], &said[..6], &said[..9], &said[..]] {
+        assert_eq!(begun_at_the_end(whole), 0, "{whole:?}");
+    }
+    // Cut in the mark: its one byte, or its two, wait for the rest.
+    assert_eq!(begun_at_the_end(&said[..7]), 1);
+    assert_eq!(begun_at_the_end(&said[..8]), 2);
+    // A character of two bytes, and one of four.
+    let (two, four) = ("\u{e9}".as_bytes(), "\u{1f511}".as_bytes());
+    assert_eq!((two.len(), four.len()), (2, 4));
+    assert_eq!(begun_at_the_end(&two[..1]), 1);
+    assert_eq!(begun_at_the_end(two), 0);
+    for cut in 1..4 {
+        assert_eq!(begun_at_the_end(&four[..cut]), cut);
+    }
+    assert_eq!(begun_at_the_end(four), 0);
+    // Bytes that are the middle of nothing are kept back by nothing.
+    assert_eq!(begun_at_the_end(&[b'a', 0x80, 0x80]), 0);
+    assert_eq!(begun_at_the_end(&[0x80, 0x80, 0x80, 0x80]), 0);
+}
+
 /// The harness makes personal nodes and relays: what those will dial can
 /// be known before they are started. A node of another role dials the
 /// addresses its peers hand it, which nothing read beforehand can show,
