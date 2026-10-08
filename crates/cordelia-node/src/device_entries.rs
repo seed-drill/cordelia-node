@@ -106,10 +106,11 @@ use cordelia_api::state::{
 };
 use cordelia_api::take::Taken;
 use cordelia_core::protocol::{
-    CHANNEL_PROOF_AGAIN_SECS, ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
-    ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
-    OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
-    PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
+    CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
+    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
+    OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
+    RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -298,6 +299,9 @@ struct Kept {
     left: HashMap<Part, Left>,
     /// A change that the device was answered with and could not apply.
     not_applied: Option<NotApplied>,
+    /// When the device last swept its old deletes, by the time of day in
+    /// seconds: none since the node started.
+    swept_at: Option<i64>,
 }
 
 /// A device's side of its relays, for the channels of its own (see the
@@ -874,15 +878,34 @@ impl DeviceEntries {
 
     /// Drop from the device's own store each delete that it has held for
     /// 90 days and that may go (decision 2026-10-04 §2.3, §7.3, §16;
-    /// [`cordelia_api::swept`]): on the node's hourly timer. A channel
-    /// that a delete went from is read again from its start by the next
-    /// whole pass. A node that is held up sweeps nothing.
+    /// [`cordelia_api::swept`]). A channel that a delete went from is
+    /// read again from its start by the next whole pass. A node that is
+    /// held up sweeps nothing.
+    ///
+    /// **Once a day.** The node's hourly timer asks, and the device
+    /// sweeps where DEVICE_DELETE_SWEEP_INTERVAL_SECS have gone by since
+    /// it last did, by the time of day, which goes on while a machine
+    /// sleeps: so a channel in which deletes come of age one after
+    /// another is read again from its start once a day at most. A node
+    /// sweeps when it starts, and where its clock was set back.
     pub fn sweep_deletes(&self) {
         let held_up = self.state.held.why().is_some();
         if held_up {
             return;
         }
-        let swept = cordelia_api::swept::sweep_deletes(&lock(&self.state.db), self.clock.unix());
+        let now = self.clock.unix();
+        {
+            let mut kept = lock(&self.kept);
+            let lately = kept.swept_at.is_some_and(|at| {
+                let since = u64::try_from(now.saturating_sub(at));
+                since.is_ok_and(|since| since < DEVICE_DELETE_SWEEP_INTERVAL_SECS)
+            });
+            if lately {
+                return;
+            }
+            kept.swept_at = Some(now);
+        }
+        let swept = cordelia_api::swept::sweep_deletes(&lock(&self.state.db), now);
         match swept {
             Ok(swept) if swept.slots > 0 => tracing::info!(
                 slots = swept.slots,
@@ -1362,8 +1385,9 @@ impl DeviceEntries {
     /// the pass ends there: the next reads the device's channels afresh.
     ///
     /// Says whether a whole pass read every channel that it pulls to its
-    /// end here: not where it ended early, and not where a pull stopped
-    /// short of the end of what the relay holds.
+    /// end here: not where it ended early, not where a pull stopped
+    /// short of the end of what the relay holds, and not where a channel
+    /// was passed by because its proof was not sent or not answered.
     async fn relay_pass(&self, link: &Link, kind: Pass) -> bool {
         let read = {
             let db = lock(&self.state.db);
@@ -1386,7 +1410,12 @@ impl DeviceEntries {
             if whole && channel.is_pulled() {
                 match self.prove(&at, channel, true).await {
                     Step::Done(true) => {}
-                    Step::Done(false) => continue,
+                    // The proof was not sent, or not answered: the
+                    // channel is passed by, and the pass has not read it.
+                    Step::Done(false) => {
+                        read_all = false;
+                        continue;
+                    }
                     Step::Stop => return false,
                 }
                 match self.pull(&at, channel).await {

@@ -1393,6 +1393,18 @@ pub const ENTRY_CHANNEL_USED_STEP_SECS: u64 = 60 * 60;
 /// TOMBSTONE_GC_INTERVAL_SECS. Hourly is plenty against 90 days.
 pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
 
+/// How often a device sweeps from its own store the deletes that it has
+/// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
+/// 2026-10-04 §16). A channel that a sweep took a delete of is read
+/// again from its start at every relay. Swept each hour, a folder in
+/// which a file is deleted every day would have its whole channel read
+/// again as often as a delete came of age; swept once a day, it is read
+/// again once a day at most. Against the 90 days that a delete is held,
+/// a day is nothing. The node's hourly timer asks
+/// (TOMBSTONE_GC_INTERVAL_SECS), and a device sweeps where this long has
+/// gone by since it last did.
+pub const DEVICE_DELETE_SWEEP_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
 /// How often a relay passes the entries it took on to the relays it works
 /// with (decision 2026-10-04 §2.4, item 6).
 /// Derived: as often as it passes on items of the older kind,
@@ -2527,6 +2539,22 @@ mod tests {
     /// The stream between relays that work together has a byte of its
     /// own, after the four of entries, and none of the older kind's. A
     /// holding of a channel is marked with 8 bytes.
+    #[test]
+    fn test_a_devices_sweep_of_old_deletes_decision_2026_10_04_16() {
+        // Once a day: a channel that a delete went from is read again
+        // from its start at every relay, once a day at most.
+        assert_eq!(DEVICE_DELETE_SWEEP_INTERVAL_SECS, 86_400);
+        // The node's hourly timer asks: a day is a whole number of its
+        // turns, and a delete that is held for 90 days is late by no
+        // more than a day.
+        assert_eq!(
+            DEVICE_DELETE_SWEEP_INTERVAL_SECS % TOMBSTONE_GC_INTERVAL_SECS,
+            0
+        );
+        let held_secs = u64::from(KEYED_TOMBSTONE_RETENTION_DAYS) * 24 * 60 * 60;
+        assert_eq!(held_secs / DEVICE_DELETE_SWEEP_INTERVAL_SECS, 90);
+    }
+
     #[test]
     fn test_relays_that_work_together_decision_2026_10_04_2_4() {
         assert_eq!(PROTOCOL_RELAY_ENTRIES, 0x14);

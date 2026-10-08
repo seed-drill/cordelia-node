@@ -1323,6 +1323,16 @@ pub struct SweptDeletes {
 /// are counted at once the slots have gone. A channel of which nothing is
 /// left is held no more.
 ///
+/// **A place that a swept entry had is not given again** (§2.4 item 3).
+/// An entry that is stored takes the place above the highest that the
+/// channel has. So where the entries with the highest places go, and the
+/// channel stays held, the last entry that is left takes the highest
+/// place there was. Whoever keeps a place in the holding, a device or a
+/// relay that pulls from this one, is then handed what is stored next:
+/// it would otherwise stand at or above the place that the next entry
+/// takes, and never be handed it. The holding and its mark are as they
+/// were.
+///
 /// Refused, with nothing dropped, on a database in which a device follows
 /// a phrase.
 pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, RelayError> {
@@ -1336,17 +1346,19 @@ pub fn sweep_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, RelayE
 fn swept_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, CordeliaError> {
     let by = now.saturating_sub(DELETE_HELD_SECS);
     let mut swept = SweptDeletes::default();
-    let mut lighter: Vec<[u8; 32]> = Vec::new();
+    // Each channel that something goes from, with the highest place that
+    // an entry of it had before anything went.
+    let mut lighter: Vec<([u8; 32], i64)> = Vec::new();
     for (channel, slot) in entries::slots_with_a_delete_stored(conn, by)? {
         if !entries::holds_only_deletes_stored(conn, &channel, &slot, by)? {
             continue;
         }
-        swept.entries += entries::remove_slot(conn, &channel, &slot)?;
-        if lighter.last() != Some(&channel) {
-            lighter.push(channel);
+        if lighter.last().map(|(channel, _)| channel) != Some(&channel) {
+            lighter.push((channel, entries::highest_place(conn, &channel)?));
         }
+        swept.entries += entries::remove_slot(conn, &channel, &slot)?;
     }
-    for channel in lighter {
+    for (channel, highest) in lighter {
         let bytes = entries::channel_cost(conn, &channel)?;
         if bytes == 0 {
             drop_channel(conn, &channel)?;
@@ -1358,6 +1370,11 @@ fn swept_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, CordeliaEr
             params![channel.as_slice(), to_sql(bytes)],
         )
         .map_err(storage)?;
+        // No place is given twice in one holding. Where the entries with
+        // the channel's highest places went, the last entry that is left
+        // takes the highest place there was: the next that is stored is
+        // then above every place that a reader has reached.
+        entries::move_last_to(conn, &channel, highest)?;
     }
     Ok(swept)
 }
@@ -4673,34 +4690,71 @@ mod tests {
     /// Whoever keeps a place in a channel is handed what the relay
     /// stores after it (decision 2026-10-04 §2.4 item 3): also once a
     /// sweep has taken the entry at that place, which was the last that
-    /// the relay had stored of the channel.
+    /// the relay had stored of the channel. The place of a swept entry
+    /// is not given again: the last entry that is left takes the highest
+    /// place there was, and the holding keeps its mark.
     #[test]
-    #[ignore = "shows that a sweep of the last-stored entry of a channel lets its place be given \
-                again under the same mark: a reader at that place is not handed the next entry"]
     fn test_a_reader_at_the_place_of_a_swept_delete_is_handed_what_is_stored_next() {
         let (conn, mut room) = relay();
+        let first = made(1, 1, 5, "first.md", "the first that was stored");
         let text = small(1, 1, 5);
         let gone = deleted(1, 1, 3, "gone.md");
+        // A reader that read the channel while it held the first alone.
+        take(&conn, &mut room, &first, &from(1), NOW).unwrap();
+        let early = paged(&conn, 1, true, 0, 100);
+        assert_eq!((early.entries.len(), early.next), (1, 1));
         for entry in [&text, &gone] {
             let taken = take(&conn, &mut room, entry, &from(1), NOW).unwrap();
             assert_eq!(taken, Taken::Stored);
         }
         // A reader reads the channel to its end, and keeps its place.
         let read = paged(&conn, 1, true, 0, 100);
-        assert_eq!(read.entries.len(), 2);
+        assert_eq!(read.entries.len(), 3);
         let (mark, place) = (read.mark, read.next);
+        assert_eq!(place, 3);
         // The delete goes at its 90 days. The channel is still held.
         let swept = sweep_deletes(&conn, NOW + 90 * DAY).unwrap();
         assert_eq!((swept.entries, swept.channels.len()), (1, 0));
+        // The holding is the one it was, and the reader is handed
+        // nothing more from the place it kept.
+        let nothing = pull(&conn, &channel(1), true, &mark, place, 100).unwrap();
+        assert_eq!((nothing.entries.len(), nothing.next), (0, place));
+        assert_eq!(nothing.mark, mark);
         // The next entry that is stored is handed to the reader, from
         // the place it kept.
         let new = made(1, 2, 1, "new.md", "written after the sweep");
         let taken = take(&conn, &mut room, &new, &from(1), NOW + 91 * DAY).unwrap();
         assert_eq!(taken, Taken::Stored);
         let next = pull(&conn, &channel(1), true, &mark, place, 100).unwrap();
-        assert_eq!(next.mark, mark);
+        assert_eq!(next.mark, mark, "a sweep leaves the holding its mark");
         let handed: Vec<[u8; 32]> = next.entries.iter().map(Entry::id).collect();
         assert_eq!(handed, [new.id()]);
+        assert_eq!(next.next, place + 1, "above the highest place there was");
+        // The reader that stood below what was swept is handed the last
+        // entry that was left, and the new one: nothing is passed over.
+        let later = pull(&conn, &channel(1), true, &early.mark, early.next, 100).unwrap();
+        let handed: Vec<[u8; 32]> = later.entries.iter().map(Entry::id).collect();
+        assert_eq!(handed, [text.id(), new.id()]);
+        // And whoever reads from the start is handed each entry once, in
+        // the order in which they were stored.
+        let all = paged(&conn, 1, true, 0, 100);
+        let handed: Vec<[u8; 32]> = all.entries.iter().map(Entry::id).collect();
+        assert_eq!(handed, [first.id(), text.id(), new.id()]);
+        assert_eq!((all.next, all.mark), (place + 1, mark));
+
+        // A sweep that leaves the entry with the highest place moves
+        // nothing: every place is as it was.
+        let (conn, mut room) = relay();
+        let stays = small(2, 1, 5);
+        for entry in [&deleted(2, 1, 3, "gone.md"), &stays] {
+            take(&conn, &mut room, entry, &from(1), NOW).unwrap();
+        }
+        let read = paged(&conn, 2, true, 0, 100);
+        assert_eq!((read.entries.len(), read.next), (2, 2));
+        assert_eq!(sweep_deletes(&conn, NOW + 90 * DAY).unwrap().entries, 1);
+        let after = pull(&conn, &channel(2), true, &read.mark, 1, 100).unwrap();
+        let handed: Vec<[u8; 32]> = after.entries.iter().map(Entry::id).collect();
+        assert_eq!((handed, after.next), (vec![stays.id()], 2));
     }
 
     /// A relay holds no list of who counts, so a slot goes only where

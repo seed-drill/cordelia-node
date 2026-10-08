@@ -101,6 +101,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             notice: None,
             carried: None,
             let_go: None,
+            let_go_alone: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
         let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
@@ -1092,14 +1093,33 @@ pub fn remove_mapping(
     Ok(())
 }
 
+/// What the node says where a name that a carry holds is not let go
+/// (decision 2026-10-04 §7.3): `waits` versions of it wait to be sent.
+pub fn not_let_go_says(name: &str, waits: usize) -> String {
+    let (versions, them, they_are) = match waits {
+        1 => ("1 version of it waits".to_string(), "it", "it is"),
+        n => (format!("{n} versions of it wait"), "them", "they are"),
+    };
+    format!(
+        "{name} is not let go: {versions} to be sent, and this device has sent {them} to no \
+         relay yet. The name can be let go once {they_are} sent: `cordelia devices` shows what \
+         this device has still to send."
+    )
+}
+
 /// Let go of the name `name`, where this device holds it by a carry that
 /// a person asked for, or by a recovery, with no folder mapped to it
 /// ([`crate::names::carried`], decision 2026-10-04 §7.3): the device says
 /// no longer that it syncs the name, and holds it no more, as for a name
 /// whose folder is unmapped ([`crate::names::stop`]). What its store held
-/// of the name's channel goes with it: what it had brought in there and
-/// had not yet sent is not sent. Says whether the name was let go: not
-/// where the device does not hold it so, and nothing is done then.
+/// of the name's channel goes with it. Says whether the name was let go:
+/// not where the device does not hold it so, and nothing is done then.
+///
+/// **While anything of the name waits to be sent, it is not let go**
+/// ([`crate::names::waits_to_be_sent`]): what a carry or a recovery
+/// brought in here, and no relay was sent, is nowhere else in the
+/// generation applied. The refusal says how much waits, and that the
+/// name can be let go once it is sent ([`not_let_go_says`]).
 pub fn let_go_of_a_carried_name(
     state: &AppState,
     db: &rusqlite::Connection,
@@ -1108,6 +1128,10 @@ pub fn let_go_of_a_carried_name(
     use crate::commands::refused;
     if !crate::names::carried(db).map_err(refused)?.contains(name) {
         return Ok(false);
+    }
+    let waits = crate::names::waits_to_be_sent(db, name).map_err(refused)?;
+    if waits > 0 {
+        return Err(ApiError::Conflict(not_let_go_says(name, waits)));
     }
     let now = chrono::Utc::now().timestamp();
     let held = crate::names::stop(db, &state.identity, name, now).map_err(refused)?;
@@ -1130,6 +1154,7 @@ pub async fn unmap(
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
     let mut let_go = None;
+    let mut alone = None;
     {
         let db = state
             .db
@@ -1139,14 +1164,30 @@ pub async fn unmap(
         match remove_mapping(&state.sync_control, &db, &body) {
             Ok(()) => names_follow(&state, &db, &before),
             Err(not_mapped) => match let_go_of_a_carried_name(&state, &db, &body.folder)? {
-                true => let_go = Some(body.folder.clone()),
+                true => {
+                    let_go = Some(body.folder.clone());
+                    alone = Some(listed_alone(&state, &db));
+                }
                 false => return Err(not_mapped),
             },
         }
     }
     let mut status = status(&state)?;
     status.let_go = let_go;
+    status.let_go_alone = alone;
     Ok(HttpResponse::Ok().json(status))
+}
+
+/// Whether the statement that this device has applied lists this device
+/// and no other: then no other device of the person's holds anything of
+/// a name, as after a recovery (decision 2026-10-04 §9, step 4).
+fn listed_alone(state: &AppState, db: &rusqlite::Connection) -> bool {
+    let own = state.identity.public_key();
+    let held = crate::person::held(db).ok().flatten();
+    held.is_some_and(|held| {
+        let devices = &held.statement.statement.devices;
+        !devices.is_empty() && devices.iter().all(|device| device.key == own)
+    })
 }
 
 // ── POST /api/v1/sync/status ───────────────────────────────────────
@@ -2457,7 +2498,51 @@ mod tests {
         assert_eq!(held(&db), ["lab", "team"]);
         assert_eq!(of_lab(&db), 1);
 
-        // The name that the carry holds: let go.
+        // The name that the carry holds, while what was brought in has
+        // been sent to no relay: it is not let go, the refusal says how
+        // much waits, and nothing changes.
+        let refusal = let_go_of_a_carried_name(&state, &db, "lab").unwrap_err();
+        let ApiError::Conflict(why) = &refusal else {
+            panic!("{refusal:?}");
+        };
+        assert_eq!(*why, not_let_go_says("lab", 1));
+        assert_eq!(
+            *why,
+            "lab is not let go: 1 version of it waits to be sent, and this device has sent it \
+             to no relay yet. The name can be let go once it is sent: `cordelia devices` shows \
+             what this device has still to send."
+        );
+        assert!(
+            not_let_go_says("lab", 3).starts_with(
+                "lab is not let go: 3 versions of it wait to be sent, and this device has sent \
+                 them to no relay yet. The name can be let go once they are sent:"
+            ),
+            "{}",
+            not_let_go_says("lab", 3)
+        );
+        assert_eq!(held(&db), ["lab", "team"]);
+        assert_eq!(said(&db), ["lab", "team"]);
+        assert_eq!(by_a_carry(&db), ["lab"]);
+        assert_eq!(of_lab(&db), 1);
+        assert!(state.own_channels.first_fetch_done(&lab, at));
+        // A relay had no room for it: it waits still.
+        let relay = [0xa1; 32];
+        let last = cordelia_storage::at_relays::last_taken(&db, &lab).unwrap();
+        cordelia_storage::at_relays::sent(&db, &relay, &lab, last).unwrap();
+        cordelia_storage::at_relays::refused(&db, &relay, &lab, last).unwrap();
+        assert!(let_go_of_a_carried_name(&state, &db, "lab").is_err());
+        assert_eq!(of_lab(&db), 1);
+        // A device that has stopped sends nothing: nothing waits to be
+        // sent there, and what it holds of a name is its person's to
+        // let go.
+        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 1);
+        held_rows::set_state(&db, held_rows::State::NotListed).unwrap();
+        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 0);
+        held_rows::set_state(&db, held_rows::State::Applied).unwrap();
+        // The relay holds it: the name is let go.
+        cordelia_storage::at_relays::not_refused(&db, &relay, &lab, last).unwrap();
+        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 0);
+        assert!(listed_alone(&state, &db));
         assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
         assert_eq!(held(&db), ["team"]);
         assert_eq!(said(&db), ["team"]);
@@ -2466,5 +2551,11 @@ mod tests {
         assert!(!state.own_channels.first_fetch_done(&lab, at));
         // Once.
         assert!(!let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+
+        // A statement that lists another device does not list this one
+        // alone: here, the device that added this one.
+        let mut two = Several::of_one_person(2);
+        let added = state_of(two.machines.remove(1));
+        assert!(!listed_alone(&added, &added.db.lock().unwrap()));
     }
 }

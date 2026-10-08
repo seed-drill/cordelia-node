@@ -24,7 +24,11 @@
 //!    device that counts it asks one of three things: the person still
 //!    has it, it is lost or broken, or it may be in someone else's
 //!    hands. No answer is suggested. A record that does not count is
-//!    shown as that, and nothing is asked of it.
+//!    shown as that, and nothing is asked of it: unless it fails only
+//!    for the bound of 64 counted devices, and a device of the statement
+//!    signed it that was not said to be in someone else's hands. Such a
+//!    key is asked about all the same: nothing is taken from it, and
+//!    said to be gone it is removed.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -58,7 +62,7 @@ use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
 use cordelia_core::protocol::{
-    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
+    MAX_COUNTED_DEVICES, MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
@@ -101,9 +105,49 @@ Of each, say one of three things. No answer is suggested: each is typed.
            what it means.";
 
 /// What is said of a record that does not count, in the place of a
-/// question (decision 2026-10-04 §9, step 3).
-const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
-    brought back, and its key is not removed.";
+/// question (decision 2026-10-04 §9, step 3). `removed` is whether the
+/// change recovered from, or one made apart from it that the recovery
+/// settles, lists the record's key as removed: a removed key stays
+/// removed in every change after, and in the one that this recovery
+/// makes.
+fn not_asked_says(removed: bool) -> &'static str {
+    match removed {
+        false => {
+            "  It is no device: nothing is asked of it, nothing that it wrote is brought \
+             back, and its key is not removed."
+        }
+        true => {
+            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
+             back. Its key was removed before this recovery, and stays removed."
+        }
+    }
+}
+
+/// What is said, in the place of nothing, of a key that is asked about
+/// though it does not count (decision 2026-10-04 §9, step 3): its record
+/// fails only for the bound of 64 counted devices, and a device of the
+/// statement signed it that was not said to be in someone else's hands
+/// ([`recover::asked_for_room`]). What each answer does is another thing
+/// for it than for a device that counts.
+const ASKED_FOR_ROOM: &str = "  That is the one thing its record fails for, so it is asked \
+    about all the same. Nothing that it wrote is brought back by this recovery, whatever is said \
+    of it: `lost` or `hands` removes its key, and what it wrote then comes in by `cordelia sync \
+    carry <name> --from <device>`, with the phrase; `have` leaves it to be added again by hand.";
+
+/// What is said of a key that is asked about for the bound of 64 alone,
+/// before its answer is asked: what is said of any row ([`row_says`]),
+/// and what the answers do for it ([`ASKED_FOR_ROOM`]). `under` is the
+/// device of the statement for whose record it is asked about: where
+/// the row shows another that added it, this one is named too.
+fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32]) -> String {
+    let mut says = row_says(rows, at, number);
+    if rows[at].added_by.is_some_and(|(shown, _)| shown != *under) {
+        let label = rows.iter().find(|row| row.key == *under);
+        let label = label.map(|row| row.label.as_str()).unwrap_or_default();
+        says.push_str(&format!("\n  {} added it too.", named(label, under)));
+    }
+    format!("{says}\n{ASKED_FOR_ROOM}")
+}
 
 /// What is said before the first question where the answers could not
 /// all be kept (decision 2026-10-04 §9, step 3): a statement has room for
@@ -160,21 +204,22 @@ fn read_channel(
 }
 
 /// [`read_channel`], with the relays at which the channel could not be
-/// read to its end, each by its name.
+/// read to its end, each by its name, and of how many relays the node
+/// said anything.
 fn read_and_not_read(
     config_path: &str,
     secret: &[u8; 32],
     sessions: &mut Sessions,
     own: &[u8; 32],
     what: &str,
-) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>)> {
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<String>, usize)> {
     let (entries, relays) = read_with_secret(config_path, secret, sessions, own)?;
     let not_read = not_read_to_its_end(&relays);
     for (relay, read) in &not_read {
         println!("  Could not read {what} at {relay} to its end ({read}).");
     }
     let not_read = not_read.into_iter().map(|(relay, _)| relay).collect();
-    Ok((entries, not_read))
+    Ok((entries, not_read, relays.len()))
 }
 
 /// Of what the node says of each relay, those at which a channel could
@@ -207,6 +252,32 @@ fn none_found_says(not_read: &[String]) -> String {
          known. Run `cordelia recover` again. Nothing was done.",
         not_read.join(", ")
     )
+}
+
+/// What a recovery is refused with where the personal channel of the
+/// change it recovers from, numbered `number`, was read to its end at
+/// none of the `relays` that the node said anything of (decision
+/// 2026-10-04 §9, step 3): `not_read` names each at which it was not.
+/// Which devices were added since that change, and which names are
+/// listed, is then not known, and nothing is asked. `None` where it was
+/// read to its end at one relay at least: the command goes on, and says
+/// before its yes at which it was not ([`will_do_lines`]).
+fn personal_not_read_says(number: u64, relays: usize, not_read: &[String]) -> Option<String> {
+    if not_read.len() < relays {
+        return None;
+    }
+    let at = match not_read.is_empty() {
+        true => "was read at no relay".to_string(),
+        false => format!(
+            "could not be read to its end at {}, and so at no relay",
+            not_read.join(", ")
+        ),
+    };
+    Some(format!(
+        "the personal channel of change {number} {at}: which devices were added since that \
+         change, and which names they sync, is not known. Run `cordelia recover` again. Nothing \
+         was done."
+    ))
 }
 
 /// What is said of two changes that were made apart, before the person
@@ -261,7 +332,9 @@ fn lists_lines(statement: &Statement, own: &[u8; 32]) -> anyhow::Result<Vec<Stri
 /// What is said of one device before its answer is asked (decision
 /// 2026-10-04 §9, step 3): its words and its label, whether the
 /// statement lists it or who added it since and when, and how much it
-/// signed in the personal channel.
+/// signed in the personal channel. A record that does not count is said
+/// to be one, and where it fails only for the bound of 64 counted
+/// devices, that is said.
 fn row_says(rows: &[Row], at: usize, number: u64) -> String {
     let row = &rows[at];
     let label_of = |key: &[u8; 32]| {
@@ -274,9 +347,13 @@ fn row_says(rows: &[Row], at: usize, number: u64) -> String {
             "added since change {number}, from {} at {}{}",
             named(&label_of(&adder), &adder),
             time_of(at),
-            match row.counts {
-                true => "",
-                false => ", by a record that does not count",
+            match (row.counts, row.no_room.is_empty()) {
+                (true, _) => String::new(),
+                (false, true) => ", by a record that does not count".to_string(),
+                (false, false) => format!(
+                    ", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted \
+                     already"
+                ),
             }
         ),
     };
@@ -306,11 +383,18 @@ fn asks_of(at: &Terminal, says: &str) -> anyhow::Result<Answer> {
 /// What a recovery will do, said before its yes (decision 2026-10-04
 /// §9): from whom the look takes and from whom it takes nothing; the
 /// names that are carried, and those that are left; and what stops.
+///
+/// `not_read` names each relay at which the personal channel of the
+/// change recovered from could not be read to its end. Where there is
+/// one, no name is said to be listed nowhere: devices added since the
+/// change, and names, may be missing from what was read, and that is
+/// said, with the relay.
 fn will_do_lines(
     generation: &Generation,
     answers: &[Answer],
     names: &recover::Names,
     own: &[u8; 32],
+    not_read: &[String],
 ) -> Vec<String> {
     let rows = &generation.rows;
     let taken = recover::takes(rows, answers);
@@ -323,11 +407,19 @@ fn will_do_lines(
         .iter()
         .filter(|row| taken.contains(&row.key) && row.key != *own)
         .collect();
+    // From a device that may be in someone else's hands, and from what
+    // it added; and from a key that does not count, which was asked
+    // about for the bound of 64 alone and said to be gone.
+    let gone = recover::gone(rows, answers);
     let nothing: Vec<&Row> = rows
         .iter()
         .enumerate()
         .filter(|(at, row)| {
-            row.counts && recover::in_other_hands(rows, answers, *at) && row.key != *own
+            let nothing = match row.counts {
+                true => recover::in_other_hands(rows, answers, *at),
+                false => gone.contains(&row.key),
+            };
+            nothing && row.key != *own
         })
         .map(|(_, row)| row)
         .collect();
@@ -364,7 +456,10 @@ fn will_do_lines(
         all.join(", ")
     };
     match names.carried.is_empty() {
-        true => lines.push("No name is carried: none is listed.".to_string()),
+        true => lines.push(match not_read.is_empty() {
+            true => "No name is carried: none is listed.".to_string(),
+            false => "No name is carried: none is listed in what was read.".to_string(),
+        }),
         false => lines.push(format!(
             "{} carried: {}.",
             match names.carried.len() {
@@ -373,6 +468,13 @@ fn will_do_lines(
             },
             said(&names.carried)
         )),
+    }
+    if !not_read.is_empty() {
+        lines.push(format!(
+            "The personal channel of the change recovered from could not be read to its end at \
+             {}: devices added since that change, and names, may be missing here.",
+            not_read.join(", ")
+        ));
     }
     if !names.over_the_bound.is_empty() {
         lines.push(format!(
@@ -449,7 +551,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let (handed, not_read) = {
+    let (handed, not_read, _) = {
         let secret = phrase.channel_secret()?;
         read_and_not_read(config_path, &secret, &mut sessions, &own, "it")?
     };
@@ -505,17 +607,19 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "\nRecovering from change {}. Reading its personal channel at each relay...",
         statement.number
     );
-    let generation = {
+    let (generation, personal_not_read) = {
         let personal = Zeroizing::new(derive::personal_secret(&for_phrase.secret)?);
-        let handed = read_channel(
-            config_path,
-            &personal,
-            &mut sessions,
-            &own,
-            "the personal channel",
-        )?;
+        let what = "the personal channel";
+        let (handed, not_read, relays) =
+            read_and_not_read(config_path, &personal, &mut sessions, &own, what)?;
+        // Read to its end at no relay: nothing is asked.
+        if let Some(refusal) = personal_not_read_says(statement.number, relays, &not_read) {
+            anyhow::bail!("{refusal}");
+        }
         let now = chrono::Utc::now().timestamp();
-        recover::read_generation(&from, &statement_key, &for_phrase.secret, &handed, now)?
+        let read =
+            recover::read_generation(&from, &statement_key, &for_phrase.secret, &handed, now)?;
+        (read, not_read)
     };
     let rows = &generation.rows;
     println!(
@@ -538,10 +642,20 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             continue;
         }
         // A record that does not count is shown as that, and nothing is
-        // asked of it.
+        // asked of it: unless only the bound of 64 kept its key out, and
+        // a device of the statement signed it that was not said to be
+        // in someone else's hands.
         if !rows[at_row].counts {
-            println!("{says}\n{NOT_ASKED}");
-            answers.push(Answer::NotAsked);
+            let Some((under, _)) = recover::asked_for_room(rows, &answers, at_row) else {
+                let key = &rows[at_row].key;
+                let removed = statement.removes(key)
+                    || apart_statement.is_some_and(|other| other.removes(key));
+                println!("{says}\n{}", not_asked_says(removed));
+                answers.push(Answer::NotAsked);
+                continue;
+            };
+            let says = for_room_says(rows, at_row, statement.number, &under);
+            answers.push(asks_of(&at, &says)?);
             continue;
         }
         let mut says = says;
@@ -607,7 +721,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     for line in lists_lines(&signs, &own)? {
         println!("{line}");
     }
-    for line in will_do_lines(&generation, &answers, &names, &own) {
+    for line in will_do_lines(&generation, &answers, &names, &own, &personal_not_read) {
         println!("{line}");
     }
     if !at.yes("\nRecover on this machine?")? {
@@ -872,6 +986,8 @@ pub fn recover_made(
     number: u64,
     cut_short: Option<String>,
 ) -> anyhow::Result<()> {
+    // The change was made a moment before this process began.
+    let began = std::time::Instant::now();
     println!(
         "Looking at what the relays hold of each name. The look is made once, and this command \
          stays until it has ended. Stopping it stops nothing: the node goes on."
@@ -921,10 +1037,44 @@ pub fn recover_made(
         );
     }
     let seen = look(config_path)?;
-    for line in after_lines(&seen) {
+    // What a folder that is mapped here has still to publish is in no
+    // store yet: whether one has still to sync for the first time is
+    // asked of the node's sync status. Where that cannot be had, each
+    // mapped folder is taken to.
+    let mapped = seen["folders"].as_u64().unwrap_or(0) as usize;
+    let first_syncs = match seen["sync_on"] == true && mapped > 0 {
+        true => crate::api_post(config_path, "/api/v1/sync/status", json!({}))
+            .map_or(mapped, |sync| first_syncs_to_come(&sync, began.elapsed())),
+        false => 0,
+    };
+    for line in after_lines(&seen, first_syncs) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// How many folders that this machine maps have still to sync for the
+/// first time since the recovery (decision 2026-10-04 §9, step 5), as
+/// the node's sync status `sync` says, `since` the change was made. A
+/// folder's first cycle in a name waits until the look has read that
+/// name. What it then publishes is to be sent, and until that cycle has
+/// run none of it is in the store, where what waits is counted.
+///
+/// None where sync is off, or no folder is mapped. Otherwise every
+/// mapped folder, where no cycle has reported since the change was made:
+/// the node says for how long it has had no report. And where one has,
+/// each folder of which the report says that it waits.
+fn first_syncs_to_come(sync: &Value, since: Duration) -> usize {
+    let mapped = list(sync, "mappings").count();
+    if sync["enabled"] != true || mapped == 0 {
+        return 0;
+    }
+    let no_report_for = sync["no_report_secs"].as_u64().unwrap_or(u64::MAX);
+    if sync["report"].is_null() || no_report_for >= since.as_secs() {
+        return mapped;
+    }
+    let waits = |folder: &&Value| folder["waiting"] == true;
+    list(&sync["report"], "folders").filter(waits).count()
 }
 
 /// What is said once the look has ended, of what the node says of this
@@ -932,7 +1082,15 @@ pub fn recover_made(
 /// the change; "keep this machine on" with how many names are still to
 /// send; and, for each device that the person still has, how it is added
 /// again.
-fn after_lines(seen: &Value) -> Vec<String> {
+///
+/// **That nothing is waiting is said only where nothing is.** Beside
+/// the names, the machine's personal channel is to be sent, which lists
+/// them: the node says how many of the machine's channels wait at each
+/// relay, and where no name does and a channel does, that is said. And
+/// `first_syncs` folders that are mapped here have still to sync for the
+/// first time since the recovery ([`first_syncs_to_come`]): what they
+/// publish is not in the store yet.
+fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for relay in list(seen, "relays") {
         lines.push(match relay["holds_latest"].as_bool() {
@@ -950,15 +1108,42 @@ fn after_lines(seen: &Value) -> Vec<String> {
         ));
     }
     let to_go = list(&seen["names"], "to_go").count();
-    lines.push(match to_go {
-        0 => "Nothing is waiting to be sent to a relay that is connected. `cordelia devices` \
-              shows what each relay holds."
-            .to_string(),
-        to_go => format!(
+    // The channels of this machine's own that wait at a relay which is
+    // connected: its personal channel among them.
+    let channels = |relay: &Value| relay["waits"].as_u64().unwrap_or(0);
+    let channels_wait = list(seen, "waiting").any(|relay| channels(relay) > 0);
+    match (to_go, channels_wait) {
+        (0, false) if first_syncs == 0 => lines.push(
+            "Nothing is waiting to be sent to a relay that is connected. `cordelia devices` \
+             shows what each relay holds."
+                .to_string(),
+        ),
+        (0, false) => {}
+        (0, true) => lines.push(
+            "keep this machine on: its personal channel, which lists the names, is still to \
+             send"
+                .to_string(),
+        ),
+        (to_go, _) => lines.push(format!(
             "keep this machine on: {} still to send",
             counted(to_go, "name")
-        ),
-    });
+        )),
+    }
+    if first_syncs > 0 {
+        lines.push(format!(
+            "keep this machine on: {} mapped here {} still to sync for the first time since \
+             the recovery, and what {} is then to send",
+            counted(first_syncs, "folder"),
+            match first_syncs {
+                1 => "has",
+                _ => "have",
+            },
+            match first_syncs {
+                1 => "it publishes",
+                _ => "they publish",
+            }
+        ));
+    }
     // A key that could not be shown is left out too, and is no device
     // that the person said they still have.
     let (not_shown, still): (Vec<&Value>, Vec<&Value>) =
@@ -1008,6 +1193,7 @@ mod tests {
             added_by: added_by.map(|adder| ([adder; 32], 1_800_000_000)),
             counts,
             signed: usize::from(n),
+            no_room: Vec::new(),
         }
     }
 
@@ -1058,6 +1244,91 @@ mod tests {
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
         let says = row_says(&odd, 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
+    }
+
+    /// A key that only the bound of 64 counted devices kept out is shown
+    /// with that reason (decision 2026-10-04 §9, step 3). Where it is
+    /// asked about, what each answer does for it is said before the
+    /// question: nothing that it wrote is brought back, `lost` or
+    /// `hands` removes its key, and `have` leaves it to be added again.
+    /// Before the yes it is named among those from whom the look takes
+    /// nothing, where it was said to be gone.
+    #[test]
+    fn test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out() {
+        let mut rows = rows();
+        // A watch that the desktop added, and the laptop too: its record
+        // found no room.
+        let mut watch = row(5, "watch", Some(1), false);
+        watch.no_room = vec![([1; 32], 1_800_000_000), ([2; 32], 1_800_000_000)];
+        rows.push(watch);
+        let says = row_says(&rows, 4, 7);
+        assert!(
+            says.contains(&format!(
+                "\"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 UTC, \
+                 by a record that does not count: 64 devices counted already. It signed 5 entries",
+                fingerprint::shown(&[1; 32])
+            )),
+            "{says}"
+        );
+        // Asked about for the record that the device shown signed.
+        let asked = for_room_says(&rows, 4, 7, &[1; 32]);
+        assert!(asked.starts_with(&says), "{asked}");
+        assert!(!asked.contains("added it too"), "{asked}");
+        assert!(
+            asked.ends_with(
+                "\n  That is the one thing its record fails for, so it is asked about all the \
+                 same. Nothing that it wrote is brought back by this recovery, whatever is said \
+                 of it: `lost` or `hands` removes its key, and what it wrote then comes in by \
+                 `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves it \
+                 to be added again by hand."
+            ),
+            "{asked}"
+        );
+        // Asked about for the record of another device than the one
+        // shown: that one is named too.
+        let asked = for_room_says(&rows, 4, 7, &[2; 32]);
+        assert!(
+            asked.contains(&format!(
+                "\n  ({}) \"desktop\" added it too.\n  That is the one thing",
+                fingerprint::shown(&[2; 32])
+            )),
+            "{asked}"
+        );
+
+        // Before the yes: said to be lost, it is one of those from whom
+        // the look takes nothing, with the command that brings what it
+        // wrote. Said to be one that the person still has, it is not.
+        let generation = Generation {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let names = recover::Names::default();
+        let lost = [
+            Answer::Lost,
+            Answer::Lost,
+            Answer::Lost,
+            Answer::NotAsked,
+            Answer::Lost,
+        ];
+        let all = will_do_lines(&generation, &lost, &names, &[9; 32], &[]).join("\n");
+        assert!(
+            all.contains(&format!(
+                "It takes nothing from: ({}) \"watch\". What they wrote comes in only by \
+                 `cordelia sync carry <name> --from <device>`.",
+                fingerprint::shown(&[5; 32])
+            )),
+            "{all}"
+        );
+        let mut have = lost;
+        have[4] = Answer::Have;
+        let all = will_do_lines(&generation, &have, &names, &[9; 32], &[]).join("\n");
+        assert!(!all.contains("It takes nothing from"), "{all}");
+        // Nor where each device that signed its record may be in someone
+        // else's hands: nothing was asked of it, whatever stands there.
+        let mut hands = lost;
+        (hands[0], hands[1]) = (Answer::OtherHands, Answer::OtherHands);
+        let all = will_do_lines(&generation, &hands, &names, &[9; 32], &[]).join("\n");
+        assert!(!all.contains("\"watch\""), "{all}");
     }
 
     /// Of two changes made apart, the command says how many more are on
@@ -1129,6 +1400,82 @@ mod tests {
             "{none}"
         );
         assert!(none.ends_with("Nothing was done."));
+    }
+
+    /// Where the personal channel of the change recovered from was read
+    /// to its end at no relay, the recovery is refused before anything
+    /// is asked, and says at which relays it could not be read (decision
+    /// 2026-10-04 §9, step 3). Where it was read to its end at one relay
+    /// at least, the command goes on, and says before its yes that
+    /// devices added since and names may be missing, and at which relay:
+    /// no name is then said to be listed nowhere.
+    #[test]
+    fn test_a_personal_channel_that_was_not_read_is_never_said_to_list_nothing() {
+        let at = |relays: &[&str]| -> Vec<String> {
+            relays.iter().map(|relay| relay.to_string()).collect()
+        };
+        // Read to its end at each relay, or at one of two: it goes on.
+        assert_eq!(personal_not_read_says(3, 2, &[]), None);
+        assert_eq!(personal_not_read_says(3, 2, &at(&["two"])), None);
+        assert_eq!(personal_not_read_says(3, 1, &[]), None);
+        // At neither of two, and not at the only one: refused.
+        let refused = personal_not_read_says(3, 2, &at(&["one", "two"])).unwrap();
+        assert_eq!(
+            refused,
+            "the personal channel of change 3 could not be read to its end at one, two, and so \
+             at no relay: which devices were added since that change, and which names they \
+             sync, is not known. Run `cordelia recover` again. Nothing was done."
+        );
+        assert!(personal_not_read_says(3, 1, &at(&["one"])).is_some());
+        // The node said nothing of any relay: it was read nowhere.
+        let nowhere = personal_not_read_says(4, 0, &[]).unwrap();
+        assert!(
+            nowhere.starts_with("the personal channel of change 4 was read at no relay: which"),
+            "{nowhere}"
+        );
+        assert!(nowhere.ends_with("Nothing was done."));
+
+        // Before the yes. Read to its end at every relay: as before.
+        let generation = Generation {
+            rows: rows(),
+            ..Default::default()
+        };
+        let answers = [Answer::Lost, Answer::Lost, Answer::Lost, Answer::NotAsked];
+        let none = recover::Names::default();
+        let own = [9; 32];
+        let whole = will_do_lines(&generation, &answers, &none, &own, &[]).join("\n");
+        assert!(
+            whole.contains("No name is carried: none is listed.\n"),
+            "{whole}"
+        );
+        assert!(!whole.contains("could not be read"), "{whole}");
+        // Not at one relay: no name is said to be listed nowhere.
+        let part = will_do_lines(&generation, &answers, &none, &own, &at(&["two"])).join("\n");
+        assert!(
+            part.contains(
+                "No name is carried: none is listed in what was read.\nThe personal channel of \
+                 the change recovered from could not be read to its end at two: devices added \
+                 since that change, and names, may be missing here.\n"
+            ),
+            "{part}"
+        );
+        assert!(!part.contains("none is listed.\n"), "{part}");
+        // And where names are carried, that more may be missing is said
+        // all the same.
+        let lab = recover::Names {
+            carried: vec!["lab".into()],
+            ..Default::default()
+        };
+        let not_read = at(&["two", "three"]);
+        let part = will_do_lines(&generation, &answers, &lab, &own, &not_read).join("\n");
+        assert!(
+            part.contains(
+                "1 name is carried: lab.\nThe personal channel of the change recovered from \
+                 could not be read to its end at two, three: devices added since that change, \
+                 and names, may be missing here.\n"
+            ),
+            "{part}"
+        );
     }
 
     /// Where the answers could not all be kept, that is said before the
@@ -1203,7 +1550,7 @@ mod tests {
         // The laptop is lost; the desktop may be in someone else's
         // hands, and with it the phone it added.
         let answers = [Answer::Lost, Answer::OtherHands, Answer::Have, Answer::Have];
-        let all = will_do_lines(&generation, &answers, &names, &[9; 32]).join("\n");
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &[]).join("\n");
         assert!(
             all.contains(&format!(
                 "The look takes what these wrote, as the relays hold it now: ({}) \"laptop\".",
@@ -1254,7 +1601,7 @@ mod tests {
             Answer::Have,
         ];
         let empty = recover::Names::default();
-        let all = will_do_lines(&generation, &none, &empty, &[9; 32]).join("\n");
+        let all = will_do_lines(&generation, &none, &empty, &[9; 32], &[]).join("\n");
         assert!(
             all.contains("Nothing that those devices wrote is brought back by this recovery."),
             "{all}"
@@ -1378,7 +1725,7 @@ mod tests {
                 { "label": "", "words": "m1 m2 m3 m4", "number": 3, "key": "cordelia_pk1y" },
             ],
         });
-        let lines = after_lines(&seen);
+        let lines = after_lines(&seen, 0);
         let all = lines.join("\n");
         // What could not be shown is no device that the person said they
         // still have: it is said apart, and is not to be added again.
@@ -1421,13 +1768,126 @@ mod tests {
             "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
             "names": { "to_go": [], "sent": ["a"] }, "left_out": [],
         });
-        let all = after_lines(&done).join("\n");
+        let all = after_lines(&done, 0).join("\n");
         assert!(all.contains("Nothing is waiting to be sent"), "{all}");
         assert!(!all.contains("keep this machine on"), "{all}");
         assert!(!all.contains("added again"), "{all}");
         let one = json!({ "relays": [], "names": { "to_go": ["a"] } });
         assert!(
-            after_lines(&one).contains(&"keep this machine on: 1 name still to send".to_string())
+            after_lines(&one, 0)
+                .contains(&"keep this machine on: 1 name still to send".to_string())
+        );
+    }
+
+    /// That nothing is waiting to be sent is said only where nothing is
+    /// (decision 2026-10-04 §9, step 5). The machine's personal channel,
+    /// which lists the names, is to be sent too: where no name waits and
+    /// a channel of the machine's own does, that is said. And a folder
+    /// that is mapped here has its first cycle once the look has read
+    /// its name: until it has synced, what it publishes is still to
+    /// come, and that is said.
+    #[test]
+    fn test_nothing_is_said_to_wait_only_where_nothing_does() {
+        let seen = |to_go: Value, waits: u64| {
+            json!({
+                "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
+                "names": { "to_go": to_go, "sent": [] }, "left_out": [],
+                "waiting": [{ "relay": "one", "waits": 0 }, { "relay": "two", "waits": waits }],
+            })
+        };
+        let nothing = "Nothing is waiting to be sent to a relay that is connected. `cordelia \
+                       devices` shows what each relay holds.";
+        let list_waits = "keep this machine on: its personal channel, which lists the names, is \
+                          still to send";
+        // Nothing waits anywhere.
+        let all = after_lines(&seen(json!([]), 0), 0);
+        assert!(all.contains(&nothing.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("keep this machine on"), "{all:?}");
+        // No name waits, and a channel of the machine's own does, at one
+        // relay: its personal channel.
+        let all = after_lines(&seen(json!([]), 1), 0);
+        assert!(all.contains(&list_waits.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
+        // Names wait: they are counted, as before.
+        let all = after_lines(&seen(json!(["a", "b"]), 3), 0);
+        assert!(
+            all.contains(&"keep this machine on: 2 names still to send".to_string()),
+            "{all:?}"
+        );
+        assert!(!all.contains(&list_waits.to_string()), "{all:?}");
+        // A folder has still to sync for the first time: nothing is said
+        // to be done, whatever waits in the store.
+        let first = "keep this machine on: 1 folder mapped here has still to sync for the first \
+                     time since the recovery, and what it publishes is then to send";
+        let all = after_lines(&seen(json!([]), 0), 1);
+        assert!(all.contains(&first.to_string()), "{all:?}");
+        assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
+        let all = after_lines(&seen(json!(["a"]), 1), 2).join("\n");
+        assert!(
+            all.contains("keep this machine on: 1 name still to send"),
+            "{all}"
+        );
+        assert!(
+            all.contains(
+                "keep this machine on: 2 folders mapped here have still to sync for the first \
+                 time since the recovery, and what they publish is then to send"
+            ),
+            "{all}"
+        );
+
+        // Which folders have still to sync, as the node's sync status
+        // says. Sync is off, or nothing is mapped: none.
+        let status = |enabled: bool, mapped: usize, no_report_secs: u64, report: Value| {
+            let mappings: Vec<Value> = (0..mapped).map(|n| json!({ "name": n })).collect();
+            json!({
+                "enabled": enabled, "mappings": mappings, "no_report_secs": no_report_secs,
+                "report": report,
+            })
+        };
+        let folders = |waiting: &[bool]| {
+            let folders: Vec<Value> = waiting.iter().map(|w| json!({ "waiting": w })).collect();
+            json!({ "folders": folders })
+        };
+        let since = Duration::from_secs(10);
+        let cycled = folders(&[false, false]);
+        let one_waits = folders(&[false, true]);
+        let to_come = |status: Value| first_syncs_to_come(&status, since);
+        assert_eq!(to_come(status(false, 2, 1, one_waits.clone())), 0);
+        assert_eq!(to_come(status(false, 2, 11, Value::Null)), 0);
+        assert_eq!(to_come(status(true, 0, 1, one_waits.clone())), 0);
+        // A cycle has reported since the change: each folder that it
+        // says waits.
+        assert_eq!(to_come(status(true, 2, 1, cycled.clone())), 0);
+        assert_eq!(to_come(status(true, 2, 9, one_waits.clone())), 1);
+        // None has, or there is no report: each mapped folder.
+        assert_eq!(
+            first_syncs_to_come(&status(true, 2, 10, cycled.clone()), since),
+            2
+        );
+        assert_eq!(first_syncs_to_come(&status(true, 2, 11, cycled), since), 2);
+        assert_eq!(
+            first_syncs_to_come(&status(true, 3, 1, Value::Null), since),
+            3
+        );
+        let unsaid = json!({ "enabled": true, "mappings": [{}], "report": one_waits });
+        assert_eq!(first_syncs_to_come(&unsaid, since), 1);
+    }
+
+    /// Of a record that does not count nothing is asked, and its key is
+    /// not removed by the recovery (decision 2026-10-04 §9, step 3):
+    /// unless the change recovered from had removed that key already,
+    /// and then it is said to stay removed.
+    #[test]
+    fn test_what_is_said_of_a_record_of_which_nothing_is_asked() {
+        assert_eq!(
+            not_asked_says(false),
+            "  It is no device: nothing is asked of it, nothing that it wrote is brought back, \
+             and its key is not removed."
+        );
+        assert_eq!(
+            not_asked_says(true),
+            "  It is no device: nothing is asked of it, and nothing that it wrote is brought \
+             back. Its key was removed before this recovery, and stays removed."
         );
     }
 }

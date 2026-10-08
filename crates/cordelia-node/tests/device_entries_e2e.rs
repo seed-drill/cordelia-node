@@ -4932,13 +4932,18 @@ async fn a_personal_node_makes_its_passes_on_its_timers_and_none_without_a_phras
     assert_eq!(channels_at(&relay), 3);
 }
 
-/// On the node's hourly timer a device drops from its own store each
-/// slot whose delete it has held for 90 days (decision 2026-10-04 §2.3,
-/// §7.3), by its own clock. A node that is held up sweeps nothing.
+/// A device drops from its own store each slot whose delete it has held
+/// for 90 days (decision 2026-10-04 §2.3, §7.3), by its own clock.
+/// **Once a day** (§16): the node's hourly timer asks, and the device
+/// sweeps where a day has gone by since it last did, so that a channel
+/// is read again from its start once a day at most. A node that is held
+/// up sweeps nothing, and sweeps when it is held up no more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     use cordelia_api::state::Held;
-    use cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS;
+    use cordelia_core::protocol::{
+        DEVICE_DELETE_SWEEP_INTERVAL_SECS, KEYED_TOMBSTONE_RETENTION_DAYS,
+    };
     let device = Device::new("laptop");
     device.makes_the_phrase(&phrase());
     device.holds("notes");
@@ -4953,7 +4958,21 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     device.engine.sweep_deletes();
     assert_eq!(device.holds_of(&channel).len(), 2);
 
+    // The delete comes of age. The device swept two minutes ago: asked
+    // again, within the day, it does not sweep.
+    assert_eq!(DEVICE_DELETE_SWEEP_INTERVAL_SECS, 24 * 60 * 60);
+    let (day, hour) = (
+        Duration::from_secs(DEVICE_DELETE_SWEEP_INTERVAL_SECS),
+        Duration::from_secs(60 * 60),
+    );
     device.clock.run_ahead(Duration::from_secs(120));
+    device.engine.sweep_deletes();
+    assert_eq!(device.holds_of(&channel).len(), 2, "swept twice in a day");
+    device.clock.run_ahead(day - hour);
+    device.engine.sweep_deletes();
+    assert_eq!(device.holds_of(&channel).len(), 2, "swept twice in a day");
+    // A day after it last swept.
+    device.clock.run_ahead(hour);
     let held = Held::FirstStart("the first start on this version is not done".into());
     device.state.held.hold(held);
     device.engine.sweep_deletes();
@@ -5065,6 +5084,42 @@ async fn a_file_made_again_under_a_swept_name_reaches_a_device_that_swept_later(
         Some("made again")
     );
     assert_eq!(desktop.text("lab", "other.md").as_deref(), Some("stays"));
+}
+
+/// A channel whose proof is not sent is passed by, and the whole pass
+/// has not read every channel to its end: it says so, as a pass does
+/// whose pull stopped short (decision 2026-10-04 §7.1, step 1). A device
+/// proves no more channels on a connection than a relay remembers for
+/// one: here, one. A device that proves each of its channels makes a
+/// pass that says no such thing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_passed_a_channel_by_for_its_proof_has_not_read_everything() {
+    // The whole passes that a device has ended, and the last of them
+    // that ended before it had read every channel to its end.
+    let passes = |device: &Device| {
+        let own = &device.state.own_channels;
+        (own.whole_passes().1, own.last_short_pass())
+    };
+    for (most_proved, short) in [(1, 1), (MAX_CHANNELS_PROVED_ON_A_CONNECTION, 0)] {
+        let relay = StandIn::started().await;
+        let mut device = Device::proving_at_most("laptop", most_proved);
+        device.makes_the_phrase(&phrase());
+        device.holds("notes");
+        device.writes("notes", "a.md", "a text");
+        device.connects_to("relay", relay.port, relay.key).await;
+        assert_eq!(passes(&device), (0, 0));
+        device.passes().await;
+        // The personal channel and the name's: each is proved and
+        // pulled where there is room for its proof, and where there is
+        // none the channel is not pulled.
+        let asked = relay.requests();
+        let proved = |one: &&WireMessage| matches!(one, WireMessage::ChannelProve(_));
+        let pulled = |one: &&WireMessage| matches!(one, WireMessage::EntryPull(_));
+        let both = most_proved.min(2);
+        assert_eq!(asked.iter().filter(proved).count(), both, "{most_proved}");
+        assert_eq!(asked.iter().filter(pulled).count(), both, "{most_proved}");
+        assert_eq!(passes(&device), (1, short), "{most_proved}");
+    }
 }
 
 /// A node that is held up makes no pass (decision 2026-10-04 §10.1):

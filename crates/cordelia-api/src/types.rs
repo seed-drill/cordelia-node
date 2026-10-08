@@ -515,4 +515,9 @@ pub struct SyncStatusResponse {
     /// to it. Only in the answer to the request that unmapped it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub let_go: Option<String>,
+    /// Beside `let_go`: whether the statement that this device has
+    /// applied lists it alone (decision 2026-10-04 §9, step 4). No other
+    /// device of the person's then holds anything of the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go_alone: Option<bool>,
 }

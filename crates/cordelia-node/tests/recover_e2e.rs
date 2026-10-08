@@ -346,8 +346,15 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
     ] {
         assert!(said.contains(shown), "{shown}: {said}");
     }
+    // What is still to send, as it stood when the look ended: the name;
+    // or, with the name sent, the machine's personal channel, in which
+    // it then writes that it has sent what it carried; or nothing.
     assert!(
         said.contains("keep this machine on: 1 name still to send")
+            || said.contains(
+                "keep this machine on: its personal channel, which lists the names, is still \
+                 to send"
+            )
             || said.contains("Nothing is waiting to be sent to a relay that is connected."),
         "{said}"
     );
@@ -920,6 +927,151 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
     );
 }
 
+/// **No device pushes another out of a recovery by filling the 64**
+/// (decision 2026-10-04 §9, step 3). A change lists the laptop and the
+/// desktop. The desktop then adds a phone, which syncs `lab` and writes
+/// a file there. The laptop signs 62 records of additions, which a
+/// recovery reads first: with them 64 devices count, and the phone's
+/// record finds no room.
+///
+/// The laptop may be in someone else's hands, and the desktop is lost.
+/// The phone is shown with the reason that it does not count, and is
+/// asked about all the same, since the desktop added it. Said to be
+/// lost, its key is removed, and the look takes nothing from it: what it
+/// wrote comes in by `cordelia sync carry lab --from`, with the phrase.
+#[test]
+fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() {
+    let relay = relay_started();
+    let mut two = two_devices(&[&relay], None);
+    // A change that lists both, the laptop first.
+    let mut at = renews(&two.laptop, &["stays"], &two.words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&relay, &two.laptop, &two.desktop];
+    wait_for("the desktop applies change 2", &all, 120, || {
+        (person_of(&two.desktop)["change"] == 2).then_some(())
+    });
+    wait_for("the relay was sent everything", &all, 180, || {
+        has_sent_everything(&two.laptop).and(has_sent_everything(&two.desktop))
+    });
+    // The desktop adds a phone, which syncs `lab` and writes a file.
+    let mut phone = device_started("phone", &relay);
+    adds(&two.desktop, &phone, "phone");
+    let phone_memory = syncs_lab(&phone);
+    const ON_THE_PHONE: &str = "written on the phone\n";
+    std::fs::write(phone_memory.join("p.md"), ON_THE_PHONE).unwrap();
+    let all = [&relay, &two.laptop, &two.desktop, &phone];
+    wait_for("the relay was sent the phone's file", &all, 180, || {
+        let there = text_of(&phone, "p.md")? == ON_THE_PHONE;
+        there
+            .then_some(())
+            .and(has_sent_everything(&phone))
+            .and(has_sent_everything(&two.desktop))
+    });
+    phone.stop();
+    two.desktop.stop();
+
+    // The laptop signs 62 records, and the relay is sent each.
+    let laptop_key = cordelia_crypto::bech32::decode_public_key(&key_of(&two.laptop)).unwrap();
+    two.laptop.stop();
+    let held_of_the_laptop = || -> Option<i64> {
+        store_of(&relay)
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE author = ?1",
+                rusqlite::params![laptop_key.as_slice()],
+                |row| row.get(0),
+            )
+            .ok()
+    };
+    let before = held_of_the_laptop().unwrap();
+    assert_eq!(signs_records(&two.laptop, 62), laptop_key);
+    two.laptop.start();
+    wait_for("the laptop is up again", &[&relay, &two.laptop], 30, || {
+        healthy(&two.laptop)
+    });
+    wait_for(
+        "the relay holds the records",
+        &[&relay, &two.laptop],
+        180,
+        || {
+            let held = held_of_the_laptop()? >= before + 62;
+            held.then_some(()).and(has_sent_everything(&two.laptop))
+        },
+    );
+    two.laptop.stop();
+
+    // The laptop may be in someone else's hands, and so may each of the
+    // 62 keys that it added, which count. The desktop is lost, and so is
+    // the phone, which is asked about last.
+    let new = device_started("new", &relay);
+    let mut answers = vec!["hands", "lost"];
+    answers.extend(std::iter::repeat_n("hands", 62));
+    answers.push("lost");
+    let mut at = recovers(&new, None, &two.words, &answers);
+    at.says("The change is made (change 3)")
+        .says("The look is made: 1 name read, and ");
+    let said = at.done();
+    println!("{said}");
+    assert!(said.contains("Recovering from change 2."), "{said}");
+    // The phone, with the device that added it and the reason that it
+    // does not count: and what each answer does for it.
+    let of_the_phone = said
+        .split("\"phone\", added since change 2, from (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{said}"));
+    let by = of_the_phone.split(" at ").next().unwrap();
+    assert!(by.ends_with(") \"desktop\""), "{by}: {said}");
+    assert!(
+        of_the_phone
+            .contains(", by a record that does not count: 64 devices counted already. It signed "),
+        "{said}"
+    );
+    assert!(
+        of_the_phone.contains(
+            "That is the one thing its record fails for, so it is asked about all the same."
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("It is no device: nothing is asked of it"),
+        "{said}"
+    );
+    // The room for removed keys was worked out with it: nothing is said,
+    // since each answer could be kept.
+    assert!(!said.contains("Not every answer could be kept"), "{said}");
+    // It is removed, with the 64 that count.
+    assert!(said.contains("removed keys (65):"), "{said}");
+    let nothing = said
+        .split("It takes nothing from: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{said}"));
+    let nothing = nothing.split(". What they wrote").next().unwrap();
+    assert!(nothing.contains("\"phone\""), "{said}");
+
+    // The look took what the desktop wrote, and nothing of the phone: it
+    // says how much the phone signed that the new channels lack.
+    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
+    assert_eq!(text_of(&new, "p.md"), None);
+    assert!(
+        said.contains("\"phone\" signed 1 version that the new channels lack, in: lab."),
+        "{said}"
+    );
+    assert_eq!(person_of(&new)["removed"].as_array().unwrap().len(), 65);
+
+    // Its key is a removed key: what it wrote comes in by the command
+    // that names it, with the phrase.
+    let mut at = new.at_terminal(&["sync", "carry", "lab", "--from", "phone"]);
+    at.says("What this removed key signed in lab:")
+        .says("1 version would go into a slot where the new channel holds nothing.")
+        .says("Bring in 1 version into the slot where the new channel holds nothing?")
+        .types("yes");
+    at.says("The recovery phrase, twelve words")
+        .types(&two.words);
+    let said = at.done();
+    assert!(said.contains("lab: 1 version brought in"), "{said}");
+    assert_eq!(text_of(&new, "p.md").as_deref(), Some(ON_THE_PHONE));
+}
+
 /// What `n` holds under the name `name`, by key, with its text.
 fn held_under(n: &Node, name: &str) -> Vec<(String, Option<String>)> {
     let answer = n.post("/api/v1/channels/entries", json!({ "channel": name }));
@@ -1251,6 +1403,57 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
     assert_eq!(text_of(&second, "b.md").as_deref(), Some(ON_THE_DESKTOP));
 }
 
+/// **A recovery says at which relay the personal channel was not read**
+/// (decision 2026-10-04 §9, step 3). A person's two devices are set up
+/// with two relays, and both are lost. One relay is down when the new
+/// machine recovers: the personal channel of the change recovered from
+/// is read to its end at the other, and the command goes on. Before its
+/// yes it says at which relay the channel could not be read, and that
+/// devices added since and names may be missing.
+#[test]
+fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
+    let first = relay_named("relay-one");
+    let mut second = relay_named("relay-two");
+    let mut two = two_devices(&[&first, &second], None);
+    two.laptop.stop();
+    two.desktop.stop();
+    let new = device_at("new", &[&first, &second]);
+    let down = format!("127.0.0.1:{}", second.p2p);
+    second.stop();
+    wait_for(
+        "the new machine has lost the second relay",
+        &[&first, &new],
+        120,
+        || {
+            let lost = |relay: &Value| relay["state"] != "connected";
+            relays_of(&new).iter().any(lost).then_some(())
+        },
+    );
+
+    let mut at = recovers(&new, None, &two.words, &["lost", "lost"]);
+    at.says("The change is made (change 2)")
+        .says("The look is made");
+    let said = at.done();
+    println!("{said}");
+    assert!(
+        said.contains(&format!(
+            "Could not read the personal channel at {down} to its end (not reached)."
+        )),
+        "{said}"
+    );
+    let missing = format!(
+        "The personal channel of the change recovered from could not be read to its end at \
+         {down}: devices added since that change, and names, may be missing here."
+    );
+    let warned = said.find(&missing).unwrap_or_else(|| panic!("{said}"));
+    let asked = said.find("Recover on this machine?").unwrap();
+    assert!(warned < asked, "{said}");
+    // What was read is carried.
+    assert!(said.contains("1 name is carried: lab."), "{said}");
+    assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
+    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
+}
+
 /// Two changes that were made apart are found at a recovery (decision
 /// 2026-10-04 §9, step 2). The laptop makes a change that only the first
 /// relay is shown, and the desktop one that only the second is shown:
@@ -1332,6 +1535,61 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
 
     // The new machine reaches both relays, and finds both changes.
     let new = device_at("new", &[&first, &second]);
+
+    // **Where the personal channel of the change recovered from is read
+    // to its end at no relay, the recovery is refused before anything is
+    // asked** (§9, step 3). The phrase's channel is read; then, while
+    // the command asks which change to recover from, both relays go
+    // down. It says at which relays it could not read, and makes
+    // nothing.
+    let mut at = new.at_terminal(&["recover", "--name", "new"]);
+    at.says("The recovery phrase, twelve words").types(&words);
+    at.says("Two changes were made apart")
+        .says("Type `1` or `2`, the one to recover from: ");
+    first.stop();
+    second.stop();
+    at.types("1");
+    let refused = at.refused();
+    assert!(
+        refused.contains("the personal channel of change 3 could not be read to its end at"),
+        "{refused}"
+    );
+    for relay in [&first, &second] {
+        assert!(
+            refused.contains(&format!("127.0.0.1:{}", relay.p2p)),
+            "{refused}"
+        );
+    }
+    assert!(
+        refused.contains("and so at no relay: which devices were added since that change"),
+        "{refused}"
+    );
+    assert!(refused.contains("Nothing was done."), "{refused}");
+    assert!(
+        !refused.contains("Type `have`, `lost` or `hands`"),
+        "{refused}"
+    );
+    assert_eq!(person_of(&new)["state"], "no_phrase", "{}", person_of(&new));
+    first.start();
+    second.start();
+    let relays = [&first, &second, &new];
+    for relay in [&first, &second] {
+        wait_for("the relay is up again", &relays, 30, || healthy(relay));
+    }
+    wait_for(
+        "the new machine reaches both relays again",
+        &relays,
+        120,
+        || {
+            // As the command is told: each relay with the session of
+            // its connection.
+            let told = new.post("/api/v1/recover/look", json!({}));
+            let sessions = told["sessions"].as_array()?;
+            let reached = |relay: &Value| relay["session"].is_string();
+            (sessions.len() == 2 && sessions.iter().all(reached)).then_some(())
+        },
+    );
+
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
     at.says("The recovery phrase, twelve words").types(&words);
     at.says("Two changes were made apart")
