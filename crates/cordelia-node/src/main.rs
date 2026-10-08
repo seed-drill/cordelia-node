@@ -656,6 +656,13 @@ fn owners_alone(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// Whether what is at `path` is a symbolic link. **A mode is never set
+/// through one:** what a link leads to is kept elsewhere, and is whoever
+/// put it there's to set.
+fn is_a_link(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| found.file_type().is_symlink())
+}
+
 /// Where a system has no such modes, there is none to set.
 #[cfg(not(unix))]
 fn owners_alone(_: &std::path::Path) -> std::io::Result<()> {
@@ -706,7 +713,9 @@ fn private_data_dir(
 /// in the directory (mode 0600).** Nothing else's mode changes: not a
 /// file in the directory that has its own mode already, and not a
 /// configuration file that is kept elsewhere, which is whoever put it
-/// there's to set.
+/// there's to set. A configuration file in the directory that is a
+/// symbolic link is kept elsewhere: neither the link nor what it leads
+/// to is touched ([`is_a_link`]).
 ///
 /// Returns what the node's log says of it, once: what was set, or what
 /// could not be. `None` where the directory is its owner's alone
@@ -727,7 +736,8 @@ fn keep_private(data_dir: &std::path::Path, config_file: &std::path::Path) -> Op
             ", and could not be set to its owner's alone ({e})"
         )),
     }
-    if config_file.starts_with(data_dir) && config_file.is_file() {
+    let in_it = config_file.starts_with(data_dir) && !is_a_link(config_file);
+    if in_it && config_file.is_file() {
         match owners_alone(config_file) {
             Ok(()) => says.push_str(", and so is the configuration file in it (mode 0600)"),
             Err(e) => says.push_str(&format!(
@@ -770,8 +780,9 @@ fn cmd_init(
 /// (or made again with `force`).
 ///
 /// **The data directory is its owner's alone (mode 0700), and so is the
-/// configuration file that this writes (mode 0600).** The key, the token
-/// and the database are each 0600.
+/// configuration file that this writes (mode 0600),** but one that it
+/// writes through a symbolic link. The key, the token and the database
+/// are each 0600.
 fn init_with(
     config_file: &std::path::Path,
     mut config: Config,
@@ -875,9 +886,13 @@ fn init_with(
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
         config.save(config_file)?;
-        // The file that this wrote is its owner's alone to read.
+        // The file that this wrote is its owner's alone to read. Where
+        // it was written through a link, the file is kept elsewhere, and
+        // its mode is left as it is.
         #[cfg(unix)]
-        owners_alone(config_file)?;
+        if !is_a_link(config_file) {
+            owners_alone(config_file)?;
+        }
         println!("Config written to {}", config_file.display());
     }
 
@@ -7196,6 +7211,54 @@ mod tests {
             assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), key);
             assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
         }
+    }
+
+    /// A configuration file that is a symbolic link is kept elsewhere,
+    /// and no mode is set through the link: not by `cordelia init`, which
+    /// writes the file through it, and not by a node that starts. The
+    /// data directory is set as it always is.
+    #[cfg(unix)]
+    #[test]
+    fn test_no_mode_is_set_through_a_link_to_a_configuration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let elsewhere = dir.path().join("kept-elsewhere.toml");
+        std::fs::write(&elsewhere, "").unwrap();
+        set_mode(&elsewhere, 0o664);
+        let config_file = data.join("config.toml");
+        std::os::unix::fs::symlink(&elsewhere, &config_file).unwrap();
+        assert!(is_a_link(&config_file) && !is_a_link(&elsewhere));
+        assert!(!is_a_link(&data) && !is_a_link(&data.join("none")));
+
+        // `init`, told to write the configuration again: it writes it
+        // through the link, and sets no mode there.
+        let mut config = Config::default();
+        config.node.data_dir = data.display().to_string();
+        init_with(
+            &config_file,
+            config,
+            Some("laptop".into()),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(is_a_link(&config_file));
+        let written = std::fs::read_to_string(&elsewhere).unwrap();
+        assert!(written.contains("laptop_"), "{written}");
+        assert_eq!(mode(&elsewhere), 0o664);
+        assert_eq!(mode(&data), 0o700);
+
+        // A node that starts on the directory, open to others: the
+        // directory is set, and nothing is said or done of the file.
+        set_mode(&data, 0o775);
+        let said = keep_private(&data, &config_file).expect("it says what it set");
+        assert!(
+            said.ends_with("it is now its owner's alone (mode 0700)"),
+            "{said}"
+        );
+        assert_eq!((mode(&data), mode(&elsewhere)), (0o700, 0o664));
     }
 
     /// `cordelia init` goes on where the data directory is there and its

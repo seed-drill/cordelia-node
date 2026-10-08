@@ -132,13 +132,15 @@ download_binary() {
 
 # The data directory is its owner's alone (mode 700): it holds the
 # device's key, the node's token and the database. So is the configuration
-# file in it (mode 600). Where either cannot be set, the script says so
-# and goes on: the node sets both when it starts.
+# file in it (mode 600), but one that is a symbolic link: that file is
+# kept elsewhere, and no mode is set through the link. Where either cannot
+# be set, the script says so and goes on: the node sets both when it
+# starts.
 private_data_dir() {
     mkdir -p "$DATA_DIR"
     chmod 700 "$DATA_DIR" 2>/dev/null \
         || echo "Warning: could not set ${DATA_DIR} to mode 700."
-    if [ -f "${DATA_DIR}/config.toml" ]; then
+    if [ -f "${DATA_DIR}/config.toml" ] && [ ! -L "${DATA_DIR}/config.toml" ]; then
         chmod 600 "${DATA_DIR}/config.toml" 2>/dev/null \
             || echo "Warning: could not set ${DATA_DIR}/config.toml to mode 600."
     fi

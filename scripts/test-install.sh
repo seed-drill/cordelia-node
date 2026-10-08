@@ -480,6 +480,21 @@ run "an-upgrade-of-a-data-directory-that-was-open-to-others"
 expect "installed=$NEW running=$NEW restart=done" 0 1
 private
 
+# A configuration file that is a link is kept elsewhere: no mode is set
+# through the link, and the data directory is set as it always is.
+setup() {
+    mkdir -p "$HOME/.cordelia"; touch "$HOME/.cordelia/identity.key" "$HOME/kept-elsewhere.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/kept-elsewhere.toml"
+    ln -s "$HOME/kept-elsewhere.toml" "$HOME/.cordelia/config.toml"
+}
+run "a-configuration-file-that-is-a-link"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwx------"
+check "the mode of the file that the link leads to" \
+    "$(mode_of "$HOME_DIR/kept-elsewhere.toml")" "-rw-rw-r--"
+check "the configuration file is still a link" \
+    "$(mode_of "$HOME_DIR/.cordelia/config.toml" | cut -c1)" "l"
+
 # A first install whose set-up fails says so, and is no success.
 setup() { touch "$HOME/.fake/init_fails"; }
 run "a-set-up-that-fails"

@@ -474,7 +474,10 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 > directory, and says so once in its log. It does so after its port is bound
 > and its lock is held: a node that does not start changes nothing. Nothing
 > else's mode changes, and a configuration file that is kept elsewhere is
-> left as whoever put it there set it.
+> left as whoever put it there set it. That holds for a `config.toml` in the
+> directory that is a symbolic link: `init`, the install script and the node
+> set no mode through a link. (The data directory itself may be a link:
+> what it leads to is the data directory, and is set.)
 
 ---
 
