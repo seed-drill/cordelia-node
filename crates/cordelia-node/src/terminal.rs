@@ -615,6 +615,21 @@ impl Terminal {
         inside_screen(std::env::var_os("STY").as_deref())
     }
 
+    /// How many columns and lines the terminal that the command writes to
+    /// says it has: `None` where that cannot be read, or where it says
+    /// nothing of its size.
+    #[cfg(unix)]
+    pub fn size(&self) -> Option<(usize, usize)> {
+        let size = rustix::termios::tcgetwinsize(rustix::stdio::stdout()).ok()?;
+        (size.ws_col > 0 && size.ws_row > 0)
+            .then(|| (usize::from(size.ws_col), usize::from(size.ws_row)))
+    }
+
+    #[cfg(not(unix))]
+    pub fn size(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Ask a yes: `says` is what will happen. Only the word `yes` is one.
     pub fn yes(&self, says: &str) -> anyhow::Result<bool> {
         drop_what_was_typed_ahead();
@@ -636,7 +651,11 @@ impl Terminal {
 
     /// Show `shown` once, under the line `says`, until a person presses
     /// Enter at `asks`: and then take it off the screen. `shown` is one
-    /// row or several, each with its own space before it. It is shown on
+    /// row or several, each with its own space before it. Whoever asks
+    /// sees to it that the terminal has room for all of it
+    /// ([`Self::size`]): what scrolls off the top of the other screen is
+    /// not seen, and a row that is broken over two lines is misread. It
+    /// is shown on
     /// the terminal's other screen, which is cleared and then put away
     /// when the person is done, and keeps no lines above what is typed
     /// next. A terminal that has no other screen shows it where it is,

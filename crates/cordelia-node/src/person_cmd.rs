@@ -445,12 +445,22 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // is shown.
     Device::new(this_device, &label)?;
 
+    // What is said above the words, and below them.
+    let says = "Your recovery phrase (shown once):";
+    let asks = "Write the twelve words down, in order. Keep them where only you can read \
+                them.\nPress Enter when you have. The words are then cleared from the screen. ";
+    // The terminal's size is read before there is a phrase: where it has
+    // no room for the twelve words, none is made.
+    let in_a_row = match words_in_a_row(at.size(), says, asks) {
+        Ok(in_a_row) => in_a_row,
+        Err(too_small) => anyhow::bail!(too_small),
+    };
+
     let phrase = Phrase::generate()?;
     at.once(
-        "Your recovery phrase (shown once):",
-        numbered(phrase.words()?.as_str()).as_str(),
-        "Write the twelve words down, in order. Keep them where only you can read them.\n\
-         Press Enter when you have. The words are then cleared from the screen. ",
+        says,
+        numbered(phrase.words()?.as_str(), in_a_row).as_str(),
+        asks,
     )?;
     let made = {
         // Each word is held against the word shown by its place in the
@@ -531,17 +541,69 @@ fn not_typed_back_says(typed_back: &TypedBack) -> Option<String> {
     }
 }
 
-/// The twelve `words` as they are shown: each with its number, four to a
-/// row, the columns lined up. So the numbers that a person writes down
-/// are the numbers that the words are asked for by.
+/// How many of the twelve words are shown to a row on a terminal of
+/// `size`, its columns and lines, with `says` above them and `asks`
+/// below (decision 2026-10-04 §5):
+///
+/// - four, as a rule, and where the terminal says nothing of its size;
+/// - **one, where the terminal is narrower than a row of four,** so that
+///   no row is broken over two lines, and a number parted from its word;
+/// - and **where it has no room for them even so, what to say:** nothing
+///   is shown, and nothing is made. What does not fit scrolls off the top
+///   of a screen that keeps no lines, and is not seen.
+///
+/// A line of `says` or `asks` that is longer than the terminal is wide
+/// goes on to the next line, and is counted so.
+fn words_in_a_row(size: Option<(usize, usize)>, says: &str, asks: &str) -> Result<usize, String> {
+    let Some((columns, lines)) = size else {
+        return Ok(4);
+    };
+    let in_a_row = if columns >= widest_row(4) { 4 } else { 1 };
+    // What the words need: at the width that the terminal has, or, where
+    // it is narrower than one word with its number, at that width.
+    let needs_columns = columns.max(widest_row(1));
+    let needs_lines = lines_taken(says, needs_columns)
+        + 1
+        + PHRASE_WORDS.div_ceil(in_a_row)
+        + 1
+        + lines_taken(asks, needs_columns);
+    if columns < needs_columns || lines < needs_lines {
+        return Err(format!(
+            "this terminal is too small to show the twelve words: it has {columns} columns and \
+             {lines} lines.\nThey need {needs_columns} columns and {needs_lines} lines. Nothing \
+             was made."
+        ));
+    }
+    Ok(in_a_row)
+}
+
+/// How many columns the widest row of the words can take, `in_a_row` of
+/// them to a row: the rows of twelve of the longest words of the list.
+fn widest_row(in_a_row: usize) -> usize {
+    let longest = ["abstract"; PHRASE_WORDS].join(" ");
+    let rows = numbered(&longest, in_a_row);
+    rows.lines().map(str::len).max().unwrap_or(0)
+}
+
+/// How many lines `text` takes on a terminal of `columns`: a line that is
+/// longer than the terminal is wide goes on to the next.
+fn lines_taken(text: &str, columns: usize) -> usize {
+    text.lines()
+        .map(|line| line.len().div_ceil(columns).max(1))
+        .sum()
+}
+
+/// The twelve `words` as they are shown: each with its number,
+/// `in_a_row` to a row, the columns lined up. So the numbers that a
+/// person writes down are the numbers that the words are asked for by.
 ///
 /// The text is overwritten when it is dropped, and is never moved as it
 /// grows: it has room for sixteen bytes a word, which is a number, a full
 /// stop and a space, the eight letters of the longest word, and what
 /// parts it from the next.
-fn numbered(words: &str) -> Zeroizing<String> {
+fn numbered(words: &str, in_a_row: usize) -> Zeroizing<String> {
     use std::fmt::Write;
-    let (in_a_row, longest, between) = (4, 8, 3);
+    let (longest, between) = (8, 3);
     let mut rows = Zeroizing::new(String::with_capacity(PHRASE_WORDS * 16));
     let mut after_the_last = 0;
     for (at, word) in words.split(' ').enumerate() {
@@ -3482,7 +3544,7 @@ mod tests {
     fn the_words_are_shown_numbered_four_to_a_row_with_the_columns_lined_up() {
         let legal = "legal winner thank year wave sausage worth useful legal winner thank yellow";
         assert_eq!(
-            numbered(legal).as_str(),
+            numbered(legal, 4).as_str(),
             "   1. legal       2. winner      3. thank       4. year\n   \
              5. wave        6. sausage     7. worth       8. useful\n   \
              9. legal      10. winner     11. thank      12. yellow"
@@ -3496,10 +3558,10 @@ mod tests {
                 .map(|row| row.match_indices(". ").map(|(at, _)| at).collect())
                 .collect()
         };
-        let of_the_longest = numbered(&longest);
+        let of_the_longest = numbered(&longest, 4);
         assert_eq!(columns(&of_the_longest), [[4, 19, 34, 49]; 3]);
         for words in [legal, &longest, &shortest] {
-            let rows = numbered(words);
+            let rows = numbered(words, 4);
             assert_eq!(columns(&rows), columns(&of_the_longest), "{words}");
             assert_eq!(rows.lines().count(), 3);
             assert!(rows.lines().all(|row| !row.ends_with(' ')), "{rows:?}");
@@ -3514,12 +3576,81 @@ mod tests {
             assert_eq!(shown.join(" "), words);
             // Within the room it was given, and so never moved.
             assert!(rows.len() <= PHRASE_WORDS * 16, "{}", rows.len());
-            assert_eq!(rows.capacity(), numbered(legal).capacity());
+            assert_eq!(rows.capacity(), numbered(legal, 4).capacity());
         }
         // Two spaces, three columns of fifteen and one of twelve: and
         // with the two ends of rows, within the room for sixteen a word.
         assert_eq!(of_the_longest.lines().next().unwrap().len(), 59);
         assert_eq!(of_the_longest.len(), 3 * 59 + 2);
+    }
+
+    /// **The terminal's size says how the words are shown** (decision
+    /// 2026-10-04 §5): four to a row; one to a line where it is narrower
+    /// than a row of four; and nothing, with the size they need, where
+    /// it has too few lines, or is narrower than one word with its
+    /// number. A terminal that says nothing of its size is shown the
+    /// rows of four.
+    #[test]
+    fn the_terminals_size_says_how_the_words_are_shown_or_that_they_are_not() {
+        let says = "Your recovery phrase (shown once):";
+        let asks = "Write the twelve words down, in order. Keep them where only you can read \
+                    them.\nPress Enter when you have. The words are then cleared from the \
+                    screen. ";
+        assert_eq!((says.len(), asks.lines().count()), (34, 2));
+        let lines: Vec<usize> = asks.lines().map(str::len).collect();
+        assert_eq!(lines, [78, 71]);
+        let shown =
+            |columns: usize, lines: usize| words_in_a_row(Some((columns, lines)), says, asks);
+        let too_small = |has: (usize, usize), needs: (usize, usize)| {
+            Err(format!(
+                "this terminal is too small to show the twelve words: it has {} columns and {} \
+                 lines.\nThey need {} columns and {} lines. Nothing was made.",
+                has.0, has.1, needs.0, needs.1
+            ))
+        };
+        // A row of four is 59 columns, and a word with its number 14.
+        assert_eq!((widest_row(4), widest_row(1)), (59, 14));
+        assert_eq!(words_in_a_row(None, says, asks), Ok(4));
+
+        // Wide enough for every line: a heading, three rows, two lines
+        // below, and a line between each.
+        assert_eq!(shown(80, 24), Ok(4));
+        assert_eq!(shown(80, 8), Ok(4));
+        assert_eq!(shown(78, 8), Ok(4));
+        assert_eq!(shown(80, 7), too_small((80, 7), (80, 8)));
+        // Narrower than the first line below: it takes two.
+        assert_eq!(shown(77, 9), Ok(4));
+        assert_eq!(shown(77, 8), too_small((77, 8), (77, 9)));
+        // As wide as a row of four, and no wider.
+        assert_eq!(shown(59, 10), Ok(4));
+        assert_eq!(shown(59, 9), too_small((59, 9), (59, 10)));
+        // Narrower than a row of four: one to a line.
+        assert_eq!(shown(58, 19), Ok(1));
+        assert_eq!(shown(58, 18), too_small((58, 18), (58, 19)));
+        assert_eq!(shown(40, 24), Ok(1));
+        // As wide as a word with its number: three lines of heading,
+        // twelve words, six and six below.
+        assert_eq!(shown(14, 29), Ok(1));
+        assert_eq!(shown(14, 28), too_small((14, 28), (14, 29)));
+        // Narrower than that: however many lines it has.
+        assert_eq!(shown(13, 1000), too_small((13, 1000), (14, 29)));
+        assert_eq!(shown(1, 1), too_small((1, 1), (14, 29)));
+
+        // One to a line: each word after its number, with no space
+        // after it.
+        let legal = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let rows = numbered(legal, 1);
+        assert_eq!(
+            rows.as_str(),
+            "   1. legal\n   2. winner\n   3. thank\n   4. year\n   5. wave\n   6. sausage\n   \
+             7. worth\n   8. useful\n   9. legal\n  10. winner\n  11. thank\n  12. yellow"
+        );
+        assert!(numbered(&["abstract"; 12].join(" "), 1).len() <= PHRASE_WORDS * 16);
+        assert_eq!(rows.capacity(), numbered(legal, 4).capacity());
+        assert_eq!(lines_taken("", 10), 0);
+        assert_eq!(lines_taken("\n", 10), 1);
+        assert_eq!(lines_taken("0123456789", 10), 1);
+        assert_eq!(lines_taken("0123456789a", 10), 2);
     }
 
     /// Where the words that `cordelia phrase` showed are not all typed

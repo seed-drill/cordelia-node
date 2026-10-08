@@ -2205,6 +2205,100 @@ fn a_phrase_is_not_shown_inside_a_terminal_that_keeps_what_is_shown() {
     assert_eq!(look(&laptop)["change"], 2);
 }
 
+/// **On a terminal narrower than a row of four words, the words are
+/// shown one to a line** (decision 2026-10-04 §5), each after its
+/// number: no row is broken over two lines, and no number parted from
+/// its word. A row of four can take 59 columns. On a terminal of 58 the
+/// twelve words are on twelve lines, and are typed back as shown; on
+/// one of 59 they are in three rows.
+#[test]
+fn on_a_terminal_narrower_than_the_rows_the_words_are_shown_one_to_a_line() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+
+    let mut at = laptop.at_terminal_of(58, 19, &["phrase", "--name", "laptop"]);
+    let shown = at.says_one_of(&["Press Enter when you have", "too small"]);
+    assert_eq!(shown, 0, "{}", at.said);
+    let rows = rows_shown(&at.said).to_string();
+    let words = words_shown(&at.said);
+    let each: Vec<&str> = words.split(' ').collect();
+    let lines: Vec<&str> = rows.split("\r\n").collect();
+    assert_eq!(lines.len(), 12, "{rows:?}");
+    for (at_line, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("  {:>2}. {}", at_line + 1, each[at_line]));
+    }
+    at.types("");
+    at.says(ASKS_THE_WORDS_BACK).types(&words);
+    let said = at.done();
+    assert!(said.contains("All twelve match."), "{said}");
+    assert_eq!(look(&laptop)["change"], 1);
+
+    // A column more: three rows of four.
+    let mut at = laptop.at_terminal_of(59, 10, &["phrase", "--name", "laptop"]);
+    at.says("Type yes to go on").types("yes");
+    let shown = at.says_one_of(&["Press Enter when you have", "too small"]);
+    assert_eq!(shown, 0, "{}", at.said);
+    let rows = rows_shown(&at.said).to_string();
+    assert_eq!(rows.split("\r\n").count(), 3, "{rows:?}");
+    assert!(
+        rows.starts_with("   1. ") && rows.contains("   4. "),
+        "{rows:?}"
+    );
+}
+
+/// **On a terminal too small for the twelve words, nothing is shown and
+/// nothing is made** (decision 2026-10-04 §5): what does not fit would
+/// scroll off the top of a screen that keeps no lines. The command stops
+/// before there is a phrase, and says the size that the terminal has and
+/// the size that the words need:
+///
+/// - wide enough for the rows of four, and a line too short for them;
+/// - narrower than a row, and a line too short for twelve lines of one
+///   word each;
+/// - narrower than one word with its number, however many lines it has.
+///
+/// With the line that was missing, the words are shown.
+#[test]
+fn on_a_terminal_too_small_for_the_twelve_words_nothing_is_shown_or_made() {
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let soon = std::time::Duration::from_secs(60);
+
+    for (has, needs) in [
+        ((80, 7), (80, 8)),
+        ((58, 18), (58, 19)),
+        ((13, 200), (14, 29)),
+    ] {
+        let mut at = laptop.at_terminal_of(has.0, has.1, &["phrase", "--name", "laptop"]);
+        let stopped = at.says_one_of(&["too small", "Press Enter when you have"]);
+        assert_eq!(stopped, 0, "{has:?}:\n{}", at.said);
+        let said = at.refused_within(soon);
+        let too_small = format!(
+            "Error: this terminal is too small to show the twelve words: it has {} columns and {} \
+             lines.\r\nThey need {} columns and {} lines. Nothing was made.\r\n",
+            has.0, has.1, needs.0, needs.1
+        );
+        assert!(said.ends_with(&too_small), "{has:?}:\n{said:?}");
+        for never in ["(shown once)", "\x1b[?1049h", "Now type the words back"] {
+            assert!(!said.contains(never), "{has:?}: {never:?} in\n{said:?}");
+        }
+        assert_eq!(text(&look(&laptop), "state"), "no_phrase", "{has:?}");
+    }
+
+    // With the eighth line, the rows of four are shown.
+    let mut at = laptop.at_terminal_of(80, 8, &["phrase", "--name", "laptop"]);
+    let shown = at.says_one_of(&["Press Enter when you have", "too small"]);
+    assert_eq!(shown, 0, "{}", at.said);
+    let words = words_shown(&at.said);
+    assert_eq!(rows_shown(&at.said).split("\r\n").count(), 3);
+    at.types("");
+    at.says(ASKS_THE_WORDS_BACK).types(&words);
+    at.done();
+    assert_eq!(look(&laptop)["change"], 1);
+}
+
 // ── A new key that is stopped ────────────────────────────────────────
 
 /// `cordelia init --new-key` on a device that is one of several, with no
