@@ -153,10 +153,10 @@ enum Commands {
         /// had sent what it carried is not among what was read
         #[arg(long)]
         cut_short: Option<String>,
-        /// With `--cut-short`: the personal channel of the change that
-        /// was recovered from was read to its end at no relay
-        #[arg(long)]
-        read_in_part: bool,
+        /// With `--cut-short`: how the personal channel of the change
+        /// that was recovered from was read at the relays
+        #[arg(long, value_enum, default_value_t = recover_cmd::ChannelRead::Whole)]
+        channel_read: recover_cmd::ChannelRead,
     },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
@@ -375,9 +375,9 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::RecoverMade {
             number,
             cut_short,
-            read_in_part,
+            channel_read,
         }) => {
-            let cut_short = recover_cmd::CutShort::handed(cut_short, read_in_part);
+            let cut_short = recover_cmd::CutShort::handed(cut_short, channel_read);
             recover_cmd::recover_made(&cli.config, number, cut_short)
         }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
@@ -6432,15 +6432,17 @@ mod tests {
     /// What a recovery hands the process that waits for its look is read
     /// there as it was handed (decision 2026-10-04 §9, step 5; §16): the
     /// device that was recovered from, where its word that it had sent
-    /// what it carried was not read, and whether the channel that the
-    /// word is written in was read to its end at no relay.
+    /// what it carried was not read, and how the channel that the word
+    /// is written in was read at the relays, which is one of three
+    /// things.
     #[test]
     fn test_what_a_recovery_hands_the_process_that_waits_is_read_there() {
         use clap::Parser;
-        for read_in_part in [false, true] {
+        use recover_cmd::ChannelRead::{HeldByNone, InPart, Whole};
+        for read in [Whole, InPart, HeldByNone] {
             let handed = recover_cmd::CutShort {
                 device: "(w1 w2 w3 w4) \"laptop\"".to_string(),
-                read_in_part,
+                read,
             };
             let mut line = vec!["cordelia".to_string()];
             line.extend([recover_cmd::MADE_COMMAND.to_string(), "3".to_string()]);
@@ -6449,23 +6451,23 @@ mod tests {
                 Some(super::Commands::RecoverMade {
                     number,
                     cut_short,
-                    read_in_part: in_part,
+                    channel_read,
                 }) => {
                     assert_eq!(number, 3);
-                    let read = recover_cmd::CutShort::handed(cut_short, in_part);
+                    let read = recover_cmd::CutShort::handed(cut_short, channel_read);
                     assert_eq!(read, Some(handed));
                 }
                 _ => panic!("what was handed is not read as that command"),
             }
         }
-        assert_eq!(recover_cmd::CutShort::handed(None, true), None);
+        assert_eq!(recover_cmd::CutShort::handed(None, InPart), None);
         // With no such device, as it was.
         let line = ["cordelia", recover_cmd::MADE_COMMAND, "3"];
         match super::Cli::parse_from(line).command {
             Some(super::Commands::RecoverMade {
                 number: 3,
                 cut_short: None,
-                read_in_part: false,
+                channel_read: Whole,
             }) => {}
             _ => panic!("that is not read as the command"),
         }

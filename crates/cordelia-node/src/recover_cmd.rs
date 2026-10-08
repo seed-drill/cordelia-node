@@ -1252,6 +1252,46 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     goes_on_in_a_new_process(config_path, signs.number, cut_short)
 }
 
+/// How the personal channel was read in which a device writes that it
+/// has sent what it carried (decision 2026-10-04 §8), where that word is
+/// not among what was read: one of three things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChannelRead {
+    /// To its end at one relay at least, and in part or not at all at
+    /// none: what was read is all that the relays which answered hold of
+    /// it, and the word is not there.
+    Whole,
+    /// In part, or not at all, at one relay at least: the word may be in
+    /// what was not read, whatever was read elsewhere.
+    InPart,
+    /// No relay that answered holds any of it. A device that wrote
+    /// nothing there, and a relay that has dropped the channel, both
+    /// give this.
+    HeldByNone,
+}
+
+impl ChannelRead {
+    /// Which of the three it is, of what the node said of each relay.
+    fn of(read: &PersonalRead) -> Self {
+        if read.any(ReadAs::Part) || read.any(ReadAs::Nothing) {
+            Self::InPart
+        } else if read.any(ReadAs::Whole) {
+            Self::Whole
+        } else {
+            Self::HeldByNone
+        }
+    }
+
+    /// The word that names it where it is handed to another process.
+    fn named(self) -> String {
+        use clap::ValueEnum;
+        let named = self.to_possible_value();
+        named
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default()
+    }
+}
+
 /// The device that a recovery was made from, where its word that it had
 /// sent what it carried is not among what was read (decision 2026-10-04
 /// §8; §9, step 5): what is said of it once the look has ended.
@@ -1259,12 +1299,8 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
 pub struct CutShort {
     /// The device, as it is shown.
     pub device: String,
-    /// Whether the word may be in what was not read: the personal
-    /// channel that it is written in was read to its end at no relay,
-    /// and at one relay at least it was read in part, or not at all.
-    /// (Where each relay that answered holds none of the channel,
-    /// nothing of it was left unread.)
-    pub read_in_part: bool,
+    /// How the personal channel that the word is written in was read.
+    pub read: ChannelRead,
 }
 
 impl CutShort {
@@ -1275,62 +1311,79 @@ impl CutShort {
         let key = generation.cut_short?;
         let label = generation.rows.iter().find(|row| row.key == key);
         let label = label.map(|row| row.label.clone()).unwrap_or_default();
-        let of = &was_read.personal;
-        let not_read = of.any(ReadAs::Part) || of.any(ReadAs::Nothing);
         Some(Self {
             device: named(&label, &key),
-            read_in_part: !of.any(ReadAs::Whole) && not_read,
+            read: ChannelRead::of(&was_read.personal),
         })
     }
 
     /// What hands this to the process that waits for the look
     /// ([`recover_made`]), as that command reads it.
     pub fn args(&self) -> Vec<String> {
-        let mut args = vec!["--cut-short".to_string(), self.device.clone()];
-        if self.read_in_part {
-            args.push("--read-in-part".to_string());
-        }
-        args
+        let (device, read) = (self.device.clone(), self.read.named());
+        [
+            "--cut-short".to_string(),
+            device,
+            "--channel-read".to_string(),
+            read,
+        ]
+        .into()
     }
 
     /// What the process that waits for the look was handed
     /// ([`Self::args`]), as its command read it: the device, where one
-    /// was named, and whether its channel was read to its end at no
-    /// relay.
-    pub fn handed(device: Option<String>, read_in_part: bool) -> Option<Self> {
-        device.map(|device| Self {
-            device,
-            read_in_part,
-        })
+    /// was named, and how its channel was read.
+    pub fn handed(device: Option<String>, read: ChannelRead) -> Option<Self> {
+        device.map(|device| Self { device, read })
     }
 
-    /// What is said of the device once the look has ended. **Where the
-    /// channel was read to its end at a relay, or no relay that answered
-    /// holds any of it, the device never wrote the word,** and a
-    /// recovery, or a change, that was made on it was cut short. Where
-    /// it was read to its end at no relay, and in part or not at all at
-    /// one, the word was not found in what was read, and may be in what
-    /// was not: the recovery or change may have been cut short.
+    /// What is said of the device once the look has ended.
+    ///
+    /// - **That it never wrote the word, and that a recovery, or a
+    ///   change, that was made on it was cut short, is said as that only
+    ///   where the channel was read to its end** ([`ChannelRead::Whole`]):
+    ///   at each relay that the node said anything of, and one of them
+    ///   holds it.
+    /// - Where it was read in part, or not at all, at one relay at least,
+    ///   the word was not found in what was read, and may be in what was
+    ///   not: the recovery or change may have been cut short.
+    /// - Where no relay that answered holds any of the channel, the word
+    ///   was not found for that. A device that wrote nothing there, and a
+    ///   relay that has dropped the channel, both give this: the recovery
+    ///   or change may have been cut short.
+    ///
+    /// What the recovery does is the same in each: only this differs.
     fn says(&self) -> String {
         let device = &self.device;
         let brings = "`cordelia sync carry <name> --from <device>` brings it in, with the \
                       phrase, and lists those devices where no device is named.";
-        match self.read_in_part {
-            false => format!(
+        let may_have_been = format!(
+            "A recovery, or a change, that was made on it may have been cut short. What it had \
+             sent is brought back. If it was cut short, what the devices that were gone before \
+             it wrote, in the files it had not sent, is at the relays in the generation before: \
+             {brings}"
+        );
+        let the_word = format!(
+            "The word of the device that this was recovered from, {device}, that it had sent \
+             what it carried"
+        );
+        match self.read {
+            ChannelRead::Whole => format!(
                 "The device that this was recovered from, {device}, never wrote that it had \
                  sent what it carried: a recovery, or a change, that was made on it was cut \
                  short. What it had sent is brought back. What the devices that were gone \
                  before it wrote, in the files it had not sent, is at the relays in the \
                  generation before: {brings}"
             ),
-            true => format!(
-                "The word of the device that this was recovered from, {device}, that it had \
-                 sent what it carried was not found in what was read: its personal channel was \
-                 read to its end at no relay, and the word may be in what was not read. A \
-                 recovery, or a change, that was made on it may have been cut short. What it \
-                 had sent is brought back. If it was cut short, what the devices that were gone \
-                 before it wrote, in the files it had not sent, is at the relays in the \
-                 generation before: {brings}"
+            ChannelRead::InPart => format!(
+                "{the_word} was not found in what was read: its personal channel was not read \
+                 to its end at every relay, and the word may be in what was not read. \
+                 {may_have_been}"
+            ),
+            ChannelRead::HeldByNone => format!(
+                "{the_word} was not found: no relay that answered holds that device's personal \
+                 channel. A device that wrote nothing there, and a relay that has dropped the \
+                 channel, both give this. {may_have_been}"
             ),
         }
     }
@@ -2803,15 +2856,24 @@ mod tests {
     /// Once the look has ended, the command says of the device that it
     /// recovered from whether a recovery or a change made on it was cut
     /// short (decision 2026-10-04 §8; §9, step 5): its word that it had
-    /// sent what it carried is not among what was read. **Where the
-    /// personal channel was read to its end at a relay, the device never
-    /// wrote the word, and it was cut short. Where it was read to its
-    /// end at no relay, the word may be in what was not read:** it was
-    /// not found in what was read, and it may have been cut short.
-    /// Which of the two it is goes to the process that waits for the
+    /// sent what it carried is not among what was read. **That the
+    /// device never wrote the word, and was cut short, is said as that
+    /// only where the personal channel was read to its end:** at each
+    /// relay that the node said anything of, and one of them holds it.
+    ///
+    /// - Read in part, or not at all, at one relay at least, whatever was
+    ///   read at another: the word was not found in what was read, may
+    ///   be in what was not, and it may have been cut short.
+    /// - No relay that answered holds any of the channel: the word was
+    ///   not found for that. A device that wrote nothing there, and a
+    ///   relay that has dropped the channel, both give this, and it may
+    ///   have been cut short.
+    ///
+    /// Which of the three it is goes to the process that waits for the
     /// look as that command reads it.
     #[test]
     fn test_what_is_said_of_a_device_whose_word_that_it_sent_was_not_read() {
+        use ChannelRead::{HeldByNone, InPart, Whole};
         let said = |relay: &str, read: &str, entries: u64| json!({ "relay": relay, "read": read, "entries": entries });
         let generation = |cut_short: Option<[u8; 32]>| Generation {
             rows: rows(),
@@ -2819,78 +2881,102 @@ mod tests {
             ..Default::default()
         };
         let laptop = named("laptop", &[1; 32]);
-        let of = |relays: &[Value]| CutShort::of(&generation(Some([1; 32])), &was_read(relays));
-        // Read to its end at one relay: the word is not there.
-        let whole = of(&[said("one", "whole", 4)]).unwrap();
-        assert_eq!(
-            whole,
-            CutShort {
-                device: laptop.clone(),
-                read_in_part: false
-            }
-        );
-        let whole_at_one = of(&[said("one", "part", 2), said("two", "whole", 4)]);
-        assert_eq!(whole_at_one, Some(whole.clone()));
-        // Read to its end at no relay, and in part or not at all at
-        // one: the word may be in what was not read.
-        let in_part = of(&[said("one", "part", 2), said("two", "not reached", 0)]).unwrap();
-        assert_eq!(
-            in_part,
-            CutShort {
-                device: laptop.clone(),
-                read_in_part: true
-            }
-        );
-        for not_read in [said("two", "part", 3), said("two", "not reached", 0)] {
-            let beside_none_held = of(&[said("one", "not held", 0), not_read]);
-            assert_eq!(beside_none_held, Some(in_part.clone()));
+        let of = |relays: &[Value]| {
+            let cut_short = CutShort::of(&generation(Some([1; 32])), &was_read(relays)).unwrap();
+            assert_eq!(cut_short.device, laptop);
+            cut_short.read
+        };
+        let (whole, part) = (said("one", "whole", 4), said("two", "part", 2));
+        let (not_held, not_reached) =
+            (said("three", "not held", 0), said("four", "not reached", 0));
+        // The read ended before any entry of the channel was handed.
+        let nothing = said("five", "part", 0);
+        // Read to its end at each relay that holds any of it, and one
+        // does: the word is not there.
+        assert_eq!(of(std::slice::from_ref(&whole)), Whole);
+        assert_eq!(of(&[whole.clone(), said("two", "whole", 4)]), Whole);
+        assert_eq!(of(&[whole.clone(), not_held.clone()]), Whole);
+        // In part, or not at all, at one relay at least: whatever was
+        // read at another, to its end or as held by none.
+        for not_read in [&part, &not_reached, &nothing] {
+            assert_eq!(of(std::slice::from_ref(not_read)), InPart, "{not_read}");
+            assert_eq!(of(&[whole.clone(), not_read.clone()]), InPart, "{not_read}");
+            assert_eq!(
+                of(&[not_held.clone(), not_read.clone()]),
+                InPart,
+                "{not_read}"
+            );
         }
-        // No relay that answered holds any of the channel: nothing of it
-        // was left unread, and the word is not there.
-        let held_by_none = of(&[said("one", "not held", 0), said("two", "not held", 0)]);
-        assert_eq!(held_by_none, Some(whole.clone()));
-        assert_eq!(of(&[said("one", "not held", 0)]), Some(whole.clone()));
+        // No relay that answered holds any of the channel.
+        assert_eq!(of(std::slice::from_ref(&not_held)), HeldByNone);
+        assert_eq!(
+            of(&[not_held.clone(), said("six", "not held", 0)]),
+            HeldByNone
+        );
         // The word was read, or the change lists more devices than one.
-        let read = was_read(&[said("one", "part", 2)]);
+        let read = was_read(std::slice::from_ref(&part));
         assert_eq!(CutShort::of(&generation(None), &read), None);
 
+        let says = |read: ChannelRead| {
+            let device = laptop.clone();
+            CutShort { device, read }.says()
+        };
+        let brings = "`cordelia sync carry <name> --from <device>` brings it in, with the phrase, \
+                      and lists those devices where no device is named.";
         assert_eq!(
-            whole.says(),
+            says(Whole),
             format!(
                 "The device that this was recovered from, {laptop}, never wrote that it had \
                  sent what it carried: a recovery, or a change, that was made on it was cut \
                  short. What it had sent is brought back. What the devices that were gone \
                  before it wrote, in the files it had not sent, is at the relays in the \
-                 generation before: `cordelia sync carry <name> --from <device>` brings it in, \
-                 with the phrase, and lists those devices where no device is named."
+                 generation before: {brings}"
             )
         );
-        let said_in_part = in_part.says();
+        let may_have_been = format!(
+            "A recovery, or a change, that was made on it may have been cut short. What it had \
+             sent is brought back. If it was cut short, what the devices that were gone before \
+             it wrote, in the files it had not sent, is at the relays in the generation before: \
+             {brings}"
+        );
         assert_eq!(
-            said_in_part,
+            says(InPart),
             format!(
                 "The word of the device that this was recovered from, {laptop}, that it had \
                  sent what it carried was not found in what was read: its personal channel was \
-                 read to its end at no relay, and the word may be in what was not read. A \
-                 recovery, or a change, that was made on it may have been cut short. What it \
-                 had sent is brought back. If it was cut short, what the devices that were gone \
-                 before it wrote, in the files it had not sent, is at the relays in the \
-                 generation before: `cordelia sync carry <name> --from <device>` brings it in, \
-                 with the phrase, and lists those devices where no device is named."
+                 not read to its end at every relay, and the word may be in what was not read. \
+                 {may_have_been}"
             )
         );
-        assert!(!said_in_part.contains("never wrote"), "{said_in_part}");
-        assert!(
-            !said_in_part.contains("made on it was cut short"),
-            "{said_in_part}"
+        assert_eq!(
+            says(HeldByNone),
+            format!(
+                "The word of the device that this was recovered from, {laptop}, that it had \
+                 sent what it carried was not found: no relay that answered holds that device's \
+                 personal channel. A device that wrote nothing there, and a relay that has \
+                 dropped the channel, both give this. {may_have_been}"
+            )
         );
+        // It is said as fact in the one case, and in no other.
+        for not_known in [InPart, HeldByNone] {
+            let said = says(not_known);
+            assert!(!said.contains("never wrote"), "{said}");
+            assert!(!said.contains("made on it was cut short"), "{said}");
+        }
 
         // What the process that waits for the look is handed.
-        assert_eq!(whole.args(), ["--cut-short", laptop.as_str()]);
-        assert_eq!(
-            in_part.args(),
-            ["--cut-short", laptop.as_str(), "--read-in-part"]
-        );
+        let handed = |read: ChannelRead| {
+            let device = laptop.clone();
+            CutShort { device, read }.args()
+        };
+        for (read, word) in [
+            (Whole, "whole"),
+            (InPart, "in-part"),
+            (HeldByNone, "held-by-none"),
+        ] {
+            let with = ["--cut-short", laptop.as_str(), "--channel-read", word];
+            assert_eq!(handed(read), with, "{read:?}");
+        }
     }
 
     /// Once the look has ended the command says which relay holds the

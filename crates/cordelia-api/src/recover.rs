@@ -275,9 +275,9 @@ pub struct Generation {
     /// alone and was made after another, and that device's word that it
     /// had sent what it carried is not among what was handed: a
     /// recovery, or a change, that was made on it was cut short, unless
-    /// the word is in what was not read. (Whoever had the channel read
-    /// knows whether it was read to its end at a relay, and says which
-    /// of the two it is.)
+    /// the word is in what was not read, or no relay holds the channel.
+    /// (Whoever had the channel read knows how it was read at each
+    /// relay, and says which it is.)
     pub cut_short: Option<[u8; 32]>,
 }
 
