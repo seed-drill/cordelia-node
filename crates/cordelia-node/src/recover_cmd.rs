@@ -808,7 +808,11 @@ fn asks_of(at: &Terminal, says: &str) -> anyhow::Result<Answer> {
 /// **What could not be read is said here** ([`WasRead::lines`], decision
 /// 2026-10-04 §16): of the change recovered from, and of the generations
 /// before, which are read for names. Where anything could not, no name
-/// is said to be listed nowhere: none is listed in what was read.
+/// is said to be listed nowhere: none is listed in what was read. **And
+/// "none is listed" is said only where none is:** where names are
+/// listed, and only by a device from which nothing is taken or a key
+/// that does not count, no name is carried, and the line for the names
+/// that are left follows.
 fn will_do_lines(
     generation: &Generation,
     answers: &[Answer],
@@ -877,6 +881,10 @@ fn will_do_lines(
         all.join(", ")
     };
     match names.carried.is_empty() {
+        // Names are listed, and none of them is carried: "none is
+        // listed" is said only where none is. The line for the names
+        // that are left says which they are, and why.
+        true if !names.only_other_hands.is_empty() => lines.push("No name is carried.".into()),
         true => lines.push(match was_read.to_the_end() {
             true => "No name is carried: none is listed.".to_string(),
             false => "No name is carried: none is listed in what was read.".to_string(),
@@ -2665,6 +2673,35 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("No name is carried: none is listed."), "{all}");
+
+        // **"None is listed" is said only where none is.** Names are
+        // listed, and only by a device from which nothing is taken, or
+        // by a key that does not count: no name is carried, and the line
+        // for the names that are left says which. So whatever was read.
+        let left = recover::Names {
+            only_other_hands: vec!["theirs".into(), "desk".into()],
+            ..Default::default()
+        };
+        let in_part = was_read(&[json!({ "relay": "one", "read": "part", "entries": 2 })]);
+        for read in [read_whole(), in_part] {
+            let lines = will_do_lines(&generation, &none, &left, &[9; 32], &read);
+            assert!(
+                lines.contains(&"No name is carried.".to_string()),
+                "{lines:?}"
+            );
+            let all = lines.join("\n");
+            assert!(!all.contains("none is listed"), "{all}");
+            assert!(
+                all.contains(
+                    "2 names are left, which only a device listed from which nothing is taken, \
+                     or a key that does not count: theirs, desk."
+                ),
+                "{all}"
+            );
+            // And where none is listed, that is still said.
+            let all = will_do_lines(&generation, &none, &empty, &[9; 32], &read).join("\n");
+            assert!(all.contains("No name is carried: none is listed"), "{all}");
+        }
     }
 
     /// What the look found is said at its end (decision 2026-10-04 §9,
