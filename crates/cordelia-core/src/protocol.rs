@@ -1010,6 +1010,23 @@ pub const PHRASE_WORDS: usize = 12;
 /// Everything that comes from the phrase is derived from these.
 pub const PHRASE_BYTES: usize = 16;
 
+/// How many of the words typed back at `cordelia phrase` may be a word of
+/// the list and not the word that was shown at that number, over the
+/// whole typing back and not for each word (decision 2026-10-04 §5, §16):
+/// the third such miss stops the command, and nothing is made. Three
+/// answers are no way to find a word, and a person who miswrote one word
+/// has room to mistype twice. A word that is not in the list is no miss.
+pub const PHRASE_TYPED_BACK_MISSES: usize = 3;
+
+/// How long `cordelia phrase` waits before it says of a word typed back
+/// that it is not the word shown, at the first such miss (decision
+/// 2026-10-04 §5, §16): twice as long at each miss after, and none at the
+/// last, which ends the command. The bound on misses is what keeps a
+/// guess from finding a word: the pause makes each answer cost time, and
+/// keeps a held key or a pasted line from spending every miss at once.
+/// Nothing waits where a phrase is proved: no word is judged there.
+pub const PHRASE_MISS_PAUSE_SECS: u64 = 2;
+
 /// The label under which a channel's entry key is derived from its secret
 /// (decision 2026-10-04 §2.1). Every label below is the `info` of
 /// HKDF-SHA256 unless it says otherwise, and no label begins another, so
@@ -2365,8 +2382,9 @@ mod tests {
     /// What the commands a person types go by: the place of a device's
     /// word that it has left, a key's fingerprint and how much of it is
     /// shown, the two minutes of the fetch before a change, when a command
-    /// says how many statements are left, and the wait of a device that is
-    /// given a new key.
+    /// says how many statements are left, the wait of a device that is
+    /// given a new key, and how many words typed back may miss, with the
+    /// pause before a miss is said.
     #[test]
     fn test_the_commands_a_person_types_decision_2026_10_04_5_to_8() {
         assert_eq!(PERSONAL_LEFT_PREFIX, "left/");
@@ -2392,6 +2410,16 @@ mod tests {
         assert_eq!(TYPED_KEY_KEPT_SECS, 86_400);
         // A key is kept for longer than it reads, to say what became of it.
         const { assert!(TYPED_KEY_KEPT_SECS > PAIR_KEY_TYPED_SECS) };
+        // The words typed back at `cordelia phrase`: the third miss stops
+        // the command, after a pause of two seconds before the first is
+        // said and of four before the second.
+        assert_eq!(PHRASE_TYPED_BACK_MISSES, 3);
+        assert_eq!(PHRASE_MISS_PAUSE_SECS, 2);
+        let longest = PHRASE_MISS_PAUSE_SECS << (PHRASE_TYPED_BACK_MISSES - 2);
+        assert_eq!(longest, 4);
+        // Fewer misses than words: a typing back that misses at every
+        // word does not reach the last.
+        const { assert!(PHRASE_TYPED_BACK_MISSES < PHRASE_WORDS) };
     }
 
     /// What a carry that a person asks for, and a recovery, go by

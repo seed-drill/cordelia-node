@@ -178,6 +178,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_ENTRY_NAME_AND_VALUE_BYTES` | 60KB | parameter-rationale.md §12.4 |
 | `ENTRY_CLEAR_BYTES`, `ENTRY_WIRE_OVERHEAD_BYTES`, `MAX_ENTRY_WIRE_BYTES` | 233, 237, 65,773 (derived) | parameter-rationale.md §12.4 |
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
+| `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `LABEL_*` (25 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
