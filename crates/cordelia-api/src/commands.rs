@@ -229,16 +229,40 @@ fn relays_reached(state: &AppState) -> Vec<(String, [u8; 32])> {
         .collect()
 }
 
+/// The relays that the device is set up with, each by the key that its
+/// configuration gives for it and the name that the configuration dials
+/// it at. One that is set up with no key is not among them: which
+/// connection is its own is then known only by its address.
+fn relays_named(state: &AppState) -> Vec<([u8; 32], String)> {
+    let known = state.relays.read().unwrap_or_else(|e| e.into_inner());
+    known
+        .iter()
+        .filter_map(|relay| {
+            let key = decode_public_key(relay.key.as_deref()?).ok()?;
+            Some((key, relay.host.clone()))
+        })
+        .collect()
+}
+
 /// For each relay that the node is connected to, how many of this
 /// device's channels have something that waits to be sent there.
+///
+/// `relay` is the address that it is reached at. **`name` is the name
+/// that the device's configuration gives it,** where it answers with the
+/// key of a relay that the device is set up with ([`relays_named`]), and
+/// null where it does not: where a device stands at its relays is said by
+/// that name, and a command lists a relay once (decision 2026-10-04 §8).
 fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
     let relays = relays_reached(state);
+    let named = relays_named(state);
     let conn = db(state);
     relays
         .iter()
         .map(|(address, key)| {
             let waits = leaving::waits_at(&conn, &state.identity, key).map_err(refused)?;
-            Ok(json!({ "relay": address, "waits": waits }))
+            let name = named.iter().find(|(of, _)| of == key);
+            let name = name.map(|(_, name)| name.as_str());
+            Ok(json!({ "relay": address, "name": name, "waits": waits }))
         })
         .collect()
 }
@@ -1488,6 +1512,56 @@ mod tests {
             );
             assert!(!says.contains("cordelia start"), "{says}");
         }
+    }
+
+    /// What waits to be sent to a relay is said with the name that the
+    /// device's configuration gives that relay, where it answers with the
+    /// key that the configuration gives for it (decision 2026-10-04 §8):
+    /// a command then lists the relay once, by its name. A relay that
+    /// answers with another key, or that is set up with none, has its
+    /// address and no name.
+    #[test]
+    fn test_what_waits_at_a_relay_is_said_with_the_relays_name() {
+        use crate::state::RelaySnapshot;
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let (one, two, three) = ([7u8; 32], [8u8; 32], [9u8; 32]);
+        connected(&state, &one, "192.0.2.1:9474");
+        connected(&state, &two, "192.0.2.2:9474");
+        connected(&state, &three, "192.0.2.3:9474");
+        let set_up = |name: &str, key: Option<&[u8; 32]>| RelaySnapshot {
+            host: name.into(),
+            key: key.map(|key| encode_public_key(key).unwrap()),
+            state: "connected".into(),
+            unreachable_secs: None,
+            last_tried_secs: None,
+            error: None,
+        };
+        // Before the node has listed its relays, none has a name.
+        let rows = waiting(&state).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row["name"].is_null()), "{rows:?}");
+
+        *state.relays.write().unwrap() = vec![
+            set_up("one.example:9474", Some(&one)),
+            set_up("two.example:9474", None),
+            set_up("other.example:9474", Some(&[6u8; 32])),
+        ];
+        let rows = waiting(&state).unwrap();
+        let said: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|row| (row["relay"].as_str().unwrap(), row["name"].as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("192.0.2.1:9474", Some("one.example:9474")),
+                ("192.0.2.2:9474", None),
+                ("192.0.2.3:9474", None),
+            ]
+        );
+        // What waits there is said as before.
+        assert!(rows.iter().all(|row| row["waits"].is_u64()), "{rows:?}");
     }
 
     /// A relay that the device is set up with and that the node is not
