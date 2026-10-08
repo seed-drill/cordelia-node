@@ -215,6 +215,11 @@ pub struct Accepting {
     pub until: i64,
     /// Whether a hand-over was taken with it.
     pub taken: bool,
+    /// When it was taken, in seconds, by this device's clock: when this
+    /// device joined, or was handed a change, by that key. A command
+    /// says nothing against a device that it has not heard from for the
+    /// first minutes after it (decision 2026-10-04 §8).
+    pub taken_at: Option<i64>,
     /// Whether the node still asks for a hand-over with it.
     pub asking: bool,
     /// What became of the last hand-over that was read with it.
@@ -1451,6 +1456,7 @@ fn accepting(conn: &Connection, now: i64) -> Result<Vec<Accepting>, PersonError>
             typed_at: typed.typed_at,
             until: typed.typed_at.saturating_add(PAIR_KEY_TYPED_SECS),
             taken,
+            taken_at: typed.taken_at,
             asking: !taken && within_its_hour(typed.typed_at, now),
             said: typed.said,
         });
@@ -2259,6 +2265,7 @@ mod tests {
         let asking = seen_at(s.now + 10);
         assert_eq!(asking.len(), 1);
         assert!(asking[0].asking && !asking[0].taken);
+        assert_eq!(asking[0].taken_at, None);
         assert_eq!(asking[0].until, s.now + 3600);
         assert!(asking[0].says().starts_with(&format!(
             "asking for what the device ({}) hands over, until ",
@@ -2272,6 +2279,8 @@ mod tests {
         acts::spend_typed_key(conn, &key, s.now, s.now + 20, "this device has joined").unwrap();
         let taken = seen_at(s.now + 30);
         assert!(taken[0].taken && !taken[0].asking);
+        // When it was taken is said with it.
+        assert_eq!(taken[0].taken_at, Some(s.now + 20));
         assert_eq!(
             taken[0].says(),
             format!(

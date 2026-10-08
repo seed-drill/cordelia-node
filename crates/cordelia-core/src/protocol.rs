@@ -1617,6 +1617,11 @@ const _: () = assert!(RECEIVED_LAST_WEEK_SECS <= HISTORY_DAYS as i64 * 24 * 60 *
 /// each through it in less, and what lasts longer is worth a person's
 /// knowing. The first two are counted by the node's own clock, which
 /// does not run while the machine sleeps.
+///
+/// It is also for how long, after a device joined or another was added,
+/// `cordelia devices` says of a device that it has not heard from only
+/// that, with no advice (§8): that device's word that it has applied the
+/// change is through in less too.
 pub const STATUS_AMBER_WAIT_SECS: u64 = 300;
 
 /// For how many days after a device applied a removal the status line
