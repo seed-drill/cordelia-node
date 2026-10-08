@@ -329,14 +329,15 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
 /// bring in the versions that stand above one that the new channel
 /// holds, each named by its file. **It says what becomes of the text that
 /// each replaces:** it is kept beside its file as a conflict copy, on
-/// each device that holds the file, and the status shows a conflict to
-/// merge until that copy is merged into the file, or deleted.
+/// each device that holds the file. The status shows a conflict for as
+/// long as that copy is in the folder: merging alone does not clear it,
+/// and deleting the copy does.
 fn above_asks(files: &[String]) -> String {
     format!(
         "\nAlso bring in {} above {} that the new channel holds?\n  {}\nThe text that each \
          replaces is kept beside its file as a conflict copy, here and on each device that \
-         holds it.\nThe status shows a conflict to merge until that copy is merged into the \
-         file, or deleted.",
+         holds it.\nThe status shows a conflict until you delete that copy. Merge what you \
+         want from it into the file first.",
         counted(files.len(), "version"),
         match files.len() {
             1 => "the version",
@@ -1347,16 +1348,18 @@ mod tests {
     /// The second yes of `--from` names each file, and says what becomes
     /// of the text that each version replaces (decision 2026-10-04
     /// §7.3): it is kept beside its file as a conflict copy, and the
-    /// status shows a conflict to merge until that copy is dealt with.
+    /// status shows a conflict until that copy is deleted. Merging alone
+    /// does not clear it, and the words do not say that it does.
     #[test]
     fn test_the_second_yes_says_what_becomes_of_the_text_that_is_replaced() {
         assert_eq!(
             above_asks(&["notes.md".to_string()]),
             "\nAlso bring in 1 version above the version that the new channel holds?\n  \
              notes.md\nThe text that each replaces is kept beside its file as a conflict copy, \
-             here and on each device that holds it.\nThe status shows a conflict to merge \
-             until that copy is merged into the file, or deleted."
+             here and on each device that holds it.\nThe status shows a conflict until you \
+             delete that copy. Merge what you want from it into the file first."
         );
+        assert!(!above_asks(&["notes.md".to_string()]).contains("merged"));
         let two = above_asks(&["a.md".to_string(), "b.md".to_string()]);
         assert!(
             two.starts_with(
