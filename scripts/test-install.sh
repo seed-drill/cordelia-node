@@ -43,9 +43,12 @@ case "$1" in
     --version) echo "cordelia @NEW@" ;;
     init)
         [ -f "$HOME/.fake/init_fails" ] && exit 7
-        # Where it is told to, as the real one does.
+        # Where it is told to, as the real one does. Its configuration
+        # file is made as an earlier version made it: open to others.
         mkdir -p "${CORDELIA_DATA_DIR:-$HOME/.cordelia}"
         touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/identity.key"
+        touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
+        chmod 664 "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
         # Its last line, as the real one's: run by a script it says
         # nothing of how the node is started.
         case " $* " in
@@ -223,6 +226,19 @@ has() {
     esac
 }
 
+# Who may read, write and enter what is at $1, as `ls -l` shows it.
+mode_of() {
+    ls -ld "$1" | cut -c1-10
+}
+
+# The data directory is its owner's alone, and so is the configuration
+# file in it.
+private() {
+    check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwx------"
+    check "the configuration file's mode" \
+        "$(mode_of "$HOME_DIR/.cordelia/config.toml")" "-rw-------"
+}
+
 has_not() {
     case "$OUT" in
         *"$1"*) echo "FAILED: $name: must not say \"$1\""; FAILED=1 ;;
@@ -277,6 +293,7 @@ setup() { :; }
 run "a-first-install"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 first_install_says "systemctl --user enable --now cordelia"
+private
 
 service() { echo "${1:-active}" > "$HOME/.fake/service"; }
 
@@ -439,6 +456,29 @@ check "the copy kept" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one 
 again "the-version-before-is-kept-at-a-second-run"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 check "the copy kept after a second run" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
+
+# A data directory that an earlier run left open to others, and the
+# configuration file in it, are set to their owner's alone: with a node
+# that is running, and with none.
+setup() {
+    mkdir -p "$HOME/.cordelia/bin"; echo "the one before" > "$HOME/.cordelia/bin/cordelia"
+    touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/.cordelia/config.toml"
+}
+run "a-data-directory-that-was-open-to-others"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+private
+check "the key's mode is left as it was" \
+    "$(mode_of "$HOME_DIR/.cordelia/identity.key")" "$(mode_of "$HOME_DIR/.fake/calls")"
+
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"
+    mkdir -p "$HOME/.cordelia"; touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/.cordelia/config.toml"
+}
+run "an-upgrade-of-a-data-directory-that-was-open-to-others"
+expect "installed=$NEW running=$NEW restart=done" 0 1
+private
 
 # A first install whose set-up fails says so, and is no success.
 setup() { touch "$HOME/.fake/init_fails"; }

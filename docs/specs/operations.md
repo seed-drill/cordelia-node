@@ -173,7 +173,7 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 
 | Path | Mode | Contents |
 |------|------|---------|
-| `~/.cordelia/config.toml` | 0644 | Node configuration |
+| `~/.cordelia/config.toml` | 0600 | Node configuration |
 | `~/.cordelia/identity.key` | 0600 | Ed25519 seed (32 bytes, raw). X25519 key derived on demand, never persisted separately (ecies-envelope-encryption.md §2). |
 | `~/.cordelia/node-token` | 0600 | Bearer token for HTTP API auth (32 bytes CSPRNG, hex-encoded, 64 chars) |
 | `~/.cordelia/cordelia.db` | 0600 | SQLite database (items, groups, FTS5) |
@@ -188,6 +188,12 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > channels are derived from the person secret, which is in the database.
 > After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
 > §10.5. A relay keeps `channel-keys/` for the older kind.
+>
+> **The data directory itself is mode 0700, and `config.toml` in it 0600.**
+> `cordelia init` and the install script make them so. A node that starts on
+> a data directory that others can read, write or enter sets it to 0700, and
+> the configuration file in it to 0600, and says so once in its log
+> (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
