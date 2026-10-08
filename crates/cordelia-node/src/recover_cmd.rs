@@ -30,7 +30,10 @@
 //!    of the device that added it. Such a key is asked about all the
 //!    same: nothing is taken from it, and said to be gone it is removed.
 //!    Where it is not asked about, the command says how its key is
-//!    removed afterwards, if it is a device of the person's.
+//!    removed afterwards, if it is a device of the person's. Where
+//!    records of additions were read whose keys have no row at all (more
+//!    were written than a recovery keeps), it says how many before the
+//!    first question, and again before its yes.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -264,6 +267,50 @@ fn not_shown_says(not_shown: usize) -> Option<String> {
         counted(not_shown, "more record"),
         removed_afterwards("<key>")
     ))
+}
+
+/// What is said where records of additions were read whose keys have no
+/// row at all (decision 2026-10-04 §9, step 3): `no_row` is how many
+/// keys ([`Generation::no_row`]), and `number` the number of the change
+/// recovered from. A reader keeps 256 records that do not count, the
+/// oldest it saw going first, so where more were written, one that was
+/// read is not among them. **A device of the person's that was added
+/// since the change, and that the bound of 64 kept out, may be among
+/// them.** Nothing is asked of it, nothing that it wrote is brought
+/// back, and this machine does not hold its key: its key is removed
+/// afterwards as that of a row that was not asked about is
+/// ([`removed_afterwards`]), and one that the person still has is added
+/// again by hand. Nothing where every key has a row.
+///
+/// It is said before the first question ([`said_first`]), and again
+/// before the yes ([`will_do_lines`]).
+fn no_row_says(no_row: usize, number: u64) -> Option<String> {
+    if no_row == 0 {
+        return None;
+    }
+    Some(format!(
+        "Records of additions were read for {} that {} not shown here at all, because more were \
+         written than a recovery keeps. A device of yours that was added since change {number} \
+         may be among them. Nothing is asked of such a device, and nothing that it wrote is \
+         brought back. This machine cannot show its key. If it is a device of yours that is \
+         gone, {}. One that you still have is added again by hand.",
+        counted(no_row, "key"),
+        match no_row {
+            1 => "is",
+            _ => "are",
+        },
+        removed_afterwards("<key>")
+    ))
+}
+
+/// What is said before the first question, once the rows are introduced
+/// (decision 2026-10-04 §9, step 3), each after an empty line: where the
+/// answers could not all be kept ([`room_says`]), and where records of
+/// additions were read whose keys have no row ([`no_row_says`]).
+fn said_first(room: &recover::Room, no_row: usize, number: u64) -> Vec<String> {
+    let mut says: Vec<String> = room_says(room).into_iter().collect();
+    says.extend(no_row_says(no_row, number).map(|says| format!("\n{says}")));
+    says
 }
 
 /// The command that a recovery goes on to when its change is made:
@@ -668,8 +715,10 @@ fn asks_of(at: &Terminal, says: &str) -> anyhow::Result<Answer> {
 }
 
 /// What a recovery will do, said before its yes (decision 2026-10-04
-/// §9): from whom the look takes and from whom it takes nothing; the
-/// names that are carried, and those that are left; and what stops.
+/// §9): from whom the look takes and from whom it takes nothing; how
+/// many records could not be shown, and how many keys a record was read
+/// for that have no row at all ([`no_row_says`]); the names that are
+/// carried, and those that are left; and what stops.
 ///
 /// `was_read` is what was read of the personal channels, relay by relay.
 /// **What could not be read is said here** ([`WasRead::lines`], decision
@@ -738,6 +787,7 @@ fn will_do_lines(
                 .replace("record of an additions", "records of additions")
         ));
     }
+    lines.extend(no_row_says(generation.no_row, was_read.number));
     let said = |all: &[String]| -> String {
         let all: Vec<String> = all.iter().map(|name| file_shown(name)).collect();
         all.join(", ")
@@ -912,10 +962,11 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          what tells two apart.\n\n{THREE_ANSWERS}",
         statement.number
     );
-    // Before anything is asked: whether the answers could all be kept.
+    // Before anything is asked: whether the answers could all be kept,
+    // and how many keys a record was read for that have no row.
     let apart_statement = apart.as_ref().map(|other| &other.statement.statement);
     let room = recover::room(&statement, apart_statement, rows, &own);
-    if let Some(says) = room_says(&room) {
+    for says in said_first(&room, generation.no_row, statement.number) {
         println!("{says}");
     }
     // Whether a change has removed a key already: the one recovered
@@ -2132,6 +2183,88 @@ mod tests {
         );
     }
 
+    /// Where records of additions were read whose keys have no row at
+    /// all, the command says how many (decision 2026-10-04 §9, step 3):
+    /// that a device of the person's added since the change may be
+    /// among them, that nothing is asked of it and nothing that it wrote
+    /// is brought back, that this machine cannot show its key, how its
+    /// key is removed afterwards where it is gone, and that one the
+    /// person still has is added again by hand. It is said before the
+    /// first question, after what is said where the answers could not
+    /// all be kept, and again before the yes. Nothing is said where
+    /// every key has a row.
+    #[test]
+    fn test_what_is_said_of_the_keys_whose_record_was_read_and_that_have_no_row() {
+        let two = "Records of additions were read for 2 keys that are not shown here at all, \
+                   because more were written than a recovery keeps. A device of yours that was \
+                   added since change 7 may be among them. Nothing is asked of such a device, and \
+                   nothing that it wrote is brought back. This machine cannot show its key. If it \
+                   is a device of yours that is gone, its key is removed afterwards, on this \
+                   machine, by `cordelia remove-device <key>`, and what it wrote then comes in by \
+                   `cordelia sync carry <name> --from <key>`, with the phrase. One that you still \
+                   have is added again by hand.";
+        assert_eq!(no_row_says(0, 7), None);
+        assert_eq!(no_row_says(2, 7).as_deref(), Some(two));
+        let one = no_row_says(1, 3).unwrap();
+        assert!(
+            one.starts_with(
+                "Records of additions were read for 1 key that is not shown here at all, because"
+            ),
+            "{one}"
+        );
+        assert!(
+            one.contains("added since change 3 may be among them"),
+            "{one}"
+        );
+
+        // Before the first question: after what is said where the
+        // answers could not all be kept, each after an empty line.
+        let room = |removed: usize, asked: usize| recover::Room {
+            removed,
+            asked,
+            can_go: MAX_STATEMENT_REMOVED - removed,
+        };
+        let (kept, tight) = (room(0, 64), room(251, 6));
+        assert!(said_first(&kept, 0, 7).is_empty());
+        assert_eq!(said_first(&kept, 2, 7), [format!("\n{two}")]);
+        let not_every = room_says(&tight).unwrap();
+        assert_eq!(said_first(&tight, 0, 7), std::slice::from_ref(&not_every));
+        assert_eq!(said_first(&tight, 2, 7), [not_every, format!("\n{two}")]);
+
+        // Before the yes: after the line for the records that could not
+        // be shown, which this machine keeps with their keys.
+        let mut generation = Generation {
+            rows: rows(),
+            not_shown: vec![row(5, "fifth", Some(1), false)],
+            no_row: 2,
+            ..Default::default()
+        };
+        let answers = [Answer::Lost, Answer::Lost, Answer::Lost, Answer::NotAsked];
+        let names = recover::Names::default();
+        let read = WasRead {
+            number: 7,
+            ..read_whole()
+        };
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read).join("\n");
+        assert!(
+            all.contains(&format!(
+                "`cordelia devices` shows it with its key.\n{two}\nNo name is carried"
+            )),
+            "{all}"
+        );
+        generation.not_shown.clear();
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read).join("\n");
+        assert!(
+            all.contains(&format!("\n{two}\nNo name is carried")),
+            "{all}"
+        );
+        // Every key has a row: nothing is said of it.
+        generation.no_row = 0;
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read).join("\n");
+        assert!(!all.contains("Records of additions were read"), "{all}");
+        assert!(!all.contains("cannot show its key"), "{all}");
+    }
+
     /// What a command hands the node of the secrets that the phrase
     /// opened is text in a request: the command's own copy of that text
     /// is overwritten once the request is sent, wherever in the request
@@ -2163,6 +2296,7 @@ mod tests {
         let generation = Generation {
             rows: rows(),
             not_shown: vec![row(5, "fifth", Some(1), false), row(6, "", Some(1), false)],
+            no_row: 0,
             names: Vec::new(),
             cut_short: None,
         };
