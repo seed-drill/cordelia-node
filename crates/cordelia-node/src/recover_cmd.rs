@@ -1283,8 +1283,10 @@ pub fn recover_made(
     number: u64,
     cut_short: Option<String>,
 ) -> anyhow::Result<()> {
-    // The change was made a moment before this process began.
+    // The change was made a moment before this process began: by the
+    // clock that cannot go back, and by the time of day.
     let began = std::time::Instant::now();
+    let began_at = chrono::Utc::now();
     println!(
         "Looking at what the relays hold of each name. The look is made once, and this command \
          stays until it has ended. Stopping it stops nothing: the node goes on."
@@ -1333,45 +1335,132 @@ pub fn recover_made(
              devices where no device is named."
         );
     }
-    let seen = look(config_path)?;
     // What a folder that is mapped here has still to publish is in no
-    // store yet: whether one has still to sync for the first time is
-    // asked of the node's sync status. Where that cannot be had, each
-    // mapped folder is taken to.
-    let mapped = seen["folders"].as_u64().unwrap_or(0) as usize;
-    let first_syncs = match seen["sync_on"] == true && mapped > 0 {
-        true => crate::api_post(config_path, "/api/v1/sync/status", json!({}))
-            .map_or(mapped, |sync| first_syncs_to_come(&sync, began.elapsed())),
-        false => 0,
+    // store yet: whether each has synced since the recovery is asked of
+    // the node's sync status, and then what the device holds. For how
+    // long this process has run is read before either.
+    let began = Began {
+        for_secs: began.elapsed().as_secs(),
+        at: began_at,
     };
-    for line in after_lines(&seen, first_syncs) {
+    let (sync, seen) = status_then_holds(
+        || crate::api_post(config_path, "/api/v1/sync/status", json!({})).ok(),
+        || look(config_path),
+    );
+    let seen = seen?;
+    let to_come = match &sync {
+        Some(sync) => folders_to_come(sync, &began),
+        // The status could not be had: with sync on, each folder that is
+        // mapped is taken not to have synced.
+        None if seen["sync_on"] == true => seen["folders"].as_u64().unwrap_or(0) as usize,
+        None => 0,
+    };
+    for line in after_lines(&seen, to_come) {
         println!("{line}");
     }
     Ok(())
 }
 
-/// How many folders that this machine maps have still to sync for the
-/// first time since the recovery (decision 2026-10-04 §9, step 5), as
-/// the node's sync status `sync` says, `since` the change was made. A
-/// folder's first cycle in a name waits until the look has read that
-/// name. What it then publishes is to be sent, and until that cycle has
-/// run none of it is in the store, where what waits is counted.
+/// Read the sync status, and then what the device holds: **in that
+/// order** (decision 2026-10-04 §16). What a folder's cycle publishes is
+/// in the store before the cycle's report is. Read so, a cycle that ends
+/// between the two readings is one whose report was not read, and its
+/// folder is said to have still to sync. Read the other way, what it
+/// published would be in neither: not in what the device held, and its
+/// folder not among those still to sync.
+fn status_then_holds<S, H>(status: impl FnOnce() -> S, holds: impl FnOnce() -> H) -> (S, H) {
+    let status = status();
+    (status, holds())
+}
+
+/// When `recover_made` began, which is a moment after the change of the
+/// recovery was applied: never earlier than that.
+struct Began {
+    /// For how many whole seconds the process had run when it went on
+    /// to ask for the sync status, by the clock that cannot go back.
+    for_secs: u64,
+    /// When it began, by the time of day.
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Whether the report that the sync status `sync` carries is of a cycle
+/// that began after the change of this recovery was applied (decision
+/// 2026-10-04 §16).
 ///
-/// None where sync is off, or no folder is mapped. Otherwise every
-/// mapped folder, where no cycle has reported since the change was made:
-/// the node says for how long it has had no report. And where one has,
-/// each folder of which the report says that it waits.
-fn first_syncs_to_come(sync: &Value, since: Duration) -> usize {
-    let mapped = list(sync, "mappings").count();
-    if sync["enabled"] != true || mapped == 0 {
+/// The status does not say when a cycle began. It says when the cycle's
+/// report was stored, which is never earlier than that: by the time of
+/// day (the report's `at`), and by the node's own clock (for how long it
+/// has stored none, `no_report_secs`). **A report that was stored after
+/// the change is of a cycle that began after it:** a cycle reads the
+/// count of changes to the settings first, a report is stored only where
+/// that count still stands, and applying a change counts as one, under
+/// the hold of the lock that it is applied under.
+///
+/// So the report counts only where both clocks say that it was stored
+/// after this command began, which was after the change:
+///
+/// - by the node's own clock, it has stored none for less long than this
+///   command had run when it asked. (After a start, the node counts from
+///   its start: a report of an earlier run passes this.)
+/// - by the time of day, the report was stored after this command
+///   began. (A report of an earlier run, from before the recovery, does
+///   not pass this.)
+fn reported_since(sync: &Value, began: &Began) -> bool {
+    let no_report_for = sync["no_report_secs"].as_u64().unwrap_or(u64::MAX);
+    let by_its_own_clock = no_report_for < began.for_secs;
+    let stored_at = sync["report"]["at"].as_str();
+    let stored_at = stored_at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    let by_the_time_of_day = stored_at.is_some_and(|at| at > began.at);
+    by_its_own_clock && by_the_time_of_day
+}
+
+/// Whether the cycle of `report` synced the folder of `mapping`: the
+/// report has a row for it, which did not end in error, was not broken
+/// off, has no file that failed, and does not wait for its first cycle.
+/// A folder that the cycle passed by has no row.
+fn synced_in(report: &Value, mapping: &Value) -> bool {
+    let of_it = |folder: &&Value| {
+        folder["cwd"] == mapping["folder"] && folder["project"] == mapping["name"]
+    };
+    let failed = |folder: &Value| {
+        list(folder, "failed").next().is_some() || folder["failed_more"].as_u64().unwrap_or(0) > 0
+    };
+    list(report, "folders").find(of_it).is_some_and(|folder| {
+        folder["waiting"] != true
+            && folder["error"].is_null()
+            && folder["stopped"] != true
+            && !failed(folder)
+    })
+}
+
+/// How many folders that this machine maps are not known to have synced
+/// since the recovery (decision 2026-10-04 §9, step 5; §16), as the
+/// node's sync status `sync` says. A folder's first cycle in a name
+/// waits until the look has read that name. What it then publishes is to
+/// be sent, and until that cycle has run none of it is in the store,
+/// where what waits is counted.
+///
+/// None where sync is off, or no folder is mapped: no cycle publishes
+/// anything. Otherwise **every mapped folder, unless the report is of a
+/// cycle that began after the change was applied** ([`reported_since`])
+/// and that published: a cycle of a device that follows no phrase, or
+/// has stopped, says that it publishes nothing. And of such a report,
+/// each mapped folder that it does not show as synced ([`synced_in`]):
+/// one that ended in error, one that the cycle passed by, and one that
+/// has still to sync for the first time.
+fn folders_to_come(sync: &Value, began: &Began) -> usize {
+    let mapped: Vec<&Value> = list(sync, "mappings").collect();
+    if sync["enabled"] != true || mapped.is_empty() {
         return 0;
     }
-    let no_report_for = sync["no_report_secs"].as_u64().unwrap_or(u64::MAX);
-    if sync["report"].is_null() || no_report_for >= since.as_secs() {
-        return mapped;
+    // A status with no report says of none when it was stored.
+    let report = &sync["report"];
+    let published = report["publishes_nothing"].is_null();
+    if !reported_since(sync, began) || !published {
+        return mapped.len();
     }
-    let waits = |folder: &&Value| folder["waiting"] == true;
-    list(&sync["report"], "folders").filter(waits).count()
+    let not_synced = |mapping: &&&Value| !synced_in(report, mapping);
+    mapped.iter().filter(not_synced).count()
 }
 
 /// What is said once the look has ended, of what the node says of this
@@ -1380,14 +1469,19 @@ fn first_syncs_to_come(sync: &Value, since: Duration) -> usize {
 /// send; and, for each device that the person still has, how it is added
 /// again.
 ///
-/// **That nothing is waiting is said only where nothing is.** Beside
-/// the names, the machine's personal channel is to be sent, which lists
-/// them: the node says how many of the machine's channels wait at each
-/// relay, and where no name does and a channel does, that is said. And
-/// `first_syncs` folders that are mapped here have still to sync for the
-/// first time since the recovery ([`first_syncs_to_come`]): what they
-/// publish is not in the store yet.
-fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
+/// **That nothing is waiting is said only where that was read**
+/// (decision 2026-10-04 §16). Beside the names, the machine's personal
+/// channel is to be sent, which lists them: the node says how many of
+/// the machine's channels wait at each relay that is connected, and
+/// where no name does and a channel does, that is said. `to_come`
+/// folders that are mapped here are not known to have synced since the
+/// recovery ([`folders_to_come`]): what they publish is not in the store
+/// yet. And **with no relay connected, what waits is not known:** that
+/// is said, and nothing is said to wait nowhere.
+///
+/// Whatever else is said says to keep the machine on, and names the
+/// command that shows when nothing waits.
+fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for relay in list(seen, "relays") {
         lines.push(match relay["holds_latest"].as_bool() {
@@ -1398,11 +1492,24 @@ fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
             ),
         });
     }
-    for relay in list(seen, "not_reached").filter_map(Value::as_str) {
+    let not_reached: Vec<&str> = list(seen, "not_reached")
+        .filter_map(Value::as_str)
+        .collect();
+    for relay in &not_reached {
         lines.push(format!(
             "keep this machine on: {relay} is not connected, and what is still to send there is \
              not known until it is."
         ));
+    }
+    // The node says what waits at each relay that is connected: with no
+    // such row, none is, whether or not one was named as not reached.
+    let connected = list(seen, "waiting").count();
+    if connected == 0 && not_reached.is_empty() {
+        lines.push(
+            "keep this machine on: no relay is connected, and what is still to send is not \
+             known until one is."
+                .to_string(),
+        );
     }
     let to_go = list(&seen["names"], "to_go").count();
     // The channels of this machine's own that wait at a relay which is
@@ -1410,7 +1517,7 @@ fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
     let channels = |relay: &Value| relay["waits"].as_u64().unwrap_or(0);
     let channels_wait = list(seen, "waiting").any(|relay| channels(relay) > 0);
     match (to_go, channels_wait) {
-        (0, false) if first_syncs == 0 => lines.push(
+        (0, false) if to_come == 0 && connected > 0 => lines.push(
             "Nothing is waiting to be sent to a relay that is connected. `cordelia devices` \
              shows what each relay holds."
                 .to_string(),
@@ -1426,20 +1533,28 @@ fn after_lines(seen: &Value, first_syncs: usize) -> Vec<String> {
             counted(to_go, "name")
         )),
     }
-    if first_syncs > 0 {
+    if to_come > 0 {
         lines.push(format!(
-            "keep this machine on: {} mapped here {} still to sync for the first time since \
-             the recovery, and what {} is then to send",
-            counted(first_syncs, "folder"),
-            match first_syncs {
-                1 => "has",
-                _ => "have",
+            "keep this machine on: {} mapped here {} not known to have synced since the \
+             recovery, and what {} is then to send. `cordelia sync status` shows each folder.",
+            counted(to_come, "folder"),
+            match to_come {
+                1 => "is",
+                _ => "are",
             },
-            match first_syncs {
+            match to_come {
                 1 => "it publishes",
                 _ => "they publish",
             }
         ));
+    }
+    let nothing_waits = to_go == 0 && !channels_wait && to_come == 0 && connected > 0;
+    if !nothing_waits {
+        lines.push(
+            "`cordelia devices` shows what this machine has still to send, and when nothing is \
+             left."
+                .to_string(),
+        );
     }
     // A key that could not be shown is left out too, and is no device
     // that the person said they still have.
@@ -2227,6 +2342,7 @@ mod tests {
                 { "relay": "two", "holds_latest": false },
             ],
             "not_reached": ["three"],
+            "waiting": [{ "relay": "one", "waits": 1 }, { "relay": "two", "waits": 1 }],
             "names": { "to_go": ["a", "b", "c"], "sent": ["d"] },
             "left_out": [
                 { "label": "desktop", "words": "w1 w2 w3 w4", "number": 3 },
@@ -2272,14 +2388,27 @@ mod tests {
             "{all}"
         );
 
+        // Whatever is still to send, the command that shows when
+        // nothing is left is named.
+        assert!(
+            lines.contains(
+                &"`cordelia devices` shows what this machine has still to send, and when \
+                  nothing is left."
+                    .to_string()
+            ),
+            "{all}"
+        );
+
         // With nothing to send, and nobody to add again.
         let done = json!({
             "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
+            "waiting": [{ "relay": "one", "waits": 0 }],
             "names": { "to_go": [], "sent": ["a"] }, "left_out": [],
         });
         let all = after_lines(&done, 0).join("\n");
         assert!(all.contains("Nothing is waiting to be sent"), "{all}");
         assert!(!all.contains("keep this machine on"), "{all}");
+        assert!(!all.contains("has still to send"), "{all}");
         assert!(!all.contains("added again"), "{all}");
         let one = json!({ "relays": [], "names": { "to_go": ["a"] } });
         assert!(
@@ -2288,13 +2417,16 @@ mod tests {
         );
     }
 
-    /// That nothing is waiting to be sent is said only where nothing is
-    /// (decision 2026-10-04 §9, step 5). The machine's personal channel,
-    /// which lists the names, is to be sent too: where no name waits and
-    /// a channel of the machine's own does, that is said. And a folder
-    /// that is mapped here has its first cycle once the look has read
-    /// its name: until it has synced, what it publishes is still to
-    /// come, and that is said.
+    /// That nothing is waiting to be sent is said only where that was
+    /// read (decision 2026-10-04 §9, step 5; §16). The machine's personal
+    /// channel, which lists the names, is to be sent too: where no name
+    /// waits and a channel of the machine's own does, that is said. A
+    /// folder that is mapped here and is not known to have synced since
+    /// the recovery has still to publish: that is said, with the command
+    /// that shows each folder. With no relay connected, what waits is
+    /// not known: that is said, and nothing is said to wait nowhere.
+    /// Whatever is said in the place of "nothing is waiting" names the
+    /// command that shows when nothing is.
     #[test]
     fn test_nothing_is_said_to_wait_only_where_nothing_does() {
         let seen = |to_go: Value, waits: u64| {
@@ -2308,14 +2440,18 @@ mod tests {
                        devices` shows what each relay holds.";
         let list_waits = "keep this machine on: its personal channel, which lists the names, is \
                           still to send";
+        let shows = "`cordelia devices` shows what this machine has still to send, and when \
+                     nothing is left.";
         // Nothing waits anywhere.
         let all = after_lines(&seen(json!([]), 0), 0);
         assert!(all.contains(&nothing.to_string()), "{all:?}");
         assert!(!all.join("\n").contains("keep this machine on"), "{all:?}");
+        assert!(!all.contains(&shows.to_string()), "{all:?}");
         // No name waits, and a channel of the machine's own does, at one
         // relay: its personal channel.
         let all = after_lines(&seen(json!([]), 1), 0);
         assert!(all.contains(&list_waits.to_string()), "{all:?}");
+        assert!(all.contains(&shows.to_string()), "{all:?}");
         assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
         // Names wait: they are counted, as before.
         let all = after_lines(&seen(json!(["a", "b"]), 3), 0);
@@ -2323,13 +2459,16 @@ mod tests {
             all.contains(&"keep this machine on: 2 names still to send".to_string()),
             "{all:?}"
         );
+        assert!(all.contains(&shows.to_string()), "{all:?}");
         assert!(!all.contains(&list_waits.to_string()), "{all:?}");
-        // A folder has still to sync for the first time: nothing is said
-        // to be done, whatever waits in the store.
-        let first = "keep this machine on: 1 folder mapped here has still to sync for the first \
-                     time since the recovery, and what it publishes is then to send";
+        // A folder is not known to have synced since the recovery:
+        // nothing is said to be done, whatever waits in the store.
+        let first = "keep this machine on: 1 folder mapped here is not known to have synced \
+                     since the recovery, and what it publishes is then to send. `cordelia sync \
+                     status` shows each folder.";
         let all = after_lines(&seen(json!([]), 0), 1);
         assert!(all.contains(&first.to_string()), "{all:?}");
+        assert!(all.contains(&shows.to_string()), "{all:?}");
         assert!(!all.join("\n").contains("Nothing is waiting"), "{all:?}");
         let all = after_lines(&seen(json!(["a"]), 1), 2).join("\n");
         assert!(
@@ -2338,48 +2477,166 @@ mod tests {
         );
         assert!(
             all.contains(
-                "keep this machine on: 2 folders mapped here have still to sync for the first \
-                 time since the recovery, and what they publish is then to send"
+                "keep this machine on: 2 folders mapped here are not known to have synced since \
+                 the recovery, and what they publish is then to send. `cordelia sync status` \
+                 shows each folder."
             ),
             "{all}"
         );
 
-        // Which folders have still to sync, as the node's sync status
-        // says. Sync is off, or nothing is mapped: none.
+        // With no relay connected, the node says of no relay what waits
+        // there. The line that says so is said, and "nothing is waiting"
+        // is not: of each relay that is named as not reached, and where
+        // none is named.
+        let not_connected = |not_reached: Value| {
+            json!({
+                "this_device": "k", "relays": [{ "relay": "one", "holds_latest": true }],
+                "names": { "to_go": [], "sent": [] }, "left_out": [],
+                "waiting": [], "not_reached": not_reached,
+            })
+        };
+        let all = after_lines(&not_connected(json!(["one"])), 0);
+        assert_eq!(
+            all[1],
+            "keep this machine on: one is not connected, and what is still to send there is not \
+             known until it is."
+        );
+        assert_eq!(all[2..], [shows.to_string()], "{all:?}");
+        let all = after_lines(&not_connected(json!([])), 0);
+        assert_eq!(
+            all[1..],
+            [
+                "keep this machine on: no relay is connected, and what is still to send is not \
+                 known until one is."
+                    .to_string(),
+                shows.to_string()
+            ],
+            "{all:?}"
+        );
+        // One relay is connected, and one is not: nothing waits at the
+        // one that is, and that is said of it.
+        let mut one_of_two = not_connected(json!(["two"]));
+        one_of_two["waiting"] = json!([{ "relay": "one", "waits": 0 }]);
+        let all = after_lines(&one_of_two, 0);
+        assert!(all.contains(&nothing.to_string()), "{all:?}");
+        assert!(
+            all.join("\n")
+                .contains("keep this machine on: two is not connected"),
+            "{all:?}"
+        );
+    }
+
+    /// The sync status is read first, and what the device holds after
+    /// it (decision 2026-10-04 §16): a first cycle that ends between the
+    /// two readings is then one whose report was not read, and its
+    /// folder is said to have still to sync.
+    #[test]
+    fn test_the_sync_status_is_read_before_what_the_device_holds() {
+        let read = std::cell::RefCell::new(Vec::new());
+        let reads = |what: &'static str| {
+            read.borrow_mut().push(what);
+            what
+        };
+        let both = status_then_holds(|| reads("the sync status"), || reads("what it holds"));
+        assert_eq!(both, ("the sync status", "what it holds"));
+        assert_eq!(*read.borrow(), ["the sync status", "what it holds"]);
+    }
+
+    /// Which folders are not known to have synced since the recovery, as
+    /// the node's sync status says (decision 2026-10-04 §16). A folder is
+    /// known to have synced only where the report is of a cycle that
+    /// began after the change was applied, and that cycle published, and
+    /// the folder neither ended in error there, nor was passed by, nor
+    /// has still to sync for the first time.
+    #[test]
+    fn test_a_folder_has_synced_only_where_a_cycle_since_the_change_says_so() {
+        use chrono::TimeZone;
+        // This command began ten seconds ago, at this time of day.
+        let at = chrono::Utc.with_ymd_and_hms(2027, 1, 15, 8, 0, 0).unwrap();
+        let began = Began { for_secs: 10, at };
+        let later = "2027-01-15T08:00:05+00:00";
+        let earlier = "2027-01-15T07:59:59+00:00";
+        let folder =
+            |n: usize| json!({ "cwd": format!("/home/sam/{n}"), "project": format!("n{n}") });
         let status = |enabled: bool, mapped: usize, no_report_secs: u64, report: Value| {
-            let mappings: Vec<Value> = (0..mapped).map(|n| json!({ "name": n })).collect();
+            let mappings: Vec<Value> = (0..mapped)
+                .map(|n| json!({ "folder": format!("/home/sam/{n}"), "name": format!("n{n}") }))
+                .collect();
             json!({
                 "enabled": enabled, "mappings": mappings, "no_report_secs": no_report_secs,
                 "report": report,
             })
         };
-        let folders = |waiting: &[bool]| {
-            let folders: Vec<Value> = waiting.iter().map(|w| json!({ "waiting": w })).collect();
-            json!({ "folders": folders })
+        // A report that was stored at `at`, with a row for each of two
+        // folders, changed as `edit` says.
+        let report = |at: &str, edit: &dyn Fn(&mut Value)| {
+            let mut report = json!({ "at": at, "folders": [folder(0), folder(1)] });
+            edit(&mut report);
+            report
         };
-        let since = Duration::from_secs(10);
-        let cycled = folders(&[false, false]);
-        let one_waits = folders(&[false, true]);
-        let to_come = |status: Value| first_syncs_to_come(&status, since);
-        assert_eq!(to_come(status(false, 2, 1, one_waits.clone())), 0);
+        let synced = |at: &str| report(at, &|_| {});
+        let to_come = |status: Value| folders_to_come(&status, &began);
+
+        // Sync is off, or nothing is mapped: none.
+        assert_eq!(to_come(status(false, 2, 1, synced(later))), 0);
         assert_eq!(to_come(status(false, 2, 11, Value::Null)), 0);
-        assert_eq!(to_come(status(true, 0, 1, one_waits.clone())), 0);
-        // A cycle has reported since the change: each folder that it
-        // says waits.
-        assert_eq!(to_come(status(true, 2, 1, cycled.clone())), 0);
-        assert_eq!(to_come(status(true, 2, 9, one_waits.clone())), 1);
-        // None has, or there is no report: each mapped folder.
-        assert_eq!(
-            first_syncs_to_come(&status(true, 2, 10, cycled.clone()), since),
-            2
-        );
-        assert_eq!(first_syncs_to_come(&status(true, 2, 11, cycled), since), 2);
-        assert_eq!(
-            first_syncs_to_come(&status(true, 3, 1, Value::Null), since),
-            3
-        );
-        let unsaid = json!({ "enabled": true, "mappings": [{}], "report": one_waits });
-        assert_eq!(first_syncs_to_come(&unsaid, since), 1);
+        assert_eq!(to_come(status(true, 0, 1, synced(later))), 0);
+        // A cycle that began since the change says that both synced.
+        assert_eq!(to_come(status(true, 2, 1, synced(later))), 0);
+        assert_eq!(to_come(status(true, 2, 9, synced(later))), 0);
+
+        // One has still to sync for the first time.
+        let waits = report(later, &|r| r["folders"][1]["waiting"] = json!(true));
+        assert_eq!(to_come(status(true, 2, 1, waits)), 1);
+        // One ended in error; one was broken off; in one a file failed.
+        let in_error = report(later, &|r| r["folders"][0]["error"] = json!("no room"));
+        assert_eq!(to_come(status(true, 2, 1, in_error)), 1);
+        let stopped = report(later, &|r| r["folders"][0]["stopped"] = json!(true));
+        assert_eq!(to_come(status(true, 2, 1, stopped)), 1);
+        let failed = report(later, &|r| {
+            r["folders"][1]["failed"] = json!([{ "name": "a.md" }])
+        });
+        assert_eq!(to_come(status(true, 2, 1, failed)), 1);
+        let more = report(later, &|r| r["folders"][1]["failed_more"] = json!(3));
+        assert_eq!(to_come(status(true, 2, 1, more)), 1);
+        // One was passed by: the cycle has no row for it. So is each
+        // where the cycle ended before it reached any.
+        let passed_by = report(later, &|r| r["folders"] = json!([folder(1)]));
+        assert_eq!(to_come(status(true, 2, 1, passed_by)), 1);
+        let none = report(later, &|r| r["folders"] = json!([]));
+        assert_eq!(to_come(status(true, 3, 1, none)), 3);
+        // A row for another folder under the name is no row for it.
+        let another = report(later, &|r| {
+            r["folders"][0]["cwd"] = json!("/home/sam/other")
+        });
+        assert_eq!(to_come(status(true, 2, 1, another)), 1);
+
+        // The report is of a cycle from before the change: each mapped
+        // folder. By the node's own clock, it has stored none since this
+        // command began, to the second.
+        assert_eq!(to_come(status(true, 2, 10, synced(later))), 2);
+        assert_eq!(to_come(status(true, 2, 11, synced(later))), 2);
+        // By the time of day, it was stored before this command began:
+        // a node that was started again counts from its start, and
+        // still holds the report of its earlier run.
+        assert_eq!(to_come(status(true, 2, 1, synced(earlier))), 2);
+        let at_the_moment = "2027-01-15T08:00:00+00:00";
+        assert_eq!(to_come(status(true, 2, 1, synced(at_the_moment))), 2);
+        // A report that does not say when it was stored, or a status
+        // that does not say for how long none was: each mapped folder.
+        let unsaid = report(later, &|r| r["at"] = Value::Null);
+        assert_eq!(to_come(status(true, 2, 1, unsaid)), 2);
+        let mut no_clock = status(true, 2, 1, synced(later));
+        no_clock["no_report_secs"] = Value::Null;
+        assert_eq!(to_come(no_clock), 2);
+        // There is no report.
+        assert_eq!(to_come(status(true, 3, 1, Value::Null)), 3);
+        // The cycle published nothing: the device followed no phrase
+        // when it ran, and no folder is said to wait in its report.
+        let no_phrase = report(later, &|r| {
+            r["publishes_nothing"] = json!("this device follows no recovery phrase yet")
+        });
+        assert_eq!(to_come(status(true, 2, 1, no_phrase)), 2);
     }
 
     /// Of a record that does not count nothing is asked, and its key is
