@@ -932,6 +932,8 @@ mod tests {
     #[derive(Default)]
     struct Said {
         gone: Vec<&'static str>,
+        /// Each path that is there and is no directory: a file.
+        files: Vec<&'static str>,
         inside: Vec<(&'static str, &'static str)>,
         no_git: bool,
         /// Each directory that is a link, with where it leads.
@@ -940,7 +942,8 @@ mod tests {
 
     impl Machine for Said {
         fn is_dir(&self, dir: &Path) -> bool {
-            !self.gone.iter().any(|gone| Path::new(gone) == dir)
+            let is = |paths: &[&str]| paths.iter().any(|path| Path::new(path) == dir);
+            !is(&self.gone) && !is(&self.files)
         }
 
         fn memory_root(&self, dir: &Path) -> Option<PathBuf> {
@@ -955,7 +958,8 @@ mod tests {
         }
 
         fn real_path(&self, dir: &Path) -> Option<PathBuf> {
-            if !self.is_dir(dir) {
+            // What is gone has no real path. A file has one.
+            if self.gone.iter().any(|gone| Path::new(gone) == dir) {
                 return None;
             }
             let link = self.links.iter().find(|(link, _)| Path::new(link) == dir);
@@ -1074,6 +1078,24 @@ mod tests {
                 Some("was"),
                 &none,
                 &gone,
+                Some(HOME)
+            ),
+            Maps::No(WhyNot::DirectoryGone)
+        );
+        // A file where the directory was: the path is there, it has a
+        // real path, and git says that it is in no repository. It is no
+        // directory, and `map` takes none but a directory: gone.
+        let a_file = Said {
+            files: vec!["/home/sam/was-here"],
+            ..Default::default()
+        };
+        assert_eq!(
+            asks(
+                &folder,
+                Some("/home/sam/was-here"),
+                Some("was"),
+                &none,
+                &a_file,
                 Some(HOME)
             ),
             Maps::No(WhyNot::DirectoryGone)

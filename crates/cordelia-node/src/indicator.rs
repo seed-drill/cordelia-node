@@ -1697,6 +1697,19 @@ mod tests {
             (error.level, error.state, error.summary.as_str()),
             (Some(Level::Red), State::Attention, "memory sync error")
         );
+        // So is what needs the person and has no level with nothing
+        // mapped: entries that relays keep refusing. The state is
+        // `attention`, nothing holds, and the words are of that, and not
+        // of the phrase.
+        let refused = no_phrase(&|f| {
+            f.mapped = 0;
+            f.outbox_refused = 2;
+        });
+        assert_eq!(
+            (refused.level, refused.state, refused.summary.as_str()),
+            (None, State::Attention, "memory: 2 not taken by a relay")
+        );
+        assert!(refused.holds.is_empty());
         // With nothing mapped and a notice: red, and the line says that
         // folders stopped syncing.
         let notice = with(&|f| {

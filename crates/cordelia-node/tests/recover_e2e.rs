@@ -927,20 +927,22 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
     );
 }
 
-/// **No device pushes another out of a recovery by filling the 64**
-/// (decision 2026-10-04 §9, step 3). A change lists the laptop and the
-/// desktop. The desktop then adds a phone, which syncs `lab` and writes
-/// a file there. The laptop signs 62 records of additions, which a
-/// recovery reads first: with them 64 devices count, and the phone's
-/// record finds no room.
-///
-/// The laptop may be in someone else's hands, and the desktop is lost.
-/// The phone is shown with the reason that it does not count, and is
-/// asked about all the same, since the desktop added it. Said to be
-/// lost, its key is removed, and the look takes nothing from it: what it
-/// wrote comes in by `cordelia sync carry lab --from`, with the phrase.
-#[test]
-fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() {
+/// A person's devices where the bound of 64 keeps one out: a relay, the
+/// two devices of a change, and a phone that the desktop added since.
+struct KeptOut {
+    relay: Node,
+    two: Two,
+    phone: Node,
+}
+
+const ON_THE_PHONE: &str = "written on the phone\n";
+
+/// A change lists the laptop and the desktop. The desktop then adds a
+/// phone, which syncs `lab` and writes a file there. The laptop signs 62
+/// records of additions, which a recovery reads first: with them 64
+/// devices count, and the phone's record finds no room. Every device is
+/// stopped, and the relay holds what each had sent.
+fn a_phone_that_the_64_keep_out() -> KeptOut {
     let relay = relay_started();
     let mut two = two_devices(&[&relay], None);
     // A change that lists both, the laptop first.
@@ -958,7 +960,6 @@ fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() 
     let mut phone = device_started("phone", &relay);
     adds(&two.desktop, &phone, "phone");
     let phone_memory = syncs_lab(&phone);
-    const ON_THE_PHONE: &str = "written on the phone\n";
     std::fs::write(phone_memory.join("p.md"), ON_THE_PHONE).unwrap();
     let all = [&relay, &two.laptop, &two.desktop, &phone];
     wait_for("the relay was sent the phone's file", &all, 180, || {
@@ -999,7 +1000,21 @@ fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() 
         },
     );
     two.laptop.stop();
+    KeptOut { relay, two, phone }
+}
 
+/// **No device pushes another out of a recovery by filling the 64**
+/// (decision 2026-10-04 §9, step 3), where the 64 keep a phone out
+/// ([`a_phone_that_the_64_keep_out`]).
+///
+/// The laptop may be in someone else's hands, and the desktop is lost.
+/// The phone is shown with the reason that it does not count, and is
+/// asked about all the same, since the desktop added it. Said to be
+/// lost, its key is removed, and the look takes nothing from it: what it
+/// wrote comes in by `cordelia sync carry lab --from`, with the phrase.
+#[test]
+fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() {
+    let KeptOut { relay, two, .. } = a_phone_that_the_64_keep_out();
     // The laptop may be in someone else's hands, and so may each of the
     // 62 keys that it added, which count. The desktop is lost, and so is
     // the phone, which is asked about last.
@@ -1061,6 +1076,103 @@ fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() 
     // Its key is a removed key: what it wrote comes in by the command
     // that names it, with the phrase.
     let mut at = new.at_terminal(&["sync", "carry", "lab", "--from", "phone"]);
+    at.says("What this removed key signed in lab:")
+        .says("1 version would go into a slot where the new channel holds nothing.")
+        .says("Bring in 1 version into the slot where the new channel holds nothing?")
+        .types("yes");
+    at.says("The recovery phrase, twelve words")
+        .types(&two.words);
+    let said = at.done();
+    assert!(said.contains("lab: 1 version brought in"), "{said}");
+    assert_eq!(text_of(&new, "p.md").as_deref(), Some(ON_THE_PHONE));
+}
+
+/// **A device that the 64 kept out, and that was not asked about, is
+/// removed afterwards by its key** (decision 2026-10-04 §9, step 3),
+/// where the 64 keep a phone out ([`a_phone_that_the_64_keep_out`]).
+///
+/// The laptop may be in someone else's hands, and so may the desktop,
+/// which added the phone: nothing is asked of the phone. Its row says
+/// how its key is removed afterwards, if it is a device of the person's,
+/// with the key written whole. On the machine that has recovered,
+/// `cordelia remove-device` takes that key, which is in no list of the
+/// new change, and `cordelia sync carry lab --from`, with the same key
+/// and the phrase, then brings in what the phone wrote.
+#[test]
+fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key() {
+    let KeptOut { relay, two, phone } = a_phone_that_the_64_keep_out();
+    let phone_key = key_of(&phone);
+    let new = device_started("new", &relay);
+    let answers = vec!["hands"; 64];
+    let mut at = recovers(&new, None, &two.words, &answers);
+    at.says("The change is made (change 3)")
+        .says("The look is made");
+    let said = at.done();
+    println!("{said}");
+    // The phone is shown, with why it does not count, and nothing is
+    // asked of it: the row says how its key is removed afterwards.
+    let of_the_phone = said
+        .split("\"phone\", added since change 2, from (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{said}"));
+    assert!(
+        of_the_phone
+            .contains(", by a record that does not count: 64 devices counted already. It signed "),
+        "{said}"
+    );
+    let afterwards = format!(
+        "It is no device: nothing is asked of it, nothing that it wrote is brought back, and its \
+         key is not removed. If it is a device of yours that is gone, its key is removed \
+         afterwards, on this machine, by `cordelia remove-device {phone_key}`, and what it wrote \
+         then comes in by `cordelia sync carry <name> --from {phone_key}`, with the phrase. One \
+         that you still have is added again by hand."
+    );
+    assert!(of_the_phone.contains(&afterwards), "{said}");
+    assert!(
+        !said.contains("That is the one thing its record fails for"),
+        "{said}"
+    );
+    // The 64 that count are removed, and the phone's key is not.
+    assert!(said.contains("removed keys (64):"), "{said}");
+    assert!(
+        said.contains("Nothing that those devices wrote is brought back by this recovery."),
+        "{said}"
+    );
+    let removed = |n: &Node| person_of(n)["removed"].as_array().unwrap().clone();
+    assert_eq!(removed(&new).len(), 64);
+    assert!(
+        !removed(&new)
+            .iter()
+            .any(|one| one["key"] == phone_key.as_str())
+    );
+
+    // On the machine that has recovered: the key, as the row wrote it.
+    // It is in no list of the change, and is removed all the same, after
+    // the typed word.
+    let mut at = new.at_terminal(&["remove-device", &phone_key]);
+    at.says("is no device of yours that this device knows of")
+        .says("Type `refuse` to refuse this key for good, or anything else to stop")
+        .types("refuse");
+    at.says("The change that the recovery phrase will sign (change 4):")
+        .says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says("The recovery phrase, twelve words")
+        .types(&two.words);
+    at.says("The change is made (change 4).");
+    let said = at.done();
+    assert!(said.contains("this machine may be closed."), "{said}");
+    assert_eq!(person_of(&new)["change"], 4);
+    assert_eq!(removed(&new).len(), 65);
+    assert!(
+        removed(&new)
+            .iter()
+            .any(|one| one["key"] == phone_key.as_str())
+    );
+
+    // Its key is a removed key now: what it wrote comes in by the
+    // command that names it by that same key, with the phrase.
+    let mut at = new.at_terminal(&["sync", "carry", "lab", "--from", &phone_key]);
     at.says("What this removed key signed in lab:")
         .says("1 version would go into a slot where the new channel holds nothing.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
@@ -1404,17 +1516,31 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
 }
 
 /// **A recovery says at which relay the personal channel was not read**
-/// (decision 2026-10-04 §9, step 3). A person's two devices are set up
-/// with two relays, and both are lost. One relay is down when the new
-/// machine recovers: the personal channel of the change recovered from
-/// is read to its end at the other, and the command goes on. Before its
-/// yes it says at which relay the channel could not be read, and that
-/// devices added since and names may be missing.
+/// (decision 2026-10-04 §9, step 3; §16). A person's two devices are set
+/// up with two relays, make a second change, and are both lost. One
+/// relay is down when the new machine recovers: the personal channel of
+/// the change recovered from is read to its end at the other, and the
+/// command goes on. Before its yes it says at which relay the channel
+/// could not be read, and that devices added since and names may be
+/// missing. **It says the same of the personal channel of the generation
+/// before, which is read for names,** by that change's number.
 #[test]
 fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let first = relay_named("relay-one");
     let mut second = relay_named("relay-two");
     let mut two = two_devices(&[&first, &second], None);
+    // A second change, which lists both: the first is a generation
+    // before, whose personal channel a recovery reads for names.
+    let mut at = renews(&two.laptop, &["stays"], &two.words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&first, &second, &two.laptop, &two.desktop];
+    wait_for("the desktop applies change 2", &all, 120, || {
+        (person_of(&two.desktop)["change"] == 2).then_some(())
+    });
+    wait_for("the relays were sent everything", &all, 180, || {
+        has_sent_everything(&two.laptop).and(has_sent_everything(&two.desktop))
+    });
     two.laptop.stop();
     two.desktop.stop();
     let new = device_at("new", &[&first, &second]);
@@ -1431,10 +1557,11 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     );
 
     let mut at = recovers(&new, None, &two.words, &["lost", "lost"]);
-    at.says("The change is made (change 2)")
+    at.says("The change is made (change 3)")
         .says("The look is made");
     let said = at.done();
     println!("{said}");
+    assert!(said.contains("Recovering from change 2."), "{said}");
     assert!(
         said.contains(&format!(
             "Could not read the personal channel at {down} to its end (not reached)."
@@ -1448,6 +1575,16 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let warned = said.find(&missing).unwrap_or_else(|| panic!("{said}"));
     let asked = said.find("Recover on this machine?").unwrap();
     assert!(warned < asked, "{said}");
+    // The generation before, by its change's number.
+    let before = format!(
+        "The personal channel of change 1, which is read for names, could not be read to its \
+         end at {down}: names that are listed only there may be missing."
+    );
+    let warned = said.find(&before).unwrap_or_else(|| panic!("{said}"));
+    assert!(warned < asked, "{said}");
+    // It was read to its end at one relay: what a read in part costs is
+    // not said.
+    assert!(!said.contains("A device that is missing"), "{said}");
     // What was read is carried.
     assert!(said.contains("1 name is carried: lab."), "{said}");
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
@@ -1536,12 +1673,13 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     // The new machine reaches both relays, and finds both changes.
     let new = device_at("new", &[&first, &second]);
 
-    // **Where the personal channel of the change recovered from is read
-    // to its end at no relay, the recovery is refused before anything is
-    // asked** (§9, step 3). The phrase's channel is read; then, while
-    // the command asks which change to recover from, both relays go
-    // down. It says at which relays it could not read, and makes
-    // nothing.
+    // **Where no relay handed an entry of the personal channel of the
+    // change recovered from, and none said that it holds none of it, the
+    // recovery is refused before anything is asked** (§9, step 3; §16).
+    // The phrase's channel is read; then, while the command asks which
+    // change to recover from, both relays go down. It names each relay
+    // at which nothing was read, says to run the command again, and
+    // makes nothing.
     let mut at = new.at_terminal(&["recover", "--name", "new"]);
     at.says("The recovery phrase, twelve words").types(&words);
     at.says("Two changes were made apart")
@@ -1551,7 +1689,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     at.types("1");
     let refused = at.refused();
     assert!(
-        refused.contains("the personal channel of change 3 could not be read to its end at"),
+        refused.contains("nothing of the personal channel of change 3 was read at any relay: "),
         "{refused}"
     );
     for relay in [&first, &second] {
@@ -1561,10 +1699,16 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
         );
     }
     assert!(
-        refused.contains("and so at no relay: which devices were added since that change"),
+        refused.contains(
+            "No relay handed an entry of it, and none said that it holds none of it: which \
+             devices were added since that change, and which names they sync, is not known."
+        ),
         "{refused}"
     );
-    assert!(refused.contains("Nothing was done."), "{refused}");
+    assert!(
+        refused.contains("Run `cordelia recover` again. Nothing was done."),
+        "{refused}"
+    );
     assert!(
         !refused.contains("Type `have`, `lost` or `hands`"),
         "{refused}"

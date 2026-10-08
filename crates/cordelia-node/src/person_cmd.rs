@@ -284,6 +284,34 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
     (short, says)
 }
 
+/// What a command that has this device begin again says before its yes
+/// (decision 2026-10-04 §16), where the device holds versions that it
+/// has sent to no relay: how many, of how many names, as the node counts
+/// them. Beginning again lets go of everything that the device's store
+/// holds, and nothing is refused for it: a person who begins again has
+/// said so. `None` where nothing waits.
+fn waits_says(seen: &Value) -> Option<String> {
+    let count = |field: &str| seen["sent_to_no_relay"][field].as_u64().unwrap_or(0) as usize;
+    let (versions, names) = (count("versions"), count("names"));
+    if versions == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} of {} that this device holds {} been sent to no relay yet: {} let go with \
+         everything else that it holds.",
+        counted(versions, "version"),
+        counted(names, "name"),
+        match versions {
+            1 => "has",
+            _ => "have",
+        },
+        match versions {
+            1 => "it is",
+            _ => "they are",
+        }
+    ))
+}
+
 // ── cordelia phrase ─────────────────────────────────────────────────
 
 /// `cordelia phrase`: make the recovery phrase of this person's devices
@@ -301,6 +329,10 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
     println!("{WHOSE_WORDS}\n");
+    // What a device that follows a phrase already would let go of.
+    if let Some(waits) = waits_says(&seen) {
+        println!("{waits}");
+    }
     let agreed = match among.as_str() {
         "no_phrase" => true,
         "alone" => at.yes(
@@ -2021,6 +2053,9 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         ("no_phrase", _) => "It follows no recovery phrase, and has nothing to leave.".into(),
         _ => "It has stopped, and says nothing to the devices it was with.".into(),
     };
+    if let Some(waits) = waits_says(&seen) {
+        println!("{waits}");
+    }
     let agreed = at.yes(&format!(
         "This gives this device a new key. {leaves}\nIt keeps its memory folders and their \
          mappings, and forgets everything else that it held of your devices: the phrase it \
@@ -3082,6 +3117,28 @@ mod tests {
         let mut behind = look(json!([]), reached, json!([]), sent);
         behind["relays"][0]["holds_latest"] = json!(false);
         assert_eq!(missing(&behind).1, 1);
+    }
+
+    /// A command that has the device begin again says before its yes how
+    /// much the device holds that it has sent to no relay (decision
+    /// 2026-10-04 §16): how many versions, of how many names, as the node
+    /// counts them. It refuses nothing. Nothing is said where nothing
+    /// waits, or beside a node that does not say.
+    #[test]
+    fn beginning_again_says_what_the_device_has_sent_to_no_relay() {
+        let seen = |versions: u64, names: u64| json!({ "sent_to_no_relay": { "versions": versions, "names": names } });
+        assert_eq!(waits_says(&seen(0, 0)), None);
+        assert_eq!(waits_says(&json!({ "among": "alone" })), None);
+        assert_eq!(
+            waits_says(&seen(1, 1)).unwrap(),
+            "1 version of 1 name that this device holds has been sent to no relay yet: it is \
+             let go with everything else that it holds."
+        );
+        assert_eq!(
+            waits_says(&seen(5, 2)).unwrap(),
+            "5 versions of 2 names that this device holds have been sent to no relay yet: they \
+             are let go with everything else that it holds."
+        );
     }
 
     /// `cordelia devices` says of each device whether it has sent what it

@@ -989,46 +989,114 @@ async fn the_timer_that_sends_and_a_publish_show_again_where_they_find_no_leave(
 
 /// Leave ends at once, at every relay, when the entry that the device
 /// keeps changes: it was given for the entry that was shown.
+///
+/// **A leave lasts SHOW_LEAVE_SECS by the clock, and this looks at one
+/// after a pass at two relays.** On a machine that is busy a pass can
+/// take longer than a leave lasts: the leave that it was given has then
+/// run out when it is looked at, and that says nothing of the pass. So
+/// each pass after which a leave is looked at says when it began. Where
+/// there is leave at each relay, the test goes on. Where there is not,
+/// **and the pass took less long than a leave lasts, the test fails:**
+/// the pass gave none. Where it took longer, the step is made again:
+/// the whole pass again, and the change again, with a file more. The
+/// first try is the test as it stands on a machine that is not busy, and
+/// each later one asserts the same, counted from what stood before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leave_ends_at_once_at_every_relay_when_the_entry_kept_changes() {
+    /// How long a leave lasts.
+    const LEAVE: Duration = Duration::from_secs(SHOW_LEAVE_SECS);
+    /// How often a step is made again where the machine took longer
+    /// than a leave lasts over a pass.
+    const TRIES: usize = 12;
     let (first, second) = (relay_started("first", None), relay_started("second", None));
     let mut device = Device::new("laptop");
     device.makes_the_phrase(&phrase());
     device.holds("notes");
     device.connects("first", &first).await;
     device.connects("second", &second).await;
-    device.passes().await;
-    for relay in ["first", "second"] {
-        assert_eq!(device.has_leave(relay), Ok(()));
-    }
+    let names = ["first", "second"];
+    let leave_at_each = |device: &Device| names.map(|relay| device.has_leave(relay));
+    let whole_shows = |device: &Device| names.map(|relay| device.counts(relay).whole_shows);
+    let given = [Ok(()), Ok(())];
+    // What is said where a pass that took less long than a leave lasts
+    // left no leave at a relay, and where every try took longer.
+    let no_leave = |after: &str, took: Duration, leave: &[Result<(), NoLeave>; 2]| {
+        assert!(
+            took >= LEAVE,
+            "{after} took {took:?}, which is less than a leave lasts, and there is no leave at \
+             each relay: {leave:?}"
+        );
+    };
+    // How many changes were made, and how many passes were made again.
+    let (mut changes, mut again) = (0, 0);
+    loop {
+        assert!(
+            again < TRIES,
+            "the machine took longer than a leave lasts over a pass, {TRIES} times"
+        );
+        // The whole pass gives leave at each relay.
+        let began = std::time::Instant::now();
+        device.passes().await;
+        let leave = leave_at_each(&device);
+        if leave != given {
+            no_leave("the whole pass", began.elapsed(), &leave);
+            // Past the leave, and past the longest wait after a show
+            // that got none.
+            again += 1;
+            device
+                .clock
+                .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+            continue;
+        }
+        // The first show on a connection is whole, and no other show of
+        // an entry that was shown there is.
+        if again == 0 {
+            assert_eq!(whole_shows(&device), [1, 1]);
+        }
+        let shown_before = whole_shows(&device);
 
-    // A change is made on it. No time goes by.
-    let waiting = device.writes("notes", "a.md", "written before the change");
-    let old_notes = device.channel("notes");
-    let change = device.changes(&phrase(), &[&device], &[]);
-    for relay in ["first", "second"] {
-        assert_eq!(device.has_leave(relay), Err(NoLeave::NotGiven));
-    }
-    // The pass that sends shows the new entry at each, whole, and only
-    // then sends: each relay holds the change, and what was carried is
-    // not sent by the pass that sends.
-    device.sends().await;
-    let new_notes = device.channel("notes");
-    for relay in [&first, &second] {
-        assert!(holds_at(relay, &change.channel, &change.id()));
-        assert!(!holds_at(relay, &old_notes, &waiting.id()));
-        assert!(held_at(relay, &new_notes).is_empty());
-    }
-    for relay in ["first", "second"] {
-        assert_eq!(device.has_leave(relay), Ok(()));
-        assert_eq!(device.counts(relay).whole_shows, 2);
-    }
-    // The whole pass fetches the name's new channel from each relay, and
-    // then sends what it carried.
-    device.passes().await;
-    for relay in [&first, &second] {
-        assert_eq!(held_at(relay, &new_notes).len(), 1);
-        assert!(!holds_at(relay, &old_notes, &waiting.id()));
+        // A change is made on it. No time goes by.
+        changes += 1;
+        let file = format!("{changes}.md");
+        let waiting = device.writes("notes", &file, "written before the change");
+        let old_notes = device.channel("notes");
+        let change = device.changes(&phrase(), &[&device], &[]);
+        for relay in names {
+            assert_eq!(device.has_leave(relay), Err(NoLeave::NotGiven));
+        }
+        // The pass that sends shows the new entry at each, whole, and
+        // only then sends: there is leave again at each.
+        let began = std::time::Instant::now();
+        device.sends().await;
+        let leave = leave_at_each(&device);
+        let took = began.elapsed();
+        if leave != given {
+            no_leave("the pass that sends", took, &leave);
+            again += 1;
+            device
+                .clock
+                .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+            continue;
+        }
+        // Each relay holds the change, and what was carried is not sent
+        // by the pass that sends.
+        let new_notes = device.channel("notes");
+        for relay in [&first, &second] {
+            assert!(holds_at(relay, &change.channel, &change.id()));
+            assert!(!holds_at(relay, &old_notes, &waiting.id()));
+            assert!(held_at(relay, &new_notes).is_empty());
+        }
+        // One whole show more at each relay, of the new entry.
+        assert_eq!(whole_shows(&device), shown_before.map(|shown| shown + 1));
+        // The whole pass fetches the name's new channel from each relay,
+        // and then sends what it carried: each file that was written
+        // before a change.
+        device.passes().await;
+        for relay in [&first, &second] {
+            assert_eq!(held_at(relay, &new_notes).len(), changes);
+            assert!(!holds_at(relay, &old_notes, &waiting.id()));
+        }
+        break;
     }
 }
 
@@ -4937,7 +5005,9 @@ async fn a_personal_node_makes_its_passes_on_its_timers_and_none_without_a_phras
 /// **Once a day** (§16): the node's hourly timer asks, and the device
 /// sweeps where a day has gone by since it last did, so that a channel
 /// is read again from its start once a day at most. A node that is held
-/// up sweeps nothing, and sweeps when it is held up no more.
+/// up sweeps nothing, and sweeps when it is held up no more. **The time
+/// of a sweep is noted once it has succeeded:** one that failed is tried
+/// again when the device is next asked, and not a day later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     use cordelia_api::state::Held;
@@ -4978,8 +5048,29 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     device.engine.sweep_deletes();
     assert_eq!(device.holds_of(&channel).len(), 2, "swept while held up");
     device.state.held.release();
+    // A sweep that fails: the store cannot be written. Nothing went, and
+    // no time is noted for it. Asked again, with no time gone by, the
+    // device sweeps.
+    let written = |can_be: bool| {
+        device
+            .db()
+            .pragma_update(None, "query_only", !can_be)
+            .unwrap()
+    };
+    written(false);
     device.engine.sweep_deletes();
-    assert_eq!(device.holds_of(&channel).len(), 1);
+    assert_eq!(
+        device.holds_of(&channel).len(),
+        2,
+        "swept a store that cannot be written"
+    );
+    written(true);
+    device.engine.sweep_deletes();
+    assert_eq!(
+        device.holds_of(&channel).len(),
+        1,
+        "a sweep that failed is tried a day later"
+    );
     assert_eq!(device.text("notes", "stays.md").as_deref(), Some("a text"));
     assert_eq!(device.text("notes", "gone.md"), None);
 }

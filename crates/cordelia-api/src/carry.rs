@@ -1153,6 +1153,13 @@ mod tests {
             // next: it is above one in the bottom half of its own.
             version("d.md", at(1, REV_BAND_HALF + 1), text("lifted")),
             version("d.md", at(1, 9), text("not lifted")),
+            // And it stands in the next band where it crosses to: above
+            // a revision there that is lower than that, though the
+            // revision it had is below every revision of that band.
+            version("e.md", at(2, 5), text("below where it crosses to")),
+            version("e.md", at(1, REV_BAND_HALF + 7), text("crosses above it")),
+            version("f.md", at(1, REV_BAND_HALF + 7), text("crosses below it")),
+            version("f.md", at(2, 9), text("above where it crosses to")),
         ]);
         let said: Vec<(&str, &Value)> = taken
             .iter()
@@ -1165,6 +1172,8 @@ mod tests {
                 ("b.md", &text("beats a delete")),
                 ("c.md", &text(higher)),
                 ("d.md", &text("lifted")),
+                ("e.md", &text("crosses above it")),
+                ("f.md", &text("above where it crosses to")),
             ]
         );
         // In whichever order they are given.
