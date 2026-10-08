@@ -308,6 +308,15 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
     assert!(!ended.success());
     let log = std::fs::read_to_string(device.log()).unwrap();
     assert!(log.contains("the node's API cannot listen at"), "{log}");
+    // It says what the likely reason is, and the way on.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        log.contains(&format!(
+            "A node is probably running already, as the service: `cordelia status` says. To \
+             restart it:\n  {restart}"
+        )),
+        "{log}"
+    );
     drop(held);
     // Not the mode of its data directory either.
     #[cfg(unix)]

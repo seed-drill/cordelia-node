@@ -797,7 +797,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         };
         let now_said = text(of_the_key, "said");
         if of_the_key["taken"] == true {
-            println!("{now_said}.");
+            println!("{}.", capitalised(now_said));
             return Ok(());
         }
         if !now_said.is_empty() && now_said != said {
@@ -1189,6 +1189,16 @@ fn names_lines(seen: &Value) -> Vec<String> {
     out
 }
 
+/// `says` with a capital first letter: what the node says in the middle
+/// of a line of a status begins a line of its own here.
+fn capitalised(says: &str) -> String {
+    let mut letters = says.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
+}
+
 /// A count with its noun: `1 name`, `3 names`.
 pub(crate) fn counted(n: usize, noun: &str) -> String {
     match n {
@@ -1205,10 +1215,15 @@ fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Resu
         println!("There is nothing to clear on this device.");
         return Ok(());
     }
-    for notice in notices {
+    for (asked, notice) in notices.into_iter().enumerate() {
+        // An empty line between one notice and the next, and none before
+        // the first.
+        if asked > 0 {
+            println!();
+        }
         let clears = at.yes(&format!(
-            "\n{}.\nClearing it changes what this device shows, and nothing else.",
-            text(notice, "says")
+            "{}.\nClearing it changes what this device shows, and nothing else.",
+            capitalised(text(notice, "says"))
         ))?;
         if !clears {
             println!("It stays.");
@@ -3758,6 +3773,28 @@ mod tests {
             assert!(!said.contains(address), "{address}: {said}");
         }
         assert_eq!(said.matches("192.0.2.4").count(), 1, "{said}");
+    }
+
+    /// What the node says in the middle of a line begins a line of its
+    /// own with a capital: the last line of `cordelia accept`, and each
+    /// notice that `cordelia devices --clear` asks about. What begins
+    /// with no letter is left as it is.
+    #[test]
+    fn a_line_of_its_own_begins_with_a_capital() {
+        assert_eq!(
+            capitalised("this device has joined: it has applied change 1"),
+            "This device has joined: it has applied change 1"
+        );
+        assert_eq!(
+            capitalised("new device: (w w w w) \"desktop\""),
+            "New device: (w w w w) \"desktop\""
+        );
+        assert_eq!(
+            capitalised("(w w w w) \"desktop\" left"),
+            "(w w w w) \"desktop\" left"
+        );
+        assert_eq!(capitalised("Already so"), "Already so");
+        assert_eq!(capitalised(""), "");
     }
 
     /// The twelve words are shown numbered, four to a row, with the

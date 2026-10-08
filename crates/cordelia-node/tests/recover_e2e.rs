@@ -384,6 +384,24 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
         || has_sent_everything(&new),
     );
 
+    // The node's log has one line for the recovery that was made on it,
+    // and one for the end of its look: numbers alone, with no key and
+    // no name.
+    let log = std::fs::read_to_string(new.log()).unwrap();
+    for says in [
+        "a recovery was made on this machine: change 2, 1 name to look through",
+        "the look of the recovery (change 2) has ended: 1 name looked through, ",
+    ] {
+        let lines: Vec<&str> = log.lines().filter(|line| line.contains(says)).collect();
+        assert_eq!(lines.len(), 1, "{says}: {lines:?}");
+        let said = &lines[0][lines[0].find(says).unwrap()..];
+        assert!(
+            !said.contains("lab") && !said.contains("cordelia_pk"),
+            "{said}"
+        );
+    }
+    assert!(log.contains(" not to their end, 0 names failed"), "{log}");
+
     // The phrase: no word of it, and nothing that only it gives, in what
     // the node was sent, in what the terminal showed, in a log or a file.
     let sent = through.sent();

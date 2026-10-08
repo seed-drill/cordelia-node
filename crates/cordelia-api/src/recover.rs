@@ -1069,6 +1069,11 @@ pub async fn make(
         zeroize::Zeroize::zeroize(secret);
     }
     let (number, to_look) = made.map_err(commands::refused)?;
+    // One line in the log, of numbers alone: no key, and no name.
+    tracing::info!(
+        "a recovery was made on this machine: change {number}, {} to look through",
+        names_counted(to_look.names.len())
+    );
     state.own_channels.set_look(json!({
         "change": number,
         "finished": false,
@@ -1083,6 +1088,45 @@ pub async fn make(
         the_look(&node, number, &to_look).await;
     });
     Ok(HttpResponse::Ok().json(json!({ "change": number })))
+}
+
+/// How many names, in words: `1 name`, `3 names`.
+fn names_counted(names: usize) -> String {
+    match names {
+        1 => "1 name".to_string(),
+        names => format!("{names} names"),
+    }
+}
+
+/// What the node's log says when the look of a recovery has ended
+/// (decision 2026-10-04 §9, step 5): the change, how many names it looked
+/// through, how many versions it carried and in how many names, how many
+/// reads did not reach their end, and how many names failed. Numbers
+/// alone: no key, and no name of a file or of a folder.
+fn look_ended_says(number: u64, found: &serde_json::Value) -> String {
+    let count = |field: &str| found[field].as_u64().unwrap_or(0);
+    let listed = |field: &str| found[field].as_array().map_or(0, Vec::len);
+    if found["new_not_read"] == true {
+        return format!(
+            "the look of the recovery (change {number}) has ended: the new channels could not \
+             be read whole, and nothing was taken"
+        );
+    }
+    format!(
+        "the look of the recovery (change {number}) has ended: {} looked through, {} carried \
+         in {}, {} not to their end, {} failed",
+        names_counted(count("names") as usize),
+        match count("carried") {
+            1 => "1 version".to_string(),
+            carried => format!("{carried} versions"),
+        },
+        names_counted(count("carried_names") as usize),
+        match listed("not_read") {
+            1 => "1 read".to_string(),
+            reads => format!("{reads} reads"),
+        },
+        names_counted(listed("failed")),
+    )
 }
 
 /// `POST /api/v1/recover/progress`: how far the look of a recovery is,
@@ -1149,6 +1193,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
             "carried": 0,
             "carried_names": 0,
         });
+        tracing::info!("{}", look_ended_says(number, &found));
         state.own_channels.set_look(found.clone());
         return found;
     }
@@ -1309,6 +1354,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
             tracing::warn!("the look of a recovery could not be noted as ended: {e}");
         }
     }
+    tracing::info!("{}", look_ended_says(number, &found));
     state.own_channels.set_look(found.clone());
     state.own_channels.written();
     found

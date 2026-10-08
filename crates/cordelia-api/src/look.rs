@@ -471,8 +471,15 @@ pub fn look(
                 look.says.extend(relay.says());
             }
         }
+        // What became of a key that was taken is said only while it is
+        // so (decision 2026-10-04 §5.1): a device that was removed since,
+        // or is in no list of the last change, has joined nobody. The key
+        // is kept, and is still listed with what became of it.
+        let stopped = matches!(look.state, "removed" | "not_listed");
         for typed in &look.accepting {
-            look.says.push(typed.says());
+            if !(typed.taken && stopped) {
+                look.says.push(typed.says());
+            }
         }
         Ok(look)
     })
@@ -2290,6 +2297,66 @@ mod tests {
         );
         // A day on, it is said no more.
         assert!(seen_at(s.now + 24 * 3600).is_empty());
+    }
+
+    /// What became of a typed key that was taken ("this device has
+    /// joined") is said in a status only while it is so (decision
+    /// 2026-10-04 §5.1): a device that was removed since, or is in no
+    /// list of the last change, has joined nobody. The key is kept, and
+    /// is still listed with what became of it.
+    #[test]
+    fn test_a_joining_is_not_said_once_the_device_has_stopped() {
+        for removed in [true, false] {
+            let mut s = Several::of_one_person(3);
+            let now = s.tick();
+            let from = s.key(0);
+            acts::type_key(&s[2].conn, &from, "no_phrase", now).unwrap();
+            acts::spend_typed_key(&s[2].conn, &from, now, now, "this device has joined").unwrap();
+            let joined = format!(
+                "accepted the device ({}): this device has joined",
+                fingerprint::shown(&from)
+            );
+            let before = seen(&s, 2);
+            assert_eq!(before.state, "applied");
+            assert!(before.says.contains(&joined), "{:?}", before.says);
+
+            // It is removed, or left out of the next change.
+            let change = match removed {
+                true => s.change(0, &[0, 1], &[2]),
+                false => s.change(0, &[0, 1], &[]),
+            };
+            give(&mut s, 2, &change);
+            let after = seen(&s, 2);
+            let stands = if removed { "removed" } else { "not_listed" };
+            assert_eq!(after.state, stands);
+            assert!(
+                after.says.iter().all(|line| !line.contains("has joined")),
+                "{stands}: {:?}",
+                after.says
+            );
+            assert_eq!(after.says[0], after.cannot_go_on.clone().unwrap());
+            // Nothing was deleted: the key is listed as it was.
+            assert_eq!(after.accepting.len(), 1, "{stands}");
+            assert!(after.accepting[0].taken, "{stands}");
+            assert_eq!(after.accepting[0].says(), joined);
+        }
+        // A key that is still asked for is said, wherever the device
+        // stands: that is so now.
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        acts::type_key(&s[2].conn, &s.key(0), "no_phrase", now).unwrap();
+        let change = s.change(0, &[0, 1], &[2]);
+        give(&mut s, 2, &change);
+        let asking = seen(&s, 2);
+        assert_eq!(asking.state, "removed");
+        assert!(
+            asking
+                .says
+                .iter()
+                .any(|line| line.starts_with("asking for what the device (")),
+            "{:?}",
+            asking.says
+        );
     }
 
     /// Once fewer than sixteen statements are left to a phrase, a look
