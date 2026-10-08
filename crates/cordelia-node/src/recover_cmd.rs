@@ -24,7 +24,11 @@
 //!    device that counts it asks one of three things: the person still
 //!    has it, it is lost or broken, or it may be in someone else's
 //!    hands. No answer is suggested. A record that does not count is
-//!    shown as that, and nothing is asked of it.
+//!    shown as that, and nothing is asked of it: unless it fails only
+//!    for the bound of 64 counted devices, and a device of the statement
+//!    signed it that was not said to be in someone else's hands. Such a
+//!    key is asked about all the same: nothing is taken from it, and
+//!    said to be gone it is removed.
 //! 4. It shows the statement from the bytes that the phrase will sign
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
@@ -58,7 +62,7 @@ use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
 use cordelia_core::protocol::{
-    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
+    MAX_COUNTED_DEVICES, MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
@@ -104,6 +108,32 @@ Of each, say one of three things. No answer is suggested: each is typed.
 /// question (decision 2026-10-04 §9, step 3).
 const NOT_ASKED: &str = "  It is no device: nothing is asked of it, nothing that it wrote is \
     brought back, and its key is not removed.";
+
+/// What is said, in the place of nothing, of a key that is asked about
+/// though it does not count (decision 2026-10-04 §9, step 3): its record
+/// fails only for the bound of 64 counted devices, and a device of the
+/// statement signed it that was not said to be in someone else's hands
+/// ([`recover::asked_for_room`]). What each answer does is another thing
+/// for it than for a device that counts.
+const ASKED_FOR_ROOM: &str = "  That is the one thing its record fails for, so it is asked \
+    about all the same. Nothing that it wrote is brought back by this recovery, whatever is said \
+    of it: `lost` or `hands` removes its key, and what it wrote then comes in by `cordelia sync \
+    carry <name> --from <device>`, with the phrase; `have` leaves it to be added again by hand.";
+
+/// What is said of a key that is asked about for the bound of 64 alone,
+/// before its answer is asked: what is said of any row ([`row_says`]),
+/// and what the answers do for it ([`ASKED_FOR_ROOM`]). `under` is the
+/// device of the statement for whose record it is asked about: where
+/// the row shows another that added it, this one is named too.
+fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32]) -> String {
+    let mut says = row_says(rows, at, number);
+    if rows[at].added_by.is_some_and(|(shown, _)| shown != *under) {
+        let label = rows.iter().find(|row| row.key == *under);
+        let label = label.map(|row| row.label.as_str()).unwrap_or_default();
+        says.push_str(&format!("\n  {} added it too.", named(label, under)));
+    }
+    format!("{says}\n{ASKED_FOR_ROOM}")
+}
 
 /// What is said before the first question where the answers could not
 /// all be kept (decision 2026-10-04 §9, step 3): a statement has room for
@@ -288,7 +318,9 @@ fn lists_lines(statement: &Statement, own: &[u8; 32]) -> anyhow::Result<Vec<Stri
 /// What is said of one device before its answer is asked (decision
 /// 2026-10-04 §9, step 3): its words and its label, whether the
 /// statement lists it or who added it since and when, and how much it
-/// signed in the personal channel.
+/// signed in the personal channel. A record that does not count is said
+/// to be one, and where it fails only for the bound of 64 counted
+/// devices, that is said.
 fn row_says(rows: &[Row], at: usize, number: u64) -> String {
     let row = &rows[at];
     let label_of = |key: &[u8; 32]| {
@@ -301,9 +333,13 @@ fn row_says(rows: &[Row], at: usize, number: u64) -> String {
             "added since change {number}, from {} at {}{}",
             named(&label_of(&adder), &adder),
             time_of(at),
-            match row.counts {
-                true => "",
-                false => ", by a record that does not count",
+            match (row.counts, row.no_room.is_empty()) {
+                (true, _) => String::new(),
+                (false, true) => ", by a record that does not count".to_string(),
+                (false, false) => format!(
+                    ", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted \
+                     already"
+                ),
             }
         ),
     };
@@ -357,11 +393,19 @@ fn will_do_lines(
         .iter()
         .filter(|row| taken.contains(&row.key) && row.key != *own)
         .collect();
+    // From a device that may be in someone else's hands, and from what
+    // it added; and from a key that does not count, which was asked
+    // about for the bound of 64 alone and said to be gone.
+    let gone = recover::gone(rows, answers);
     let nothing: Vec<&Row> = rows
         .iter()
         .enumerate()
         .filter(|(at, row)| {
-            row.counts && recover::in_other_hands(rows, answers, *at) && row.key != *own
+            let nothing = match row.counts {
+                true => recover::in_other_hands(rows, answers, *at),
+                false => gone.contains(&row.key),
+            };
+            nothing && row.key != *own
         })
         .map(|(_, row)| row)
         .collect();
@@ -584,10 +628,17 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             continue;
         }
         // A record that does not count is shown as that, and nothing is
-        // asked of it.
+        // asked of it: unless only the bound of 64 kept its key out, and
+        // a device of the statement signed it that was not said to be
+        // in someone else's hands.
         if !rows[at_row].counts {
-            println!("{says}\n{NOT_ASKED}");
-            answers.push(Answer::NotAsked);
+            let Some((under, _)) = recover::asked_for_room(rows, &answers, at_row) else {
+                println!("{says}\n{NOT_ASKED}");
+                answers.push(Answer::NotAsked);
+                continue;
+            };
+            let says = for_room_says(rows, at_row, statement.number, &under);
+            answers.push(asks_of(&at, &says)?);
             continue;
         }
         let mut says = says;
@@ -1054,6 +1105,7 @@ mod tests {
             added_by: added_by.map(|adder| ([adder; 32], 1_800_000_000)),
             counts,
             signed: usize::from(n),
+            no_room: Vec::new(),
         }
     }
 
@@ -1104,6 +1156,91 @@ mod tests {
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
         let says = row_says(&odd, 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
+    }
+
+    /// A key that only the bound of 64 counted devices kept out is shown
+    /// with that reason (decision 2026-10-04 §9, step 3). Where it is
+    /// asked about, what each answer does for it is said before the
+    /// question: nothing that it wrote is brought back, `lost` or
+    /// `hands` removes its key, and `have` leaves it to be added again.
+    /// Before the yes it is named among those from whom the look takes
+    /// nothing, where it was said to be gone.
+    #[test]
+    fn test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out() {
+        let mut rows = rows();
+        // A watch that the desktop added, and the laptop too: its record
+        // found no room.
+        let mut watch = row(5, "watch", Some(1), false);
+        watch.no_room = vec![([1; 32], 1_800_000_000), ([2; 32], 1_800_000_000)];
+        rows.push(watch);
+        let says = row_says(&rows, 4, 7);
+        assert!(
+            says.contains(&format!(
+                "\"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 UTC, \
+                 by a record that does not count: 64 devices counted already. It signed 5 entries",
+                fingerprint::shown(&[1; 32])
+            )),
+            "{says}"
+        );
+        // Asked about for the record that the device shown signed.
+        let asked = for_room_says(&rows, 4, 7, &[1; 32]);
+        assert!(asked.starts_with(&says), "{asked}");
+        assert!(!asked.contains("added it too"), "{asked}");
+        assert!(
+            asked.ends_with(
+                "\n  That is the one thing its record fails for, so it is asked about all the \
+                 same. Nothing that it wrote is brought back by this recovery, whatever is said \
+                 of it: `lost` or `hands` removes its key, and what it wrote then comes in by \
+                 `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves it \
+                 to be added again by hand."
+            ),
+            "{asked}"
+        );
+        // Asked about for the record of another device than the one
+        // shown: that one is named too.
+        let asked = for_room_says(&rows, 4, 7, &[2; 32]);
+        assert!(
+            asked.contains(&format!(
+                "\n  ({}) \"desktop\" added it too.\n  That is the one thing",
+                fingerprint::shown(&[2; 32])
+            )),
+            "{asked}"
+        );
+
+        // Before the yes: said to be lost, it is one of those from whom
+        // the look takes nothing, with the command that brings what it
+        // wrote. Said to be one that the person still has, it is not.
+        let generation = Generation {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let names = recover::Names::default();
+        let lost = [
+            Answer::Lost,
+            Answer::Lost,
+            Answer::Lost,
+            Answer::NotAsked,
+            Answer::Lost,
+        ];
+        let all = will_do_lines(&generation, &lost, &names, &[9; 32], &[]).join("\n");
+        assert!(
+            all.contains(&format!(
+                "It takes nothing from: ({}) \"watch\". What they wrote comes in only by \
+                 `cordelia sync carry <name> --from <device>`.",
+                fingerprint::shown(&[5; 32])
+            )),
+            "{all}"
+        );
+        let mut have = lost;
+        have[4] = Answer::Have;
+        let all = will_do_lines(&generation, &have, &names, &[9; 32], &[]).join("\n");
+        assert!(!all.contains("It takes nothing from"), "{all}");
+        // Nor where each device that signed its record may be in someone
+        // else's hands: nothing was asked of it, whatever stands there.
+        let mut hands = lost;
+        (hands[0], hands[1]) = (Answer::OtherHands, Answer::OtherHands);
+        let all = will_do_lines(&generation, &hands, &names, &[9; 32], &[]).join("\n");
+        assert!(!all.contains("\"watch\""), "{all}");
     }
 
     /// Of two changes made apart, the command says how many more are on
