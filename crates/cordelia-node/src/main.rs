@@ -39,44 +39,67 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    /// Initialise a new node (generate keypair, create database)
+    /// Create this device's key and database
+    ///
+    /// Run it once on each machine. The install script does this for you.
+    /// If you run it again, it keeps the key and the database that are
+    /// there.
+    ///
+    /// Then start the node with `cordelia start`.
     Init {
-        /// Entity name (defaults to OS username)
+        /// The name at the start of this device's entity ID (default: your
+        /// user name)
         #[arg(long)]
         name: Option<String>,
 
-        /// Run by a script, such as the install script, that starts the
-        /// node itself: do not say how to start it
+        /// For a script that starts the node itself, such as the install
+        /// script. Do not print how to start the node
         #[arg(long)]
         non_interactive: bool,
 
-        /// Force re-initialisation (overwrites existing identity)
+        /// Make a new node token and write the configuration file again.
+        /// Keeps this device's key and its database
         #[arg(long)]
         force: bool,
 
-        /// Show secrets (node token) in output
+        /// Print the node token. Without this, only the file that stores
+        /// it is named
         #[arg(long)]
         show_secrets: bool,
 
-        /// Give this device a new key: it leaves the devices it is with,
-        /// keeps its memory folders and their mappings, and follows no
-        /// recovery phrase. Asks at a terminal.
+        /// Give this device a new key
+        ///
+        /// The device leaves your other devices and then has no recovery
+        /// phrase. It keeps its memory folders and their mappings. You
+        /// then add it as a new device.
+        ///
+        /// Run it in a terminal: it asks you to type yes.
         #[arg(long, conflicts_with_all = ["name", "force", "show_secrets"])]
         new_key: bool,
     },
-    /// Show node status (`--line` for a status bar, `--json` for tools)
+    /// Show this device and the state of its memory sync
+    ///
+    /// With no flag it prints this device's key and settings, whether the
+    /// node is running, its peers, and the state of memory sync and of
+    /// your devices.
     Status {
-        /// One line for a status bar, e.g. Claude Code's status line
+        /// Print one short line for a status bar, such as Claude Code's
+        /// status line
         #[arg(long, conflicts_with = "json")]
         line: bool,
-        /// Machine-readable state, for widgets and scripts
+        /// Print the whole state as JSON, for panels, scripts and agents
         #[arg(long)]
         json: bool,
-        /// Icon, tooltip and class as JSON, for Waybar and the Omarchy bar
+        /// Print an icon, a tooltip and a class as JSON, for Waybar and the
+        /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
     },
-    /// Start the node daemon
+    /// Run the node on this device
+    ///
+    /// The node does the syncing, and runs until you stop it. The install
+    /// script sets it up as a service, so you rarely run this yourself.
+    /// Run `cordelia init` first.
     Start,
     /// Stop the node daemon
     Stop,
@@ -94,53 +117,150 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Print this device's public key (give it to `add-device` elsewhere)
+    /// Print this device's key
+    ///
+    /// To add this device, give the key to `cordelia add-device` on a
+    /// device that has your recovery phrase.
     #[command(alias = "pubkey")]
     Id,
-    /// Make the recovery phrase of your devices on this one: twelve
-    /// words, shown once. Asks at a terminal.
+    /// Make your recovery phrase on this device
+    ///
+    /// Run it once, on one device, in a terminal. It shows twelve words,
+    /// once, each with its number. Write them down in order. Then type
+    /// them back from what you wrote. No device stores the words.
+    ///
+    /// Keep the twelve words safe.
+    ///
+    /// - If you lose them, you can still add a device, but you can never
+    ///   remove one or recover.
+    ///
+    /// - Anyone who gets a copy can read your memory, even after you
+    ///   remove devices, and you would not know.
+    ///
+    /// If you already have a phrase and have lost every device, do not
+    /// make a new one. Run `cordelia recover` instead.
+    ///
+    /// On a device that already has a phrase, this replaces it. The
+    /// device starts again alone, and leaves any other devices it was
+    /// with. The command says so first, and asks you to type yes.
     Phrase {
-        /// What your devices call this one, e.g. "laptop" (default: the
+        /// A name for this device, such as "laptop" (default: the
         /// machine's name)
         #[arg(long)]
         name: Option<String>,
     },
-    /// Add another of your devices; then run `cordelia accept` on it,
-    /// within the hour. Asks at a terminal.
+    /// Add another machine to your devices
+    ///
+    /// Run it in a terminal, on a device that has your recovery phrase.
+    /// It says what it will do and asks you to type yes. You do not type
+    /// the phrase.
+    ///
+    /// The new machine can then read all your memory.
+    ///
+    /// The command prints a `cordelia accept` command. Run that on the
+    /// new machine within the hour.
+    ///
+    /// Each of your devices then shows amber until you confirm the new
+    /// one there with `cordelia devices --clear`.
+    ///
+    /// If the machine is already one of your devices, this hands it the
+    /// last change again and adds nothing.
     AddDevice {
-        /// The other device's key, from `cordelia id` on that device
+        /// The new machine's key. Run `cordelia id` there to print it
         key: String,
-        /// A name for the device, e.g. "desktop"
+        /// A name for the new machine, such as "desktop"
         #[arg(long)]
         name: Option<String>,
     },
-    /// Take what the device that added this one hands over. Asks at a
-    /// terminal.
+    /// Join this device to your other devices
+    ///
+    /// Run it in a terminal, on the new machine. `cordelia add-device`
+    /// on the other device prints the whole command, with the key. Run
+    /// it within the hour.
+    ///
+    /// The command says what it will do and asks you to type yes. What
+    /// it does depends on this device:
+    ///
+    /// - A device with no phrase joins your devices, and starts syncing
+    ///   the folders it maps.
+    ///
+    /// - A device that is already one of several takes only what the
+    ///   other device hands it under the phrase it already has. It joins
+    ///   nothing new.
+    ///
+    /// - A device that is alone under a phrase of its own leaves that
+    ///   phrase and joins. Run `cordelia sync off` first, or the command
+    ///   refuses.
+    ///
+    /// Then the command asks the relays for what the other device handed
+    /// over. If nothing arrives within a minute, the command ends and the
+    /// node goes on asking for the rest of the hour. `cordelia status`
+    /// shows what happened.
     Accept {
-        /// The key printed by `add-device` on the other device
+        /// The key of the device that added this one. `add-device` prints
+        /// it there
         key: String,
     },
-    /// Remove one of your devices, with the recovery phrase. Asks at a
-    /// terminal. Given a key that this device knows nothing of, it
-    /// refuses that key for good, after a typed answer.
+    /// Remove one of your devices
+    ///
+    /// Run it in a terminal, on a device that you still have. It asks
+    /// for the recovery phrase.
+    ///
+    /// The command shows the device it will remove and every device that
+    /// will remain. It asks whether each device added since the last
+    /// change stays. Then it asks you to type yes, and then for the
+    /// phrase.
+    ///
+    /// Keep this machine on until the command says you can close it.
+    ///
+    /// You cannot remove the device you are on. Remove it from another
+    /// one.
+    ///
+    /// If this device does not know the key, removing it refuses that
+    /// key for good: none of your devices can add it again. The command
+    /// says so, and asks you to type `refuse`.
     RemoveDevice {
-        /// The device's key, as `cordelia devices` or `cordelia id` shows it
+        /// The key of the device to remove, as `cordelia devices` or
+        /// `cordelia id` shows it
         key: String,
     },
-    /// Give the devices that stay a new secret, with the recovery
-    /// phrase: of each device added since the last change, you say
-    /// whether it stays. Asks at a terminal.
+    /// Give the devices that stay a new secret
+    ///
+    /// Run it in a terminal. It asks for the recovery phrase.
+    ///
+    /// You name no device to remove. The command asks whether each
+    /// device added since the last change stays. Then it asks you to type
+    /// yes, and then for the phrase.
+    ///
+    /// Run it once you have added your devices. They are then all in a
+    /// list that you have checked.
+    ///
+    /// Keep this machine on until the command says you can close it.
     Renew,
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
     Settle,
-    /// Recover on this machine, with the recovery phrase, when you have
-    /// no device left that you trust: it stops every other device, and
-    /// brings back what the relays hold. If a device of yours remains,
-    /// remove the one that is gone from it instead. Asks at a terminal.
+    /// Recover on a new machine when you have no device you trust
+    ///
+    /// Run it in a terminal, on a machine that has no recovery phrase
+    /// yet. It asks for your recovery phrase. Do not make a new phrase
+    /// first: this command refuses a machine that has one.
+    ///
+    /// If you still have a device that you trust, do not recover. Remove
+    /// the lost device from it with `cordelia remove-device`. That stops
+    /// no other device.
+    ///
+    /// A recovery stops every other device until you add each one again.
+    /// It brings back only what the relays still have: a relay is a
+    /// cache, not a backup.
+    ///
+    /// The command asks for the phrase and shows every device. For each
+    /// one you type `have`, `lost` or `hands` (it may be in someone
+    /// else's hands). Then the command shows the change it will make and
+    /// asks you to type yes.
     Recover {
-        /// What your devices call this machine, e.g. "laptop" (default:
-        /// the machine's name)
+        /// A name for this machine, such as "laptop" (default: the
+        /// machine's name)
         #[arg(long)]
         name: Option<String>,
     },
@@ -168,11 +288,32 @@ enum Commands {
         /// The change's number
         number: u64,
     },
-    /// List your devices, what each has applied, and what each relay
-    /// holds
+    /// List your devices and what each relay has
+    ///
+    /// It is the one place to look. It lists:
+    ///
+    /// - every device of the last change, and whether it has applied that
+    ///   change and sent what it had;
+    ///
+    /// - every device added since, and which device added it;
+    ///
+    /// - every removed key;
+    ///
+    /// - the names that no device lists yet since the last change, and
+    ///   what this device still has to send;
+    ///
+    /// - for each relay, whether it has the last change.
+    ///
+    /// Each device is shown with the first four words of its key's
+    /// fingerprint. Two devices can have the same label, and the words
+    /// tell them apart.
     Devices {
-        /// Go through what this device is to tell you, and clear what
-        /// you say yes to. Asks at a terminal.
+        /// Go through what this device has to tell you, such as a device
+        /// that was added
+        ///
+        /// It asks about each notice, and clears those you answer yes to.
+        /// Clearing changes only what this device shows. Run it in a
+        /// terminal.
         #[arg(long)]
         clear: bool,
     },
@@ -240,70 +381,95 @@ enum HistoryCommand {
 
 #[derive(clap::Subcommand)]
 enum SyncCommand {
-    /// Turn on Claude Code memory sync. Nothing syncs until you map a
-    /// folder (`cordelia sync map`): only mapped folders sync. Running it
-    /// again keeps your settings.
+    /// Turn on sync for Claude Code's memory
+    ///
+    /// Nothing syncs until you map a folder with `cordelia sync map`.
+    /// Only mapped folders sync. The command lists the memory folders it
+    /// found. If you run it again, it keeps your settings and says so.
     Claude {
-        /// Claude Code directory (default: ~/.claude)
+        /// The directory where Claude Code keeps its files (default:
+        /// ~/.claude)
         #[arg(long)]
         dir: Option<String>,
         /// No more: only mapped folders sync. It is refused, and says
         /// what to do instead.
         #[arg(long, hide = true)]
         all: bool,
-        /// Sync only the folders you map: the only scope there is
+        /// Sync only the folders you map. That is always so: the flag
+        /// changes nothing
         #[arg(long, conflicts_with = "all")]
         mapped_only: bool,
         /// No more: there is nothing left to exclude. It is refused, and
         /// says what to do instead.
         #[arg(long, hide = true)]
         exclude: Vec<String>,
-        /// Do not sync home-folder memory on this device: unmaps the home
+        /// Stop syncing home memory on this device. It unmaps the home
         /// directory
         #[arg(long)]
         no_home: bool,
-        /// Back to the default Claude Code directory, ~/.claude. Mapped
-        /// folders stay mapped.
+        /// Go back to the default Claude Code directory, ~/.claude. Mapped
+        /// folders stay mapped
         #[arg(long)]
         reset: bool,
     },
-    /// Sync Claude's memory for a folder under a name. The name is what
-    /// your devices share: map the same name on each of them. For a git
-    /// project it defaults to the remote (github.com/owner/repo), and for
-    /// your home directory to `~`. Claude Code keeps one memory per
-    /// repository, so any folder of a repository maps the whole repository.
+    /// Sync a folder's memory under a name
+    ///
+    /// Your devices share a folder by its name. Map the same name on
+    /// each device, and Claude's memory for it stays in step.
+    ///
+    /// - A git project gets its name from its remote
+    ///   (github.com/owner/repo). You need not give one.
+    ///
+    /// - Any other folder needs a name.
+    ///
+    /// - Your home directory needs `--home`. Its name is `~` unless you
+    ///   give one.
+    ///
+    /// Claude Code keeps one memory per repository. So mapping any folder
+    /// of a repository maps the whole repository.
     Map {
         /// The folder you run Claude Code in
         folder: String,
-        /// The name to sync under (default: the folder's git remote; `~`
-        /// for the home directory)
+        /// The name to sync under (default: the folder's git remote, or
+        /// `~` for the home directory)
         name: Option<String>,
-        /// Map the home directory itself: home memory, under `~` or under
-        /// the name given
+        /// Sync home memory. Use it when the folder is your home
+        /// directory itself
         #[arg(long)]
         home: bool,
     },
-    /// Stop syncing a mapped folder from this device (its files stay where
-    /// they are)
+    /// Stop syncing a folder from this device
+    ///
+    /// Its files stay where they are.
     Unmap {
-        /// The folder, or the name it is mapped to
+        /// The folder, or the name it syncs under
         folder: String,
     },
-    /// Bring in what your devices had sent to the relays before a change,
-    /// and that no device carried: the last edits of a device that never
-    /// returned, or a name that no device syncs any more. It reads each
-    /// generation that this device left in the last 90 days.
+    /// Bring in what a change left behind at the relays
     ///
-    /// What a removed device wrote comes in only with `--from`, at a
+    /// After a change, such as a removal, your devices move to a new
+    /// secret. This brings in what was left under an earlier one: the
+    /// last edits of a device that never came back, or a name that no
+    /// device syncs any more.
+    ///
+    /// With no flag it brings in what your devices that were not removed
+    /// wrote. It reads each secret that this device left in the last 90
+    /// days.
+    ///
+    /// What a removed device wrote comes in only with `--from`, in a
     /// terminal, with the recovery phrase.
     Carry {
-        /// The name to carry (default: every name this device holds)
+        /// The name to bring in (default: every name this device has)
         name: Option<String>,
-        /// Also take what a removed device signed there: its label, or
-        /// the first six words of its key's fingerprint, in quotes. Give
-        /// `--from` once for each device. With no device after it, list
-        /// the removed keys that signed there, and take nothing. Asks for
-        /// the recovery phrase
+        /// Bring in what a removed device wrote under one name
+        ///
+        /// Name the device by its label, by the first six words of its
+        /// key's fingerprint, or by its key. Put a label or the words in
+        /// quotes. Give `--from` once for each device.
+        ///
+        /// With no device after it, it lists the removed keys that wrote
+        /// there and brings in nothing. With a device, it asks for the
+        /// recovery phrase.
         #[arg(
             long,
             num_args = 0..=1,
@@ -311,18 +477,32 @@ enum SyncCommand {
             value_name = "LABEL_OR_SIX_WORDS"
         )]
         from: Vec<String>,
-        /// Read the generations whose secret this device never held (it
-        /// was off through a change), and take what your devices that
-        /// count signed there. Asks for the recovery phrase
+        /// Read, for one name, what was written under secrets that this
+        /// device never had
+        ///
+        /// A device never had a secret if it was off through two changes
+        /// or more, or was added after a change. This brings in what your
+        /// devices that were not removed wrote under those secrets. It
+        /// asks for the recovery phrase.
         #[arg(long)]
         phrase: bool,
     },
-    /// Stop syncing (files already synced are left in place)
+    /// Turn sync off on this device
+    ///
+    /// Files that have already synced stay where they are.
     Off,
-    /// Show what syncs, what was found, and what your other devices sync
+    /// Show what syncs on this device and on your others
+    ///
+    /// It lists:
+    ///
+    /// - each folder that syncs, and its name;
+    ///
+    /// - the memory folders found on this machine that do not sync;
+    ///
+    /// - the names that your other devices sync and this one does not.
     Status {
-        /// Put away the notice of the folders that stopped syncing: you
-        /// have seen it
+        /// Put away the notice about folders that stopped syncing, once
+        /// you have read it
         #[arg(long)]
         seen: bool,
     },
