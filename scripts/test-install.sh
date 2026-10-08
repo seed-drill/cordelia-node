@@ -46,6 +46,12 @@ case "$1" in
         # Where it is told to, as the real one does.
         mkdir -p "${CORDELIA_DATA_DIR:-$HOME/.cordelia}"
         touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/identity.key"
+        # Its last line, as the real one's: run by a script it says
+        # nothing of how the node is started.
+        case " $* " in
+            *" --non-interactive "*) echo "Node is ready." ;;
+            *) echo 'Node is ready. Run `cordelia start` to begin.' ;;
+        esac
         ;;
     status)
         if [ -n "${CORDELIA_CONFIG:-}${CORDELIA_HTTP_PORT:-}${CORDELIA_P2P_PORT:-}${CORDELIA_BIND_ADDRESS:-}" ] \
@@ -217,6 +223,46 @@ has() {
     esac
 }
 
+has_not() {
+    case "$OUT" in
+        *"$1"*) echo "FAILED: $name: must not say \"$1\""; FAILED=1 ;;
+    esac
+}
+
+# The closing words of a first install, in their order: the one command
+# that starts the node as the service ($1), the three ways on for a
+# machine that follows no recovery phrase, each with its command, and
+# the two commands of memory sync. Nothing that the script printed says
+# `cordelia start`, or names pairing.
+first_install_says() {
+    want=$(cat << WORDS
+Next steps:
+  $1
+                        # run the node as a background service
+
+Then one of these three:
+  cordelia phrase       # this is your first machine: make a phrase here
+  cordelia id           # another machine has the phrase: add this one from it.
+                        #   Give this key to cordelia add-device there; it
+                        #   prints the cordelia accept to run here
+  cordelia recover      # every device that has the phrase is lost: recover
+                        #   here with it. Do not make a new phrase first
+
+Then:
+  cordelia sync claude  # turn on memory sync: lists what it found
+  cordelia sync map <folder>
+                        # sync Claude Code's memory for that folder
+
+Open a new terminal first if 'cordelia' is not found.
+WORDS
+)
+    check "the closing words" \
+        "$(sed -n '/^Next steps:/,/^Open a new terminal/p' "$HOME_DIR/.fake/out")" "$want"
+    has "Node is ready."
+    has_not "cordelia start"
+    has_not "to pair"
+}
+
 expect() {
     check "the last line" "$LAST" "cordelia-install: $1"
     check "the exit code" "$CODE" "$2"
@@ -230,16 +276,16 @@ expect() {
 setup() { :; }
 run "a-first-install"
 expect "installed=$NEW running=none restart=not-needed" 0 0
-case "$OUT" in
-    *"Next steps:"*) ;;
-    *) echo "FAILED: $name: a first install says what to do next"; FAILED=1 ;;
-esac
+first_install_says "systemctl --user enable --now cordelia"
 
 service() { echo "${1:-active}" > "$HOME/.fake/service"; }
 
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-running-node-is-restarted"
 expect "installed=$NEW running=$NEW restart=done" 0 1
+# An upgrade ends as it did: with what became of the node, and no steps.
+has "The node was restarted and is running $NEW."
+has_not "Next steps:"
 check "the unit is read again before the restart" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" "daemon-reload restart "
 
@@ -317,6 +363,7 @@ done
 setup() { :; }
 run "a-first-install-in-a-shell-with-settings" CORDELIA_DATA_DIR="$WORK/elsewhere"
 expect "installed=$NEW running=none restart=not-needed" 0 0
+first_install_says "systemctl --user enable --now cordelia"
 check "the key is where the service looks" \
     "$(ls "$HOME_DIR/.cordelia/identity.key" 2>/dev/null)" "$HOME_DIR/.cordelia/identity.key"
 
@@ -385,6 +432,9 @@ setup() {
 }
 run "the-version-before-is-kept"
 expect "installed=$NEW running=none restart=not-needed" 0 0
+# A later run with no node running ends as it did.
+has "  cordelia status       # the node and its relays"
+has_not "Then one of these three:"
 check "the copy kept" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
 again "the-version-before-is-kept-at-a-second-run"
 expect "installed=$NEW running=none restart=not-needed" 0 0
@@ -399,6 +449,7 @@ check "the last line" "$LAST" "Error: cordelia init failed. The binary is instal
 setup() { :; }
 run "a-first-install-on-a-mac" FAKE_OS=Darwin
 expect "installed=$NEW running=none restart=not-needed" 0 0
+first_install_says "launchctl load $HOME_DIR/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
 
 if [ "$FAILED" -ne 0 ]; then
     exit 1

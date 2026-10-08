@@ -40,6 +40,17 @@ The install script:
 7. Runs `cordelia init` if `~/.cordelia/config.toml` does not exist
 8. Installs system service (launchctl on macOS, systemd on Linux)
 
+> **v1 status.** The script runs `cordelia init --non-interactive` on a
+> machine that has no key yet (`~/.cordelia/identity.key`): so run, `init`
+> does not end by saying to run `cordelia start`. Such a first install ends
+> with, in this order: the one command that starts the node as the service;
+> the three ways on for a machine that follows no recovery phrase (§2.1),
+> each with its command (`cordelia phrase`, `cordelia id` for `cordelia
+> add-device` on a machine that has the phrase, `cordelia recover`); and
+> `cordelia sync claude` and `cordelia sync map <folder>`. A later run ends
+> as it did: with what became of the node that is running, and the line for
+> a program.
+
 ### 1.2 Platform Matrix
 
 | Platform | Architecture | Binary | Service Manager |

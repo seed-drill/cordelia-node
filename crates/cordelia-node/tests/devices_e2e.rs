@@ -1820,6 +1820,23 @@ fn cli_reports_when_the_node_is_not_running() {
     );
 }
 
+/// `cordelia init` ends by saying how the node is started, where a
+/// person runs it. Run by a script (`--non-interactive`), as the install
+/// script runs it, it says nothing of `cordelia start`: the script names
+/// the command that starts the node as the service.
+#[test]
+fn init_run_by_a_script_does_not_say_how_to_start_the_node() {
+    let n = node("fresh", "personal", None);
+    let by_a_person = n.cli(&["init"]);
+    assert!(
+        by_a_person.ends_with("\nNode is ready. Run `cordelia start` to begin.\n"),
+        "{by_a_person}"
+    );
+    let by_a_script = n.cli(&["init", "--non-interactive"]);
+    assert!(by_a_script.ends_with("\nNode is ready.\n"), "{by_a_script}");
+    assert!(!by_a_script.contains("cordelia start"), "{by_a_script}");
+}
+
 /// A clone of this repository at `rel` under `home`: a git repository
 /// whose remote is this project's. Returns where it is.
 fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
