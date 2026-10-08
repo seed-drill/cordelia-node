@@ -456,8 +456,14 @@ SERVICE
 
 # ── Init ────────────────────────────────────────────────────────────
 
+# A machine with no key yet is set up here: that makes this a first
+# install. `--non-interactive` has init say nothing of how the node is
+# started: the closing words below name the one command that starts it as
+# the service.
 maybe_init() {
+    FIRST_INSTALL=""
     if [ ! -f "${DATA_DIR}/identity.key" ]; then
+        FIRST_INSTALL=yes
         echo ""
         echo "Running cordelia init..."
         export PATH="${INSTALL_DIR}:$PATH"
@@ -466,6 +472,41 @@ maybe_init() {
             exit 1
         fi
     fi
+}
+
+# What a first install ends with, in this order: the one command that
+# starts the node as the service; the three ways on for a machine that
+# follows no recovery phrase, each with its command; and the two commands
+# that turn memory sync on and say what syncs.
+first_steps() {
+    echo "Next steps:"
+    echo "  ${START_CMD}"
+    echo "                        # run the node as a background service"
+    echo ""
+    echo "Then one of these three:"
+    echo "  cordelia phrase       # this is your first machine: make a phrase here"
+    echo "  cordelia id           # another machine has the phrase: add this one from it."
+    echo "                        #   Give this key to cordelia add-device there; it"
+    echo "                        #   prints the cordelia accept to run here"
+    echo "  cordelia recover      # every device that has the phrase is lost: recover"
+    echo "                        #   here with it. Do not make a new phrase first"
+    echo ""
+    echo "Then:"
+    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
+    echo "  cordelia sync map <folder>"
+    echo "                        # sync Claude Code's memory for that folder"
+}
+
+# What a later run ends with, where no node is running here.
+next_steps() {
+    echo "Next steps:"
+    echo "  ${START_CMD}"
+    echo "                        # run the node as a background service"
+    echo "  cordelia status       # the node and its relays"
+    echo "  cordelia id           # this device's key, to pair another device"
+    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
+    echo "  cordelia sync map <folder>"
+    echo "                        # sync Claude Code's memory for that folder"
 }
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -491,14 +532,11 @@ main() {
         finish
         return
     fi
-    echo "Next steps:"
-    echo "  ${START_CMD}"
-    echo "                        # run the node as a background service"
-    echo "  cordelia status       # the node and its relays"
-    echo "  cordelia id           # this device's key, to pair another device"
-    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
-    echo "  cordelia sync map <folder>"
-    echo "                        # sync Claude Code's memory for that folder"
+    if [ -n "$FIRST_INSTALL" ]; then
+        first_steps
+    else
+        next_steps
+    fi
     echo ""
     echo "Open a new terminal first if 'cordelia' is not found."
     echo ""

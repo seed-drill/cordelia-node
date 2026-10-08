@@ -44,7 +44,8 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Skip interactive prompts
+        /// Run by a script, such as the install script, that starts the
+        /// node itself: do not say how to start it
         #[arg(long)]
         non_interactive: bool,
 
@@ -441,10 +442,21 @@ fn open_database(db_path: &std::path::Path) -> anyhow::Result<rusqlite::Connecti
     }
 }
 
+/// The last line of `cordelia init`. Run by a person, it says how the
+/// node is started. Run by a script (`--non-interactive`), as the install
+/// script runs it, it does not: the script starts the node itself, as
+/// the service it sets up, and says how in its own closing words.
+fn node_is_ready(by_a_script: bool) -> &'static str {
+    match by_a_script {
+        true => "Node is ready.",
+        false => "Node is ready. Run `cordelia start` to begin.",
+    }
+}
+
 fn cmd_init(
     config_path: &str,
     name: Option<String>,
-    _non_interactive: bool,
+    non_interactive: bool,
     force: bool,
     show_secrets: bool,
 ) -> anyhow::Result<()> {
@@ -557,7 +569,7 @@ fn cmd_init(
     }
 
     println!();
-    println!("Node is ready. Run `cordelia start` to begin.");
+    println!("{}", node_is_ready(non_interactive));
 
     Ok(())
 }
@@ -6721,6 +6733,19 @@ mod tests {
         assert!(!sweep.is_due(start + hour + second));
         assert!(!sweep.is_due(start + hour * 2 - second));
         assert!(sweep.is_due(start + hour * 2));
+    }
+
+    /// Run by a person, `cordelia init` ends by saying how the node is
+    /// started. Run by a script, as the install script runs it, it says
+    /// nothing of that: the script names the command that starts the node
+    /// as the service.
+    #[test]
+    fn test_init_run_by_a_script_does_not_say_how_to_start_the_node() {
+        assert_eq!(
+            node_is_ready(false),
+            "Node is ready. Run `cordelia start` to begin."
+        );
+        assert_eq!(node_is_ready(true), "Node is ready.");
     }
 
     #[test]
