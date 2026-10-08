@@ -81,12 +81,45 @@ pub(crate) fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
         .and_then(|seed| <[u8; 32]>::try_from(seed).ok());
     match on_disk {
         Some(seed) if seed != *state.identity.seed() => Err(ApiError::Conflict(
-            "this device was given a new key, and the node still runs under the old one: stop \
-             the node and start it again (`cordelia start`)."
-                .into(),
+            under_the_old_key_says(std::env::consts::OS),
         )),
         _ => Ok(()),
     }
+}
+
+/// The command that restarts a node which runs as the service that the
+/// install script sets up, on the system named (`std::env::consts::OS`).
+/// The script prints the same one.
+pub fn restart_command(os: &str) -> &'static str {
+    match os {
+        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+        _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
+    }
+}
+
+/// How a node is restarted on the system named, in the lines that follow
+/// "restart the node:" (decision 2026-10-04 §5.2): the command that
+/// restarts the service, on a line of its own; `cordelia status` after
+/// it; and that a node which does not run as the service is stopped and
+/// started by whatever started it.
+pub fn restart_says(os: &str) -> String {
+    format!(
+        "  {}\nThen run `cordelia status`.\nWhere the node does not run as the service that \
+         the install script set up, stop it and start it again with whatever started it.",
+        restart_command(os)
+    )
+}
+
+/// What a command is told by a node that still runs under the key which
+/// the device had before it was given a new one ([`asked`]), on the
+/// system named: why nothing is made, and how the node is restarted
+/// ([`restart_says`]).
+fn under_the_old_key_says(os: &str) -> String {
+    format!(
+        "this device was given a new key, and the node still runs under the old one. Restart \
+         the node:\n{}",
+        restart_says(os)
+    )
 }
 
 /// A refusal, as the API answers it: what a person did that is refused is
@@ -1421,6 +1454,40 @@ mod tests {
         assert_eq!(not_shown, [json!({ "by": listing, "words": no_names })]);
         let handed = json!([names, not_shown]).to_string();
         assert!(!handed.to_uppercase().contains("NOT-A-NAME"), "{handed}");
+    }
+
+    /// A node that still runs under the key which the device had before
+    /// it was given a new one says how it is restarted, on each system
+    /// (decision 2026-10-04 §5.2): the command that restarts the service,
+    /// on a line of its own, then `cordelia status`, and what is done
+    /// where the node does not run as the service. It names no command
+    /// that does not restart a service.
+    #[test]
+    fn test_a_node_under_the_old_key_names_the_command_that_restarts_it() {
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            assert_eq!(restart_command(os), restart);
+            let says = under_the_old_key_says(os);
+            assert_eq!(
+                says,
+                format!(
+                    "this device was given a new key, and the node still runs under the old \
+                     one. Restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
+                     the node does not run as the service that the install script set up, stop \
+                     it and start it again with whatever started it."
+                )
+            );
+            assert!(!says.contains("cordelia start"), "{says}");
+        }
     }
 
     /// A relay that the device is set up with and that the node is not

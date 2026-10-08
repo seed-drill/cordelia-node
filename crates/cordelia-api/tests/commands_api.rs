@@ -879,6 +879,15 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
             said.to_string().contains("this device was given a new key"),
             "{path}: {said}"
         );
+        // It names the command that restarts the service on this
+        // system, on a line of its own, and `cordelia status` after it.
+        let says = said["error"]["message"].as_str().unwrap_or_default();
+        let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+        assert!(
+            says.contains(&format!("\n  {restart}\nThen run `cordelia status`.\n")),
+            "{path}: {said}"
+        );
+        assert!(!says.contains("cordelia start"), "{path}: {said}");
     }
     assert_eq!(woken(&state).await, (false, false));
     let typed: i64 = {

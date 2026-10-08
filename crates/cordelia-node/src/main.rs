@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use actix_web::{App, HttpServer, web};
 use clap::Parser;
 
+use cordelia_api::commands::restart_command;
 use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
@@ -3123,16 +3124,6 @@ pub(crate) fn note_another_version(config_path: &str) {
     if let Some(note) = node_version_note(config_path) {
         eprintln!("{note}\n");
         VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// The command that restarts a node which runs as the service that the
-/// install script sets up, on the system named (`std::env::consts::OS`).
-/// The script prints the same one.
-fn restart_command(os: &str) -> &'static str {
-    match os {
-        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
-        _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
     }
 }
 

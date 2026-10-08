@@ -1812,11 +1812,32 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     let new_key = key_of(&tablet);
     assert_ne!(new_key, tablet_key);
     assert!(said.contains(&new_key), "{said}");
+    // It ends with the command that restarts the node as the service on
+    // this system, on a line of its own, and `cordelia status` after it.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        said.contains(&format!(
+            "The node still runs under the old key. Before anything else, restart the \
+             node:\r\n  {restart}\r\nThen run `cordelia status`.\r\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
     // Until the node is started again it makes nothing for a command,
-    // under a key that is the device's no longer.
+    // under a key that is the device's no longer: and says the same.
     let said = tablet.refused(&["devices"]);
     assert!(
-        said.contains("this device was given a new key, and the node still runs under the old one"),
+        said.contains(&format!(
+            "this device was given a new key, and the node still runs under the old one. \
+             Restart the node:\n  {restart}\nThen run `cordelia status`.\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
+    // So does `cordelia accept`, which is what a person runs next.
+    let said = tablet.at_terminal(&["accept", &laptop_key]).refused();
+    assert!(
+        said.contains(&format!("Restart the node:\r\n  {restart}\r\n")),
         "{said}"
     );
     tablet.stop();
