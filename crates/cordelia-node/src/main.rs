@@ -149,10 +149,14 @@ enum Commands {
     RecoverMade {
         /// The change's number
         number: u64,
-        /// The device that was recovered from, where it never wrote that
-        /// it had sent what it carried
+        /// The device that was recovered from, where its word that it
+        /// had sent what it carried is not among what was read
         #[arg(long)]
         cut_short: Option<String>,
+        /// With `--cut-short`: how the personal channel of the change
+        /// that was recovered from was read at the relays
+        #[arg(long, value_enum, default_value_t = recover_cmd::ChannelRead::Whole)]
+        channel_read: recover_cmd::ChannelRead,
     },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
@@ -368,7 +372,12 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
-        Some(Commands::RecoverMade { number, cut_short }) => {
+        Some(Commands::RecoverMade {
+            number,
+            cut_short,
+            channel_read,
+        }) => {
+            let cut_short = recover_cmd::CutShort::handed(cut_short, channel_read);
             recover_cmd::recover_made(&cli.config, number, cut_short)
         }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
@@ -1060,7 +1069,10 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.sync = Some(sync);
     }
     // What the node holds of this person's devices (decision 2026-10-04
-    // §8): a level goes by it.
+    // §8): a level goes by it. It is asked with a body that asks for
+    // nothing more: how much the device has sent to no relay is worked
+    // out by the node only where a request asks for it, and a status is
+    // run every few seconds (§16).
     if out.facts.role == "personal"
         && let Ok(person) = local_api(&config, true, "/api/v1/devices/list", timeout)
     {
@@ -3174,6 +3186,22 @@ fn let_go_says(name: &str, alone: bool) -> String {
     )
 }
 
+/// What `cordelia sync unmap` says once a folder is unmapped, where the
+/// node says that this device still holds the name that the folder was
+/// mapped to (decision 2026-10-04 §16): a carry or a recovery brought
+/// the name, and it is held as it was before the folder. The unmapping
+/// of the name is what lets it go, where nothing of it waits to be sent.
+/// `None` where the name went with its folder.
+fn still_held_says(after: &serde_json::Value) -> Option<String> {
+    let name = after["still_held"].as_str()?;
+    Some(format!(
+        "This device still holds {}, since a carry or a recovery brought it: `cordelia sync \
+         unmap {}` lets it go, once nothing of it waits to be sent.",
+        sync_label(name),
+        shell_word(name)
+    ))
+}
+
 /// What `cordelia sync unmap <name>` says of the node's answer where it
 /// asked the node to let go of a name (decision 2026-10-04 §7.3). The
 /// node let go of it: [`let_go_says`]. The node holds the name by a
@@ -3571,6 +3599,9 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 short_path(mapped),
                 sync_label(name)
             );
+            if let Some(still_held) = still_held_says(&after) {
+                println!("{still_held}");
+            }
             println!();
         }
         SyncCommand::Off => {
@@ -6370,6 +6401,136 @@ mod tests {
             message: "lab is not mapped on this device".into(),
         });
         assert!(not_mapped.is_none());
+    }
+
+    /// Once a folder is unmapped that was mapped to a name which a carry
+    /// or a recovery holds, `cordelia sync unmap` says that this device
+    /// still holds the name, and what lets it go (decision 2026-10-04
+    /// §16): the node's answer names the name. Nothing is said where the
+    /// name went with its folder.
+    #[test]
+    fn test_what_unmap_says_of_a_name_that_is_still_held_after_its_folder() {
+        let after = |still_held: serde_json::Value| serde_json::json!({ "enabled": true, "generation": 4, "still_held": still_held });
+        assert_eq!(
+            still_held_says(&after("lab".into())).unwrap(),
+            "This device still holds lab, since a carry or a recovery brought it: `cordelia \
+             sync unmap lab` lets it go, once nothing of it waits to be sent."
+        );
+        // Home memory is said as that, and its name is one that a shell
+        // would read: it is quoted in the command to copy.
+        assert_eq!(
+            still_held_says(&after("~".into())).unwrap(),
+            "This device still holds home memory, since a carry or a recovery brought it: \
+             `cordelia sync unmap '~'` lets it go, once nothing of it waits to be sent."
+        );
+        // The name went with its folder: the answer names none.
+        let gone = serde_json::json!({ "enabled": true, "generation": 4 });
+        assert_eq!(still_held_says(&gone), None);
+        assert_eq!(still_held_says(&after(serde_json::Value::Null)), None);
+    }
+
+    /// What a recovery hands the process that waits for its look is read
+    /// there as it was handed (decision 2026-10-04 §9, step 5; §16): the
+    /// device that was recovered from, where its word that it had sent
+    /// what it carried was not read, and how the channel that the word
+    /// is written in was read at the relays, which is one of three
+    /// things.
+    #[test]
+    fn test_what_a_recovery_hands_the_process_that_waits_is_read_there() {
+        use clap::Parser;
+        use recover_cmd::ChannelRead::{HeldByNone, InPart, Whole};
+        for read in [Whole, InPart, HeldByNone] {
+            let handed = recover_cmd::CutShort {
+                device: "(w1 w2 w3 w4) \"laptop\"".to_string(),
+                read,
+            };
+            let mut line = vec!["cordelia".to_string()];
+            line.extend([recover_cmd::MADE_COMMAND.to_string(), "3".to_string()]);
+            line.extend(handed.args());
+            match super::Cli::parse_from(line).command {
+                Some(super::Commands::RecoverMade {
+                    number,
+                    cut_short,
+                    channel_read,
+                }) => {
+                    assert_eq!(number, 3);
+                    let read = recover_cmd::CutShort::handed(cut_short, channel_read);
+                    assert_eq!(read, Some(handed));
+                }
+                _ => panic!("what was handed is not read as that command"),
+            }
+        }
+        assert_eq!(recover_cmd::CutShort::handed(None, InPart), None);
+        // With no such device, as it was.
+        let line = ["cordelia", recover_cmd::MADE_COMMAND, "3"];
+        match super::Cli::parse_from(line).command {
+            Some(super::Commands::RecoverMade {
+                number: 3,
+                cut_short: None,
+                channel_read: Whole,
+            }) => {}
+            _ => panic!("that is not read as the command"),
+        }
+    }
+
+    /// **A status asks the node for no count of what the device has sent
+    /// to no relay** (decision 2026-10-04 §16): the node works that count
+    /// out only where a request asks for it, and a status bar runs a
+    /// status every few seconds. What a status posts to the node, for
+    /// what it holds of its person, is a body that asks for nothing.
+    #[test]
+    fn test_a_status_asks_the_node_for_no_count_of_what_waits() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        // What stands in for the node, at a port of this machine: it
+        // keeps the one request that it is sent, and answers it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.node.http_port = listener.local_addr().unwrap().port();
+        config.node.data_dir = dir.path().display().to_string();
+        std::fs::write(config.token_path(), "a-token").unwrap();
+        let asked = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let answer = "{\"state\":\"no_phrase\"}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{answer}",
+                answer.len()
+            )
+            .unwrap();
+            (first, body)
+        });
+        // As a status asks: `gather_status` asks so, and so does the
+        // line that `cordelia status` prints of a person's devices.
+        let timeout = std::time::Duration::from_secs(30);
+        let answered = local_api(&config, true, "/api/v1/devices/list", timeout).unwrap();
+        assert_eq!(answered["state"], "no_phrase");
+        let (first, body) = asked.join().unwrap();
+        assert!(first.starts_with("POST /api/v1/devices/list "), "{first}");
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({}),
+            "a status asks for nothing more"
+        );
     }
 
     /// A command asks the node only at one of the two addresses that the

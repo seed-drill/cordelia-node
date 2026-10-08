@@ -625,14 +625,38 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         let made = publish(&db, &state.identity, &write, 1_800_000_000).unwrap();
         assert!(matches!(made, Published::Made(_)), "{made:?}");
     }
-    // What a look says of it: a command that has the device begin again
-    // says before its yes how much it has sent to no relay.
-    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    // What a look says of it, where it is asked: a command that has the
+    // device begin again says before its yes how much it has sent to no
+    // relay. **The count is worked out only where the request asks for
+    // it** (decision 2026-10-04 §16): a look that asks for nothing, as a
+    // status asks, is answered without it, and so is one that says no,
+    // and one with no body at all.
+    let what_waits = json!({ "sent_to_no_relay": true });
+    let (_, seen) = asks!(app, "/api/v1/devices/list", what_waits.clone());
     assert_eq!(
         seen["sent_to_no_relay"],
         json!({ "versions": 1, "names": 1 }),
         "{seen}"
     );
+    for not_asked in [json!({}), json!({ "sent_to_no_relay": false })] {
+        let (status, seen) = asks!(app, "/api/v1/devices/list", not_asked.clone());
+        assert_eq!(status, 200, "{not_asked}: {seen}");
+        assert!(
+            seen.get("sent_to_no_relay").is_none(),
+            "{not_asked}: {seen}"
+        );
+        // It is the same look otherwise.
+        assert_eq!(seen["state"], "applied", "{not_asked}: {seen}");
+    }
+    let no_body = test::TestRequest::post()
+        .uri("/api/v1/devices/list")
+        .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+        .to_request();
+    let answer = test::call_service(&app, no_body).await;
+    assert_eq!(answer.status().as_u16(), 200);
+    let seen: Value = test::read_body_json(answer).await;
+    assert!(seen.get("sent_to_no_relay").is_none(), "{seen}");
+    assert_eq!(seen["state"], "applied", "{seen}");
     let unmap = json!({ "folder": "lab" });
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
     assert_eq!(status, 409, "{said}");
@@ -647,6 +671,32 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         "{said}"
     );
     assert_eq!(held(&state), Some(lab));
+    // A folder is mapped to the name, and unmapped again: the name is
+    // still held, as it was before the folder, and the answer to the
+    // folder's unmapping names it (decision 2026-10-04 §16), so that the
+    // command says so and what lets go of it. No other answer names one.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let home = home.canonicalize().unwrap_or(home);
+    let folder = home.join("notes-of-a-test").display().to_string();
+    let on = json!({ "enabled": true, "dir": "/srv/claude" });
+    let (status, said) = asks!(app, "/api/v1/sync/claude", on);
+    assert_eq!(status, 200, "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    let maps = json!({ "folder": folder, "name": "lab" });
+    let (status, said) = asks!(app, "/api/v1/sync/map", maps);
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["mappings"][0]["name"], "lab", "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", json!({ "folder": folder }));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(said["mappings"], json!([]), "{said}");
+    assert_eq!(said["still_held"], "lab", "{said}");
+    assert!(said.get("let_go").is_none(), "{said}");
+    assert_eq!(held(&state), Some(lab));
+    let (status, said) = asks!(app, "/api/v1/sync/claude", json!({ "enabled": false }));
+    assert_eq!(status, 200, "{said}");
+    assert!(said.get("still_held").is_none(), "{said}");
+    assert_eq!(held(&state), Some(lab));
     // A relay was sent it: unmapping the name lets go of it, and the
     // answer says so, and that the statement lists this device alone.
     // Asked again, nothing is mapped so, as for any word that names no
@@ -656,7 +706,7 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         let last = kept_rows::last_taken(&db, &lab).unwrap();
         kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
     }
-    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    let (_, seen) = asks!(app, "/api/v1/devices/list", what_waits);
     assert_eq!(
         seen["sent_to_no_relay"],
         json!({ "versions": 0, "names": 0 }),

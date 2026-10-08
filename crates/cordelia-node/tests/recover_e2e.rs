@@ -1469,11 +1469,25 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
             "{words}: {said}"
         );
     }
+    // The relay had no room for the first machine's personal channel,
+    // and holds none of it: the word that the first machine had sent
+    // what it carried was not found for that. It is not said that the
+    // machine never wrote it. A device that wrote nothing there, and a
+    // relay that has dropped the channel, both give this.
     assert!(
-        said.contains("never wrote that it had sent what it carried"),
+        said.contains(
+            "that it had sent what it carried was not found: no relay that answered holds that \
+             device's personal channel. A device that wrote nothing there, and a relay that has \
+             dropped the channel, both give this. A recovery, or a change, that was made on it \
+             may have been cut short."
+        ),
         "{said}"
     );
-    assert!(said.contains("was cut short"), "{said}");
+    assert!(!said.contains("never wrote"), "{said}");
+    assert!(
+        said.contains("No relay that answered holds the personal channel of change 2"),
+        "{said}"
+    );
     assert!(held(&second).is_empty(), "{:?}", held(&second));
 
     // It never knew either device by a label: a label names none.

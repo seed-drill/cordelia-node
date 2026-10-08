@@ -520,4 +520,11 @@ pub struct SyncStatusResponse {
     /// device of the person's then holds anything of the name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub let_go_alone: Option<bool>,
+    /// The name that a folder was mapped to, where this device still
+    /// holds it once the folder is unmapped (decision 2026-10-04 §16): a
+    /// carry or a recovery brought it, and it is held as it was before
+    /// the folder. Only in the answer to the request that unmapped the
+    /// folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub still_held: Option<String>,
 }

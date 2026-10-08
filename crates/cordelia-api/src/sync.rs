@@ -102,6 +102,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             carried: None,
             let_go: None,
             let_go_alone: None,
+            still_held: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
         let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
@@ -1154,10 +1155,28 @@ pub fn let_go_of_a_carried_name(
     Ok(true)
 }
 
+/// The name that a folder was mapped to before a change of settings,
+/// where no folder is mapped to it now and the device holds it by a
+/// carry or a recovery ([`crate::names::carried`], decision 2026-10-04
+/// §16): the folder's unmapping left it held ([`names_follow`]). `before`
+/// is the names that the device's folders were mapped to before. The
+/// answer to the unmapping names it, so that the command says that the
+/// name is still held, and what lets go of it. It decides nothing, and
+/// where it cannot be read it says nothing.
+fn still_held_by_a_carry(db: &rusqlite::Connection, before: &[String]) -> Option<String> {
+    let mapped = mapped_names(db).ok()?;
+    let carried = crate::names::carried(db).ok()?;
+    let still_held = |name: &&String| !mapped.contains(name) && carried.contains(*name);
+    before.iter().find(still_held).cloned()
+}
+
 /// Stop syncing a mapped folder (see [`remove_mapping`]). **Where no
 /// folder is mapped so, a name that the device holds by a carry is let
 /// go** ([`let_go_of_a_carried_name`]), and the answer says so: such a
 /// name has no folder to unmap, and is held until a person says this.
+/// **Where the folder was mapped to a name that a carry or a recovery
+/// holds, the name is still held, and the answer says so**
+/// ([`still_held_by_a_carry`]).
 pub async fn unmap(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1166,6 +1185,7 @@ pub async fn unmap(
     auth::check_bearer(&req, &state)?;
     let mut let_go = None;
     let mut alone = None;
+    let mut still_held = None;
     {
         let db = state
             .db
@@ -1173,7 +1193,10 @@ pub async fn unmap(
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         let before = mapped_names(&db)?;
         match remove_mapping(&state.sync_control, &db, &body) {
-            Ok(()) => names_follow(&state, &db, &before),
+            Ok(()) => {
+                names_follow(&state, &db, &before);
+                still_held = still_held_by_a_carry(&db, &before);
+            }
             Err(not_mapped) => match let_go_of_a_carried_name(&state, &db, &body.folder)? {
                 true => {
                     let_go = Some(body.folder.clone());
@@ -1186,6 +1209,7 @@ pub async fn unmap(
     let mut status = status(&state)?;
     status.let_go = let_go;
     status.let_go_alone = alone;
+    status.still_held = still_held;
     Ok(HttpResponse::Ok().json(status))
 }
 
@@ -2460,6 +2484,10 @@ mod tests {
     /// Where nothing of the name waits, the folder's unmapping leaves it
     /// held all the same: it is the unmapping of the name that lets it
     /// go. A name that no carry holds goes with its folder, as it did.
+    ///
+    /// **The answer to the folder's unmapping names the name that is
+    /// still held,** so that the command says so, and what lets go of
+    /// it: and names none where the name went with its folder.
     #[test]
     fn test_a_folders_unmapping_does_not_let_go_of_a_name_that_a_carry_holds() {
         use crate::several::{Several, state_of};
@@ -2485,13 +2513,15 @@ mod tests {
             add_mapping(&state.sync_control, &db, &body, home).unwrap();
             names_follow(&state, &db, &before);
         };
-        let unmaps = |word: &str| {
+        // And what its answer says is still held.
+        let unmaps = |word: &str| -> Option<String> {
             let before = mapped_names(&db).unwrap();
             let body = SyncUnmapRequest {
                 folder: word.to_string(),
             };
             remove_mapping(&state.sync_control, &db, &body).unwrap();
             names_follow(&state, &db, &before);
+            still_held_by_a_carry(&db, &before)
         };
         let held = || -> Vec<String> {
             let names = held_rows::names(&db).unwrap();
@@ -2542,7 +2572,11 @@ mod tests {
         for unmapped_by in ["/home/sam/notes", "lab"] {
             maps("/home/sam/notes", "lab");
             assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
-            unmaps(unmapped_by);
+            // While the folder is mapped, nothing is said to be held
+            // beside it.
+            let mapped_now = mapped_names(&db).unwrap();
+            assert_eq!(still_held_by_a_carry(&db, &mapped_now), None);
+            assert_eq!(unmaps(unmapped_by).as_deref(), Some("lab"), "{unmapped_by}");
             assert!(mapped_names(&db).unwrap().is_empty());
             // Held as it was before the folder, with every version.
             assert_eq!(as_before_the_folder(), before_the_folder, "{unmapped_by}");
@@ -2566,7 +2600,7 @@ mod tests {
         kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
         assert_eq!(waits(), 0);
         maps("/home/sam/notes", "lab");
-        unmaps("/home/sam/notes");
+        assert_eq!(unmaps("/home/sam/notes").as_deref(), Some("lab"));
         assert_eq!(as_before_the_folder(), before_the_folder);
         assert_eq!(of_lab(), carried_in);
         assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
@@ -2580,7 +2614,7 @@ mod tests {
             (held(), said()),
             (vec!["team".to_string()], vec!["team".to_string()])
         );
-        unmaps("/home/sam/work");
+        assert_eq!(unmaps("/home/sam/work"), None);
         assert!(held().is_empty() && said().is_empty());
     }
 

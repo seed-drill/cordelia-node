@@ -23,10 +23,16 @@
 //!   first;** after them the keys added since that count, each under the
 //!   device that added it; and after those the records that do not count,
 //!   **up to 256 rows in all**, each with how much its key signed there.
-//!   One key has one row. No device can push another out of the rows by
-//!   what it signs. It also reads the names that those devices list, and
-//!   whether the device it recovers from had written that it sent what it
-//!   carried.
+//!   One key has one row. No device can push a device of the statement
+//!   out of the rows by what it signs. **It counts the keys that a
+//!   record of an addition was read for and that have no row at all:** a
+//!   reader keeps 256 records that do not count, and where more were
+//!   written, one that was read is not among them. **And it says of each
+//!   row whether a record that was read for its key is not among those
+//!   kept:** the row is then by another record, and may say less of the
+//!   key than was written. It also reads the names that those devices
+//!   list, and whether the device it recovers from had written that it
+//!   sent what it carried.
 //! - A person says one of three things of each row that counts
 //!   ([`Answer`]). **A record that does not count is shown as that and is
 //!   not asked about:** it is no device, nothing is taken from it, and it
@@ -35,7 +41,7 @@
 //!   where a key that added it may add (a device of the statement, or a
 //!   key that counts and that such a device added) and is not in someone
 //!   else's hands, by what was said of it and of the device that added
-//!   it: no device can push another out of a recovery by filling the 64.
+//!   it: filling the 64 alone pushes no device out of what is asked.
 //!   Nothing is taken from it either way; said to be gone, its key is
 //!   removed. [`takes`] is then the keys that the look takes from: a key
 //!   that counts, and that the person still has or that is lost or
@@ -86,7 +92,7 @@ use cordelia_core::protocol::{
 use cordelia_core::revision::band;
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::derive;
-use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::entry::{CheckedEntry, Entry, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::statement::{SignedStatement, Statement};
 use cordelia_storage::acts;
@@ -101,7 +107,7 @@ use crate::error::ApiError;
 use crate::names;
 use crate::person::{self, NotCounted, PersonError, in_one};
 use crate::state::{AppState, AtRelays};
-use crate::take::{self, Taken};
+use crate::take::{self, Record, Taken};
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -224,6 +230,16 @@ pub struct Row {
     /// Such a key is asked about all the same, where one of these is not
     /// in someone else's hands ([`asked_for_room`]).
     pub no_room: Vec<([u8; 32], u64)>,
+    /// Whether a record of an addition that was read for this key, under
+    /// some adder, is not among the records that the reader kept
+    /// (decision 2026-10-04 §9, step 3): a reader keeps 256 records that
+    /// do not count, the oldest it saw going first. The row is then by
+    /// another record of the key, and may say less of it than was
+    /// written: the record that went may be the one that fails only for
+    /// the bound of 64, under an adder that may add, by which the key
+    /// would have been asked about. Never so for a key that the statement
+    /// removes: it stays removed whatever a record says of it.
+    pub record_let_go: bool,
 }
 
 /// What a recovery reads of the generation that it recovers from.
@@ -239,15 +255,29 @@ pub struct Generation {
     /// nothing from them, and the new machine keeps their keys as left
     /// out.
     pub not_shown: Vec<Row>,
+    /// How many keys a record of an addition was read for that have no
+    /// row at all, shown or not (decision 2026-10-04 §9, step 3). A
+    /// reader keeps 256 records that do not count, the oldest it saw
+    /// going first: where more were written, one that was read is not
+    /// among those it kept. A device that was added since the change,
+    /// and that the bound of 64 kept out, may be among them. Nothing is
+    /// asked of such a key, nothing is taken from it, and the reader
+    /// does not hold it: the command says how many there are. Keys are
+    /// counted, and not records, and no key in either list of the
+    /// statement is among them.
+    pub no_row: usize,
     /// Each name that the personal channel lists, with the keys that
     /// count and list it. A name that only keys list which do not count
     /// is here too, with no key: nothing is taken for it, and it is
     /// named among the names that are left.
     pub names: Vec<(String, Vec<[u8; 32]>)>,
     /// The one device of the statement, where the statement lists one
-    /// alone and was made after another, and that device never wrote
-    /// that it had sent what it carried: a recovery, or a change, that
-    /// was made on it was cut short.
+    /// alone and was made after another, and that device's word that it
+    /// had sent what it carried is not among what was handed: a
+    /// recovery, or a change, that was made on it was cut short, unless
+    /// the word is in what was not read, or no relay holds the channel.
+    /// (Whoever had the channel read knows how it was read at each
+    /// relay, and says which it is.)
     pub cut_short: Option<[u8; 32]>,
 }
 
@@ -312,17 +342,27 @@ pub fn read_generation(
             of_it.push(entry);
         }
     }
+    // The records of additions that were read: of each entry that the
+    // one door took as such a record, at any giving, the key that it
+    // adds and the key that signed it. Its signer counted, and the
+    // record is its signer's own word, verifies, and is made under this
+    // statement.
+    let mut read_for: BTreeSet<([u8; 32], [u8; 32])> = BTreeSet::new();
     of_it.sort_by_key(|entry| (place(&entry.author), entry.author, entry.slot, entry.rev));
     for _ in 0..GIVEN_AGAIN {
         let mut again = false;
         for entry in &of_it {
             if let Taken::Own {
+                record,
                 came_to_count,
                 came_to_add,
                 ..
             } = take::take(&conn, &reader, entry, now)?
             {
                 again |= came_to_count + came_to_add > 0;
+                if let Some(Record::Seen(_)) = record {
+                    read_for.extend(added_by(entry, &personal));
+                }
             }
         }
         if !again {
@@ -336,6 +376,21 @@ pub fn read_generation(
         *signed.entry(entry.author).or_default() += 1;
     }
     let kept = held_rows::additions(&conn)?;
+    // The keys one of whose records was read, under some adder, and is
+    // not among the records kept: the reader let go of it. A key that
+    // the statement removes stays removed whatever a record says of it,
+    // and is not among them.
+    let is_kept = |key: &[u8; 32], adder: &[u8; 32]| {
+        let records = kept.iter();
+        records
+            .filter(|record| record.key == *key)
+            .any(|record| record.adder == *adder)
+    };
+    let let_go: BTreeSet<[u8; 32]> = read_for
+        .iter()
+        .filter(|(key, adder)| !is_kept(key, adder) && !statement.removes(key))
+        .map(|(key, _)| *key)
+        .collect();
     // The records that fail only for the bound of 64 counted devices:
     // for each key, the keys that signed one, each with when its record
     // says so. (A key that counts has none: its other records fail
@@ -366,6 +421,7 @@ pub fn read_generation(
             counts: record.counted && counting.counts(&record.key),
             signed: signed.get(&record.key).copied().unwrap_or(0),
             no_room: Vec::new(),
+            record_let_go: let_go.contains(&record.key),
         };
         records.push((row, record.adder));
     }
@@ -401,6 +457,7 @@ pub fn read_generation(
             counts: counting.counts(&device.key),
             signed: signed.get(&device.key).copied().unwrap_or(0),
             no_room: Vec::new(),
+            record_let_go: let_go.contains(&device.key),
         });
     }
     // Then the keys added since that count, each under the device that
@@ -429,6 +486,17 @@ pub fn read_generation(
     rows.extend(only_for_room.into_iter().map(|(row, _)| row));
     rows.extend(others.into_iter().map(|(row, _)| row));
     let not_shown = rows.split_off(RECOVERY_MAX_DEVICES_SHOWN.min(rows.len()));
+    // The keys that a record was read for and that have no row, shown
+    // or not: the reader kept 256 records that do not count, and let go
+    // of the oldest beyond that. A key that the statement removes stays
+    // removed whatever a record says of it, and is not counted. (A
+    // device of the statement always has a row.)
+    let has_a_row = |key: &[u8; 32]| rows.iter().chain(&not_shown).any(|row| row.key == *key);
+    let read_keys: BTreeSet<[u8; 32]> = read_for.iter().map(|(key, _)| *key).collect();
+    let no_row = read_keys
+        .iter()
+        .filter(|key| !has_a_row(key) && !statement.removes(key))
+        .count();
 
     let mut names: Vec<(String, Vec<[u8; 32]>)> = names::listed(&conn)?
         .into_iter()
@@ -462,9 +530,24 @@ pub fn read_generation(
     Ok(Generation {
         rows,
         not_shown,
+        no_row,
         names,
         cut_short,
     })
+}
+
+/// The key that `entry` holds a record of an addition for, and the key
+/// that signed that record (decision 2026-10-04 §6), where it is an
+/// entry of the personal channel whose secret is `personal`. `None`
+/// where it holds none. It checks nothing: it is asked of an entry that
+/// the one door took as a record.
+fn added_by(entry: &CheckedEntry, personal: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
+    let inside = entry.open(personal).ok()?;
+    let Value::Other(bytes) = &inside.value else {
+        return None;
+    };
+    let added = SignedAddition::from_bytes(bytes).ok()?.addition;
+    Some((added.device.key, added.adder))
 }
 
 /// Whether nothing is taken from the device of the row at `at` because
@@ -529,12 +612,18 @@ pub fn takes(rows: &[Row], answers: &[Answer]) -> Vec<[u8; 32]> {
 /// answer: what such a key added is not asked about, and nothing is
 /// taken from it.
 ///
-/// **So no device pushes another out of a recovery by filling the 64.**
+/// **So filling the 64 alone pushes no device out of what is asked.**
 /// A device that is listed can sign additions until 64 count, and a
 /// device that another added since then finds no room. It is asked about
 /// all the same. Nothing is taken from it by the look, whatever is said:
 /// said to be gone, its key is removed ([`gone`]), and what it wrote
 /// comes in by the command that names a removed key, with the phrase.
+///
+/// **The two bounds of 256 can be reached by what one device signs:** a
+/// reader keeps 256 records that do not count, and 256 rows are shown.
+/// What they leave out is counted and said: the rows beyond those shown
+/// ([`Generation::not_shown`]), and the keys whose record was read and
+/// that have no row at all ([`Generation::no_row`]).
 pub fn asked_for_room(rows: &[Row], answers: &[Answer], at: usize) -> Option<([u8; 32], u64)> {
     let row = rows.get(at).filter(|row| !row.counts)?;
     let not_in_other_hands = |(adder, _): &&([u8; 32], u64)| {
@@ -1230,7 +1319,6 @@ mod tests {
     use super::*;
 
     use cordelia_crypto::addition::Addition;
-    use cordelia_crypto::entry::Value;
     use cordelia_crypto::phrase::Phrase;
     use cordelia_crypto::statement::Device;
 
@@ -1356,12 +1444,28 @@ mod tests {
         };
         let after_other = made_after(&other);
         let apart_from_second = made_after(&first);
-        let both = of(&[&fourth, &after_other, &other]).unwrap();
+        // Each of the two at number 4 has a change behind it that is off
+        // the other's chain: the third is behind the fourth, and the
+        // other behind the one made after it. Which of the two is first
+        // goes by the hash of its statement, and a change is made with a
+        // new secret: it is the one in one run and the other in the
+        // next. Both of those behind are handed, so that whichever is
+        // the second, the one behind it is among those apart from the
+        // first, and is counted as nothing.
+        let both = of(&[&fourth, &after_other, &other, &third]).unwrap();
         let (second_of, on_neither) = both.second().unwrap();
         let two = [both.from.entry.id(), second_of.entry.id()];
         assert!(two.contains(&fourth.id()) && two.contains(&after_other.id()));
+        let behind_the_second = match second_of.entry.id() == fourth.id() {
+            true => third.id(),
+            false => other.id(),
+        };
+        let apart: Vec<[u8; 32]> = both.apart.iter().map(|c| c.entry.id()).collect();
+        assert_eq!(apart, [second_of.entry.id(), behind_the_second]);
         assert_eq!(on_neither, 0);
-        let three = of(&[&fourth, &after_other, &other, &apart_from_second]).unwrap();
+        let all = [&fourth, &after_other, &other, &third, &apart_from_second];
+        let three = of(&all).unwrap();
+        assert_eq!(three.apart.len(), 3);
         assert_eq!(three.second().unwrap().1, 1);
     }
 
@@ -2681,6 +2785,11 @@ mod tests {
         // it syncs a name of its own.
         let mut personal = base.clone();
         personal.push(record_by(counted_one, third, "third"));
+        // It signs a record for the tablet too. It may not add, so that
+        // record fails for that, and not for the bound: the tablet's row
+        // is by the record that fails only for the bound, which the
+        // desktop signed, whichever of the two keys is the lower.
+        personal.push(record_by(counted_one, kt, "the tablet, by another"));
         let word = names::word_name("theirs");
         let personal_channel = derive::personal_secret(&s[0].secret()).unwrap();
         personal.push(entry_by(
@@ -2708,6 +2817,7 @@ mod tests {
         let of_the_tablet = &read.rows[t_at];
         assert!(!of_the_tablet.counts);
         assert_eq!(of_the_tablet.added_by, Some((kx, AT)));
+        assert_ne!(of_the_tablet.label, "the tablet, by another");
         assert_eq!(of_the_tablet.no_room, [(kx, AT)]);
         // The third: its adder counts, and was added by a device added
         // since, so it may not add. The record fails for that, and not
@@ -2781,6 +2891,334 @@ mod tests {
             assert_eq!(names.only_other_hands, ["theirs"], "{of_x:?} {of_t:?}");
             assert!(names.over_the_bound.is_empty());
         }
+    }
+
+    /// **A recovery counts the keys that a record of an addition was read
+    /// for and that have no row at all** (decision 2026-10-04 §9, step
+    /// 3). A reader keeps 256 records that do not count, the oldest it
+    /// saw going first: where more were written, a record that was read
+    /// is not among those it kept, and its key has no row, shown or not.
+    ///
+    /// A statement lists device 0 and device 1, and removes device 2.
+    /// Device 0 signed 62 additions, which are read first and count, and
+    /// a record for device 1. Device 1 added a phone since, which only
+    /// the bound of 64 keeps out, and signed a record for the key that
+    /// the statement removes. One of the 62 then signed records for keys
+    /// of nobody's: each fails for the bound alone, and is read after
+    /// those three.
+    ///
+    /// With no more records that do not count than a reader keeps, each
+    /// key has a row and the count is 0. With more, the oldest are let
+    /// go, the phone's among them: the count says how many keys have no
+    /// row, and neither a device of the statement nor a key that it
+    /// removes is counted.
+    #[test]
+    fn test_a_recovery_counts_the_keys_whose_record_was_read_and_that_have_no_row() {
+        const AT: u64 = 1_800_000_000;
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let (k0, k1, removed) = (s.key(0), s.key(1), s.key(2));
+        let from = candidate(&s[0].latest());
+        let statement = from.statement.statement.clone();
+        assert!(statement.lists(&k0) && statement.lists(&k1) && statement.removes(&removed));
+        let band = statement.number << cordelia_core::protocol::REV_COUNT_BITS;
+        let personal = s[0].personal();
+        let record_by = |adder: &NodeIdentity, key: [u8; 32], label: &str| {
+            let device = Device::new(key, label).unwrap();
+            let record = Addition::under(&statement, device, adder.public_key(), AT)
+                .unwrap()
+                .sign(adder)
+                .unwrap();
+            entry_by(
+                adder,
+                &personal,
+                band + 1,
+                &added_name(&key).unwrap(),
+                Value::Other(record.to_bytes().unwrap()),
+                &[],
+            )
+        };
+        let phone = identity_of(500).public_key();
+        let not_read = identity_of(600).public_key();
+        let (counted, kept) = (
+            cordelia_core::protocol::MAX_COUNTED_DEVICES,
+            cordelia_core::protocol::MAX_NOT_COUNTED_RECORDS,
+        );
+        assert_eq!((counted, kept, RECOVERY_MAX_DEVICES_SHOWN), (64, 256, 256));
+        let base = {
+            let mut handed = s[0].stored_in(&personal);
+            for n in 0..62u16 {
+                let key = identity_of(1_000 + n).public_key();
+                handed.push(record_by(&s[0].identity, key, &format!("added {n}")));
+            }
+            handed.push(record_by(&s[0].identity, k1, "device 1, again"));
+            handed.push(record_by(&s[1].identity, phone, "phone"));
+            handed.push(record_by(&s[1].identity, removed, "removed"));
+            // An entry of device 1's that holds a record which device 0
+            // signed, for a key of nobody's: it is not its signer's own
+            // word, and is taken as no record. Its key has no row, and
+            // is not counted: no record was read for it.
+            let device = Device::new(not_read, "not read").unwrap();
+            let record = Addition::under(&statement, device, k0, AT)
+                .unwrap()
+                .sign(&s[0].identity)
+                .unwrap();
+            handed.push(entry_by(
+                &s[1].identity,
+                &personal,
+                band + 1,
+                &added_name(&not_read).unwrap(),
+                Value::Other(record.to_bytes().unwrap()),
+                &[],
+            ));
+            handed
+        };
+        // One of the 62 signs `more` records, for keys of nobody's.
+        let nobodys = |n: usize| identity_of(2_000 + n as u16).public_key();
+        let statement_key = *phrase().statement_key().unwrap();
+        let reads = |more: usize| {
+            let mut handed = base.clone();
+            for n in 0..more {
+                handed.push(record_by(&identity_of(1_000), nobodys(n), "nobody's"));
+            }
+            read_generation(&from, &statement_key, &s[0].secret(), &handed, s.now).unwrap()
+        };
+        let has_a_row = |read: &Generation, key: [u8; 32]| {
+            let rows = read.rows.iter().chain(&read.not_shown);
+            rows.filter(|row| row.key == key).count() == 1
+        };
+        // How many of the keys that a record was handed for have no row,
+        // and are in neither list of the statement: counted here from
+        // the keys themselves.
+        let with_no_row = |read: &Generation, more: usize| {
+            let mut keys: Vec<[u8; 32]> = (0..62u16)
+                .map(|n| identity_of(1_000 + n).public_key())
+                .collect();
+            keys.extend([k1, phone, removed]);
+            keys.extend((0..more).map(nobodys));
+            let in_no_list = |key: &&[u8; 32]| !statement.lists(key) && !statement.removes(key);
+            let listed = keys.iter().filter(in_no_list);
+            listed.filter(|key| !has_a_row(read, **key)).count()
+        };
+
+        // Three records that do not count, and 253 more: as many as a
+        // reader keeps. Each key has a row, and the count is 0. The
+        // phone is one that only the bound of 64 kept out, under the
+        // device that added it.
+        let within = reads(kept - 3);
+        assert_eq!(within.no_row, 0);
+        assert_eq!(with_no_row(&within, kept - 3), 0);
+        assert!(has_a_row(&within, phone) && has_a_row(&within, removed));
+        assert!(!has_a_row(&within, not_read));
+        // (The record for device 1 is one of those kept, and is no row
+        // of its own: device 1 has its row as a device of the statement.)
+        assert_eq!(within.rows.len(), RECOVERY_MAX_DEVICES_SHOWN);
+        assert_eq!(within.not_shown.len(), counted - 1);
+        assert!(within.rows[..counted].iter().all(|row| row.counts));
+        let of_the_phone = &within.rows[counted..];
+        let of_the_phone = of_the_phone.iter().find(|row| row.key == phone).unwrap();
+        assert_eq!(of_the_phone.no_room, [(k1, AT)]);
+        // With no record but those of the 62, and with none at all.
+        let few = read_generation(&from, &statement_key, &s[0].secret(), &base, s.now).unwrap();
+        assert_eq!((few.no_row, few.rows.len()), (0, counted + 2));
+        let none = read_generation(&from, &statement_key, &s[0].secret(), &[], s.now).unwrap();
+        assert_eq!((none.no_row, none.rows.len()), (0, 2));
+
+        // Three more than a reader keeps: the three oldest are let go.
+        // The record for device 1, which has its row as a device of the
+        // statement; the record for the key that the statement removes,
+        // which is not counted; and the phone's. The count is 1, and
+        // the phone's is the one key with no row: it is not among the
+        // rows that are shown, nor among those that are not.
+        let over = reads(kept);
+        assert_eq!(over.no_row, 1);
+        assert_eq!(with_no_row(&over, kept), 1);
+        assert!(!has_a_row(&over, phone) && !has_a_row(&over, removed));
+        assert!(has_a_row(&over, k1));
+        assert!((0..kept).all(|n| has_a_row(&over, nobodys(n))));
+        assert_eq!(over.rows.len(), RECOVERY_MAX_DEVICES_SHOWN);
+        assert_eq!(over.not_shown.len(), counted);
+        // Nothing is asked of a key with no row, and nothing is taken
+        // from it or removed: only the rows are answered.
+        let all_lost = vec![Answer::Lost; over.rows.len()];
+        assert!(!gone(&over.rows, &all_lost).contains(&phone));
+        assert!(!takes(&over.rows, &all_lost).contains(&phone));
+
+        // One more: a key of nobody's has no row either, and the count
+        // is 2.
+        let further = reads(kept + 1);
+        assert_eq!(further.no_row, 2);
+        assert_eq!(with_no_row(&further, kept + 1), 2);
+        assert!(!has_a_row(&further, phone));
+    }
+
+    /// **A recovery says of each row whether a record that was read for
+    /// its key is not among the records kept** (decision 2026-10-04 §9,
+    /// step 3). A reader keeps 256 records that do not count, the oldest
+    /// it saw going first: where the record by which a key would be
+    /// asked about is the one that went, and another record of the key
+    /// is kept, the key has a row, by that other record, and the count
+    /// of keys with no row does not tell of it.
+    ///
+    /// A statement lists device 0 and device 1, and removes device 2.
+    /// Device 0 added 61 keys, which count. The first of them, in order
+    /// of key, added a key that counts as the 64th, and may not add; and
+    /// it signed a record for the key that the statement removes. The
+    /// second, which may add, signed a record for a tablet: it fails only
+    /// for the bound of 64. The key that may not add signed a record for
+    /// the tablet too, one for a watch, and one for the removed key: each
+    /// fails for another reason than the bound. Others of the 61 signed
+    /// records for keys that count already. The entries are read in the
+    /// order of their signers, so the record for the removed key is the
+    /// first that does not count to be read, and the tablet's, under the
+    /// key that may add, the second.
+    ///
+    /// With as many records that do not count as a reader keeps, the
+    /// tablet's row is by the record that fails only for the bound, and
+    /// no row is flagged. With two more, both of those go. The tablet's
+    /// row is by the other record, has nothing that fails only for the
+    /// bound, and is flagged. The watch's row, none of whose records
+    /// went, is not; nor is the row of the key that the statement
+    /// removes, which stays removed whatever a record says. Every key
+    /// has a row, and the count of keys with none is 0.
+    #[test]
+    fn test_a_row_says_that_a_record_read_for_its_key_was_not_kept() {
+        const AT: u64 = 1_800_000_000;
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1], &[2]);
+        let (k0, k1, removed) = (s.key(0), s.key(1), s.key(2));
+        let from = candidate(&s[0].latest());
+        let statement = from.statement.statement.clone();
+        assert!(statement.lists(&k0) && statement.lists(&k1) && statement.removes(&removed));
+        let band = statement.number << cordelia_core::protocol::REV_COUNT_BITS;
+        let personal = s[0].personal();
+        let record_by = |adder: &NodeIdentity, key: [u8; 32], label: &str| {
+            let device = Device::new(key, label).unwrap();
+            let record = Addition::under(&statement, device, adder.public_key(), AT)
+                .unwrap()
+                .sign(adder)
+                .unwrap();
+            entry_by(
+                adder,
+                &personal,
+                band + 1,
+                &added_name(&key).unwrap(),
+                Value::Other(record.to_bytes().unwrap()),
+                &[],
+            )
+        };
+        // The 61 that device 0 added, in order of key: the entries of a
+        // key that the statement does not list are read in that order.
+        let mut added: Vec<NodeIdentity> = (0..61u16).map(|n| identity_of(1_000 + n)).collect();
+        added.sort_by_key(NodeIdentity::public_key);
+        let (first, second) = (&added[0], &added[1]);
+        // The key that the first of them adds: it counts as the 64th,
+        // and may not add. Its entries are read after the second's.
+        let may_not_add = (2_000..2_100u16)
+            .map(identity_of)
+            .find(|one| one.public_key() > second.public_key())
+            .unwrap();
+        let (tablet, watch) = (identity_of(500).public_key(), identity_of(501).public_key());
+        let counted = cordelia_core::protocol::MAX_COUNTED_DEVICES;
+        let kept = cordelia_core::protocol::MAX_NOT_COUNTED_RECORDS;
+        let base = {
+            let mut handed = s[0].stored_in(&personal);
+            for one in &added {
+                handed.push(record_by(&s[0].identity, one.public_key(), "added"));
+            }
+            handed.push(record_by(first, may_not_add.public_key(), "the 64th"));
+            handed.push(record_by(first, removed, "removed"));
+            handed.push(record_by(second, tablet, "tablet"));
+            handed.push(record_by(&may_not_add, tablet, "the tablet, by another"));
+            handed.push(record_by(&may_not_add, watch, "watch"));
+            handed.push(record_by(&may_not_add, removed, "removed, by another"));
+            handed
+        };
+        // Records for keys that count already, signed by the others of
+        // the 61: each is kept as not counted, and is no row of its own.
+        let mut counting: Vec<[u8; 32]> = added.iter().map(NodeIdentity::public_key).collect();
+        counting.extend([k0, k1, may_not_add.public_key()]);
+        let fillers: Vec<CheckedEntry> = added[2..]
+            .iter()
+            .flat_map(|signer| {
+                let others = counting.iter().filter(|key| **key != signer.public_key());
+                others.map(|key| record_by(signer, *key, "counts already"))
+            })
+            .take(kept)
+            .collect();
+        assert_eq!(fillers.len(), kept);
+        let statement_key = *phrase().statement_key().unwrap();
+        let reads = |more: usize| {
+            let mut handed = base.clone();
+            handed.extend(fillers[..more].iter().cloned());
+            read_generation(&from, &statement_key, &s[0].secret(), &handed, s.now).unwrap()
+        };
+        let row_of = |read: &Generation, key: [u8; 32]| -> Row {
+            let of_it = read.rows.iter().find(|row| row.key == key);
+            of_it.cloned().unwrap()
+        };
+        let flagged = |read: &Generation| -> Vec<[u8; 32]> {
+            let rows = read.rows.iter().chain(&read.not_shown);
+            rows.filter(|row| row.record_let_go)
+                .map(|row| row.key)
+                .collect()
+        };
+
+        // Five records that do not count, and 251 more: as many as a
+        // reader keeps. The tablet's row is by the record that fails only
+        // for the bound, under the key that may add.
+        let within = reads(kept - 5);
+        assert_eq!(within.rows.len(), counted + 3);
+        assert!(within.rows[..counted].iter().all(|row| row.counts));
+        let of_the_tablet = row_of(&within, tablet);
+        assert_eq!(of_the_tablet.added_by, Some((second.public_key(), AT)));
+        assert_eq!(of_the_tablet.no_room, [(second.public_key(), AT)]);
+        assert!(!of_the_tablet.counts && !of_the_tablet.record_let_go);
+        assert!(flagged(&within).is_empty());
+        assert_eq!(within.no_row, 0);
+
+        // One more: the oldest that does not count is let go, which is
+        // the first record for the key that the statement removes. That
+        // key stays removed whatever a record says of it: its row, by
+        // its other record, is not flagged.
+        let one_over = reads(kept - 4);
+        let of_the_removed = row_of(&one_over, removed);
+        assert_eq!(
+            of_the_removed.added_by,
+            Some((may_not_add.public_key(), AT))
+        );
+        assert!(!of_the_removed.counts && !of_the_removed.record_let_go);
+        assert_eq!(row_of(&one_over, tablet), of_the_tablet);
+        assert!(flagged(&one_over).is_empty());
+
+        // And one more: the tablet's record under the key that may add
+        // is let go too. The tablet has a row all the same, by the record
+        // of the key that may not add: it fails for that, and nothing of
+        // it fails only for the bound.
+        let over = reads(kept - 3);
+        assert_eq!(over.rows.len(), counted + 3);
+        let of_the_tablet = row_of(&over, tablet);
+        assert_eq!(of_the_tablet.added_by, Some((may_not_add.public_key(), AT)));
+        assert_eq!(of_the_tablet.label, "the tablet, by another");
+        assert!(!of_the_tablet.counts && of_the_tablet.no_room.is_empty());
+        assert!(of_the_tablet.record_let_go);
+        assert_eq!(flagged(&over), [tablet]);
+        // The watch's row is as it was: none of its records went.
+        let of_the_watch = row_of(&over, watch);
+        assert_eq!(of_the_watch, row_of(&within, watch));
+        assert!(!of_the_watch.counts && !of_the_watch.record_let_go);
+        assert!(of_the_watch.no_room.is_empty());
+        // Every key has a row: the count of keys with none does not
+        // tell of the tablet.
+        assert_eq!(over.no_row, 0);
+        // Nothing else has changed for it: it is not asked about, and
+        // whatever is said of it, nothing is taken from it and its key
+        // is not removed.
+        let at = over.rows.iter().position(|row| row.key == tablet).unwrap();
+        let all_lost = vec![Answer::Lost; over.rows.len()];
+        assert_eq!(asked_for_room(&over.rows, &all_lost, at), None);
+        assert!(!gone(&over.rows, &all_lost).contains(&tablet));
+        assert!(!takes(&over.rows, &all_lost).contains(&tablet));
     }
 
     /// Whether the answers of a recovery could all be kept is worked out

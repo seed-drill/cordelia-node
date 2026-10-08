@@ -100,7 +100,32 @@ const ASKS_AGAIN: usize = 10;
 /// (it has no `state`): that is no look of a node of this version, and
 /// nothing is read from it (decision 2026-10-04 §16).
 pub(crate) fn look(config_path: &str) -> anyhow::Result<Value> {
-    let seen = api_post(config_path, "/api/v1/devices/list", json!({}))?;
+    looks(config_path, false)
+}
+
+/// [`look`], with how many versions the device holds that it has sent to
+/// no relay, and of how many names (decision 2026-10-04 §16): what a
+/// command that has this device begin again says before its yes
+/// ([`waits_says`]). The node works that count out only where a request
+/// asks for it, and only such a command asks: a status, which a status
+/// bar runs every few seconds, does not.
+fn look_with_what_waits(config_path: &str) -> anyhow::Result<Value> {
+    looks(config_path, true)
+}
+
+/// What a look asks the node for beside what every look says: the count
+/// of what the device has sent to no relay, where `what_waits`, and
+/// nothing otherwise.
+fn look_asks(what_waits: bool) -> Value {
+    match what_waits {
+        true => json!({ "sent_to_no_relay": true }),
+        false => json!({}),
+    }
+}
+
+/// [`look`], asking as [`look_asks`] says.
+fn looks(config_path: &str, what_waits: bool) -> anyhow::Result<Value> {
+    let seen = api_post(config_path, "/api/v1/devices/list", look_asks(what_waits))?;
     if seen["state"].as_str().is_none() {
         anyhow::bail!(
             "what answered at the node's address says nothing of where this device stands: it \
@@ -312,6 +337,37 @@ fn waits_says(seen: &Value) -> Option<String> {
     ))
 }
 
+/// What `cordelia phrase` says, before its yes, of what the device has
+/// sent to no relay ([`waits_says`], decision 2026-10-04 §16): where it
+/// goes on to ask a yes, on a device that is alone under a phrase or one
+/// of several. **A device that has stopped is refused,** and nothing is
+/// let go there: nothing is said of it. (`cordelia init --new-key`,
+/// which that refusal names, says it before its own yes.)
+fn waits_before_a_new_phrase(seen: &Value) -> Option<String> {
+    match text(seen, "among") {
+        "alone" | "several" => waits_says(seen),
+        _ => None,
+    }
+}
+
+/// What the yes of `cordelia accept` says on a device that is alone
+/// under a recovery phrase (decision 2026-10-04 §5.1): it leaves that
+/// phrase, and joins the devices of `from`. Leaving lets go of
+/// everything that the device holds, a name that a carry or a recovery
+/// holds among it: **what it has sent to no relay is said first**
+/// ([`waits_says`], decision 2026-10-04 §16), as before the yes of any
+/// command that has a device begin again.
+fn alone_says(seen: &Value, from: &str) -> String {
+    let leaves = format!(
+        "The recovery phrase that this device follows stops working here: this device leaves \
+         it, and joins the devices of {from}."
+    );
+    match waits_says(seen) {
+        Some(waits) => format!("{waits}\n{leaves}"),
+        None => leaves,
+    }
+}
+
 // ── cordelia phrase ─────────────────────────────────────────────────
 
 /// `cordelia phrase`: make the recovery phrase of this person's devices
@@ -325,12 +381,12 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
     println!("{WHOSE_WORDS}\n");
     // What a device that follows a phrase already would let go of.
-    if let Some(waits) = waits_says(&seen) {
+    if let Some(waits) = waits_before_a_new_phrase(&seen) {
         println!("{waits}");
     }
     let agreed = match among.as_str() {
@@ -524,7 +580,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
     })?;
     let own = own_key(config_path)?;
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &own)?;
     let from = named("", &typed);
     // What the yes says goes by the row of §5.1 that the device stands
@@ -563,11 +619,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
                      devices takes two acts."
                 );
             }
-            let says = format!(
-                "The recovery phrase that this device follows stops working here: this device \
-                 leaves it, and joins the devices of {from}."
-            );
-            ("alone", says)
+            ("alone", alone_says(&seen, &from))
         }
         _ => (
             "several",
@@ -2037,7 +2089,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     if !key_path.exists() {
         anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
     }
-    let seen = look(config_path)?;
+    let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &NodeIdentity::from_file(&key_path)?.public_key())?;
     let leaves = match (text(&seen, "among"), seen["others"].as_u64().unwrap_or(0)) {
         ("several", others) => format!(
@@ -3128,7 +3180,12 @@ mod tests {
     fn beginning_again_says_what_the_device_has_sent_to_no_relay() {
         let seen = |versions: u64, names: u64| json!({ "sent_to_no_relay": { "versions": versions, "names": names } });
         assert_eq!(waits_says(&seen(0, 0)), None);
+        // A look that was not asked for the count carries none.
         assert_eq!(waits_says(&json!({ "among": "alone" })), None);
+        // Only a look for a command that has the device begin again
+        // asks for it.
+        assert_eq!(look_asks(false), json!({}));
+        assert_eq!(look_asks(true), json!({ "sent_to_no_relay": true }));
         assert_eq!(
             waits_says(&seen(1, 1)).unwrap(),
             "1 version of 1 name that this device holds has been sent to no relay yet: it is \
@@ -3139,6 +3196,65 @@ mod tests {
             "5 versions of 2 names that this device holds have been sent to no relay yet: they \
              are let go with everything else that it holds."
         );
+    }
+
+    /// `cordelia accept` on a device that is alone under a recovery
+    /// phrase leaves that phrase, which lets go of everything that the
+    /// device holds: what it has sent to no relay is said before its
+    /// yes, as before any beginning again (decision 2026-10-04 §5.1,
+    /// §16). Where nothing waits, the yes says what it said.
+    #[test]
+    fn accepting_alone_says_what_the_device_has_sent_to_no_relay() {
+        let leaves = "The recovery phrase that this device follows stops working here: this \
+                      device leaves it, and joins the devices of the device (w1 w2 w3 w4).";
+        let from = "the device (w1 w2 w3 w4)";
+        let waits = json!({
+            "among": "alone",
+            "sent_to_no_relay": { "versions": 3, "names": 1 },
+        });
+        assert_eq!(
+            alone_says(&waits, from),
+            format!(
+                "3 versions of 1 name that this device holds have been sent to no relay yet: \
+                 they are let go with everything else that it holds.\n{leaves}"
+            )
+        );
+        let none = json!({
+            "among": "alone",
+            "sent_to_no_relay": { "versions": 0, "names": 0 },
+        });
+        assert_eq!(alone_says(&none, from), leaves);
+        assert_eq!(alone_says(&json!({ "among": "alone" }), from), leaves);
+    }
+
+    /// `cordelia phrase` says what the device has sent to no relay where
+    /// it goes on to ask its yes (decision 2026-10-04 §16): on a device
+    /// that is alone under a phrase, or one of several. A device that
+    /// has stopped is refused there, and lets go of nothing: nothing is
+    /// said of what it holds. Its count is said by the command that the
+    /// refusal names, before that command's yes.
+    #[test]
+    fn a_new_phrase_says_what_waits_only_where_it_asks_its_yes() {
+        let seen = |among: &str| {
+            json!({
+                "among": among,
+                "sent_to_no_relay": { "versions": 2, "names": 1 },
+            })
+        };
+        let waits = "2 versions of 1 name that this device holds have been sent to no relay \
+                     yet: they are let go with everything else that it holds.";
+        for asks_a_yes in ["alone", "several"] {
+            let said = waits_before_a_new_phrase(&seen(asks_a_yes));
+            assert_eq!(said.as_deref(), Some(waits), "{asks_a_yes}");
+        }
+        for refused in ["stopped", "no_phrase", ""] {
+            assert_eq!(waits_before_a_new_phrase(&seen(refused)), None, "{refused}");
+        }
+        // The command that a stopped device is told to run says it.
+        assert_eq!(waits_says(&seen("stopped")).as_deref(), Some(waits));
+        // Nothing waits: nothing is said.
+        let none = json!({ "among": "alone", "sent_to_no_relay": { "versions": 0, "names": 0 } });
+        assert_eq!(waits_before_a_new_phrase(&none), None);
     }
 
     /// `cordelia devices` says of each device whether it has sent what it
