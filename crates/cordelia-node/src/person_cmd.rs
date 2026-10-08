@@ -58,7 +58,7 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::{Phrase, PhraseError};
 use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementError};
 
-use crate::terminal::Terminal;
+use crate::terminal::{Terminal, TypedBack};
 use crate::{
     Told, api_post, api_post_told, note_another_version, refuse_another_version,
     refuse_before_a_phrase,
@@ -459,11 +459,8 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             "Now type the words back, one at a time. What you type is not shown.",
             &*phrase.places()?,
         )?;
-        if !typed_back {
-            anyhow::bail!(
-                "Three tries did not match. Nothing was made, and the words you were shown are \
-                 not a recovery phrase: do not keep them. Run `cordelia phrase` again."
-            );
+        if let Some(why) = not_typed_back_says(&typed_back) {
+            anyhow::bail!(why);
         }
         println!("\nAll twelve match.");
         first_entry(&phrase, &this_device, &label)?
@@ -515,6 +512,23 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
          key>`."
     );
     Ok(())
+}
+
+/// What `cordelia phrase` says where the words that it showed were not
+/// all typed back, and `None` where they were (decision 2026-10-04 §5):
+/// at the third miss, or where the input ended first. Either way nothing
+/// is made, and the words that were shown are a phrase of nothing: a
+/// person is told so, and not to keep them.
+fn not_typed_back_says(typed_back: &TypedBack) -> Option<String> {
+    let nothing_made = "Nothing was made, and the words you were shown are not a recovery \
+                        phrase: do not keep them.";
+    match typed_back {
+        TypedBack::All => None,
+        TypedBack::Missed => Some(format!(
+            "Three tries did not match. {nothing_made} Run `cordelia phrase` again."
+        )),
+        TypedBack::Ended(said) => Some(format!("{said}. {nothing_made}")),
+    }
 }
 
 /// The twelve `words` as they are shown: each with its number, four to a
@@ -3506,6 +3520,35 @@ mod tests {
         // with the two ends of rows, within the room for sixteen a word.
         assert_eq!(of_the_longest.lines().next().unwrap().len(), 59);
         assert_eq!(of_the_longest.len(), 3 * 59 + 2);
+    }
+
+    /// Where the words that `cordelia phrase` showed are not all typed
+    /// back, nothing is made, and a person is told that those words are
+    /// no recovery phrase and are not to be kept (decision 2026-10-04
+    /// §5): at the third miss, and where the input ended, after what a
+    /// command says of that anywhere.
+    #[test]
+    fn where_the_words_are_not_typed_back_they_are_said_to_be_no_phrase() {
+        assert_eq!(not_typed_back_says(&TypedBack::All), None);
+        assert_eq!(
+            not_typed_back_says(&TypedBack::Missed).as_deref(),
+            Some(
+                "Three tries did not match. Nothing was made, and the words you were shown are \
+                 not a recovery phrase: do not keep them. Run `cordelia phrase` again."
+            )
+        );
+        for said in [
+            "nothing was typed",
+            "a recovery phrase is twelve words, and this is 5",
+        ] {
+            assert_eq!(
+                not_typed_back_says(&TypedBack::Ended(said.to_string())),
+                Some(format!(
+                    "{said}. Nothing was made, and the words you were shown are not a recovery \
+                     phrase: do not keep them."
+                ))
+            );
+        }
     }
 
     /// What `cordelia phrase` says before anything is shown: what a

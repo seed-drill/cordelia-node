@@ -724,7 +724,15 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     at.says("That is not a word from the list. Type word 1 again.\r\n   1. ")
         .ends_the_input();
     let said = at.refused_within(soon);
-    assert!(said.contains("nothing was typed"), "{said}");
+    // The input ended: what a command says of that anywhere, and that
+    // the words that were shown are no phrase.
+    assert!(
+        said.ends_with(
+            "   1. \r\nError: nothing was typed. Nothing was made, and the words you were shown \
+             are not a recovery phrase: do not keep them.\r\n"
+        ),
+        "{said:?}"
+    );
     assert_eq!(holds(&laptop), before);
 
     // A phrase is made, and then: a yes that is not given replaces

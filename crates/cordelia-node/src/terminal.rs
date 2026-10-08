@@ -502,9 +502,32 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
     }
 }
 
+/// What became of the typing back of the words that were shown
+/// ([`Terminal::phrase_back`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedBack {
+    /// Each of the twelve was the word shown at its number.
+    All,
+    /// The last miss that a typing back may have: it stopped there.
+    Missed,
+    /// The input ended before the twelfth word: with what a command says
+    /// of that wherever a phrase is typed ([`input_ended_says`]).
+    Ended(String),
+}
+
+/// What a command says where the input ended before the twelve words
+/// were typed, `words` of them having been typed.
+fn input_ended_says(words: usize) -> String {
+    match words {
+        0 => "nothing was typed".to_string(),
+        words => PhraseError::WordCount(words).to_string(),
+    }
+}
+
 /// Ask for word `number` of a recovery phrase until a word of the list is
 /// typed: its place in the list and how its typing ended, with the word
-/// itself left in `word`, which whoever gave it overwrites.
+/// itself left in `word`, which whoever gave it overwrites. `None` where
+/// the input ended first.
 ///
 /// The number is said, right-aligned, and nothing that is typed after
 /// it is shown. **A word that is not in the list gets a cross and a few
@@ -513,14 +536,12 @@ fn word_typed(word: &mut Zeroizing<String>, nothing_yet: bool) -> anyhow::Result
 /// once nothing has been typed for a second: the rest of a line that
 /// was pasted, and what a person goes on typing, are dropped, and not
 /// taken for the word that is asked again ([`ReadsKeys::waits_for_quiet`]).
-///
-/// Where the input ends, this fails, and says how many words there were.
 #[cfg(unix)]
 fn word_of_the_list(
     hidden: &ReadsKeys,
     number: usize,
     word: &mut Zeroizing<String>,
-) -> anyhow::Result<(Zeroizing<u16>, Ended)> {
+) -> anyhow::Result<Option<(Zeroizing<u16>, Ended)>> {
     loop {
         word.zeroize();
         say(&format!("  {number:>2}. "))?;
@@ -532,14 +553,11 @@ fn word_of_the_list(
         }
         let ended = typed?;
         if ended == Ended::Input {
-            match number {
-                1 => anyhow::bail!("nothing was typed"),
-                _ => anyhow::bail!("{}", PhraseError::WordCount(number - 1)),
-            }
+            return Ok(None);
         }
         // The whole list is gone through, whatever the word.
         if let Some(place) = place_in_list(word) {
-            return Ok((Zeroizing::new(place), ended));
+            return Ok(Some((Zeroizing::new(place), ended)));
         }
         word.zeroize();
         say(&format!(
@@ -681,7 +699,10 @@ impl Terminal {
         let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
         let mut last = Ended::Line;
         for number in 1..=PHRASE_WORDS {
-            (_, last) = word_of_the_list(&hidden, number, &mut word)?;
+            let Some((_, ended)) = word_of_the_list(&hidden, number, &mut word)? else {
+                anyhow::bail!(input_ended_says(number - 1));
+            };
+            last = ended;
             // A word of the list: that is all the tick says, and all
             // that is known of the word here.
             say("✓\n")?;
@@ -705,7 +726,8 @@ impl Terminal {
 
     /// Ask for the twelve words that were shown a moment ago to be typed
     /// back, as [`Self::phrase`] asks: `shown` is the place in the list
-    /// of each word that was shown. Whether all twelve were typed back.
+    /// of each word that was shown. What became of it: all twelve typed
+    /// back, the last miss, or the input ended first ([`TypedBack`]).
     ///
     /// **Here, and nowhere else, a word is held against the word that
     /// was shown at its number** (decision 2026-10-04 §16), by its place
@@ -727,11 +749,15 @@ impl Terminal {
     ///   and not one for each word that follows it.
     /// - At the miss numbered `PHRASE_TYPED_BACK_MISSES`, counted over
     ///   the whole typing back and not for each word, this stops, at
-    ///   once, and gives back `false`.
+    ///   once.
     /// - A word that is not in the list is no miss: it is said at once,
     ///   and asked again as after any cross ([`word_of_the_list`]).
     #[cfg(unix)]
-    pub fn phrase_back(&self, asks: &str, shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
+    pub fn phrase_back(
+        &self,
+        asks: &str,
+        shown: &[u16; PHRASE_WORDS],
+    ) -> anyhow::Result<TypedBack> {
         let hidden = ReadsKeys::set()?;
         say(&format!("{asks}\n\n"))?;
         let mut word = Zeroizing::new(String::with_capacity(MAX_LINE));
@@ -739,7 +765,9 @@ impl Terminal {
         let mut number = 1;
         while number <= PHRASE_WORDS {
             // What is kept of the word is its place in the list.
-            let (place, ended) = word_of_the_list(&hidden, number, &mut word)?;
+            let Some((place, ended)) = word_of_the_list(&hidden, number, &mut word)? else {
+                return Ok(TypedBack::Ended(input_ended_says(number - 1)));
+            };
             word.zeroize();
             if *place == shown[number - 1] {
                 say("✓\n")?;
@@ -754,7 +782,7 @@ impl Terminal {
             misses += 1;
             if misses == PHRASE_TYPED_BACK_MISSES {
                 say("✗\n")?;
-                return Ok(false);
+                return Ok(TypedBack::Missed);
             }
             let waited = hidden.waits(Duration::from_secs(PHRASE_MISS_PAUSE_SECS << (misses - 1)));
             if waited.is_err() {
@@ -772,11 +800,15 @@ impl Terminal {
             // has stopped typing.
             hidden.waits_for_quiet(Duration::from_secs(PHRASE_QUIET_AFTER_CROSS_SECS))?;
         }
-        Ok(true)
+        Ok(TypedBack::All)
     }
 
     #[cfg(not(unix))]
-    pub fn phrase_back(&self, _asks: &str, _shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
+    pub fn phrase_back(
+        &self,
+        _asks: &str,
+        _shown: &[u16; PHRASE_WORDS],
+    ) -> anyhow::Result<TypedBack> {
         anyhow::bail!("the recovery phrase is typed at the terminal of a Unix system");
     }
 }
@@ -794,5 +826,20 @@ mod tests {
         assert!(inside_screen(Some(OsStr::new("x"))));
         assert!(!inside_screen(Some(OsStr::new(""))));
         assert!(!inside_screen(None));
+    }
+
+    /// Where the input ends before the twelve words are typed, a command
+    /// says how many there were: or, with none, that nothing was typed.
+    #[test]
+    fn where_the_input_ends_a_command_says_how_many_words_there_were() {
+        assert_eq!(input_ended_says(0), "nothing was typed");
+        assert_eq!(
+            input_ended_says(5),
+            "a recovery phrase is twelve words, and this is 5"
+        );
+        assert_eq!(
+            input_ended_says(11),
+            "a recovery phrase is twelve words, and this is 11"
+        );
     }
 }
