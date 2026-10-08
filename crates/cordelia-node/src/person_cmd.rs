@@ -312,6 +312,24 @@ fn waits_says(seen: &Value) -> Option<String> {
     ))
 }
 
+/// What the yes of `cordelia accept` says on a device that is alone
+/// under a recovery phrase (decision 2026-10-04 §5.1): it leaves that
+/// phrase, and joins the devices of `from`. Leaving lets go of
+/// everything that the device holds, a name that a carry or a recovery
+/// holds among it: **what it has sent to no relay is said first**
+/// ([`waits_says`], decision 2026-10-04 §16), as before the yes of any
+/// command that has a device begin again.
+fn alone_says(seen: &Value, from: &str) -> String {
+    let leaves = format!(
+        "The recovery phrase that this device follows stops working here: this device leaves \
+         it, and joins the devices of {from}."
+    );
+    match waits_says(seen) {
+        Some(waits) => format!("{waits}\n{leaves}"),
+        None => leaves,
+    }
+}
+
 // ── cordelia phrase ─────────────────────────────────────────────────
 
 /// `cordelia phrase`: make the recovery phrase of this person's devices
@@ -563,11 +581,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
                      devices takes two acts."
                 );
             }
-            let says = format!(
-                "The recovery phrase that this device follows stops working here: this device \
-                 leaves it, and joins the devices of {from}."
-            );
-            ("alone", says)
+            ("alone", alone_says(&seen, &from))
         }
         _ => (
             "several",
@@ -3139,6 +3153,35 @@ mod tests {
             "5 versions of 2 names that this device holds have been sent to no relay yet: they \
              are let go with everything else that it holds."
         );
+    }
+
+    /// `cordelia accept` on a device that is alone under a recovery
+    /// phrase leaves that phrase, which lets go of everything that the
+    /// device holds: what it has sent to no relay is said before its
+    /// yes, as before any beginning again (decision 2026-10-04 §5.1,
+    /// §16). Where nothing waits, the yes says what it said.
+    #[test]
+    fn accepting_alone_says_what_the_device_has_sent_to_no_relay() {
+        let leaves = "The recovery phrase that this device follows stops working here: this \
+                      device leaves it, and joins the devices of the device (w1 w2 w3 w4).";
+        let from = "the device (w1 w2 w3 w4)";
+        let waits = json!({
+            "among": "alone",
+            "sent_to_no_relay": { "versions": 3, "names": 1 },
+        });
+        assert_eq!(
+            alone_says(&waits, from),
+            format!(
+                "3 versions of 1 name that this device holds have been sent to no relay yet: \
+                 they are let go with everything else that it holds.\n{leaves}"
+            )
+        );
+        let none = json!({
+            "among": "alone",
+            "sent_to_no_relay": { "versions": 0, "names": 0 },
+        });
+        assert_eq!(alone_says(&none, from), leaves);
+        assert_eq!(alone_says(&json!({ "among": "alone" }), from), leaves);
     }
 
     /// `cordelia devices` says of each device whether it has sent what it

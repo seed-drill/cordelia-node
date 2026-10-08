@@ -500,15 +500,22 @@ pub fn waits_to_be_sent(conn: &Connection, name: &str) -> Result<usize, PersonEr
 }
 
 /// How many versions this device holds that it has sent to no relay,
-/// and of how many names (decision 2026-10-04 §16): what
-/// [`waits_to_be_sent`] counts, over every name that the device holds. A
-/// device that begins again, with a new phrase or a new key, lets go of
-/// everything that its store holds, a name that a carry or a recovery
-/// holds among it: the command says this count before its yes.
+/// and of how many names (decision 2026-10-04 §16): for each name that
+/// the device holds, what its store holds of the name's channel that no
+/// relay was sent ([`kept_rows::sent_to_no_relay`]). A device that
+/// begins again, with a new phrase or a new key, lets go of everything
+/// that its store holds, a name that a carry or a recovery holds among
+/// it: the command says this count before its yes.
+///
+/// **It is counted however the device stands.** A device that was
+/// removed, or that holds two changes made apart, sends nothing more,
+/// and is the one that is told to begin again: what its store holds
+/// that no relay was sent goes then all the same. ([`waits_to_be_sent`],
+/// which the unmapping of a name asks, counts none on such a device.)
 pub fn waits_in_every_name(conn: &Connection) -> Result<(usize, usize), PersonError> {
     let (mut versions, mut names) = (0, 0);
     for held in held_rows::names(conn)? {
-        let waits = waits_to_be_sent(conn, &held.name)?;
+        let waits = kept_rows::sent_to_no_relay(conn, &held.channel)?;
         versions += waits;
         names += usize::from(waits > 0);
     }
@@ -1479,8 +1486,14 @@ mod tests {
 
     /// What a device has sent to no relay is counted over every name
     /// that it holds (decision 2026-10-04 §16): how many versions, and of
-    /// how many names. A name of which nothing waits is not among them,
-    /// and a device that has stopped sends nothing.
+    /// how many names. A name of which nothing waits is not among them.
+    ///
+    /// **It is counted however the device stands.** A device that was
+    /// removed, or that holds two changes made apart, is told to begin
+    /// again, which lets go of everything that it holds: the count there
+    /// is what its store holds that no relay was sent. The check on the
+    /// unmapping of a name counts none on a device that has stopped, as
+    /// it did.
     #[test]
     fn test_what_was_sent_to_no_relay_is_counted_over_every_name_held() {
         let mut s = Several::of_one_person(1);
@@ -1500,9 +1513,21 @@ mod tests {
         let last = kept_rows::last_taken(conn, &lab).unwrap();
         kept_rows::sent(conn, &[0xa1; 32], &lab, last).unwrap();
         assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1));
-        // A device that has stopped sends nothing.
-        held_rows::set_state(conn, State::NotListed).unwrap();
-        assert_eq!(waits_in_every_name(conn).unwrap(), (0, 0));
+        // A device that has stopped holds what it held: what no relay
+        // was sent is counted there all the same.
+        for stopped in [
+            State::Removed,
+            State::Fork,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(conn, stopped).unwrap();
+            assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1), "{stopped:?}");
+            assert_eq!(waits_to_be_sent(conn, "brought").unwrap(), 0, "{stopped:?}");
+        }
+        held_rows::set_state(conn, State::Applied).unwrap();
+        assert_eq!(waits_to_be_sent(conn, "brought").unwrap(), 2);
+        assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1));
     }
 
     /// Where a device comes to sync a name it holds it, so that its
