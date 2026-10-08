@@ -45,6 +45,13 @@
 //! phrase that is shown is written straight to the terminal, never
 //! through the buffer that the program's standard output has, which
 //! nothing overwrites.
+//!
+//! **A phrase is shown only on a terminal that lets go of it** (decision
+//! 2026-10-04 §16). What is shown once is taken away by the terminal's
+//! other screen and by the clearing of the lines that scrolled off
+//! ([`Terminal::once`]). A terminal that is known to honour neither
+//! keeps what was shown, and nothing is shown there
+//! ([`Terminal::keeps_what_is_shown`]).
 
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -447,6 +454,12 @@ fn word_of_the_list(number: usize, word: &mut Zeroizing<String>) -> anyhow::Resu
     }
 }
 
+/// Whether `sty`, the value of the variable `STY`, says that the command
+/// runs inside GNU `screen`: it is set, to something.
+fn inside_screen(sty: Option<&std::ffi::OsStr>) -> bool {
+    sty.is_some_and(|sty| !sty.is_empty())
+}
+
 impl Terminal {
     /// The terminal that the command was run at. Refused where the
     /// command's input is not a terminal: nothing was asked, and nothing
@@ -474,6 +487,19 @@ impl Terminal {
         }
         cannot_be_dumped()?;
         Ok(at)
+    }
+
+    /// Whether this terminal is known to keep what is shown on it once
+    /// ([`Self::once`]), so that nothing is to be shown there (decision
+    /// 2026-10-04 §16).
+    ///
+    /// GNU `screen`, as it is set up by itself, has no other screen and
+    /// does not clear the lines that scrolled off, as far as is known:
+    /// the clear then pushes what was shown into its scrollback, where
+    /// it stays. A command that runs inside it is told so by the
+    /// variable `STY`.
+    pub fn keeps_what_is_shown(&self) -> bool {
+        inside_screen(std::env::var_os("STY").as_deref())
     }
 
     /// Ask a yes: `says` is what will happen. Only the word `yes` is one.
@@ -650,5 +676,21 @@ impl Terminal {
     #[cfg(not(unix))]
     pub fn phrase_back(&self, _asks: &str, _shown: &[u16; PHRASE_WORDS]) -> anyhow::Result<bool> {
         anyhow::bail!("the recovery phrase is typed at the terminal of a Unix system");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// GNU `screen` says that a command runs inside it by the variable
+    /// `STY`: set to something, and not where it is unset or empty.
+    #[test]
+    fn a_command_is_inside_screen_where_sty_is_set_to_something() {
+        assert!(inside_screen(Some(OsStr::new("4242.pts-1.laptop"))));
+        assert!(inside_screen(Some(OsStr::new("x"))));
+        assert!(!inside_screen(Some(OsStr::new(""))));
+        assert!(!inside_screen(None));
     }
 }

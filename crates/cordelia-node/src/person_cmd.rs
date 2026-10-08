@@ -380,6 +380,12 @@ fn alone_says(seen: &Value, from: &str) -> String {
 /// made. The node is handed the first statement's change entry and the
 /// statement key, and never the words.
 ///
+/// **Nothing is shown on a terminal that keeps what is shown** (decision
+/// 2026-10-04 §16): inside GNU `screen` the command stops before it
+/// asks the node anything, and no phrase is made
+/// ([`Terminal::keeps_what_is_shown`]). The commands that only read a
+/// phrase show none, and are not stopped there.
+///
 /// **Each word typed back is held against the word that was shown at its
 /// number** (decision 2026-10-04 §16), here and at no other command: a
 /// phrase written down wrongly is found out word by word. The third
@@ -387,6 +393,14 @@ fn alone_says(seen: &Value, from: &str) -> String {
 /// made ([`Terminal::phrase_back`]).
 pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
+    // A terminal that keeps what is shown is shown nothing: before the
+    // node is asked anything, and before there is a phrase to show.
+    if at.keeps_what_is_shown() {
+        anyhow::bail!(
+            "this terminal can keep what is shown in its scrollback.\nRun `cordelia phrase` in \
+             a terminal outside `screen`. Nothing was made."
+        );
+    }
     refuse_before_a_phrase(config_path)?;
     // The first statement is made for the key in this device's key file.
     let this_device = own_key(config_path)?;

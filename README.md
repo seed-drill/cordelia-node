@@ -62,6 +62,10 @@ them where only you can read them.
   program.
 - They are typed only at the prompt of a `cordelia` command, at a terminal:
   never as an argument, never into a chat with an agent.
+- `cordelia phrase` shows the words on a terminal that lets go of them when
+  you are done. Inside GNU `screen` it stops before it shows anything:
+  `screen` can keep what is shown in its scrollback. Run it in a terminal
+  outside `screen`.
 - A command asks for them by number, one word at a time, and shows nothing
   of what you type. After each word it puts a tick beside the number, or, for
   a word that is not in the list, a cross, and asks for that number again.

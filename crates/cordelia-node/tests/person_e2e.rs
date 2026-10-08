@@ -2156,6 +2156,46 @@ fn a_phrase_is_shown_only_on_a_terminal_and_is_cleared_from_it() {
     assert!(said[..shown].contains("\x1b[?1049h"), "{said:?}");
 }
 
+/// `cordelia phrase` shows nothing on a terminal that is known to keep
+/// what is shown (decision 2026-10-04 §16). The words are taken away by
+/// the terminal's other screen and by the clearing of what scrolled off
+/// it, and GNU `screen` honours neither as it is set up by itself: what
+/// was shown stays in its scrollback. Where the environment says that
+/// the command runs inside it (`STY` is set), the command stops before
+/// anything is shown or made, and says where to run it.
+///
+/// A command that only reads the phrase shows no word, and is not
+/// stopped there: here `cordelia renew`.
+#[test]
+fn a_phrase_is_not_shown_inside_a_terminal_that_keeps_what_is_shown() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let inside_screen = [("STY", "4242.pts-1.laptop")];
+
+    let mut at = laptop.at_terminal_given(&inside_screen, &["phrase", "--name", "laptop"]);
+    let stopped = at.says_one_of(&["outside `screen`", "Press Enter when you have"]);
+    assert_eq!(stopped, 0, "{}", at.said);
+    let said = at.refused_within(std::time::Duration::from_secs(60));
+    assert_eq!(
+        said,
+        "Error: this terminal can keep what is shown in its scrollback.\r\nRun `cordelia phrase` \
+         in a terminal outside `screen`. Nothing was made.\r\n"
+    );
+    assert_eq!(text(&look(&laptop), "state"), "no_phrase");
+
+    // Outside it, a phrase is made. And inside it, a command that reads
+    // the phrase asks for it as anywhere.
+    let words = makes_a_phrase(&laptop, "laptop");
+    let mut at = laptop.at_terminal_given(&inside_screen, &["renew"]);
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says(ASKS_THE_PHRASE).types(&words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    assert_eq!(look(&laptop)["change"], 2);
+}
+
 // ── A new key that is stopped ────────────────────────────────────────
 
 /// `cordelia init --new-key` on a device that is one of several, with no
