@@ -2348,13 +2348,23 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         written.save(&config_file)?;
     }
     println!("\nThis device has a new key:\n  {key}");
-    println!(
-        "It follows no recovery phrase. Its memory folders and their mappings are as they \
-         were.\nThe node still runs under the old key: stop it and start it again (`cordelia \
-         start`) before anything else. Then make a phrase here (`cordelia phrase`), or add \
-         this device from one that has one."
-    );
+    println!("{}", after_a_new_key_says(std::env::consts::OS));
     Ok(())
+}
+
+/// What `cordelia init --new-key` ends with, on the system named
+/// (decision 2026-10-04 §5.2): where the device stands, and that the
+/// node, which still runs under the old key, is restarted before
+/// anything else ([`cordelia_api::commands::restart_says`]). The status
+/// of the node, once it is restarted, names the ways on for a device
+/// that follows no phrase.
+fn after_a_new_key_says(os: &str) -> String {
+    format!(
+        "It follows no recovery phrase. Its memory folders and their mappings are as they \
+         were.\nThe node still runs under the old key. Before anything else, restart the \
+         node:\n{}\nThe status then names the ways on.",
+        cordelia_api::commands::restart_says(os)
+    )
 }
 
 /// What the node answered when it was asked to forget what it holds of
@@ -3719,6 +3729,40 @@ mod tests {
             assert!(WHOSE_WORDS.contains(says), "{says}");
         }
         assert_eq!(WHOSE_WORDS.lines().count(), 6);
+    }
+
+    /// `cordelia init --new-key` ends, on each system, with the command
+    /// that restarts the node as the service, on a line of its own, and
+    /// `cordelia status` after it (decision 2026-10-04 §5.2); and with
+    /// what is done where the node does not run as the service. It names
+    /// no command that does not restart a service.
+    #[test]
+    fn a_new_key_ends_with_the_command_that_restarts_the_node() {
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            let says = after_a_new_key_says(os);
+            assert_eq!(
+                says,
+                format!(
+                    "It follows no recovery phrase. Its memory folders and their mappings are \
+                     as they were.\nThe node still runs under the old key. Before anything \
+                     else, restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
+                     the node does not run as the service that the install script set up, stop \
+                     it and start it again with whatever started it.\nThe status then names \
+                     the ways on."
+                )
+            );
+            assert!(!says.contains("cordelia start"), "{says}");
+        }
     }
 
     /// On a machine that follows no phrase, `cordelia phrase` says, before
