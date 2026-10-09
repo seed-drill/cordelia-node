@@ -215,6 +215,11 @@ pub struct Accepting {
     pub until: i64,
     /// Whether a hand-over was taken with it.
     pub taken: bool,
+    /// When it was taken, in seconds, by this device's clock: when this
+    /// device joined, or was handed a change, by that key. A command
+    /// says nothing against a device that it has not heard from for the
+    /// first minutes after it (decision 2026-10-04 §8).
+    pub taken_at: Option<i64>,
     /// Whether the node still asks for a hand-over with it.
     pub asking: bool,
     /// What became of the last hand-over that was read with it.
@@ -324,10 +329,45 @@ impl Look {
     }
 }
 
+/// The second and third ways on for a machine that follows no phrase
+/// (decision 2026-10-04 §5.1, §9), each on a line of its own: it is
+/// added from a machine that has the phrase; or, where every device that
+/// has the phrase is lost, a person recovers here with it. **No new
+/// phrase is made first there:** `cordelia recover` refuses a machine
+/// that follows a phrase.
+macro_rules! add_or_recover {
+    () => {
+        "  - Another machine has the phrase: add this one from it (`cordelia add-device` \
+         there, `cordelia accept` here).\n  - Every device that has the phrase is lost: recover \
+         here with it (`cordelia recover`). Do not make a new phrase first."
+    };
+}
+
+/// The three ways on for a machine that follows no phrase, as a new
+/// install says them ([`WAYS_ON`]).
+macro_rules! ways_on {
+    () => {
+        concat!(
+            "  - This is your first machine: make a phrase here (`cordelia phrase`).\n",
+            add_or_recover!()
+        )
+    };
+}
+
+/// The three ways on for a machine that follows no phrase, in the order
+/// in which they are always said (decision 2026-10-04 §5.2, §5.1, §9),
+/// each on a line of its own: a phrase is made here, on a person's first
+/// machine; the machine is added from one that has the phrase; or a
+/// person who has lost every device recovers here.
+pub const WAYS_ON: &str = ways_on!();
+
 /// What the statement of a device that follows no phrase says of itself
-/// (decision 2026-10-04 §5.2).
-pub const NO_PHRASE: &str = "no recovery phrase yet: memory stays on this machine. Make one here \
-                             (`cordelia phrase`), or add this machine from one that has one.";
+/// (decision 2026-10-04 §5.2): that it has none, and then the three ways
+/// on ([`WAYS_ON`]).
+pub const NO_PHRASE: &str = concat!(
+    "no recovery phrase yet: memory stays on this machine.\n",
+    ways_on!()
+);
 
 /// What is said in a few words of a device that follows no phrase and
 /// took this version with what an earlier one held (decision 2026-10-04
@@ -335,14 +375,16 @@ pub const NO_PHRASE: &str = "no recovery phrase yet: memory stays on this machin
 pub const NOT_ADDED_YET: &str = "not added yet";
 
 /// What such a device says of itself: that it is not added yet, and the
-/// way on, which begins on the device whose memory is the most up to
-/// date (decision 2026-10-04 §10, steps 3 to 5).
-pub const NOT_ADDED: &str = "not added yet: this device has taken a version of Cordelia in \
-                             which every device is added again, and memory stays on this \
-                             machine until it is. Make the recovery phrase on one device, the \
-                             one whose memory is the most up to date (`cordelia phrase`), and \
-                             add each other device from it (`cordelia add-device` there, \
-                             `cordelia accept` here).";
+/// three ways on, in the order of [`WAYS_ON`]. The first begins on the
+/// machine whose memory is the most up to date (decision 2026-10-04 §10,
+/// steps 3 to 5).
+pub const NOT_ADDED: &str = concat!(
+    "not added yet: this device has taken a version of Cordelia in which every device is added \
+     again, and memory stays on this machine until it is.\n",
+    "  - No machine has a phrase yet: make it on the one whose memory is the most up to date \
+     (`cordelia phrase`).\n",
+    add_or_recover!()
+);
 
 /// What is said in a few words of a device that follows no phrase and
 /// held nothing of an earlier version: a new install (decision
@@ -357,9 +399,10 @@ pub fn moved_on(conn: &Connection) -> Result<bool, cordelia_core::CordeliaError>
 }
 
 /// What a device that follows no phrase says of itself, in a few words
-/// and in a sentence (decision 2026-10-04 §10.1): "not added yet" where
-/// the step of the first start was made (`moved_on`), and the words for
-/// a new install where it was not.
+/// and in full (decision 2026-10-04 §10.1): "not added yet" where the
+/// step of the first start was made (`moved_on`), and the words for a
+/// new install where it was not. In full it is a sentence and then the
+/// three ways on, each on a line of its own.
 pub fn no_phrase_says(moved_on: bool) -> (&'static str, &'static str) {
     match moved_on {
         true => (NOT_ADDED_YET, NOT_ADDED),
@@ -409,7 +452,9 @@ pub fn look(
             None => {
                 let (short, says) = no_phrase_says(moved_on(conn)?);
                 look.short = Some(short.into());
-                look.says.push(says.into());
+                // Where it stands, and then each way on, on a line of
+                // its own: a status prints what is said a line each.
+                look.says.extend(says.lines().map(str::to_string));
             }
             Some(held) => {
                 of_its_person(conn, identity, &held, at_relays, &mut look)?;
@@ -426,8 +471,15 @@ pub fn look(
                 look.says.extend(relay.says());
             }
         }
+        // What became of a key that was taken is said only while it is
+        // so (decision 2026-10-04 §5.1): a device that was removed since,
+        // or is in no list of the last change, has joined nobody. The key
+        // is kept, and is still listed with what became of it.
+        let stopped = matches!(look.state, "removed" | "not_listed");
         for typed in &look.accepting {
-            look.says.push(typed.says());
+            if !(typed.taken && stopped) {
+                look.says.push(typed.says());
+            }
         }
         Ok(look)
     })
@@ -1411,6 +1463,7 @@ fn accepting(conn: &Connection, now: i64) -> Result<Vec<Accepting>, PersonError>
             typed_at: typed.typed_at,
             until: typed.typed_at.saturating_add(PAIR_KEY_TYPED_SECS),
             taken,
+            taken_at: typed.taken_at,
             asking: !taken && within_its_hour(typed.typed_at, now),
             said: typed.said,
         });
@@ -1503,13 +1556,26 @@ mod tests {
         assert_eq!(look.state, "no_phrase");
         assert_eq!(look.among, "no_phrase");
         assert_eq!(look.short.as_deref(), Some("no recovery phrase yet"));
+        // Where it stands, and then the three ways on, each on a line of
+        // its own and in this order: a phrase is made here; the machine
+        // is added from one that has the phrase; or a person who has
+        // lost every device recovers here, and makes no new phrase
+        // first.
+        let add = "  - Another machine has the phrase: add this one from it (`cordelia \
+                   add-device` there, `cordelia accept` here).";
+        let recover = "  - Every device that has the phrase is lost: recover here with it \
+                       (`cordelia recover`). Do not make a new phrase first.";
         assert_eq!(
             look.says,
             [
-                "no recovery phrase yet: memory stays on this machine. Make one here \
-              (`cordelia phrase`), or add this machine from one that has one."
+                "no recovery phrase yet: memory stays on this machine.",
+                "  - This is your first machine: make a phrase here (`cordelia phrase`).",
+                add,
+                recover,
             ]
         );
+        assert_eq!(look.says.join("\n"), NO_PHRASE);
+        assert_eq!(look.says[1..].join("\n"), WAYS_ON);
         // Where the device took this version with what an earlier one
         // held, and the step of its first start was made: it is not
         // added yet (decision 2026-10-04 §10.1).
@@ -1519,25 +1585,20 @@ mod tests {
         let look = seen(&s, 0);
         assert_eq!(look.state, "no_phrase");
         assert_eq!(look.short.as_deref(), Some("not added yet"));
-        assert_eq!(look.says.len(), 1);
-        assert!(
-            look.says[0].starts_with(
+        // The same three ways, in the same order: the first begins on
+        // the machine whose memory is the most up to date.
+        assert_eq!(
+            look.says,
+            [
                 "not added yet: this device has taken a version of Cordelia in which every \
-                 device is added again, and memory stays on this machine until it is."
-            ),
-            "{:?}",
-            look.says
+                 device is added again, and memory stays on this machine until it is.",
+                "  - No machine has a phrase yet: make it on the one whose memory is the most \
+                 up to date (`cordelia phrase`).",
+                add,
+                recover,
+            ]
         );
-        assert!(
-            look.says[0].contains("`cordelia phrase`"),
-            "{:?}",
-            look.says
-        );
-        assert!(
-            look.says[0].contains("`cordelia accept` here"),
-            "{:?}",
-            look.says
-        );
+        assert_eq!(look.says.join("\n"), NOT_ADDED);
         // A mark that says there was nothing to step is a new install's.
         let fresh = Several::new(1);
         cordelia_storage::first_start::first_start(
@@ -2126,7 +2187,7 @@ mod tests {
             |s: &Several, at: &AtRelays| look(&s[0].conn, &s[0].identity, at, s.now).unwrap();
         let none = seen_at(&s, &at);
         assert_eq!(none.relays.len(), 3);
-        assert_eq!(none.says, [NO_PHRASE]);
+        assert_eq!(none.says.join("\n"), NO_PHRASE);
 
         s.make_phrase(0);
         let look = seen_at(&s, &at);
@@ -2211,6 +2272,7 @@ mod tests {
         let asking = seen_at(s.now + 10);
         assert_eq!(asking.len(), 1);
         assert!(asking[0].asking && !asking[0].taken);
+        assert_eq!(asking[0].taken_at, None);
         assert_eq!(asking[0].until, s.now + 3600);
         assert!(asking[0].says().starts_with(&format!(
             "asking for what the device ({}) hands over, until ",
@@ -2224,6 +2286,8 @@ mod tests {
         acts::spend_typed_key(conn, &key, s.now, s.now + 20, "this device has joined").unwrap();
         let taken = seen_at(s.now + 30);
         assert!(taken[0].taken && !taken[0].asking);
+        // When it was taken is said with it.
+        assert_eq!(taken[0].taken_at, Some(s.now + 20));
         assert_eq!(
             taken[0].says(),
             format!(
@@ -2233,6 +2297,66 @@ mod tests {
         );
         // A day on, it is said no more.
         assert!(seen_at(s.now + 24 * 3600).is_empty());
+    }
+
+    /// What became of a typed key that was taken ("this device has
+    /// joined") is said in a status only while it is so (decision
+    /// 2026-10-04 §5.1): a device that was removed since, or is in no
+    /// list of the last change, has joined nobody. The key is kept, and
+    /// is still listed with what became of it.
+    #[test]
+    fn test_a_joining_is_not_said_once_the_device_has_stopped() {
+        for removed in [true, false] {
+            let mut s = Several::of_one_person(3);
+            let now = s.tick();
+            let from = s.key(0);
+            acts::type_key(&s[2].conn, &from, "no_phrase", now).unwrap();
+            acts::spend_typed_key(&s[2].conn, &from, now, now, "this device has joined").unwrap();
+            let joined = format!(
+                "accepted the device ({}): this device has joined",
+                fingerprint::shown(&from)
+            );
+            let before = seen(&s, 2);
+            assert_eq!(before.state, "applied");
+            assert!(before.says.contains(&joined), "{:?}", before.says);
+
+            // It is removed, or left out of the next change.
+            let change = match removed {
+                true => s.change(0, &[0, 1], &[2]),
+                false => s.change(0, &[0, 1], &[]),
+            };
+            give(&mut s, 2, &change);
+            let after = seen(&s, 2);
+            let stands = if removed { "removed" } else { "not_listed" };
+            assert_eq!(after.state, stands);
+            assert!(
+                after.says.iter().all(|line| !line.contains("has joined")),
+                "{stands}: {:?}",
+                after.says
+            );
+            assert_eq!(after.says[0], after.cannot_go_on.clone().unwrap());
+            // Nothing was deleted: the key is listed as it was.
+            assert_eq!(after.accepting.len(), 1, "{stands}");
+            assert!(after.accepting[0].taken, "{stands}");
+            assert_eq!(after.accepting[0].says(), joined);
+        }
+        // A key that is still asked for is said, wherever the device
+        // stands: that is so now.
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        acts::type_key(&s[2].conn, &s.key(0), "no_phrase", now).unwrap();
+        let change = s.change(0, &[0, 1], &[2]);
+        give(&mut s, 2, &change);
+        let asking = seen(&s, 2);
+        assert_eq!(asking.state, "removed");
+        assert!(
+            asking
+                .says
+                .iter()
+                .any(|line| line.starts_with("asking for what the device (")),
+            "{:?}",
+            asking.says
+        );
     }
 
     /// Once fewer than sixteen statements are left to a phrase, a look

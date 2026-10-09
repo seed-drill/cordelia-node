@@ -26,7 +26,7 @@
 ### 1.1 One-Line Install
 
 ```bash
-curl -sSL https://install.seeddrill.ai | sh
+curl -fsSL https://seeddrill.ai/install.sh | sh
 ```
 
 The install script:
@@ -39,6 +39,21 @@ The install script:
 6. Prompts before modifying shell RC files (skipped in `--non-interactive` mode). Adds `~/.cordelia/bin` to `PATH` (appends to `~/.bashrc`, `~/.zshrc`, or `~/.profile`)
 7. Runs `cordelia init` if `~/.cordelia/config.toml` does not exist
 8. Installs system service (launchctl on macOS, systemd on Linux)
+
+> **v1 status.** The script runs `cordelia init --non-interactive` on a
+> machine that has no key yet (`~/.cordelia/identity.key`): so run, `init`
+> does not end by saying to run `cordelia start`. Such a first install ends
+> with, in this order: the one command that starts the node as the service;
+> the three ways on for a machine that follows no recovery phrase (§2.1),
+> each with its command (`cordelia phrase`, `cordelia id` for `cordelia
+> add-device` on a machine that has the phrase, `cordelia recover`); and
+> `cordelia sync claude` and `cordelia sync map <folder>`. A later run ends
+> as it did: with what became of the node that is running, and the line for
+> a program. On Linux with no systemd user session that answers (a
+> container, or a login that has none), the service's file is written and
+> cannot be started: the command that starts the node is then `cordelia
+> start`, run by hand, and the script says that it runs until that terminal
+> is closed.
 
 ### 1.2 Platform Matrix
 
@@ -71,7 +86,7 @@ If verification fails, the script aborts with exit code 1 and prints the mismatc
 
 GPG signature verification is Phase 2 (requires Seed Drill signing key infrastructure).
 
-**Integrity note:** The install script is served over HTTPS (TLS). The SHA-256 checksum of the install script itself is published at `https://install.seeddrill.ai/install.sh.sha256` for out-of-band verification. For maximum security, download the script first, inspect it, then run it. Or use the manual install procedure (§1.4) which performs checksum verification externally. This pattern is standard practice (Rust's rustup, Homebrew, nvm).
+**Integrity note:** The install script is served over HTTPS (TLS), at `https://seeddrill.ai/install.sh`. For maximum security, download the script first, inspect it, then run it. Or use the manual install procedure (§1.4) which performs checksum verification externally. This pattern is standard practice (Rust's rustup, Homebrew, nvm).
 
 **Enterprise note:** Enterprise deployments should use the manual install procedure (§1.4) until GPG signature verification is available (Phase 2). SHA-256 checksums from the same server as the binary provide integrity verification against transport corruption but not against server compromise.
 
@@ -133,8 +148,15 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > configuration and its database, and no channel: there is no personal
 > channel until there is a recovery phrase. `cordelia start` runs the node.
 > A device that follows no phrase publishes nothing, and its status says "no
-> recovery phrase yet: memory stays on this machine. Make one here
-> (`cordelia phrase`), or add this machine from one that has one."
+> recovery phrase yet: memory stays on this machine", and then three ways
+> on, each on a line of its own, in this order:
+>
+> - "This is your first machine: make a phrase here (`cordelia phrase`)."
+> - "Another machine has the phrase: add this one from it (`cordelia
+>   add-device` there, `cordelia accept` here)."
+> - "Every device that has the phrase is lost: recover here with it
+>   (`cordelia recover`). Do not make a new phrase first."
+>
 > `cordelia init --new-key` gives a device a new key: it leaves the devices
 > it is with, keeps its memory folders and their mappings, and then follows
 > no phrase. It asks at a terminal.
@@ -155,7 +177,7 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 
 | Path | Mode | Contents |
 |------|------|---------|
-| `~/.cordelia/config.toml` | 0644 | Node configuration |
+| `~/.cordelia/config.toml` | 0600 | Node configuration |
 | `~/.cordelia/identity.key` | 0600 | Ed25519 seed (32 bytes, raw). X25519 key derived on demand, never persisted separately (ecies-envelope-encryption.md §2). |
 | `~/.cordelia/node-token` | 0600 | Bearer token for HTTP API auth (32 bytes CSPRNG, hex-encoded, 64 chars) |
 | `~/.cordelia/cordelia.db` | 0600 | SQLite database (items, groups, FTS5) |
@@ -170,6 +192,12 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > channels are derived from the person secret, which is in the database.
 > After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
 > §10.5. A relay keeps `channel-keys/` for the older kind.
+>
+> **The data directory itself is mode 0700, and `config.toml` in it 0600.**
+> `cordelia init` and the install script make them so. A node that starts on
+> a data directory that others can read, write or enter sets it to 0700, and
+> the configuration file in it to 0600, and says so once in its log
+> (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
@@ -303,7 +331,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 | `cordelia peers` | List connected peers | Yes |
 | `cordelia channels` | List subscribed channels | Yes |
 | `cordelia stats` | Detailed metrics | Yes |
-| `cordelia stop` | Stop the daemon | Yes |
+| `cordelia stop` | Not built: a node is stopped through its service (§7), or by a signal | - |
 | `cordelia start` | Start the daemon (see §7 for service integration) | No |
 | `cordelia export` | Export channel data (§9.3) | Yes |
 | `cordelia version` | Print version and build info | No |
@@ -331,7 +359,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia sync off` | Stop syncing | |
 > | `cordelia sync status [--seen]` | Show what syncs, what was found and what your other devices sync. `--seen` shows the notice of the folders that stopped syncing once more, and puts it away | |
 > | `cordelia sync carry [name]` | Bring into the channels of the last change what your devices that count had sent to the relays before it, in each generation that this device left in the last 90 days; with no name, for every name this device holds | |
-> | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing | With a device named: twice a yes at most, and then the phrase |
+> | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing: a key whose versions the new channel holds already, all of them, is marked "already brought back". Before its second yes it says that the text which a version replaces is kept beside the file as a conflict copy, and that the status shows a conflict until that copy is deleted | With a device named: twice a yes at most, and then the phrase |
 > | `cordelia sync carry <name> --phrase` | Read the generations whose secret this device never held, and take what your devices that count signed there. `--from` and `--phrase` together are refused | Yes, and the phrase |
 > | `cordelia history [<name or folder>] [--removed] [--since <time>]`, `cordelia history show <id>`, `cordelia history drop`, `cordelia restore <id>...` | Local history: the versions that sync replaced or removed here, printing one, removing kept versions, and putting versions back | |
 > | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
@@ -357,6 +385,13 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   the exception. `cordelia status`, `cordelia sync status`, `cordelia
 >   devices` and `cordelia history` still answer beside such a node, with the
 >   note (decision 2026-10-04 §10.1, rule 6).
+> - **A command that opens the database itself opens none beside a running
+>   node of another version:** opening runs the schema's steps, and a later
+>   command would step the database under an earlier node. `cordelia stats`,
+>   `cordelia channels`, `cordelia swarm-init`, and `cordelia init` where it
+>   makes the database or is given `--force`, say the note that names the
+>   restart, and open nothing. `cordelia status` says the note, and reads
+>   nothing of the database. Where no node answers, each goes on.
 > - `cordelia sync exclude`, `cordelia sync include`, `cordelia sync claude
 >   --exclude` and `cordelia sync claude --all` are refused, before anything
 >   is sent to the node, with what to do instead: only what is mapped syncs,
@@ -946,13 +981,11 @@ The node does not auto-update. Operators choose when to upgrade.
 ### 10.2 Upgrade Procedure
 
 ```bash
-cordelia stop
-curl -sSL https://install.seeddrill.ai | sh    # downloads latest, verifies checksum
-cordelia start
+curl -fsSL https://seeddrill.ai/install.sh | sh  # downloads latest, verifies checksum, restarts the service
 cordelia status                                  # verify
 ```
 
-The install script detects an existing installation and performs an in-place binary replacement. Configuration and data are preserved.
+The install script detects an existing installation and performs an in-place binary replacement. Configuration and data are preserved. The node is not stopped first: the script puts the new binary beside the old one, renames it into place, and restarts a node that runs as the service it set up.
 
 ### 10.3 Version Compatibility
 
@@ -976,13 +1009,21 @@ The install script detects an existing installation and performs an in-place bin
 
 ### 10.4 Rollback
 
+> **v1 status.** After an upgrade to this version, go back by §10.5: it puts
+> the database back as well, and has each step. The short way below is for
+> an upgrade that stepped no database.
+
 If an upgrade causes issues:
 
 ```bash
-cordelia stop
+# Stop the service
+systemctl --user stop cordelia                                        # Linux
+launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
 # Restore previous binary (kept as ~/.cordelia/bin/cordelia.prev by install script)
 mv ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia
-cordelia start
+# Start the service
+systemctl --user start cordelia                                       # Linux
+launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
 ```
 
 **Database rollback caveat:** If the new version applied a schema migration, rolling back the binary may fail if the old version doesn't understand the new schema. Schema migrations are designed to be forward-compatible where possible (additive columns, not destructive). If a migration is not forward-compatible, the release notes will state this explicitly.
@@ -1082,23 +1123,134 @@ before makes a copy and then one step, when it starts (data-formats.md §12):
   the same, and stops. A command that opens the database itself is refused
   likewise.
 
-**Going back:**
+**Going back.** Nine steps, in this order. Each gives the command for Linux
+(systemd) and for macOS (launchd), and says why. The paths are those of a
+node that the install script set up: its data directory is `~/.cordelia`.
 
-1. Stop the node.
-2. Install the version before, with the installer told to leave the node as
-   it is (`CORDELIA_NO_RESTART=1`).
-3. Remove the database, `cordelia.db`, and the two files that the store
-   keeps beside it, whose names end `-wal` and `-shm`. Left there, they
-   would be replayed over what is put back.
-4. Put the copy's database and key files where they were.
-5. Move the `before-<version>` folder away.
-6. Start the node.
+The steps name two versions:
+
+- `<version>` is the version that made the copy. `ls ~/.cordelia` shows the
+  copy's folder, `before-<version>`.
+- `<the version before>` is the version you go back to: the one this
+  machine ran before it took `<version>`. `~/.cordelia/bin/cordelia.prev
+  --version` prints it, unless the install script has run again since with
+  another version.
+
+1. **Check that the copy is there.** Do this before you stop or change
+   anything.
+
+   ```bash
+   ls ~/.cordelia/before-<version>/cordelia.db
+   ```
+
+   If the file is not there, stop. There is nothing to go back by, and you
+   have changed nothing. A machine has no copy if its first install was this
+   version, if you deleted the copy, or if the copy could not be made.
+
+   If `ls ~/.cordelia` shows more than one `before-` folder, use the one
+   named exactly `before-<version>`. Do not use one whose name ends in
+   `.partial` or `.earlier`. A `.partial` folder is a copy that was not
+   finished. An `.earlier` folder is an older copy, which a later start kept
+   when it made a new one.
+
+2. **Stop the service.** The next steps replace the database, and a node
+   that runs would write to it meanwhile.
+
+   ```bash
+   systemctl --user stop cordelia                                        # Linux
+   launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
+   ```
+
+3. **Put the older binary back.** The install script kept it beside the new
+   one, as `cordelia.prev`, when it installed this version. Check its
+   version first.
+
+   ```bash
+   ~/.cordelia/bin/cordelia.prev --version      # the version before?
+   cp ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia.new
+   mv -f ~/.cordelia/bin/cordelia.new ~/.cordelia/bin/cordelia
+   ```
+
+   Copy it beside the binary and then move it into place, as the install
+   script does. A plain copy over `cordelia` fails while a `cordelia`
+   process runs from that file.
+
+   If `cordelia.prev` is not the version before, install the version before
+   by its number instead:
+
+   ```bash
+   curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v<the version before> sh
+   ```
+
+   **Do not run the "Next steps" that it prints.** They would start the older
+   version on the database that this version stepped, and it would stop with
+   an error. Go on with step 4.
+
+4. **Move the database and its two side files aside.** Do not delete them:
+   if the copy in step 5 fails, you have lost nothing.
+
+   ```bash
+   mkdir -p ~/cordelia-stepped-<version>
+   mv ~/.cordelia/cordelia.db* ~/cordelia-stepped-<version>/
+   ```
+
+   The pattern matches the database and whichever of its side files are
+   there (`cordelia.db-wal` and `cordelia.db-shm`). A node that stopped
+   cleanly leaves neither. They must not stay: the node would replay them
+   over the database that you put back. You can delete
+   `~/cordelia-stepped-<version>` once the older version runs (step 9).
+
+5. **Copy the database and the older channels' key files back from the
+   copy.** Put each where the node keeps it: the database at
+   `~/.cordelia/cordelia.db`, and the key files in
+   `~/.cordelia/channel-keys/`. The older version reads both.
+
+   ```bash
+   cp -p ~/.cordelia/before-<version>/cordelia.db ~/.cordelia/cordelia.db
+   cp -p ~/.cordelia/before-<version>/channel-keys/* ~/.cordelia/channel-keys/
+   ```
+
+   Run the second command only if the copy has a `channel-keys` folder. It
+   has one only where the device had key files.
+
+6. **Move the copy out of the data directory,** to your home directory, say.
+   It is what you went back by. A later upgrade then makes a fresh copy, and
+   does not rename this one or put another in its place.
+
+   ```bash
+   mv ~/.cordelia/before-<version> ~/cordelia-before-<version>
+   ```
+
+7. **On Linux, have the service manager read the service's file again.** The
+   install script writes that file anew each time it runs. (launchd reads it
+   at the next step.)
+
+   ```bash
+   systemctl --user daemon-reload                                        # Linux
+   ```
+
+8. **Start the service.** It runs the older binary, on the database that
+   you put back.
+
+   ```bash
+   systemctl --user start cordelia                                       # Linux
+   launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
+   ```
+
+9. **Check.** The status names the version, and says whether the node runs.
+
+   ```bash
+   cordelia status
+   ```
+
+   Once it runs the older version, you can delete
+   `~/cordelia-stepped-<version>`.
 
 What that does not give back: the device's key and its configuration file
 were never in the copy, so a device that was given a new key since cannot go
 back. The mappings and the sync settings are rows of the database, so they
-are as the copy has them, and those made since go with the database that is
-removed. And the memory folders are as they are now, so what changed in
+are as the copy has them, and those made since are in the database that was
+moved aside. And the memory folders are as they are now, so what changed in
 them since is published into the older channels as edits.
 
 A version from before this one that is started by mistake on a database
@@ -1119,10 +1271,11 @@ on and where the copy is.
 | `Error: database locked` | Stale lock from crashed process | Remove `~/.cordelia/cordelia.db-wal` and `cordelia.db-shm`, restart |
 | `Error: config parse error` | Invalid TOML | Check `config.toml` syntax. Run `cordelia init` to regenerate |
 
-> **v1 status.** Three more, of this version:
+> **v1 status.** Four more, of this version:
 >
 > | What is said | Why | What to do |
 > |--------------|-----|------------|
+> | `the node's API cannot listen at ...: Address already in use` | The port is taken: a node is probably running already, as the service. The message says so, and names the command that restarts the service on this system | `cordelia status` says whether one runs. Restart the service; do not start a second node |
 > | `another node is running on the data directory ...` | A data directory is one node's: the node that runs holds the lock on it | Stop that node first, or give this one a directory of its own. Nothing was changed |
 > | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back the copy that it made, as §10.5 says |
 > | `cordelia status` says `Held up:` | The first start on this version is not done (the copy could not be made), or the database is from a later version | For the first: make the room that the status names. The node tries again by itself |

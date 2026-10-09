@@ -1069,6 +1069,11 @@ pub async fn make(
         zeroize::Zeroize::zeroize(secret);
     }
     let (number, to_look) = made.map_err(commands::refused)?;
+    // One line in the log, of numbers alone: no key, and no name.
+    tracing::info!(
+        "a recovery was made on this machine: change {number}, {} to look through",
+        names_counted(to_look.names.len())
+    );
     state.own_channels.set_look(json!({
         "change": number,
         "finished": false,
@@ -1083,6 +1088,51 @@ pub async fn make(
         the_look(&node, number, &to_look).await;
     });
     Ok(HttpResponse::Ok().json(json!({ "change": number })))
+}
+
+/// How many names, in words: `1 name`, `3 names`.
+fn names_counted(names: usize) -> String {
+    match names {
+        1 => "1 name".to_string(),
+        names => format!("{names} names"),
+    }
+}
+
+/// What the node's log says when the look of a recovery is over
+/// (decision 2026-10-04 §9, step 5), in numbers alone: no key, and no
+/// name of a file or of a folder.
+///
+/// - **Where the look ended:** the change, how many names it looked
+///   through, how many versions it carried and in how many names, how
+///   many reads did not reach their end, and how many names failed.
+/// - **Where the new channels could not be read whole:** that the look
+///   took nothing, and that it is not noted as ended. It is not: the
+///   machine's store still says that its look has not ended
+///   ([`the_look`]), and the line does not say otherwise.
+fn look_over_says(number: u64, found: &serde_json::Value) -> String {
+    let count = |field: &str| found[field].as_u64().unwrap_or(0);
+    let listed = |field: &str| found[field].as_array().map_or(0, Vec::len);
+    if found["new_not_read"] == true {
+        return format!(
+            "the look of the recovery (change {number}) took nothing: the new channels could \
+             not be read whole. It is not noted as ended"
+        );
+    }
+    format!(
+        "the look of the recovery (change {number}) has ended: {} looked through, {} carried \
+         in {}, {} not to their end, {} failed",
+        names_counted(count("names") as usize),
+        match count("carried") {
+            1 => "1 version".to_string(),
+            carried => format!("{carried} versions"),
+        },
+        names_counted(count("carried_names") as usize),
+        match listed("not_read") {
+            1 => "1 read".to_string(),
+            reads => format!("{reads} reads"),
+        },
+        names_counted(listed("failed")),
+    )
 }
 
 /// `POST /api/v1/recover/progress`: how far the look of a recovery is,
@@ -1149,6 +1199,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
             "carried": 0,
             "carried_names": 0,
         });
+        tracing::info!("{}", look_over_says(number, &found));
         state.own_channels.set_look(found.clone());
         return found;
     }
@@ -1309,6 +1360,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
             tracing::warn!("the look of a recovery could not be noted as ended: {e}");
         }
     }
+    tracing::info!("{}", look_over_says(number, &found));
     state.own_channels.set_look(found.clone());
     state.own_channels.written();
     found
@@ -1327,6 +1379,35 @@ mod tests {
     use crate::several::{Machine, Node, OTHER_WORDS, Several, WORDS, entry_by, identity_of, text};
 
     const LAB: &str = "lab";
+
+    /// What the node's log says of the look of a recovery, in numbers
+    /// alone (decision 2026-10-04 §9, step 5). Where the look ended, the
+    /// line says so. Where the new channels could not be read whole, the
+    /// look took nothing and is not noted as ended: the line says that,
+    /// and does not say that the look has ended.
+    #[test]
+    fn test_the_log_says_that_a_look_has_ended_only_where_it_has() {
+        let ended = json!({
+            "change": 2, "finished": true, "names": 3, "read": 3, "carried": 5,
+            "carried_names": 2, "not_read": [], "failed": [],
+        });
+        assert_eq!(
+            look_over_says(2, &ended),
+            "the look of the recovery (change 2) has ended: 3 names looked through, 5 versions \
+             carried in 2 names, 0 reads not to their end, 0 names failed"
+        );
+        let took_nothing = json!({
+            "change": 2, "finished": true, "new_not_read": true, "names": 3, "read": 0,
+            "carried": 0, "carried_names": 0,
+        });
+        let says = look_over_says(2, &took_nothing);
+        assert_eq!(
+            says,
+            "the look of the recovery (change 2) took nothing: the new channels could not be \
+             read whole. It is not noted as ended"
+        );
+        assert!(!says.contains("has ended"), "{says}");
+    }
 
     fn phrase() -> Phrase {
         Phrase::parse(WORDS).unwrap()

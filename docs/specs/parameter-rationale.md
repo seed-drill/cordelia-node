@@ -1732,7 +1732,11 @@ alone.
 **Rationale:** How long a thing that will pass by itself has lasted before
 the status line shows it as amber (decision §10.1): no relay connected; a
 relay that is connected and does not hold the latest change; and, after a
-change, names that are not yet in the new generation or not yet sent.
+change, names that are not yet in the new generation or not yet sent. It is
+also for how long, after a device joined or another was added, `cordelia
+devices` says of a device that it has not heard from only "not heard from
+yet", and advises nothing (decision §8): after that it says that the device
+has not applied the change, as far as it has heard, and what to do.
 
 **Why five minutes:** a machine that wakes, a relay that restarts and a
 device that has just applied a change are each through it in less, and what

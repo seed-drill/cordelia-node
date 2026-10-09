@@ -294,16 +294,7 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
     let mut above: Vec<String> = Vec::new();
     if !found.above.is_empty() && found.has_folder {
         let files: Vec<String> = found.above.iter().map(|file| file_shown(file)).collect();
-        let second = at.yes(&format!(
-            "\nAlso bring in {} above {} that the new channel holds? The text that each replaces \
-             is kept beside its file, here and on each device that holds it:\n  {}",
-            counted(files.len(), "version"),
-            match files.len() {
-                1 => "the version",
-                _ => "the versions",
-            },
-            files.join("\n  ")
-        ))?;
+        let second = at.yes(&above_asks(&files))?;
         match second {
             true => above = found.above.clone(),
             false if found.empty == 0 => {
@@ -332,6 +323,28 @@ fn from_keys(config_path: &str, name: &str, named: &[String]) -> anyhow::Result<
         println!("{line}");
     }
     Ok(())
+}
+
+/// What the second yes of `--from` asks (decision 2026-10-04 §7.3): to
+/// bring in the versions that stand above one that the new channel
+/// holds, each named by its file. **It says what becomes of the text that
+/// each replaces:** it is kept beside its file as a conflict copy, on
+/// each device that holds the file. The status shows a conflict for as
+/// long as that copy is in the folder: merging alone does not clear it,
+/// and deleting the copy does.
+fn above_asks(files: &[String]) -> String {
+    format!(
+        "\nAlso bring in {} above {} that the new channel holds?\n  {}\nThe text that each \
+         replaces is kept beside its file as a conflict copy, here and on each device that \
+         holds it.\nThe status shows a conflict until you delete that copy. Merge what you \
+         want from it into the file first.",
+        counted(files.len(), "version"),
+        match files.len() {
+            1 => "the version",
+            _ => "the versions",
+        },
+        files.join("\n  ")
+    )
 }
 
 /// Ask for the recovery phrase, and give its word for `allows` on this
@@ -527,6 +540,11 @@ fn signed_lines(found: &Value, name: &str) -> Vec<String> {
             words_then(&carry::naming_words(&key), text(signed, "label")),
             counted(entries, "entry").replace("entrys", "entries")
         );
+        // What the new channel holds already, all of it, is said to be
+        // so: nothing of that key's is missing.
+        if signed["brought_back"] == true {
+            line.push_str(", already brought back");
+        }
         // Where the node says that those words name another removed key
         // too, the key is given written whole: that names it alone.
         if signed["by_words"] == false {
@@ -584,6 +602,23 @@ fn not_read_lines(done: &Value) -> Vec<String> {
     lines
 }
 
+/// What `cordelia sync carry <name> --phrase` says before it asks its
+/// yes (decision 2026-10-04 §7.3): which generations it reads, and what
+/// it takes from them. **A device never held a generation's secret where
+/// it was off through two changes or more, or was added after a change.**
+/// One that was off through a single change held the secret before it,
+/// and takes the one after it: a change entry gives a device the new
+/// secret alone, and the earlier ones are in the part for the phrase.
+fn with_the_phrase_says(shown: &str) -> String {
+    format!(
+        "With the recovery phrase, this reads what the relays hold of {shown} in the generations \
+         whose secret this device never held: it was off through two changes or more, or was \
+         added after a change. From those it takes what your devices that count signed, as \
+         `cordelia sync carry {shown}` does from the generations that this device left: what \
+         your own devices wrote, as the relays hold it now."
+    )
+}
+
 /// `cordelia sync carry <name> --phrase`: what your devices that count
 /// signed in the name's channel, in the generations whose secret this
 /// device never held (decision 2026-10-04 §7.3). The part of the change
@@ -595,13 +630,7 @@ fn with_the_phrase(config_path: &str, name: &str) -> anyhow::Result<()> {
     refuse_before_a_phrase(config_path)?;
     let own = own_key(config_path)?;
     let shown = file_shown(name);
-    println!(
-        "With the recovery phrase, this reads what the relays hold of {shown} in the generations \
-         whose secret this device never held: it was off through a change, or was added after \
-         one. From those it takes what your devices that count signed, as `cordelia sync carry \
-         {shown}` does from the generations that this device left: what your own devices wrote, \
-         as the relays hold it now."
-    );
+    println!("{}", with_the_phrase_says(&shown));
     if !at.yes(&format!(
         "\nRead those generations of {shown}, and bring in what the new channel lacks?"
     ))? {
@@ -1288,6 +1317,105 @@ mod tests {
         let mut bad = found(json!([]), true);
         bad["under"] = "00".into();
         assert!(Found::of(&bad).is_err());
+    }
+
+    /// A removed key whose versions the new channel holds already is
+    /// marked as that, in the list of the removed keys that signed
+    /// (decision 2026-10-04 §7.3): its work is not missing. One whose
+    /// versions it lacks is not.
+    #[test]
+    fn test_a_removed_key_whose_work_is_held_already_is_marked() {
+        let found = json!({ "signed": [
+            { "key": hex::encode([7u8; 32]), "label": "desktop", "entries": 2,
+              "by_words": true, "brought_back": true },
+            { "key": hex::encode([8u8; 32]), "label": "laptop", "entries": 1,
+              "by_words": true, "brought_back": false },
+            { "key": hex::encode([9u8; 32]), "label": "old", "entries": 4,
+              "by_words": false, "brought_back": true },
+        ]});
+        let lines = signed_lines(&found, "lab");
+        assert_eq!(
+            lines[1],
+            format!(
+                "  ({}) \"desktop\": 2 entries, already brought back",
+                carry::naming_words(&[7u8; 32])
+            )
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "  ({}) \"laptop\": 1 entry",
+                carry::naming_words(&[8u8; 32])
+            )
+        );
+        assert!(
+            lines[3].contains(
+                "\"old\": 4 entries, already brought back. Those words name another removed key"
+            ),
+            "{lines:?}"
+        );
+    }
+
+    /// The second yes of `--from` names each file, and says what becomes
+    /// of the text that each version replaces (decision 2026-10-04
+    /// §7.3): it is kept beside its file as a conflict copy, and the
+    /// status shows a conflict until that copy is deleted. Merging alone
+    /// does not clear it, and the words do not say that it does.
+    #[test]
+    fn test_the_second_yes_says_what_becomes_of_the_text_that_is_replaced() {
+        assert_eq!(
+            above_asks(&["notes.md".to_string()]),
+            "\nAlso bring in 1 version above the version that the new channel holds?\n  \
+             notes.md\nThe text that each replaces is kept beside its file as a conflict copy, \
+             here and on each device that holds it.\nThe status shows a conflict until you \
+             delete that copy. Merge what you want from it into the file first."
+        );
+        assert!(!above_asks(&["notes.md".to_string()]).contains("merged"));
+        let two = above_asks(&["a.md".to_string(), "b.md".to_string()]);
+        assert!(
+            two.starts_with(
+                "\nAlso bring in 2 versions above the versions that the new channel holds?\n  \
+                 a.md\n  b.md\nThe text"
+            ),
+            "{two}"
+        );
+    }
+
+    /// Where a mapping carried nothing, because the new channel holds
+    /// something for the name already, it is said once that nothing was
+    /// carried (decision 2026-10-04 §7.3).
+    #[test]
+    fn test_that_nothing_was_carried_is_said_once() {
+        let done = json!({
+            "name": "lab",
+            "nothing": "the new channel holds something for this name already",
+        });
+        let lines = carried_lines(&done);
+        assert_eq!(
+            lines,
+            ["lab: nothing was carried: the new channel holds something for this name already."]
+        );
+        assert_eq!(lines[0].matches("nothing was carried").count(), 1);
+    }
+
+    /// `--phrase` says which devices never held a secret as the code has
+    /// it, and as its help says it (decision 2026-10-04 §7.3): one that
+    /// was off through two changes or more, or was added after a change.
+    /// A device that was off through one change held every secret.
+    #[test]
+    fn test_the_phrase_carry_says_which_devices_never_held_a_secret() {
+        let says = with_the_phrase_says("lab");
+        assert!(
+            says.contains(
+                "in the generations whose secret this device never held: it was off through \
+                 two changes or more, or was added after a change. From those"
+            ),
+            "{says}"
+        );
+        assert!(!says.contains("off through a change"), "{says}");
+        assert!(
+            says.starts_with("With the recovery phrase, this reads what the relays hold of lab ")
+        );
     }
 
     /// With no key, `--from` lists each removed key that signed there,

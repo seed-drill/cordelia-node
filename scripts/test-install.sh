@@ -43,9 +43,18 @@ case "$1" in
     --version) echo "cordelia @NEW@" ;;
     init)
         [ -f "$HOME/.fake/init_fails" ] && exit 7
-        # Where it is told to, as the real one does.
+        # Where it is told to, as the real one does. Its configuration
+        # file is made as an earlier version made it: open to others.
         mkdir -p "${CORDELIA_DATA_DIR:-$HOME/.cordelia}"
         touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/identity.key"
+        touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
+        chmod 664 "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
+        # Its last line, as the real one's: run by a script it says
+        # nothing of how the node is started.
+        case " $* " in
+            *" --non-interactive "*) echo "Node is ready." ;;
+            *) echo 'Node is ready. Run `cordelia start` to begin.' ;;
+        esac
         ;;
     status)
         if [ -n "${CORDELIA_CONFIG:-}${CORDELIA_HTTP_PORT:-}${CORDELIA_P2P_PORT:-}${CORDELIA_BIND_ADDRESS:-}" ] \
@@ -132,6 +141,8 @@ case "$*" in
             echo inactive; exit 3
         fi
         ;;
+    # A user session answers, unless the test says that none does.
+    *show-environment*) [ ! -f "$HOME/.fake/no_user_session" ] ;;
     *daemon-reload*) echo daemon-reload >> "$HOME/.fake/calls" ;;
     *restart*)       restarted ;;
 esac
@@ -217,6 +228,59 @@ has() {
     esac
 }
 
+# Who may read, write and enter what is at $1, as `ls -l` shows it.
+mode_of() {
+    ls -ld "$1" | cut -c1-10
+}
+
+# The data directory is its owner's alone, and so is the configuration
+# file in it.
+private() {
+    check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwx------"
+    check "the configuration file's mode" \
+        "$(mode_of "$HOME_DIR/.cordelia/config.toml")" "-rw-------"
+}
+
+has_not() {
+    case "$OUT" in
+        *"$1"*) echo "FAILED: $name: must not say \"$1\""; FAILED=1 ;;
+    esac
+}
+
+# The closing words of a first install, in their order: the one command
+# that starts the node as the service ($1), the three ways on for a
+# machine that follows no recovery phrase, each with its command, and
+# the two commands of memory sync. Nothing that the script printed says
+# `cordelia start`, or names pairing.
+first_install_says() {
+    want=$(cat << WORDS
+Next steps:
+  $1
+                        # run the node as a background service
+
+Then one of these three:
+  cordelia phrase       # this is your first machine: make a phrase here
+  cordelia id           # another machine has the phrase: add this one from it.
+                        #   Give this key to cordelia add-device there; it
+                        #   prints the cordelia accept to run here
+  cordelia recover      # every device that has the phrase is lost: recover
+                        #   here with it. Do not make a new phrase first
+
+Then:
+  cordelia sync claude  # turn on memory sync: lists what it found
+  cordelia sync map <folder>
+                        # sync Claude Code's memory for that folder
+
+Open a new terminal first if 'cordelia' is not found.
+WORDS
+)
+    check "the closing words" \
+        "$(sed -n '/^Next steps:/,/^Open a new terminal/p' "$HOME_DIR/.fake/out")" "$want"
+    has "Node is ready."
+    has_not "cordelia start"
+    has_not "to pair"
+}
+
 expect() {
     check "the last line" "$LAST" "cordelia-install: $1"
     check "the exit code" "$CODE" "$2"
@@ -230,16 +294,17 @@ expect() {
 setup() { :; }
 run "a-first-install"
 expect "installed=$NEW running=none restart=not-needed" 0 0
-case "$OUT" in
-    *"Next steps:"*) ;;
-    *) echo "FAILED: $name: a first install says what to do next"; FAILED=1 ;;
-esac
+first_install_says "systemctl --user enable --now cordelia"
+private
 
 service() { echo "${1:-active}" > "$HOME/.fake/service"; }
 
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-running-node-is-restarted"
 expect "installed=$NEW running=$NEW restart=done" 0 1
+# An upgrade ends as it did: with what became of the node, and no steps.
+has "The node was restarted and is running $NEW."
+has_not "Next steps:"
 check "the unit is read again before the restart" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" "daemon-reload restart "
 
@@ -317,6 +382,7 @@ done
 setup() { :; }
 run "a-first-install-in-a-shell-with-settings" CORDELIA_DATA_DIR="$WORK/elsewhere"
 expect "installed=$NEW running=none restart=not-needed" 0 0
+first_install_says "systemctl --user enable --now cordelia"
 check "the key is where the service looks" \
     "$(ls "$HOME_DIR/.cordelia/identity.key" 2>/dev/null)" "$HOME_DIR/.cordelia/identity.key"
 
@@ -385,10 +451,70 @@ setup() {
 }
 run "the-version-before-is-kept"
 expect "installed=$NEW running=none restart=not-needed" 0 0
+# A later run with no node running ends as it did.
+has "  cordelia status       # the node and its relays"
+has_not "Then one of these three:"
 check "the copy kept" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
 again "the-version-before-is-kept-at-a-second-run"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 check "the copy kept after a second run" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
+
+# A data directory that an earlier run left open to others, and the
+# configuration file in it, are set to their owner's alone: with a node
+# that is running, and with none.
+setup() {
+    mkdir -p "$HOME/.cordelia/bin"; echo "the one before" > "$HOME/.cordelia/bin/cordelia"
+    touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/.cordelia/config.toml"
+}
+run "a-data-directory-that-was-open-to-others"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+private
+check "the key's mode is left as it was" \
+    "$(mode_of "$HOME_DIR/.cordelia/identity.key")" "$(mode_of "$HOME_DIR/.fake/calls")"
+
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"
+    mkdir -p "$HOME/.cordelia"; touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/.cordelia/config.toml"
+}
+run "an-upgrade-of-a-data-directory-that-was-open-to-others"
+expect "installed=$NEW running=$NEW restart=done" 0 1
+private
+
+# A configuration file that is a link is kept elsewhere: no mode is set
+# through the link, and the data directory is set as it always is.
+setup() {
+    mkdir -p "$HOME/.cordelia"; touch "$HOME/.cordelia/identity.key" "$HOME/kept-elsewhere.toml"
+    chmod 775 "$HOME/.cordelia"; chmod 664 "$HOME/kept-elsewhere.toml"
+    ln -s "$HOME/kept-elsewhere.toml" "$HOME/.cordelia/config.toml"
+}
+run "a-configuration-file-that-is-a-link"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwx------"
+check "the mode of the file that the link leads to" \
+    "$(mode_of "$HOME_DIR/kept-elsewhere.toml")" "-rw-rw-r--"
+check "the configuration file is still a link" \
+    "$(mode_of "$HOME_DIR/.cordelia/config.toml" | cut -c1)" "l"
+
+# A machine with no service manager that the script can use: Linux with
+# no systemd user session. The next steps name the command that runs the
+# node by hand, on a line of its own, and say that it runs until that
+# terminal is closed. The command that starts the service cannot work
+# there, and is not named.
+setup() { touch "$HOME/.fake/no_user_session"; }
+run "a-first-install-with-no-systemd-user-session"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the first of the next steps" \
+    "$(sed -n '/^Next steps:/,/^$/p' "$HOME_DIR/.fake/out")" \
+    "Next steps:
+  cordelia start
+                        # run the node yourself: you have no systemd user session here.
+                        # It runs until you close that terminal"
+has "You have no systemd user session here, so the service cannot start."
+has "Then one of these three:"
+has "  cordelia sync claude  # turn on memory sync: lists what it found"
+has_not "systemctl --user enable --now cordelia"
 
 # A first install whose set-up fails says so, and is no success.
 setup() { touch "$HOME/.fake/init_fails"; }
@@ -399,6 +525,7 @@ check "the last line" "$LAST" "Error: cordelia init failed. The binary is instal
 setup() { :; }
 run "a-first-install-on-a-mac" FAKE_OS=Darwin
 expect "installed=$NEW running=none restart=not-needed" 0 0
+first_install_says "launchctl load $HOME_DIR/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
 
 if [ "$FAILED" -ne 0 ]; then
     exit 1

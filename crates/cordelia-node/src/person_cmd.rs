@@ -49,7 +49,9 @@ use cordelia_api::change::{Prepared, prepare_change, prepare_settlement};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
-use cordelia_core::protocol::{CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS};
+use cordelia_core::protocol::{
+    CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS, STATUS_AMBER_WAIT_SECS,
+};
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -73,6 +75,27 @@ Your recovery phrase is twelve words.
     (You can add a device without it.)
   - Nobody else has it, and this device does not keep it. It is shown once, now.
   - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's words here.";
+
+/// What `cordelia phrase` says on a machine that follows no phrase, after
+/// what a phrase is for and before any word of a new one is shown
+/// (decision 2026-10-04 §5.2, §9): a person who has a phrase already,
+/// and has lost every device, wants `cordelia recover`. A phrase made
+/// here first would be another: `cordelia recover` refuses a machine that
+/// follows one.
+const HAS_ONE_ALREADY: &str = "\
+If you have a recovery phrase already and every device is lost, do not make a new one.
+Press Ctrl-C, and recover with the phrase you have:
+  cordelia recover";
+
+/// What `cordelia phrase` says before it goes on, by where the device
+/// stands among its person's devices (`among`): [`WHOSE_WORDS`], and on
+/// a machine that follows no phrase [`HAS_ONE_ALREADY`] after it.
+fn phrase_opening(among: &str) -> String {
+    match among {
+        "no_phrase" => format!("{WHOSE_WORDS}\n\n{HAS_ONE_ALREADY}\n"),
+        _ => format!("{WHOSE_WORDS}\n"),
+    }
+}
 
 /// What is said where a person did not say yes.
 pub(crate) const NOT_A_YES: &str = "That was not a yes. Nothing was done.";
@@ -129,13 +152,21 @@ fn look_asks(what_waits: bool) -> Value {
 fn looks(config_path: &str, what_waits: bool) -> anyhow::Result<Value> {
     let seen = api_post(config_path, "/api/v1/devices/list", look_asks(what_waits))?;
     if seen["state"].as_str().is_none() {
-        anyhow::bail!(
-            "what answered at the node's address says nothing of where this device stands: it \
-             is no node of this command's version. Nothing was done. Stop the node and start \
-             it again (`cordelia start`)."
-        );
+        anyhow::bail!(no_look_says(std::env::consts::OS));
     }
     Ok(seen)
+}
+
+/// What a command says where what answered at the node's address is no
+/// look of a node of this command's version ([`look`]), on the system
+/// named: nothing was done, and how the node is restarted
+/// ([`cordelia_api::commands::restart_says`]).
+fn no_look_says(os: &str) -> String {
+    format!(
+        "what answered at the node's address says nothing of where this device stands: it is \
+         no node of this command's version. Nothing was done. Restart the node:\n{}",
+        cordelia_api::commands::restart_says(os)
+    )
 }
 
 pub(crate) fn text<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -211,12 +242,21 @@ pub(crate) fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Resul
     if decode_public_key(text(answer, "this_device")).ok() == Some(*own) {
         return Ok(());
     }
-    anyhow::bail!(
+    anyhow::bail!(not_this_devices_key_says(own, std::env::consts::OS))
+}
+
+/// What a command says where what answered at the node's address names
+/// another key as this device than `own`, or none ([`names_this_device`]),
+/// on the system named: nothing was done, and how the node is restarted
+/// ([`cordelia_api::commands::restart_says`]), since a node that still
+/// runs under the key the device had before answers so.
+fn not_this_devices_key_says(own: &[u8; 32], os: &str) -> String {
+    format!(
         "what answered at the node's address does not name this device's key, which is the \
          one in its key file ({}). Nothing was done. A node goes on under the key it was \
-         started with: if this device was given a new key, stop the node and start it again \
-         (`cordelia start`).",
-        fingerprint::shown(own)
+         started with. If this device was given a new key, restart the node:\n{}",
+        fingerprint::shown(own),
+        cordelia_api::commands::restart_says(os)
     )
 }
 
@@ -407,7 +447,7 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let seen = look_with_what_waits(config_path)?;
     names_this_device(&seen, &this_device)?;
     let among = text(&seen, "among").to_string();
-    println!("{WHOSE_WORDS}\n");
+    println!("{}", phrase_opening(&among));
     // What a device that follows a phrase already would let go of.
     if let Some(waits) = waits_before_a_new_phrase(&seen) {
         println!("{waits}");
@@ -774,7 +814,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         };
         let now_said = text(of_the_key, "said");
         if of_the_key["taken"] == true {
-            println!("{now_said}.");
+            println!("{}.", capitalised(now_said));
             return Ok(());
         }
         if !now_said.is_empty() && now_said != said {
@@ -820,6 +860,35 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
 fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
+    devices_lines_at(seen, own, chrono::Utc::now().timestamp())
+}
+
+/// Whether it is too soon, at `now`, to say anything against `device`,
+/// which this device has not heard to have applied the change (decision
+/// 2026-10-04 §8). A device says that it has applied a change in the
+/// personal channel, and its word takes a moment to arrive. So for
+/// `STATUS_AMBER_WAIT_SECS`:
+///
+/// - **after this device joined** (it took what a typed key handed it,
+///   and has heard from nobody yet), of every device;
+/// - **after `device` was added** (its record says when), of that one.
+///
+/// A time that is ahead of this device's clock by less than that counts
+/// too, and one that is further ahead does not: another device's clock
+/// wrote it.
+fn too_soon_to_say(seen: &Value, device: &Value, now: i64) -> bool {
+    let just = |at: i64| now.abs_diff(at) < STATUS_AMBER_WAIT_SECS;
+    let joined = list(seen, "accepting")
+        .filter(|typed| typed["taken"] == true)
+        .filter_map(|typed| typed["taken_at"].as_i64())
+        .any(just);
+    joined || device["at"].as_i64().is_some_and(just)
+}
+
+/// [`devices_lines`], at `now`, in seconds: what is said of a device
+/// that has not been heard from goes by how long ago this device joined,
+/// or that one was added ([`too_soon_to_say`]).
+fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
     out.push(format!(
@@ -858,6 +927,10 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
                  in what it had sent before)"
             ),
         },
+        // Not heard to have applied it. Just after this device joined,
+        // or that one was added, that is all that is known: its word may
+        // not have arrived yet, and nothing is advised.
+        _ if too_soon_to_say(seen, device, now) => "not heard from yet".to_string(),
         _ => format!(
             "has not applied change {change} yet, as far as this device has heard: adding it \
              again from a device that has (`cordelia add-device`) hands it the change, and \
@@ -960,7 +1033,16 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
     if relays.is_empty() {
         out.push("  none is reached".into());
     }
-    for relay in relays {
+    // A relay is listed once, by its name, and what waits to be sent
+    // there is said on its line. A row of what waits is that relay's
+    // where the node gives it the relay's name, or where the address it
+    // is reached at is the name.
+    let is_of = |waits: &Value, relay: &Value| {
+        let name = text(relay, "relay");
+        text(waits, "name") == name || text(waits, "relay") == name
+    };
+    let to_send = |waits: &Value| waits["waits"].as_u64().filter(|n| *n > 0);
+    for relay in &relays {
         let holds = match (
             relay["heard_since_woke"] == true,
             relay["holds_latest"].as_bool(),
@@ -973,7 +1055,12 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
             (true, Some(false)) => "does not hold the latest change yet",
             (true, None) => "has not said whether it holds the latest change",
         };
-        out.push(format!("  {}: {holds}", text(relay, "relay")));
+        let waits = list(seen, "waiting").filter(|waits| is_of(waits, relay));
+        let still = match waits.filter_map(to_send).max() {
+            Some(n) => format!("; {n} of this device's channels still to send there"),
+            None => String::new(),
+        };
+        out.push(format!("  {}: {holds}{still}", text(relay, "relay")));
         for more in [&relay["no_room"], &relay["refuses"]] {
             if let Some(more) = more.as_str() {
                 out.push(format!("      {more}"));
@@ -992,8 +1079,10 @@ fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
             )),
         }
     }
-    for waits in list(seen, "waiting") {
-        if let Some(n) = waits["waits"].as_u64().filter(|n| *n > 0) {
+    // What waits at an address that is no relay's name is listed after.
+    let of_no_relay = |waits: &&Value| !relays.iter().any(|relay| is_of(waits, relay));
+    for waits in list(seen, "waiting").filter(of_no_relay) {
+        if let Some(n) = to_send(waits) {
             out.push(format!(
                 "  {}: {n} of this device's channels still to send there",
                 text(waits, "relay")
@@ -1117,6 +1206,16 @@ fn names_lines(seen: &Value) -> Vec<String> {
     out
 }
 
+/// `says` with a capital first letter: what the node says in the middle
+/// of a line of a status begins a line of its own here.
+fn capitalised(says: &str) -> String {
+    let mut letters = says.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
+}
+
 /// A count with its noun: `1 name`, `3 names`.
 pub(crate) fn counted(n: usize, noun: &str) -> String {
     match n {
@@ -1133,10 +1232,15 @@ fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Resu
         println!("There is nothing to clear on this device.");
         return Ok(());
     }
-    for notice in notices {
+    for (asked, notice) in notices.into_iter().enumerate() {
+        // An empty line between one notice and the next, and none before
+        // the first.
+        if asked > 0 {
+            println!();
+        }
         let clears = at.yes(&format!(
-            "\n{}.\nClearing it changes what this device shows, and nothing else.",
-            text(notice, "says")
+            "{}.\nClearing it changes what this device shows, and nothing else.",
+            capitalised(text(notice, "says"))
         ))?;
         if !clears {
             println!("It stays.");
@@ -2327,13 +2431,23 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         written.save(&config_file)?;
     }
     println!("\nThis device has a new key:\n  {key}");
-    println!(
-        "It follows no recovery phrase. Its memory folders and their mappings are as they \
-         were.\nThe node still runs under the old key: stop it and start it again (`cordelia \
-         start`) before anything else. Then make a phrase here (`cordelia phrase`), or add \
-         this device from one that has one."
-    );
+    println!("{}", after_a_new_key_says(std::env::consts::OS));
     Ok(())
+}
+
+/// What `cordelia init --new-key` ends with, on the system named
+/// (decision 2026-10-04 §5.2): where the device stands, and that the
+/// node, which still runs under the old key, is restarted before
+/// anything else ([`cordelia_api::commands::restart_says`]). The status
+/// of the node, once it is restarted, names the ways on for a device
+/// that follows no phrase.
+fn after_a_new_key_says(os: &str) -> String {
+    format!(
+        "It follows no recovery phrase. Its memory folders and their mappings are as they \
+         were.\nThe node still runs under the old key. Before anything else, restart the \
+         node:\n{}\nThe status then names the ways on.",
+        cordelia_api::commands::restart_says(os)
+    )
 }
 
 /// What the node answered when it was asked to forget what it holds of
@@ -3534,6 +3648,172 @@ mod tests {
         assert!(names_lines(&quiet).is_empty());
     }
 
+    /// Right after a device is added, nothing is said against it that is
+    /// not known (decision 2026-10-04 §8). For the first five minutes
+    /// after this device joined, each device that it has not heard from
+    /// is said to be "not heard from yet", with no advice; and so is a
+    /// device for the first five minutes after it was added. After that,
+    /// the sentence with its advice is said. A device that has said it
+    /// applied the change is said to have, whenever it is asked.
+    #[test]
+    fn a_device_not_heard_from_just_after_it_was_added_is_said_to_be_only_that() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        let (now, wait) = (1_800_000_000_i64, STATUS_AMBER_WAIT_SECS as i64);
+        assert_eq!(wait, 300);
+        let advice = "has not applied change 1 yet, as far as this device has heard: adding it \
+                      again from a device that has (`cordelia add-device`)";
+        let says_of = |seen: &Value, own: u8, label: &str, at: i64| -> String {
+            let lines = devices_lines_at(seen, &key(own), at);
+            let of_it = format!("\"{label}\"");
+            let line = lines.iter().find(|line| line.contains(&of_it));
+            line.unwrap_or_else(|| panic!("no line for {label}: {lines:?}"))
+                .clone()
+        };
+
+        // On the device that added the other: the desktop was added at
+        // `now`, and has not been heard from.
+        let adder = json!({
+            "this_device": written(1),
+            "change": 1,
+            "devices": [
+                { "key": written(1), "label": "laptop", "words": "w", "applied": 1,
+                  "sent": true, "maker": true },
+            ],
+            "added": [
+                { "key": written(2), "label": "desktop", "words": "w", "counted": true,
+                  "by": { "key": written(1), "label": "laptop", "words": "w" },
+                  "at": now, "applied": null, "sent": false },
+            ],
+        });
+        for soon in [now, now + 1, now + wait - 1] {
+            let line = says_of(&adder, 1, "desktop", soon);
+            assert!(line.ends_with(": not heard from yet"), "{soon}: {line}");
+            assert!(!line.contains("add-device"), "{soon}: {line}");
+        }
+        for later in [now + wait, now + wait + 1, now + 86_400] {
+            let line = says_of(&adder, 1, "desktop", later);
+            assert!(line.contains(advice), "{later}: {line}");
+            assert!(!line.contains("not heard from yet"), "{later}: {line}");
+        }
+        // A time that another device's clock wrote, and that is far ahead
+        // of this one's, holds nothing back.
+        assert!(says_of(&adder, 1, "desktop", now - wait).contains(advice));
+        assert!(says_of(&adder, 1, "desktop", now - wait + 1).ends_with("not heard from yet"));
+
+        // On the device that joined: it took what the laptop's key handed
+        // it at `now`, and has not heard from the laptop, which is a
+        // device of the statement and has no time of its own.
+        let joined = |taken: bool| {
+            json!({
+                "this_device": written(2),
+                "change": 1,
+                "devices": [
+                    { "key": written(1), "label": "laptop", "words": "w", "applied": null,
+                      "sent": false, "maker": true },
+                ],
+                "added": [
+                    { "key": written(2), "label": "desktop", "words": "w", "counted": true,
+                      "by": { "key": written(1), "label": "laptop", "words": "w" },
+                      "at": now - 3000, "applied": 1, "sent": true },
+                ],
+                "accepting": [
+                    { "key": written(1), "words": "w", "typed_at": now - 60, "until": now + 3540,
+                      "taken": taken, "taken_at": if taken { json!(now) } else { json!(null) },
+                      "asking": !taken, "said": "this device has joined" },
+                ],
+            })
+        };
+        let line = says_of(&joined(true), 2, "laptop", now + wait - 1);
+        assert!(
+            line.ends_with(": not heard from yet; the change was made on it"),
+            "{line}"
+        );
+        assert!(says_of(&joined(true), 2, "laptop", now + wait).contains(advice));
+        // A key that was typed and not taken is no joining.
+        assert!(says_of(&joined(false), 2, "laptop", now + 1).contains(advice));
+
+        // What is known is said at once: a device that has said it
+        // applied the change has, however lately it was added.
+        let mut heard = adder.clone();
+        heard["added"][0]["applied"] = json!(1);
+        let line = says_of(&heard, 1, "desktop", now + 1);
+        assert!(line.contains("has applied change 1"), "{line}");
+    }
+
+    /// `cordelia devices` lists each relay once, by its name, with both
+    /// things said on its line: whether it holds the latest change, and
+    /// what waits to be sent there (decision 2026-10-04 §8). What waits
+    /// at an address that is no relay's name is listed after the relays.
+    #[test]
+    fn devices_lists_each_relay_once_with_what_waits_there() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let relay = |name: &str, holds: Value| json!({ "relay": name, "heard_since_woke": true, "holds_latest": holds });
+        let seen = json!({
+            "this_device": encode_public_key(&key(1)).unwrap(),
+            "change": 1,
+            "devices": [],
+            "relays": [
+                relay("one.example:9474", json!(true)),
+                relay("two.example:9474", json!(false)),
+                relay("three.example:9474", json!(true)),
+                relay("192.0.2.4:9474", json!(true)),
+            ],
+            "waiting": [
+                { "relay": "192.0.2.1:9474", "name": "one.example:9474", "waits": 1 },
+                { "relay": "192.0.2.2:9474", "name": "two.example:9474", "waits": 3 },
+                { "relay": "192.0.2.3:9474", "name": "three.example:9474", "waits": 0 },
+                { "relay": "192.0.2.4:9474", "name": null, "waits": 2 },
+                { "relay": "192.0.2.9:9474", "name": null, "waits": 5 },
+                { "relay": "192.0.2.8:9474", "name": null, "waits": 0 },
+            ],
+        });
+        let lines = devices_lines(&seen, &key(1));
+        let from = lines.iter().position(|line| line == "Relays:").unwrap();
+        assert_eq!(
+            lines[from..],
+            [
+                "Relays:",
+                "  one.example:9474: holds the latest change; 1 of this device's channels still \
+                 to send there",
+                "  two.example:9474: does not hold the latest change yet; 3 of this device's \
+                 channels still to send there",
+                "  three.example:9474: holds the latest change",
+                "  192.0.2.4:9474: holds the latest change; 2 of this device's channels still to \
+                 send there",
+                "  192.0.2.9:9474: 5 of this device's channels still to send there",
+            ]
+        );
+        // No relay is on two lines, by its name and by its address.
+        let said = lines.join("\n");
+        for address in ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.8"] {
+            assert!(!said.contains(address), "{address}: {said}");
+        }
+        assert_eq!(said.matches("192.0.2.4").count(), 1, "{said}");
+    }
+
+    /// What the node says in the middle of a line begins a line of its
+    /// own with a capital: the last line of `cordelia accept`, and each
+    /// notice that `cordelia devices --clear` asks about. What begins
+    /// with no letter is left as it is.
+    #[test]
+    fn a_line_of_its_own_begins_with_a_capital() {
+        assert_eq!(
+            capitalised("this device has joined: it has applied change 1"),
+            "This device has joined: it has applied change 1"
+        );
+        assert_eq!(
+            capitalised("new device: (w w w w) \"desktop\""),
+            "New device: (w w w w) \"desktop\""
+        );
+        assert_eq!(
+            capitalised("(w w w w) \"desktop\" left"),
+            "(w w w w) \"desktop\" left"
+        );
+        assert_eq!(capitalised("Already so"), "Already so");
+        assert_eq!(capitalised(""), "");
+    }
+
     /// The twelve words are shown numbered, four to a row, with the
     /// columns lined up and the numbers right-aligned (decision
     /// 2026-10-04 §5): the number that a word is shown by is the number
@@ -3698,5 +3978,121 @@ mod tests {
             assert!(WHOSE_WORDS.contains(says), "{says}");
         }
         assert_eq!(WHOSE_WORDS.lines().count(), 6);
+    }
+
+    /// Where what answered at the node's address is no look of this
+    /// command's version, or names another key as this device, the
+    /// refusal says how the node is restarted on each system (decision
+    /// 2026-10-04 §16): the command that restarts the service, on a line
+    /// of its own, and `cordelia status` after it, as the node's own
+    /// refusal says it. Neither names a command that restarts no service.
+    #[test]
+    fn a_refusal_of_what_answered_names_the_command_that_restarts_the_node() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            let how = format!(
+                "\n  {restart}\nThen run `cordelia status`.\nWhere the node does not run as \
+                 the service that the install script set up, stop it and start it again with \
+                 whatever started it."
+            );
+            assert_eq!(
+                how,
+                format!("\n{}", cordelia_api::commands::restart_says(os))
+            );
+            assert_eq!(
+                no_look_says(os),
+                format!(
+                    "what answered at the node's address says nothing of where this device \
+                     stands: it is no node of this command's version. Nothing was done. \
+                     Restart the node:{how}"
+                )
+            );
+            assert_eq!(
+                not_this_devices_key_says(&own, os),
+                format!(
+                    "what answered at the node's address does not name this device's key, \
+                     which is the one in its key file ({}). Nothing was done. A node goes on \
+                     under the key it was started with. If this device was given a new key, \
+                     restart the node:{how}",
+                    fingerprint::shown(&own)
+                )
+            );
+            for says in [no_look_says(os), not_this_devices_key_says(&own, os)] {
+                assert!(!says.contains("cordelia start"), "{says}");
+            }
+        }
+        // And the refusal itself is those words.
+        let refused = names_this_device(&json!({ "this_device": "no key" }), &own).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            not_this_devices_key_says(&own, std::env::consts::OS)
+        );
+    }
+
+    /// `cordelia init --new-key` ends, on each system, with the command
+    /// that restarts the node as the service, on a line of its own, and
+    /// `cordelia status` after it (decision 2026-10-04 §5.2); and with
+    /// what is done where the node does not run as the service. It names
+    /// no command that does not restart a service.
+    #[test]
+    fn a_new_key_ends_with_the_command_that_restarts_the_node() {
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            let says = after_a_new_key_says(os);
+            assert_eq!(
+                says,
+                format!(
+                    "It follows no recovery phrase. Its memory folders and their mappings are \
+                     as they were.\nThe node still runs under the old key. Before anything \
+                     else, restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
+                     the node does not run as the service that the install script set up, stop \
+                     it and start it again with whatever started it.\nThe status then names \
+                     the ways on."
+                )
+            );
+            assert!(!says.contains("cordelia start"), "{says}");
+        }
+    }
+
+    /// On a machine that follows no phrase, `cordelia phrase` says, before
+    /// any word is shown, that a person who has a phrase already and has
+    /// lost every device wants `cordelia recover` (decision 2026-10-04
+    /// §5.2, §9), with the command on a line of its own. A device that
+    /// follows a phrase is told nothing of it: its yes says what a new
+    /// phrase does there.
+    #[test]
+    fn a_person_who_has_a_phrase_and_no_device_is_pointed_to_recover() {
+        let opening = phrase_opening("no_phrase");
+        assert!(opening.starts_with(WHOSE_WORDS), "{opening}");
+        assert!(
+            opening.ends_with(
+                "\n\nIf you have a recovery phrase already and every device is lost, do not \
+                 make a new one.\nPress Ctrl-C, and recover with the phrase you have:\n  \
+                 cordelia recover\n"
+            ),
+            "{opening}"
+        );
+        for among in ["alone", "several", "stopped"] {
+            assert_eq!(phrase_opening(among), format!("{WHOSE_WORDS}\n"), "{among}");
+        }
     }
 }

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use actix_web::{App, HttpServer, web};
 use clap::Parser;
 
+use cordelia_api::commands::restart_command;
 use cordelia_core::config::{self, Config};
 use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
@@ -20,8 +21,13 @@ mod recover_cmd;
 mod relay_entries;
 mod terminal;
 
+/// What the program is, in one line: the head of `cordelia --help`, and
+/// what `cordelia` with no command prints.
+const ABOUT: &str =
+    "Keeps your AI agent's memory in step across your machines, end to end encrypted";
+
 #[derive(Parser)]
-#[command(name = "cordelia", version, about = "Encrypted pub/sub for AI agents")]
+#[command(name = "cordelia", version, about = ABOUT)]
 struct Cli {
     /// Path to config file (accepted before or after the subcommand)
     #[arg(
@@ -38,43 +44,67 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    /// Initialise a new node (generate keypair, create database)
+    /// Create this device's key and database
+    ///
+    /// Run it once on each machine. The install script does this for you.
+    /// If you run it again, it keeps the key and the database that are
+    /// there.
+    ///
+    /// Then start the node with `cordelia start`.
     Init {
-        /// Entity name (defaults to OS username)
+        /// The name at the start of this device's entity ID (default: your
+        /// user name)
         #[arg(long)]
         name: Option<String>,
 
-        /// Skip interactive prompts
+        /// For a script that starts the node itself, such as the install
+        /// script. Do not print how to start the node
         #[arg(long)]
         non_interactive: bool,
 
-        /// Force re-initialisation (overwrites existing identity)
+        /// Make a new node token and write the configuration file again.
+        /// Keeps this device's key and its database
         #[arg(long)]
         force: bool,
 
-        /// Show secrets (node token) in output
+        /// Print the node token. Without this, only the file that stores
+        /// it is named
         #[arg(long)]
         show_secrets: bool,
 
-        /// Give this device a new key: it leaves the devices it is with,
-        /// keeps its memory folders and their mappings, and follows no
-        /// recovery phrase. Asks at a terminal.
+        /// Give this device a new key
+        ///
+        /// The device leaves your other devices and then has no recovery
+        /// phrase. It keeps its memory folders and their mappings. You
+        /// then add it as a new device.
+        ///
+        /// Run it in a terminal: it asks you to type yes.
         #[arg(long, conflicts_with_all = ["name", "force", "show_secrets"])]
         new_key: bool,
     },
-    /// Show node status (`--line` for a status bar, `--json` for tools)
+    /// Show this device and the state of its memory sync
+    ///
+    /// With no flag it prints this device's key and settings, whether the
+    /// node is running, its peers, and the state of memory sync and of
+    /// your devices.
     Status {
-        /// One line for a status bar, e.g. Claude Code's status line
+        /// Print one short line for a status bar, such as Claude Code's
+        /// status line
         #[arg(long, conflicts_with = "json")]
         line: bool,
-        /// Machine-readable state, for widgets and scripts
+        /// Print the whole state as JSON, for panels, scripts and agents
         #[arg(long)]
         json: bool,
-        /// Icon, tooltip and class as JSON, for Waybar and the Omarchy bar
+        /// Print an icon, a tooltip and a class as JSON, for Waybar and the
+        /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
     },
-    /// Start the node daemon
+    /// Run the node on this device
+    ///
+    /// The node does the syncing, and runs until you stop it. The install
+    /// script sets it up as a service, so you rarely run this yourself.
+    /// Run `cordelia init` first.
     Start,
     /// Stop the node daemon
     Stop,
@@ -92,53 +122,150 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Print this device's public key (give it to `add-device` elsewhere)
+    /// Print this device's key
+    ///
+    /// To add this device, give the key to `cordelia add-device` on a
+    /// device that has your recovery phrase.
     #[command(alias = "pubkey")]
     Id,
-    /// Make the recovery phrase of your devices on this one: twelve
-    /// words, shown once. Asks at a terminal.
+    /// Make your recovery phrase on this device
+    ///
+    /// Run it once, on one device, in a terminal. It shows twelve words,
+    /// once, each with its number. Write them down in order. Then type
+    /// them back from what you wrote. No device stores the words.
+    ///
+    /// Keep the twelve words safe.
+    ///
+    /// - If you lose them, you can still add a device, but you can never
+    ///   remove one or recover.
+    ///
+    /// - Anyone who gets a copy can read your memory, even after you
+    ///   remove devices, and you would not know.
+    ///
+    /// If you already have a phrase and have lost every device, do not
+    /// make a new one. Run `cordelia recover` instead.
+    ///
+    /// On a device that already has a phrase, this replaces it. The
+    /// device starts again alone, and leaves any other devices it was
+    /// with. The command says so first, and asks you to type yes.
     Phrase {
-        /// What your devices call this one, e.g. "laptop" (default: the
+        /// A name for this device, such as "laptop" (default: the
         /// machine's name)
         #[arg(long)]
         name: Option<String>,
     },
-    /// Add another of your devices; then run `cordelia accept` on it,
-    /// within the hour. Asks at a terminal.
+    /// Add another machine to your devices
+    ///
+    /// Run it in a terminal, on a device that has your recovery phrase.
+    /// It says what it will do and asks you to type yes. You do not type
+    /// the phrase.
+    ///
+    /// The new machine can then read all your memory.
+    ///
+    /// The command prints a `cordelia accept` command. Run that on the
+    /// new machine within the hour.
+    ///
+    /// Each of your devices then shows amber until you confirm the new
+    /// one there with `cordelia devices --clear`.
+    ///
+    /// If the machine is already one of your devices, this hands it the
+    /// last change again and adds nothing.
     AddDevice {
-        /// The other device's key, from `cordelia id` on that device
+        /// The new machine's key. Run `cordelia id` there to print it
         key: String,
-        /// A name for the device, e.g. "desktop"
+        /// A name for the new machine, such as "desktop"
         #[arg(long)]
         name: Option<String>,
     },
-    /// Take what the device that added this one hands over. Asks at a
-    /// terminal.
+    /// Join this device to your other devices
+    ///
+    /// Run it in a terminal, on the new machine. `cordelia add-device`
+    /// on the other device prints the whole command, with the key. Run
+    /// it within the hour.
+    ///
+    /// The command says what it will do and asks you to type yes. What
+    /// it does depends on this device:
+    ///
+    /// - A device with no phrase joins your devices, and starts syncing
+    ///   the folders it maps.
+    ///
+    /// - A device that is already one of several takes only what the
+    ///   other device hands it under the phrase it already has. It joins
+    ///   nothing new.
+    ///
+    /// - A device that is alone under a phrase of its own leaves that
+    ///   phrase and joins. Run `cordelia sync off` first, or the command
+    ///   refuses.
+    ///
+    /// Then the command asks the relays for what the other device handed
+    /// over. If nothing arrives within a minute, the command ends and the
+    /// node goes on asking for the rest of the hour. `cordelia status`
+    /// shows what happened.
     Accept {
-        /// The key printed by `add-device` on the other device
+        /// The key of the device that added this one. `add-device` prints
+        /// it there
         key: String,
     },
-    /// Remove one of your devices, with the recovery phrase. Asks at a
-    /// terminal. Given a key that this device knows nothing of, it
-    /// refuses that key for good, after a typed answer.
+    /// Remove one of your devices
+    ///
+    /// Run it in a terminal, on a device that you still have. It asks
+    /// for the recovery phrase.
+    ///
+    /// The command shows the device it will remove and every device that
+    /// will remain. It asks whether each device added since the last
+    /// change stays. Then it asks you to type yes, and then for the
+    /// phrase.
+    ///
+    /// Keep this machine on until the command says you can close it.
+    ///
+    /// You cannot remove the device you are on. Remove it from another
+    /// one.
+    ///
+    /// If this device does not know the key, removing it refuses that
+    /// key for good: none of your devices can add it again. The command
+    /// says so, and asks you to type `refuse`.
     RemoveDevice {
-        /// The device's key, as `cordelia devices` or `cordelia id` shows it
+        /// The key of the device to remove, as `cordelia devices` or
+        /// `cordelia id` shows it
         key: String,
     },
-    /// Give the devices that stay a new secret, with the recovery
-    /// phrase: of each device added since the last change, you say
-    /// whether it stays. Asks at a terminal.
+    /// Give the devices that stay a new secret
+    ///
+    /// Run it in a terminal. It asks for the recovery phrase.
+    ///
+    /// You name no device to remove. The command asks whether each
+    /// device added since the last change stays. Then it asks you to type
+    /// yes, and then for the phrase.
+    ///
+    /// Run it once you have added your devices. They are then all in a
+    /// list that you have checked.
+    ///
+    /// Keep this machine on until the command says you can close it.
     Renew,
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
     Settle,
-    /// Recover on this machine, with the recovery phrase, when you have
-    /// no device left that you trust: it stops every other device, and
-    /// brings back what the relays hold. If a device of yours remains,
-    /// remove the one that is gone from it instead. Asks at a terminal.
+    /// Recover on a new machine when you have no device you trust
+    ///
+    /// Run it in a terminal, on a machine that has no recovery phrase
+    /// yet. It asks for your recovery phrase. Do not make a new phrase
+    /// first: this command refuses a machine that has one.
+    ///
+    /// If you still have a device that you trust, do not recover. Remove
+    /// the lost device from it with `cordelia remove-device`. That stops
+    /// no other device.
+    ///
+    /// A recovery stops every other device until you add each one again.
+    /// It brings back only what the relays still have: a relay is a
+    /// cache, not a backup.
+    ///
+    /// The command asks for the phrase and shows every device. For each
+    /// one you type `have`, `lost` or `hands` (it may be in someone
+    /// else's hands). Then the command shows the change it will make and
+    /// asks you to type yes.
     Recover {
-        /// What your devices call this machine, e.g. "laptop" (default:
-        /// the machine's name)
+        /// A name for this machine, such as "laptop" (default: the
+        /// machine's name)
         #[arg(long)]
         name: Option<String>,
     },
@@ -166,11 +293,32 @@ enum Commands {
         /// The change's number
         number: u64,
     },
-    /// List your devices, what each has applied, and what each relay
-    /// holds
+    /// List your devices and what each relay has
+    ///
+    /// It is the one place to look. It lists:
+    ///
+    /// - every device of the last change, and whether it has applied that
+    ///   change and sent what it had;
+    ///
+    /// - every device added since, and which device added it;
+    ///
+    /// - every removed key;
+    ///
+    /// - the names that no device lists yet since the last change, and
+    ///   what this device still has to send;
+    ///
+    /// - for each relay, whether it has the last change.
+    ///
+    /// Each device is shown with the first four words of its key's
+    /// fingerprint. Two devices can have the same label, and the words
+    /// tell them apart.
     Devices {
-        /// Go through what this device is to tell you, and clear what
-        /// you say yes to. Asks at a terminal.
+        /// Go through what this device has to tell you, such as a device
+        /// that was added
+        ///
+        /// It asks about each notice, and clears those you answer yes to.
+        /// Clearing changes only what this device shows. Run it in a
+        /// terminal.
         #[arg(long)]
         clear: bool,
     },
@@ -238,70 +386,95 @@ enum HistoryCommand {
 
 #[derive(clap::Subcommand)]
 enum SyncCommand {
-    /// Turn on Claude Code memory sync. Nothing syncs until you map a
-    /// folder (`cordelia sync map`): only mapped folders sync. Running it
-    /// again keeps your settings.
+    /// Turn on sync for Claude Code's memory
+    ///
+    /// Nothing syncs until you map a folder with `cordelia sync map`.
+    /// Only mapped folders sync. The command lists the memory folders it
+    /// found. If you run it again, it keeps your settings and says so.
     Claude {
-        /// Claude Code directory (default: ~/.claude)
+        /// The directory where Claude Code keeps its files (default:
+        /// ~/.claude)
         #[arg(long)]
         dir: Option<String>,
         /// No more: only mapped folders sync. It is refused, and says
         /// what to do instead.
         #[arg(long, hide = true)]
         all: bool,
-        /// Sync only the folders you map: the only scope there is
+        /// Sync only the folders you map. That is always so: the flag
+        /// changes nothing
         #[arg(long, conflicts_with = "all")]
         mapped_only: bool,
         /// No more: there is nothing left to exclude. It is refused, and
         /// says what to do instead.
         #[arg(long, hide = true)]
         exclude: Vec<String>,
-        /// Do not sync home-folder memory on this device: unmaps the home
+        /// Stop syncing home memory on this device. It unmaps the home
         /// directory
         #[arg(long)]
         no_home: bool,
-        /// Back to the default Claude Code directory, ~/.claude. Mapped
-        /// folders stay mapped.
+        /// Go back to the default Claude Code directory, ~/.claude. Mapped
+        /// folders stay mapped
         #[arg(long)]
         reset: bool,
     },
-    /// Sync Claude's memory for a folder under a name. The name is what
-    /// your devices share: map the same name on each of them. For a git
-    /// project it defaults to the remote (github.com/owner/repo), and for
-    /// your home directory to `~`. Claude Code keeps one memory per
-    /// repository, so any folder of a repository maps the whole repository.
+    /// Sync a folder's memory under a name
+    ///
+    /// Your devices share a folder by its name. Map the same name on
+    /// each device, and Claude's memory for it stays in step.
+    ///
+    /// - A git project gets its name from its remote
+    ///   (github.com/owner/repo). You need not give one.
+    ///
+    /// - Any other folder needs a name.
+    ///
+    /// - Your home directory needs `--home`. Its name is `~` unless you
+    ///   give one.
+    ///
+    /// Claude Code keeps one memory per repository. So mapping any folder
+    /// of a repository maps the whole repository.
     Map {
         /// The folder you run Claude Code in
         folder: String,
-        /// The name to sync under (default: the folder's git remote; `~`
-        /// for the home directory)
+        /// The name to sync under (default: the folder's git remote, or
+        /// `~` for the home directory)
         name: Option<String>,
-        /// Map the home directory itself: home memory, under `~` or under
-        /// the name given
+        /// Sync home memory. Use it when the folder is your home
+        /// directory itself
         #[arg(long)]
         home: bool,
     },
-    /// Stop syncing a mapped folder from this device (its files stay where
-    /// they are)
+    /// Stop syncing a folder from this device
+    ///
+    /// Its files stay where they are.
     Unmap {
-        /// The folder, or the name it is mapped to
+        /// The folder, or the name it syncs under
         folder: String,
     },
-    /// Bring in what your devices had sent to the relays before a change,
-    /// and that no device carried: the last edits of a device that never
-    /// returned, or a name that no device syncs any more. It reads each
-    /// generation that this device left in the last 90 days.
+    /// Bring in what a change left behind at the relays
     ///
-    /// What a removed device wrote comes in only with `--from`, at a
+    /// After a change, such as a removal, your devices move to a new
+    /// secret. This brings in what was left under an earlier one: the
+    /// last edits of a device that never came back, or a name that no
+    /// device syncs any more.
+    ///
+    /// With no flag it brings in what your devices that were not removed
+    /// wrote. It reads each secret that this device left in the last 90
+    /// days.
+    ///
+    /// What a removed device wrote comes in only with `--from`, in a
     /// terminal, with the recovery phrase.
     Carry {
-        /// The name to carry (default: every name this device holds)
+        /// The name to bring in (default: every name this device has)
         name: Option<String>,
-        /// Also take what a removed device signed there: its label, or
-        /// the first six words of its key's fingerprint, in quotes. Give
-        /// `--from` once for each device. With no device after it, list
-        /// the removed keys that signed there, and take nothing. Asks for
-        /// the recovery phrase
+        /// Bring in what a removed device wrote under one name
+        ///
+        /// Name the device by its label, by the first six words of its
+        /// key's fingerprint, or by its key. Put a label or the words in
+        /// quotes. Give `--from` once for each device.
+        ///
+        /// With no device after it, it lists the removed keys that wrote
+        /// there and brings in nothing. With a device, it asks for the
+        /// recovery phrase.
         #[arg(
             long,
             num_args = 0..=1,
@@ -309,18 +482,32 @@ enum SyncCommand {
             value_name = "LABEL_OR_SIX_WORDS"
         )]
         from: Vec<String>,
-        /// Read the generations whose secret this device never held (it
-        /// was off through a change), and take what your devices that
-        /// count signed there. Asks for the recovery phrase
+        /// Read, for one name, what was written under secrets that this
+        /// device never had
+        ///
+        /// A device never had a secret if it was off through two changes
+        /// or more, or was added after a change. This brings in what your
+        /// devices that were not removed wrote under those secrets. It
+        /// asks for the recovery phrase.
         #[arg(long)]
         phrase: bool,
     },
-    /// Stop syncing (files already synced are left in place)
+    /// Turn sync off on this device
+    ///
+    /// Files that have already synced stay where they are.
     Off,
-    /// Show what syncs, what was found, and what your other devices sync
+    /// Show what syncs on this device and on your others
+    ///
+    /// It lists:
+    ///
+    /// - each folder that syncs, and its name;
+    ///
+    /// - the memory folders found on this machine that do not sync;
+    ///
+    /// - the names that your other devices sync and this one does not.
     Status {
-        /// Put away the notice of the folders that stopped syncing: you
-        /// have seen it
+        /// Put away the notice about folders that stopped syncing, once
+        /// you have read it
         #[arg(long)]
         seen: bool,
     },
@@ -402,7 +589,7 @@ fn main() -> anyhow::Result<()> {
         }) => cmd_swarm_init(&cli.config, index, &lead_identity, &lead_entity_id),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
-            println!("Encrypted pub/sub for AI agents");
+            println!("{ABOUT}");
             println!();
             println!("Run `cordelia --help` for usage.");
             Ok(())
@@ -441,16 +628,174 @@ fn open_database(db_path: &std::path::Path) -> anyhow::Result<rusqlite::Connecti
     }
 }
 
+/// The last line of `cordelia init`. Run by a person, it says how the
+/// node is started. Run by a script (`--non-interactive`), as the install
+/// script runs it, it does not: the script starts the node itself, as
+/// the service it sets up, and says how in its own closing words.
+fn node_is_ready(by_a_script: bool) -> &'static str {
+    match by_a_script {
+        true => "Node is ready.",
+        false => "Node is ready. Run `cordelia start` to begin.",
+    }
+}
+
+/// Whether anyone but its owner may read, write or enter what is at
+/// `path`: any bit of its mode that is the group's or everyone else's.
+/// What is not there is open to nobody.
+#[cfg(unix)]
+fn open_to_others(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|found| found.permissions().mode() & 0o077 != 0)
+}
+
+/// Let only its owner read and write the file, or read, write and enter
+/// the directory, at `path`: mode 0600 for a file and 0700 for a
+/// directory.
+#[cfg(unix)]
+fn owners_alone(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::metadata(path)?.is_dir() {
+        true => 0o700,
+        false => 0o600,
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Whether what is at `path` is a symbolic link. **A mode is never set
+/// through one:** what a link leads to is kept elsewhere, and is whoever
+/// put it there's to set.
+fn is_a_link(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| found.file_type().is_symlink())
+}
+
+/// Where a system has no such modes, there is none to set.
+#[cfg(not(unix))]
+fn owners_alone(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// What `cordelia init` says where the data directory at `dir` could not
+/// be made its owner's alone: one line, with why. It then goes on.
+fn not_private_says(dir: &std::path::Path, why: &std::io::Error) -> String {
+    format!(
+        "Could not make {} private: {why}. Other users of this machine may be able to read it.",
+        dir.display()
+    )
+}
+
+/// Make the data directory at `dir`, with every directory above it that
+/// is missing, and let only its owner read, write or enter it (mode
+/// 0700): it holds the device's key, the node's token and the database.
+/// One that is there already is set so. Nothing in it is touched.
+///
+/// **Only a directory that cannot be made is an error.** Where its mode
+/// cannot be set (the directory is another's, or its volume refuses the
+/// change), the directory is used as it is, and this gives back what to
+/// say of it ([`not_private_says`]): a node that starts there does the
+/// same ([`keep_private`]). `set` sets the mode: [`owners_alone`], but in
+/// the test of this.
+fn private_data_dir(
+    dir: &std::path::Path,
+    set: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<Option<String>> {
+    let mut made = std::fs::DirBuilder::new();
+    made.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        made.mode(0o700);
+    }
+    made.create(dir)?;
+    match set(dir) {
+        Ok(()) => Ok(None),
+        Err(why) => Ok(Some(not_private_says(dir, &why))),
+    }
+}
+
+/// What a node that starts does about a data directory that others can
+/// read, write or enter: **it sets the directory to its owner's alone
+/// (mode 0700), and with it the configuration file, where that file is
+/// in the directory (mode 0600).** Nothing else's mode changes: not a
+/// file in the directory that has its own mode already, and not a
+/// configuration file that is kept elsewhere, which is whoever put it
+/// there's to set. A configuration file in the directory that is a
+/// symbolic link is kept elsewhere: neither the link nor what it leads
+/// to is touched ([`is_a_link`]).
+///
+/// Returns what the node's log says of it, once: what was set, or what
+/// could not be. `None` where the directory is its owner's alone
+/// already: nothing is looked at further, and nothing is said. A mode
+/// that cannot be set keeps no node from starting.
+#[cfg(unix)]
+fn keep_private(data_dir: &std::path::Path, config_file: &std::path::Path) -> Option<String> {
+    if !open_to_others(data_dir) {
+        return None;
+    }
+    let mut says = format!(
+        "the data directory {} could be read, written or entered by others",
+        data_dir.display()
+    );
+    match owners_alone(data_dir) {
+        Ok(()) => says.push_str(": it is now its owner's alone (mode 0700)"),
+        Err(e) => says.push_str(&format!(
+            ", and could not be set to its owner's alone ({e})"
+        )),
+    }
+    let in_it = config_file.starts_with(data_dir) && !is_a_link(config_file);
+    if in_it && config_file.is_file() {
+        match owners_alone(config_file) {
+            Ok(()) => says.push_str(", and so is the configuration file in it (mode 0600)"),
+            Err(e) => says.push_str(&format!(
+                "; the configuration file in it could not be set so ({e})"
+            )),
+        }
+    }
+    Some(says)
+}
+
 fn cmd_init(
     config_path: &str,
     name: Option<String>,
-    _non_interactive: bool,
+    non_interactive: bool,
     force: bool,
     show_secrets: bool,
 ) -> anyhow::Result<()> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file).unwrap_or_default();
     config.apply_env_overrides();
+    // `init` opens the database where it makes one, and with `--force`:
+    // it opens none beside a node of another version, and writes nothing
+    // there either (decision 2026-10-04 §10.1, rule 6).
+    if force || !config.data_dir().join("cordelia.db").exists() {
+        refuse_to_open_beside_another_version(config_path)?;
+    }
+    init_with(
+        &config_file,
+        config,
+        name,
+        non_interactive,
+        force,
+        show_secrets,
+    )
+}
+
+/// What `cordelia init` does, given the configuration as it stands and
+/// the file that it is written to: the device's key, the node's token,
+/// the database and the configuration, each made where it is not there
+/// (or made again with `force`).
+///
+/// **The data directory is its owner's alone (mode 0700), and so is the
+/// configuration file that this writes (mode 0600),** but one that it
+/// writes through a symbolic link. The key, the token and the database
+/// are each 0600.
+fn init_with(
+    config_file: &std::path::Path,
+    mut config: Config,
+    name: Option<String>,
+    non_interactive: bool,
+    force: bool,
+    show_secrets: bool,
+) -> anyhow::Result<()> {
     let data_dir = config.data_dir();
 
     // A database that this command would open is opened before anything
@@ -459,6 +804,12 @@ fn cmd_init(
     let db_path = data_dir.join("cordelia.db");
     if db_path.exists() && force {
         drop(open_database(&db_path)?);
+    }
+
+    // The data directory is made its owner's alone before anything is
+    // put in it. Where it cannot be made so, init says so and goes on.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
     }
 
     // 1. Generate or load Ed25519 identity
@@ -539,7 +890,14 @@ fn cmd_init(
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
-        config.save(&config_file)?;
+        config.save(config_file)?;
+        // The file that this wrote is its owner's alone to read. Where
+        // it was written through a link, the file is kept elsewhere, and
+        // its mode is left as it is.
+        #[cfg(unix)]
+        if !is_a_link(config_file) {
+            owners_alone(config_file)?;
+        }
         println!("Config written to {}", config_file.display());
     }
 
@@ -557,7 +915,7 @@ fn cmd_init(
     }
 
     println!();
-    println!("Node is ready. Run `cordelia start` to begin.");
+    println!("{}", node_is_ready(non_interactive));
 
     Ok(())
 }
@@ -834,9 +1192,21 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     // A database from a later version is not opened: the status says so,
     // and goes on to what the node says of itself (decision 2026-10-04
     // §10.1).
-    let opened = match db_path.exists() {
-        true => Some(open_database(&db_path)),
-        false => None,
+    // Nor is it opened beside a running node of another version: the
+    // schema's steps would be run under that node (rule 6). Where the
+    // node said nothing in the moment that a status gives it, it is
+    // asked once more, for as long as a command waits for a node.
+    let beside = match &status.live {
+        Some(live) => version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION"))
+            .map(|_| NOT_READ_BESIDE_ANOTHER_VERSION.to_string()),
+        None if status.not_asked.is_some() => None,
+        None => another_version_answered(&node_status(config_path, VERSION_ASKED_FOR))
+            .map(|note| format!("{note} So {NOT_READ_BESIDE_ANOTHER_VERSION}")),
+    };
+    let opened = match (db_path.exists(), beside) {
+        (false, _) => None,
+        (true, Some(why)) => Some(Err(anyhow::anyhow!(why))),
+        (true, None) => Some(open_database(&db_path)),
     };
     if let Some(Err(why)) = &opened {
         println!();
@@ -1237,6 +1607,22 @@ fn room_on_volume(folder: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// What a node says where the port of its local API cannot be bound, on
+/// the system named. **Where the port is taken, a node is probably
+/// running already, as the service:** the words say so, and name
+/// `cordelia status` and the command that restarts the service there.
+fn cannot_listen_says(listen_addr: &str, why: &std::io::Error, os: &str) -> String {
+    let says = format!("the node's API cannot listen at {listen_addr}: {why}");
+    match why.kind() {
+        std::io::ErrorKind::AddrInUse => format!(
+            "{says}\nA node is probably running already, as the service: `cordelia status` \
+             says. To restart it:\n  {}",
+            restart_command(os)
+        ),
+        _ => says,
+    }
+}
+
 fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let config_file = config::expand_tilde(config_path);
     let mut config = Config::load(&config_file)?;
@@ -1278,13 +1664,22 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // node that cannot bind, because another is running, changes
     // nothing.
     let api_listener = std::net::TcpListener::bind(&listen_addr)
-        .map_err(|e| anyhow::anyhow!("the node's API cannot listen at {listen_addr}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(cannot_listen_says(&listen_addr, &e, std::env::consts::OS)))?;
 
     // A data directory is one node's (decision 2026-10-04 §10.1): the
     // lock on it is taken before the database is opened, and is held for
     // as long as the process lives. A second node on the same directory,
     // whatever port it was given, says so here and changes nothing.
     let _one_node = lock_data_dir(&data_dir)?;
+
+    // A data directory that others can read, write or enter is set to
+    // its owner's alone, with the configuration file in it, and the log
+    // says so once. It is done here, after the port is bound and the lock
+    // is held: a node that does not start changes nothing.
+    #[cfg(unix)]
+    if let Some(says) = keep_private(&data_dir, &config_file) {
+        tracing::warn!("{says}");
+    }
 
     // Open database. One from a later version is refused (decision
     // 2026-10-04 §10.1). A personal node then stays up, over a database
@@ -2094,6 +2489,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
+    refuse_to_open_beside_another_version(config_path)?;
     let conn = open_database(&db_path)?;
 
     // A personal node carries no channel of the older kind (decision
@@ -2175,6 +2571,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
+    refuse_to_open_beside_another_version(config_path)?;
     let conn = open_database(&db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -2360,6 +2757,11 @@ fn cmd_swarm_init(
     let child_pk_bech32 = encode_public_key(&child_pk)?;
     let child_suffix = child.entity_id_suffix();
     let entity_id = format!("swarm{index}_{child_suffix}");
+
+    // The database is opened below: none is opened, and nothing is made,
+    // beside a node of another version (decision 2026-10-04 §10.1, rule
+    // 6).
+    refuse_to_open_beside_another_version(config_path)?;
 
     // Write child identity
     std::fs::create_dir_all(&data_dir)?;
@@ -3103,6 +3505,51 @@ fn refuse_by_how_it_stands(status: &anyhow::Result<serde_json::Value>) -> anyhow
     }
 }
 
+/// What a command that opens the node's database itself says of a running
+/// node of another version, after the note that says how to restart it.
+const NOT_OPENED_BESIDE_ANOTHER_VERSION: &str = "This command opens the node's database itself, \
+                                                 and does not open it beside a node of another \
+                                                 version: nothing was opened.";
+
+/// What `cordelia status` says in the place of what the database stores,
+/// beside a running node of another version.
+const NOT_READ_BESIDE_ANOTHER_VERSION: &str = "a node of another version is running, and its \
+                                               database is not opened beside it.";
+
+/// The note on a running node of another version than this command
+/// ([`version_note`]), given what answered when the node was asked its
+/// status. `None` where the node is of this command's version, and where
+/// no node answered: there is then none to say it of.
+fn another_version_answered(status: &anyhow::Result<serde_json::Value>) -> Option<String> {
+    let node = status.as_ref().ok()?;
+    version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+}
+
+/// Refuse to open the node's database beside a running node of another
+/// version than this command (decision 2026-10-04 §10.1, rule 6). A
+/// command that opens the database runs the schema's steps on it, and a
+/// node goes on running the version it was started as until it is
+/// restarted: a later command would step the database under an earlier
+/// node. The refusal is the note that says how to restart the node, and
+/// nothing is opened.
+///
+/// The commands that open the database themselves are `stats`,
+/// `channels`, `swarm-init`, and `init` where it makes the database or
+/// is given `--force`. `cordelia status` opens it too, to say what it
+/// stores: beside such a node it says the note, and reads nothing of the
+/// database.
+///
+/// **Where no node answers, the command goes on as it did:** there is
+/// no node to open the database beside. (A command that is sent to the
+/// node is refused there, [`refuse_another_version`]: these are sent to
+/// no node.)
+fn refuse_to_open_beside_another_version(config_path: &str) -> anyhow::Result<()> {
+    match another_version_answered(&node_status(config_path, VERSION_ASKED_FOR)) {
+        None => Ok(()),
+        Some(note) => anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}"),
+    }
+}
+
 /// Say, where the running node is another version than this command, that
 /// it is, and how to restart it: for a command that only shows, or that
 /// turns sync off, which is answered beside such a node all the same
@@ -3111,16 +3558,6 @@ pub(crate) fn note_another_version(config_path: &str) {
     if let Some(note) = node_version_note(config_path) {
         eprintln!("{note}\n");
         VERSION_NOTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// The command that restarts a node which runs as the service that the
-/// install script sets up, on the system named (`std::env::consts::OS`).
-/// The script prints the same one.
-fn restart_command(os: &str) -> &'static str {
-    match os {
-        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
-        _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
     }
 }
 
@@ -6721,6 +7158,259 @@ mod tests {
         assert!(!sweep.is_due(start + hour + second));
         assert!(!sweep.is_due(start + hour * 2 - second));
         assert!(sweep.is_due(start + hour * 2));
+    }
+
+    /// The mode of what is at `path`, as far as who may read, write and
+    /// enter it.
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `cordelia init` makes the data directory its owner's alone (mode
+    /// 0700), and the configuration file that it writes (0600): a
+    /// directory that was there and open to others, as an install script
+    /// may leave one, and a directory that it makes itself. The key, the
+    /// token and the database are 0600 as they were, and run again it
+    /// leaves each as it is.
+    #[cfg(unix)]
+    #[test]
+    fn test_init_makes_the_data_directory_and_the_configuration_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("there");
+        std::fs::create_dir(&there).unwrap();
+        set_mode(&there, 0o775);
+        let made = dir.path().join("not").join("there");
+        for data in [there, made] {
+            let config_file = data.join("config.toml");
+            let mut config = Config::default();
+            config.node.data_dir = data.display().to_string();
+            let init = || {
+                init_with(
+                    &config_file,
+                    config.clone(),
+                    Some("laptop".into()),
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap()
+            };
+            init();
+            assert_eq!(mode(&data), 0o700, "{}", data.display());
+            assert_eq!(mode(&config_file), 0o600);
+            for file in ["identity.key", "node-token", "cordelia.db"] {
+                assert_eq!(mode(&data.join(file)), 0o600, "{file}");
+            }
+            assert_eq!(mode(&data.join("channel-keys")), 0o700);
+            // Run again: the same key, and the same modes.
+            let key = std::fs::read(data.join("identity.key")).unwrap();
+            init();
+            assert_eq!(std::fs::read(data.join("identity.key")).unwrap(), key);
+            assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
+        }
+    }
+
+    /// A configuration file that is a symbolic link is kept elsewhere,
+    /// and no mode is set through the link: not by `cordelia init`, which
+    /// writes the file through it, and not by a node that starts. The
+    /// data directory is set as it always is.
+    #[cfg(unix)]
+    #[test]
+    fn test_no_mode_is_set_through_a_link_to_a_configuration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let elsewhere = dir.path().join("kept-elsewhere.toml");
+        std::fs::write(&elsewhere, "").unwrap();
+        set_mode(&elsewhere, 0o664);
+        let config_file = data.join("config.toml");
+        std::os::unix::fs::symlink(&elsewhere, &config_file).unwrap();
+        assert!(is_a_link(&config_file) && !is_a_link(&elsewhere));
+        assert!(!is_a_link(&data) && !is_a_link(&data.join("none")));
+
+        // `init`, told to write the configuration again: it writes it
+        // through the link, and sets no mode there.
+        let mut config = Config::default();
+        config.node.data_dir = data.display().to_string();
+        init_with(
+            &config_file,
+            config,
+            Some("laptop".into()),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(is_a_link(&config_file));
+        let written = std::fs::read_to_string(&elsewhere).unwrap();
+        assert!(written.contains("laptop_"), "{written}");
+        assert_eq!(mode(&elsewhere), 0o664);
+        assert_eq!(mode(&data), 0o700);
+
+        // A node that starts on the directory, open to others: the
+        // directory is set, and nothing is said or done of the file.
+        set_mode(&data, 0o775);
+        let said = keep_private(&data, &config_file).expect("it says what it set");
+        assert!(
+            said.ends_with("it is now its owner's alone (mode 0700)"),
+            "{said}"
+        );
+        assert_eq!((mode(&data), mode(&elsewhere)), (0o700, 0o664));
+    }
+
+    /// `cordelia init` goes on where the data directory is there and its
+    /// mode cannot be set (it is another's, or its volume refuses the
+    /// change): it says so in one line, with why, and uses the directory
+    /// as it is. Only a directory that cannot be made is an error.
+    #[test]
+    fn test_init_goes_on_where_the_data_directory_cannot_be_made_private() {
+        use std::io::{Error, ErrorKind};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let refused = |_: &std::path::Path| Err(Error::from(ErrorKind::PermissionDenied));
+        let said = private_data_dir(&data, refused).expect("init goes on");
+        assert!(data.is_dir());
+        assert_eq!(
+            said,
+            Some(format!(
+                "Could not make {} private: {}. Other users of this machine may be able to \
+                 read it.",
+                data.display(),
+                Error::from(ErrorKind::PermissionDenied)
+            ))
+        );
+        // Where the mode is set, nothing is said.
+        assert_eq!(private_data_dir(&data, |_| Ok(())).unwrap(), None);
+        // A directory that cannot be made is an error: here a file is in
+        // the way.
+        let in_the_way = dir.path().join("file");
+        std::fs::write(&in_the_way, "").unwrap();
+        let not_made = private_data_dir(&in_the_way.join("data"), |_| Ok(()));
+        assert!(not_made.is_err(), "{not_made:?}");
+    }
+
+    /// A node that starts on a data directory that others can read, write
+    /// or enter sets it to its owner's alone (mode 0700), and the
+    /// configuration file in it (0600), and says so once. Nothing else's
+    /// mode changes: not another file in the directory, and not a
+    /// configuration file that is kept elsewhere. A directory that is its
+    /// owner's alone already is looked at no further, and nothing is
+    /// said.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_node_that_starts_keeps_its_data_directory_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let (config_file, other) = (data.join("config.toml"), data.join("notes"));
+        let elsewhere = dir.path().join("config.toml");
+        for file in [&config_file, &other, &elsewhere] {
+            std::fs::write(file, "").unwrap();
+            set_mode(file, 0o664);
+        }
+        set_mode(&data, 0o775);
+
+        let said = keep_private(&data, &config_file).expect("it says what it set");
+        assert_eq!(
+            said,
+            format!(
+                "the data directory {} could be read, written or entered by others: it is now \
+                 its owner's alone (mode 0700), and so is the configuration file in it (mode \
+                 0600)",
+                data.display()
+            )
+        );
+        assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o600));
+        assert_eq!((mode(&other), mode(&elsewhere)), (0o664, 0o664));
+        // Its owner's alone already: nothing is set, and nothing is said,
+        // whatever the mode of the configuration file in it.
+        set_mode(&config_file, 0o664);
+        assert_eq!(keep_private(&data, &config_file), None);
+        assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o664));
+
+        // A configuration file that is kept elsewhere is left as it is.
+        for open in [0o750, 0o705, 0o701, 0o720] {
+            set_mode(&data, open);
+            let said = keep_private(&data, &elsewhere).expect("it says what it set");
+            assert!(
+                said.ends_with("it is now its owner's alone (mode 0700)"),
+                "{said}"
+            );
+            assert_eq!((mode(&data), mode(&elsewhere)), (0o700, 0o664), "{open:o}");
+        }
+        // A directory that is not there is open to nobody.
+        assert_eq!(keep_private(&dir.path().join("none"), &elsewhere), None);
+    }
+
+    /// Where the port of its local API is taken, a node says that one is
+    /// probably running already, as the service, and names `cordelia
+    /// status` and the command that restarts the service on each system.
+    /// Where the port cannot be bound for another reason it says why,
+    /// and nothing of a service.
+    #[test]
+    fn test_a_port_that_is_taken_is_said_to_be_a_node_that_runs_already() {
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let systems = [
+            (
+                "linux",
+                "systemctl --user daemon-reload && systemctl --user restart cordelia",
+            ),
+            (
+                "macos",
+                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+            ),
+        ];
+        for (os, restart) in systems {
+            assert_eq!(
+                cannot_listen_says("127.0.0.1:9473", &taken, os),
+                format!(
+                    "the node's API cannot listen at 127.0.0.1:9473: {taken}\nA node is \
+                     probably running already, as the service: `cordelia status` says. To \
+                     restart it:\n  {restart}"
+                )
+            );
+        }
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            cannot_listen_says("127.0.0.1:80", &refused, "linux"),
+            format!("the node's API cannot listen at 127.0.0.1:80: {refused}")
+        );
+    }
+
+    /// `cordelia --help`, and `cordelia` with no command, are headed by
+    /// what the program is now, in one short line: it keeps an agent's
+    /// memory in step across a person's machines, end to end encrypted.
+    #[test]
+    fn test_the_program_says_what_it_is_in_one_line() {
+        use clap::CommandFactory;
+        let about = Cli::command().get_about().map(|about| about.to_string());
+        assert_eq!(about.as_deref(), Some(ABOUT));
+        assert_eq!(
+            ABOUT,
+            "Keeps your AI agent's memory in step across your machines, end to end encrypted"
+        );
+        assert!(!ABOUT.contains('\n') && !ABOUT.contains("pub/sub"));
+    }
+
+    /// Run by a person, `cordelia init` ends by saying how the node is
+    /// started. Run by a script, as the install script runs it, it says
+    /// nothing of that: the script names the command that starts the node
+    /// as the service.
+    #[test]
+    fn test_init_run_by_a_script_does_not_say_how_to_start_the_node() {
+        assert_eq!(
+            node_is_ready(false),
+            "Node is ready. Run `cordelia start` to begin."
+        );
+        assert_eq!(node_is_ready(true), "Node is ready.");
     }
 
     #[test]

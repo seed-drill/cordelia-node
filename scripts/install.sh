@@ -130,7 +130,24 @@ download_binary() {
 
 # ── Install ─────────────────────────────────────────────────────────
 
+# The data directory is its owner's alone (mode 700): it holds the
+# device's key, the node's token and the database. So is the configuration
+# file in it (mode 600), but one that is a symbolic link: that file is
+# kept elsewhere, and no mode is set through the link. Where either cannot
+# be set, the script says so and goes on: the node sets both when it
+# starts.
+private_data_dir() {
+    mkdir -p "$DATA_DIR"
+    chmod 700 "$DATA_DIR" 2>/dev/null \
+        || echo "Warning: could not set ${DATA_DIR} to mode 700."
+    if [ -f "${DATA_DIR}/config.toml" ] && [ ! -L "${DATA_DIR}/config.toml" ]; then
+        chmod 600 "${DATA_DIR}/config.toml" 2>/dev/null \
+            || echo "Warning: could not set ${DATA_DIR}/config.toml to mode 600."
+    fi
+}
+
 install_binary() {
+    private_data_dir
     mkdir -p "$INSTALL_DIR"
 
     # Put the new binary beside the old one, then rename it into place: a
@@ -405,12 +422,20 @@ install_launchctl() {
 PLIST
 
     START_CMD="launchctl load ${PLIST_FILE}"
+    START_SAYS="                        # run the node as a background service"
     RESTART_CMD="launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Stop:   launchctl unload ${PLIST_FILE}"
     echo "  Logs:   tail -f ${DATA_DIR}/logs/cordelia.log"
+}
+
+# Whether a systemd user session answers on this machine. Only then can
+# the node be started as the service that this script writes: in a
+# container, or at a login that has no such session, none answers.
+systemd_user_answers() {
+    systemctl --user show-environment >/dev/null 2>&1
 }
 
 install_systemd() {
@@ -437,8 +462,22 @@ WantedBy=default.target
 SERVICE
 
     START_CMD="systemctl --user enable --now cordelia"
+    START_SAYS="                        # run the node as a background service"
     RESTART_CMD="systemctl --user daemon-reload && systemctl --user restart cordelia"
     LOGS_CMD="journalctl --user -u cordelia -n 50"
+
+    # With no service manager that the script can use, the node is run by
+    # hand: the closing words name that command, and not one that cannot
+    # work here. The service's file is written all the same.
+    if ! systemd_user_answers; then
+        START_CMD="cordelia start"
+        START_SAYS="                        # run the node yourself: you have no systemd user session here.
+                        # It runs until you close that terminal"
+        echo "systemd user service written: ${SERVICE_FILE}"
+        echo "  You have no systemd user session here, so the service cannot start."
+        return
+    fi
+
     echo "systemd user service installed: ${SERVICE_FILE}"
     echo "  Start:  ${START_CMD}"
     echo "  Status: systemctl --user status cordelia"
@@ -456,8 +495,14 @@ SERVICE
 
 # ── Init ────────────────────────────────────────────────────────────
 
+# A machine with no key yet is set up here: that makes this a first
+# install. `--non-interactive` has init say nothing of how the node is
+# started: the closing words below name the one command that starts it as
+# the service.
 maybe_init() {
+    FIRST_INSTALL=""
     if [ ! -f "${DATA_DIR}/identity.key" ]; then
+        FIRST_INSTALL=yes
         echo ""
         echo "Running cordelia init..."
         export PATH="${INSTALL_DIR}:$PATH"
@@ -466,6 +511,42 @@ maybe_init() {
             exit 1
         fi
     fi
+}
+
+# What a first install ends with, in this order: the one command that
+# starts the node, as the service or, where no service manager can be
+# used, by hand; the three ways on for a machine that follows no recovery
+# phrase, each with its command; and the two commands that turn memory
+# sync on and say what syncs.
+first_steps() {
+    echo "Next steps:"
+    echo "  ${START_CMD}"
+    echo "${START_SAYS}"
+    echo ""
+    echo "Then one of these three:"
+    echo "  cordelia phrase       # this is your first machine: make a phrase here"
+    echo "  cordelia id           # another machine has the phrase: add this one from it."
+    echo "                        #   Give this key to cordelia add-device there; it"
+    echo "                        #   prints the cordelia accept to run here"
+    echo "  cordelia recover      # every device that has the phrase is lost: recover"
+    echo "                        #   here with it. Do not make a new phrase first"
+    echo ""
+    echo "Then:"
+    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
+    echo "  cordelia sync map <folder>"
+    echo "                        # sync Claude Code's memory for that folder"
+}
+
+# What a later run ends with, where no node is running here.
+next_steps() {
+    echo "Next steps:"
+    echo "  ${START_CMD}"
+    echo "${START_SAYS}"
+    echo "  cordelia status       # the node and its relays"
+    echo "  cordelia id           # this device's key, to pair another device"
+    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
+    echo "  cordelia sync map <folder>"
+    echo "                        # sync Claude Code's memory for that folder"
 }
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -481,6 +562,8 @@ main() {
     setup_path
     install_service
     maybe_init
+    # Again, now that a first install has its configuration file.
+    private_data_dir
 
     echo ""
     echo "Cordelia installed successfully."
@@ -491,14 +574,11 @@ main() {
         finish
         return
     fi
-    echo "Next steps:"
-    echo "  ${START_CMD}"
-    echo "                        # run the node as a background service"
-    echo "  cordelia status       # the node and its relays"
-    echo "  cordelia id           # this device's key, to pair another device"
-    echo "  cordelia sync claude  # turn on memory sync: lists what it found"
-    echo "  cordelia sync map <folder>"
-    echo "                        # sync Claude Code's memory for that folder"
+    if [ -n "$FIRST_INSTALL" ]; then
+        first_steps
+    else
+        next_steps
+    fi
     echo ""
     echo "Open a new terminal first if 'cordelia' is not found."
     echo ""

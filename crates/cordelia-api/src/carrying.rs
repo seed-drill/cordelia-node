@@ -525,11 +525,8 @@ pub async fn carry_name(
         let channel = held_rows::channel_of_name(&conn, name)?
             .ok_or_else(|| PersonError::NameNotHeld(name.to_string()))?;
         if only_where_empty && !entries::channel_slots(&conn, &channel)?.is_empty() {
-            done.nothing = Some(
-                "the new channel holds something for this name already: nothing was carried \
-                 for the mapping"
-                    .into(),
-            );
+            // A command says "nothing was carried", and then this.
+            done.nothing = Some("the new channel holds something for this name already".into());
             return Ok(done);
         }
         for was in &read {
@@ -595,6 +592,31 @@ fn removed_says(removed: &Removed, all: &[Removed]) -> serde_json::Value {
         "label": removed.label,
         "by_words": carry::words_tell(&removed.key, all),
     })
+}
+
+/// Whether the channel of `name` in the generation applied holds already
+/// all of `versions`, which one key signed in generations that were left
+/// (decision 2026-10-04 §7.3): each is there as it is, or an entry at a
+/// higher revision is in its slot. Such a key's work is not missing, and
+/// a command says so of it. A delete that a removed key signed is never
+/// taken, and is not counted. `false` where no version is held so.
+///
+/// It is judged in the device's own store, with nothing written.
+fn held_in_full(
+    conn: &rusqlite::Connection,
+    identity: &cordelia_crypto::identity::NodeIdentity,
+    name: &str,
+    versions: &[Version],
+) -> Result<bool, PersonError> {
+    let mut held = 0;
+    for version in versions {
+        match carry::would_bring(conn, identity, name, version, Rule::EmptySlots)? {
+            carry::Brought::Held | carry::Brought::Higher => held += 1,
+            carry::Brought::Delete => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(held > 0)
 }
 
 /// Of what was read in the generations, the newest version of each file
@@ -740,7 +762,9 @@ pub struct FromLookRequest {
 /// It reads the name's channel in each generation that the device left
 /// and still holds the secret of, and answers with:
 ///
-/// - each removed key that signed there, with how many entries;
+/// - each removed key that signed there, with how many entries, and
+///   whether the new channel holds already all that it signed
+///   (`brought_back`);
 /// - where keys were named: those keys; how many of their versions would
 ///   go into slots where the new channel holds nothing; the files of
 ///   which a version of theirs stands above a version that the new
@@ -819,12 +843,29 @@ pub async fn look_from(
             *signed.entry(key).or_default() += entries;
         }
     }
+    // Which of those keys has all that it signed in the new channel
+    // already ([`held_in_full`]): it is marked, so that its work is not
+    // taken for missing. Judged only for a name that the device holds,
+    // in its own store: nothing is fetched for it, and nothing written.
+    let mut brought_back: Vec<[u8; 32]> = Vec::new();
+    {
+        let conn = db(state);
+        if held_rows::channel_of_name(&conn, name)?.is_some() {
+            for one in removed.iter().filter(|one| signed.contains_key(&one.key)) {
+                let versions = newest_of(&read, &[one.key])?;
+                if held_in_full(&conn, &state.identity, name, &versions)? {
+                    brought_back.push(one.key);
+                }
+            }
+        }
+    }
     let signed_there: Vec<serde_json::Value> = removed
         .iter()
         .filter_map(|one| {
             let entries = *signed.get(&one.key)?;
             let mut says = removed_says(one, &removed);
             says["entries"] = entries.into();
+            says["brought_back"] = brought_back.contains(&one.key).into();
             Some(says)
         })
         .collect();
@@ -1594,6 +1635,8 @@ mod tests {
             nothing.contains("holds something for this name already"),
             "{nothing}"
         );
+        // That nothing was carried is the command's to say, once.
+        assert!(!nothing.contains("nothing was carried"), "{nothing}");
         assert_eq!(held.stored(), before);
         assert_eq!(held.text(LAB, "theirs.md"), None);
         // Asked for by name, it is carried.
@@ -1621,6 +1664,9 @@ mod tests {
         assert_eq!(signed["label"], "device 2");
         assert_eq!(signed["entries"], 3);
         assert_eq!(signed["by_words"], true);
+        // The new channel lacks what it signed: it is not marked as
+        // brought back.
+        assert_eq!(signed["brought_back"], false);
         assert_eq!(listed["keys"], json!([]));
         assert_eq!(listed["empty"], 0);
         // Nothing was written.
@@ -2009,6 +2055,13 @@ mod tests {
         assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("over it"));
         // A file that the word does not name stays where it is.
         assert_eq!(node.text(LAB, "deleted.md"), None);
+
+        // The new channel now holds all that the removed key signed
+        // there, but its delete, which is never taken: the list of the
+        // removed keys that signed marks it as brought back.
+        let listed = look_from(&node.state, LAB, &[]).await.unwrap();
+        assert_eq!(listed["signed"][0]["key"], hex::encode(removed));
+        assert_eq!(listed["signed"][0]["brought_back"], true, "{listed}");
     }
 
     /// **Which slots of the new channel hold nothing is judged only

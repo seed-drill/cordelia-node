@@ -114,10 +114,18 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
         status.contains("Devices:   no recovery phrase yet"),
         "{status}"
     );
+    // Where it stands, and then the three ways on, each on a line of
+    // its own and in this order: a person who has lost every device is
+    // pointed to `cordelia recover`, and told to make no new phrase
+    // first.
     assert!(
         status.contains(
-            "no recovery phrase yet: memory stays on this machine. Make one here (`cordelia \
-             phrase`), or add this machine from one that has one."
+            "    no recovery phrase yet: memory stays on this machine.\n      \
+             - This is your first machine: make a phrase here (`cordelia phrase`).\n      \
+             - Another machine has the phrase: add this one from it (`cordelia add-device` \
+             there, `cordelia accept` here).\n      \
+             - Every device that has the phrase is lost: recover here with it (`cordelia \
+             recover`). Do not make a new phrase first.\n"
         ),
         "{status}"
     );
@@ -129,8 +137,17 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     assert_eq!(json["sync"]["moved_on"], false, "{json}");
     let says = json["person"]["says"][0].as_str().unwrap();
     assert!(says.starts_with("no recovery phrase yet:"), "{json}");
+    assert_eq!(
+        json["person"]["says"].as_array().unwrap().len(),
+        4,
+        "{json}"
+    );
     let devices = laptop.cli(&["devices"]);
     assert!(devices.contains("no recovery phrase yet:"), "{devices}");
+    assert!(
+        devices.contains("\n  - Every device that has the phrase is lost: recover here"),
+        "{devices}"
+    );
 
     // The phrase, made at a terminal.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
@@ -151,6 +168,17 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
          - It is not a wallet phrase. Never type it into a wallet, and never type a wallet's \
          words here.\r\n";
     assert!(said.starts_with(before_anything), "{said:?}");
+    // On a machine that follows no phrase: a person who has a phrase
+    // already, and has lost every device, is pointed to `cordelia
+    // recover` before any word of a new phrase is shown.
+    let has_one_already = "\r\nIf you have a recovery phrase already and every device is lost, \
+         do not make a new one.\r\nPress Ctrl-C, and recover with the phrase you have:\r\n  \
+         cordelia recover\r\n";
+    let pointed_at = said.find(has_one_already).expect("the way to recover");
+    assert!(
+        pointed_at < said.find("Your recovery phrase (shown once):").unwrap(),
+        "{said:?}"
+    );
     for says in [
         "Your recovery phrase (shown once):\r\n\r\n   1. ",
         "Write the twelve words down, in order. Keep them where only you can read them.\r\n\
@@ -425,7 +453,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     let accepted = at.done();
     println!("{accepted}");
     assert!(
-        accepted.contains("this device has joined") && accepted.contains("applied change 1"),
+        accepted.contains("\nThis device has joined") && accepted.contains("applied change 1"),
         "{accepted}"
     );
 
@@ -489,14 +517,18 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     let json: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["person"]["notices"][0]["says"], told.as_str());
     assert_eq!(json["person"]["notices"][0]["kind"], "added");
-    // Not cleared without a yes.
+    // Not cleared without a yes. What is asked begins with the notice,
+    // on the first line and with a capital.
+    let asked = told.replacen("new device", "New device", 1);
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says(&told).says("Type yes to go on").types("no");
-    assert!(at.done().contains("It stays."));
+    at.says(&asked).says("Type yes to go on").types("no");
+    let said = at.done();
+    assert!(said.starts_with(&asked), "{said:?}");
+    assert!(said.contains("It stays."), "{said}");
     assert_eq!(notices(&laptop), std::slice::from_ref(&told));
     // Cleared with one, on that device and on no other.
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says(&told).says("Type yes to go on").types("yes");
+    at.says(&asked).says("Type yes to go on").types("yes");
     assert!(at.done().contains("Cleared on this device."));
     assert!(notices(&laptop).is_empty());
     assert!(!laptop.cli(&["status"]).contains("new device:"));
@@ -597,7 +629,11 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // refusal says the way on.
     let said = laptop.at_terminal(&["add-device", &other]).refused();
     assert!(
-        said.contains("this device follows no recovery phrase yet. Make one here"),
+        said.contains("this device follows no recovery phrase yet.\r\n  - This is your first"),
+        "{said}"
+    );
+    assert!(
+        said.contains("recover here with it (`cordelia recover`). Do not make a new phrase first."),
         "{said}"
     );
     // Nor removed, renewed or settled.
@@ -1413,11 +1449,22 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&laptop_key)
     ));
     at.says("Type yes to go on").types("yes");
+    // Where the command itself says what became of the key, that is its
+    // last line, and it begins with a capital: read from what the command
+    // printed, and from nothing that the harness made of it.
+    let printed = at.done();
+    if !printed.contains("Nothing was taken yet") {
+        assert!(
+            printed.ends_with("\nThis device has applied change 2, which it was handed.\r\n"),
+            "{printed:?}"
+        );
+    }
     // The command stays a minute: where the hand-over is read later than
-    // that, the node says what became of the key.
-    let said = became_of_the_key(&tablet, &laptop_key, at.done());
+    // that, the node says what became of the key, in its own words.
+    let said = became_of_the_key(&tablet, &laptop_key, printed);
     assert!(
-        said.contains("this device has applied change 2, which it was handed"),
+        said.to_lowercase()
+            .contains("this device has applied change 2, which it was handed"),
         "{said}"
     );
     let seen = look(&tablet);
@@ -1698,11 +1745,11 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // person clears the last there, and it is shown there no more.
     assert_eq!(notices(&laptop).len(), 3);
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
-    at.says("new device: (")
+    at.says("New device: (")
         .says(") \"desktop\", added from")
         .says("Type yes to go on")
         .types("no");
-    at.says("new device: (")
+    at.says("New device: (")
         .says(") \"tablet\", added from")
         .says("Type yes to go on")
         .types("no");
@@ -1740,7 +1787,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     at.says("Type yes to go on").types("yes");
     let said = at.done();
     assert!(
-        said.contains("this device has left the recovery phrase it followed alone, and has joined"),
+        said.contains("This device has left the recovery phrase it followed alone, and has joined"),
         "{said}"
     );
     assert_eq!(text(&look(&desktop), "among"), "several");
@@ -1780,11 +1827,32 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     let new_key = key_of(&tablet);
     assert_ne!(new_key, tablet_key);
     assert!(said.contains(&new_key), "{said}");
+    // It ends with the command that restarts the node as the service on
+    // this system, on a line of its own, and `cordelia status` after it.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        said.contains(&format!(
+            "The node still runs under the old key. Before anything else, restart the \
+             node:\r\n  {restart}\r\nThen run `cordelia status`.\r\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
     // Until the node is started again it makes nothing for a command,
-    // under a key that is the device's no longer.
+    // under a key that is the device's no longer: and says the same.
     let said = tablet.refused(&["devices"]);
     assert!(
-        said.contains("this device was given a new key, and the node still runs under the old one"),
+        said.contains(&format!(
+            "this device was given a new key, and the node still runs under the old one. \
+             Restart the node:\n  {restart}\nThen run `cordelia status`.\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
+    // So does `cordelia accept`, which is what a person runs next.
+    let said = tablet.at_terminal(&["accept", &laptop_key]).refused();
+    assert!(
+        said.contains(&format!("Restart the node:\r\n  {restart}\r\n")),
         "{said}"
     );
     tablet.stop();
@@ -4306,6 +4374,16 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
         .at_terminal_through(stand_in.port, &["renew"])
         .refused_within(soon);
     assert!(said.contains(refusal), "{said}");
+    // It says how the node is restarted on this system, and names no
+    // command that restarts no service.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        said.contains(&format!(
+            "If this device was given a new key, restart the node:\r\n  {restart}\r\n"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("cordelia start"), "{said}");
     for never in [
         "Type your recovery phrase, one word at a time",
         "Make this change?",
@@ -4875,6 +4953,14 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
             said.contains("says nothing of where this device stands"),
             "{args:?}: {said}"
         );
+        // It says how the node is restarted on this system, and names no
+        // command that restarts no service.
+        let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+        assert!(
+            said.contains(&format!("Restart the node:\r\n  {restart}\r\n")),
+            "{args:?}: {said}"
+        );
+        assert!(!said.contains("cordelia start"), "{args:?}: {said}");
         assert!(!said.contains("Type yes to go on"), "{args:?}: {said}");
         assert!(!said.contains("shown once"), "{args:?}: {said}");
         let looks = looks_asked(&no_state, before);
@@ -4885,6 +4971,130 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
             "{args:?}: {looks:?}"
         );
     }
+}
+
+/// A command that opens the node's database itself does not open it
+/// beside a running node of another version than its own (decision
+/// 2026-10-04 §10.1, rule 6): opening runs the schema's steps, and a
+/// later command would step the database under an earlier node. `cordelia
+/// stats`, `cordelia channels` and `cordelia init --force` say the note
+/// that names the restart, end in failure, and open nothing: the
+/// database stays at its schema version, byte for byte. `cordelia
+/// status` still answers: it says the note, and that the database was
+/// not read. **Where no node answers, each goes on as it did,** and the
+/// database is stepped as any opening steps it.
+///
+/// The node here is of this version, behind a stand-in that says it is
+/// of another. The database is one of the test's own, in the released
+/// version's form, in a directory beside the node's with a key and a
+/// token: no command here opens the database that the node runs on.
+#[test]
+fn a_command_that_opens_the_database_opens_none_beside_a_node_of_another_version() {
+    use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
+    let another = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.0-another".into();
+        }
+    });
+
+    // A data directory as the released version left one.
+    let beside = laptop.dir.path().join("beside");
+    std::fs::create_dir(&beside).unwrap();
+    for file in ["identity.key", "node-token"] {
+        std::fs::copy(laptop.data_dir().join(file), beside.join(file)).unwrap();
+    }
+    let database = beside.join("cordelia.db");
+    drop(cordelia_storage::first_start::released::database(&database).unwrap());
+    let schema_version = || -> u32 {
+        let db = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
+    const { assert!(RELEASED_SCHEMA_VERSION < SCHEMA_VERSION) };
+    let as_it_was = std::fs::read(&database).unwrap();
+    let key = std::fs::read(beside.join("identity.key")).unwrap();
+
+    // Beside the node that says it is of another version.
+    let port = another.port.to_string();
+    let directory = beside.to_str().unwrap();
+    let through = [
+        ("CORDELIA_DATA_DIR", directory),
+        ("CORDELIA_HTTP_PORT", port.as_str()),
+    ];
+    let note = "The running node is version 0.0.0-another and this command is version";
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    let opens: [&[&str]; 4] = [
+        &["stats"],
+        &["stats", "--json"],
+        &["channels"],
+        &["init", "--force"],
+    ];
+    for args in opens {
+        let before = another.asked().len();
+        let out = laptop.command_given(&through, args);
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?}: {said}");
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert!(said.contains(restart), "{args:?}: {said}");
+        assert!(
+            said.contains("does not open it beside a node of another version: nothing was opened."),
+            "{args:?}: {said}"
+        );
+        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
+        // The node was asked its version, and nothing else.
+        let asked = another.asked();
+        assert!(asked.len() > before, "{args:?} did not ask the node");
+        for (path, _) in &asked[before..] {
+            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
+        }
+    }
+    // `init --force` wrote no new key either.
+    assert_eq!(std::fs::read(beside.join("identity.key")).unwrap(), key);
+
+    // `cordelia status` still answers, and reads nothing of the database.
+    let out = laptop.command_given(&through, &["status"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains(
+            "Storage:\n  Not read:  a node of another version is running, and its database \
+             is not opened beside it."
+        ),
+        "{said}"
+    );
+    assert!(said.contains(note), "{said}");
+    assert!(!said.contains("DB size:"), "{said}");
+    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
+    assert_eq!(std::fs::read(&database).unwrap(), as_it_was);
+
+    // The control: where no node answers, each goes on as it did, and
+    // the opening steps the database.
+    let nobody = {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        free.local_addr().unwrap().port().to_string()
+    };
+    let alone = [
+        ("CORDELIA_DATA_DIR", directory),
+        ("CORDELIA_HTTP_PORT", nobody.as_str()),
+    ];
+    let out = laptop.command_given(&alone, &["stats"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(said.contains("Database:"), "{said}");
+    assert_eq!(schema_version(), SCHEMA_VERSION);
 }
 
 // ── A change made while a pass is in flight ──────────────────────────

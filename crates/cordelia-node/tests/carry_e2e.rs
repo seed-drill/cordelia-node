@@ -588,8 +588,15 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         .says("say no unless you know it was not.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");
+    // Before the second yes it says what becomes of the text that the
+    // version replaces: a conflict copy, which the status shows until it
+    // is deleted.
     at.says("Also bring in 1 version above the version that the new channel holds?")
         .says("first.md")
+        .says("The text that each replaces is kept beside its file as a conflict copy")
+        .says("The status shows a conflict until you delete that copy.")
+        .says("Merge what you want from it into the file first.")
+        .says("Type yes to go on")
         .types("no");
     at.says("Those stay where they are.")
         .says("Type your recovery phrase, one word at a time")
@@ -793,6 +800,7 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     let another = "legal winner thank year wave sausage worth useful legal winner thank yellow";
     let mut at = desktop.at_terminal(&["sync", "carry", "lab", "--phrase"]);
     at.says("the generations whose secret this device never held")
+        .says("it was off through two changes or more, or was added after a change")
         .says("Read those generations of lab")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")

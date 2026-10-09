@@ -283,6 +283,9 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
         older_rows(&conn)
     };
     let database = std::fs::read(device.data_dir().join("cordelia.db")).unwrap();
+    // Its data directory is open to others, as an earlier version made it.
+    #[cfg(unix)]
+    set_mode(&device.data_dir(), 0o775);
     // Another holds the port.
     let held = std::net::TcpListener::bind(("127.0.0.1", device.http)).unwrap();
 
@@ -305,7 +308,22 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
     assert!(!ended.success());
     let log = std::fs::read_to_string(device.log()).unwrap();
     assert!(log.contains("the node's API cannot listen at"), "{log}");
+    // It says what the likely reason is, and the way on.
+    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
+    assert!(
+        log.contains(&format!(
+            "A node is probably running already, as the service: `cordelia status` says. To \
+             restart it:\n  {restart}"
+        )),
+        "{log}"
+    );
     drop(held);
+    // Not the mode of its data directory either.
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&device.data_dir()), 0o775);
+        assert!(!log.contains(MADE_PRIVATE), "{log}");
+    }
 
     assert_eq!(
         std::fs::read(device.data_dir().join("cordelia.db")).unwrap(),
@@ -319,6 +337,63 @@ fn a_node_that_cannot_bind_its_port_changes_nothing() {
     let conn = database_of(&device);
     assert_eq!(schema_version(&conn), 10);
     assert_eq!(older_rows(&conn), before);
+}
+
+/// The mode of what is at `path`, as far as who may read, write and
+/// enter it.
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// What a node's log says where it set its data directory to its owner's
+/// alone.
+#[cfg(unix)]
+const MADE_PRIVATE: &str = "could be read, written or entered by others: it is now its owner's \
+                            alone (mode 0700)";
+
+/// `cordelia init` makes the data directory its owner's alone. A node
+/// that is started on one that others can read, write or enter, as an
+/// earlier version made it, sets it to mode 0700 and says so once in its
+/// log: at its next start there is nothing to set, and nothing is said.
+/// The key, the token and the database are 0600 as they were, and the
+/// configuration file, which the harness keeps beside the data directory
+/// and not in it, is left as it is.
+#[cfg(unix)]
+#[test]
+fn a_node_that_starts_makes_its_data_directory_its_owners_alone() {
+    let mut device = node("laptop", "personal", None);
+    let data = device.data_dir();
+    assert_eq!(mode_of(&data), 0o700, "as `cordelia init` made it");
+
+    set_mode(&data, 0o775);
+    set_mode(&device.config(), 0o664);
+    device.start();
+    wait_for("the device is up", &[&device], 30, || healthy(&device));
+    assert_eq!(mode_of(&data), 0o700);
+    assert_eq!(mode_of(&device.config()), 0o664);
+    for file in ["identity.key", "node-token", "cordelia.db"] {
+        assert_eq!(mode_of(&data.join(file)), 0o600, "{file}");
+    }
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(log.matches(MADE_PRIVATE).count(), 1, "{log}");
+
+    // Started again: it is its owner's alone already.
+    device.stop();
+    device.start();
+    wait_for("the device is up again", &[&device], 30, || {
+        healthy(&device)
+    });
+    assert_eq!(mode_of(&data), 0o700);
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(log.matches(MADE_PRIVATE).count(), 0, "{log}");
 }
 
 /// A node answers from the moment its port is bound, while the copy of
