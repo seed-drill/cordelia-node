@@ -1471,7 +1471,8 @@ pub const RELAY_CHANNEL_PAGES_PER_PASS: usize = 10;
 ///
 /// It is sized for a device with 256 names, which is what an address may
 /// make a relay take in an hour: a pull of each every ten seconds, and of
-/// the personal channel (1,542 a minute); its day's proofs in one burst,
+/// the personal channel and the messages channel (1,548 a minute); its
+/// day's proofs in one burst,
 /// as many as a relay remembers for a connection (1,024); a show for each
 /// pass and each time it sends; and what it pushes.
 pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
@@ -1760,8 +1761,233 @@ pub const RECOVERY_MAX_DEVICES_SHOWN: usize = 256;
 /// Derived: MAX_EARLIER_SECRETS and one.
 pub const RECOVERY_MAX_LEFT_SECRETS: usize = MAX_EARLIER_SECRETS + 1;
 
+// ── Messages between your own agents (decision 2026-10-09) ──────────
+
+/// The label that the messages channel's secret is derived under, from
+/// the person secret (decision 2026-10-09 §2.1). A label of its own, and
+/// not a name under LABEL_OWN, so that no place which lists names has to
+/// pass over one.
+pub const LABEL_AGENT_MESSAGES: &[u8] = b"cordelia v2 messages";
+
+/// The label that a message's ID is hashed under (decision 2026-10-09
+/// §2.2): the first 16 bytes of SHA-256 of this label, the signer's key
+/// and the value.
+pub const LABEL_AGENT_MESSAGE_ID: &[u8] = b"cordelia v2 message id";
+
+/// The label that a mark in a device's list of what its agents read is
+/// hashed under (decision 2026-10-09 §2.2): the first 16 bytes of SHA-256
+/// of this label, the message's ID and the name of the agent that read it.
+pub const LABEL_AGENT_MESSAGE_READ: &[u8] = b"cordelia v2 message read";
+
+/// The first part of the name of a message, or of the entry that clears
+/// one (decision 2026-10-09 §2.2): the sender's key follows it, as a
+/// device's key is written, then `/` and the slot's place in its ring.
+pub const AGENT_MESSAGE_PREFIX: &str = "msg/";
+
+/// The first part of the name of a device's list of what its agents read
+/// (decision 2026-10-09 §2.2, §2.4): the device's key follows it.
+pub const AGENT_MESSAGE_READ_PREFIX: &str = "read/";
+
+/// How many slots a device has for its messages (decision 2026-10-09
+/// §2.3), how many numbers of one signer are live at a reader (§2.5), and
+/// how many places a reader gives one signer in an hour (§6). With its
+/// list, a device has 65 slots of the messages channel, and 64 devices'
+/// are within what a relay holds of one channel. It is above the device's
+/// hourly limit, so an honest device's hour of messages is never
+/// overwritten within the hour.
+pub const AGENT_MESSAGE_RING: usize = 64;
+
+/// The content of every entry of the messages channel, whatever it holds
+/// (decision 2026-10-09 §2.2): one size class, so that a relay learns no
+/// length, and a slot that is written again is never larger.
+pub const AGENT_MESSAGE_CONTENT_BYTES: usize = 2048;
+
+/// The value of every entry of the messages channel: a message, the entry
+/// that clears one, or a list (decision 2026-10-09 §2.2).
+/// Derived: AGENT_MESSAGE_CONTENT_BYTES, less the seal
+/// (ITEM_SEAL_OVERHEAD_BYTES), less the 7 bytes of an entry's form around
+/// its name and value (the name's length, the value's kind and length,
+/// and the chain's count), less the longest name: `msg/`, a key as it is
+/// written (70 bytes), `/` and two digits. So every entry of the channel
+/// seals at the one size through `Entry::seal` as it is.
+pub const AGENT_MESSAGE_VALUE_BYTES: usize = AGENT_MESSAGE_CONTENT_BYTES
+    - ITEM_SEAL_OVERHEAD_BYTES
+    - 7
+    - (AGENT_MESSAGE_PREFIX.len() + 70 + 1 + 2);
+
+/// The most bytes of a message's body (decision 2026-10-09 §2.2): a
+/// paragraph, and a link to where the rest is.
+pub const AGENT_MESSAGE_BODY_MAX_BYTES: usize = 1024;
+
+/// The most bytes of a name in a message's `from` and `to` (decision
+/// 2026-10-09 §2.2): a name's own bound, which a test in `cordelia-api`
+/// ties to this.
+pub const AGENT_MESSAGE_NAME_MAX_BYTES: usize = 200;
+
+/// The bounds of a link's three parts (decision 2026-10-09 §2.2): an
+/// owner's and a repository's longest names where links are made, and the
+/// digits of a number below 2^32.
+pub const AGENT_MESSAGE_LINK_OWNER_MAX_BYTES: usize = 39;
+pub const AGENT_MESSAGE_LINK_REPO_MAX_BYTES: usize = 100;
+pub const AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS: usize = 10;
+
+/// The most bytes of a link, `owner/repo#n` (decision 2026-10-09 §2.2).
+/// Derived: the three parts at their bounds, with `/` and `#`.
+pub const AGENT_MESSAGE_LINK_MAX_BYTES: usize = AGENT_MESSAGE_LINK_OWNER_MAX_BYTES
+    + 1
+    + AGENT_MESSAGE_LINK_REPO_MAX_BYTES
+    + 1
+    + AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS;
+
+/// A message's ID, in bytes (decision 2026-10-09 §2.2): 128 bits, as a
+/// link's hash is in a chain.
+pub const AGENT_MESSAGE_ID_BYTES: usize = 16;
+
+/// How many hex characters of a message's ID are shown (decision
+/// 2026-10-09 §2.2): enough to tell apart the few hundred messages a
+/// device holds. A longer prefix is taken where two match.
+pub const AGENT_MESSAGE_ID_SHOWN_CHARS: usize = 8;
+
+/// A mark in a device's list of what its agents read, in bytes (decision
+/// 2026-10-09 §2.2): 128 bits, as an ID is.
+pub const AGENT_MESSAGE_READ_MARK_BYTES: usize = 16;
+
+/// The most marks in a device's list of what its agents read (decision
+/// 2026-10-09 §2.2, §2.4).
+/// Derived: as many as fit in a value after the form's byte and the
+/// count's two.
+pub const AGENT_MESSAGE_READ_MARKS_MAX: usize =
+    (AGENT_MESSAGE_VALUE_BYTES - 1 - 2) / AGENT_MESSAGE_READ_MARK_BYTES;
+
+/// How long a message is shown on a device, from its shown time, and when
+/// its sender clears it at the relays (decision 2026-10-09 §7.1): 30 days.
+/// Messages are coordination, not a record. Also how long a kept value
+/// waits for every relay to take it (§2.3).
+pub const AGENT_MESSAGE_KEPT_DAYS: u32 = 30;
+
+/// How far ahead of a sender's clock a `sent` of its own may be and still
+/// hold its sending back (decision 2026-10-09 §7.1): ten minutes. A row
+/// further ahead is passed over, so a clock that was ahead for a moment
+/// does not lock a device out. A reader uses no such bound.
+pub const AGENT_MESSAGE_AHEAD_MAX_SECS: u64 = 600;
+
+/// The most numbers that one message is sent under (decision 2026-10-09
+/// §2.3): a restore a lap behind needs one more, and behind two relays
+/// two; four leaves room, and bounds a relay that answers falsely.
+pub const AGENT_MESSAGE_SENDS_MAX: usize = 4;
+
+/// The most messages an honest command sends from one folder in an hour
+/// (decision 2026-10-09 §6). A message to every name counts as one.
+pub const AGENT_MESSAGES_PER_FOLDER_PER_HOUR: usize = 20;
+
+/// The most messages an honest command sends from one device in an hour,
+/// each sending again counted as one (decision 2026-10-09 §6): below the
+/// ring, so a device with many folders does not go round its ring before
+/// anyone reads.
+pub const AGENT_MESSAGES_PER_DEVICE_PER_HOUR: usize = 60;
+
+/// How many messages between two agents that are shown on a device and
+/// that no person there has read stop that device sending between them
+/// (decision 2026-10-09 §6).
+pub const AGENT_MESSAGE_PAIR_UNREAD_MAX: usize = 10;
+
+/// How many lines of new messages `cordelia msg summary` prints, and how
+/// many IDs its count line lists (decision 2026-10-09 §4.1).
+pub const AGENT_MESSAGE_SUMMARY_LINES: usize = 5;
+
+/// The most Unicode scalar values of a subject that is printed (decision
+/// 2026-10-09 §4.1).
+pub const AGENT_MESSAGE_SUBJECT_CHARS: usize = 80;
+
+/// The most Unicode scalar values of an agent's name in `summary`, in
+/// `read` and in `send`'s line (decision 2026-10-09 §4.1): `github.com/`
+/// and an owner and a repository of usual lengths.
+pub const AGENT_MESSAGE_AGENT_NAME_CHARS: usize = 48;
+
+/// How long `cordelia msg summary` has, in all, from the moment it reads
+/// its clock (decision 2026-10-09 §4.1): a hook runs on every prompt, and
+/// must never hold an agent up.
+pub const AGENT_MESSAGE_SUMMARY_WAIT_MS: u64 = 100;
+
+/// How long `summary` waits for a hook's input, and the most of it that
+/// it reads (decision 2026-10-09 §4.1). A hook's input is written before
+/// the hook is waited on, so it is there at once; the wait is for a busy
+/// machine, and an open pipe that nothing writes to holds nothing up.
+pub const AGENT_MESSAGE_HOOK_INPUT_WAIT_MS: u64 = 20;
+pub const AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES: usize = 65_536;
+
+/// The random bytes of the value that marks one printing of a body
+/// (decision 2026-10-09 §4.1): 48 bits that a body written before them
+/// cannot guess.
+pub const AGENT_MESSAGE_MARKER_BYTES: usize = 6;
+
+/// How often a sender clears its expired messages, and then checkpoints
+/// its log (decision 2026-10-09 §2.3, §7.1).
+/// Derived: as often as a relay sweeps its unused channels,
+/// ENTRY_CHANNEL_SWEEP_INTERVAL_SECS. A body stays at most an hour past
+/// its 30 days while its sender is on.
+pub const AGENT_MESSAGE_CLEAR_INTERVAL_SECS: u64 = ENTRY_CHANNEL_SWEEP_INTERVAL_SECS;
+
+/// The highest number a message can have (decision 2026-10-09 §2.3): a
+/// message's revision is twice its number, and its clearing's one more,
+/// which must stay in the bottom half of band 0.
+/// Derived: the highest k for which 2k + 1 is below REV_BAND_HALF.
+pub const AGENT_MESSAGE_NUMBER_MAX: u64 = REV_BAND_HALF / 2 - 1;
+
+// Checked at compile time (decision 2026-10-09 §6). The largest message:
+// the form, the flags, `sent`, the nonce, `thread` and `answers`; `from`
+// and `to` behind their lengths with the kind of `to` between them; the
+// link behind its length; and the body behind its length.
+const _: () = assert!(
+    1 + 1
+        + 8
+        + 16
+        + 2 * AGENT_MESSAGE_ID_BYTES
+        + (2 + AGENT_MESSAGE_NAME_MAX_BYTES)
+        + 1
+        + (2 + AGENT_MESSAGE_NAME_MAX_BYTES)
+        + (1 + AGENT_MESSAGE_LINK_MAX_BYTES)
+        + (2 + AGENT_MESSAGE_BODY_MAX_BYTES)
+        <= AGENT_MESSAGE_VALUE_BYTES
+);
+// The smallest: a name of one byte, every name, no link, a body of one.
+const _: () = assert!(
+    1 + 1 + 8 + 16 + 2 * AGENT_MESSAGE_ID_BYTES + 3 + 1 + 2 + 1 + 3 <= AGENT_MESSAGE_VALUE_BYTES
+);
+// A full list. The entry that clears a message is its form's byte and
+// the fill.
+const _: () = assert!(
+    1 + 2 + AGENT_MESSAGE_READ_MARKS_MAX * AGENT_MESSAGE_READ_MARK_BYTES
+        <= AGENT_MESSAGE_VALUE_BYTES
+);
+// With the longest name the entry says 2,020 bytes, and with the seal it
+// is the content; with the shortest, `read/` and a key, it is in the same
+// class.
+const _: () =
+    assert!(7 + (AGENT_MESSAGE_PREFIX.len() + 70 + 3) + AGENT_MESSAGE_VALUE_BYTES == 2020);
+const _: () = assert!(2020 + ITEM_SEAL_OVERHEAD_BYTES == AGENT_MESSAGE_CONTENT_BYTES);
+const _: () = assert!(AGENT_MESSAGE_CONTENT_BYTES.is_power_of_two());
+const _: () = assert!(
+    (7 + AGENT_MESSAGE_READ_PREFIX.len()
+        + 70
+        + AGENT_MESSAGE_VALUE_BYTES
+        + ITEM_SEAL_OVERHEAD_BYTES)
+        .next_power_of_two()
+        == AGENT_MESSAGE_CONTENT_BYTES
+);
+// Every counted device's ring and list are within one channel at a relay.
+const _: () = assert!(
+    (MAX_COUNTED_DEVICES * (AGENT_MESSAGE_RING + 1)) as u64
+        * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
+        <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+);
+// An honest device's hour of messages is within one lap of its ring.
+const _: () = assert!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR < AGENT_MESSAGE_RING);
+// The clearing of the highest number is in the bottom half of band 0.
+const _: () = assert!(2 * AGENT_MESSAGE_NUMBER_MAX + 1 < REV_BAND_HALF);
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 25] = [
+pub const LABELS: [&[u8]; 28] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -1787,6 +2013,9 @@ pub const LABELS: [&[u8]; 25] = [
     LABEL_FINGERPRINT,
     LABEL_CARRY_WORD,
     LABEL_CARRY_BATCH,
+    LABEL_AGENT_MESSAGES,
+    LABEL_AGENT_MESSAGE_ID,
+    LABEL_AGENT_MESSAGE_READ,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2392,7 +2621,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 25);
+        assert_eq!(LABELS.len(), 28);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2635,17 +2864,18 @@ mod tests {
 
     /// A connection may make 3,000 requests a minute on the streams of
     /// entries. That is room for a device with 256 names: a pull of each,
-    /// and of its personal channel, every ten seconds; its day's proofs in
-    /// one burst; and a show and a push every two seconds besides.
+    /// of its personal channel and of its messages channel (decision
+    /// 2026-10-09 §12), every ten seconds; its day's proofs in one burst;
+    /// and a show and a push every two seconds besides.
     #[test]
     fn test_requests_on_the_streams_of_entries_decision_2026_10_04_16() {
         assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
         let passes = 60 / REALTIME_SYNC_INTERVAL_SECS;
-        let pulls = passes * (NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR as u64 + 1);
-        assert_eq!(pulls, 1_542);
+        let pulls = passes * (NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR as u64 + 1 + 1);
+        assert_eq!(pulls, 1_548);
         let proofs = MAX_CHANNELS_PROVED_ON_A_CONNECTION as u64;
         let sends = 2 * (60 / OUTBOX_FLUSH_INTERVAL_SECS);
-        assert_eq!(pulls + proofs + sends, 2_626);
+        assert_eq!(pulls + proofs + sends, 2_632);
         assert!(pulls + proofs + sends <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
     }
 
@@ -2741,5 +2971,118 @@ mod tests {
         // in a minute, for the answer to a show (§16).
         assert_eq!(SHOW_ANSWER_ROOM_BYTES, 65_536 + 1024);
         assert_eq!(SHOW_ANSWER_ROOM_BYTES, entry_cost(MAX_ITEM_BYTES));
+    }
+
+    // ── Messages between your own agents (decision 2026-10-09) ───────
+
+    /// The messages channel's label, the labels of an ID and of a mark,
+    /// and the two prefixes of its names (decision 2026-10-09 §2.1, §2.2).
+    #[test]
+    fn test_the_messages_channel_and_its_names_decision_2026_10_09_2() {
+        assert_eq!(LABEL_AGENT_MESSAGES, b"cordelia v2 messages");
+        assert_eq!(LABEL_AGENT_MESSAGE_ID, b"cordelia v2 message id");
+        assert_eq!(LABEL_AGENT_MESSAGE_READ, b"cordelia v2 message read");
+        for label in [
+            LABEL_AGENT_MESSAGES,
+            LABEL_AGENT_MESSAGE_ID,
+            LABEL_AGENT_MESSAGE_READ,
+        ] {
+            assert_eq!(LABELS.iter().filter(|one| **one == label).count(), 1);
+        }
+        assert_eq!(AGENT_MESSAGE_PREFIX, "msg/");
+        assert_eq!(AGENT_MESSAGE_READ_PREFIX, "read/");
+        assert!(!AGENT_MESSAGE_PREFIX.starts_with(AGENT_MESSAGE_READ_PREFIX));
+        assert!(!AGENT_MESSAGE_READ_PREFIX.starts_with(AGENT_MESSAGE_PREFIX));
+    }
+
+    /// Every entry of the messages channel is 2,048 bytes, and its value
+    /// 1,936 (decision 2026-10-09 §2.2): the value with the longest name
+    /// is 2,020 bytes said, and with the seal 2,048. A message at every
+    /// bound is 1,641 bytes, the smallest 68, and a full list of 120
+    /// marks 1,923.
+    #[test]
+    fn test_the_one_size_of_an_entry_of_messages_decision_2026_10_09_2_2() {
+        assert_eq!(AGENT_MESSAGE_CONTENT_BYTES, 2_048);
+        assert_eq!(AGENT_MESSAGE_VALUE_BYTES, 1_936);
+        assert_eq!(AGENT_MESSAGE_VALUE_BYTES, 2_048 - 28 - 7 - 77);
+        assert_eq!(AGENT_MESSAGE_BODY_MAX_BYTES, 1_024);
+        assert_eq!(AGENT_MESSAGE_NAME_MAX_BYTES, 200);
+        assert_eq!(AGENT_MESSAGE_LINK_OWNER_MAX_BYTES, 39);
+        assert_eq!(AGENT_MESSAGE_LINK_REPO_MAX_BYTES, 100);
+        assert_eq!(AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS, 10);
+        assert_eq!(AGENT_MESSAGE_LINK_MAX_BYTES, 151);
+        // Ten digits hold every number below 2^32, which has ten.
+        assert_eq!(
+            u32::MAX.to_string().len(),
+            AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS
+        );
+        assert_eq!(AGENT_MESSAGE_ID_BYTES, 16);
+        assert_eq!(AGENT_MESSAGE_ID_SHOWN_CHARS, 8);
+        const { assert!(AGENT_MESSAGE_ID_SHOWN_CHARS <= 2 * AGENT_MESSAGE_ID_BYTES) };
+        assert_eq!(AGENT_MESSAGE_READ_MARK_BYTES, 16);
+        assert_eq!(AGENT_MESSAGE_READ_MARKS_MAX, 120);
+        let full_list = 1 + 2 + AGENT_MESSAGE_READ_MARKS_MAX * AGENT_MESSAGE_READ_MARK_BYTES;
+        assert_eq!(full_list, 1_923);
+        assert!(full_list + AGENT_MESSAGE_READ_MARK_BYTES > AGENT_MESSAGE_VALUE_BYTES);
+        let fixed = 1 + 1 + 8 + 16 + 16 + 16;
+        let largest = fixed
+            + (2 + AGENT_MESSAGE_NAME_MAX_BYTES)
+            + 1
+            + (2 + AGENT_MESSAGE_NAME_MAX_BYTES)
+            + (1 + AGENT_MESSAGE_LINK_MAX_BYTES)
+            + (2 + AGENT_MESSAGE_BODY_MAX_BYTES);
+        assert_eq!(largest, 1_641);
+        assert_eq!(AGENT_MESSAGE_VALUE_BYTES - largest, 295);
+        let smallest = fixed + (2 + 1) + 1 + 2 + 1 + (2 + 1);
+        assert_eq!(smallest, 68);
+        // The names: `read/` and a key, `msg/`, a key and one digit, and
+        // two; each entry says 2,018 to 2,020 bytes, and seals at 2,048.
+        for (name, said) in [(5 + 70, 2_018), (4 + 70 + 2, 2_019), (4 + 70 + 3, 2_020)] {
+            assert_eq!(7 + name + AGENT_MESSAGE_VALUE_BYTES, said);
+            assert_eq!(
+                (said + ITEM_SEAL_OVERHEAD_BYTES).next_power_of_two(),
+                AGENT_MESSAGE_CONTENT_BYTES
+            );
+        }
+        // 65 slots of 3,072 bytes for each device, and 64 devices'.
+        assert_eq!(AGENT_MESSAGE_RING, 64);
+        assert_eq!(entry_cost(AGENT_MESSAGE_CONTENT_BYTES), 3_072);
+        let room = (AGENT_MESSAGE_RING as u64 + 1) * entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        assert_eq!(room, 199_680);
+        assert_eq!(room * MAX_COUNTED_DEVICES as u64, 12_779_520);
+        assert!(room * MAX_COUNTED_DEVICES as u64 <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        // The highest number, whose clearing is the last revision in the
+        // bottom half of band 0.
+        assert_eq!(AGENT_MESSAGE_NUMBER_MAX, (1 << 42) - 1);
+        assert_eq!(2 * AGENT_MESSAGE_NUMBER_MAX + 1, REV_BAND_HALF - 1);
+    }
+
+    /// The guards and limits of messages (decision 2026-10-09 §6).
+    #[test]
+    fn test_the_guards_and_limits_of_messages_decision_2026_10_09_6() {
+        assert_eq!(AGENT_MESSAGE_KEPT_DAYS, 30);
+        assert_eq!(AGENT_MESSAGE_AHEAD_MAX_SECS, 600);
+        assert_eq!(AGENT_MESSAGE_SENDS_MAX, 4);
+        assert_eq!(AGENT_MESSAGES_PER_FOLDER_PER_HOUR, 20);
+        assert_eq!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR, 60);
+        // A device's hour is below one lap of its ring, and a folder's
+        // below a device's.
+        const { assert!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR < AGENT_MESSAGE_RING) };
+        const { assert!(AGENT_MESSAGES_PER_FOLDER_PER_HOUR < AGENT_MESSAGES_PER_DEVICE_PER_HOUR) };
+        assert_eq!(AGENT_MESSAGE_PAIR_UNREAD_MAX, 10);
+        assert_eq!(AGENT_MESSAGE_SUMMARY_LINES, 5);
+        assert_eq!(AGENT_MESSAGE_SUBJECT_CHARS, 80);
+        assert_eq!(AGENT_MESSAGE_AGENT_NAME_CHARS, 48);
+        assert_eq!(AGENT_MESSAGE_SUMMARY_WAIT_MS, 100);
+        assert_eq!(AGENT_MESSAGE_HOOK_INPUT_WAIT_MS, 20);
+        assert_eq!(AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES, 65_536);
+        // The wait for a hook's input is within the summary's time.
+        const { assert!(AGENT_MESSAGE_HOOK_INPUT_WAIT_MS < AGENT_MESSAGE_SUMMARY_WAIT_MS) };
+        assert_eq!(AGENT_MESSAGE_MARKER_BYTES, 6);
+        assert_eq!(AGENT_MESSAGE_CLEAR_INTERVAL_SECS, 3_600);
+        assert_eq!(
+            AGENT_MESSAGE_CLEAR_INTERVAL_SECS,
+            ENTRY_CHANNEL_SWEEP_INTERVAL_SECS
+        );
     }
 }

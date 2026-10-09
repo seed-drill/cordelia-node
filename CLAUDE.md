@@ -41,6 +41,7 @@ cordelia-node/
                          #   change_entry, entry and wire (an entry, sealed and on the wire),
                          #   chain and version (what an entry was written after; a slot's
                          #   current version), addition, hand_over, proof, fingerprint;
+                         #   message (the value of a message, its ID and the ring);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
     cordelia-storage/    # SQLite (schema.rs: steps 1 to 18). entries; person and acts (what a
@@ -180,7 +181,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (25 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (28 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -220,6 +221,26 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
+
+The constants of messages between your own agents (decision 2026-10-09),
+each with its reason in parameter-rationale.md §12.12:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `LABEL_AGENT_MESSAGES`, `LABEL_AGENT_MESSAGE_ID`, `LABEL_AGENT_MESSAGE_READ` | `cordelia v2 messages`, `cordelia v2 message id`, `cordelia v2 message read` | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_PREFIX`, `AGENT_MESSAGE_READ_PREFIX` | `msg/`, `read/` | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_RING` | 64 (a device's slots for messages; a signer's live numbers; places in an hour) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_CONTENT_BYTES`, `AGENT_MESSAGE_VALUE_BYTES` | 2,048, 1,936 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_BODY_MAX_BYTES`, `AGENT_MESSAGE_NAME_MAX_BYTES` | 1,024, 200 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_LINK_OWNER_MAX_BYTES`, `AGENT_MESSAGE_LINK_REPO_MAX_BYTES`, `AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS`, `AGENT_MESSAGE_LINK_MAX_BYTES` | 39, 100, 10, 151 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_ID_BYTES`, `AGENT_MESSAGE_ID_SHOWN_CHARS`, `AGENT_MESSAGE_READ_MARK_BYTES` | 16, 8, 16 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_READ_MARKS_MAX` | 120 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_KEPT_DAYS`, `AGENT_MESSAGE_AHEAD_MAX_SECS`, `AGENT_MESSAGE_SENDS_MAX` | 30, 600s, 4 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGES_PER_FOLDER_PER_HOUR`, `AGENT_MESSAGES_PER_DEVICE_PER_HOUR`, `AGENT_MESSAGE_PAIR_UNREAD_MAX` | 20, 60, 10 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_SUMMARY_LINES`, `AGENT_MESSAGE_SUBJECT_CHARS`, `AGENT_MESSAGE_AGENT_NAME_CHARS` | 5, 80, 48 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_SUMMARY_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES` | 100ms, 20ms, 64KB | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_MARKER_BYTES`, `AGENT_MESSAGE_CLEAR_INTERVAL_SECS` | 6, 3600s (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_NUMBER_MAX` | 2^42 - 1 (derived: a clearing's revision stays below `REV_BAND_HALF`) | parameter-rationale.md §12.12 |
 
 ## Running Tests
 

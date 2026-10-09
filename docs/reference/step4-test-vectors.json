@@ -1,5 +1,5 @@
 {
-  "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret of each kind of channel, the recovery phrase, and the statement. Bytes are in hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. This file is written by crates/cordelia-crypto/src/vectors.rs, and a test there checks the code against it.",
+  "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret of each kind of channel (with the messages channel of decision 2026-10-09), the recovery phrase, and the statement. Bytes are in hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. This file is written by crates/cordelia-crypto/src/vectors.rs, and a test there checks the code against it.",
   "channel": {
     "entry_key": "58e1ccacc2fdae6fec33cf8af19b484e052c963ff95ac682270a79e55ba9e4da",
     "id": "6c889e0c623433aa409db1bdaea7502809124f0170181a1dca682bf1ff28eab1",
@@ -18,6 +18,7 @@
       "name": "notes",
       "secret": "3479bc7eaeb7a1a634447437cd1988a8dea0e86be61f8ae899b957755d939a72"
     },
+    "messages": "8af7ed98ceb579f1785524882e25da6bd766426b7a7ddefe6c12a8535ebb9727",
     "own": [
       {
         "name": "~",
