@@ -79,7 +79,7 @@ const TO_ALL: u8 = 2;
 /// each as "not a message", and shows none.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotAMessage {
-    #[error("an entry of the messages channel holds bytes that are not a text")]
+    #[error("an entry of the messages channel holds a value that is not of kind 2")]
     Kind,
 
     #[error("a value of the messages channel is 1936 bytes, and this is {0}")]
@@ -210,7 +210,9 @@ impl Message {
         out.extend_from_slice(self.body.as_bytes());
         out.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
 
-        Self::from_value(&Value::Other(out.clone()), is_a_name)?;
+        if Self::from_value(&Value::Other(out.clone()), is_a_name)? != *self {
+            return Err(NotAMessage::Field);
+        }
         Ok(out)
     }
 
@@ -384,7 +386,7 @@ pub enum Place {
 ///
 /// - a message is in the slot `msg/<signer>/<n>`, with n its number
 ///   modulo 64 written with no leading zero, at an even revision whose
-///   half is its number, from 1;
+///   half is its number, from 1 to the highest;
 /// - a clearing is in the same slot at an odd revision, whose half,
 ///   rounded down, is the number it clears;
 /// - a list is in `read/<signer>`, at any revision.
@@ -396,7 +398,7 @@ pub fn place_of(name: &str, signer: &[u8; 32], rev: u64) -> Option<Place> {
         return Some(Place::List);
     }
     let number = number_of(rev);
-    if number == 0 || name != message_name(signer, number).ok()? {
+    if !is_a_number(number) || name != message_name(signer, number).ok()? {
         return None;
     }
     Some(if is_clearing_rev(rev) {
@@ -497,7 +499,7 @@ pub fn next_number(highest: u64) -> Option<u64> {
 /// signer is `highest`: above `highest` less the ring (decision 2026-10-09
 /// §2.5). An entry at a number that is not live is overwritten.
 pub fn is_live(number: u64, highest: u64) -> bool {
-    number + AGENT_MESSAGE_RING as u64 > highest
+    number > highest.saturating_sub(AGENT_MESSAGE_RING as u64)
 }
 
 /// A message's ID: the first 16 bytes of SHA-256 of its label, the
@@ -987,6 +989,38 @@ mod tests {
             place_of(&slot("0"), &laptop, 129),
             Some(Place::Clearing(64))
         );
+        // A number past the highest is in slot 0 here, and is no message's
+        // and no clearing's: 2^42, one past the highest, at revision 2^43,
+        // and 2^43, at 2^44, the first revision of band 1.
+        let clearing = Value::Other(clearing_value());
+        for rev in [1 << 43, 1 << 44] {
+            assert_eq!(message_name(&laptop, number_of(rev)).unwrap(), slot("0"));
+            for (rev, value) in [(rev, &message), (rev + 1, &clearing)] {
+                assert_eq!(place_of(&slot("0"), &laptop, rev), None, "{rev}");
+                assert_eq!(
+                    take(&slot("0"), &laptop, rev, value, names),
+                    Err(NotAMessage::NotInRing),
+                    "{rev}"
+                );
+            }
+        }
+        // The control: the highest, in its slot, is a message's and a
+        // clearing's.
+        let highest = slot(&(AGENT_MESSAGE_NUMBER_MAX % 64).to_string());
+        let rev = message_rev(AGENT_MESSAGE_NUMBER_MAX).unwrap();
+        assert_eq!(
+            take(&highest, &laptop, rev, &message, names),
+            Ok(Taken::Message {
+                number: AGENT_MESSAGE_NUMBER_MAX,
+                message: smallest()
+            })
+        );
+        assert_eq!(
+            take(&highest, &laptop, rev + 1, &clearing, names),
+            Ok(Taken::Clearing {
+                number: AGENT_MESSAGE_NUMBER_MAX
+            })
+        );
         // Another prefix, or none.
         assert_eq!(place_of(&format!("msgs/{key}/7"), &laptop, 14), None);
         assert_eq!(place_of(&format!("{key}/7"), &laptop, 14), None);
@@ -1081,6 +1115,14 @@ mod tests {
         assert!(!is_live(1, 65));
         // Above the highest is live too: it is about to be the highest.
         assert!(is_live(201, 200));
+        // At the top nothing overflows: a number less the ring is never
+        // added up past u64.
+        let live = |number, highest| std::panic::catch_unwind(|| is_live(number, highest));
+        assert_eq!(live(u64::MAX, 0).ok(), Some(true));
+        assert_eq!(live(u64::MAX, 100).ok(), Some(true));
+        assert_eq!(live(u64::MAX, u64::MAX).ok(), Some(true));
+        assert_eq!(live(u64::MAX - 64, u64::MAX).ok(), Some(false));
+        assert_eq!(live(u64::MAX - 63, u64::MAX).ok(), Some(true));
     }
 
     /// The value's fields, byte for byte, in their places.
@@ -1145,6 +1187,10 @@ mod tests {
         let value = largest().to_value(names).unwrap();
         let text = Value::Text(String::from_utf8(vec![b'a'; 1_936]).unwrap());
         assert_eq!(Message::from_value(&text, names), Err(NotAMessage::Kind));
+        assert_eq!(
+            NotAMessage::Kind.to_string(),
+            "an entry of the messages channel holds a value that is not of kind 2"
+        );
         for length in [1_935, 1_937] {
             let mut changed = value.clone();
             changed.resize(length, 0);
