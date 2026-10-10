@@ -514,7 +514,7 @@ fn written(
     seal(conn, ring, number, rev, value.to_vec(), now)?;
     let generation = ring.generation(conn, now)?;
     kept(held::hold_number(
-        conn, &ring.own, generation, number, false,
+        conn, &ring.own, generation, number, false, now,
     ))?;
     let label = own_label(conn, &ring.own)?;
     let id = message_id(&ring.own, value);
@@ -645,6 +645,9 @@ pub struct AnsweredAt {
 /// and the list of what its agents read written again above another that
 /// the relay holds ([`crate::marks::answered`], decision 2026-10-09 §2.4),
 /// in one write, so that a process that stops between them loses none.
+/// So an error in `marks::answered` takes back the relay's count and what
+/// was kept of the answer too, and the push counts as unanswered and is
+/// made again at the next pass, as the one write means it to be.
 /// Every other channel's push is written as `at_relays::sent` writes it.
 pub fn pushed(
     conn: &Connection,
@@ -833,7 +836,9 @@ pub fn clear_expired(
             };
             seal(conn, &ring, number, rev, clearing_value(), now)?;
             let generation = ring.generation(conn, now)?;
-            kept(held::hold_number(conn, &ring.own, generation, number, true))?;
+            kept(held::hold_number(
+                conn, &ring.own, generation, number, true, now,
+            ))?;
             kept(held::clear(conn, &ring.own, generation, number, now))?;
             cleared += 1;
         }

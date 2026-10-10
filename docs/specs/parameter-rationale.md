@@ -1914,6 +1914,13 @@ restore a lap behind needs one more number, and a restore behind two relays
 that each hold a later life needs two; four leaves room, and bounds a relay
 that answers falsely to three slots for each message.
 
+It bounds a list's revisions too (record §2.4): a list's marks go under at
+most four, so a relay that answers `Another` falsely makes the device write
+its list again at most three times for each list written for a new mark.
+The same figure serves, since a list is answered so for the same causes as
+a message, a store restored behind one relay or two, and each list written
+again is the one entry in its slot, so the margin costs nothing.
+
 #### AGENT_MESSAGES_PER_FOLDER_PER_HOUR = 20, AGENT_MESSAGES_PER_DEVICE_PER_HOUR = 60
 
 **Rationale:** An honest command sends at most 20 messages in an hour from

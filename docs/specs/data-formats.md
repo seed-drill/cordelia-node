@@ -1293,7 +1293,7 @@ CREATE INDEX idx_message_lists_mark ON message_lists(mark);
 CREATE TABLE message_read_here (
     mark       BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
     seq        INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
-    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    id         BLOB REFERENCES message_index(id),
     name       TEXT CHECK(name IS NULL OR length(name) >= 1),
     made_at    INTEGER NOT NULL CHECK(typeof(made_at) = 'integer'),
     merged_at  INTEGER CHECK(merged_at IS NULL OR typeof(merged_at) = 'integer'),
@@ -1393,7 +1393,10 @@ CREATE TABLE message_kept_taken (
   made; or the mark alone, where it was merged from the device's own list on
   a relay and no message has been found for it, with when (§7.2). `seq` is
   the table's order, unique on the device: the newest is the highest, and a
-  mark merged as older than any held takes one below the lowest.
+  mark merged as older than any held takes one below the lowest. When a
+  message's row goes from the index, each of its marks stays as the mark
+  alone, `merged_at` being when it became so; its key to the index has no
+  cascade.
 - `message_announced` and `message_read_by_a_person`: the device's own marks,
   that `summary` announced a message to the agent of a name here, and that a
   person read it here. They are never synced.

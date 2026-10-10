@@ -10,14 +10,15 @@
 //!   addressed to it, and its mark is the newest in the table. The list is
 //!   then written again, where it may be.
 //! - **The list** ([`write_list`]): written from the table, the newest
-//!   marks first, as many as a list holds (120), one revision above the
-//!   list of the device's own that its store holds. **Never before the
-//!   first fetch** of the messages channel since the node started, nor
-//!   where the device does not stand applied or has sync off: a mark made
-//!   then waits in the table for the first list after. It is written where
-//!   the table holds a mark that the list held lacks, so a pass writes the
-//!   first list of a new generation, and the list after one that a relay
-//!   handed back.
+//!   marks first, as many as a list holds (120), whatever became of their
+//!   messages (a mark stays as a bare hash when its message's row goes),
+//!   one revision above the list of the device's own that its store
+//!   holds. **Never before the first fetch** of the messages channel since
+//!   the node started, nor where the device does not stand applied or has
+//!   sync off: a mark made then waits in the table for the first list
+//!   after. It is written where the table holds a mark that the list held
+//!   lacks, so a pass writes the first list of a new generation, and the
+//!   list after one that a relay handed back.
 //! - **A list taken** ([`list_taken`], from the reader, in the door's
 //!   write, only where the store kept it): another device's replaces what
 //!   was kept of that device; the device's own, from its later life, is
@@ -180,7 +181,7 @@ fn list_written(
     }
     let own = identity.public_key();
     let held = Held::of(conn, &own)?;
-    let marks = kept(held::marks_to_list(conn, now))?;
+    let marks = kept(held::marks_to_list(conn))?;
     let (rev, listed) = held.list.unwrap_or((0, Vec::new()));
     let again: usize = meta::get(conn, meta::MESSAGES_LIST_AGAIN)?
         .and_then(|again| again.parse().ok())
@@ -932,7 +933,7 @@ mod tests {
 
     /// After a statement, a device's first list in the new generation is
     /// written from its table once it has fetched the new channel, and
-    /// holds the marks of what it still shows (decision 2026-10-09 §2.4,
+    /// holds the newest marks of its table (decision 2026-10-09 §2.4,
     /// §9.1, F8): the laptop's agent of `notes` reads three messages;
     /// after a renewal the desktop keeps the laptop's list until the new
     /// one replaces it, and neither announces nor counts the three.
@@ -973,24 +974,182 @@ mod tests {
         assert_eq!(unread_on(&s, 2, "notes", t), Vec::<String>::new());
     }
 
-    /// A mark's row leaves the table when its message passes its 30 days
-    /// and the hourly task drops it (decision 2026-10-09 §7.2, F8); a bare
-    /// hash stays until its own 30 days.
+    /// A mark stays in the table as a bare hash when its message's row
+    /// goes, and is in the next list (decision 2026-10-09 §7.2, F8): the
+    /// row goes at the hourly task once its 30 days are up, the mark
+    /// stays, and goes 30 days after it became bare, as a merged bare
+    /// hash goes 30 days after it was merged.
     #[test]
-    fn a_mark_goes_from_the_table_when_its_message_goes() {
+    fn a_mark_stays_as_a_bare_hash_when_its_message_goes() {
         let mut s = devices(2);
         let t = s.now;
         let id = sends(&s, 0, "~", "notes", "a month", t);
         s.pass(0, 1);
         reads(&s, 1, "notes", &id, t, true);
         held::merge_own_list(&s[1].conn, &[[0xb1; 16]], &[], t + DAY).unwrap();
+        let mark = read_mark(&id, "notes");
         let month = i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY;
-        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month - 1, true).unwrap();
-        assert_eq!(table(&s, 1).len(), 2);
-        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month, true).unwrap();
-        assert_eq!(table(&s, 1), [([0xb1; 16], false)]);
-        crate::reader::hourly(&s[1].conn, &s[1].identity, t + DAY + month, true).unwrap();
+        let hourly = |now: i64| {
+            crate::reader::hourly(&s[1].conn, &s[1].identity, now, true).unwrap();
+        };
+        hourly(t + month - 1);
+        assert_eq!(table(&s, 1), [(mark, true), ([0xb1; 16], false)]);
+        hourly(t + month);
+        assert_eq!(table(&s, 1), [(mark, false), ([0xb1; 16], false)]);
+        assert!(read_on(&s[1].conn, &id, "notes").unwrap().here);
+        assert_eq!(
+            write_list(&s[1].conn, &s[1].identity, t + month, true).unwrap(),
+            Some(2)
+        );
+        assert_eq!(listed(&s, 1), Some((2, vec![mark, [0xb1; 16]])));
+        hourly(t + DAY + month);
+        assert_eq!(table(&s, 1), [(mark, false)]);
+        hourly(t + 2 * month - 1);
+        assert_eq!(table(&s, 1), [(mark, false)]);
+        hourly(t + 2 * month);
         assert!(table(&s, 1).is_empty());
+    }
+
+    /// A mark outlasts its message's row on the device that made it
+    /// (decision 2026-10-09 §2.4, §7.2): whether a message is shown is each
+    /// device's own. The sender's clock is 5 days ahead; the laptop first
+    /// holds m1 at t and the desktop at t + 4 days, so the desktop shows it
+    /// until t + 34 days. The laptop's agent reads m1, and the desktop
+    /// takes its list. At t + 31 days m1 has gone from the laptop's index,
+    /// and its agent reads m2: the list it writes still holds m1's mark,
+    /// and the desktop's agent is not shown m1 again.
+    #[test]
+    fn a_mark_outlasts_its_messages_row_on_the_device_that_made_it() {
+        let s = devices(3);
+        let t = s.now;
+        let ahead = 5 * DAY;
+        let entry_of = |s: &Several, number: u64| {
+            s[0].stored_in(&messages_secret(s, 0))
+                .into_iter()
+                .find(|entry| {
+                    entry.author == s.key(0) && Some(entry.rev) == message::message_rev(number)
+                })
+                .unwrap()
+        };
+        let m1 = sends(&s, 0, "~", "notes", "m1", t + ahead);
+        let first = entry_of(&s, 1);
+        take(&s[1].conn, &s[1].identity, &first, t).unwrap();
+        take(&s[2].conn, &s[2].identity, &first, t + 4 * DAY).unwrap();
+        assert_eq!(reads(&s, 1, "notes", &m1, t, true).list, Some(1));
+        let list = checked(&own_list(&s, 1).unwrap());
+        take(&s[2].conn, &s[2].identity, &list, t + 4 * DAY).unwrap();
+        assert!(unread_on(&s, 2, "notes", t + 4 * DAY).is_empty());
+
+        let later = t + 31 * DAY;
+        crate::reader::hourly(&s[1].conn, &s[1].identity, later, true).unwrap();
+        assert!(held::shown(&s[1].conn, later).unwrap().is_empty());
+        let m2 = sends(&s, 0, "~", "notes", "m2", later + ahead);
+        take(&s[1].conn, &s[1].identity, &entry_of(&s, 2), later).unwrap();
+        assert_eq!(reads(&s, 1, "notes", &m2, later, true).list, Some(2));
+        let list = checked(&own_list(&s, 1).unwrap());
+        take(&s[2].conn, &s[2].identity, &list, later).unwrap();
+
+        let shown: Vec<String> = held::shown(&s[2].conn, later)
+            .unwrap()
+            .into_iter()
+            .map(|shown| shown.body)
+            .collect();
+        assert_eq!(shown, ["m1"], "the desktop still shows m1");
+        assert_eq!(unread_on(&s, 2, "notes", later), Vec::<String>::new());
+        assert_eq!(
+            read_on(&s[2].conn, &m1, "notes").unwrap().devices,
+            [s.key(1)]
+        );
+    }
+
+    /// A mark merged from the device's own list, whose message it holds
+    /// and has not yet given a place, is in the next list (decision
+    /// 2026-10-09 §2.4, §7.2): it is given its ID and name, and the list
+    /// written above the merged one, when the agent reads another message,
+    /// holds it after the new mark, so that the other devices do not lose
+    /// it.
+    #[test]
+    fn a_merged_mark_of_a_message_held_and_not_yet_placed_is_in_the_next_list() {
+        let mut s = devices(2);
+        let t = s.now;
+        let to_read = sends(&s, 0, "~", "notes", "to read", t);
+        s.pass(0, 1);
+        shows(&s, 1, t);
+        let held_only = sends(&s, 0, "~", "notes", "held, not shown", t);
+        s.pass(0, 1);
+        let placed: Option<i64> = s[1]
+            .conn
+            .query_row(
+                "SELECT placed_at FROM message_index WHERE id = ?1",
+                [&held_only[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(placed, None);
+        let mark = read_mark(&held_only, "notes");
+        let value = ReadMarks { marks: vec![mark] }.to_value().unwrap();
+        let later = Entry::seal(
+            &messages_secret(&s, 1),
+            &s[1].identity,
+            1,
+            &message::inside(read_name(&s.key(1)).unwrap(), value),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        take(&s[1].conn, &s[1].identity, &later, t).unwrap();
+        assert_eq!(table(&s, 1), [(mark, true)]);
+        let marked = read_here(&s[1].conn, &s[1].identity, "notes", &to_read, t, true);
+        assert_eq!(marked.unwrap().list, Some(2));
+        assert_eq!(
+            listed(&s, 1),
+            Some((2, vec![read_mark(&to_read, "notes"), mark]))
+        );
+    }
+
+    /// A relay's answer of another to an entry in this device's list's
+    /// slot that another key signed writes no list (decision 2026-10-09
+    /// §2.4): a push sends every author's entries of the messages channel,
+    /// and a key that counts can write in the slot `read/<this device's
+    /// key>`; only an answer to the device's own list, at the revision it
+    /// holds, writes it again.
+    #[test]
+    fn an_answer_of_another_to_another_keys_entry_in_the_lists_slot_writes_no_list() {
+        let mut s = devices(2);
+        let t = s.now;
+        let id = sends(&s, 0, "~", "notes", "read", t);
+        s.pass(0, 1);
+        assert_eq!(reads(&s, 1, "notes", &id, t, true).list, Some(1));
+        let value = ReadMarks::default().to_value().unwrap();
+        let others = Entry::seal(
+            &messages_secret(&s, 1),
+            &s[0].identity,
+            1,
+            &message::inside(read_name(&s.key(1)).unwrap(), value),
+        )
+        .unwrap();
+        let own = own_list(&s, 1).unwrap().entry;
+        assert_eq!((others.slot, others.rev), (own.slot, own.rev));
+        let channels = crate::at_relays::channels(&s[1].conn, &s[1].identity).unwrap();
+        let channel = channels
+            .iter()
+            .find(|own| own.kind == Kind::Messages)
+            .unwrap();
+        let another = |entry: &Entry| {
+            answered(
+                &s[1].conn,
+                &s[1].identity,
+                channel,
+                std::slice::from_ref(entry),
+                &[Pushed::HoldsAnother],
+                t,
+                true,
+            )
+            .unwrap()
+        };
+        assert_eq!(another(&others), None);
+        assert_eq!(listed(&s, 1).unwrap().0, 1);
+        assert_eq!(another(&own), Some(2));
     }
 
     /// A device whose agents read more messages than a list holds between

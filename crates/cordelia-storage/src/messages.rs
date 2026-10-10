@@ -5,8 +5,8 @@
 //! body, link, subject and names in the clear, as it was opened. **A row
 //! that goes is overwritten first** (§7.1): its body, link, subject,
 //! `from_name` and `to_name` are written over with zeros of the same
-//! length, and then the row is deleted, with its marks, in one
-//! transaction. On a personal node `secure_delete` is on as well
+//! length, and then the row is deleted, in one transaction, its marks
+//! staying as bare hashes. On a personal node `secure_delete` is on as well
 //! ([`crate::db::secure_delete_on`]), and the log is truncated after each
 //! hourly clearing ([`crate::db::checkpoint_truncating`]).
 //!
@@ -33,8 +33,9 @@
 //! The device keeps its own table of what its agents read
 //! (`message_read_here`, [`mark_read`]), each mark with the message's ID
 //! and the name, or as a bare hash where it was merged from the device's
-//! own list and no message was found for it ([`merge_own_list`]); and the
-//! latest list of each other device ([`keep_list`]). Neither is matched
+//! own list and no message was found for it ([`merge_own_list`]), or
+//! where its message's row went ([`drop_row`]); and the latest list of
+//! each other device ([`keep_list`]). Neither is matched
 //! to a message when it is taken: whether a message is read is worked out
 //! when it is shown ([`read_by`], decision 2026-10-09 §7.2).
 
@@ -184,7 +185,7 @@ pub fn not_a_message(
 /// - **Above H, it raises H.** Every number that was live and is no
 ///   longer leaves the reader's rows: its row of numbers held, its row of
 ///   first holding, and the index row of its message where none of that
-///   message's numbers is left (overwritten first, [`drop_row`]). Each of
+///   message's numbers is left (overwritten first, [`drop_row`], at `now`). Each of
 ///   them from the number counted from is counted as overwritten, unless
 ///   its message had a place, or was held and has gone (it expired, or
 ///   was cleared), or its clearing was held ([`clear`]): those it never
@@ -203,6 +204,7 @@ pub fn hold_number(
     generation: i64,
     number: u64,
     clearing: bool,
+    now: i64,
 ) -> Result<bool, StorageError> {
     let mut kept = signer(conn, of, generation)?.unwrap_or_default();
     let number_sql = to_sql(number);
@@ -216,7 +218,7 @@ pub fn hold_number(
             if left >= lowest {
                 kept.overwritten += from_sql(left_unshown(conn, of, generation, lowest, left)?);
             }
-            leave_up_to(conn, of, generation, left)?;
+            leave_up_to(conn, of, generation, left, now)?;
         }
         kept.highest = number;
         kept.counted_from = Some(kept.counted_from.unwrap_or(number));
@@ -260,12 +262,13 @@ fn left_unshown(
 
 /// Drop the rows of each number of `of` at or below `highest`, which are
 /// live no longer: its rows of numbers held and of first holding, and
-/// the index row of a message that is then held at no number.
+/// the index row of a message that is then held at no number, at `now`.
 fn leave_up_to(
     conn: &Connection,
     of: &[u8; 32],
     generation: i64,
     highest: i64,
+    now: i64,
 ) -> Result<(), StorageError> {
     let ids: Vec<Vec<u8>> = conn
         .prepare(
@@ -289,7 +292,7 @@ fn leave_up_to(
             |row| row.get(0),
         )?;
         if held == 0 {
-            drop_row(conn, &id)?;
+            drop_row(conn, &id, now)?;
         }
     }
     Ok(())
@@ -468,7 +471,7 @@ pub fn clear(
         )
         .optional()?;
     match id {
-        Some(id) => drop_row(conn, &id),
+        Some(id) => drop_row(conn, &id, now),
         None => Ok(false),
     }
 }
@@ -706,10 +709,10 @@ pub fn drop_gone(conn: &Connection, now: i64, applied: &Applied) -> Result<Gone,
     };
     let mut gone = Gone::default();
     for id in ids(format!("{now} >= {}", expires_sql()))? {
-        gone.expired += usize::from(drop_row(conn, &id)?);
+        gone.expired += usize::from(drop_row(conn, &id, now)?);
     }
     for id in ids(format!("NOT {}", live_sql()))? {
-        gone.not_live += usize::from(drop_row(conn, &id)?);
+        gone.not_live += usize::from(drop_row(conn, &id, now)?);
     }
     conn.execute(
         &format!(
@@ -1065,8 +1068,9 @@ pub type Mark = [u8; AGENT_MESSAGE_READ_MARK_BYTES];
 /// (decision 2026-10-09 §7.2): its mark is kept in the device's own table,
 /// with the ID and the name, as the newest there, in the caller's write.
 /// A mark the table kept as a bare hash is given its ID and its name, and
-/// one it kept already is made the newest. The message is in the index,
-/// and the row goes with it. Returns whether the table lacked the mark.
+/// one it kept already is made the newest. The message is in the index;
+/// when its row goes, the mark stays as a bare hash ([`drop_row`]).
+/// Returns whether the table lacked the mark.
 pub fn mark_read(conn: &Connection, id: &Id, name: &str, now: i64) -> Result<bool, StorageError> {
     let mark = read_mark(id, name);
     let held: i64 = conn.query_row(
@@ -1085,24 +1089,20 @@ pub fn mark_read(conn: &Connection, id: &Id, name: &str, now: i64) -> Result<boo
     Ok(held == 0)
 }
 
-/// The marks that the device's list holds at `now` (decision 2026-10-09
-/// §2.4, §7.2, §9.1): the newest of its own table, as many as a list holds
-/// (120), newest first. They are the marks of the messages it still shows,
-/// which have a place, are live and are within their 30 days, of either
-/// generation, and the marks it keeps as a bare hash.
-pub fn marks_to_list(conn: &Connection, now: i64) -> Result<Vec<Mark>, StorageError> {
+/// The marks that the device's list holds (decision 2026-10-09 §2.4,
+/// §7.2, §9.1): the newest of its own table, as many as a list holds
+/// (120), newest first, whatever became of their messages, the marks it
+/// keeps as a bare hash among them. Whether a message is shown is each
+/// device's own (its place, its first holding, its clock), so a list
+/// leaves out no mark for what this device no longer shows.
+pub fn marks_to_list(conn: &Connection) -> Result<Vec<Mark>, StorageError> {
     let marks: Vec<Vec<u8>> = conn
         .prepare(&format!(
             "SELECT r.mark FROM message_read_here r
-             LEFT JOIN message_index i ON i.id = r.id
-             WHERE r.id IS NULL
-                OR (i.placed_at IS NOT NULL AND ?1 < {expires} AND {live})
              ORDER BY r.seq DESC
-             LIMIT {AGENT_MESSAGE_READ_MARKS_MAX}",
-            expires = expires_sql(),
-            live = live_sql(),
+             LIMIT {AGENT_MESSAGE_READ_MARKS_MAX}"
         ))?
-        .query_map([now], |row| row.get(0))?
+        .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     Ok(marks.iter().map(|mark| mark_of(mark)).collect())
 }
@@ -1168,6 +1168,14 @@ pub fn merge_own_list(
             merged += 1;
         }
     }
+    keep_120_bare(conn)?;
+    Ok(merged)
+}
+
+/// Keep at most 120 marks as a bare hash (`AGENT_MESSAGE_READ_MARKS_MAX`,
+/// decision 2026-10-09 §7.2), the oldest going first, whether each was
+/// merged or became bare when its message's row went.
+fn keep_120_bare(conn: &Connection) -> Result<(), StorageError> {
     conn.execute(
         &format!(
             "DELETE FROM message_read_here WHERE id IS NULL AND seq <
@@ -1177,14 +1185,15 @@ pub fn merge_own_list(
         ),
         [],
     )?;
-    Ok(merged)
+    Ok(())
 }
 
 /// The part of the hourly task that is the marks' (decision 2026-10-09
 /// §7.2), at `now`, in the caller's write: each mark kept as a bare hash
 /// for which the device now holds a message is given its ID and its name,
 /// made with each of `names` and the name the message is to; and each
-/// still bare 30 days after it was merged goes. Returns how many went.
+/// still bare 30 days after it became bare, merged or left by its
+/// message's row, goes. Returns how many went.
 pub fn keep_bare_marks(
     conn: &Connection,
     names: &[String],
@@ -1304,21 +1313,29 @@ fn from_sql(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-/// Drop the index row of the message `id` (decision 2026-10-09 §7.1): at
-/// its 30 days, at a clearing, or when none of its numbers is live. Its
-/// body, link, subject, `from_name` and `to_name` are first written over
-/// with zeros of the same length, then the row is deleted, and its marks
-/// and its rows of numbers held with it, in one transaction. The rows of
-/// first holding stay. A field that holds nothing (no link, and no
-/// `to_name` for every name) is left so. Returns whether the device held
-/// the row.
+/// Drop the index row of the message `id` at `now` (decision 2026-10-09
+/// §7.1): at its 30 days, at a clearing, or when none of its numbers is
+/// live, in whatever generation. Its body, link, subject, `from_name` and
+/// `to_name` are first written over with zeros of the same length, then
+/// the row is deleted, and its rows of numbers held with it, in one
+/// transaction. The rows of first holding stay. A field that holds
+/// nothing (no link, and no `to_name` for every name) is left so. Returns
+/// whether the device held the row.
+///
+/// **Each mark of it in the device's own table stays, as a bare hash**
+/// (§7.2): its ID and its name are dropped, and it became bare at `now`.
+/// Another device may show the message for longer than this one (its
+/// place, its first holding, its clock), and its agent is not to act on
+/// it twice: the mark goes in the lists as it did, by the bounds of a
+/// bare hash, at most 120 and for 30 days. This is the one statement that
+/// deletes a row of the index, and the table's key to it has no cascade.
 ///
 /// It runs in a savepoint, so it is whole by itself, and part of the
 /// caller's transaction where there is one: the door's write that takes a
 /// clearing, or raises H, drops its rows in that write.
-pub fn drop_row(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
+pub fn drop_row(conn: &Connection, id: &[u8], now: i64) -> Result<bool, StorageError> {
     conn.execute_batch("SAVEPOINT drop_row")?;
-    let dropped = overwritten_and_deleted(conn, id);
+    let dropped = overwritten_and_deleted(conn, id, now);
     let end = match dropped {
         Ok(_) => "RELEASE drop_row",
         Err(_) => "ROLLBACK TO drop_row; RELEASE drop_row",
@@ -1327,7 +1344,7 @@ pub fn drop_row(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
     dropped
 }
 
-fn overwritten_and_deleted(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
+fn overwritten_and_deleted(conn: &Connection, id: &[u8], now: i64) -> Result<bool, StorageError> {
     conn.execute(
         "UPDATE message_index SET
              body = zeroblob(length(CAST(body AS BLOB))),
@@ -1340,6 +1357,11 @@ fn overwritten_and_deleted(conn: &Connection, id: &[u8]) -> Result<bool, Storage
          WHERE id = ?1",
         params![id],
     )?;
+    conn.execute(
+        "UPDATE message_read_here SET id = NULL, name = NULL, merged_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    keep_120_bare(conn)?;
     let dropped = conn.execute("DELETE FROM message_index WHERE id = ?1", params![id])?;
     Ok(dropped == 1)
 }
@@ -1440,7 +1462,7 @@ mod tests {
             .unwrap();
         assert_eq!(words_in(&log), WORDS);
 
-        assert!(drop_row(&conn, &[1; 16]).unwrap());
+        assert!(drop_row(&conn, &[1; 16], 200).unwrap());
         assert_eq!(count(&conn, "message_index"), 0);
         assert!(!words_in(&log).is_empty(), "the log holds the page before");
         assert!(db::checkpoint_truncating(&conn).unwrap());
@@ -1467,7 +1489,7 @@ mod tests {
         indexed(&conn, 2, 2);
         assert!(db::checkpoint_truncating(&conn).unwrap());
 
-        assert!(drop_row(&conn, &[1; 16]).unwrap());
+        assert!(drop_row(&conn, &[1; 16], 200).unwrap());
         assert!(db::checkpoint_truncating(&conn).unwrap());
         // The other row still holds the words: count them.
         let held = |file: &std::path::Path| -> Vec<usize> {
@@ -1484,9 +1506,17 @@ mod tests {
         };
         assert_eq!(held(&file), [1; 5]);
 
-        // A row deleted as it is leaves its words where they were.
-        conn.execute("DELETE FROM message_index WHERE id = ?1", [&[2u8; 16][..]])
-            .unwrap();
+        // A row deleted as it is leaves its words where they were. Its
+        // mark goes first: the index row that a mark names is refused to
+        // any delete but `drop_row`'s.
+        let delete = "DELETE FROM message_index WHERE id = ?1";
+        assert!(conn.execute(delete, [&[2u8; 16][..]]).is_err());
+        conn.execute(
+            "DELETE FROM message_read_here WHERE id = ?1",
+            [&[2u8; 16][..]],
+        )
+        .unwrap();
+        conn.execute(delete, [&[2u8; 16][..]]).unwrap();
         assert!(db::checkpoint_truncating(&conn).unwrap());
         assert_eq!(
             held(&file),
@@ -1527,8 +1557,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(drop_row(&conn, &[1; 16]).unwrap());
-        assert!(drop_row(&conn, &[2; 16]).unwrap());
+        assert!(drop_row(&conn, &[1; 16], 200).unwrap());
+        assert!(drop_row(&conn, &[2; 16], 200).unwrap());
         let caught: Vec<AsDeleted> = conn
             .prepare("SELECT id, label, sent, fields, none FROM as_deleted ORDER BY id")
             .unwrap()
@@ -1554,13 +1584,18 @@ mod tests {
         );
     }
 
-    /// A row that goes takes its marks and its rows of numbers held with
-    /// it, and leaves its rows of first holding, and every other row
-    /// (decision 2026-10-09 §7.1, §7.2). A mark merged from the device's
-    /// own list, with no message, stays. Dropping a row the device does
-    /// not hold changes nothing.
+    /// A mark as the table keeps it: the mark, its ID and name, and when it
+    /// became bare.
+    type AsKept = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<i64>);
+
+    /// A row that goes takes its rows of numbers held with it, leaves its
+    /// marks as bare hashes that became bare as it went, and leaves its
+    /// rows of first holding, and every other row (decision 2026-10-09
+    /// §7.1, §7.2). A mark merged from the device's own list, with no
+    /// message, stays as it was. Dropping a row the device does not hold
+    /// changes nothing.
     #[test]
-    fn a_dropped_row_takes_its_marks_and_leaves_its_first_holding() {
+    fn a_dropped_row_leaves_its_marks_as_bare_hashes_and_its_first_holding() {
         let conn = db::open_in_memory().unwrap();
         indexed(&conn, 1, 1);
         indexed(&conn, 2, 2);
@@ -1572,7 +1607,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(drop_row(&conn, &[1; 16]).unwrap());
+        assert!(drop_row(&conn, &[1; 16], 200).unwrap());
         let held = |table: &str, id: u8| -> i64 {
             conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
@@ -1594,10 +1629,26 @@ mod tests {
             (held("message_first_held", 1), held("message_first_held", 2)),
             (1, 1)
         );
-        assert_eq!(count(&conn, "message_read_here"), 2);
+        let marks: Vec<AsKept> = conn
+            .prepare("SELECT mark, id, name, merged_at FROM message_read_here ORDER BY mark")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            marks,
+            [
+                (vec![1; 16], None, None, Some(200)),
+                (vec![2; 16], Some(vec![2; 16]), Some("notes".into()), None),
+                (vec![9; 16], None, None, Some(103)),
+            ]
+        );
 
-        assert!(!drop_row(&conn, &[1; 16]).unwrap());
-        assert!(!drop_row(&conn, &[3; 16]).unwrap());
+        assert!(!drop_row(&conn, &[1; 16], 200).unwrap());
+        assert!(!drop_row(&conn, &[3; 16], 200).unwrap());
         assert_eq!(count(&conn, "message_index"), 1);
     }
 
@@ -1650,7 +1701,7 @@ mod tests {
 
         for begin in ["BEGIN", "SAVEPOINT the_doors_write"] {
             conn.execute_batch(begin).unwrap();
-            assert_eq!(drop_row(&conn, &[1; 16]).ok(), Some(true), "{begin}");
+            assert_eq!(drop_row(&conn, &[1; 16], 200).ok(), Some(true), "{begin}");
             assert_eq!(count(&conn, "message_index"), 0, "{begin}");
             assert!(!conn.is_autocommit(), "{begin}: the caller's write is open");
             let back = if begin == "BEGIN" {
@@ -1663,7 +1714,7 @@ mod tests {
         }
 
         conn.execute_batch("BEGIN").unwrap();
-        assert_eq!(drop_row(&conn, &[1; 16]).ok(), Some(true));
+        assert_eq!(drop_row(&conn, &[1; 16], 200).ok(), Some(true));
         conn.execute_batch("COMMIT").unwrap();
         assert_eq!(body(&conn), None);
         assert_eq!(count(&conn, "message_numbers"), 0);
@@ -1689,7 +1740,7 @@ mod tests {
     /// body's first byte and its number.
     fn taken(conn: &Connection, signer: u8, number: u64, body: &str, at: i64) -> Indexed {
         generation_1(conn);
-        assert!(hold_number(conn, &[signer; 32], 1, number, false).unwrap());
+        assert!(hold_number(conn, &[signer; 32], 1, number, false, at).unwrap());
         let message = message(body, at);
         let mut id = [signer; 16];
         id[0] = body.as_bytes()[0];
@@ -1727,10 +1778,10 @@ mod tests {
         )
         .unwrap();
         assert!(clear(&conn, &[7; 32], 1, 3, 100).unwrap());
-        assert!(hold_number(&conn, &[7; 32], 1, 5, false).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 5, false, 100).unwrap());
         assert_eq!(signer(&conn, &[7; 32], 1).unwrap().unwrap().overwritten, 0);
 
-        assert!(hold_number(&conn, &[7; 32], 1, 68, false).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 68, false, 100).unwrap());
         assert_eq!(
             signer(&conn, &[7; 32], 1).unwrap(),
             Some(Signer {
@@ -1745,8 +1796,8 @@ mod tests {
         assert_eq!(count(&conn, "message_first_held"), 0);
         // 5 is live still, and 4 is not: taken now, 4 is not opened and
         // not counted again, being above the number counted from.
-        assert!(hold_number(&conn, &[7; 32], 1, 5, false).unwrap());
-        assert!(!hold_number(&conn, &[7; 32], 1, 4, false).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 5, false, 100).unwrap());
+        assert!(!hold_number(&conn, &[7; 32], 1, 4, false, 100).unwrap());
         assert_eq!(signer(&conn, &[7; 32], 1).unwrap().unwrap().overwritten, 2);
     }
 
@@ -1941,14 +1992,14 @@ mod tests {
         };
         let as_written = [BODY, LINK, SUBJECT, FROM, TO].map(|text| text.as_bytes().to_vec());
 
-        assert!(drop_row(&conn, &[1; 16]).is_err());
+        assert!(drop_row(&conn, &[1; 16], 200).is_err());
         assert!(conn.is_autocommit(), "nothing is left open");
         assert_eq!(text(&conn), as_written);
 
         conn.execute_batch("BEGIN").unwrap();
         conn.execute("UPDATE message_index SET placed_at = 7", [])
             .unwrap();
-        assert!(drop_row(&conn, &[1; 16]).is_err());
+        assert!(drop_row(&conn, &[1; 16], 200).is_err());
         assert!(!conn.is_autocommit(), "the caller's write is open");
         assert_eq!(text(&conn), as_written);
         conn.execute("UPDATE message_index SET asks = 0", [])
@@ -2129,7 +2180,7 @@ mod tests {
             conn.execute_batch("BEGIN").unwrap();
             for place in 1..=RING as u64 {
                 let number = lap * RING as u64 + place;
-                assert!(hold_number(&conn, &[7; 32], 1, number, false).unwrap());
+                assert!(hold_number(&conn, &[7; 32], 1, number, false, 100).unwrap());
                 let mut id = [0; 16];
                 id[..8].copy_from_slice(&number.to_be_bytes());
                 let opened = Opened {
@@ -2212,7 +2263,7 @@ mod tests {
         );
         assert_eq!(read_by(&conn, &ids[0], "~").unwrap(), ReadBy::default());
         assert_eq!(read_by(&conn, &ids[1], "notes").unwrap(), ReadBy::default());
-        let marks = marks_to_list(&conn, 102).unwrap();
+        let marks = marks_to_list(&conn).unwrap();
         assert_eq!(marks, [read_mark(&ids[0], "notes")]);
         assert_ne!(marks[0][..], ids[0][..]);
 
@@ -2229,16 +2280,16 @@ mod tests {
         assert!(mark_read(&conn, &ids[1], "notes", 103).unwrap());
         assert!(!mark_read(&conn, &ids[0], "notes", 104).unwrap());
         assert_eq!(
-            marks_to_list(&conn, 105).unwrap(),
+            marks_to_list(&conn).unwrap(),
             [read_mark(&ids[0], "notes"), read_mark(&ids[1], "notes")]
         );
         assert_eq!(count(&conn, "message_read_here"), 2);
     }
 
-    /// A list holds the newest 120 marks, the newest first, of the messages
-    /// still shown and the bare hashes (decision 2026-10-09 §2.4, §7.2);
-    /// and of each other device only its latest list is kept, each mark
-    /// once, until its key no longer counts.
+    /// A list holds the newest 120 marks of the table, the newest first,
+    /// whatever became of their messages, the bare hashes among them
+    /// (decision 2026-10-09 §2.4, §7.2); and of each other device only its
+    /// latest list is kept, each mark once, until its key no longer counts.
     #[test]
     fn a_list_holds_the_newest_120_and_only_the_latest_list_of_each_device_is_kept() {
         let conn = db::open_in_memory().unwrap();
@@ -2255,32 +2306,23 @@ mod tests {
             .rev()
             .flat_map(|id| [read_mark(id, "~"), read_mark(id, "notes")])
             .collect();
-        assert_eq!(marks_to_list(&conn, 300).unwrap(), newest[..120]);
+        assert_eq!(marks_to_list(&conn).unwrap(), newest[..120]);
         // With room, the bare hashes are listed, the oldest last.
         conn.execute("DELETE FROM message_read_here WHERE seq > 100", [])
             .unwrap();
-        let listed = marks_to_list(&conn, 300).unwrap();
+        let listed = marks_to_list(&conn).unwrap();
         assert_eq!(listed.len(), 102);
         assert_eq!(listed[100..], [[0xb1; 16], [0xb2; 16]]);
-        // A message that is not shown, or has expired, is not listed.
+        // Whatever became of its message here, a mark is listed: one with
+        // no place, and one held at no live number.
         conn.execute(
             "UPDATE message_index SET placed_at = NULL WHERE id = ?1",
             [&ids[49][..]],
         )
         .unwrap();
-        assert_eq!(marks_to_list(&conn, 300).unwrap().len(), 100);
-        let expired = 100 + i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS;
-        assert_eq!(marks_to_list(&conn, expired - 1).unwrap().len(), 100);
-        assert_eq!(
-            marks_to_list(&conn, expired).unwrap(),
-            [[0xb1; 16], [0xb2; 16]]
-        );
-        // Nor one held at no live number: with H at 94, of the numbers
-        // whose marks are left (1 to 50) those from 31 are live, and 50 is
-        // not shown.
         conn.execute("UPDATE message_signers SET highest = 64 + 30", [])
             .unwrap();
-        assert_eq!(marks_to_list(&conn, 300).unwrap().len(), 2 * 19 + 2);
+        assert_eq!(marks_to_list(&conn).unwrap(), listed);
 
         keep_list(&conn, &[3; 32], &[[1; 16], [2; 16], [1; 16]]).unwrap();
         keep_list(&conn, &[4; 32], &[[1; 16]]).unwrap();
@@ -2348,7 +2390,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "work");
         assert_eq!(
-            marks_to_list(&conn, 200).unwrap(),
+            marks_to_list(&conn).unwrap(),
             [
                 read_mark(&ids[0], "notes"),
                 read_mark(&ids[1], "work"),
@@ -2435,5 +2477,127 @@ mod tests {
                 (read_mark(&ids[0], "notes"), true)
             ]
         );
+    }
+
+    /// Each mark of the table, by seq: its mark, whether it has an ID, and
+    /// when it became bare.
+    fn bare_at(conn: &Connection) -> Vec<(Mark, bool, Option<i64>)> {
+        conn.prepare("SELECT mark, id IS NOT NULL, merged_at FROM message_read_here ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    mark_of(&row.get::<_, Vec<u8>>(0)?),
+                    row.get(1)?,
+                    row.get(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// A mark whose message's row goes from the index stays in the table
+    /// as a bare hash, from the moment it went, and is in the list and
+    /// read here, whichever way the row went (decision 2026-10-09 §7.1,
+    /// §7.2): a clearing, leaving the live numbers at the door, held at no
+    /// live number at the hourly task, and its 30 days in a generation the
+    /// device has left, which then goes whole.
+    #[test]
+    fn a_mark_whose_messages_row_goes_stays_as_a_bare_hash_for_each_reason() {
+        let conn = db::open_in_memory().unwrap();
+        let ids: Vec<Id> = (1..=4)
+            .map(|number| {
+                taken(&conn, 7, number, "m", 100);
+                id_taken(7, number, "m")
+            })
+            .collect();
+        give_places(&conn, &[1; 32], 100).unwrap();
+        for (k, id) in ids.iter().enumerate() {
+            mark_read(&conn, id, "notes", 101 + i64::try_from(k).unwrap()).unwrap();
+        }
+        let marks: Vec<Mark> = ids.iter().map(|id| read_mark(id, "notes")).collect();
+        generation(&conn, &[2; 32], 1, 100).unwrap();
+
+        // A clearing.
+        assert!(clear(&conn, &[7; 32], 1, 1, 150).unwrap());
+        // Number 2 leaves the live numbers, at the door.
+        assert!(hold_number(&conn, &[7; 32], 1, 2 + 64, false, 160).unwrap());
+        // Number 3 is held at no live number at the hourly task.
+        conn.execute("UPDATE message_signers SET highest = 3 + 64", [])
+            .unwrap();
+        let gone = drop_gone(&conn, 170, &Applied::NotKnown).unwrap();
+        assert_eq!(gone.not_live, 1);
+        // Number 4's 30 days are up, in the generation the device left.
+        let month = i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS;
+        let gone = drop_gone(&conn, 100 + month, &Applied::Under([2; 32])).unwrap();
+        assert_eq!(gone.expired, 1);
+        assert_eq!(count(&conn, "message_index"), 0);
+        let generations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_generations WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generations, 0, "the generation left goes whole");
+
+        assert_eq!(
+            bare_at(&conn),
+            [
+                (marks[0], false, Some(150)),
+                (marks[1], false, Some(160)),
+                (marks[2], false, Some(170)),
+                (marks[3], false, Some(100 + month)),
+            ]
+        );
+        let newest_first: Vec<Mark> = marks.iter().rev().copied().collect();
+        assert_eq!(marks_to_list(&conn).unwrap(), newest_first);
+        for id in &ids {
+            assert!(read_by(&conn, id, "notes").unwrap().here);
+        }
+    }
+
+    /// A mark left bare by its message's row is bound as a merged bare
+    /// hash is (decision 2026-10-09 §7.2): at most 120 are kept, the oldest
+    /// going first, and each goes 30 days after it became bare, not after
+    /// it was made. Two devices' shown times of one message differ by less
+    /// than 30 days, so another device that still shows it is told.
+    #[test]
+    fn a_mark_left_bare_is_kept_at_most_120_and_30_days_after_it_became_bare() {
+        let conn = db::open_in_memory().unwrap();
+        let mut ids: Vec<Id> = Vec::new();
+        for (signer, count) in [(7, 60), (8, 61)] {
+            for number in 1..=count {
+                taken(&conn, signer, number, "m", 100);
+                ids.push(id_taken(signer, number, "m"));
+            }
+        }
+        give_places(&conn, &[1; 32], 100).unwrap();
+        for (k, id) in ids.iter().enumerate() {
+            mark_read(&conn, id, "notes", 101 + i64::try_from(k).unwrap()).unwrap();
+        }
+        let month = i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS;
+        let expired = 100 + month;
+        assert_eq!(
+            drop_gone(&conn, expired, &Applied::NotKnown)
+                .unwrap()
+                .expired,
+            121
+        );
+        // The mark made first, the oldest, is the one that went.
+        let kept = bare_at(&conn);
+        assert_eq!(kept.len(), 120);
+        assert!(kept.iter().all(|row| !row.1 && row.2 == Some(expired)));
+        let newest: Vec<Mark> = ids[1..]
+            .iter()
+            .rev()
+            .map(|id| read_mark(id, "notes"))
+            .collect();
+        assert_eq!(marks_to_list(&conn).unwrap(), newest);
+
+        assert_eq!(keep_bare_marks(&conn, &[], expired + month - 1).unwrap(), 0);
+        assert_eq!(count(&conn, "message_read_here"), 120);
+        assert_eq!(keep_bare_marks(&conn, &[], expired + month).unwrap(), 120);
+        assert_eq!(count(&conn, "message_read_here"), 0);
     }
 }
