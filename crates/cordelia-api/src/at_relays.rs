@@ -325,21 +325,17 @@ pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, 
     Ok(pairs)
 }
 
-/// Whether the messages channel among `own`, as [`channels`] gives them,
-/// has no place among the proofs of one connection, where a relay
-/// remembers the proofs of `most` channels for one (decision 2026-10-09
-/// §2.1): the channels that are proved, up to it and with it, are more
-/// than that. It is last, so it is the one that is not proved, and the
-/// device has no messages. Its memory comes first. A pair channel is not
-/// proved, and takes no place.
-///
-/// No for a list that has no messages channel: sync is off, or the device
-/// stands nowhere.
-pub fn no_place(own: &[Own], most: usize) -> bool {
-    let Some(at) = own.iter().position(|own| own.kind == Kind::Messages) else {
-        return false;
-    };
-    own[..=at].iter().filter(|own| own.is_pulled()).count() > most
+/// The ID of the messages channel of the generation that this device
+/// stands applied under, whether or not sync is on (decision 2026-10-09
+/// §2.1): it is not read through the door for a carry. None for a device
+/// that does not stand applied.
+pub fn messages_channel(conn: &Connection) -> Result<Option<[u8; 32]>, PersonError> {
+    if stands(conn)? != Stands::Applied {
+        return Ok(None);
+    }
+    let standing = Standing::to_write(conn)?;
+    let messages = derive::messages_secret(&standing.secret)?;
+    Ok(Some(derive::channel_id(&messages)?))
 }
 
 /// The channels of the names that the personal channel lists and that
@@ -1575,47 +1571,6 @@ mod tests {
     fn kinds_of(on: &Machine) -> Vec<Kind> {
         let own = channels(&on.conn, &on.identity).unwrap();
         own.iter().map(|own| own.kind.clone()).collect()
-    }
-
-    /// Past the limit on proofs the messages channel has no place
-    /// (decision 2026-10-09 §2.1): with 1,024 channels that are proved
-    /// before it, it would be the 1,025th, and is not proved. With 1,023
-    /// it has its place. A pair channel is not proved, and takes none. A
-    /// list with no messages channel has nothing that wants a place.
-    #[test]
-    fn test_past_the_limit_on_proofs_the_messages_channel_has_no_place() {
-        use cordelia_core::protocol::MAX_CHANNELS_PROVED_ON_A_CONNECTION as MOST;
-        let channel = |kind: Kind, n: usize, proved: bool| Own {
-            kind,
-            id: [n as u8; 32],
-            secret: proved.then_some([n as u8; 32]),
-        };
-        let with = |before: usize, pairs: usize| -> Vec<Own> {
-            let pairs = (0..pairs).map(|n| channel(Kind::Pair, n, false));
-            let names = (0..before).map(|n| channel(Kind::Name(n.to_string()), n, true));
-            let mut own: Vec<Own> = pairs.chain(names).collect();
-            own.push(channel(Kind::Messages, 0, true));
-            own
-        };
-        assert!(no_place(&with(MOST, 0), MOST));
-        assert!(!no_place(&with(MOST - 1, 0), MOST));
-        assert!(!no_place(&with(MOST - 1, 2), MOST));
-        assert!(no_place(&with(2, 0), 2));
-        assert!(!no_place(&with(1, 0), 2));
-        // No messages channel.
-        let mut without = with(MOST + 1, 0);
-        without.pop();
-        assert!(!no_place(&without, MOST));
-
-        // As a device's own channels give it.
-        let mut s = Several::new(1);
-        s.make_phrase(0);
-        s.hold(&[0], "notes");
-        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
-        let own = channels(&s[0].conn, &s[0].identity).unwrap();
-        assert_eq!(own.len(), 3);
-        assert!(!no_place(&own, 3));
-        assert!(no_place(&own, 2));
     }
 
     /// A device proves, once a day, the channel of every name that its
