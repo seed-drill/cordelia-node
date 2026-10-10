@@ -812,7 +812,6 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(another(channel, &message), None);
         let personal = own.iter().find(|own| own.kind == Kind::Personal).unwrap();
         assert_eq!(another(personal, &pushed), None);
         // Answers that are not one for each entry say nothing.
@@ -833,6 +832,10 @@ mod tests {
         assert_eq!(listed(&s, 1).unwrap().0, 1);
         assert_eq!(answer(Pushed::HoldsAnother, true), Some(2));
         assert_eq!(listed(&s, 1), Some((2, vec![read_mark(&id, "notes")])));
+        // Another to the device's message at the list's revision writes no
+        // list: it is not the list's slot.
+        assert_eq!(message.rev, 2);
+        assert_eq!(another(channel, &message), None);
         // Answered so again for the list below the one held: nothing.
         assert_eq!(answer(Pushed::HoldsAnother, true), None);
     }
