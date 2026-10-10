@@ -36,6 +36,7 @@ use cordelia_core::CordeliaError;
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Value};
+use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::message::{self, NotAMessage, Taken as InTheRing};
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::Statement;
@@ -74,8 +75,15 @@ pub enum Read {
 ///
 /// The generation is the channel's row, made the first time the device
 /// holds it ([`held::generation`]).
+///
+/// **An entry of the device's own, `own`,** that the store kept is one a
+/// relay handed back from the device's later life, over what its store
+/// held: a message of its own there that not every relay had taken waits
+/// to be sent again under the next number (decision 2026-10-09 §2.3, case
+/// 2; [`crate::sender::taken_over`]).
 pub fn taken(
     conn: &Connection,
+    own: &[u8; 32],
     secret: &[u8; 32],
     statement: &Statement,
     entry: &CheckedEntry,
@@ -90,6 +98,8 @@ pub fn taken(
         statement.number,
         now,
     ))?;
+
+    crate::sender::taken_over(conn, own, &slot_key, generation, entry)?;
 
     let is_list = entry.slot == slot_id(&slot_key, &message::read_name(&signer)?);
     let number = message::number_of(entry.rev);
@@ -155,7 +165,7 @@ pub fn taken(
 
 /// The label that this device knows `key` by (decision 2026-10-09 §3):
 /// the statement's, or the one in the record of its addition, or none.
-fn label_of(
+pub(crate) fn label_of(
     conn: &Connection,
     statement: &Statement,
     key: &[u8; 32],
@@ -179,6 +189,8 @@ fn label_of(
 pub struct Hourly {
     /// What went from the index.
     pub gone: held::Gone,
+    /// How many of the device's own messages it cleared at the relays.
+    pub cleared: usize,
     /// Whether the write-ahead log was written back whole and truncated.
     pub checkpointed: bool,
 }
@@ -187,24 +199,45 @@ pub struct Hourly {
 /// `AGENT_MESSAGE_CLEAR_INTERVAL_SECS`), at `now` by the node's clock,
 /// whatever the device's state: first the index rows of messages that
 /// have expired or are held at no live number are overwritten and
-/// dropped, in one write, with what is kept of each generation other
-/// than the one the device stands applied under once none of its rows is
-/// left; and last the truncating checkpoint runs, so that what was
-/// overwritten stands in the log no longer than an hour.
-pub fn hourly(conn: &Connection, now: i64) -> Result<Hourly, PersonError> {
-    let gone = in_one(conn, || {
-        let applied = crate::at_relays::messages_channel(conn)?;
-        kept(held::drop_gone(conn, now, applied.as_ref()))
-    })?;
-
-    // ── The clearing at the relays (decision 2026-10-09 §2.3) ──────────
-    // Here, between the two, goes the clearing of the device's own
-    // expired messages: where the device stands applied, has sync on and
-    // has fetched the messages channel since it started, it writes the
-    // entry that clears each of them. It is not built yet.
-
+/// dropped, in one write, with the kept values of the device's own of
+/// every generation other than the one it stands applied under, and then
+/// what is kept of each such generation once none of its rows is left;
+/// then, where the device stands applied, has sync on and has fetched the
+/// messages channel since it started (`fetched`), it clears its own
+/// expired messages at the relays ([`crate::sender::clear_expired`]); and
+/// last the truncating checkpoint runs, so that what was overwritten
+/// stands in the log no longer than an hour.
+///
+/// Which channel the device stands applied under is read before the
+/// write: where it cannot be read, no generation goes, and what has
+/// expired still does. An error in clearing is logged, nothing is counted
+/// as cleared, and the checkpoint still runs.
+pub fn hourly(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: bool,
+) -> Result<Hourly, PersonError> {
+    let applied = match crate::at_relays::messages_channel(conn) {
+        Ok(Some(channel)) => held::Applied::Under(channel),
+        Ok(None) => held::Applied::Nowhere,
+        Err(_) => held::Applied::NotKnown,
+    };
+    let gone = in_one(conn, || kept(held::drop_gone(conn, now, &applied)))?;
+    // The checkpoint runs whether or not the clearing could (§7.1).
+    let cleared = match crate::sender::clear_expired(conn, identity, now, fetched) {
+        Ok(cleared) => cleared,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not clear this device's expired messages");
+            0
+        }
+    };
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
-    Ok(Hourly { gone, checkpointed })
+    Ok(Hourly {
+        gone,
+        cleared,
+        checkpointed,
+    })
 }
 
 /// What the store answered, with its error as the device's.
@@ -891,10 +924,10 @@ mod tests {
         assert!(shown_on(&s, 1, held_at + 30 * DAY).is_empty());
         assert_eq!(indexed(&s, 1), ["for a month"]);
 
-        let task = hourly(&s[1].conn, held_at + 30 * DAY - 1).unwrap();
+        let task = hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY - 1, true).unwrap();
         assert_eq!(task.gone, held::Gone::default());
         assert_eq!(indexed(&s, 1), ["for a month"]);
-        let task = hourly(&s[1].conn, held_at + 30 * DAY).unwrap();
+        let task = hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY, true).unwrap();
         assert_eq!(task.gone.expired, 1);
         assert!(indexed(&s, 1).is_empty());
         assert_eq!(rows(&s[1].conn, "message_numbers"), 0);
@@ -976,7 +1009,7 @@ mod tests {
                 .unwrap();
             assert_eq!(words_in(&log, &words), words, "{run}");
 
-            let task = hourly(&s[1].conn, s.now + 30 * DAY).unwrap();
+            let task = hourly(&s[1].conn, &s[1].identity, s.now + 30 * DAY, true).unwrap();
             assert_eq!(task.gone.expired, 1, "{run}");
             assert!(task.checkpointed, "{run}");
             assert!(words_in(&path, &words).is_empty(), "{run}");
@@ -1086,7 +1119,7 @@ mod tests {
         let entry = sent(&s, 0, 1, &message);
         assert_eq!(given(&s, 1, &entry), STORED);
         assert_eq!(shown_on(&s, 1, held_at), ["once"]);
-        hourly(&s[1].conn, held_at + 30 * DAY).unwrap();
+        hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY, true).unwrap();
         assert!(indexed(&s, 1).is_empty());
 
         s[1].conn
@@ -1550,6 +1583,85 @@ mod tests {
         assert_eq!(places, 0);
     }
 
+    /// Where the channel the device stands applied under cannot be read,
+    /// the hourly task drops no generation, and still drops what has
+    /// expired (decision 2026-10-09 §7.1): here the device's secret has
+    /// gone from its store, and the generation it has left stays after
+    /// the messages of both generations expired.
+    #[test]
+    fn an_hourly_task_that_cannot_read_the_channel_applied_drops_what_expired_and_no_generation() {
+        let mut s = Several::of_one_person(2);
+        let start = s.now;
+        let entry = sent(&s, 0, 1, &says("old", start));
+        assert_eq!(given(&s, 1, &entry), STORED);
+        let old = generation(&s, 1);
+        renewed(&mut s);
+        let entry = sent(&s, 0, 1, &says("new", start));
+        assert_eq!(given_at(&s, 1, &entry, start), STORED);
+        let new = generation(&s, 1);
+        s[1].conn.execute("DELETE FROM person_secrets", []).unwrap();
+        assert!(crate::at_relays::messages_channel(&s[1].conn).is_err());
+
+        let task = hourly(&s[1].conn, &s[1].identity, start + 30 * DAY, false).unwrap();
+        assert_eq!(task.gone.expired, 2);
+        assert!(indexed(&s, 1).is_empty());
+        assert_eq!(generations_in(&s, 1, "message_generations"), [old, new]);
+    }
+
+    /// An error in the clearing does not keep the checkpoint from running
+    /// (decision 2026-10-09 §7.1): with sync on and the channel fetched,
+    /// where the channel applied cannot be read, the hourly task drops what
+    /// expired, clears nothing, truncates the log, and answers.
+    #[test]
+    fn an_hourly_task_whose_clearing_fails_still_runs_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Several::of_one_person(2);
+        let path = dir.path().join("desktop.db");
+        s.machines[1]
+            .conn
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        s.machines[1].conn = cordelia_storage::db::open_as(&path, true).unwrap();
+        cordelia_storage::meta::set(
+            &s[1].conn,
+            cordelia_storage::meta::SYNC_CLAUDE_DIR,
+            "/home/desktop/.claude",
+        )
+        .unwrap();
+        let start = s.now;
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &says("old", start))), STORED);
+        s[1].conn.execute("DELETE FROM person_secrets", []).unwrap();
+        let later = start + 30 * DAY;
+        assert!(crate::sender::clear_expired(&s[1].conn, &s[1].identity, later, true).is_err());
+        let log = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&log).unwrap().len() > 0);
+
+        let task = hourly(&s[1].conn, &s[1].identity, later, true);
+        assert!(task.is_ok(), "{task:?}");
+        let task = task.unwrap();
+        assert_eq!((task.gone.expired, task.cleared), (1, 0));
+        assert!(task.checkpointed);
+        assert!(indexed(&s, 1).is_empty());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+    }
+
+    /// A number of the new generation held at a message of the old one,
+    /// not shown there, is not counted as overwritten when it leaves the
+    /// live numbers: its message is of the other generation, and was not
+    /// held in this one (decision 2026-10-09 §2.5, §7.1).
+    #[test]
+    fn a_number_held_at_another_generations_message_is_not_counted_as_overwritten() {
+        let mut s = Several::of_one_person(2);
+        let message = says("from before", s.now);
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &message)), STORED);
+        renewed(&mut s);
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &message)), STORED);
+        let last = sent(&s, 0, 65, &says("65", s.now));
+        assert_eq!(given(&s, 1, &last), STORED);
+        let kept = signer_on(&s, 1, 0);
+        assert_eq!((kept.highest, kept.overwritten), (65, 0));
+    }
+
     /// What is kept of a generation the device has left goes once none of
     /// its index rows is left (decision 2026-10-09 §7.1, §9.1): after a
     /// statement and 30 days, nothing of the old generation is in any
@@ -1612,11 +1724,11 @@ mod tests {
         let (signers_before, firsts_before) = (signers(&s), firsts(&s));
         assert_eq!(firsts_before.len(), 1);
 
-        hourly(&s[1].conn, start + DAY).unwrap();
+        hourly(&s[1].conn, &s[1].identity, start + DAY, true).unwrap();
         assert_eq!(generations_in(&s, 1, "message_generations"), [old, new]);
         assert_eq!(generations_in(&s, 1, "message_first_held"), [old, new]);
 
-        let task = hourly(&s[1].conn, start + 30 * DAY).unwrap();
+        let task = hourly(&s[1].conn, &s[1].identity, start + 30 * DAY, true).unwrap();
         assert_eq!(task.gone.expired, 4);
         for table in tables {
             assert!(

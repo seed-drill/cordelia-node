@@ -105,6 +105,7 @@ use cordelia_api::at_relays::{
     self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
 };
 use cordelia_api::person::{PersonError, Shown};
+use cordelia_api::sender;
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftRead, NoRoom, ProvedBy,
 };
@@ -403,6 +404,7 @@ impl DeviceEntries {
         }
         let read_all = self.pass_at(relays, &links, kind).await;
         self.say_no_place(&links);
+        self.taken_everywhere(relays);
         let mut taken = false;
         while let Some(done) = asking.join_next().await {
             taken |= done.unwrap_or(false);
@@ -955,7 +957,10 @@ impl DeviceEntries {
             return;
         }
         let now = self.unix();
-        match cordelia_api::reader::hourly(&lock(&self.state.db), now) {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        match cordelia_api::reader::hourly(&db, identity, now, fetched.unwrap_or(false)) {
             Ok(task) => {
                 let gone = task.gone.expired + task.gone.not_live;
                 if gone > 0 {
@@ -965,11 +970,56 @@ impl DeviceEntries {
                         "messages left the index, written over first"
                     );
                 }
+                if task.cleared > 0 {
+                    tracing::info!(
+                        cleared = task.cleared,
+                        "messages of this device's whose 30 days are up were cleared"
+                    );
+                }
                 if !task.checkpointed {
                     tracing::debug!("the log was not written back whole: the next hour will");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not drop the messages that went"),
+        }
+    }
+
+    /// Write again, each under the next number, the device's own messages
+    /// that wait to be sent again (decision 2026-10-09 §2.3;
+    /// [`sender::write_again`]): only once the messages channel was
+    /// fetched since the node started. Says whether it wrote any.
+    fn write_again(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        let again = sender::write_again(&db, identity, self.unix(), fetched.unwrap_or(false));
+        match again {
+            Ok(again) => {
+                if !again.dropped.is_empty() {
+                    tracing::info!(
+                        messages = again.dropped.len(),
+                        "messages that would need another number are sent no more: they may not have reached every relay"
+                    );
+                }
+                !again.written.is_empty()
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "could not send messages again");
+                false
+            }
+        }
+    }
+
+    /// Drop each message of the device's own that every relay it is set up
+    /// with has taken (decision 2026-10-09 §2.3). Which relays those are
+    /// is known by their keys only while every one is connected
+    /// ([`Self::set_up_by_key`]): nothing is dropped otherwise.
+    fn taken_everywhere(&self, relays: &[Relay]) {
+        let Some(set_up) = self.set_up_by_key(relays) else {
+            return;
+        };
+        if let Err(e) = sender::taken_everywhere(&lock(&self.state.db), &set_up) {
+            tracing::debug!(error = %e, "could not drop what every relay took");
         }
     }
 
@@ -1515,10 +1565,21 @@ impl DeviceEntries {
                         .fetched_from(&channel.id, link.name(), now);
                 }
             }
-            let sent = match self.push(&at, channel, Which::Since).await {
+            let mut sent = match self.push(&at, channel, Which::Since).await {
                 Step::Done(sent) => sent,
                 Step::Stop => return self.stopped(&at, stopped),
             };
+            // A message that waits to be sent again is written again under
+            // the next number, and pushed in this pass: the pull may have
+            // handed back the device's own later entry over it, or the push
+            // been answered that the relay holds another entry of the
+            // device's at its revision (decision 2026-10-09 §2.3).
+            if messages && self.write_again() {
+                sent = match self.push(&at, channel, Which::Since).await {
+                    Step::Done(sent) => sent,
+                    Step::Stop => return self.stopped(&at, stopped),
+                };
+            }
             // What was carried into a name goes after the channel was
             // fetched from the relay, and after what came since (§7.3).
             if read_to_its_end
@@ -1989,7 +2050,11 @@ impl DeviceEntries {
                 },
                 |db, answers| {
                     let answers = answers?;
-                    at_relays::sent(db, &relay, channel, batch, &answers).ok()
+                    // For the messages channel, what the relay took of the
+                    // device's own messages, and what waits to be sent
+                    // again, in the same write (decision 2026-10-09 §2.3).
+                    let own = &self.state.identity;
+                    sender::pushed(db, own, &relay, channel, batch, &answers).ok()
                 },
             )
             .await?;
@@ -2202,7 +2267,8 @@ fn paced(of: &mut OfRelay) -> &mut ByteCounter {
 /// What a relay's answer for one entry means for sending it.
 fn pushed_as(answer: &PushAnswer) -> Pushed {
     match answer {
-        PushAnswer::Stored | PushAnswer::Held | PushAnswer::Older => Pushed::Holds,
+        PushAnswer::Stored | PushAnswer::Held => Pushed::Holds,
+        PushAnswer::Older => Pushed::HoldsLater,
         PushAnswer::Another => Pushed::HoldsAnother,
         PushAnswer::Refused(EntryRefused::NotSigned) => Pushed::DoesNotCheck,
         PushAnswer::Refused(EntryRefused::NoRoom) => Pushed::NoRoom,
@@ -2438,15 +2504,17 @@ mod tests {
         assert_eq!(counted_as_handed(3), entry_cost(0));
     }
 
-    /// Each answer to a push says one of five things for sending: the
-    /// relay holds the entry, whichever way; it holds another at that
-    /// revision; it does not check; there is no room; or the address is
-    /// over its allowance.
+    /// Each answer to a push says one of six things for sending: the
+    /// relay holds the entry, whichever way; it holds a later one, which
+    /// in the messages channel is not taken (decision 2026-10-09 §2.3,
+    /// F6); it holds another at that revision; it does not check; there
+    /// is no room; or the address is over its allowance.
     #[test]
     fn each_answer_to_a_push_is_read_as_what_it_means_for_sending() {
-        for holds in [PushAnswer::Stored, PushAnswer::Held, PushAnswer::Older] {
+        for holds in [PushAnswer::Stored, PushAnswer::Held] {
             assert_eq!(pushed_as(&holds), Pushed::Holds);
         }
+        assert_eq!(pushed_as(&PushAnswer::Older), Pushed::HoldsLater);
         assert_eq!(pushed_as(&PushAnswer::Another), Pushed::HoldsAnother);
         assert_eq!(
             pushed_as(&PushAnswer::Refused(EntryRefused::NotSigned)),
