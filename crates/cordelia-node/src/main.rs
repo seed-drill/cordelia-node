@@ -614,18 +614,63 @@ fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> Stri
 }
 
 /// Open the node's database, as a command that opens it itself does, with
-/// the schema's steps run. **A database from a later version is refused**
-/// (decision 2026-10-04 §10.1): the command names both versions, and
-/// changes nothing.
-fn open_database(db_path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+/// the schema's steps run, and set on the connection what a node of the
+/// role that `config` gives keeps ([`as_its_role_keeps`]). **A database
+/// from a later version is refused** (decision 2026-10-04 §10.1): the
+/// command names both versions, and changes nothing.
+fn open_database(
+    db_path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<rusqlite::Connection> {
     use cordelia_storage::StorageError;
     match cordelia_storage::db::open(db_path) {
-        Ok(conn) => Ok(conn),
+        Ok(conn) => {
+            as_its_role_keeps(&conn, &config.network.role)?;
+            Ok(conn)
+        }
         Err(StorageError::LaterVersion { found, own }) => {
             anyhow::bail!("{}", from_a_later_version(db_path, found, own))
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open the database as the node opens it when it starts (decision
+/// 2026-10-04 §10.1). One from a later version is refused: a personal
+/// node then stays up, over a database of its own in memory, with why
+/// (the second of what is returned); a node of any other role does not
+/// start without its database, and says why. The connection is set as a
+/// node of the role that `config` gives keeps it ([`as_its_role_keeps`]).
+fn open_the_nodes_database(
+    db_path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<(rusqlite::Connection, Option<String>)> {
+    let role = config.network.role.as_str();
+    let (conn, later) = match cordelia_storage::db::open(db_path) {
+        Ok(conn) => (conn, None),
+        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
+            let why = from_a_later_version(db_path, found, own);
+            if role != "personal" {
+                anyhow::bail!("{why}");
+            }
+            (cordelia_storage::db::open_in_memory()?, Some(why))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    as_its_role_keeps(&conn, role)?;
+    Ok((conn, later))
+}
+
+/// Set on a connection to the store what a node of `role` keeps there
+/// (decision 2026-10-09 §7.1, D10): a personal node keeps SQLite's
+/// `secure_delete` on, so that every row it deletes or moves, of memory
+/// as of messages, is written over with zeros. A relay sets nothing, and
+/// pays nothing for it.
+fn as_its_role_keeps(conn: &rusqlite::Connection, role: &str) -> anyhow::Result<()> {
+    if role == "personal" {
+        cordelia_storage::db::secure_delete_on(conn)?;
+    }
+    Ok(())
 }
 
 /// The last line of `cordelia init`. Run by a person, it says how the
@@ -803,7 +848,7 @@ fn init_with(
     // changed, not the node's token either (decision 2026-10-04 §10.1).
     let db_path = data_dir.join("cordelia.db");
     if db_path.exists() && force {
-        drop(open_database(&db_path)?);
+        drop(open_database(&db_path, &config)?);
     }
 
     // The data directory is made its owner's alone before anything is
@@ -859,7 +904,7 @@ fn init_with(
     // 4. Create database
     if !db_path.exists() || force {
         println!("Creating database...");
-        let _conn = open_database(&db_path)?;
+        let _conn = open_database(&db_path, &config)?;
         println!("  done.");
         #[cfg(unix)]
         {
@@ -1206,7 +1251,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     let opened = match (db_path.exists(), beside) {
         (false, _) => None,
         (true, Some(why)) => Some(Err(anyhow::anyhow!(why))),
-        (true, None) => Some(open_database(&db_path)),
+        (true, None) => Some(open_database(&db_path, &config)),
     };
     if let Some(Err(why)) = &opened {
         println!();
@@ -1689,17 +1734,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // carries what other nodes hand it, and does not start without its
     // database: it says why, and stops.
     let db_path = data_dir.join("cordelia.db");
-    let (conn, later) = match cordelia_storage::db::open(&db_path) {
-        Ok(conn) => (conn, None),
-        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
-            let why = from_a_later_version(&db_path, found, own);
-            if config.network.role != "personal" {
-                anyhow::bail!("{why}");
-            }
-            (cordelia_storage::db::open_in_memory()?, Some(why))
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (conn, later) = open_the_nodes_database(&db_path, &config)?;
 
     let version = env!("CARGO_PKG_VERSION");
     let role = &config.network.role;
@@ -2490,7 +2525,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
     refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
 
     // A personal node carries no channel of the older kind (decision
     // 2026-10-04 §10): what it has is the names that it holds, each with
@@ -2572,7 +2607,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
     refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     // A personal node carries no channel of the older kind (decision
@@ -2776,7 +2811,7 @@ fn cmd_swarm_init(
     // later version is refused, and nothing is changed (decision
     // 2026-10-04 §10.1).
     let db_path = data_dir.join("cordelia.db");
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
     std::fs::write(&identity_path, child.seed())?;
     #[cfg(unix)]
     {
@@ -7411,6 +7446,47 @@ mod tests {
             "Node is ready. Run `cordelia start` to begin."
         );
         assert_eq!(node_is_ready(true), "Node is ready.");
+    }
+
+    /// `PRAGMA secure_delete` reads 1 on the connection a personal node
+    /// opens, where the node starts and where a command opens the store
+    /// itself, and 0 on a relay's (decision 2026-10-09 §7.1, D10). A
+    /// personal node over a database from a later version keeps it on
+    /// over the one it holds in memory.
+    #[test]
+    fn a_personal_nodes_store_has_secure_delete_on_and_a_relays_has_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let secure_delete = |conn: &rusqlite::Connection| -> i64 {
+            conn.pragma_query_value(None, "secure_delete", |row| row.get(0))
+                .unwrap()
+        };
+        let as_a = |role: &str| {
+            let mut config = Config::default();
+            config.network.role = role.into();
+            config
+        };
+        for (role, on) in [("personal", 1), ("relay", 0), ("bootnode", 0)] {
+            let db_path = dir.path().join(format!("{role}.db"));
+            let (started, later) = open_the_nodes_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!((secure_delete(&started), later), (on, None), "{role}");
+            let command = open_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!(secure_delete(&command), on, "{role}");
+        }
+
+        let later = dir.path().join("later.db");
+        rusqlite::Connection::open(&later)
+            .unwrap()
+            .pragma_update(
+                None,
+                "user_version",
+                cordelia_storage::schema::SCHEMA_VERSION + 1,
+            )
+            .unwrap();
+        let (held, why) = open_the_nodes_database(&later, &as_a("personal")).unwrap();
+        assert_eq!(secure_delete(&held), 1);
+        assert!(why.is_some_and(|why| why.contains("later version")));
+        assert!(open_the_nodes_database(&later, &as_a("relay")).is_err());
+        assert!(open_database(&later, &as_a("personal")).is_err());
     }
 
     #[test]

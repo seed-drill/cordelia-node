@@ -12,6 +12,7 @@ pub mod first_start;
 pub mod history;
 pub mod index_lines;
 pub mod items;
+pub mod messages;
 pub mod meta;
 pub mod naming;
 pub mod person;
