@@ -254,9 +254,9 @@ pub fn answered(
 /// which the store kept over what it held (decision 2026-10-09 §7.2), in
 /// the door's write. Another device's list is kept in place of what was
 /// kept of it. The device's own, `own`, is one a relay handed back from
-/// its later life: its marks are merged into the table below those made
-/// since the device last wrote its list and above the rest, each found by
-/// the messages held and the names mapped here.
+/// its later life: its marks are placed in the table as one block, in its
+/// order, below those made since and above the rest, each added one found
+/// by the messages held and the names mapped here.
 pub(crate) fn list_taken(
     conn: &Connection,
     own: &[u8; 32],
