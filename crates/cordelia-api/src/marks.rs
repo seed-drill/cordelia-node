@@ -732,11 +732,11 @@ mod tests {
     /// top of it, no list is written above.
     #[test]
     fn no_list_is_written_above_the_bottom_half_of_band_0() {
-        let mut s = devices(2);
-        let t = s.now;
-        let id = sends(&s, 0, "~", "notes", "read", t);
-        s.pass(0, 1);
         for (top, written) in [(REV_BAND_HALF - 2, true), (REV_BAND_HALF - 1, false)] {
+            let mut s = devices(2);
+            let t = s.now;
+            let id = sends(&s, 0, "~", "notes", "read", t);
+            s.pass(0, 1);
             let value = ReadMarks::default().to_value().unwrap();
             let entry = Entry::seal(
                 &messages_secret(&s, 1),
@@ -748,9 +748,6 @@ mod tests {
             .check()
             .unwrap();
             entries::store(&s[1].conn, &entry, t).unwrap();
-            s[1].conn
-                .execute("DELETE FROM message_read_here", [])
-                .unwrap();
             let marked = reads(&s, 1, "notes", &id, t, true);
             assert_eq!(marked.list, written.then_some(top + 1), "{top}");
         }

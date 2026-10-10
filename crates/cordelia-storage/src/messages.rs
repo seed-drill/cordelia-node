@@ -2298,7 +2298,14 @@ mod tests {
             [(vec![3; 32], vec![5; 16]), (vec![4; 32], vec![1; 16])]
         );
         assert_eq!(drop_lists_but(&conn, &[[4; 32], [9; 32]]).unwrap(), 1);
-        assert_eq!(count(&conn, "message_lists"), 1);
+        let left: Vec<Vec<u8>> = conn
+            .prepare("SELECT key FROM message_lists")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(left, [vec![4; 32]]);
     }
 
     /// The device's own list taken from a relay is merged as older than
@@ -2382,14 +2389,14 @@ mod tests {
         let ids = shown_messages(&conn, 1, 100);
         mark_read(&conn, &ids[0], "notes", 100).unwrap();
         let bare = |k: u8| [k; 16];
-        let mut first: Vec<Mark> = (1..=100).map(bare).collect();
-        // The oldest of the first list is found: the bound is on bare
-        // hashes alone.
+        let first: Vec<Mark> = (1..=100).map(bare).collect();
+        merge_own_list(&conn, &first, &[], 200).unwrap();
+        // The oldest of the second list is found, and is below the bound:
+        // the bound is on bare hashes alone.
+        let mut second: Vec<Mark> = (101..=130).map(bare).collect();
         let to_work = read_mark(&ids[0], "work");
-        first.push(to_work);
-        merge_own_list(&conn, &first, &["work".to_string()], 200).unwrap();
-        let second: Vec<Mark> = (101..=130).map(bare).collect();
-        merge_own_list(&conn, &second, &[], 300).unwrap();
+        second.push(to_work);
+        merge_own_list(&conn, &second, &["work".to_string()], 300).unwrap();
         let held = table(&conn);
         assert_eq!(held.len(), 122);
         assert!(held.iter().any(|row| row.0 == to_work && row.2));
