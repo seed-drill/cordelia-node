@@ -1287,6 +1287,17 @@ mod tests {
         assert!(!valid_sync_name(&"a".repeat(201)));
     }
 
+    /// A message's `from` and `to` are bounded at a name's own bound
+    /// (decision 2026-10-09 §2.2, §6): every name fits, and the bound is no
+    /// wider than a name.
+    #[test]
+    fn a_names_bound_is_the_bound_of_a_name_in_a_message() {
+        use cordelia_core::protocol::AGENT_MESSAGE_NAME_MAX_BYTES;
+        let longest = "a".repeat(AGENT_MESSAGE_NAME_MAX_BYTES);
+        assert!(valid_sync_name(&longest));
+        assert!(!valid_sync_name(&format!("{longest}a")));
+    }
+
     fn request(folder: &str, name: &str, home: bool) -> SyncMapRequest {
         SyncMapRequest {
             folder: folder.into(),

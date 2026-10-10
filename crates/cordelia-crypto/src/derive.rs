@@ -12,6 +12,7 @@
 //! | Kind | Secret |
 //! |---|---|
 //! | Personal | HKDF(person secret, `cordelia v2 personal`) |
+//! | Messages | HKDF(person secret, `cordelia v2 messages`) (decision 2026-10-09 §2.1) |
 //! | Own, by name | HKDF(person secret, `cordelia v2 own` + length + name) |
 //! | Pair | HKDF(X25519(device a, device b), `cordelia v2 pair` + both keys, the lower first) |
 //! | The phrase's | HKDF(phrase, `cordelia v2 recovery`): see [`crate::phrase`] |
@@ -21,8 +22,8 @@
 //! throughout.
 
 use cordelia_core::protocol::{
-    LABEL_CHANNEL_SIGN, LABEL_ENTRY_KEY, LABEL_LOCKED, LABEL_OWN, LABEL_PAIR, LABEL_PERSONAL,
-    LABEL_SLOT_KEY,
+    LABEL_AGENT_MESSAGES, LABEL_CHANNEL_SIGN, LABEL_ENTRY_KEY, LABEL_LOCKED, LABEL_OWN, LABEL_PAIR,
+    LABEL_PERSONAL, LABEL_SLOT_KEY,
 };
 use cordelia_core::sync_name;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -84,6 +85,13 @@ pub fn channel_id(secret: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
 /// can derive.
 pub fn personal_secret(person_secret: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
     hkdf_sha256(person_secret, &[], LABEL_PERSONAL)
+}
+
+/// The secret of the messages channel, which every device of the person
+/// can derive (decision 2026-10-09 §2.1). It is under a label of its own,
+/// and not a name's, so it is no name's channel.
+pub fn messages_secret(person_secret: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
+    hkdf_sha256(person_secret, &[], LABEL_AGENT_MESSAGES)
 }
 
 /// The secret of the channel of the person's own that is called `name`,
@@ -256,7 +264,10 @@ mod tests {
             "pair",
             "github.com/owner/repo",
         ];
-        let mut secrets = vec![personal_secret(&PERSON).unwrap()];
+        let mut secrets = vec![
+            personal_secret(&PERSON).unwrap(),
+            messages_secret(&PERSON).unwrap(),
+        ];
         for name in names {
             secrets.push(own_secret(&PERSON, name).unwrap());
             secrets.push(locked_secret(&PERSON, &LOCK, name).unwrap());
@@ -271,7 +282,7 @@ mod tests {
 
         let distinct: HashSet<[u8; 32]> = secrets.iter().copied().collect();
         assert_eq!(distinct.len(), secrets.len());
-        assert_eq!(secrets.len(), 3 + 5 * names.len());
+        assert_eq!(secrets.len(), 4 + 5 * names.len());
 
         // Nor are their channels the same: each secret has its own ID.
         let ids: HashSet<[u8; 32]> = secrets
@@ -279,6 +290,28 @@ mod tests {
             .map(|secret| channel_id(secret).unwrap())
             .collect();
         assert_eq!(ids.len(), secrets.len());
+    }
+
+    /// The messages channel is derived from the person secret alone, under
+    /// its own label (decision 2026-10-09 §2.1): another person secret
+    /// gives another, and it is neither the personal channel nor the
+    /// channel of any name, the name `messages` among them.
+    #[test]
+    fn the_messages_channel_is_derived_from_the_person_secret_alone() {
+        let messages = messages_secret(&PERSON).unwrap();
+        assert_eq!(
+            messages,
+            hkdf_sha256(&PERSON, &[], b"cordelia v2 messages").unwrap()
+        );
+        assert_ne!(messages, messages_secret(&LOCK).unwrap());
+        assert_ne!(messages, personal_secret(&PERSON).unwrap());
+        for name in ["~", "messages", "msg", "github.com/owner/repo"] {
+            assert_ne!(messages, own_secret(&PERSON, name).unwrap(), "{name}");
+        }
+        assert_ne!(
+            channel_id(&messages).unwrap(),
+            channel_id(&personal_secret(&PERSON).unwrap()).unwrap()
+        );
     }
 
     /// The name's length goes before it, as two bytes, the higher first.

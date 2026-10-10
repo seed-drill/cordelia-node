@@ -1447,7 +1447,8 @@ pull a look at its store.
 
 **Derivation:** It is sized for a device with 256 names, which is what an
 address may make a relay take in an hour: a pull of each every ten seconds,
-and of the personal channel (1,542 a minute); its day's proofs in one
+and of the personal channel and the messages channel (1,548 a minute; the
+messages channel is decision 2026-10-09 §2.1); its day's proofs in one
 burst, as many as a relay remembers for a connection (1,024); a show for
 each pass and each time it sends; and what it pushes.
 
@@ -1794,9 +1795,195 @@ run, and the first wait is a cycle long: without this, the timer's own
 jitter would put every try off by a whole cycle. `protocol.rs` asserts that
 it is less than the first wait.
 
+### 12.12 Messages Between Your Own Agents
+
+The constants of the [decision record of 2026-10-09](../decisions/2026-10-09-messages-between-your-own-agents.md),
+which `protocol.rs` has under "Messages between your own agents". "Record"
+below is that record. They are named `AGENT_MESSAGE_` because "message"
+already names a message of the wire (`MAX_MESSAGE_BYTES`).
+
+#### LABEL_AGENT_MESSAGES, LABEL_AGENT_MESSAGE_ID, LABEL_AGENT_MESSAGE_READ
+
+**Rationale:** `cordelia v2 messages` is the label the messages channel's
+secret is derived under, from the person secret (record §2.1); `cordelia v2
+message id` the label of a message's ID, and `cordelia v2 message read` that
+of a mark in a device's list of what its agents read (record §2.2). The
+channel has a label of its own, and not a reserved name under `cordelia v2
+own`, so that no place which lists names has to pass over one. No label
+begins another (§12.5), which `protocol.rs` tests over `LABELS`, which then
+has 28.
+
+#### AGENT_MESSAGE_PREFIX = `msg/`, AGENT_MESSAGE_READ_PREFIX = `read/`
+
+**Rationale:** The first parts of the names in the messages channel (record
+§2.2): `msg/`, the sender's key and its place in the ring for a message or
+the entry that clears one, and `read/` and the device's key for its list.
+Neither begins the other. Each device writes only in slots named for its
+own key, and a reader takes from them only what that key signed.
+
+#### AGENT_MESSAGE_RING = 64
+
+**Rationale:** A device's slots for its messages (record §2.3), the live
+numbers of one signer at a reader (§2.5), and the places a reader gives one
+signer in an hour (§6). With its list, a device has 65 slots of 3,072 bytes
+as counted: at the cap of 64 devices that count, 12,779,520 bytes, under a
+channel's 16 MiB at a relay, so no honest device's first message is refused
+for room. It is above the device's hourly limit, so an honest device's hour
+of messages is never overwritten within the hour, and a reader that was
+away is shown a whole ring at once.
+
+#### AGENT_MESSAGE_CONTENT_BYTES = 2,048, AGENT_MESSAGE_VALUE_BYTES = 1,936
+
+**Derivation:** The value is the content, less the seal's 28 bytes
+(`ITEM_SEAL_OVERHEAD_BYTES`), less the 7 bytes of an entry's form around its
+name and value, less the longest name, 77 bytes (`msg/`, a key as it is
+written in 70, `/` and two digits): 2,048 − 28 − 7 − 77.
+
+**Rationale:** Every entry of the channel, a message, a clearing or a list,
+is of one size class (record §2.2): a relay learns no length, and a slot
+written again is never larger, so it is never refused for room. Each seals
+at 2,048 through `Entry::seal` as it is: with the names of 75, 76 and 77
+bytes an entry says 2,018 to 2,020 bytes, and with the seal that is 2,046 to
+2,048, whose power of two is 2,048. A message at every bound is 1,641 bytes,
+which leaves 295 of fill; the smallest is 68. `protocol.rs` checks each of
+these when it is compiled. The class of 1,024 would leave a body of under
+300 bytes at the bounds of the other fields.
+
+#### AGENT_MESSAGE_BODY_MAX_BYTES = 1,024
+
+**Rationale:** A message is coordination: a sentence or a paragraph, and a
+link to where the rest is (record §2.2). 1 KB is some two hundred words. A
+larger body would invite logs and diffs, which belong in the issue that the
+link names, and every byte of a body is a byte in front of another agent.
+`send` reads one byte more than this from its input, and no more.
+
+#### AGENT_MESSAGE_NAME_MAX_BYTES = 200
+
+**Rationale:** The bound on `from` and `to` (record §2.2): a name's own
+bound in `sync::valid_sync_name`, which a test in `cordelia-api` ties to
+this.
+
+#### AGENT_MESSAGE_LINK_OWNER_MAX_BYTES = 39, AGENT_MESSAGE_LINK_REPO_MAX_BYTES = 100, AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS = 10, AGENT_MESSAGE_LINK_MAX_BYTES = 151
+
+**Derivation:** The link's most is its three parts at their bounds, with `/`
+and `#`: 39 + 1 + 100 + 1 + 10.
+
+**Rationale:** A link is `owner/repo#n` (record §2.2): an owner's and a
+repository's longest names where links are made, and ten digits, which hold
+every number below 2^32. The link is text, and is never read as a number,
+so a number of ten digits need not fit in 32 bits.
+
+#### AGENT_MESSAGE_ID_BYTES = 16, AGENT_MESSAGE_ID_SHOWN_CHARS = 8, AGENT_MESSAGE_READ_MARK_BYTES = 16
+
+**Rationale:** An ID is 128 bits, as a link's hash is in a chain
+(`ENTRY_LINK_HASH_BYTES`), and so is a mark (record §2.2). Eight hex
+characters tell apart the few hundred messages a device holds, and a longer
+prefix is taken where two match.
+
+#### AGENT_MESSAGE_READ_MARKS_MAX = 120
+
+**Derivation:** As many marks as fit in a value after the form's byte and
+the count's two: (1,936 − 3) / 16, rounded down. A full list is 1,923 bytes.
+
+**Rationale:** A device's list holds the newest marks of what its agents
+read (record §2.4). One that reads more between two fetches by another
+device loses the oldest for that device, which then shows them unread: at
+worst one request is acted on twice.
+
+#### AGENT_MESSAGE_KEPT_DAYS = 30
+
+**Rationale:** A message is shown for 30 days from its shown time, and its
+sender clears it at the relays at its 30 days (record §7.1). Messages are
+coordination, not a record. Long enough for a laptop closed over a holiday
+to hear what was asked of it. Also how long a kept value waits for every
+relay to take it (§2.3).
+
+#### AGENT_MESSAGE_AHEAD_MAX_SECS = 600
+
+**Rationale:** How far ahead of a sender's clock a `sent` of its own may be
+and still hold its sending back (`clock_behind`, record §7.1). A row further
+ahead is passed over, so a device whose clock was ahead for a moment, and
+sent then, is not locked out until that row goes. The person's machines
+keep time by the network to within seconds, and ten minutes covers one that
+has woken and not yet set its clock. A reader uses no such bound.
+
+#### AGENT_MESSAGE_SENDS_MAX = 4
+
+**Rationale:** The most numbers one message is sent under (record §2.3). A
+restore a lap behind needs one more number, and a restore behind two relays
+that each hold a later life needs two; four leaves room, and bounds a relay
+that answers falsely to three slots for each message.
+
+#### AGENT_MESSAGES_PER_FOLDER_PER_HOUR = 20, AGENT_MESSAGES_PER_DEVICE_PER_HOUR = 60
+
+**Rationale:** An honest command sends at most 20 messages in an hour from
+a folder: one every three minutes is more than any task needs, and a loop
+that the other guards miss is stopped at twenty (record §6). A device with
+thirty folders would otherwise send 600 an hour, and go round its ring of 64
+in six minutes, overwriting what its other agents had sent before anyone
+read it: 60 is below the ring, which `protocol.rs` checks. A message to
+every name counts as one, and each sending again counts as one.
+
+#### AGENT_MESSAGE_PAIR_UNREAD_MAX = 10
+
+**Rationale:** Ten messages between two agents that are shown on a device
+and that no person there has read stop that device sending between them,
+until a person reads them there (record §6). Chosen with the folder's rate;
+no measurement behind it yet.
+
+#### AGENT_MESSAGE_SUMMARY_LINES = 5, AGENT_MESSAGE_SUBJECT_CHARS = 80, AGENT_MESSAGE_AGENT_NAME_CHARS = 48
+
+**Rationale:** What `cordelia msg summary` puts in front of an agent (record
+§4.1): the lines of at most five new messages, and five IDs in its count
+line; a subject of at most 80 Unicode scalar values; and an agent's name of
+at most 48, which is `github.com/` and an owner and a repository of usual
+lengths. The whole name is in `log`'s JSON. No measurement behind them yet.
+
+#### AGENT_MESSAGE_SUMMARY_WAIT_MS = 100
+
+**Rationale:** How long `summary` has, in all, from the moment the process
+reads its clock (record §4.1): a hook runs on every prompt, and must never
+hold an agent up. It prints nothing where the node does not answer within
+it. A new timeout: the summary is run by a hook, not by a person, and the
+stream timeout of ten seconds would hold every prompt up for as long.
+
+#### AGENT_MESSAGE_HOOK_INPUT_WAIT_MS = 20, AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES = 65,536
+
+**Rationale:** A hook's input is written before the hook is waited on, so
+it is there at once (record §4.1); 20 ms is for a busy machine, and an open
+pipe that nothing writes to does not hold the summary up. It is within the
+summary's 100 ms, which `protocol.rs` checks. 64 KiB is more than a hook's
+JSON holds.
+
+#### AGENT_MESSAGE_MARKER_BYTES = 6
+
+**Rationale:** The random bytes of the value made for one printing of a
+body, which its start and end lines carry (record §4.1): 48 bits that a
+body written before them cannot guess, as `history show` makes them.
+
+#### AGENT_MESSAGE_CLEAR_INTERVAL_SECS = 3,600
+
+**Derivation:** `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS`.
+
+**Rationale:** How often a sender clears its expired messages, and then
+checkpoints its log (record §2.3, §7.1): a body stays at most an hour past
+its 30 days while its sender is on.
+
+#### AGENT_MESSAGE_NUMBER_MAX = 2^42 − 1
+
+**Derivation:** `REV_BAND_HALF` / 2 − 1: the highest k for which 2k + 1 is
+below `REV_BAND_HALF`.
+
+**Rationale:** A message's revision is twice its number, and its clearing's
+one more, in the bottom half of band 0 (record §2.3), which every statement
+allows. A device sends nothing once its next number would be above this,
+until the next statement starts its ring again. The record states the bound
+and does not name a constant for it; it is here so that nothing else derives
+it. An honest device sending 60 an hour never comes near it.
+
 ---
 
-*Spec version: 1.4*
+*Spec version: 1.5*
 *Created: 2026-03-16*
-*Updated: 2026-09-30*
-*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md*
+*Updated: 2026-10-09*
+*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md; decisions/2026-10-09-messages-between-your-own-agents.md*
