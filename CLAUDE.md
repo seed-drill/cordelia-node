@@ -70,7 +70,8 @@ cordelia-node/
                          #   history; reader (what a device keeps of an entry of the
                          #   messages channel that the door stores, and the hourly task of
                          #   messages); sender (what a device does to send a message: the
-                         #   next number, its checks, sending again and clearing). The older Channels API (handlers, entries, verify): a
+                         #   next number, its checks, sending again and clearing). The
+                         #   older Channels API (handlers, entries, verify): a
                          #   relay's and a bootnode's
     cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
                          #   (claude.rs, plan.rs; claude/sequences.rs is the harness of

@@ -14,11 +14,13 @@
 //!   store's slots are, and compared. The list in `read/<its signer>`
 //!   raises nothing, and an entry in any other slot is no message.
 //! - **Only a live number is opened.** An entry at a number that is not
-//!   live is counted as overwritten and never opened into the index.
+//!   live is never opened into the index, and is counted as overwritten
+//!   where it is a message (its revision is even): a clearing there says
+//!   only that its number is gone.
 //! - **Then the value** (`message::take`): a message is written into the
 //!   index with its opened fields, a clearing drops the index row of the
-//!   message held at its number, and anything else is counted as no
-//!   message.
+//!   message held at its number and counts that number as gone, and
+//!   anything else is counted as no message.
 //!
 //! The reader refuses nothing that the store took: the entry stays in the
 //! store whatever it is, and nothing here changes what the door answers.
@@ -55,8 +57,8 @@ pub enum Read {
     Clearing { dropped: bool },
     /// The signer's list of what its agents read.
     List,
-    /// An entry at a number that is not live: counted as overwritten,
-    /// and never opened.
+    /// An entry at a number that is not live: never opened, and counted
+    /// as overwritten where it is a message.
     Overwritten,
     /// An entry in its place that does not open: counted as no message.
     DidNotOpen,
@@ -111,7 +113,12 @@ pub fn taken(
     if !is_list && !in_its_slot {
         return no_message(NotAMessage::NotInRing);
     }
-    if in_its_slot && !kept(held::hold_number(conn, &signer, generation, number))? {
+    let clearing = entry.rev % 2 == 1;
+    if in_its_slot
+        && !kept(held::hold_number(
+            conn, &signer, generation, number, clearing,
+        ))?
+    {
         return Ok(Read::Overwritten);
     }
 
@@ -146,7 +153,7 @@ pub fn taken(
             Ok(Read::Message(kept(held::index(conn, &opened))?))
         }
         Ok(InTheRing::Clearing { number }) => Ok(Read::Clearing {
-            dropped: kept(held::clear(conn, &signer, generation, number))?,
+            dropped: kept(held::clear(conn, &signer, generation, number, now))?,
         }),
         // What a list's marks say is kept by whoever keeps the lists of
         // what each device's agents read (decision 2026-10-09 §7.2): the
@@ -192,19 +199,24 @@ pub struct Hourly {
 /// `AGENT_MESSAGE_CLEAR_INTERVAL_SECS`), at `now` by the node's clock,
 /// whatever the device's state: first the index rows of messages that
 /// have expired or are held at no live number are overwritten and
-/// dropped, in one write; then, where the device stands applied, has sync
-/// on and has fetched the messages channel since it started (`fetched`),
-/// it clears its own expired messages at the relays
-/// ([`crate::sender::clear_expired`]); and last the truncating checkpoint
-/// runs, so that what was overwritten stands in the log no longer than an
-/// hour.
+/// dropped, in one write, with the kept values of the device's own of
+/// every generation other than the one it stands applied under, and then
+/// what is kept of each such generation once none of its rows is left;
+/// then, where the device stands applied, has sync on and has fetched the
+/// messages channel since it started (`fetched`), it clears its own
+/// expired messages at the relays ([`crate::sender::clear_expired`]); and
+/// last the truncating checkpoint runs, so that what was overwritten
+/// stands in the log no longer than an hour.
 pub fn hourly(
     conn: &Connection,
     identity: &NodeIdentity,
     now: i64,
     fetched: bool,
 ) -> Result<Hourly, PersonError> {
-    let gone = in_one(conn, || kept(held::drop_gone(conn, now)))?;
+    let gone = in_one(conn, || {
+        let applied = crate::at_relays::messages_channel(conn)?;
+        kept(held::drop_gone(conn, now, applied.as_ref()))
+    })?;
     let cleared = crate::sender::clear_expired(conn, identity, now, fetched)?;
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
     Ok(Hourly {
@@ -856,7 +868,8 @@ mod tests {
     /// (decision 2026-10-09 §2.3, D11): a message sent again at 1 and 2
     /// goes at the clearing of 1, and in a second run at the clearing of
     /// 2. Another message stays, a clearing of a number not held drops
-    /// nothing, and the rows of first holding stay.
+    /// nothing and holds that number as gone, and the rows of first
+    /// holding stay.
     #[test]
     fn a_clearing_by_either_number_drops_a_message_sent_again() {
         for cleared in [1, 2] {
@@ -875,7 +888,7 @@ mod tests {
             assert_eq!(given(&s, 1, &clearing(&s, 0, cleared)), STORED);
             assert_eq!(indexed(&s, 1), ["another"], "{cleared}");
             assert_eq!(numbers(&s, 1, 0, "message_numbers"), [3]);
-            assert_eq!(numbers(&s, 1, 0, "message_first_held"), [1, 2, 3]);
+            assert_eq!(numbers(&s, 1, 0, "message_first_held"), [1, 2, 3, 9]);
             assert_eq!(shown_on(&s, 1, s.now), ["another"]);
         }
     }
@@ -1367,5 +1380,272 @@ mod tests {
         let kept = signer_on(&s, 1, 0);
         assert_eq!(kept.highest, LAPS * 64);
         assert_eq!(kept.overwritten, (LAPS - 1) * 64);
+    }
+
+    /// What the door answered for an entry it did not store.
+    fn not_stored(taken: &Taken) -> Option<Outcome> {
+        match taken {
+            Taken::Own { stored, .. } if *stored != Outcome::Stored => Some(*stored),
+            _ => None,
+        }
+    }
+
+    /// The reader reads only what the store kept (decision 2026-10-09
+    /// §7.1). A reader that holds the clearing of a number, and is then
+    /// handed that number's message by a relay that is behind, is told by
+    /// the store that it holds a higher revision: nothing is indexed,
+    /// shown or counted. So for an entry the store already holds, handed
+    /// again. At a live number, and at one that is not live and is below
+    /// the number counted from, where a message read would be counted.
+    #[test]
+    fn the_reader_reads_only_what_the_store_kept() {
+        // A live number: the clearing of 5, then message 5.
+        let s = Several::of_one_person(2);
+        assert_eq!(given(&s, 1, &clearing(&s, 0, 5)), STORED);
+        let before = s[1].everything();
+        let five = sent(&s, 0, 5, &says("five", s.now));
+        assert_eq!(
+            not_stored(&given(&s, 1, &five)),
+            Some(Outcome::OlderThanHeld)
+        );
+        assert_eq!(s[1].everything(), before);
+        assert!(indexed(&s, 1).is_empty());
+        assert!(shown_on(&s, 1, s.now).is_empty());
+        // A message that is shown, handed again.
+        let six = sent(&s, 0, 6, &says("six", s.now));
+        assert_eq!(given(&s, 1, &six), STORED);
+        assert_eq!(shown_on(&s, 1, s.now), ["six"]);
+        let before = s[1].everything();
+        assert_eq!(not_stored(&given(&s, 1, &six)), Some(Outcome::AlreadyHeld));
+        assert_eq!(s[1].everything(), before);
+        assert_eq!(shown_on(&s, 1, s.now), ["six"]);
+
+        // Below the number counted from, 100: the clearing of 20, then
+        // message 20; and message 21, handed twice.
+        let s = Several::of_one_person(2);
+        assert_eq!(given(&s, 1, &hundred_of(&s)), STORED);
+        assert_eq!(given(&s, 1, &clearing(&s, 0, 20)), STORED);
+        let twenty = sent(&s, 0, 20, &says("twenty", s.now));
+        assert_eq!(
+            not_stored(&given(&s, 1, &twenty)),
+            Some(Outcome::OlderThanHeld)
+        );
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 0);
+        let twenty_one = sent(&s, 0, 21, &says("twenty-one", s.now));
+        assert_eq!(given(&s, 1, &twenty_one), STORED);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 1);
+        let before = s[1].everything();
+        assert_eq!(
+            not_stored(&given(&s, 1, &twenty_one)),
+            Some(Outcome::AlreadyHeld)
+        );
+        assert_eq!(s[1].everything(), before);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 1);
+        assert_eq!(indexed(&s, 1), ["100"]);
+        assert_eq!(shown_on(&s, 1, s.now), ["100"]);
+    }
+
+    /// Message 100 of device 0, saying so.
+    fn hundred_of(s: &Several) -> CheckedEntry {
+        sent(s, 0, 100, &says("100", s.now))
+    }
+
+    /// A number whose clearing alone a reader holds is gone, and is never
+    /// counted as overwritten (decision 2026-10-09 §2.5): a reader that
+    /// comes after its sender cleared numbers 1 to 63 holds their
+    /// clearings, then message 128; of the 64 numbers that leave the live
+    /// numbers, only 64, which it never held, is counted. A message
+    /// handed at a number held as a clearing is not shown.
+    #[test]
+    fn a_number_held_as_a_clearing_is_gone_and_not_overwritten() {
+        let s = Several::of_one_person(2);
+        for number in 1..=63 {
+            assert_eq!(given(&s, 1, &clearing(&s, 0, number)), STORED);
+        }
+        let held: Vec<u64> = (1..=63).collect();
+        assert_eq!(numbers(&s, 1, 0, "message_first_held"), held);
+        assert_eq!(signer_on(&s, 1, 0).highest, 63);
+        // The store lost the clearing of 63, as one restored from before
+        // it is: message 63, handed then, is not shown.
+        let channel = derive::channel_id(&messages(&s, 1)).unwrap();
+        let slot = slot_id(
+            &derive::slot_key(&messages(&s, 1)).unwrap(),
+            &message_name(&s.key(0), 63).unwrap(),
+        );
+        s[1].conn
+            .execute(
+                "DELETE FROM entries WHERE channel_id = ?1 AND slot = ?2",
+                [&channel[..], &slot[..]],
+            )
+            .unwrap();
+        let again = sent(&s, 0, 63, &says("sixty-three", s.now));
+        assert_eq!(given(&s, 1, &again), STORED);
+        assert!(indexed(&s, 1).is_empty());
+
+        let last = sent(&s, 0, 128, &says("128", s.now));
+        assert_eq!(given(&s, 1, &last), STORED);
+        let kept = signer_on(&s, 1, 0);
+        assert_eq!((kept.highest, kept.overwritten), (128, 1));
+        assert_eq!(shown_on(&s, 1, s.now), ["128"]);
+    }
+
+    /// One number is counted once, however many of its entries are
+    /// handed (decision 2026-10-09 §2.5): a reader that holds number 100
+    /// is handed message 20 and then the clearing of 20, and counts 1. A
+    /// clearing alone at a number that is not live counts nothing.
+    #[test]
+    fn a_number_is_counted_once_however_many_of_its_entries_are_handed() {
+        let s = Several::of_one_person(2);
+        assert_eq!(given(&s, 1, &hundred_of(&s)), STORED);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 0);
+        let twenty = sent(&s, 0, 20, &says("twenty", s.now));
+        assert_eq!(given(&s, 1, &twenty), STORED);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 1);
+        assert_eq!(given(&s, 1, &clearing(&s, 0, 20)), STORED);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 1);
+        assert_eq!(given(&s, 1, &clearing(&s, 0, 30)), STORED);
+        assert_eq!(signer_on(&s, 1, 0).overwritten, 1);
+        assert_eq!(indexed(&s, 1), ["100"]);
+    }
+
+    /// The generations device `n` holds rows of, in `table`.
+    fn generations_in(s: &Several, n: usize, table: &str) -> Vec<i64> {
+        s[n].conn
+            .prepare(&format!(
+                "SELECT DISTINCT {column} FROM {table} ORDER BY {column}",
+                column = if table == "message_generations" {
+                    "id"
+                } else {
+                    "generation"
+                }
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Device 1 applies a renewal that device 0 makes.
+    fn renewed(s: &mut Several) {
+        let renewal = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+    }
+
+    /// A message is of its generation (decision 2026-10-09 §7.1, §9.2): a
+    /// holder of a key that writes the value of a message from before the
+    /// last change again in the new generation does not attach it to the
+    /// old generation's row. That row stays the old generation's, held at
+    /// its own numbers only, and is shown once; the new generation holds
+    /// no number of it and gives it no place.
+    #[test]
+    fn a_message_written_again_in_a_new_generation_is_not_the_old_ones() {
+        let mut s = Several::of_one_person(2);
+        let message = says("from before", s.now);
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &message)), STORED);
+        assert_eq!(shown_on(&s, 1, s.now), ["from before"]);
+        let old = generation(&s, 1);
+        renewed(&mut s);
+
+        let again = sent(&s, 0, 1, &message);
+        assert_eq!(given(&s, 1, &again), STORED);
+        let new = generation(&s, 1);
+        assert_ne!(new, old);
+        assert_eq!(generations_in(&s, 1, "message_index"), [old]);
+        assert_eq!(generations_in(&s, 1, "message_numbers"), [old]);
+        assert_eq!(generations_in(&s, 1, "message_first_held"), [old, new]);
+        let later = s.now + HOUR;
+        assert_eq!(held_back(&s, 1, 0, later), 0);
+        assert_eq!(shown_on(&s, 1, later), ["from before"]);
+        let places: i64 = s[1]
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_places WHERE generation = ?1",
+                [new],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(places, 0);
+    }
+
+    /// What is kept of a generation the device has left goes once none of
+    /// its index rows is left (decision 2026-10-09 §7.1, §9.1): after a
+    /// statement and 30 days, nothing of the old generation is in any
+    /// table of messages, and the rows of first holding, the signers and
+    /// the generation the device stands applied under are as they were,
+    /// though its one message expired with the others. A day after the
+    /// statement the old generation is all still there.
+    #[test]
+    fn a_generation_the_device_has_left_goes_once_its_rows_have() {
+        let mut s = Several::of_one_person(2);
+        let start = s.now;
+        for number in 1..=3 {
+            let entry = sent(&s, 0, number, &says(&format!("old {number}"), start));
+            assert_eq!(given(&s, 1, &entry), STORED);
+        }
+        assert_eq!(shown_on(&s, 1, start).len(), 3);
+        let old = generation(&s, 1);
+        renewed(&mut s);
+        let entry = sent(&s, 0, 1, &says("new", start));
+        assert_eq!(given_at(&s, 1, &entry, start), STORED);
+        assert_eq!(shown_on(&s, 1, start).len(), 4);
+        let new = generation(&s, 1);
+        let tables = [
+            "message_generations",
+            "message_index",
+            "message_numbers",
+            "message_first_held",
+            "message_signers",
+            "message_places",
+            "message_kept",
+        ];
+        // The rows of the generation applied, of `table`, as text.
+        let rows_of = |s: &Several, table: &str, columns: &str| -> Vec<String> {
+            s[1].conn
+                .prepare(&format!(
+                    "SELECT {columns} FROM {table} WHERE generation = ?1 ORDER BY 1"
+                ))
+                .unwrap()
+                .query_map([new], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let signers = |s: &Several| {
+            rows_of(
+                s,
+                "message_signers",
+                "hex(signer) || ' ' || highest || ' ' || overwritten || ' ' || not_messages
+                 || ' ' || IFNULL(counted_from, '-')",
+            )
+        };
+        let firsts = |s: &Several| {
+            rows_of(
+                s,
+                "message_first_held",
+                "number || ' ' || IFNULL(hex(id), '-') || ' ' || IFNULL(sent, '-') || ' '
+                 || first_held",
+            )
+        };
+        let (signers_before, firsts_before) = (signers(&s), firsts(&s));
+        assert_eq!(firsts_before.len(), 1);
+
+        hourly(&s[1].conn, &s[1].identity, start + DAY, true).unwrap();
+        assert_eq!(generations_in(&s, 1, "message_generations"), [old, new]);
+        assert_eq!(generations_in(&s, 1, "message_first_held"), [old, new]);
+
+        let task = hourly(&s[1].conn, &s[1].identity, start + 30 * DAY, true).unwrap();
+        assert_eq!(task.gone.expired, 4);
+        for table in tables {
+            assert!(
+                !generations_in(&s, 1, table).contains(&old),
+                "{table} holds the old generation"
+            );
+        }
+        assert_eq!(generations_in(&s, 1, "message_generations"), [new]);
+        assert_eq!(signers(&s), signers_before);
+        assert_eq!(firsts(&s), firsts_before);
+        assert_eq!(generations_in(&s, 1, "message_signers"), [new]);
     }
 }

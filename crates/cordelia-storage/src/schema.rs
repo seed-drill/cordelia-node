@@ -704,9 +704,11 @@ CREATE TABLE person_left (
 ///   each signer, generation and number. A message held at two numbers
 ///   is one row of the index and two here. They go with the index row.
 /// - `message_first_held`: one row for each live number held, with its
-///   ID, `sent`, and when it was first held. It outlives the index row,
-///   so that an entry taken again at a live number after its 30 days is
-///   not shown again (§7.1).
+///   ID, `sent`, and when it was first held; or with no ID and no `sent`
+///   where the number was first held as a clearing, which counts the
+///   number as gone and not as overwritten (§2.5). It outlives the index
+///   row, so that an entry taken again at a live number after its 30
+///   days is not shown again (§7.1).
 /// - `message_signers`: for each signer and generation, H, the highest
 ///   number held of a message or a clearing, with the counts of numbers
 ///   that were overwritten before they were shown and of entries that
@@ -794,9 +796,10 @@ CREATE TABLE message_first_held (
                     REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
-    id          BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
-    sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
+    sent        INTEGER CHECK(sent IS NULL OR typeof(sent) = 'integer'),
     first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    CHECK((id IS NULL) = (sent IS NULL)),
     PRIMARY KEY (signer, generation, number)
 );
 
@@ -3334,6 +3337,18 @@ mod tests {
                 "message_first_held",
                 "signer, generation, number, id, sent, first_held",
                 "zeroblob(32), 1, 2, zeroblob(17), 9, 9",
+            ),
+            // A row of first holding has an ID and a `sent`, or neither,
+            // where its number was first held as a clearing.
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                "zeroblob(32), 1, 2, NULL, 9, 9",
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                &format!("zeroblob(32), 1, 2, {id}, NULL, 9"),
             ),
             one(
                 "message_first_held",

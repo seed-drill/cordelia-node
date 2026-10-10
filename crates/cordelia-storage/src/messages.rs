@@ -164,10 +164,11 @@ pub fn not_a_message(
 }
 
 /// A reader holds an entry of `of` in `generation` at `number`, in the
-/// slot of that number in the signer's ring (decision 2026-10-09 §2.5).
-/// The caller has checked the slot before opening anything: nothing but
-/// such an entry is given here. Returns whether `number` is live, after
-/// it is held: only then is the entry opened.
+/// slot of that number in the signer's ring (decision 2026-10-09 §2.5),
+/// a clearing where `clearing` (its revision is odd). The caller has
+/// checked the slot before opening anything: nothing but such an entry
+/// is given here. Returns whether `number` is live, after it is held:
+/// only then is the entry opened.
 ///
 /// - **Above H, it raises H.** Every number that was live and is no
 ///   longer leaves the reader's rows: its row of numbers held, its row of
@@ -175,18 +176,22 @@ pub fn not_a_message(
 ///   message's numbers is left (overwritten first, [`drop_row`]). Each of
 ///   them from the number counted from is counted as overwritten, unless
 ///   its message had a place, or was held and has gone (it expired, or
-///   was cleared): those it never held, and those it held and had not
-///   shown.
+///   was cleared), or its clearing was held ([`clear`]): those it never
+///   held, and those it held and had not shown.
 /// - **At a live number,** it changes nothing but the number counted
 ///   from, where it is below it.
-/// - **At a number that is not live,** the entry is counted as
+/// - **At a number that is not live,** a message is counted as
 ///   overwritten, where it is below the number counted from: a number
-///   at or above it was counted, or not, as it left.
+///   at or above it was counted, or not, as it left. A clearing is not:
+///   its number is gone, and a message of that number that the store
+///   held before it was counted when it was taken, so a number is
+///   counted once, however many of its entries are handed.
 pub fn hold_number(
     conn: &Connection,
     of: &[u8; 32],
     generation: i64,
     number: u64,
+    clearing: bool,
 ) -> Result<bool, StorageError> {
     let mut kept = signer(conn, of, generation)?.unwrap_or_default();
     let number_sql = to_sql(number);
@@ -211,7 +216,7 @@ pub fn hold_number(
         }
         true
     } else {
-        if kept.counted_from.is_none_or(|from| number < from) {
+        if !clearing && kept.counted_from.is_none_or(|from| number < from) {
             kept.overwritten += 1;
         }
         false
@@ -222,7 +227,8 @@ pub fn hold_number(
 
 /// How many of the numbers from `lowest` to `highest` of `of` left the
 /// live numbers before their message had a place: all of them but those
-/// held at a message that has a place, or that was held and has gone.
+/// held at a message that has a place, or that was held and has gone,
+/// and those held as a clearing (a row of first holding with no ID).
 fn left_unshown(
     conn: &Connection,
     of: &[u8; 32],
@@ -308,7 +314,8 @@ pub enum Indexed {
     AnotherNumber,
     /// It is not shown again: the device first held this number before,
     /// or held the message at another live number and its row has gone,
-    /// at its 30 days or at a clearing (§7.1, D11).
+    /// at its 30 days or at a clearing (§7.1, D11), or holds it in
+    /// another generation.
     NotAgain,
 }
 
@@ -319,7 +326,9 @@ pub enum Indexed {
 ///
 /// A number whose row of first holding is there was held before: what is
 /// taken again there is not shown again. A message held at another live
-/// number is one row, with a row of numbers held for each.
+/// number is one row, with a row of numbers held for each. A message is
+/// looked up by its ID and its generation: one held in another
+/// generation is not shown again here, and is not held at this number.
 pub fn index(conn: &Connection, opened: &Opened) -> Result<Indexed, StorageError> {
     let Opened {
         id,
@@ -361,13 +370,18 @@ pub fn index(conn: &Connection, opened: &Opened) -> Result<Indexed, StorageError
             opened.first_held
         ],
     )?;
-    let in_index: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM message_index WHERE id = ?1",
-        [&id[..]],
-        |row| row.get(0),
-    )?;
-    let indexed = match (in_index, first_held_before) {
-        (0, 0) => {
+    // A message is of its generation: the same ID in a generation the
+    // device held before is that generation's message, which is not
+    // shown again and takes nothing of this generation's.
+    let held_in: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM message_index WHERE id = ?1",
+            [&id[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let indexed = match (held_in, first_held_before) {
+        (None, 0) => {
             let (to_kind, to_name) = match &message.to {
                 To::Name(name) => (1, Some(name.as_str())),
                 To::All => (2, None),
@@ -403,8 +417,8 @@ pub fn index(conn: &Connection, opened: &Opened) -> Result<Indexed, StorageError
             )?;
             Indexed::New
         }
-        (0, _) => return Ok(Indexed::NotAgain),
-        _ => Indexed::AnotherNumber,
+        (Some(held_in), _) if held_in == generation => Indexed::AnotherNumber,
+        _ => return Ok(Indexed::NotAgain),
     };
     conn.execute(
         "INSERT INTO message_numbers (signer, generation, number, id) VALUES (?1, ?2, ?3, ?4)",
@@ -414,16 +428,27 @@ pub fn index(conn: &Connection, opened: &Opened) -> Result<Indexed, StorageError
 }
 
 /// A reader takes the entry that clears message `number` of `of` in
-/// `generation` (decision 2026-10-09 §2.3, D11): it drops the index row
-/// of the message it holds at that number, whichever other numbers that
-/// row was held at, in the caller's write. Its rows of first holding
-/// stay, so that it is not shown again. Returns whether a row went.
+/// `generation`, a live number, at `now` (decision 2026-10-09 §2.3, §2.5,
+/// D11): it drops the index row of the message it holds at that number,
+/// whichever other numbers that row was held at, in the caller's write.
+/// Its rows of first holding stay, so that it is not shown again. Where
+/// the number has no row of first holding, as where the reader came
+/// after its sender cleared it, it is given one with no ID: the number is
+/// gone, never counted as overwritten, and a message taken there after
+/// is not shown. Returns whether a row went.
 pub fn clear(
     conn: &Connection,
     of: &[u8; 32],
     generation: i64,
     number: u64,
+    now: i64,
 ) -> Result<bool, StorageError> {
+    conn.execute(
+        "INSERT INTO message_first_held (signer, generation, number, id, sent, first_held)
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4)
+         ON CONFLICT(signer, generation, number) DO NOTHING",
+        params![&of[..], generation, to_sql(number), now],
+    )?;
     let id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT id FROM message_numbers WHERE signer = ?1 AND generation = ?2 AND number = ?3",
@@ -638,8 +663,28 @@ pub struct Gone {
 /// each index row whose 30 days are up, and each held at no live number,
 /// is overwritten and dropped ([`drop_row`]), whatever the device's state;
 /// the rows of first holding of numbers that are not live go, and the
-/// times of places from before the hour. In the caller's write.
-pub fn drop_gone(conn: &Connection, now: i64) -> Result<Gone, StorageError> {
+/// times of places from before the hour, and the device's record of when
+/// it sent from before the hour (§6).
+///
+/// Then what is kept of each generation the device has left (decision
+/// 2026-10-09 §9.1), by `applied`, the messages channel it stands applied
+/// under:
+///
+/// - **Its kept values,** where the device stands applied: they may not
+///   have reached every relay, and go with their generation.
+/// - **Then each such generation** that holds no index row and no kept
+///   value any more goes whole: its rows of first holding, its signers'
+///   rows, its places and then its own row, since no entry of it is taken
+///   again. So one run leaves nothing of a generation whose messages have
+///   all gone.
+///
+/// `applied` is none where the device does not stand applied. In the
+/// caller's write.
+pub fn drop_gone(
+    conn: &Connection,
+    now: i64,
+    applied: Option<&[u8; 32]>,
+) -> Result<Gone, StorageError> {
     let ids = |condition: String| -> Result<Vec<Vec<u8>>, StorageError> {
         Ok(conn
             .prepare(&format!(
@@ -673,6 +718,35 @@ pub fn drop_gone(conn: &Connection, now: i64) -> Result<Gone, StorageError> {
         "DELETE FROM message_sends WHERE sent_at <= ?1",
         [now - HOUR_SECS],
     )?;
+    if let Some(channel) = applied {
+        let generation = generation_of(conn, channel)?;
+        for kept in kept(conn)? {
+            if Some(kept.generation) != generation {
+                drop_kept(conn, &kept.id, false)?;
+            }
+        }
+    }
+    let left: Vec<i64> = conn
+        .prepare(
+            "SELECT g.id FROM message_generations g
+             WHERE g.channel IS NOT ?1
+               AND NOT EXISTS (SELECT 1 FROM message_index i WHERE i.generation = g.id)
+               AND NOT EXISTS (SELECT 1 FROM message_kept k WHERE k.generation = g.id)",
+        )?
+        .query_map([applied.map(|channel| &channel[..])], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for generation in left {
+        for table in ["message_first_held", "message_signers", "message_places"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE generation = ?1"),
+                [generation],
+            )?;
+        }
+        conn.execute(
+            "DELETE FROM message_generations WHERE id = ?1",
+            [generation],
+        )?;
+    }
     Ok(gone)
 }
 
@@ -1359,7 +1433,7 @@ mod tests {
     /// body's first byte and its number.
     fn taken(conn: &Connection, signer: u8, number: u64, body: &str, at: i64) -> Indexed {
         generation_1(conn);
-        assert!(hold_number(conn, &[signer; 32], 1, number).unwrap());
+        assert!(hold_number(conn, &[signer; 32], 1, number, false).unwrap());
         let message = message(body, at);
         let mut id = [signer; 16];
         id[0] = body.as_bytes()[0];
@@ -1396,11 +1470,11 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(clear(&conn, &[7; 32], 1, 3).unwrap());
-        assert!(hold_number(&conn, &[7; 32], 1, 5).unwrap());
+        assert!(clear(&conn, &[7; 32], 1, 3, 100).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 5, false).unwrap());
         assert_eq!(signer(&conn, &[7; 32], 1).unwrap().unwrap().overwritten, 0);
 
-        assert!(hold_number(&conn, &[7; 32], 1, 68).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 68, false).unwrap());
         assert_eq!(
             signer(&conn, &[7; 32], 1).unwrap(),
             Some(Signer {
@@ -1415,8 +1489,8 @@ mod tests {
         assert_eq!(count(&conn, "message_first_held"), 0);
         // 5 is live still, and 4 is not: taken now, 4 is not opened and
         // not counted again, being above the number counted from.
-        assert!(hold_number(&conn, &[7; 32], 1, 5).unwrap());
-        assert!(!hold_number(&conn, &[7; 32], 1, 4).unwrap());
+        assert!(hold_number(&conn, &[7; 32], 1, 5, false).unwrap());
+        assert!(!hold_number(&conn, &[7; 32], 1, 4, false).unwrap());
         assert_eq!(signer(&conn, &[7; 32], 1).unwrap().unwrap().overwritten, 2);
     }
 
@@ -1495,14 +1569,14 @@ mod tests {
 
         let now = 100 + 30 * day;
         assert_eq!(
-            drop_gone(&conn, now - 1).unwrap(),
+            drop_gone(&conn, now - 1, None).unwrap(),
             Gone {
                 expired: 0,
                 not_live: 1
             }
         );
         assert_eq!(
-            drop_gone(&conn, now).unwrap(),
+            drop_gone(&conn, now, None).unwrap(),
             Gone {
                 expired: 1,
                 not_live: 0
@@ -1722,5 +1796,54 @@ mod tests {
         for taken in at(AGENT_MESSAGE_NUMBER_MAX) {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
+    }
+
+    /// A holder of a device's key writes its 64 slots with rising numbers
+    /// ten thousand times over, and the store takes each as the reader
+    /// does, by `hold_number` and `index`, with nothing sealed or opened:
+    /// after every lap no table holds more than one lap's rows, the
+    /// signer is one row, and every lap but the last is counted as
+    /// overwritten (decision 2026-10-09 §2.5, property 21, D1, T22). The
+    /// whole path, through the door, is run for a hundred laps in the
+    /// reader's test of the same name.
+    #[test]
+    fn a_signer_that_rewrites_its_ring_ten_thousand_times_leaves_one_lap_in_the_store() {
+        const LAPS: u64 = 10_000;
+        let conn = db::open_in_memory().unwrap();
+        generation_1(&conn);
+        let tables = [
+            "message_index",
+            "message_numbers",
+            "message_first_held",
+            "message_signers",
+            "message_places",
+        ];
+        let message = message("a lap", 100);
+        for lap in 0..LAPS {
+            conn.execute_batch("BEGIN").unwrap();
+            for place in 1..=RING as u64 {
+                let number = lap * RING as u64 + place;
+                assert!(hold_number(&conn, &[7; 32], 1, number, false).unwrap());
+                let mut id = [0; 16];
+                id[..8].copy_from_slice(&number.to_be_bytes());
+                let opened = Opened {
+                    id: &id,
+                    signer: &[7; 32],
+                    label: "laptop",
+                    generation: 1,
+                    number,
+                    message: &message,
+                    first_held: 100,
+                    placed_at: None,
+                };
+                assert_eq!(index(&conn, &opened).unwrap(), Indexed::New);
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            let rows: Vec<i64> = tables.iter().map(|table| count(&conn, table)).collect();
+            assert_eq!(rows, [RING, RING, RING, 1, 0], "lap {lap}");
+        }
+        let kept = signer(&conn, &[7; 32], 1).unwrap().unwrap();
+        assert_eq!(kept.highest, LAPS * RING as u64);
+        assert_eq!(kept.overwritten, (LAPS - 1) * RING as u64);
     }
 }

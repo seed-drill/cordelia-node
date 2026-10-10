@@ -476,7 +476,9 @@ fn written(
     ))?;
     seal(conn, ring, number, rev, value.to_vec(), now)?;
     let generation = ring.generation(conn, now)?;
-    kept(held::hold_number(conn, &ring.own, generation, number))?;
+    kept(held::hold_number(
+        conn, &ring.own, generation, number, false,
+    ))?;
     let label = own_label(conn, &ring.own)?;
     let id = message_id(&ring.own, value);
     let opened = Opened {
@@ -734,8 +736,8 @@ pub fn clear_expired(
             };
             seal(conn, &ring, number, rev, clearing_value(), now)?;
             let generation = ring.generation(conn, now)?;
-            kept(held::hold_number(conn, &ring.own, generation, number))?;
-            kept(held::clear(conn, &ring.own, generation, number))?;
+            kept(held::hold_number(conn, &ring.own, generation, number, true))?;
+            kept(held::clear(conn, &ring.own, generation, number, now))?;
             cleared += 1;
         }
         let generation = ring.generation(conn, now)?;
@@ -1508,9 +1510,9 @@ mod tests {
         ));
         assert!(sends_at(&s, 0, &says("notes", "work", "x"), t + HOUR).is_ok());
         // The record is kept for the hour, and no longer.
-        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR - 1).unwrap();
+        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR - 1, Some(&messages(&s, 0))).unwrap();
         assert_eq!(rows(&s[0].conn, "message_sends"), 2);
-        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR).unwrap();
+        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR, Some(&messages(&s, 0))).unwrap();
         assert_eq!(rows(&s[0].conn, "message_sends"), 1);
     }
 
@@ -2220,6 +2222,45 @@ mod tests {
         assert_eq!(after.number, 1);
         assert_eq!(kept_of(&s, 0, &before.id), None);
         assert!(not_every_relay(&s, 0, &before.id));
+    }
+
+    /// The kept values of a generation the device has left go at the first
+    /// hourly task after the statement, said to be not every relay's, and
+    /// what is kept of the generation goes with its last index row: after
+    /// the hourly task that drops its messages at their 30 days, nothing
+    /// of it is left (decision 2026-10-09 §7.1, §9.1). A day after the
+    /// statement its index row and the generation are still there.
+    #[test]
+    fn one_hourly_task_leaves_nothing_of_a_generation_left_with_a_kept_value() {
+        let mut s = devices(2);
+        let t = s.now;
+        let done = sent(&s, 0, &says("notes", "work", "before the change"), t);
+        let old = held::generation_of(&s[0].conn, &messages(&s, 0))
+            .unwrap()
+            .unwrap();
+        s.change(0, &[0, 1], &[]);
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        assert!(kept_of(&s, 0, &done.id).is_some());
+        crate::reader::hourly(conn, identity, t + DAY, true).unwrap();
+        assert_eq!(kept_of(&s, 0, &done.id), None);
+        assert!(not_every_relay(&s, 0, &done.id));
+        assert_eq!(
+            rows(conn, &format!("message_generations WHERE id = {old}")),
+            1
+        );
+
+        crate::reader::hourly(conn, identity, t + 30 * DAY, true).unwrap();
+        for table in [
+            "message_generations WHERE id",
+            "message_index WHERE generation",
+            "message_numbers WHERE generation",
+            "message_first_held WHERE generation",
+            "message_signers WHERE generation",
+            "message_places WHERE generation",
+            "message_kept WHERE generation",
+        ] {
+            assert_eq!(rows(conn, &format!("{table} = {old}")), 0, "{table}");
+        }
     }
 
     // ── One room, and restores ──────────────────────────────────────
