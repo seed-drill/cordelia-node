@@ -1064,6 +1064,9 @@ mod tests {
             Some(AGENT_MESSAGE_NUMBER_MAX)
         );
         assert_eq!(next_number(AGENT_MESSAGE_NUMBER_MAX), None);
+        // The highest is 2^42 - 1, whose clearing is 2^43 - 1.
+        assert_eq!(next_number((1 << 42) - 2), Some((1 << 42) - 1));
+        assert_eq!(next_number((1 << 42) - 1), None);
         assert_eq!(next_number(u64::MAX), None);
     }
 
@@ -1095,6 +1098,10 @@ mod tests {
             body: "hi\nthere".into(),
         };
         let value = message.to_value(names).unwrap();
+        assert_eq!(
+            Message::from_value(&Value::Other(value.clone()), names).unwrap(),
+            message
+        );
         let mut expected = vec![1, 1, 1, 2, 3, 4, 5, 6, 7, 8];
         expected.extend_from_slice(&[0xa1; 16]);
         expected.extend_from_slice(&[0xb2; 16]);
