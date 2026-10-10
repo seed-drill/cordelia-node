@@ -210,7 +210,8 @@ pub struct Hourly {
 ///
 /// Which channel the device stands applied under is read before the
 /// write: where it cannot be read, no generation goes, and what has
-/// expired still does.
+/// expired still does. An error in clearing is logged, nothing is counted
+/// as cleared, and the checkpoint still runs.
 pub fn hourly(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -223,7 +224,14 @@ pub fn hourly(
         Err(_) => held::Applied::NotKnown,
     };
     let gone = in_one(conn, || kept(held::drop_gone(conn, now, &applied)))?;
-    let cleared = crate::sender::clear_expired(conn, identity, now, fetched)?;
+    // The checkpoint runs whether or not the clearing could (§7.1).
+    let cleared = match crate::sender::clear_expired(conn, identity, now, fetched) {
+        Ok(cleared) => cleared,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not clear this device's expired messages");
+            0
+        }
+    };
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
     Ok(Hourly {
         gone,
@@ -1598,6 +1606,43 @@ mod tests {
         assert_eq!(task.gone.expired, 2);
         assert!(indexed(&s, 1).is_empty());
         assert_eq!(generations_in(&s, 1, "message_generations"), [old, new]);
+    }
+
+    /// An error in the clearing does not keep the checkpoint from running
+    /// (decision 2026-10-09 §7.1): with sync on and the channel fetched,
+    /// where the channel applied cannot be read, the hourly task drops what
+    /// expired, clears nothing, truncates the log, and answers.
+    #[test]
+    fn an_hourly_task_whose_clearing_fails_still_runs_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Several::of_one_person(2);
+        let path = dir.path().join("desktop.db");
+        s.machines[1]
+            .conn
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        s.machines[1].conn = cordelia_storage::db::open_as(&path, true).unwrap();
+        cordelia_storage::meta::set(
+            &s[1].conn,
+            cordelia_storage::meta::SYNC_CLAUDE_DIR,
+            "/home/desktop/.claude",
+        )
+        .unwrap();
+        let start = s.now;
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &says("old", start))), STORED);
+        s[1].conn.execute("DELETE FROM person_secrets", []).unwrap();
+        let later = start + 30 * DAY;
+        assert!(crate::sender::clear_expired(&s[1].conn, &s[1].identity, later, true).is_err());
+        let log = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&log).unwrap().len() > 0);
+
+        let task = hourly(&s[1].conn, &s[1].identity, later, true);
+        assert!(task.is_ok(), "{task:?}");
+        let task = task.unwrap();
+        assert_eq!((task.gone.expired, task.cleared), (1, 0));
+        assert!(task.checkpointed);
+        assert!(indexed(&s, 1).is_empty());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
     }
 
     /// A number of the new generation held at a message of the old one,

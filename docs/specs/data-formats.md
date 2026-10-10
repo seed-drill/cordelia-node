@@ -1408,6 +1408,9 @@ CREATE TABLE message_kept_taken (
   that have taken it (§2.3); and `again`, 1 where it waits to be sent again
   under the next number: a relay answered that it holds another entry of the
   device's at its newest number, or handed back the device's own entry over it.
+  What a relay answered of a push of the messages channel is kept here in the
+  write that moves `sent_to` for it (`at_relays`), so that neither is kept
+  without the other.
 
 **`secure_delete` is not a step.** A personal node sets SQLite's
 `secure_delete` on its store's connection where it opens it, before the

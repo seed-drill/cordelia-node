@@ -2050,16 +2050,11 @@ impl DeviceEntries {
                 },
                 |db, answers| {
                     let answers = answers?;
-                    let done = at_relays::sent(db, &relay, channel, batch, &answers).ok()?;
-                    // What the relay took of the device's own messages, and
-                    // what waits to be sent again (decision 2026-10-09
-                    // §2.3).
+                    // For the messages channel, what the relay took of the
+                    // device's own messages, and what waits to be sent
+                    // again, in the same write (decision 2026-10-09 §2.3).
                     let own = &self.state.identity;
-                    if let Err(e) = sender::answered(db, own, &relay, channel, &batch.entries, &answers)
-                    {
-                        tracing::debug!(error = %e, "could not keep what a relay took of messages");
-                    }
-                    Some(done)
+                    sender::pushed(db, own, &relay, channel, batch, &answers).ok()
                 },
             )
             .await?;

@@ -473,6 +473,7 @@ impl Device {
             now: self.engine.unix(),
             fetched: sender::fetched(&db, own_channels, self.clock.now()).unwrap(),
             no_place: own_channels.no_place(),
+            mapped: true,
             per_folder_per_hour: 20,
         };
         let request = Request {
@@ -484,7 +485,7 @@ impl Device {
             thread: [0; 16],
             answers: [0; 16],
         };
-        sender::send(&db, &self.state.identity, &at, &request)
+        sender::send(&db, &self.state.identity, &at, &request, sender::no_reply)
     }
 
     /// The bodies of the messages it shows now, oldest first, once it has
