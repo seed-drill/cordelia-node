@@ -90,6 +90,20 @@ pub enum Refused {
     /// 8, §7.1).
     #[error("this device's clock is behind the time of a message it already sent")]
     ClockBehind,
+    /// The ID, as it was given, begins no message that the agent of the
+    /// folder may read (step 9, §4.1).
+    #[error("no message {0} that this agent can read is held here")]
+    NoSuchMessage(String),
+    /// The ID, as it was given, begins more than one message: their IDs,
+    /// whole, in hex (step 9).
+    #[error("{id} begins more than one message")]
+    MoreThanOne { id: String, ids: Vec<String> },
+    /// The signer of the message the ID names no longer counts (step 9).
+    #[error("message {0} is from a device that is no longer one of the person's")]
+    SignerRemoved(String),
+    /// A reply names a message that asks for nothing (step 9, C7).
+    #[error("message {0} asks for nothing, and is not answered")]
+    AsksNothing(String),
     /// The recipient is no name the personal channel lists (step 10).
     #[error("no device of the person's syncs {0}")]
     NoSuchName(String),
@@ -130,6 +144,10 @@ impl Refused {
             Self::NotFetched => "not_fetched",
             Self::NoNumbers => "no_numbers",
             Self::ClockBehind => "clock_behind",
+            Self::NoSuchMessage(_) => "no_such_message",
+            Self::MoreThanOne { .. } => "more_than_one",
+            Self::SignerRemoved(_) => "signer_removed",
+            Self::AsksNothing(_) => "asks_nothing",
             Self::NoSuchName(_) => "no_such_name",
             Self::FolderRate { .. } => "folder_rate",
             Self::DeviceRate { .. } => "device_rate",

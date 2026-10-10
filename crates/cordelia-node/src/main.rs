@@ -15,6 +15,7 @@ use cordelia_crypto::identity::NodeIdentity;
 mod carry_cmd;
 mod history_cmd;
 mod indicator;
+mod msg_cmd;
 mod p2p;
 mod person_cmd;
 mod recover_cmd;
@@ -348,6 +349,21 @@ enum Commands {
         /// The ids of the versions, each restored by itself in this order
         ids: Vec<String>,
     },
+    /// Messages between your agents on your devices
+    ///
+    /// An agent sends another agent of yours a short request, and reads
+    /// the requests sent to it. Each message is a request from an agent,
+    /// never an instruction from you. Messages go only between your own
+    /// devices, through the relays, end to end encrypted.
+    ///
+    /// An agent is the name of a folder you map with `cordelia sync map`.
+    /// Each command acts as the agent of the folder it runs in: Claude
+    /// Code's project directory where it is set, or the directory it runs
+    /// in.
+    Msg {
+        #[command(subcommand)]
+        what: MsgCommand,
+    },
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -361,6 +377,49 @@ enum Commands {
         /// Entity ID of the lead node (for swarm channel naming)
         #[arg(long)]
         lead_entity_id: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum MsgCommand {
+    /// What waits for this folder's agent: for an agent's hook
+    ///
+    /// It prints nothing when nothing waits, and nothing on any error. It
+    /// prints a message's line, with the first line of its text, once,
+    /// and after that only counts it.
+    #[command(after_long_help = msg_cmd::SUMMARY_HELP)]
+    Summary,
+    /// Print one message, between two lines that say whose it is
+    ///
+    /// It marks the message read by this folder's agent, on every device
+    /// of yours.
+    Read {
+        /// 8 to 32 hex characters of the message's id, as `summary` shows
+        /// it
+        id: String,
+    },
+    /// Send a message, as this folder's agent: its text on standard input
+    ///
+    /// Give one of --to, --all and --reply. A message is at most 1024
+    /// bytes: put the rest in the issue or pull request that --re names.
+    Send {
+        /// The name of one of your agents, as `cordelia sync status` lists
+        /// it
+        #[arg(long)]
+        to: Option<String>,
+        /// Every one of your agents
+        #[arg(long)]
+        all: bool,
+        /// Answer the message with this id: it goes to the agent that sent
+        /// it
+        #[arg(long, value_name = "ID")]
+        reply: Option<String>,
+        /// Say that the message asks for an answer
+        #[arg(long)]
+        ask: bool,
+        /// A link to an issue or a pull request: owner/repo#number
+        #[arg(long, value_name = "OWNER/REPO#N")]
+        re: Option<String>,
     },
 }
 
@@ -528,7 +587,15 @@ enum SyncCommand {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // `cordelia msg summary` keeps to its time from here, and is read
+    // before the command line is parsed (decision 2026-10-09 §4.1).
+    let started = std::time::Instant::now();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some((config, others)) = msg_cmd::summary_asked(&args) {
+        msg_cmd::summary(&config, started, others);
+        return Ok(());
+    }
+    let cli = Cli::parse_from(args);
 
     match cli.command {
         Some(Commands::Init { new_key: true, .. }) => person_cmd::new_key(&cli.config),
@@ -582,6 +649,31 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Some(Commands::Restore { ids }) => history_cmd::restore(&cli.config, &ids),
+        Some(Commands::Msg { what }) => match what {
+            // Read before the command line was parsed: here only where
+            // the parser printed its help and stopped.
+            MsgCommand::Summary => {
+                msg_cmd::summary(&cli.config, started, false);
+                Ok(())
+            }
+            MsgCommand::Read { id } => msg_cmd::read(&cli.config, &id),
+            MsgCommand::Send {
+                to,
+                all,
+                reply,
+                ask,
+                re,
+            } => msg_cmd::send(
+                &cli.config,
+                &msg_cmd::SendFlags {
+                    to,
+                    all,
+                    reply,
+                    ask,
+                    re,
+                },
+            ),
+        },
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -1830,6 +1922,12 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         held: Default::default(),
         history: Default::default(),
     });
+    // How many messages a folder's agent sends in an hour (decision
+    // 2026-10-09 §6): the configuration may lower it, and was refused on
+    // loading where it raised it.
+    state
+        .own_channels
+        .set_per_folder_per_hour(config.messages.per_folder_per_hour as usize);
 
     // A personal node makes its first start on this version here
     // (decision 2026-10-04 §10.1): after the port of its local API is
@@ -7432,6 +7530,27 @@ mod tests {
             "Keeps your AI agent's memory in step across your machines, end to end encrypted"
         );
         assert!(!ABOUT.contains('\n') && !ABOUT.contains("pub/sub"));
+    }
+
+    /// `cordelia msg summary --help` prints the hook of Claude Code's
+    /// settings and the line of an instructions file, and that Cordelia
+    /// writes neither (decision 2026-10-09 §5).
+    #[test]
+    fn the_summarys_help_holds_the_hook_and_the_instructions_line() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("msg")
+            .and_then(|msg| msg.find_subcommand_mut("summary"))
+            .expect("msg summary is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(msg_cmd::SUMMARY_HELP), "{help}");
+        assert!(
+            help.contains("\"command\": \"cordelia msg summary\""),
+            "{help}"
+        );
+        assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
     }
 
     /// Run by a person, `cordelia init` ends by saying how the node is

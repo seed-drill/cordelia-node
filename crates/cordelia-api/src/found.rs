@@ -54,14 +54,24 @@ enum Layout {
 /// Ask git for the work tree `cwd` is in and the repository's common
 /// directory.
 fn git_layout(cwd: &Path) -> Layout {
-    let asked = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--show-toplevel", "--git-common-dir"])
-        .output();
+    let asked = git_rev_parse(cwd).output();
     let Ok(output) = asked else {
         return Layout::GitNotRun;
     };
+    layout_of(cwd, &output)
+}
+
+/// The command that asks git where `cwd` is.
+fn git_rev_parse(cwd: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel", "--git-common-dir"]);
+    git
+}
+
+/// What git's answer says of `cwd`.
+fn layout_of(cwd: &Path, output: &std::process::Output) -> Layout {
     if !output.status.success() {
         return Layout::NoRepository;
     }
@@ -80,6 +90,38 @@ fn git_layout(cwd: &Path) -> Layout {
     }
 }
 
+/// [`git_layout`], with git given until `deadline`: `None` where it has
+/// not answered by then, and is killed.
+fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
+    use std::process::Stdio;
+    let Ok(mut child) = git_rev_parse(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Some(Layout::GitNotRun);
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    // What it wrote is two short lines, which the pipe holds whole.
+    child
+        .wait_with_output()
+        .ok()
+        .map(|output| layout_of(cwd, &output))
+}
+
 /// The directory whose folder holds the memory for sessions started in
 /// `cwd`, where git can be run. Claude Code keeps one memory per git
 /// repository, shared by its subdirectories and worktrees, in the folder
@@ -87,7 +129,12 @@ fn git_layout(cwd: &Path) -> Layout {
 /// `cwd` itself. `None` where git cannot be run: the repository that
 /// `cwd` may be in is then not known.
 pub fn memory_root_known(cwd: &Path) -> Option<PathBuf> {
-    Some(match git_layout(cwd) {
+    root_of(cwd, git_layout(cwd))
+}
+
+/// [`memory_root_known`] of `cwd`, given what git says of it.
+fn root_of(cwd: &Path, layout: Layout) -> Option<PathBuf> {
+    Some(match layout {
         Layout::GitNotRun => return None,
         // A linked worktree's common directory is the main working tree's
         // `.git`.
@@ -106,6 +153,15 @@ pub fn memory_root_known(cwd: &Path) -> Option<PathBuf> {
 /// [`memory_root_known`], or `cwd` itself where git cannot be run.
 pub fn memory_root(cwd: &Path) -> PathBuf {
     memory_root_known(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// [`memory_root`], with git given until `deadline` (decision 2026-10-09
+/// §4.1, C20): `None` where git has not answered by then. Git is killed,
+/// and nothing falls back to `cwd` itself, which may be another agent's
+/// folder than the repository's.
+pub fn memory_root_by(cwd: &Path, deadline: std::time::Instant) -> Option<PathBuf> {
+    let layout = git_layout_by(cwd, deadline)?;
+    Some(root_of(cwd, layout).unwrap_or_else(|| cwd.to_path_buf()))
 }
 
 /// Whether [`memory_root`] is a guess for `cwd`: it is in a repository
@@ -1603,6 +1659,31 @@ mod tests {
         std::fs::remove_dir_all(&notes).unwrap();
         assert!(!Remembered.is_dir(&notes));
         assert!(!ThisMachine.is_dir(&notes));
+    }
+
+    /// Git given until a deadline answers as git with none, and where the
+    /// deadline is past it is killed, and no directory is answered: not
+    /// the subdirectory itself, which is not the repository's root
+    /// (decision 2026-10-09 §4.1, C20).
+    #[test]
+    fn test_git_given_until_a_deadline_answers_in_time_or_not_at_all() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let notes = base.join("repo/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let in_time = || Instant::now() + Duration::from_secs(30);
+        assert_eq!(memory_root_by(&notes, in_time()), Some(notes.clone()));
+        let made = Command::new("git")
+            .arg("-C")
+            .arg(base.join("repo"))
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        assert_eq!(memory_root_by(&notes, in_time()), Some(base.join("repo")));
+        assert_eq!(memory_root_by(&notes, in_time()), Some(memory_root(&notes)));
+        assert_eq!(memory_root_by(&notes, Instant::now()), None);
     }
 
     /// The notice as a status carries it: one record for each time it

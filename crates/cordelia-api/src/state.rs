@@ -230,6 +230,12 @@ pub struct OwnChannels {
     /// Whether the messages channel had no place among the proofs of a
     /// connection, as the node last said.
     no_place: AtomicBool,
+    /// The messages channel that a relay refused for room since the node
+    /// started, by its ID, where one did.
+    no_room_for_messages: Mutex<Option<[u8; 32]>>,
+    /// The most messages the agent of one folder sends in an hour, as the
+    /// configuration sets it, and one more: 0 where the node has not said.
+    per_folder_per_hour: AtomicU64,
     /// Since when each relay has been connected, and since when none has.
     connected: Mutex<Connected>,
     /// What was asked through the door for a carry, and is not taken up
@@ -635,6 +641,47 @@ impl OwnChannels {
     /// said ([`Self::say_no_place`]). No before it has said.
     pub fn no_place(&self) -> bool {
         self.no_place.load(Ordering::SeqCst)
+    }
+
+    /// A relay refused the messages channel whose ID is `channel` for room
+    /// (decision 2026-10-09 §4.1, §10, C15): `send` says so after what it
+    /// sent. It sets no hold, and changes no status's line (§8).
+    pub fn say_no_room_for_messages(&self, channel: &[u8; 32]) {
+        *self
+            .no_room_for_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(*channel);
+    }
+
+    /// Whether a relay refused the messages channel whose ID is `channel`
+    /// for room since the node started ([`Self::say_no_room_for_messages`]).
+    pub fn no_room_for_messages(&self, channel: &[u8; 32]) -> bool {
+        *self
+            .no_room_for_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            == Some(*channel)
+    }
+
+    /// The configuration sets the most messages the agent of one folder
+    /// sends in an hour (`[messages] per_folder_per_hour`, decision
+    /// 2026-10-09 §6).
+    pub fn set_per_folder_per_hour(&self, most: usize) {
+        self.per_folder_per_hour
+            .store(most as u64 + 1, Ordering::SeqCst);
+    }
+
+    /// The most messages the agent of one folder sends in an hour, as the
+    /// node said it ([`Self::set_per_folder_per_hour`]), or the protocol's
+    /// own where it has not said.
+    pub fn per_folder_per_hour(&self) -> usize {
+        self.per_folder_per_hour
+            .load(Ordering::SeqCst)
+            .checked_sub(1)
+            .map_or(
+                cordelia_core::protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+                |most| most as usize,
+            )
     }
 
     /// Keep nothing of which relays have handed the channel whose ID is

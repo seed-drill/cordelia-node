@@ -526,6 +526,9 @@ struct Script {
     says_nothing_of: usize,
     /// The entries it took, each by what it is named by.
     holds: BTreeSet<[u8; 32]>,
+    /// A channel it has no room for, whatever `has_room` says: an entry
+    /// of it that is shown or pushed is refused for room.
+    no_room_in: Option<[u8; 32]>,
 }
 
 /// A stand-in for a relay. It completes the handshake as a relay does,
@@ -571,6 +574,7 @@ fn stand_in_relay() -> StandIn {
             has_room: true,
             says_nothing_of: 0,
             holds: BTreeSet::new(),
+            no_room_in: None,
         })),
     };
 
@@ -634,10 +638,12 @@ impl StandIn {
         // its bytes are an entry's: it is held, or taken, or refused for
         // room.
         let taken = |script: &mut Script, bytes: &[u8]| -> Option<PushAnswer> {
-            let id = Entry::from_wire(bytes).ok()?.id();
+            let entry = Entry::from_wire(bytes).ok()?;
+            let id = entry.id();
+            let room = script.has_room && script.no_room_in != Some(entry.channel);
             Some(if script.holds.contains(&id) {
                 PushAnswer::Held
-            } else if script.has_room {
+            } else if room {
                 script.holds.insert(id);
                 PushAnswer::Stored
             } else {
@@ -704,6 +710,12 @@ impl StandIn {
     /// From now on it has room, or has none, as `has_room` says.
     fn has_room(&self, has_room: bool) {
         self.script.lock().unwrap().has_room = has_room;
+    }
+
+    /// From now on it has no room for the channel `channel`, and room for
+    /// the others as [`Self::has_room`] says.
+    fn has_no_room_in(&self, channel: [u8; 32]) {
+        self.script.lock().unwrap().no_room_in = Some(channel);
     }
 
     /// Every request it was sent on a stream of entries, in the order
@@ -3157,4 +3169,94 @@ fn a_device_answers_its_relays_request_of_the_older_kind_with_nothing() {
         "{:?}",
         began.elapsed()
     );
+}
+
+/// What `cordelia status --json` says of how sync stands, and its line:
+/// what messages never change (decision 2026-10-09 §8).
+fn how_it_stands(n: &Node) -> (serde_json::Value, String) {
+    let status: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
+    let kept: serde_json::Map<String, serde_json::Value> = ["state", "level", "summary", "holds"]
+        .iter()
+        .map(|key| (key.to_string(), status[*key].clone()))
+        .collect();
+    (
+        serde_json::Value::Object(kept),
+        n.cli(&["status", "--line"]),
+    )
+}
+
+/// A relay that has no room for the messages channel refuses a message
+/// pushed there; the status's level, holds and line are what they were
+/// before, and the next `send` says that a relay has no room, and which
+/// signer's entries fill the channel (decision 2026-10-09 §4.1, §8, §10,
+/// C13, C15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line() {
+    use std::io::Write;
+    let relay = stand_in_relay();
+    let mut a = node("a", "personal", Some(relay.port));
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    syncs_notes_as(&a, "notes");
+    makes_a_phrase(&a, "laptop");
+    let messages =
+        channel_of(&cordelia_crypto::derive::messages_secret(&person_secret_of(&a)).unwrap());
+    relay.has_no_room_in(messages);
+    let before = wait_for("the status settles", &[&a], 90, || {
+        let first = how_it_stands(&a);
+        (first.0["state"] == "synced").then_some(())?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        (how_it_stands(&a) == first).then_some(first)
+    });
+    let sends = |body: &str| {
+        let mut child = a
+            .command_for(&[], &["msg", "send", "--to", "notes"])
+            .current_dir(a.home().join("notes"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let first = wait_for("the first message is sent", &[&a], 120, || {
+        let said = sends("the first\n");
+        said.status.success().then_some(said)
+    });
+    assert!(!String::from_utf8_lossy(&first.stdout).contains("no room"));
+    wait_for(
+        "the relay is pushed the messages channel",
+        &[&a],
+        90,
+        || {
+            relay
+                .pushes()
+                .iter()
+                .flatten()
+                .any(|entry| entry.channel == messages)
+                .then_some(())
+        },
+    );
+    let said = wait_for("send says a relay has no room", &[&a], 90, || {
+        let said = String::from_utf8_lossy(&sends("the next\n").stdout).into_owned();
+        said.contains("no room").then_some(said)
+    });
+    assert!(
+        said.lines().nth(1).is_some_and(|line| line.starts_with(
+            "A relay has no room for more messages of yours in this generation: laptop fills \
+             it with "
+        ) && line
+            .ends_with(" entries. This message waits, and may not be taken there.")),
+        "{said}"
+    );
+    // Passes go on, and what was refused is offered again.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+    assert_eq!(how_it_stands(&a), before);
 }

@@ -223,7 +223,7 @@ pub fn valid_sync_name(name: &str) -> bool {
 
 /// An absolute path with one spelling: no `..`, no doubled or trailing
 /// separators. `None` if it is not such a path.
-fn clean_path(path: &str) -> Option<String> {
+pub(crate) fn clean_path(path: &str) -> Option<String> {
     use std::path::Component;
     let path = std::path::Path::new(path);
     let plain = path.is_absolute()
