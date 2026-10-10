@@ -4281,6 +4281,48 @@ async fn a_typed_keys_pair_channel_is_read_without_leave_and_its_hand_over_accep
     assert_eq!(new.state.own_channels.whole_passes(), (2, 2));
 }
 
+/// The hour of a typed key is judged by the node's clock, the one a test
+/// sets (decision 2026-10-04 §6, decision 2026-10-09 §13): set to the end
+/// of that hour, the key reads nothing, and nothing is asked of the
+/// relay; set a second before it, the hand-over is read and taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hour_of_a_typed_key_is_judged_by_the_nodes_clock() {
+    let relay = relay_started("relay", None);
+    let (mut adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    added.unwrap();
+    adder.connects("relay", &relay).await;
+    adder.passes().await;
+    new.connects("relay", &relay).await;
+    let typed = types(&new, &adder);
+    let an_hour = cordelia_core::protocol::PAIR_KEY_TYPED_SECS;
+
+    new.state
+        .sync_control
+        .set_now(Some(typed.typed_at + an_hour));
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::NotNow)
+    );
+    assert_eq!(new.stands(), Stands::NoPhrase);
+
+    new.state
+        .sync_control
+        .set_now(Some(typed.typed_at + an_hour - 1));
+    assert_ne!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::NotNow)
+    );
+    assert_eq!(new.stands(), Stands::Applied);
+}
+
 /// A hand-over that is read from a pair channel and is not taken is no
 /// change of settings (decision 2026-10-04 §4.2): nothing is counted, and
 /// no sync cycle is stopped for it. Here the key was typed while the

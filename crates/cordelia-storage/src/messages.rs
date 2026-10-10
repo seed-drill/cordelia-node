@@ -238,7 +238,7 @@ fn left_unshown(
 ) -> Result<i64, StorageError> {
     let shown_or_gone: i64 = conn.query_row(
         "SELECT COUNT(*) FROM message_first_held f
-         LEFT JOIN message_index i ON i.id = f.id
+         LEFT JOIN message_index i ON i.id = f.id AND i.generation = f.generation
          WHERE f.signer = ?1 AND f.generation = ?2 AND f.number BETWEEN ?3 AND ?4
            AND (i.id IS NULL OR i.placed_at IS NOT NULL)",
         params![&of[..], generation, lowest, highest],
@@ -677,14 +677,14 @@ pub struct Gone {
 ///   rows, its places and then its own row, since no entry of it is taken
 ///   again. So one run leaves nothing of a generation whose messages have
 ///   all gone.
+/// - **Where the device stands applied under none,** the most recent
+///   generation stays, with its counts and its rows of first holding: it
+///   is the one the device last stood under, and may stand under again.
+/// - **Where which one is not known,** no generation goes, and no kept
+///   value: only what has expired, or is not live, goes.
 ///
-/// `applied` is none where the device does not stand applied. In the
-/// caller's write.
-pub fn drop_gone(
-    conn: &Connection,
-    now: i64,
-    applied: Option<&[u8; 32]>,
-) -> Result<Gone, StorageError> {
+/// In the caller's write.
+pub fn drop_gone(conn: &Connection, now: i64, applied: &Applied) -> Result<Gone, StorageError> {
     let ids = |condition: String| -> Result<Vec<Vec<u8>>, StorageError> {
         Ok(conn
             .prepare(&format!(
@@ -718,18 +718,24 @@ pub fn drop_gone(
         "DELETE FROM message_sends WHERE sent_at <= ?1",
         [now - HOUR_SECS],
     )?;
-    if let Some(channel) = applied {
-        let generation = generation_of(conn, channel)?;
-        for kept in kept(conn)? {
-            if Some(kept.generation) != generation {
-                drop_kept(conn, &kept.id, false)?;
+    let applied = match applied {
+        Applied::NotKnown => return Ok(gone),
+        Applied::Nowhere => None,
+        Applied::Under(channel) => {
+            let generation = generation_of(conn, channel)?;
+            for kept in kept(conn)? {
+                if Some(kept.generation) != generation {
+                    drop_kept(conn, &kept.id, false)?;
+                }
             }
+            Some(channel)
         }
-    }
+    };
     let left: Vec<i64> = conn
         .prepare(
             "SELECT g.id FROM message_generations g
              WHERE g.channel IS NOT ?1
+               AND (?1 IS NOT NULL OR g.id < (SELECT MAX(id) FROM message_generations))
                AND NOT EXISTS (SELECT 1 FROM message_index i WHERE i.generation = g.id)
                AND NOT EXISTS (SELECT 1 FROM message_kept k WHERE k.generation = g.id)",
         )?
@@ -1036,6 +1042,18 @@ fn id_of(bytes: &[u8]) -> Id {
     let len = bytes.len().min(id.len());
     id[..len].copy_from_slice(&bytes[..len]);
     id
+}
+
+/// The messages channel the device stands applied under, as the hourly
+/// task is told it ([`drop_gone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// This channel, by its ID.
+    Under([u8; 32]),
+    /// None: the device follows no phrase, or does not stand applied.
+    Nowhere,
+    /// It could not be read.
+    NotKnown,
 }
 
 /// A count or a number as the store's integer holds it. Every number of
@@ -1569,14 +1587,14 @@ mod tests {
 
         let now = 100 + 30 * day;
         assert_eq!(
-            drop_gone(&conn, now - 1, None).unwrap(),
+            drop_gone(&conn, now - 1, &Applied::Nowhere).unwrap(),
             Gone {
                 expired: 0,
                 not_live: 1
             }
         );
         assert_eq!(
-            drop_gone(&conn, now, None).unwrap(),
+            drop_gone(&conn, now, &Applied::Nowhere).unwrap(),
             Gone {
                 expired: 1,
                 not_live: 0
@@ -1599,6 +1617,56 @@ mod tests {
             .unwrap();
         assert_eq!(left, [3, 4]);
         assert_eq!(count(&conn, "message_places"), 0);
+    }
+
+    /// Where the device stands applied under none, the hourly drop keeps
+    /// the most recent generation, though nothing of it is left but its
+    /// counts and rows of first holding, and drops the older ones that are
+    /// empty; where which one it stands under is not known, it drops no
+    /// generation, and still drops what has expired (decision 2026-10-09
+    /// §7.1, §9.1).
+    #[test]
+    fn the_hourly_drop_keeps_the_last_generation_and_drops_none_where_it_is_not_known() {
+        let conn = db::open_in_memory().unwrap();
+        for channel in 1..=3u8 {
+            generation(&conn, &[channel; 32], 1, 100).unwrap();
+        }
+        // The third holds an expired message, and the row of first holding
+        // of a clearing.
+        conn.execute_batch(
+            "INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                        from_name, sent, subject, thread, answers, asks,
+                                        link, body, first_held, placed_at)
+                 VALUES (zeroblob(16), zeroblob(32), 'laptop', 3, 2, NULL, '~', 100, 'a',
+                         zeroblob(16), zeroblob(16), 0, NULL, 'a', 100, 100);
+             INSERT INTO message_numbers (signer, generation, number, id)
+                 VALUES (zeroblob(32), 3, 1, zeroblob(16));
+             INSERT INTO message_signers (signer, generation, highest, counted_from)
+                 VALUES (zeroblob(32), 3, 2, 1);
+             INSERT INTO message_first_held (signer, generation, number, id, sent, first_held)
+                 VALUES (zeroblob(32), 3, 2, NULL, NULL, 100);",
+        )
+        .unwrap();
+        let generations = || -> Vec<i64> {
+            conn.prepare("SELECT id FROM message_generations ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let later = 100 + 30 * DAY_SECS;
+        let gone = drop_gone(&conn, later, &Applied::NotKnown).unwrap();
+        assert_eq!(gone.expired, 1);
+        assert_eq!(generations(), [1, 2, 3]);
+
+        drop_gone(&conn, later, &Applied::Nowhere).unwrap();
+        assert_eq!(generations(), [3]);
+        assert_eq!(count(&conn, "message_first_held"), 1);
+        assert_eq!(count(&conn, "message_signers"), 1);
+
+        drop_gone(&conn, later, &Applied::Under([4; 32])).unwrap();
+        assert!(generations().is_empty());
     }
 
     /// A drop refused part-way, by a delete that fails after the fields

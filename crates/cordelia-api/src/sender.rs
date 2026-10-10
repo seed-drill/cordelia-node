@@ -1518,9 +1518,19 @@ mod tests {
         ));
         assert!(sends_at(&s, 0, &says("notes", "work", "x"), t + HOUR).is_ok());
         // The record is kept for the hour, and no longer.
-        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR - 1, Some(&messages(&s, 0))).unwrap();
+        held::drop_gone(
+            &s[0].conn,
+            t + 19 * 60 + HOUR - 1,
+            &held::Applied::Under(messages(&s, 0)),
+        )
+        .unwrap();
         assert_eq!(rows(&s[0].conn, "message_sends"), 2);
-        held::drop_gone(&s[0].conn, t + 19 * 60 + HOUR, Some(&messages(&s, 0))).unwrap();
+        held::drop_gone(
+            &s[0].conn,
+            t + 19 * 60 + HOUR,
+            &held::Applied::Under(messages(&s, 0)),
+        )
+        .unwrap();
         assert_eq!(rows(&s[0].conn, "message_sends"), 1);
     }
 

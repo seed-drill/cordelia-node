@@ -207,16 +207,22 @@ pub struct Hourly {
 /// expired messages at the relays ([`crate::sender::clear_expired`]); and
 /// last the truncating checkpoint runs, so that what was overwritten
 /// stands in the log no longer than an hour.
+///
+/// Which channel the device stands applied under is read before the
+/// write: where it cannot be read, no generation goes, and what has
+/// expired still does.
 pub fn hourly(
     conn: &Connection,
     identity: &NodeIdentity,
     now: i64,
     fetched: bool,
 ) -> Result<Hourly, PersonError> {
-    let gone = in_one(conn, || {
-        let applied = crate::at_relays::messages_channel(conn)?;
-        kept(held::drop_gone(conn, now, applied.as_ref()))
-    })?;
+    let applied = match crate::at_relays::messages_channel(conn) {
+        Ok(Some(channel)) => held::Applied::Under(channel),
+        Ok(None) => held::Applied::Nowhere,
+        Err(_) => held::Applied::NotKnown,
+    };
+    let gone = in_one(conn, || kept(held::drop_gone(conn, now, &applied)))?;
     let cleared = crate::sender::clear_expired(conn, identity, now, fetched)?;
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
     Ok(Hourly {
@@ -1567,6 +1573,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(places, 0);
+    }
+
+    /// Where the channel the device stands applied under cannot be read,
+    /// the hourly task drops no generation, and still drops what has
+    /// expired (decision 2026-10-09 §7.1): here the device's secret has
+    /// gone from its store, and the generation it has left stays after
+    /// the messages of both generations expired.
+    #[test]
+    fn an_hourly_task_that_cannot_read_the_channel_applied_drops_what_expired_and_no_generation() {
+        let mut s = Several::of_one_person(2);
+        let start = s.now;
+        let entry = sent(&s, 0, 1, &says("old", start));
+        assert_eq!(given(&s, 1, &entry), STORED);
+        let old = generation(&s, 1);
+        renewed(&mut s);
+        let entry = sent(&s, 0, 1, &says("new", start));
+        assert_eq!(given_at(&s, 1, &entry, start), STORED);
+        let new = generation(&s, 1);
+        s[1].conn.execute("DELETE FROM person_secrets", []).unwrap();
+        assert!(crate::at_relays::messages_channel(&s[1].conn).is_err());
+
+        let task = hourly(&s[1].conn, &s[1].identity, start + 30 * DAY, false).unwrap();
+        assert_eq!(task.gone.expired, 2);
+        assert!(indexed(&s, 1).is_empty());
+        assert_eq!(generations_in(&s, 1, "message_generations"), [old, new]);
+    }
+
+    /// A number of the new generation held at a message of the old one,
+    /// not shown there, is not counted as overwritten when it leaves the
+    /// live numbers: its message is of the other generation, and was not
+    /// held in this one (decision 2026-10-09 §2.5, §7.1).
+    #[test]
+    fn a_number_held_at_another_generations_message_is_not_counted_as_overwritten() {
+        let mut s = Several::of_one_person(2);
+        let message = says("from before", s.now);
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &message)), STORED);
+        renewed(&mut s);
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &message)), STORED);
+        let last = sent(&s, 0, 65, &says("65", s.now));
+        assert_eq!(given(&s, 1, &last), STORED);
+        let kept = signer_on(&s, 1, 0);
+        assert_eq!((kept.highest, kept.overwritten), (65, 0));
     }
 
     /// What is kept of a generation the device has left goes once none of
