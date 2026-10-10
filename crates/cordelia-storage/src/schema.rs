@@ -677,7 +677,10 @@ CREATE TABLE person_left (
 /// and the highest number held, is at most 2^42 - 1
 /// (`AGENT_MESSAGE_NUMBER_MAX`, §2.3), and a statement's number at most
 /// `MAX_STATEMENT_NUMBER`. Each column takes only its type and its bound:
-/// a blob of its length, or an integer, and a flag 0 or 1. The fields a
+/// a blob of its length, or an integer, and a flag 0 or 1. A flag and a
+/// kind of `to` are checked by their `IN (...)` alone, which a column of
+/// integer affinity passes only with an integer; a generation by its
+/// foreign key to the integer key of `message_generations`. The fields a
 /// row is overwritten in before it goes take any type, since they are
 /// written over with a blob of zeros.
 ///
@@ -725,9 +728,13 @@ CREATE TABLE person_left (
 ///   and when it was made; or the mark alone, where it was merged from
 ///   the device's own list on a relay and no message has been found for
 ///   it, with when it was merged. `seq` is the order of the table, unique
-///   on the device: the newest is the highest, and a mark merged as older
-///   than any held takes one below the lowest, so it may be 0 or below.
-///   A row with an ID goes with its message (§7.2).
+///   on the device: the newest is the highest. A merged mark goes below
+///   those made since the device last wrote its list, which are moved up,
+///   or below the lowest where it never wrote one, so it may be 0 or below.
+///   A row with an ID stays when its message's row goes, as a bare hash:
+///   its ID and name are dropped, and `merged_at` is when it became bare
+///   (§7.2). Its key to the index has no cascade, so a row of the index
+///   that a mark names goes only by [`crate::messages::drop_row`].
 /// - `message_announced`, `message_read_by_a_person`: the device's own
 ///   marks, that `summary` announced a message to the agent of a name
 ///   here, and that a person read it here. They go with the message.
@@ -758,30 +765,28 @@ CREATE TABLE message_index (
     id               BLOB PRIMARY KEY CHECK(typeof(id) = 'blob' AND length(id) = 16),
     signer           BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
     label            TEXT NOT NULL,
-    generation       INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                         REFERENCES message_generations(id),
-    to_kind          INTEGER NOT NULL CHECK(typeof(to_kind) = 'integer' AND to_kind IN (1, 2)),
+    generation       INTEGER NOT NULL REFERENCES message_generations(id),
+    to_kind          INTEGER NOT NULL CHECK(to_kind IN (1, 2)),
     to_name          TEXT CHECK((to_kind = 1) = (to_name IS NOT NULL)),
     from_name        TEXT NOT NULL,
     sent             INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
     subject          TEXT NOT NULL,
     thread           BLOB NOT NULL CHECK(typeof(thread) = 'blob' AND length(thread) = 16),
     answers          BLOB NOT NULL CHECK(typeof(answers) = 'blob' AND length(answers) = 16),
-    asks             INTEGER NOT NULL CHECK(typeof(asks) = 'integer' AND asks IN (0, 1)),
+    asks             INTEGER NOT NULL CHECK(asks IN (0, 1)),
     link             TEXT,
     body             TEXT NOT NULL,
     first_held       INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
     placed_at        INTEGER CHECK(placed_at IS NULL OR typeof(placed_at) = 'integer'),
     not_every_relay  INTEGER NOT NULL DEFAULT 0
-                         CHECK(typeof(not_every_relay) = 'integer' AND not_every_relay IN (0, 1))
+                         CHECK(not_every_relay IN (0, 1))
 );
 
 CREATE INDEX idx_message_index_signer ON message_index(signer, generation);
 
 CREATE TABLE message_numbers (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
     id          BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
@@ -792,8 +797,7 @@ CREATE INDEX idx_message_numbers_id ON message_numbers(id);
 
 CREATE TABLE message_first_held (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
     id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
@@ -805,8 +809,7 @@ CREATE TABLE message_first_held (
 
 CREATE TABLE message_signers (
     signer        BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation    INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                      REFERENCES message_generations(id),
+    generation    INTEGER NOT NULL REFERENCES message_generations(id),
     highest       INTEGER NOT NULL CHECK(typeof(highest) = 'integer'
                                          AND highest >= 0 AND highest <= 4398046511103),
     overwritten   INTEGER NOT NULL DEFAULT 0
@@ -821,8 +824,7 @@ CREATE TABLE message_signers (
 
 CREATE TABLE message_places (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     placed_at   INTEGER NOT NULL CHECK(typeof(placed_at) = 'integer')
 );
 
@@ -842,7 +844,7 @@ CREATE INDEX idx_message_lists_mark ON message_lists(mark);
 CREATE TABLE message_read_here (
     mark       BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
     seq        INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
-    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    id         BLOB REFERENCES message_index(id),
     name       TEXT CHECK(name IS NULL OR length(name) >= 1),
     made_at    INTEGER NOT NULL CHECK(typeof(made_at) = 'integer'),
     merged_at  INTEGER CHECK(merged_at IS NULL OR typeof(merged_at) = 'integer'),
@@ -865,7 +867,7 @@ CREATE TABLE message_read_by_a_person (
 CREATE TABLE message_sends (
     sent_at  INTEGER NOT NULL CHECK(typeof(sent_at) = 'integer'),
     name     TEXT CHECK(name IS NULL OR length(name) >= 1),
-    to_all   INTEGER NOT NULL CHECK(typeof(to_all) = 'integer' AND to_all IN (0, 1)),
+    to_all   INTEGER NOT NULL CHECK(to_all IN (0, 1)),
     CHECK(name IS NOT NULL OR to_all = 0)
 );
 
@@ -873,8 +875,7 @@ CREATE INDEX idx_message_sends_at ON message_sends(sent_at);
 
 CREATE TABLE message_kept (
     id          BLOB PRIMARY KEY CHECK(typeof(id) = 'blob' AND length(id) = 16),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     value       BLOB NOT NULL CHECK(typeof(value) = 'blob' AND length(value) = 1936),
     sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
     kept_at     INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer'),
@@ -3784,6 +3785,66 @@ mod tests {
                 "DELETE FROM message_first_held",
             ),
             (
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES ({}, 1, 2, {id}, 9, 9)",
+                    text(32)
+                ),
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, 2, {id}, 9, 9)"
+                ),
+                "DELETE FROM message_first_held",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, 2.5, {id}, 9, 9)"
+                ),
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, 2, {id}, 9, 9)"
+                ),
+                "DELETE FROM message_first_held",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, 2, {id}, 9, 'then')"
+                ),
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, 2, {id}, 9, 9)"
+                ),
+                "DELETE FROM message_first_held",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_signers (signer, generation, highest)
+                     VALUES ({}, 1, 5)",
+                    text(32)
+                ),
+                "INSERT INTO message_signers (signer, generation, highest)
+                 VALUES (zeroblob(32), 1, 5)"
+                    .into(),
+                "DELETE FROM message_signers",
+            ),
+            (
+                "INSERT INTO message_signers (signer, generation, highest, counted_from)
+                 VALUES (zeroblob(32), 1, 5, 4.5)"
+                    .into(),
+                "INSERT INTO message_signers (signer, generation, highest, counted_from)
+                 VALUES (zeroblob(32), 1, 5, 4)"
+                    .into(),
+                "DELETE FROM message_signers",
+            ),
+            (
                 "INSERT INTO message_signers (signer, generation, highest, counted_from)
                  VALUES (zeroblob(32), 1, 5, 6)"
                     .into(),
@@ -3885,6 +3946,15 @@ mod tests {
                 "DELETE FROM message_read_here",
             ),
             (
+                "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (zeroblob(16), 1, 8.5, 9)"
+                    .into(),
+                "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (zeroblob(16), 1, 8, 9)"
+                    .into(),
+                "DELETE FROM message_read_here",
+            ),
+            (
                 "INSERT INTO message_sends (sent_at, name, to_all) VALUES (9, 'notes', 0.5)".into(),
                 "INSERT INTO message_sends (sent_at, name, to_all) VALUES (9, 'notes', 0)".into(),
                 "DELETE FROM message_sends",
@@ -3906,6 +3976,45 @@ mod tests {
                      VALUES ({other}, 1, zeroblob(1936), 9, 9)"
                 ),
                 "DELETE FROM message_kept WHERE id <> X'01010101010101010101010101010101'",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({}, 1, zeroblob(1936), 9, 9)",
+                    text(16)
+                ),
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({other}, 1, zeroblob(1936), 9, 9)"
+                ),
+                "DELETE FROM message_kept WHERE id <> X'01010101010101010101010101010101'",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({other}, 1, zeroblob(1936), 9.5, 9)"
+                ),
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({other}, 1, zeroblob(1936), 9, 9)"
+                ),
+                "DELETE FROM message_kept WHERE id <> X'01010101010101010101010101010101'",
+            ),
+            (
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({other}, 1, zeroblob(1936), 9, 'then')"
+                ),
+                format!(
+                    "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES ({other}, 1, zeroblob(1936), 9, 9)"
+                ),
+                "DELETE FROM message_kept WHERE id <> X'01010101010101010101010101010101'",
+            ),
+            (
+                format!("INSERT INTO message_kept_numbers (id, number) VALUES ({id}, 2.5)"),
+                format!("INSERT INTO message_kept_numbers (id, number) VALUES ({id}, 2)"),
+                "DELETE FROM message_kept_numbers",
             ),
             (
                 format!("INSERT INTO message_kept_numbers (id, number) VALUES ({id}, '2'||'x')"),

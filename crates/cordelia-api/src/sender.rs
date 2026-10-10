@@ -514,7 +514,7 @@ fn written(
     seal(conn, ring, number, rev, value.to_vec(), now)?;
     let generation = ring.generation(conn, now)?;
     kept(held::hold_number(
-        conn, &ring.own, generation, number, false,
+        conn, &ring.own, generation, number, false, now,
     ))?;
     let label = own_label(conn, &ring.own)?;
     let id = message_id(&ring.own, value);
@@ -631,10 +631,23 @@ fn newest_number(conn: &Connection, id: &Id) -> Result<Option<u64>, PersonError>
         .and_then(|kept_value| kept_value.numbers.last().copied()))
 }
 
+/// When a relay's answer is taken, as the node knows it: its clock, and
+/// whether the messages channel was fetched since it started ([`fetched`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnsweredAt {
+    pub now: i64,
+    pub fetched: bool,
+}
+
 /// A relay answered a push of `batch` of `channel` with `answers`: how far
 /// it was sent the channel ([`crate::at_relays::sent`]) and, for the
-/// messages channel, what the device keeps of what it took ([`answered`]),
-/// in one write, so that a process that stops between them loses neither.
+/// messages channel, what the device keeps of what it took ([`answered`])
+/// and the list of what its agents read written again above another that
+/// the relay holds ([`crate::marks::answered`], decision 2026-10-09 §2.4),
+/// in one write, so that a process that stops between them loses none.
+/// So an error in `marks::answered` takes back the relay's count and what
+/// was kept of the answer too, and the push counts as unanswered and is
+/// made again at the next pass, as the one write means it to be.
 /// Every other channel's push is written as `at_relays::sent` writes it.
 pub fn pushed(
     conn: &Connection,
@@ -643,6 +656,7 @@ pub fn pushed(
     channel: &Own,
     batch: &Batch,
     answers: &[Pushed],
+    at: &AnsweredAt,
 ) -> Result<crate::at_relays::Sent, PersonError> {
     if channel.kind != Kind::Messages {
         return crate::at_relays::sent(conn, relay, channel, batch, answers);
@@ -650,6 +664,15 @@ pub fn pushed(
     in_one(conn, || {
         let done = crate::at_relays::sent(conn, relay, channel, batch, answers)?;
         answered(conn, identity, relay, channel, &batch.entries, answers)?;
+        crate::marks::answered(
+            conn,
+            identity,
+            channel,
+            &batch.entries,
+            answers,
+            at.now,
+            at.fetched,
+        )?;
         Ok(done)
     })
 }
@@ -813,7 +836,9 @@ pub fn clear_expired(
             };
             seal(conn, &ring, number, rev, clearing_value(), now)?;
             let generation = ring.generation(conn, now)?;
-            kept(held::hold_number(conn, &ring.own, generation, number, true))?;
+            kept(held::hold_number(
+                conn, &ring.own, generation, number, true, now,
+            ))?;
             kept(held::clear(conn, &ring.own, generation, number, now))?;
             cleared += 1;
         }
@@ -843,6 +868,13 @@ mod tests {
 
     const HOUR: i64 = 60 * 60;
     const DAY: i64 = 24 * HOUR;
+
+    /// A relay's answer taken before the messages channel was fetched: no
+    /// list is written again by it.
+    const NOT_FETCHED: AnsweredAt = AnsweredAt {
+        now: 0,
+        fetched: false,
+    };
 
     /// The names each device of a test syncs.
     const NAMES: [&str; 4] = ["notes", "work", "plans", "home"];
@@ -1105,6 +1137,7 @@ mod tests {
                 &channel,
                 &batch,
                 &answers,
+                &AnsweredAt { now, fetched: true },
             )
             .unwrap();
             answers
@@ -2395,11 +2428,31 @@ mod tests {
         )
         .unwrap();
         let answers = [Pushed::Holds];
-        assert!(pushed(conn, identity, &relay, &channel, &batch, &answers).is_err());
+        assert!(
+            pushed(
+                conn,
+                identity,
+                &relay,
+                &channel,
+                &batch,
+                &answers,
+                &NOT_FETCHED
+            )
+            .is_err()
+        );
         assert_eq!(sent_to(), 0);
         assert!(held::taken_at(conn, &done.id).unwrap().is_empty());
         conn.execute_batch("DROP TRIGGER taken_fails").unwrap();
-        pushed(conn, identity, &relay, &channel, &batch, &answers).unwrap();
+        pushed(
+            conn,
+            identity,
+            &relay,
+            &channel,
+            &batch,
+            &answers,
+            &NOT_FETCHED,
+        )
+        .unwrap();
         assert!(sent_to() > 0);
         assert_eq!(held::taken_at(conn, &done.id).unwrap(), [relay]);
     }
@@ -2430,6 +2483,7 @@ mod tests {
             &channel,
             &batch,
             &[Pushed::HoldsAnother],
+            &NOT_FETCHED,
         );
         assert!(answered_now.is_ok(), "{answered_now:?}");
         let sent_to: i64 = conn

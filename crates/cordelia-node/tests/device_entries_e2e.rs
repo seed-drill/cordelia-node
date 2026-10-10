@@ -21,6 +21,7 @@ use std::time::Duration;
 use cordelia_api::adding::{Accepted, accept, add_device};
 use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::change::make_change;
+use cordelia_api::marks;
 use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::sender::{self, At, NotSent, Request, Sent};
@@ -39,6 +40,7 @@ use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::message;
 use cordelia_crypto::phrase::Phrase;
+use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::Device as Listed;
 use cordelia_network::messages::{
     ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryRefused,
@@ -499,6 +501,49 @@ impl Device {
             .into_iter()
             .map(|shown| shown.body)
             .collect()
+    }
+
+    /// The agent of `name` on this device reads message `id`, as a read
+    /// will: once places are given, at the node's clock, its list written
+    /// where it may be (decision 2026-10-09 §7.2).
+    fn reads_message(&self, name: &str, id: &[u8; 16]) -> marks::Marked {
+        let db = self.db();
+        let now = self.engine.unix();
+        held_messages::give_places(&db, &self.key(), now).unwrap();
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now()).unwrap();
+        marks::read_here(&db, &self.state.identity, name, id, now, fetched).unwrap()
+    }
+
+    /// The bodies of the messages that the agent of `name` has not read,
+    /// here or by another device's list, once places are given.
+    fn unread_by(&self, name: &str) -> Vec<String> {
+        let db = self.db();
+        let now = self.engine.unix();
+        held_messages::give_places(&db, &self.key(), now).unwrap();
+        marks::unread(&db, &self.state.identity, name, now)
+            .unwrap()
+            .into_iter()
+            .map(|shown| shown.body)
+            .collect()
+    }
+
+    /// The slot of its list of what its agents read, in the messages
+    /// channel of the generation applied.
+    fn list_slot(&self) -> [u8; 32] {
+        let key = derive::slot_key(&self.messages_secret()).unwrap();
+        slot_id(&key, &message::read_name(&self.key()).unwrap())
+    }
+
+    /// Its list among `held`, as its revision and its marks.
+    fn list_in(&self, held: &[Entry]) -> Option<(u64, Vec<[u8; 16]>)> {
+        let slot = self.list_slot();
+        let entry = held
+            .iter()
+            .find(|entry| entry.author == self.key() && entry.slot == slot)?;
+        let entry = entry.clone().check().unwrap();
+        let inside = entry.open(&self.messages_secret()).unwrap();
+        let list = message::ReadMarks::from_value(&inside.value).unwrap();
+        Some((entry.rev, list.marks))
     }
 
     /// The numbers it keeps its own message `id` sent under, where it
@@ -6234,4 +6279,224 @@ async fn a_message_cleared_by_its_sender_leaves_the_other_devices_index() {
         .query_row("SELECT COUNT(*) FROM message_index", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0);
+}
+
+// ── What an agent read, across a relay (decision 2026-10-09 §7.2) ────
+
+/// A mark made on one device reaches the other through a relay: the
+/// desktop's agent of `work` reads a message, its list is pushed, the
+/// relay holds it in the desktop's slot `read/<its key>`, and the laptop
+/// keeps it as the desktop's latest list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mark_made_on_one_device_reaches_the_other_through_a_relay() {
+    let relay = relay_started("relay", None);
+    let (laptop, desktop) = two_that_message(&relay).await;
+    let to_work = message::To::Name("work".into());
+    let sent = laptop.sends_message("notes", to_work, "a request").unwrap();
+    laptop.sends().await;
+    desktop.passes().await;
+    let marked = desktop.reads_message("work", &sent.id);
+    assert_eq!(
+        marked,
+        marks::Marked {
+            marked: true,
+            list: Some(1)
+        }
+    );
+    desktop.sends().await;
+    let mark = message::read_mark(&sent.id, "work");
+    let at_relay = desktop.list_in(&held_at(&relay, &laptop.messages()));
+    assert_eq!(at_relay, Some((1, vec![mark])));
+
+    laptop.passes().await;
+    let kept: Vec<(Vec<u8>, Vec<u8>)> = laptop
+        .db()
+        .prepare("SELECT key, mark FROM message_lists")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(kept, [(desktop.key().to_vec(), mark.to_vec())]);
+}
+
+/// A message that an agent of a name read on one device is not counted
+/// unread for that name on the other, once the other has its list
+/// (decision 2026-10-09 §7.2): the laptop's agent of `work` is shown the
+/// laptop's own message from `notes` as unread until the desktop's agent
+/// of `work` reads it and the laptop takes the desktop's list; it is still
+/// unread for `notes` on the desktop, which no agent of that name read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_read_on_one_device_is_not_counted_unread_on_the_other() {
+    let relay = relay_started("relay", None);
+    let (laptop, desktop) = two_that_message(&relay).await;
+    let sent = laptop
+        .sends_message("notes", message::To::All, "for every agent")
+        .unwrap();
+    laptop.sends().await;
+    desktop.passes().await;
+    assert_eq!(laptop.unread_by("work"), ["for every agent"]);
+    assert!(desktop.reads_message("work", &sent.id).marked);
+    desktop.sends().await;
+    assert_eq!(laptop.unread_by("work"), ["for every agent"]);
+
+    laptop.passes().await;
+    assert_eq!(laptop.unread_by("work"), Vec::<String>::new());
+    assert_eq!(desktop.unread_by("work"), Vec::<String>::new());
+    assert_eq!(desktop.unread_by("notes"), ["for every agent"]);
+    let read_on = marks::read_on(&laptop.db(), &sent.id, "work").unwrap();
+    assert_eq!(read_on.devices, [desktop.key()]);
+}
+
+/// A store restored from before a read takes its own later list back from
+/// the relay, and the list it writes next holds both lives' marks, above
+/// the relay's (decision 2026-10-09 §2.4, §7.2, §11): after the restore,
+/// which is a start, an agent reads before the first fetch and nothing is
+/// written; the pass pulls the later list, merges it, and writes the next.
+/// The backup said 130 marks, more than a list holds: the later list's
+/// mark goes above them, below the read made since the restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_device_merges_its_later_list_from_a_relay_and_writes_above_it() {
+    let relay = relay_started("relay", None);
+    let (laptop, desktop) = two_that_message(&relay).await;
+    let to_work = || message::To::Name("work".into());
+    let first = laptop.sends_message("notes", to_work(), "first").unwrap();
+    let second = laptop.sends_message("notes", to_work(), "second").unwrap();
+    laptop.sends().await;
+    let said: Vec<[u8; 16]> = (1..=130u8).map(|k| [k; 16]).collect();
+    for (seq, mark) in (1..).zip(&said) {
+        desktop
+            .db()
+            .execute(
+                "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (?1, ?2, 0, 0)",
+                rusqlite::params![&mark[..], seq],
+            )
+            .unwrap();
+    }
+    desktop.passes().await;
+    assert_eq!(
+        desktop
+            .list_in(&held_at(&relay, &laptop.messages()))
+            .map(|list| list.0),
+        Some(1)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("desktop.db");
+    desktop
+        .db()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    assert_eq!(desktop.reads_message("work", &first.id).list, Some(2));
+    desktop.sends().await;
+
+    *desktop.db() = cordelia_storage::db::open(&backup).unwrap();
+    let messages = desktop.messages();
+    desktop.state.own_channels.forget_fetched(&messages);
+    assert_eq!(desktop.reads_message("work", &second.id).list, None);
+    desktop.passes().await;
+    let mut both = vec![
+        message::read_mark(&second.id, "work"),
+        message::read_mark(&first.id, "work"),
+    ];
+    both.extend(said[12..].iter().rev());
+    assert_eq!(
+        desktop.list_in(&held_at(&relay, &messages)),
+        Some((3, both))
+    );
+    laptop.passes().await;
+    assert_eq!(laptop.unread_by("work"), Vec::<String>::new());
+}
+
+/// After a statement, the first list in the new generation is written by
+/// the pass once the new messages channel is fetched, and holds the marks
+/// of what is still shown (decision 2026-10-09 §2.4, §9.1, F8): the
+/// desktop's agent read a message before a renewal; the laptop keeps the
+/// desktop's list across it, and takes the new one from the new channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_list_after_a_statement_is_written_by_the_pass_in_the_new_channel() {
+    let relay = relay_started("relay", None);
+    let (laptop, desktop) = two_that_message(&relay).await;
+    let sent = laptop
+        .sends_message("notes", message::To::All, "before the renewal")
+        .unwrap();
+    laptop.sends().await;
+    desktop.passes().await;
+    desktop.reads_message("work", &sent.id);
+    desktop.sends().await;
+    laptop.passes().await;
+    let old = laptop.messages();
+
+    laptop.changes(&phrase(), &[&laptop, &desktop], &[]);
+    all_pass(&[&laptop, &desktop], 3).await;
+    let messages = desktop.messages();
+    assert_eq!(laptop.messages(), messages);
+    assert_ne!(messages, old);
+    assert_eq!(laptop.unread_by("work"), Vec::<String>::new());
+    let mark = message::read_mark(&sent.id, "work");
+    assert_eq!(
+        desktop.list_in(&held_at(&relay, &messages)),
+        Some((1, vec![mark]))
+    );
+    // The laptop took the new list from the new channel.
+    let list = held_at(&relay, &messages)
+        .into_iter()
+        .find(|entry| entry.author == desktop.key() && entry.slot == desktop.list_slot())
+        .unwrap();
+    assert!(laptop.holds_of(&messages).contains(&list.id()));
+    laptop
+        .db()
+        .execute("DELETE FROM message_lists", [])
+        .unwrap();
+    assert_eq!(laptop.unread_by("work"), ["before the renewal"]);
+}
+
+/// A relay that answers that it holds another list of the device's at the
+/// revision pushed has the list written again above it, and pushed; one
+/// that answers that it holds a later one has nothing written (decision
+/// 2026-10-09 §2.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_that_a_relay_holds_another_of_is_written_again_above_it() {
+    for (answer, revs) in [
+        (PushAnswer::Another, vec![1, 2]),
+        (PushAnswer::Older, vec![1]),
+    ] {
+        let relay = StandIn::started().await;
+        relay.holds_what_is_proved(true);
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.syncs(true);
+        device.says_it_syncs("notes");
+        device.says_it_syncs("work");
+        let slot = device.list_slot();
+        let first = Arc::new(AtomicBool::new(true));
+        let once = first.clone();
+        relay.pushes(
+            move |entry| match entry.slot == slot && once.swap(false, Ordering::SeqCst) {
+                true => answer,
+                false => PushAnswer::Stored,
+            },
+        );
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        let to_work = message::To::Name("work".into());
+        let sent = device.sends_message("notes", to_work, "a request").unwrap();
+        assert_eq!(device.reads_message("work", &sent.id).list, Some(1));
+        relay.requests();
+        device.passes().await;
+        device.passes().await;
+        let pushed: Vec<u64> = relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|bytes| Entry::from_wire(&bytes).unwrap())
+            .filter(|entry| entry.slot == slot)
+            .map(|entry| entry.rev)
+            .collect();
+        assert_eq!(pushed, revs, "{answer:?}");
+    }
 }
