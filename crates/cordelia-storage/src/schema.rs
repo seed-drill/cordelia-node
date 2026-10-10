@@ -728,9 +728,13 @@ CREATE TABLE person_left (
 ///   and when it was made; or the mark alone, where it was merged from
 ///   the device's own list on a relay and no message has been found for
 ///   it, with when it was merged. `seq` is the order of the table, unique
-///   on the device: the newest is the highest, and a mark merged as older
-///   than any held takes one below the lowest, so it may be 0 or below.
-///   A row with an ID goes with its message (§7.2).
+///   on the device: the newest is the highest. A merged mark goes below
+///   those made since the device last wrote its list, which are moved up,
+///   or below the lowest where it never wrote one, so it may be 0 or below.
+///   A row with an ID stays when its message's row goes, as a bare hash:
+///   its ID and name are dropped, and `merged_at` is when it became bare
+///   (§7.2). Its key to the index has no cascade, so a row of the index
+///   that a mark names goes only by [`crate::messages::drop_row`].
 /// - `message_announced`, `message_read_by_a_person`: the device's own
 ///   marks, that `summary` announced a message to the agent of a name
 ///   here, and that a person read it here. They go with the message.
@@ -840,7 +844,7 @@ CREATE INDEX idx_message_lists_mark ON message_lists(mark);
 CREATE TABLE message_read_here (
     mark       BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
     seq        INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
-    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    id         BLOB REFERENCES message_index(id),
     name       TEXT CHECK(name IS NULL OR length(name) >= 1),
     made_at    INTEGER NOT NULL CHECK(typeof(made_at) = 'integer'),
     merged_at  INTEGER CHECK(merged_at IS NULL OR typeof(merged_at) = 'integer'),

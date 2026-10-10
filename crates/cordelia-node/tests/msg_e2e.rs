@@ -1270,7 +1270,8 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
 
 /// What a device keeps of its person and its settings, from its store:
 /// every row of the tables of its person, and of its settings, but the
-/// report of its last cycle of sync, which says when it ran.
+/// report of its last cycle of sync, which says when it ran, and the
+/// `seq` its list last said, which moves with each read.
 fn kept_of(n: &Node) -> Vec<String> {
     let db = rusqlite::Connection::open_with_flags(
         n.data_dir().join("cordelia.db"),
@@ -1303,7 +1304,10 @@ fn kept_of(n: &Node) -> Vec<String> {
             rows.push(format!("{table}: {}", values.join(" | ")));
         }
     }
-    rows.retain(|row| !row.starts_with("node_meta: sync.claude.report |"));
+    rows.retain(|row| {
+        !row.starts_with("node_meta: sync.claude.report |")
+            && !row.starts_with("node_meta: messages.listed_seq |")
+    });
     rows.sort();
     rows
 }

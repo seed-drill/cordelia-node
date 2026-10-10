@@ -1293,7 +1293,7 @@ CREATE INDEX idx_message_lists_mark ON message_lists(mark);
 CREATE TABLE message_read_here (
     mark       BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
     seq        INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
-    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    id         BLOB REFERENCES message_index(id),
     name       TEXT CHECK(name IS NULL OR length(name) >= 1),
     made_at    INTEGER NOT NULL CHECK(typeof(made_at) = 'integer'),
     merged_at  INTEGER CHECK(merged_at IS NULL OR typeof(merged_at) = 'integer'),
@@ -1393,7 +1393,10 @@ CREATE TABLE message_kept_taken (
   made; or the mark alone, where it was merged from the device's own list on
   a relay and no message has been found for it, with when (§7.2). `seq` is
   the table's order, unique on the device: the newest is the highest, and a
-  mark merged as older than any held takes one below the lowest.
+  mark merged as older than any held takes one below the lowest. When a
+  message's row goes from the index, each of its marks stays as the mark
+  alone, `merged_at` being when it became so; its key to the index has no
+  cascade.
 - `message_announced` and `message_read_by_a_person`: the device's own marks,
   that `summary` announced a message to the agent of a name here, and that a
   person read it here. They are never synced.
@@ -1439,6 +1442,7 @@ nothing in any of these tables.
 | `person.names_carried` | JSON array of the names that the device holds by a carry that a person asked for, or by a recovery, with no folder of its own mapped to them. It holds each, and lists it in the personal channel, whether or not sync is on. A name goes from the list when the device stops it | Decision §7.3, §9 |
 | `person.look_pending` | Present while the look of a recovery that was made on this machine has not ended: set where the recovery's statement is applied, and removed when the look has carried what it takes, or when a later statement is applied. While it is present the machine does not write that it has sent what it carried | Decision §8, §9 |
 | `messages.list_again` | How many times in a row the device's list of what its agents read was written again because a relay answered that it holds another at the revision pushed, since a list was last written for a mark it lacked. A list's marks go under at most four revisions (`AGENT_MESSAGE_SENDS_MAX`), as a message's do | Decision 2026-10-09 §2.4 |
+| `messages.listed_seq` | The highest `seq` of the device's table of what its agents read when it last wrote its list, as an integer in text. A mark above it was made since and is not yet said. A merge of the device's own later list puts what the table lacked just above it, moving the marks made since up, and raises it to the highest of the marks merged. Absent where the device never wrote a list from this store; a mark made later is always above it | Decision 2026-10-09 §2.4, §7.2 |
 | `person.removed_labels` | JSON object of what the device called each key that a statement it applied removed, by the key in hex. A statement lists removed keys bare, and a person names one by its label at `cordelia sync carry --from`. A key that the device never knew by a label is not in it | Decision §7.3 |
 | `usage.sighting_secret` | The secret a node hashes peer keys with for its usage counts. It never leaves the node | Kept |
 

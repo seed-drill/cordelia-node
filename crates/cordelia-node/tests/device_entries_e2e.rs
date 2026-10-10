@@ -6353,6 +6353,8 @@ async fn a_message_read_on_one_device_is_not_counted_unread_on_the_other() {
 /// the relay's (decision 2026-10-09 §2.4, §7.2, §11): after the restore,
 /// which is a start, an agent reads before the first fetch and nothing is
 /// written; the pass pulls the later list, merges it, and writes the next.
+/// The backup said 130 marks, more than a list holds: the later list's
+/// mark goes above them, below the read made since the restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restored_device_merges_its_later_list_from_a_relay_and_writes_above_it() {
     let relay = relay_started("relay", None);
@@ -6361,14 +6363,31 @@ async fn a_restored_device_merges_its_later_list_from_a_relay_and_writes_above_i
     let first = laptop.sends_message("notes", to_work(), "first").unwrap();
     let second = laptop.sends_message("notes", to_work(), "second").unwrap();
     laptop.sends().await;
+    let said: Vec<[u8; 16]> = (1..=130u8).map(|k| [k; 16]).collect();
+    for (seq, mark) in (1..).zip(&said) {
+        desktop
+            .db()
+            .execute(
+                "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (?1, ?2, 0, 0)",
+                rusqlite::params![&mark[..], seq],
+            )
+            .unwrap();
+    }
     desktop.passes().await;
+    assert_eq!(
+        desktop
+            .list_in(&held_at(&relay, &laptop.messages()))
+            .map(|list| list.0),
+        Some(1)
+    );
     let dir = tempfile::tempdir().unwrap();
     let backup = dir.path().join("desktop.db");
     desktop
         .db()
         .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
         .unwrap();
-    assert_eq!(desktop.reads_message("work", &first.id).list, Some(1));
+    assert_eq!(desktop.reads_message("work", &first.id).list, Some(2));
     desktop.sends().await;
 
     *desktop.db() = cordelia_storage::db::open(&backup).unwrap();
@@ -6376,13 +6395,14 @@ async fn a_restored_device_merges_its_later_list_from_a_relay_and_writes_above_i
     desktop.state.own_channels.forget_fetched(&messages);
     assert_eq!(desktop.reads_message("work", &second.id).list, None);
     desktop.passes().await;
-    let both = vec![
+    let mut both = vec![
         message::read_mark(&second.id, "work"),
         message::read_mark(&first.id, "work"),
     ];
+    both.extend(said[12..].iter().rev());
     assert_eq!(
         desktop.list_in(&held_at(&relay, &messages)),
-        Some((2, both))
+        Some((3, both))
     );
     laptop.passes().await;
     assert_eq!(laptop.unread_by("work"), Vec::<String>::new());

@@ -1109,7 +1109,7 @@ mod tests {
         let conn = &s[n].conn;
         let channel = messages_channel(conn).unwrap().unwrap();
         let generation = held::generation(conn, &channel, s[n].number(), times.1).unwrap();
-        held::hold_number(conn, &signer, generation, number, false).unwrap();
+        held::hold_number(conn, &signer, generation, number, false, times.1).unwrap();
         let message = Message {
             asks,
             sent: times.0 as u64,
