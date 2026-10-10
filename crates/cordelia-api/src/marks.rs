@@ -211,6 +211,7 @@ fn list_written(
             "the store holds a list of this device's at or above that revision".into(),
         ));
     }
+    kept(held::wrote_list(conn))?;
     Ok(Some(next))
 }
 
@@ -253,8 +254,9 @@ pub fn answered(
 /// which the store kept over what it held (decision 2026-10-09 §7.2), in
 /// the door's write. Another device's list is kept in place of what was
 /// kept of it. The device's own, `own`, is one a relay handed back from
-/// its later life: its marks are merged into the table as older than any
-/// there, each found by the messages held and the names mapped here.
+/// its later life: its marks are merged into the table below those made
+/// since the device last wrote its list and above the rest, each found by
+/// the messages held and the names mapped here.
 pub(crate) fn list_taken(
     conn: &Connection,
     own: &[u8; 32],
@@ -992,16 +994,17 @@ mod tests {
         let hourly = |now: i64| {
             crate::reader::hourly(&s[1].conn, &s[1].identity, now, true).unwrap();
         };
+        // The merged mark was listed after the one said: it is above it.
         hourly(t + month - 1);
-        assert_eq!(table(&s, 1), [(mark, true), ([0xb1; 16], false)]);
+        assert_eq!(table(&s, 1), [([0xb1; 16], false), (mark, true)]);
         hourly(t + month);
-        assert_eq!(table(&s, 1), [(mark, false), ([0xb1; 16], false)]);
+        assert_eq!(table(&s, 1), [([0xb1; 16], false), (mark, false)]);
         assert!(read_on(&s[1].conn, &id, "notes").unwrap().here);
         assert_eq!(
             write_list(&s[1].conn, &s[1].identity, t + month, true).unwrap(),
             Some(2)
         );
-        assert_eq!(listed(&s, 1), Some((2, vec![mark, [0xb1; 16]])));
+        assert_eq!(listed(&s, 1), Some((2, vec![[0xb1; 16], mark])));
         hourly(t + DAY + month);
         assert_eq!(table(&s, 1), [(mark, false)]);
         hourly(t + 2 * month - 1);
@@ -1105,6 +1108,64 @@ mod tests {
             listed(&s, 1),
             Some((2, vec![read_mark(&to_read, "notes"), mark]))
         );
+    }
+
+    /// A restored store whose backup said more marks than a list holds
+    /// lists its later list's marks above them (decision 2026-10-09 §2.4,
+    /// §7.2): the backup held 130 marks left bare and wrote its list of the
+    /// newest 120; its later life read a message and wrote a list above
+    /// it. Taken back, that list's new mark is merged above the 130, and
+    /// the list written at the next read holds the new read, then the
+    /// later list's mark, then the newest 118 of the backup.
+    #[test]
+    fn a_restored_store_that_said_more_than_a_list_holds_lists_its_later_marks_first() {
+        let mut s = devices(2);
+        let t = s.now;
+        let bare: Vec<Mark> = (1..=130u8).map(|k| [k; 16]).collect();
+        for (seq, mark) in (1..).zip(&bare) {
+            s[1].conn
+                .execute(
+                    "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                     VALUES (?1, ?2, ?3, ?3)",
+                    rusqlite::params![&mark[..], seq, t],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            write_list(&s[1].conn, &s[1].identity, t, true).unwrap(),
+            Some(1)
+        );
+        let id = sends(&s, 0, "~", "notes", "read in the later life", t);
+        s.pass(0, 1);
+        let mark = read_mark(&id, "notes");
+        let mut later = vec![mark];
+        later.extend(bare[11..].iter().rev());
+        let value = ReadMarks {
+            marks: later.clone(),
+        }
+        .to_value()
+        .unwrap();
+        let entry = Entry::seal(
+            &messages_secret(&s, 1),
+            &s[1].identity,
+            2,
+            &message::inside(read_name(&s.key(1)).unwrap(), value),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        take(&s[1].conn, &s[1].identity, &entry, t).unwrap();
+        assert_eq!(table(&s, 1)[0], (mark, true));
+        // The bound of 120 bare hashes drops the backup's oldest ten.
+        assert_eq!(table(&s, 1).len(), 121);
+
+        let next = sends(&s, 0, "~", "notes", "read after the restore", t);
+        s.pass(0, 1);
+        let marked = reads(&s, 1, "notes", &next, t, true);
+        assert_eq!(marked.list, Some(3));
+        let mut newest = vec![read_mark(&next, "notes")];
+        newest.extend(&later[..119]);
+        assert_eq!(listed(&s, 1), Some((3, newest)));
     }
 
     /// A relay's answer of another to an entry in this device's list's

@@ -1068,9 +1068,10 @@ pub type Mark = [u8; AGENT_MESSAGE_READ_MARK_BYTES];
 /// (decision 2026-10-09 §7.2): its mark is kept in the device's own table,
 /// with the ID and the name, as the newest there, in the caller's write.
 /// A mark the table kept as a bare hash is given its ID and its name, and
-/// one it kept already is made the newest. The message is in the index;
-/// when its row goes, the mark stays as a bare hash ([`drop_row`]).
-/// Returns whether the table lacked the mark.
+/// one it kept already is made the newest. It is above what the device
+/// last listed ([`wrote_list`]) though the marks listed went. The message
+/// is in the index; when its row goes, the mark stays as a bare hash
+/// ([`drop_row`]). Returns whether the table lacked the mark.
 pub fn mark_read(conn: &Connection, id: &Id, name: &str, now: i64) -> Result<bool, StorageError> {
     let mark = read_mark(id, name);
     let held: i64 = conn.query_row(
@@ -1078,15 +1079,58 @@ pub fn mark_read(conn: &Connection, id: &Id, name: &str, now: i64) -> Result<boo
         [&mark[..]],
         |row| row.get(0),
     )?;
+    let above = highest_seq(conn)?.max(listed_seq(conn)?).unwrap_or(0);
     conn.execute(
         "INSERT INTO message_read_here (mark, seq, id, name, made_at)
-         VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM message_read_here), ?2, ?3, ?4)
+         VALUES (?1, ?5 + 1, ?2, ?3, ?4)
          ON CONFLICT(mark) DO UPDATE SET
              seq = excluded.seq, id = excluded.id, name = excluded.name,
              made_at = excluded.made_at, merged_at = NULL",
-        params![&mark[..], &id[..], name, now],
+        params![&mark[..], &id[..], name, now, above],
     )?;
     Ok(held == 0)
+}
+
+/// The highest `seq` of the table, where it holds a mark.
+fn highest_seq(conn: &Connection) -> Result<Option<i64>, StorageError> {
+    Ok(
+        conn.query_row("SELECT MAX(seq) FROM message_read_here", [], |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+/// The highest `seq` of the table when the device last wrote its list,
+/// as raised by a merge since (`MESSAGES_LISTED_SEQ`); none where it never
+/// wrote one from this store.
+fn listed_seq(conn: &Connection) -> Result<Option<i64>, StorageError> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM node_meta WHERE key = ?1",
+            [crate::meta::MESSAGES_LISTED_SEQ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.and_then(|value| value.parse().ok()))
+}
+
+fn set_listed_seq(conn: &Connection, seq: i64) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO node_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![crate::meta::MESSAGES_LISTED_SEQ, seq.to_string()],
+    )?;
+    Ok(())
+}
+
+/// The device wrote its list ([`marks_to_list`]), in the caller's write
+/// (decision 2026-10-09 §2.4, §7.2): what the table holds is said, and a
+/// mark made after is above it.
+pub fn wrote_list(conn: &Connection) -> Result<(), StorageError> {
+    match highest_seq(conn)? {
+        Some(highest) => set_listed_seq(conn, highest),
+        None => Ok(()),
+    }
 }
 
 /// The marks that the device's list holds (decision 2026-10-09 §2.4,
@@ -1130,8 +1174,14 @@ fn marks_held(
 
 /// The device took its own list from a relay, and the store kept it
 /// (decision 2026-10-09 §2.4, §7.2, D7, F8): each of its `marks` that the
-/// table lacks is merged into the table as older than any it holds, in
-/// the list's order, in the caller's write. Each is given the ID and the
+/// table lacks is merged into the table, in the list's order, in the
+/// caller's write, below the marks made since the device last wrote its
+/// list and above every other. The later list was written after all that
+/// the store held when it last wrote its own, and before what its agents
+/// have read since, which is not yet said: so the marks made since are
+/// moved up to make room, and the merged ones count as said. Where the
+/// device never wrote a list from this store, every mark it holds is made
+/// since, and the merged go below them all. Each is given the ID and the
 /// name of a message it holds, found by making the mark of each message
 /// with each of `names`, the names mapped here, and with the name it is
 /// to; one that matches none is kept as a bare hash, merged at `now`. At
@@ -1144,13 +1194,43 @@ pub fn merge_own_list(
     now: i64,
 ) -> Result<usize, StorageError> {
     let held = marks_held(conn, names)?;
-    let lowest: Option<i64> =
-        conn.query_row("SELECT MIN(seq) FROM message_read_here", [], |row| {
-            row.get(0)
-        })?;
-    let mut seq = lowest.map_or(0, |lowest| lowest - 1);
-    let mut merged = 0;
+    let mut lacked: Vec<&Mark> = Vec::new();
     for mark in marks {
+        let here: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM message_read_here WHERE mark = ?1",
+            [&mark[..]],
+            |row| row.get(0),
+        )?;
+        if here == 0 && !lacked.contains(&mark) {
+            lacked.push(mark);
+        }
+    }
+    let count = i64::try_from(lacked.len()).unwrap_or(i64::MAX);
+    let listed = listed_seq(conn)?;
+    let top = match listed {
+        Some(listed) => {
+            // Up past the highest and back, as the UNIQUE on seq allows.
+            if let Some(highest) = highest_seq(conn)?.filter(|highest| *highest > listed) {
+                conn.execute(
+                    "UPDATE message_read_here SET seq = seq + ?2 WHERE seq > ?1",
+                    params![listed, highest - listed + count],
+                )?;
+                conn.execute(
+                    "UPDATE message_read_here SET seq = seq - ?2 WHERE seq > ?1",
+                    params![highest, highest - listed],
+                )?;
+            }
+            listed + count
+        }
+        None => conn
+            .query_row("SELECT MIN(seq) FROM message_read_here", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })?
+            .map_or(0, |lowest| lowest - 1),
+    };
+    let mut seq = top;
+    let mut merged = 0;
+    for mark in lacked {
         let inserted = match held.get(mark) {
             Some((id, name)) => conn.execute(
                 "INSERT OR IGNORE INTO message_read_here (mark, seq, id, name, made_at, merged_at)
@@ -1167,6 +1247,9 @@ pub fn merge_own_list(
             seq -= 1;
             merged += 1;
         }
+    }
+    if listed.is_some() && merged > 0 {
+        set_listed_seq(conn, top)?;
     }
     keep_120_bare(conn)?;
     Ok(merged)
@@ -2599,5 +2682,131 @@ mod tests {
         assert_eq!(count(&conn, "message_read_here"), 120);
         assert_eq!(keep_bare_marks(&conn, &[], expired + month).unwrap(), 120);
         assert_eq!(count(&conn, "message_read_here"), 0);
+    }
+
+    /// The messages of each signer of `signers`, numbers 1 to its count,
+    /// taken and given places at `at`, each then read by the agent of
+    /// `notes` in turn: their marks, the oldest first.
+    fn read_in_turn(conn: &Connection, signers: &[(u8, u64)], at: i64) -> Vec<Mark> {
+        let mut ids: Vec<Id> = Vec::new();
+        for &(signer, count) in signers {
+            for number in 1..=count {
+                taken(conn, signer, number, "m", at);
+                ids.push(id_taken(signer, number, "m"));
+            }
+        }
+        give_places(conn, &[1; 32], at).unwrap();
+        for (k, id) in ids.iter().enumerate() {
+            mark_read(conn, id, "notes", at + 1 + i64::try_from(k).unwrap()).unwrap();
+        }
+        ids.iter().map(|id| read_mark(id, "notes")).collect()
+    }
+
+    /// A restored store's later list goes above what the backup held,
+    /// though every mark of the backup was left bare (decision 2026-10-09
+    /// §2.4, §7.2): the later list was written after them. The backup said
+    /// its 120 marks in a list, and their messages expired; the three marks
+    /// merged are in the table and first in the list, and the bound of 120
+    /// bare hashes drops the backup's oldest three, not them. Where the
+    /// merged mark's message is held, it is listed first too.
+    #[test]
+    fn a_merged_mark_goes_above_the_marks_the_store_held_though_they_went_bare() {
+        let conn = db::open_in_memory().unwrap();
+        let backup = read_in_turn(&conn, &[(7, 60), (8, 60)], 100);
+        wrote_list(&conn).unwrap();
+        let month = i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS;
+        let gone = drop_gone(&conn, 100 + month, &Applied::NotKnown).unwrap();
+        assert_eq!(gone.expired, 120);
+        let later = [[0xb1; 16], [0xb2; 16], [0xb3; 16]];
+        assert_eq!(merge_own_list(&conn, &later, &[], 200 + month).unwrap(), 3);
+        let mut newest = later.to_vec();
+        newest.extend(backup[3..].iter().rev());
+        assert_eq!(marks_to_list(&conn).unwrap(), newest);
+        let held: Vec<Mark> = table(&conn).iter().rev().map(|row| row.0).collect();
+        assert_eq!(held, newest);
+
+        let conn = db::open_in_memory().unwrap();
+        let backup = read_in_turn(&conn, &[(7, 60), (8, 60)], 100);
+        wrote_list(&conn).unwrap();
+        taken(&conn, 9, 1, "m", 100);
+        let x = read_mark(&id_taken(9, 1, "m"), "notes");
+        let names = ["notes".to_string()];
+        assert_eq!(merge_own_list(&conn, &[x], &names, 200).unwrap(), 1);
+        let mut newest = vec![x];
+        newest.extend(backup[1..].iter().rev());
+        assert_eq!(marks_to_list(&conn).unwrap(), newest);
+        assert_eq!(
+            table(&conn).last().map(|row| (row.0, row.2)),
+            Some((x, true))
+        );
+    }
+
+    /// A store of 130 marks of messages it holds, all said in a list,
+    /// merges a later list of 50 marks it lacks: their marks, the 130
+    /// oldest first, and the 50 newest first.
+    fn said_130_and_50_merged(conn: &Connection) -> (Vec<Mark>, Vec<Mark>) {
+        let backup = read_in_turn(conn, &[(7, 60), (8, 60), (9, 10)], 100);
+        wrote_list(conn).unwrap();
+        let later: Vec<Mark> = (1..=50).map(|k| [k; 16]).collect();
+        assert_eq!(merge_own_list(conn, &later, &[], 300).unwrap(), 50);
+        (backup, later)
+    }
+
+    /// A later list merged into a store whose marks were all said goes
+    /// above them, in its own order (decision 2026-10-09 §2.4, §7.2): the
+    /// next list holds its 50 marks and the newest 70 of the 130.
+    #[test]
+    fn a_later_list_merged_into_a_store_that_said_its_marks_is_listed_above_them() {
+        let conn = db::open_in_memory().unwrap();
+        let (backup, later) = said_130_and_50_merged(&conn);
+        let mut newest = later.clone();
+        newest.extend(backup[60..].iter().rev());
+        assert_eq!(marks_to_list(&conn).unwrap(), newest);
+    }
+
+    /// After that restore, the marks made before the first fetch stay the
+    /// newest (decision 2026-10-09 §2.4, §7.2): they are not yet said. Five
+    /// reads, then a later list of 120, the 50 merged before among them,
+    /// last: the next list holds the five, then the newest 115 of the
+    /// later list. The 50 merged first count as said, and go below.
+    #[test]
+    fn the_marks_made_since_the_last_list_stay_above_a_later_list_merged() {
+        let conn = db::open_in_memory().unwrap();
+        let (_, fifty) = said_130_and_50_merged(&conn);
+        let ids: Vec<Id> = (1..=5)
+            .map(|number| id_taken(7, number + 55, "m"))
+            .collect();
+        for (k, id) in ids.iter().enumerate() {
+            mark_read(&conn, id, "work", 400 + i64::try_from(k).unwrap()).unwrap();
+        }
+        let mut later: Vec<Mark> = (51..=120).rev().map(|k| [k; 16]).collect();
+        later.extend(&fifty);
+        assert_eq!(merge_own_list(&conn, &later, &[], 500).unwrap(), 70);
+        let mut newest: Vec<Mark> = ids.iter().rev().map(|id| read_mark(id, "work")).collect();
+        newest.extend(&later[..115]);
+        assert_eq!(marks_to_list(&conn).unwrap(), newest);
+    }
+
+    /// A mark made after a list is above what was listed, though the
+    /// marks listed went from the table (decision 2026-10-09 §7.2): a list
+    /// merged after it goes below it.
+    #[test]
+    fn a_mark_made_after_a_list_is_above_it_though_the_marks_listed_went() {
+        let conn = db::open_in_memory().unwrap();
+        read_in_turn(&conn, &[(7, 2)], 100);
+        wrote_list(&conn).unwrap();
+        let month = i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS;
+        drop_gone(&conn, 100 + month, &Applied::NotKnown).unwrap();
+        assert_eq!(keep_bare_marks(&conn, &[], 100 + 2 * month).unwrap(), 2);
+        let now = 100 + 2 * month;
+        taken(&conn, 7, 3, "m", now);
+        give_places(&conn, &[1; 32], now).unwrap();
+        let id = id_taken(7, 3, "m");
+        mark_read(&conn, &id, "notes", now).unwrap();
+        merge_own_list(&conn, &[[0xb1; 16]], &[], now).unwrap();
+        assert_eq!(
+            marks_to_list(&conn).unwrap(),
+            [read_mark(&id, "notes"), [0xb1; 16]]
+        );
     }
 }

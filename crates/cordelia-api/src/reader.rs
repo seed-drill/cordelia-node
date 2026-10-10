@@ -218,9 +218,11 @@ pub struct Hourly {
 ///
 /// Which channel the device stands applied under is read before the
 /// write: where it cannot be read, no generation goes, and what has
-/// expired still does. An error in the marks' part is logged and takes
-/// back nothing of the drop; an error in clearing is logged, nothing is
-/// counted as cleared; and the checkpoint runs whatever they answered.
+/// expired still does. An error in the drop is logged, nothing is counted
+/// as gone, and the rest still runs; an error in the marks' part is logged
+/// and takes back nothing of the drop; an error in clearing is logged,
+/// nothing is counted as cleared; and the checkpoint runs whatever they
+/// answered.
 pub fn hourly(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -232,12 +234,18 @@ pub fn hourly(
         Ok(None) => held::Applied::Nowhere,
         Err(_) => held::Applied::NotKnown,
     };
-    let gone = in_one(conn, || kept(held::drop_gone(conn, now, &applied)))?;
+    let gone = match in_one(conn, || kept(held::drop_gone(conn, now, &applied))) {
+        Ok(gone) => gone,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not drop this device's expired messages");
+            held::Gone::default()
+        }
+    };
     if let Err(e) = in_one(conn, || crate::marks::hourly(conn, now)) {
         tracing::warn!(error = %e, "could not keep this device's marks");
     }
-    // The checkpoint runs whether or not the marks' part or the clearing
-    // could (§7.1).
+    // The checkpoint runs whether or not the drop, the marks' part or the
+    // clearing could (§7.1).
     let cleared = match crate::sender::clear_expired(conn, identity, now, fetched) {
         Ok(cleared) => cleared,
         Err(e) => {
@@ -1701,6 +1709,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(marks, 1);
+    }
+
+    /// An error in the drop does not keep the rest of the hourly task from
+    /// running (decision 2026-10-09 §7.1): with the index refusing to let
+    /// an expired row go, the hourly task counts nothing gone, still lets a
+    /// bare hash 30 days old go, truncates the log, and answers.
+    #[test]
+    fn an_hourly_task_whose_drop_fails_still_keeps_the_marks_and_runs_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Several::of_one_person(2);
+        let path = dir.path().join("desktop.db");
+        s.machines[1]
+            .conn
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        s.machines[1].conn = cordelia_storage::db::open_as(&path, true).unwrap();
+        let start = s.now;
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &says("old", start))), STORED);
+        held::merge_own_list(&s[1].conn, &[[0xb1; 16]], &[], start).unwrap();
+        s[1].conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER refused BEFORE DELETE ON main.message_index
+                 BEGIN SELECT RAISE(ABORT, 'the drop is refused'); END;",
+            )
+            .unwrap();
+        let later = start + 30 * DAY;
+        let applied = held::Applied::NotKnown;
+        assert!(held::drop_gone(&s[1].conn, later, &applied).is_err());
+        let log = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&log).unwrap().len() > 0);
+
+        let task = hourly(&s[1].conn, &s[1].identity, later, false);
+        assert!(task.is_ok(), "{task:?}");
+        let task = task.unwrap();
+        assert_eq!(task.gone, held::Gone::default());
+        assert!(task.checkpointed);
+        assert_eq!(indexed(&s, 1).len(), 1);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        let marks: i64 = s[1]
+            .conn
+            .query_row("SELECT COUNT(*) FROM message_read_here", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(marks, 0, "the marks' part ran");
     }
 
     /// A number of the new generation held at a message of the old one,
