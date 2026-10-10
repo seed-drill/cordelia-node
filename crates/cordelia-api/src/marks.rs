@@ -39,7 +39,7 @@
 use rusqlite::Connection;
 
 use cordelia_core::CordeliaError;
-use cordelia_core::protocol::REV_BAND_HALF;
+use cordelia_core::protocol::{AGENT_MESSAGE_SENDS_MAX, REV_BAND_HALF};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::Entry;
 use cordelia_crypto::identity::NodeIdentity;
@@ -158,8 +158,13 @@ impl Held {
 
 /// [`write_list`], in the caller's write. With `above`, a relay answered
 /// that it holds another list of the device's at that revision: the list
-/// is written again where the store holds none above it, whatever the
-/// table says.
+/// is written again where that is the revision of the list the store
+/// holds, whatever the table says. **A list's marks go under at most four
+/// revisions** (`AGENT_MESSAGE_SENDS_MAX`, as a message's numbers do): a
+/// relay that answers falsely can make the device write its list again
+/// three times for each list it writes for a mark it lacked, and no more
+/// (`meta::MESSAGES_LIST_AGAIN` counts them, and a list written for a new
+/// mark starts the count again).
 fn list_written(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -177,16 +182,24 @@ fn list_written(
     let held = Held::of(conn, &own)?;
     let marks = kept(held::marks_to_list(conn, now))?;
     let (rev, listed) = held.list.unwrap_or((0, Vec::new()));
+    let again: usize = meta::get(conn, meta::MESSAGES_LIST_AGAIN)?
+        .and_then(|again| again.parse().ok())
+        .unwrap_or(0);
     let due = match above {
-        Some(answered) => rev <= answered,
+        Some(answered) => rev == answered && again + 1 < AGENT_MESSAGE_SENDS_MAX,
         None => marks.iter().any(|mark| !listed.contains(mark)),
     };
     // A list stays in the bottom half of band 0, as the messages do: a
     // holder of the key that wrote one at its top leaves none above it.
-    let next = rev.max(above.unwrap_or(0)) + 1;
+    let next = rev + 1;
     if !due || next >= REV_BAND_HALF {
         return Ok(None);
     }
+    let again = match above {
+        Some(_) => again + 1,
+        None => 0,
+    };
+    meta::set(conn, meta::MESSAGES_LIST_AGAIN, &again.to_string())?;
     let value = ReadMarks { marks }
         .to_value()
         .map_err(|e| PersonError::Held(format!("a list of read marks: {e}")))?;
@@ -822,6 +835,96 @@ mod tests {
         assert_eq!(listed(&s, 1), Some((2, vec![read_mark(&id, "notes")])));
         // Answered so again for the list below the one held: nothing.
         assert_eq!(answer(Pushed::HoldsAnother, true), None);
+    }
+
+    /// A relay that answers another to every list pushed makes the device
+    /// write a list's marks under at most four revisions (decision
+    /// 2026-10-09 §2.4, `AGENT_MESSAGE_SENDS_MAX`, as a message's numbers):
+    /// three lists written again, and no fourth, until a list is written
+    /// for a mark the device lacked, which starts the count again.
+    #[test]
+    fn a_relay_that_answers_falsely_makes_a_list_go_under_at_most_four_revisions() {
+        let mut s = devices(2);
+        let t = s.now;
+        let first = sends(&s, 0, "~", "notes", "first", t);
+        let second = sends(&s, 0, "~", "notes", "second", t);
+        s.pass(0, 1);
+        assert_eq!(reads(&s, 1, "notes", &first, t, true).list, Some(1));
+        let own = crate::at_relays::channels(&s[1].conn, &s[1].identity).unwrap();
+        let channel = own.iter().find(|own| own.kind == Kind::Messages).unwrap();
+        let answer_newest = |s: &Several| {
+            let newest = own_list(s, 1).unwrap().entry;
+            answered(
+                &s[1].conn,
+                &s[1].identity,
+                channel,
+                std::slice::from_ref(&newest),
+                &[Pushed::HoldsAnother],
+                t,
+                true,
+            )
+            .unwrap()
+        };
+        let written: Vec<Option<u64>> = (0..4).map(|_| answer_newest(&s)).collect();
+        assert_eq!(written, [Some(2), Some(3), Some(4), None]);
+        assert_eq!(listed(&s, 1).unwrap().0, 4);
+
+        assert_eq!(reads(&s, 1, "notes", &second, t, true).list, Some(5));
+        let written: Vec<Option<u64>> = (0..4).map(|_| answer_newest(&s)).collect();
+        assert_eq!(written, [Some(6), Some(7), Some(8), None]);
+    }
+
+    /// A list counts only where its signer is the key its slot is named for
+    /// (decision 2026-10-09 §2.2, §2.4, property 3): the store keeps one
+    /// entry for each author in a slot, so another device of the person can
+    /// sign a list in `read/<this device's key>`. This device takes it
+    /// through the door and keeps nothing of it: its table, the lists it
+    /// keeps and what is unread are as they were, and it is counted as no
+    /// message of its signer.
+    #[test]
+    fn a_list_in_this_devices_slot_signed_by_another_key_is_no_list() {
+        let mut s = devices(2);
+        let t = s.now;
+        let id = sends(&s, 1, "~", "notes", "for the laptop", t);
+        s.pass(1, 0);
+        let unread_before = unread_on(&s, 0, "notes", t);
+        assert_eq!(unread_before, ["for the laptop"]);
+        let value = ReadMarks {
+            marks: vec![read_mark(&id, "notes")],
+        }
+        .to_value()
+        .unwrap();
+        let entry = Entry::seal(
+            &messages_secret(&s, 1),
+            &s[1].identity,
+            1,
+            &message::inside(read_name(&s.key(0)).unwrap(), value),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let rows = |s: &Several, table: &str| -> i64 {
+            s[0].conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert!(matches!(
+            take(&s[0].conn, &s[0].identity, &entry, t).unwrap(),
+            Taken::Own { .. }
+        ));
+        assert_eq!(rows(&s, "message_read_here"), 0);
+        assert_eq!(rows(&s, "message_lists"), 0);
+        assert_eq!(unread_on(&s, 0, "notes", t), unread_before);
+        let generation = held::generation_of(
+            &s[0].conn,
+            &derive::channel_id(&messages_secret(&s, 0)).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let signer = held::signer(&s[0].conn, &s.key(1), generation).unwrap();
+        assert_eq!(signer.unwrap().not_messages, 1);
     }
 
     /// After a statement, a device's first list in the new generation is
