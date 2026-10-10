@@ -22,11 +22,12 @@
 //!
 //! [`channels`] is what a pass goes through, for a device that has applied
 //! a statement and has not stopped: the pair channels in which it has
-//! something of its own to send, the personal channel, and the channel of
-//! each name it holds. [`listed`] is the channels of the names that the
-//! personal channel lists and that the device does not hold: it proves
-//! those once a day, so that a name whose only device is gone is not
-//! dropped while any device of the person's is on.
+//! something of its own to send, the personal channel, the channel of
+//! each name it holds, and last, where sync is on, the messages channel
+//! (decision 2026-10-09 §2.1). [`listed`] is the channels of the names
+//! that the personal channel lists and that the device does not hold: it
+//! proves those once a day, so that a name whose only device is gone is
+//! not dropped while any device of the person's is on.
 //!
 //! ## Pulling (§16)
 //!
@@ -221,6 +222,10 @@ pub enum Kind {
     Personal,
     /// The channel of this name, in the generation it has applied.
     Name(String),
+    /// The messages channel of the generation it has applied (decision
+    /// 2026-10-09 §2.1): a channel of its own in every rule of decision
+    /// 2026-10-04, last in a pass, and in none where sync is off.
+    Messages,
 }
 
 /// A channel of a device's own, as a pass goes through it.
@@ -262,8 +267,16 @@ impl Own {
 
 /// The channels that a pass goes through, in its order: the pair channels
 /// in which this device has something of its own, since a hand-over goes
-/// ahead of everything (decision 2026-10-04 §6); the personal channel; and
-/// the channel of each name it holds, in order of name.
+/// ahead of everything (decision 2026-10-04 §6); the personal channel; the
+/// channel of each name it holds, in order of name; and the messages
+/// channel.
+///
+/// **The messages channel is last** (decision 2026-10-09 §2.1, C14): a
+/// device that is added pulls its memory before its messages, and a relay
+/// short of room drops messages before every name it held when the
+/// generation began. **It is in the list only where sync is on** (C12):
+/// where the node's settings hold no Claude Code directory, nothing of it
+/// is proved, pulled or pushed.
 ///
 /// None for a device that follows no phrase, has stopped, or is in a
 /// fork: it neither sends in a channel of its own nor takes from one.
@@ -286,20 +299,47 @@ pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, 
             secret: Some(secret),
         });
     }
+    let messages = derive::messages_secret(&standing.secret)?;
+    let messages = Own {
+        kind: Kind::Messages,
+        id: derive::channel_id(&messages)?,
+        secret: Some(messages),
+    };
     // Whatever else this device wrote in is a pair channel: its store
     // holds nothing of its own but in its own channels, and where it
-    // handed a device what it needs.
+    // handed a device what it needs. The messages channel is never one,
+    // with sync off as with it on.
     let mut pairs: Vec<Own> = kept_rows::channels_written_by(conn, &identity.public_key())?
         .into_iter()
-        .filter(|id| !own.iter().any(|channel| channel.id == *id))
+        .filter(|id| *id != messages.id && !own.iter().any(|channel| channel.id == *id))
         .map(|id| Own {
             kind: Kind::Pair,
             id,
             secret: None,
         })
         .collect();
+    if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_some() {
+        own.push(messages);
+    }
     pairs.append(&mut own);
     Ok(pairs)
+}
+
+/// Whether the messages channel among `own`, as [`channels`] gives them,
+/// has no place among the proofs of one connection, where a relay
+/// remembers the proofs of `most` channels for one (decision 2026-10-09
+/// §2.1): the channels that are proved, up to it and with it, are more
+/// than that. It is last, so it is the one that is not proved, and the
+/// device has no messages. Its memory comes first. A pair channel is not
+/// proved, and takes no place.
+///
+/// No for a list that has no messages channel: sync is off, or the device
+/// stands nowhere.
+pub fn no_place(own: &[Own], most: usize) -> bool {
+    let Some(at) = own.iter().position(|own| own.kind == Kind::Messages) else {
+        return false;
+    };
+    own[..=at].iter().filter(|own| own.is_pulled()).count() > most
 }
 
 /// The channels of the names that the personal channel lists and that
@@ -574,7 +614,9 @@ pub fn carried_waits_at(
         let from = match channel.kind {
             Kind::Personal => kept.sent_to,
             Kind::Name(_) => kept.carried_to,
-            Kind::Pair => continue,
+            // Nothing is carried into the messages channel (decision
+            // 2026-10-09 §9.1).
+            Kind::Pair | Kind::Messages => continue,
         };
         let next = entries::channel_entries_after(conn, &channel.id, from, 1)?;
         if next.first().is_some_and(|held| held.seq <= carried_up_to) {
@@ -768,7 +810,7 @@ fn sent_from(
 ) -> Result<i64, PersonError> {
     Ok(match channel.kind {
         Kind::Name(_) => kept.sent_to.max(kept_rows::carried_up_to(conn)?),
-        Kind::Pair | Kind::Personal => kept.sent_to,
+        Kind::Pair | Kind::Personal | Kind::Messages => kept.sent_to,
     })
 }
 
@@ -1469,6 +1511,111 @@ mod tests {
         let printed = format!("{own:?}");
         assert!(!printed.contains(&hex::encode(on.personal())));
         assert!(!printed.contains(&hex::encode(on.own("notes"))));
+    }
+
+    /// The messages channel is the last channel of a pass, after every
+    /// name, and after a pair channel too (decision 2026-10-09 §2.1, C14).
+    /// It is in the list only where sync is on (C12). It is proved with
+    /// its own key and pulled, as the personal channel is.
+    #[test]
+    fn test_the_messages_channel_is_last_in_the_pass() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        s.hold(&[0], "notes");
+        s.hold(&[0], "a team");
+        let names = [
+            Kind::Personal,
+            Kind::Name("a team".into()),
+            Kind::Name("notes".into()),
+        ];
+        // Sync is off: there is no messages channel.
+        assert_eq!(kinds_of(&s[0]), names);
+
+        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        let mut with = names.to_vec();
+        with.push(Kind::Messages);
+        assert_eq!(kinds_of(&s[0]), with);
+        let on = &s[0];
+        let own = channels(&on.conn, &on.identity).unwrap();
+        let messages = derive::messages_secret(&on.secret()).unwrap();
+        assert_eq!(own[3].id, derive::channel_id(&messages).unwrap());
+        assert!(own[3].is_pulled());
+        let (session, prover) = ([0x51; 32], on.key());
+        let made = own[3].proof(&session, &prover).unwrap();
+        assert!(proof::check(&own[3].id, &session, &prover, &made));
+        // Neither the personal channel's nor a name's.
+        assert!(own[..3].iter().all(|channel| channel.id != own[3].id));
+
+        // A name held later, and a pair channel: it is still last.
+        s.hold(&[0], "z");
+        s.hand(0, 1);
+        let kinds = kinds_of(&s[0]);
+        assert_eq!(kinds.first(), Some(&Kind::Pair));
+        assert_eq!(
+            kinds[kinds.len() - 2..],
+            [Kind::Name("z".into()), Kind::Messages]
+        );
+
+        // Sync off again: it is gone from the pass, and an entry of the
+        // device's own in it does not make it a pair channel.
+        let on = &s[0];
+        let name = cordelia_crypto::message::message_name(&on.key(), 1).unwrap();
+        let value = Value::Other(cordelia_crypto::message::clearing_value());
+        let entry = entry_by(&on.identity, &messages, 2, &name, value, &[]);
+        entries::store(&on.conn, &entry, s.now).unwrap();
+        assert_eq!(kinds_of(&s[0]).last(), Some(&Kind::Messages));
+        meta::remove(&s[0].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        let own = channels(&s[0].conn, &s[0].identity).unwrap();
+        assert!(own.iter().all(|channel| channel.id != entry.channel));
+        assert_eq!(own.len(), 5);
+    }
+
+    /// The kinds of the channels that a pass on `on` goes through, in
+    /// their order.
+    fn kinds_of(on: &Machine) -> Vec<Kind> {
+        let own = channels(&on.conn, &on.identity).unwrap();
+        own.iter().map(|own| own.kind.clone()).collect()
+    }
+
+    /// Past the limit on proofs the messages channel has no place
+    /// (decision 2026-10-09 §2.1): with 1,024 channels that are proved
+    /// before it, it would be the 1,025th, and is not proved. With 1,023
+    /// it has its place. A pair channel is not proved, and takes none. A
+    /// list with no messages channel has nothing that wants a place.
+    #[test]
+    fn test_past_the_limit_on_proofs_the_messages_channel_has_no_place() {
+        use cordelia_core::protocol::MAX_CHANNELS_PROVED_ON_A_CONNECTION as MOST;
+        let channel = |kind: Kind, n: usize, proved: bool| Own {
+            kind,
+            id: [n as u8; 32],
+            secret: proved.then_some([n as u8; 32]),
+        };
+        let with = |before: usize, pairs: usize| -> Vec<Own> {
+            let pairs = (0..pairs).map(|n| channel(Kind::Pair, n, false));
+            let names = (0..before).map(|n| channel(Kind::Name(n.to_string()), n, true));
+            let mut own: Vec<Own> = pairs.chain(names).collect();
+            own.push(channel(Kind::Messages, 0, true));
+            own
+        };
+        assert!(no_place(&with(MOST, 0), MOST));
+        assert!(!no_place(&with(MOST - 1, 0), MOST));
+        assert!(!no_place(&with(MOST - 1, 2), MOST));
+        assert!(no_place(&with(2, 0), 2));
+        assert!(!no_place(&with(1, 0), 2));
+        // No messages channel.
+        let mut without = with(MOST + 1, 0);
+        without.pop();
+        assert!(!no_place(&without, MOST));
+
+        // As a device's own channels give it.
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        s.hold(&[0], "notes");
+        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        let own = channels(&s[0].conn, &s[0].identity).unwrap();
+        assert_eq!(own.len(), 3);
+        assert!(!no_place(&own, 3));
+        assert!(no_place(&own, 2));
     }
 
     /// A device proves, once a day, the channel of every name that its

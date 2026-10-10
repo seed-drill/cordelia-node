@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use cordelia_crypto::identity::NodeIdentity;
@@ -189,7 +189,12 @@ impl HeldUp {
 /// channel since the node started ([`OwnChannels::fetched_from`]): a
 /// folder with no record in a channel yet waits for that before its
 /// first cycle there ([`OwnChannels::first_fetch_done`], decision
-/// 2026-10-04 §6).
+/// 2026-10-04 §6). So too of the messages channel, before which a device
+/// writes nothing there after it starts (decision 2026-10-09 §2.3).
+///
+/// And it carries whether the messages channel has no place among the
+/// proofs of a connection ([`OwnChannels::no_place`], decision 2026-10-09
+/// §2.1): the device then has no messages.
 ///
 /// And it carries since when each relay has been connected, and since
 /// when none has, by the node's own clock ([`OwnChannels::
@@ -218,9 +223,13 @@ pub struct OwnChannels {
     /// The number of the last whole pass that ended before it had read
     /// every channel to its end at every relay it reached.
     short: AtomicU64,
-    /// For each channel of a name, by its ID: the relays that have handed
-    /// the whole of it, and when the first of them had.
+    /// For each channel of a name, and the messages channel, by its ID:
+    /// the relays that have handed the whole of it, and when the first of
+    /// them had.
     fetched: Mutex<std::collections::HashMap<[u8; 32], FirstFetch>>,
+    /// Whether the messages channel had no place among the proofs of a
+    /// connection, as the node last said.
+    no_place: AtomicBool,
     /// Since when each relay has been connected, and since when none has.
     connected: Mutex<Connected>,
     /// What was asked through the door for a carry, and is not taken up
@@ -612,6 +621,20 @@ impl OwnChannels {
             .relays_set_up()
             .is_some_and(|set_up| of.from.len() >= set_up);
         from_each || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
+    }
+
+    /// The node says whether the messages channel has no place among the
+    /// proofs of one connection (decision 2026-10-09 §2.1): it would be
+    /// proved past what a relay remembers for one, and is not proved.
+    pub fn say_no_place(&self, no_place: bool) {
+        self.no_place.store(no_place, Ordering::SeqCst);
+    }
+
+    /// Whether the device has no messages because the messages channel
+    /// has no place among the proofs of a connection, as the node last
+    /// said ([`Self::say_no_place`]). No before it has said.
+    pub fn no_place(&self) -> bool {
+        self.no_place.load(Ordering::SeqCst)
     }
 
     /// Keep nothing of which relays have handed the channel whose ID is

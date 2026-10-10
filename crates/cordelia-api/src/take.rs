@@ -4,11 +4,13 @@
 //! another device, goes through. It is given an entry that passed the
 //! check which needs no key, and decides by the entry's channel:
 //!
-//! - **The personal channel, or the channel of a name this device holds,
-//!   in the generation it has applied.** The entry is stored only if its
-//!   signer counts (§4.4), and by the store's own rule. A record of an
-//!   addition in the personal channel is also taken as a record
-//!   ([`crate::person::see_addition`]).
+//! - **The personal channel, the channel of a name this device holds, or
+//!   the messages channel, in the generation it has applied.** The entry
+//!   is stored only if its signer counts (§4.4), and by the store's own
+//!   rule. A record of an addition in the personal channel is also taken
+//!   as a record ([`crate::person::see_addition`]). What an entry of the
+//!   messages channel holds is not read here: it is stored as an entry of
+//!   any channel of the person's own is (decision 2026-10-09 §2.1).
 //! - **The phrase's channel.** The entry is shown to the device as a
 //!   change entry ([`crate::person::shown`]).
 //! - **A channel of a generation it has left, or any other channel.** The
@@ -196,9 +198,16 @@ fn taken_as_its_own(
     }
 
     let statement = &held.statement.statement;
-    let personal = derive::personal_secret(&applied_secret(conn, statement)?)?;
+    let secret = applied_secret(conn, statement)?;
+    let personal = derive::personal_secret(&secret)?;
     let is_personal = entry.channel == derive::channel_id(&personal)?;
-    if !is_personal && held_rows::name_of_channel(conn, &entry.channel)?.is_none() {
+    // The messages channel is a channel of the person's own, beside the
+    // personal channel and the channels of names (decision 2026-10-09
+    // §2.1): so it is refused where the device does not stand applied,
+    // from a signer that does not count, and in a band above the
+    // statement's, as they are.
+    let is_messages = entry.channel == derive::channel_id(&derive::messages_secret(&secret)?)?;
+    if !is_personal && !is_messages && held_rows::name_of_channel(conn, &entry.channel)?.is_none() {
         return Ok(None);
     }
     if held.state != State::Applied {
@@ -254,7 +263,8 @@ fn not_its_own(conn: &Connection, entry: &CheckedEntry) -> Result<NotTaken, Pers
 
 /// Whether `entry` is of a channel of a generation that this device has
 /// left and still holds the secret of: that generation's personal
-/// channel, or its channel of a name the device holds.
+/// channel, its messages channel, or its channel of a name the device
+/// holds.
 fn is_of_a_generation_left(conn: &Connection, entry: &CheckedEntry) -> Result<bool, PersonError> {
     let names = held_rows::names(conn)?;
     for left in held_rows::secrets(conn)? {
@@ -262,8 +272,11 @@ fn is_of_a_generation_left(conn: &Connection, entry: &CheckedEntry) -> Result<bo
             continue;
         }
         let personal = derive::personal_secret(&left.secret)?;
-        if derive::channel_id(&personal)? == entry.channel {
-            return Ok(true);
+        let messages = derive::messages_secret(&left.secret)?;
+        for secret in [personal, messages] {
+            if derive::channel_id(&secret)? == entry.channel {
+                return Ok(true);
+            }
         }
         for name in &names {
             let own = derive::own_secret(&left.secret, &name.name)?;
@@ -942,6 +955,64 @@ mod tests {
             given(&s, 1, &by(&old.1, "a.md")),
             Taken::Refused(NotTaken::AnotherChannel)
         );
+    }
+
+    /// The messages channel is a channel of the person's own (decision
+    /// 2026-10-09 §2.1): an entry of it in the generation applied is
+    /// stored where its signer counts, whatever it holds and whether or
+    /// not sync is on. It is refused from a signer that does not count, in
+    /// a band above the statement's, on a device that has stopped, and in
+    /// a generation that was left.
+    #[test]
+    fn test_the_door_takes_the_messages_channel_as_a_channel_of_the_persons_own() {
+        let mut s = two();
+        let number = s[1].number();
+        let messages = |on: &Machine| derive::messages_secret(&on.secret()).unwrap();
+        let old = messages(&s[1]);
+        // Message 1 of `author`, in its slot, at revision 2: the door does
+        // not read what it holds.
+        let message = |author: &NodeIdentity, channel: &[u8; 32], rev: u64| {
+            let name = cordelia_crypto::message::message_name(&author.public_key(), 1).unwrap();
+            let value = Value::Other(cordelia_crypto::message::clearing_value());
+            entry_by(author, channel, rev, &name, value, &[])
+        };
+
+        let first = message(&s[0].identity, &old, 2);
+        assert_eq!(given(&s, 1, &first), STORED);
+        assert_eq!(s[1].stored_in(&old), std::slice::from_ref(&first));
+
+        let before = s[1].everything();
+        let stranger = Machine::new(9);
+        assert_eq!(
+            given(&s, 1, &message(&stranger.identity, &old, 2)),
+            Taken::Refused(NotTaken::SignerDoesNotCount)
+        );
+        assert_eq!(
+            given(&s, 1, &message(&s[0].identity, &old, at(number + 1, 4))),
+            Taken::Refused(NotTaken::BandAboveTheStatements)
+        );
+        held_rows::set_state(&s[1].conn, State::Removed).unwrap();
+        assert_eq!(
+            given(&s, 1, &message(&s[0].identity, &old, 4)),
+            Taken::Refused(NotTaken::Stopped(State::Removed))
+        );
+        held_rows::set_state(&s[1].conn, State::Applied).unwrap();
+        assert_eq!(s[1].everything(), before);
+
+        // A statement: the messages channel of the generation left is
+        // refused as an old channel, and the new one is taken.
+        let change = s.change(0, &[0, 1], &[]);
+        assert!(matches!(
+            given(&s, 1, &change),
+            Taken::Shown(Shown::Applied(_))
+        ));
+        let new = messages(&s[1]);
+        assert_ne!(new, old);
+        assert_eq!(
+            given(&s, 1, &message(&s[0].identity, &old, 4)),
+            Taken::Refused(NotTaken::OldChannel)
+        );
+        assert_eq!(given(&s, 1, &message(&s[0].identity, &new, 2)), STORED);
     }
 
     /// A device that has stopped takes nothing in its own channels: it
