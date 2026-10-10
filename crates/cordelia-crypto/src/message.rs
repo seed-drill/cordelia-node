@@ -176,6 +176,9 @@ impl Message {
         if self.link.as_deref() == Some("") {
             return Err(NotAMessage::Link);
         }
+        // Each length first, so that none is written that its own field
+        // cannot count: a length that wrapped would read back as another
+        // message.
         if self.from.len() > AGENT_MESSAGE_NAME_MAX_BYTES
             || to.len() > AGENT_MESSAGE_NAME_MAX_BYTES
             || link.len() > AGENT_MESSAGE_LINK_MAX_BYTES
@@ -809,6 +812,43 @@ mod tests {
             };
             assert_eq!(read, Ok(()));
         }
+        // The clearing is the byte of its form, 0, and the fill.
+        assert!(clearing_value().iter().all(|byte| *byte == 0));
+    }
+
+    /// A field longer than its length can count is refused before it is
+    /// written: written, its length would wrap, and the value would read
+    /// back as another message, here one from `a`, to every name, that
+    /// says `z`.
+    #[test]
+    fn the_sender_writes_no_value_that_reads_back_as_another_message() {
+        let wrapped = |head: &str, at: usize| format!("{head}{}", "\0".repeat(at - head.len()));
+        // A from of 65,537 bytes counts as 1: `a`, then every name, no
+        // link, and a body of one byte.
+        let from = Message {
+            from: wrapped("a\u{2}\0\0\0\0\u{1}z", 65_537),
+            ..smallest()
+        };
+        assert_eq!(from.to_value(names), Err(NotAMessage::Field));
+        // A to of 65,537 counts as 1: `t`, no link, and a body `z`.
+        let to = Message {
+            to: To::Name(wrapped("t\0\0\u{1}z", 65_537)),
+            ..smallest()
+        };
+        assert_eq!(to.to_value(names), Err(NotAMessage::Field));
+        // A link of 2,053 counts as 5: `o/r#1`, and a body `z`; the rest
+        // is past the value's end.
+        let link = Message {
+            link: Some(wrapped("o/r#1\0\u{1}z", 2_053)),
+            ..smallest()
+        };
+        assert_eq!(link.to_value(names), Err(NotAMessage::Field));
+        // A body of 65,537 counts as 1: `z`.
+        let body = Message {
+            body: wrapped("z", 65_537),
+            ..smallest()
+        };
+        assert_eq!(body.to_value(names), Err(NotAMessage::BodyTooLong(65_537)));
     }
 
     /// What a relay sees of a message and of its clearing: the same
