@@ -837,7 +837,9 @@ impl Leave {
     ///   applied a statement and reads what it left.
     /// - **A channel of the device's own is refused,** as the database
     ///   says which those are, under its lock: there is one way in to
-    ///   those.
+    ///   those. So is the messages channel of the generation it stands
+    ///   applied under, whether or not sync is on (decision 2026-10-09
+    ///   §2.1).
     /// - The two requests are built here, and each counts against what
     ///   the device asks of a relay in a minute. Nothing is pushed.
     /// - Of what comes back, the entries of that channel that pass the
@@ -854,9 +856,13 @@ impl Leave {
         prove: bool,
     ) -> Result<LeftPage, LeftRefused> {
         let not = |why: &str| LeftRefused::NotAnswered(why.to_string());
-        let own = at_relays::channels(&lock(&state.db), &state.identity)
-            .map_err(|e| not(&format!("could not read the device's own channels: {e}")))?;
-        if own.iter().any(|own| own.id == *channel) {
+        let (own, messages) = {
+            let db = lock(&state.db);
+            let own = at_relays::channels(&db, &state.identity);
+            own.and_then(|own| Ok((own, at_relays::messages_channel(&db)?)))
+        }
+        .map_err(|e| not(&format!("could not read the device's own channels: {e}")))?;
+        if own.iter().any(|own| own.id == *channel) || messages == Some(*channel) {
             return Err(LeftRefused::OwnChannel);
         }
         let asks = |refused: Refused| match refused {

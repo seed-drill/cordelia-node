@@ -30,7 +30,11 @@
 //!   and **pushes** what that relay has not been sent, and then what it
 //!   carried into the channel of a name, by the rule of §7.3. Once a day
 //!   it proves the channel of every name that its personal channel lists
-//!   and that it does not hold (§2.5).
+//!   and that it does not hold (§2.5). The messages channel, where sync
+//!   is on, is the last of its own, makes a pass short only where the
+//!   device came to keep another change entry, and is passed over where
+//!   the connection has no room for its proof (decision 2026-10-09
+//!   §2.1).
 //! - **The pass that sends**, as often as the node sends what waits, and
 //!   when something is written: it pushes what each relay has not been
 //!   sent, and nothing else.
@@ -398,6 +402,7 @@ impl DeviceEntries {
             }
         }
         let read_all = self.pass_at(relays, &links, kind).await;
+        self.say_no_place(&links);
         let mut taken = false;
         while let Some(done) = asking.join_next().await {
             taken |= done.unwrap_or(false);
@@ -1391,6 +1396,21 @@ impl DeviceEntries {
     /// end here: not where it ended early, not where a pull stopped
     /// short of the end of what the relay holds, and not where a channel
     /// was passed by because its proof was not sent or not answered.
+    ///
+    /// **The messages channel never makes a pass short** (decision
+    /// 2026-10-09 §2.1, D13): a proof of it that was not sent or not
+    /// answered, a pull of it that did not reach its end, and a relay that
+    /// stopped answering there, leave the pass as it was. A filled
+    /// messages channel never makes a change warn or wait. It is last, so
+    /// nothing of the device's own follows it. But where the pass stops
+    /// there because the device came to keep another change entry, the
+    /// channels of that generation were not read here, and the pass is
+    /// short.
+    ///
+    /// **Past the limit on proofs the messages channel is passed over**
+    /// in either kind of pass: nothing of it is proved, pulled or pushed
+    /// where `prove` finds no room for it on the connection, and that is
+    /// what the device says as the pass ends ([`Self::say_no_place`]).
     async fn relay_pass(&self, link: &Link, kind: Pass) -> bool {
         let read = {
             let db = lock(&self.state.db);
@@ -1409,6 +1429,17 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         let mut read_all = true;
         for channel in &own {
+            let messages = channel.kind == Kind::Messages;
+            // What a pass that stops at this channel says, where the
+            // device still keeps the change entry it began under.
+            let stopped = messages && read_all;
+            // Past the limit on proofs the messages channel is not proved,
+            // and nothing of it is pulled or pushed: the device has no
+            // messages (decision 2026-10-09 §2.1). Its memory comes first.
+            // Its place is what `prove` would find here and now.
+            if messages && !self.has_room(link, &channel.id) {
+                continue;
+            }
             let mut read_to_its_end = false;
             if whole && channel.is_pulled() {
                 match self.prove(&at, channel, true).await {
@@ -1416,20 +1447,22 @@ impl DeviceEntries {
                     // The proof was not sent, or not answered: the
                     // channel is passed by, and the pass has not read it.
                     Step::Done(false) => {
-                        read_all = false;
+                        read_all &= messages;
                         continue;
                     }
-                    Step::Stop => return false,
+                    Step::Stop => return self.stopped(&at, stopped),
                 }
                 match self.pull(&at, channel).await {
                     Step::Done(caught_up) => read_to_its_end = caught_up,
-                    Step::Stop => return false,
+                    Step::Stop => return self.stopped(&at, stopped),
                 }
-                read_all &= read_to_its_end;
+                read_all &= read_to_its_end || messages;
                 // The relay has handed the whole of a name's channel: a
                 // folder with no record there yet waits for that before
-                // its first cycle (decision 2026-10-04 §6).
-                if read_to_its_end && matches!(channel.kind, Kind::Name(_)) {
+                // its first cycle (decision 2026-10-04 §6). And the whole
+                // of the messages channel: a device writes nothing there
+                // before that, after it starts (decision 2026-10-09 §2.3).
+                if read_to_its_end && matches!(channel.kind, Kind::Name(_) | Kind::Messages) {
                     let now = self.clock.now();
                     self.state
                         .own_channels
@@ -1438,7 +1471,7 @@ impl DeviceEntries {
             }
             let sent = match self.push(&at, channel, Which::Since).await {
                 Step::Done(sent) => sent,
-                Step::Stop => return false,
+                Step::Stop => return self.stopped(&at, stopped),
             };
             // What was carried into a name goes after the channel was
             // fetched from the relay, and after what came since (§7.3).
@@ -1454,6 +1487,33 @@ impl DeviceEntries {
             self.prove_listed(&at, own.len()).await;
         }
         read_all
+    }
+
+    /// What a relay's pass that stopped says, where it would say `whole`
+    /// had the device kept the change entry it began under: where it
+    /// keeps another now, the channels of that generation were not read
+    /// at this relay, and the pass is short.
+    fn stopped(&self, at: &At<'_>, whole: bool) -> bool {
+        whole
+            && matches!(at_relays::kept_id(&lock(&self.state.db)), Ok(Some(kept)) if kept == at.under)
+    }
+
+    /// Say, as every pass ends, whether the messages channel has no place
+    /// among the proofs of a connection (decision 2026-10-09 §2.1): of
+    /// one of `links`, those that are open, by the room that `prove`
+    /// finds there ([`Self::has_room`]), which a pass also passes the
+    /// channel over by. No where no relay is connected, and where the
+    /// device has no messages channel: sync is off, or it does not stand
+    /// applied.
+    fn say_no_place(&self, links: &[&Link]) {
+        let own = at_relays::channels(&lock(&self.state.db), &self.state.identity);
+        let messages = own.ok().and_then(|own| {
+            let messages = own.into_iter().find(|own| own.kind == Kind::Messages);
+            messages.map(|messages| messages.id)
+        });
+        let no_place = messages
+            .is_some_and(|messages| links.iter().any(|link| !self.has_room(link, &messages)));
+        self.state.own_channels.say_no_place(no_place);
     }
 
     /// Ask `request` on a stream for a channel of the device's own, at
@@ -1510,14 +1570,9 @@ impl DeviceEntries {
             if lately {
                 return Step::Done(true);
             }
-            // A relay remembers so many channels for a connection, and
-            // looks at no proof beyond them.
-            let room = proved.is_none_or(|proved| {
-                proved.contains_key(&channel.id) || proved.len() < self.most_proved
-            });
-            if !room {
-                return Step::Done(false);
-            }
+        }
+        if !self.has_room(link, &channel.id) {
+            return Step::Done(false);
         }
         let own_key = self.state.identity.public_key();
         let Some(proof) = link
@@ -1563,6 +1618,16 @@ impl DeviceEntries {
             Ok(None) => Step::Done(false),
             Err(_) => Step::Stop,
         }
+    }
+
+    /// Whether the connection at `link` has room for the proof of
+    /// `channel`: a relay remembers so many channels for a connection,
+    /// and looks at no proof beyond them. One that was proved there has
+    /// its place.
+    fn has_room(&self, link: &Link, channel: &[u8; 32]) -> bool {
+        let kept = lock(&self.kept);
+        let proved = kept.links.get(&link.id()).map(|of| &of.proved);
+        proved.is_none_or(|proved| proved.contains_key(channel) || proved.len() < self.most_proved)
     }
 
     /// Once a day on a connection, prove the channel of every name that
@@ -1787,7 +1852,11 @@ impl DeviceEntries {
                     "a relay refused entries as not signed as they must be; they are not sent there again"
                 );
             }
-            if done.another > 0 {
+            // A relay's answer of another form to an entry of the messages
+            // channel is not said where a status reads (decision
+            // 2026-10-09 §8, F7): what is written there again goes under
+            // another revision.
+            if done.another > 0 && channel.kind != Kind::Messages {
                 tracing::warn!(
                     relay = link.name(),
                     entries = done.another,
@@ -1800,7 +1869,12 @@ impl DeviceEntries {
             }
             let stopped = done.refused.is_some();
             if stopped || done.no_room > 0 {
-                self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                // A relay with no room for the messages channel sets no
+                // hold, and changes no status's line (decision 2026-10-09
+                // §8): what it refused still waits, and is sent again.
+                if channel.kind != Kind::Messages {
+                    self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                }
                 // The wait begins, or doubles, once for what was offered:
                 // and not for what is refused while it lasts.
                 if again || stopped {

@@ -36,6 +36,7 @@ use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::message;
 use cordelia_crypto::phrase::Phrase;
 use cordelia_crypto::statement::Device as Listed;
 use cordelia_network::messages::{
@@ -48,7 +49,7 @@ use cordelia_node::device_entries::{
 };
 use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::person::State;
-use cordelia_storage::{at_relays as kept_rows, entries, person as held_rows};
+use cordelia_storage::{at_relays as kept_rows, entries, meta, person as held_rows};
 
 use common::*;
 
@@ -359,6 +360,15 @@ impl Device {
     /// A change is made on this device, with the phrase: `stay` stay, and
     /// `removed` are removed. It applies it. Returns the change entry.
     fn changes(&self, phrase: &Phrase, stay: &[&Device], removed: &[&Device]) -> CheckedEntry {
+        let entry = self.makes_change(phrase, stay, removed);
+        let outcome = shown(&self.db(), &self.state.identity, &entry, self.now()).unwrap();
+        assert!(matches!(outcome, Shown::Applied(_)), "{outcome:?}");
+        entry
+    }
+
+    /// [`Self::changes`], but the change is not applied: the change entry
+    /// is returned, for whatever shows it to the device later.
+    fn makes_change(&self, phrase: &Phrase, stay: &[&Device], removed: &[&Device]) -> CheckedEntry {
         let db = self.db();
         let applied = held(&db).unwrap().unwrap().statement;
         let latest = at_relays::to_show(&db).unwrap().unwrap().entry;
@@ -367,10 +377,7 @@ impl Device {
             .map(|device| Listed::new(device.key(), device.label).unwrap())
             .collect();
         let removed: Vec<[u8; 32]> = removed.iter().map(|device| device.key()).collect();
-        let entry = make_change(phrase, &applied, &latest, &self.key(), stay, &removed).unwrap();
-        let outcome = shown(&db, &self.state.identity, &entry, self.now()).unwrap();
-        assert!(matches!(outcome, Shown::Applied(_)), "{outcome:?}");
-        entry
+        make_change(phrase, &applied, &latest, &self.key(), stay, &removed).unwrap()
     }
 
     /// The person secret of the statement it has applied.
@@ -399,6 +406,53 @@ impl Device {
     /// The ID of the channel of `name` in the generation applied.
     fn channel(&self, name: &str) -> [u8; 32] {
         derive::channel_id(&self.name_secret(name)).unwrap()
+    }
+
+    /// Sync is on here, or off: the node's settings hold a Claude Code
+    /// directory, or none. Where it is on, the device has the messages
+    /// channel (decision 2026-10-09 §2.1).
+    fn syncs(&self, on: bool) {
+        let db = self.db();
+        match on {
+            true => meta::set(&db, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap(),
+            false => meta::remove(&db, meta::SYNC_CLAUDE_DIR).unwrap(),
+        }
+    }
+
+    /// The secret of the messages channel in the generation applied.
+    fn messages_secret(&self) -> [u8; 32] {
+        derive::messages_secret(&self.secret()).unwrap()
+    }
+
+    /// The ID of the messages channel in the generation applied.
+    fn messages(&self) -> [u8; 32] {
+        derive::channel_id(&self.messages_secret()).unwrap()
+    }
+
+    /// The device writes its message numbered `number`, to `to`, in the
+    /// slot of its own that the number names, at the number's revision:
+    /// an entry of the messages channel, through its store, as a sender
+    /// will write it (decision 2026-10-09 §2.2, §2.3).
+    fn writes_message(&self, number: u64, to: &str, body: &str) -> CheckedEntry {
+        let said = message::Message {
+            asks: false,
+            sent: self.now() as u64,
+            nonce: [number as u8; 16],
+            thread: [0; 16],
+            answers: [0; 16],
+            from: "github.com/owner/repo".into(),
+            to: message::To::Name(to.into()),
+            link: None,
+            body: body.into(),
+        };
+        let value = said.to_value(|_| true).unwrap();
+        let name = message::message_name(&self.key(), number).unwrap();
+        let rev = message::message_rev(number).unwrap();
+        let inside = message::inside(name, value);
+        let entry = Entry::seal(&self.messages_secret(), &self.state.identity, rev, &inside);
+        let entry = entry.unwrap().check().unwrap();
+        entries::store(&self.db(), &entry, self.now()).unwrap();
+        entry
     }
 
     /// What its store holds of `channel`, each by what it is named by.
@@ -498,7 +552,8 @@ enum Say {
 /// answered: for a show, `Some` is what this one is answered with, in the
 /// place of what the script says. For a push, `Some` that is no answer
 /// has the stand-in take the push and answer nothing: it resets the
-/// stream, or keeps it open.
+/// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
+/// answer nothing, and keep the stream open.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -619,6 +674,7 @@ impl StandIn {
                         Say::Nothing => Err(()),
                     }
                 }
+                WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
                 WireMessage::ChannelProve(_) => {
                     Ok(Some(WireMessage::ChannelProved(ChannelProved {
                         proved: script.proves,
@@ -5238,4 +5294,575 @@ async fn a_device_that_is_held_up_makes_no_pass() {
     device.passes().await;
     assert!(!relay.requests().is_empty());
     assert_eq!(device.state.own_channels.whole_passes(), (1, 1));
+}
+
+// ── The messages channel (decision 2026-10-09 §2.1, §8) ──────────────
+
+/// The channels that each of `requests` is of: a proof's, a pull's, and
+/// those of the entries of a push.
+fn of_channels(requests: &[WireMessage]) -> Vec<[u8; 32]> {
+    requests
+        .iter()
+        .flat_map(|request| match request {
+            WireMessage::ChannelProve(prove) => vec![prove.channel],
+            WireMessage::EntryPull(pull) => vec![pull.channel],
+            WireMessage::EntryPush(push) => push
+                .entries
+                .iter()
+                .map(|entry| Entry::from_wire(entry).unwrap().channel)
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// What a stand-in saw of the channel `channel` since it was last asked:
+/// how many proofs, pulls and entries pushed.
+fn asked_of(relay: &StandIn, channel: &[u8; 32]) -> (usize, usize, usize) {
+    let mut asked = (0, 0, 0);
+    for request in relay.requests() {
+        let of = of_channels(std::slice::from_ref(&request));
+        let here = of.iter().filter(|one| *one == channel).count();
+        match request {
+            WireMessage::ChannelProve(_) => asked.0 += here,
+            WireMessage::EntryPull(_) => asked.1 += here,
+            WireMessage::EntryPush(_) => asked.2 += here,
+            _ => {}
+        }
+    }
+    asked
+}
+
+/// Two devices of one person, each with sync on, each hold the messages
+/// channel of their generation after a pass: the same channel, the last
+/// that each goes through, which each has fetched whole from the relay
+/// since it started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_devices_of_one_person_each_hold_the_messages_channel_after_a_pass() {
+    let relay = relay_started("relay", None);
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.holds("notes");
+        device.syncs(true);
+        device.connects("relay", &relay).await;
+    }
+    let messages = laptop.messages();
+    assert_eq!(desktop.messages(), messages);
+    let not_yet = std::time::Instant::now();
+    for device in [&laptop, &desktop] {
+        assert!(
+            !device
+                .state
+                .own_channels
+                .first_fetch_done(&messages, not_yet)
+        );
+    }
+
+    all_pass(&[&laptop, &desktop], 2).await;
+    for device in [&laptop, &desktop] {
+        let own = at_relays::channels(&device.db(), &device.state.identity).unwrap();
+        let last = own.last().unwrap();
+        assert_eq!(
+            (&last.kind, last.id),
+            (&at_relays::Kind::Messages, messages)
+        );
+        let now = std::time::Instant::now();
+        assert!(device.state.own_channels.first_fetch_done(&messages, now));
+        assert!(!device.state.own_channels.no_place());
+    }
+    // Nothing of it was pushed: no device wrote in it.
+    assert!(held_at(&relay, &messages).is_empty());
+}
+
+/// An entry that one device writes in a slot of its own in the messages
+/// channel reaches the other through a relay: the relay holds it, as it
+/// holds any entry of a channel from its secret, and the other device's
+/// store takes it through the one door. One that a key which does not
+/// count writes there is taken by neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_in_the_messages_channel_reaches_the_other_device_through_a_relay() {
+    let relay = relay_started("relay", None);
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.holds("notes");
+        device.syncs(true);
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&laptop, &desktop], 2).await;
+    let messages = laptop.messages();
+    let channels_before = channels_at(&relay);
+
+    let sent = laptop.writes_message(1, "notes", "the branch is ready to look at");
+    assert_eq!(sent.channel, messages);
+    laptop.sends().await;
+    assert!(holds_at(&relay, &messages, &sent.id()));
+    assert_eq!(channels_at(&relay), channels_before + 1);
+    // Every entry of it is of one size at the relay.
+    assert_eq!(sent.content.len(), 2048);
+
+    desktop.passes().await;
+    assert_eq!(desktop.holds_of(&messages), BTreeSet::from([sent.id()]));
+    let secret = desktop.messages_secret();
+    let held = entries::channel_entries_after(&desktop.db(), &messages, 0, 10).unwrap();
+    let held = held[0].entry.clone().check().unwrap();
+    let inside = held.open(&secret).unwrap();
+    let taken = message::take(&inside.name, &laptop.key(), held.rev, &inside.value, |_| {
+        true
+    });
+    match taken.unwrap() {
+        message::Taken::Message { number, message } => {
+            assert_eq!(number, 1);
+            assert_eq!(message.body, "the branch is ready to look at");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A key that does not count writes in the channel: the relay holds
+    // it, and the desktop does not take it.
+    let stranger = NodeIdentity::generate().unwrap();
+    let name = message::message_name(&stranger.public_key(), 1).unwrap();
+    let value = message::clearing_value();
+    let theirs = sealed(
+        &stranger,
+        &laptop.messages_secret(),
+        3,
+        &name,
+        Value::Other(value),
+    );
+    assert_eq!(
+        pushed_by_hand(&laptop, "relay", &[&theirs]).await,
+        [PushAnswer::Stored]
+    );
+    desktop.passes().await;
+    assert!(!desktop.holds_of(&messages).contains(&theirs.id()));
+    assert_eq!(desktop.holds_of(&messages).len(), 1);
+}
+
+/// Where sync is off, the device neither proves, pulls nor pushes the
+/// messages channel (decision 2026-10-09 §2.1, C12), though its store
+/// holds an entry of it. With sync on, it does each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_sync_off_the_messages_channel_is_neither_pushed_nor_pulled() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes_message(1, "notes", "written while sync was on");
+    let messages = device.messages();
+    device.connects_to("relay", relay.port, relay.key).await;
+
+    device.syncs(false);
+    device.passes().await;
+    device.sends().await;
+    let requests = relay.requests();
+    assert!(!requests.is_empty());
+    assert!(!of_channels(&requests).contains(&messages));
+    assert!(
+        !device
+            .state
+            .own_channels
+            .first_fetch_done(&messages, std::time::Instant::now())
+    );
+
+    device.syncs(true);
+    device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages), (1, 1, 1));
+}
+
+/// A whole pass that reads the messages channel to its end records that
+/// the relay has handed it (decision 2026-10-09 §2.3): before that a
+/// device writes nothing in it after it starts. A pull of it that does
+/// not reach its end records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_reads_the_messages_channel_to_its_end_records_its_first_fetch() {
+    for to_its_end in [false, true] {
+        let relay = StandIn::started().await;
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.syncs(true);
+        let messages = device.messages();
+        let handed = device.writes_message(1, "notes", "a message").to_wire();
+        // A relay that hands page after page of it, without end; or none.
+        if !to_its_end {
+            relay.pulls(move |pull| {
+                let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+                let entries = match pull.channel == messages {
+                    true => vec![handed.clone().into()],
+                    false => Vec::new(),
+                };
+                EntryPulled {
+                    entries,
+                    next: after + 1,
+                    mark: [5; 8],
+                }
+            });
+        }
+        device.connects_to("relay", relay.port, relay.key).await;
+        let now = std::time::Instant::now();
+        assert!(!device.state.own_channels.first_fetch_done(&messages, now));
+        device.passes().await;
+        let now = std::time::Instant::now();
+        assert_eq!(
+            device.state.own_channels.first_fetch_done(&messages, now),
+            to_its_end
+        );
+    }
+}
+
+/// Past the limit on proofs a device has no messages, and says so
+/// (decision 2026-10-09 §2.1, D13). Here a relay remembers the proofs of
+/// three channels for one connection, and the personal channel and two
+/// names come before the messages channel: it is not proved, pulled or
+/// pushed, `no_place` is said, and the pass is not short. With room for
+/// four it is proved, and nothing is said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_the_limit_on_proofs_a_device_has_no_messages_and_says_so() {
+    for (most_proved, no_place) in [(3, true), (4, false)] {
+        let relay = StandIn::started().await;
+        let mut device = Device::proving_at_most("laptop", most_proved);
+        device.makes_the_phrase(&phrase());
+        device.holds("notes");
+        device.holds("lab");
+        device.syncs(true);
+        device.writes_message(1, "notes", "a message");
+        let messages = device.messages();
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        let own = &device.state.own_channels;
+        assert_eq!(own.no_place(), no_place, "{most_proved}");
+        let asked = asked_of(&relay, &messages);
+        match no_place {
+            true => assert_eq!(asked, (0, 0, 0)),
+            false => assert_eq!(asked, (1, 1, 1)),
+        }
+        assert_eq!(own.whole_passes().1, 1);
+        assert_eq!(own.last_short_pass(), 0, "{most_proved}");
+
+        // The device writes in the channel, and sends: past the limit the
+        // relay is asked nothing of it in the pass that sends either.
+        device.writes_message(2, "notes", "another message");
+        device.sends().await;
+        let asked = asked_of(&relay, &messages);
+        match no_place {
+            true => assert_eq!(asked, (0, 0, 0), "{most_proved}"),
+            false => assert_eq!(asked, (0, 0, 1), "{most_proved}"),
+        }
+        assert_eq!(device.state.own_channels.no_place(), no_place);
+    }
+}
+
+/// A filled messages channel makes no pass short (decision 2026-10-09
+/// §2.1, §8, D13): a relay that holds more of it than one pass takes, and
+/// one that does not answer its proof, leave the pass whole, so a command
+/// that waits for a fetch is not told that it ended early. The same of a
+/// name's channel makes the pass short. What the commands then print is
+/// for the record's real-process test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filled_messages_channel_makes_no_pass_short() {
+    let short = |device: &Device| device.state.own_channels.last_short_pass();
+    // More than a pass takes: page after page, without end, of the
+    // messages channel or of a name's.
+    for of_messages in [true, false] {
+        let relay = StandIn::started().await;
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.holds("notes");
+        device.syncs(true);
+        let filled = match of_messages {
+            true => device.messages(),
+            false => device.channel("notes"),
+        };
+        let handed = match of_messages {
+            true => device.writes_message(1, "notes", "a message"),
+            false => device.writes("notes", "a.md", "a text"),
+        };
+        let handed = handed.to_wire();
+        relay.pulls(move |pull| {
+            let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+            let entries = match pull.channel == filled {
+                true => vec![handed.clone().into()],
+                false => Vec::new(),
+            };
+            EntryPulled {
+                entries,
+                next: after + 1,
+                mark: [5; 8],
+            }
+        });
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        assert_eq!(
+            asked_of(&relay, &filled).1,
+            cordelia_core::protocol::RELAY_ENTRY_PULL_PAGES
+        );
+        assert_eq!(device.state.own_channels.whole_passes().1, 1);
+        assert_eq!(short(&device), u64::from(!of_messages), "{of_messages}");
+    }
+
+    // A proof of the messages channel that is not answered.
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.syncs(true);
+    let messages = device.messages();
+    relay.hook(move |request| match request {
+        WireMessage::ChannelProve(prove) if prove.channel == messages => Some(Say::Nothing),
+        _ => None,
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages), (1, 0, 0));
+    assert_eq!(device.state.own_channels.whole_passes().1, 1);
+    assert_eq!(short(&device), 0);
+}
+
+/// A refusal for room of the messages channel, or for the address's
+/// allowance of new channels, is said of no relay (decision 2026-10-09
+/// §8): no refusal is said for the relay, and the messages channel is not
+/// counted among what waits there, which are the facts a status reads. It
+/// is sent again, as anything a relay refused is. The same refusal of a
+/// name's entry is said. What the commands then print is for the record's
+/// real-process test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_for_room_of_the_messages_channel_is_said_of_no_relay() {
+    for refused in [EntryRefused::NoRoom, EntryRefused::OverLimit] {
+        let relay = StandIn::started().await;
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.holds("notes");
+        device.syncs(true);
+        let (messages, notes) = (device.messages(), device.channel("notes"));
+        let refuses = Arc::new(AtomicBool::new(false));
+        let notes_refused = refuses.clone();
+        relay.pushes(move |entry| {
+            let of_notes = entry.channel == notes && notes_refused.load(Ordering::SeqCst);
+            match entry.channel == messages || of_notes {
+                true => PushAnswer::Refused(refused),
+                false => PushAnswer::Stored,
+            }
+        });
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        device.sends().await;
+        let waits = || {
+            let key = relay.key;
+            cordelia_api::leaving::waits_at(&device.db(), &device.state.identity, &key).unwrap()
+        };
+        assert_eq!(waits(), 0);
+        let before = device.at("relay");
+        assert_eq!(before.no_room, None);
+
+        device.writes_message(1, "notes", "a message");
+        device.sends().await;
+        assert_eq!(asked_of(&relay, &messages).2, 1, "{refused:?}");
+        let after = device.at("relay");
+        assert_eq!(after.no_room, None, "{refused:?}");
+        assert_eq!(after, before);
+        assert_eq!(waits(), 0, "{refused:?}");
+        // It is sent again once the wait has gone by.
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+        device.sends().await;
+        assert_eq!(asked_of(&relay, &messages).2, 1, "{refused:?}");
+
+        // The control: a name's entry refused so is said.
+        refuses.store(true, Ordering::SeqCst);
+        device.writes("notes", "a.md", "a text");
+        device.sends().await;
+        assert!(device.at("relay").no_room.is_some(), "{refused:?}");
+        assert_eq!(waits(), 1, "{refused:?}");
+    }
+}
+
+/// A relay that answers that it holds another entry from the device at
+/// the revision of an entry of the messages channel is not said to hold
+/// one of the device's own in another form (decision 2026-10-09 §8, F7):
+/// what `cordelia devices` prints of that relay is as it was. The same
+/// answer to a name's entry is said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_answered_another_is_not_said_in_another_form() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.syncs(true);
+    let (messages, notes) = (device.messages(), device.channel("notes"));
+    relay.pushes(
+        move |entry| match entry.channel == messages || entry.channel == notes {
+            true => PushAnswer::Another,
+            false => PushAnswer::Stored,
+        },
+    );
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    device.sends().await;
+
+    device.writes_message(1, "notes", "a message");
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages).2, 1);
+    assert_eq!(device.at("relay").another_form, 0);
+
+    device.writes("notes", "a.md", "a text");
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(device.at("relay").another_form, 1);
+}
+
+/// A pass that stops at the messages channel because the device came to
+/// keep another change entry is short (decision 2026-10-09 §2.1, decision
+/// 2026-10-04 §16): a statement was applied elsewhere in the middle of
+/// it, here as the relay is asked the proof of the messages channel, and
+/// the channels of the new generation were not read at this relay. The
+/// control: where only that proof goes unanswered, the pass is not short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_stops_at_the_messages_channel_after_a_statement_is_short() {
+    for applied_elsewhere in [false, true] {
+        let relay = StandIn::started().await;
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.holds("notes");
+        device.syncs(true);
+        let messages = device.messages();
+        let change = device.makes_change(&phrase(), &[&device], &[]);
+        let (state, now) = (device.state.clone(), device.now());
+        relay.hook(move |request| match request {
+            WireMessage::ChannelProve(prove) if prove.channel == messages => {
+                if !applied_elsewhere {
+                    return Some(Say::Nothing);
+                }
+                let db = state.db.lock().unwrap();
+                let outcome = shown(&db, &state.identity, &change, now).unwrap();
+                assert!(matches!(outcome, Shown::Applied(_)), "{outcome:?}");
+                None
+            }
+            _ => None,
+        });
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        assert_eq!(asked_of(&relay, &messages), (1, 0, 0));
+        assert_eq!(device.messages() != messages, applied_elsewhere);
+        let own = &device.state.own_channels;
+        assert_eq!(own.whole_passes().1, 1);
+        assert_eq!(
+            own.last_short_pass(),
+            u64::from(applied_elsewhere),
+            "{applied_elsewhere}"
+        );
+    }
+}
+
+/// What the device says of the place of the messages channel is the room
+/// that `prove` finds for it on the connection (decision 2026-10-09
+/// §2.1). Here a relay remembers the proofs of four channels for one,
+/// and the device proved four with sync off: the personal channel and
+/// three names. It holds one of those names no more, and sync is on: its
+/// own channels, with the messages channel, are four, but the place of
+/// the name it dropped is still taken on the connection. The messages
+/// channel is not proved, and `no_place` is said. With room for five it
+/// is proved, and nothing is said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none() {
+    for (most_proved, no_place) in [(4, true), (5, false)] {
+        let relay = StandIn::started().await;
+        let mut device = Device::proving_at_most("laptop", most_proved);
+        device.makes_the_phrase(&phrase());
+        for name in ["lab", "notes", "old"] {
+            device.holds(name);
+        }
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        assert_eq!(device.counts("relay").proofs, 4);
+
+        held_rows::drop_name(&device.db(), "old").unwrap();
+        device.syncs(true);
+        let own = at_relays::channels(&device.db(), &device.state.identity).unwrap();
+        assert_eq!(own.len(), 4);
+        let messages = device.messages();
+        relay.requests();
+        device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+        device.passes().await;
+        let proved = usize::from(!no_place);
+        assert_eq!(asked_of(&relay, &messages), (proved, proved, 0));
+        let own = &device.state.own_channels;
+        assert_eq!(own.no_place(), no_place, "{most_proved}");
+        assert_eq!(own.last_short_pass(), 0, "{most_proved}");
+    }
+}
+
+/// The messages channel of the generation that the device stands applied
+/// under is not read through the door for a carry (decision 2026-10-09
+/// §2.1), with sync off as with it on: the relay is asked nothing. The
+/// control: a channel of a generation that was left is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_messages_channel_is_not_read_through_the_door_for_a_carry() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    let (old, old_secret) = (device.personal(), device.personal_secret());
+    device.changes(&phrase(), &[&device], &[]);
+    device.passes().await;
+    relay.requests();
+
+    let by = |secret: [u8; 32]| ProvedBy::Secret(zeroize::Zeroizing::new(secret));
+    for sync in [false, true] {
+        device.syncs(sync);
+        let read = reads_left(&device, device.messages(), by(device.messages_secret())).await;
+        assert!(
+            matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("this device's own")),
+            "{sync}: {read:?}"
+        );
+        assert!(relay.requests().is_empty(), "{sync}");
+
+        // The control.
+        let read = reads_left(&device, old, by(old_secret)).await;
+        assert!(
+            !matches!(&read[0].read, LeftRead::NotRead(_)),
+            "{sync}: {read:?}"
+        );
+        assert!(!relay.requests().is_empty(), "{sync}");
+    }
+}
+
+/// What the device says of the place of the messages channel is said
+/// afresh as every pass ends (decision 2026-10-09 §2.1): past the limit
+/// on proofs it is said; with no relay connected it is said no more; on a
+/// connection made again it is said again; and a device that has stopped,
+/// and makes no pass at a relay, has no messages channel, and says
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_word_that_the_messages_channel_has_no_place_is_said_afresh() {
+    let relay = StandIn::started().await;
+    let mut device = Device::proving_at_most("laptop", 3);
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.holds("lab");
+    device.syncs(true);
+    let no_place = |device: &Device| device.state.own_channels.no_place();
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert!(no_place(&device));
+
+    device.disconnects("relay");
+    device.passes().await;
+    assert!(!no_place(&device));
+
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert!(no_place(&device));
+
+    held_rows::set_state(&device.db(), State::Removed).unwrap();
+    device.passes().await;
+    device.sends().await;
+    assert!(!no_place(&device));
 }

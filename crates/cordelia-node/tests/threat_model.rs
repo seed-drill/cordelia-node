@@ -766,7 +766,9 @@ fn has_sent_everything(n: &Node) -> Option<()> {
 /// entry in one is an entry that a relay accepts: none carries the name,
 /// a file's name or text, or a label, and none carries anything beyond
 /// what its form has. The device announces no channel at all: it opens no
-/// stream of the older kind (decision 2026-10-04 §2.3, §2.4).
+/// stream of the older kind (decision 2026-10-04 §2.3, §2.4). The channels
+/// it names are its own: its messages channel among them, since sync is
+/// on (decision 2026-10-09 §2.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t01_a_device_tells_a_relay_only_a_channels_id() {
     const PROJECT: &str = "t01-canary-project-name";
@@ -797,7 +799,11 @@ async fn t01_a_device_tells_a_relay_only_a_channels_id() {
         .expect("the node keeps a change entry")
         .entry
         .channel;
-    let own = [change, personal, named];
+    // With sync on it has its messages channel too (decision 2026-10-09
+    // §2.1), last in each pass.
+    let messages =
+        channel_of(&cordelia_crypto::derive::messages_secret(&person_secret_of(&a)).unwrap());
+    let own = [change, personal, named, messages];
 
     // The relay hears of each of them: it is sent what the node holds of
     // each.
