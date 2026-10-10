@@ -607,7 +607,9 @@ enum Say {
 /// place of what the script says. For a push, `Some` that is no answer
 /// has the stand-in take the push and answer nothing: it resets the
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
-/// answer nothing, and keep the stream open.
+/// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
+/// has it answer with that answer of a show, which is no answer to a
+/// proof.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -729,6 +731,13 @@ impl StandIn {
                     }
                 }
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
+                // An answer of a show, which is no answer to a proof.
+                WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Answer(_))) => {
+                    let Some(Say::Answer(answer)) = hooked else {
+                        unreachable!()
+                    };
+                    Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
+                }
                 WireMessage::ChannelProve(_) => {
                     Ok(Some(WireMessage::ChannelProved(ChannelProved {
                         proved: script.proves,
@@ -5707,8 +5716,9 @@ async fn past_the_limit_on_proofs_a_device_has_no_messages_and_says_so() {
 }
 
 /// A filled messages channel makes no pass short (decision 2026-10-09
-/// §2.1, §8, D13): a relay that holds more of it than one pass takes, and
-/// one that does not answer its proof, leave the pass whole, so a command
+/// §2.1, §8, D13): a relay that holds more of it than one pass takes, one
+/// that does not answer its proof, and one that answers it with what is no
+/// answer to a proof, leave the pass whole, so a command
 /// that waits for a fetch is not told that it ended early. The same of a
 /// name's channel makes the pass short. What the commands then print is
 /// for the record's real-process test.
@@ -5763,6 +5773,26 @@ async fn a_filled_messages_channel_makes_no_pass_short() {
     let messages = device.messages();
     relay.hook(move |request| match request {
         WireMessage::ChannelProve(prove) if prove.channel == messages => Some(Say::Nothing),
+        _ => None,
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages), (1, 0, 0));
+    assert_eq!(device.state.own_channels.whole_passes().1, 1);
+    assert_eq!(short(&device), 0);
+
+    // A proof of the messages channel answered with what is no answer to
+    // a proof: the channel is passed by, and the pass is not short.
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.syncs(true);
+    let messages = device.messages();
+    relay.hook(move |request| match request {
+        WireMessage::ChannelProve(prove) if prove.channel == messages => {
+            Some(Say::Answer(ShowAnswer::Held))
+        }
         _ => None,
     });
     device.connects_to("relay", relay.port, relay.key).await;

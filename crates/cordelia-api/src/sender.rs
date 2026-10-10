@@ -2306,6 +2306,9 @@ mod tests {
             .unwrap();
         s.change(0, &[0, 1], &[]);
         let (conn, identity) = (&s[0].conn, &s[0].identity);
+        // Sync is off, so the step that clears does nothing, and the drop
+        // alone is what is tested.
+        meta::remove(conn, meta::SYNC_CLAUDE_DIR).unwrap();
         assert!(kept_of(&s, 0, &done.id).is_some());
         crate::reader::hourly(conn, identity, t + DAY, true).unwrap();
         assert_eq!(kept_of(&s, 0, &done.id), None);
