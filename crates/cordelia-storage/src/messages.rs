@@ -31,8 +31,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::protocol::{
-    AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_KEPT_DAYS, AGENT_MESSAGE_RING,
-    AGENT_MESSAGE_SUBJECT_CHARS,
+    AGENT_MESSAGE_AHEAD_MAX_SECS, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_KEPT_DAYS,
+    AGENT_MESSAGE_RING, AGENT_MESSAGE_SUBJECT_CHARS,
 };
 use cordelia_crypto::message::{Message, To};
 
@@ -70,6 +70,18 @@ pub fn generation(
         [&channel[..]],
         |row| row.get(0),
     )?)
+}
+
+/// The generation of the messages channel whose ID is `channel`, where
+/// the device has held it.
+pub fn generation_of(conn: &Connection, channel: &[u8; 32]) -> Result<Option<i64>, StorageError> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM message_generations WHERE channel = ?1",
+            [&channel[..]],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// What a reader keeps of one signer in one generation (decision
@@ -655,7 +667,301 @@ pub fn drop_gone(conn: &Connection, now: i64) -> Result<Gone, StorageError> {
         "DELETE FROM message_places WHERE placed_at <= ?1",
         [now - HOUR_SECS],
     )?;
+    // The device's record of when it sent is kept for the hour of its
+    // rates, and no longer (§6).
+    conn.execute(
+        "DELETE FROM message_sends WHERE sent_at <= ?1",
+        [now - HOUR_SECS],
+    )?;
     Ok(gone)
+}
+
+// ── The sender's own ─────────────────────────────────────────────────
+
+/// The device writes in its record that it sent at `at` by its clock
+/// (decision 2026-10-09 §6, C10): as the agent of the folder `name`, to
+/// one name or to every name; or, with no name, a message sent again.
+pub fn record_send(
+    conn: &Connection,
+    at: i64,
+    name: Option<&str>,
+    to_all: bool,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO message_sends (sent_at, name, to_all) VALUES (?1, ?2, ?3)",
+        params![at, name, to_all],
+    )?;
+    Ok(())
+}
+
+/// What the device's record says it sent in the hour before `now`, each
+/// as the time it sent, oldest first (decision 2026-10-09 §6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SentLately {
+    /// The sends of one folder's agent.
+    pub by_folder: Vec<i64>,
+    /// Every send of the device's, a message to every name as one.
+    pub sends: Vec<i64>,
+    /// Every message sent again.
+    pub again: Vec<i64>,
+}
+
+/// What the device's record says it sent in the last hour of its clock,
+/// at `now`, of the folder's agent `folder` and of the device: every row
+/// within the hour, **or later than its clock**, so that a clock that went
+/// back does not free the hour (decision 2026-10-09 §6, C10).
+pub fn sent_lately(conn: &Connection, folder: &str, now: i64) -> Result<SentLately, StorageError> {
+    let rows: Vec<(i64, Option<String>)> = conn
+        .prepare("SELECT sent_at, name FROM message_sends WHERE sent_at > ?1 ORDER BY sent_at")?
+        .query_map([now - HOUR_SECS], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut lately = SentLately::default();
+    for (at, name) in rows {
+        match name {
+            Some(name) => {
+                if name == folder {
+                    lately.by_folder.push(at);
+                }
+                lately.sends.push(at);
+            }
+            None => lately.again.push(at),
+        }
+    }
+    Ok(lately)
+}
+
+/// The newest `sent` of the device's own messages in its index that is
+/// not more than `AGENT_MESSAGE_AHEAD_MAX_SECS` ahead of `now` (decision
+/// 2026-10-09 §7.1, D8): a row of its own further ahead is passed over,
+/// so that a clock that was ahead for a moment does not lock it out.
+pub fn newest_own_sent(
+    conn: &Connection,
+    own: &[u8; 32],
+    now: i64,
+) -> Result<Option<i64>, StorageError> {
+    let ahead = i64::try_from(AGENT_MESSAGE_AHEAD_MAX_SECS).unwrap_or(i64::MAX);
+    Ok(conn.query_row(
+        "SELECT MAX(sent) FROM message_index WHERE signer = ?1 AND sent <= ?2",
+        params![&own[..], now.saturating_add(ahead)],
+        |row| row.get(0),
+    )?)
+}
+
+/// The other side of a pair of agents: a name, or every name.
+pub type Other = Option<String>;
+
+/// For each pair with the agent of `name` on one side, how many of its
+/// messages count towards the hold at `now` (decision 2026-10-09 §6, C8,
+/// F2): those the device holds, that have a place, that have not expired,
+/// that are live, and that no person has read on this device. A message
+/// to one name is of the pair of its sender and its recipient, in either
+/// direction; a message to every name is of the pair of its sender and
+/// all (`None`). In order of the other name, and all last.
+pub fn pairs_with(
+    conn: &Connection,
+    name: &str,
+    now: i64,
+) -> Result<Vec<(Other, u64)>, StorageError> {
+    let rows: Vec<(String, Option<String>)> = conn
+        .prepare(&format!(
+            "SELECT i.from_name, i.to_name FROM message_index i
+             WHERE i.placed_at IS NOT NULL AND ?1 < {expires} AND {live}
+               AND NOT EXISTS (SELECT 1 FROM message_read_by_a_person p WHERE p.id = i.id)
+               AND (i.from_name = ?2 OR i.to_name = ?2)",
+            expires = expires_sql(),
+            live = live_sql(),
+        ))?
+        .query_map(params![now, name], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut pairs: std::collections::BTreeMap<(bool, String), u64> = Default::default();
+    for (from, to) in rows {
+        let other = match to {
+            // To every name: only the sender's side is this agent's.
+            None if from == name => (true, String::new()),
+            None => continue,
+            Some(to) if from == name => (false, to),
+            Some(_) => (false, from),
+        };
+        *pairs.entry(other).or_default() += 1;
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|((all, other), count)| (if all { None } else { Some(other) }, count))
+        .collect())
+}
+
+/// A message of the device's own, kept apart until every relay the device
+/// is set up with has taken it (decision 2026-10-09 §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub id: Id,
+    pub generation: i64,
+    /// Its value as it was sent.
+    pub value: Vec<u8>,
+    pub sent: i64,
+    /// The numbers it was sent under, lowest first.
+    pub numbers: Vec<u64>,
+    /// Whether it waits to be sent again under the next number.
+    pub again: bool,
+}
+
+/// Keep the value of the device's own message `id`, sent under `number`
+/// in `generation`, in the caller's write (decision 2026-10-09 §2.3).
+/// Where a 65th would be kept, the oldest goes, and its index row says
+/// that it may not have reached every relay: returns its ID.
+pub fn keep(conn: &Connection, kept: &Kept, now: i64) -> Result<Option<Id>, StorageError> {
+    conn.execute(
+        "INSERT INTO message_kept (id, generation, value, sent, kept_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![&kept.id[..], kept.generation, kept.value, kept.sent, now],
+    )?;
+    for number in &kept.numbers {
+        kept_under(conn, &kept.id, *number)?;
+    }
+    let held: i64 = conn.query_row("SELECT COUNT(*) FROM message_kept", [], |row| row.get(0))?;
+    if held <= RING {
+        return Ok(None);
+    }
+    let oldest: Vec<u8> = conn.query_row(
+        "SELECT id FROM message_kept ORDER BY kept_at, rowid LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    drop_kept(conn, &oldest, false)?;
+    Ok(Some(id_of(&oldest)))
+}
+
+/// The kept message `id` was sent again under `number`: it waits no more.
+pub fn kept_under(conn: &Connection, id: &Id, number: u64) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO message_kept_numbers (id, number) VALUES (?1, ?2)",
+        params![&id[..], to_sql(number)],
+    )?;
+    conn.execute("UPDATE message_kept SET again = 0 WHERE id = ?1", [&id[..]])?;
+    Ok(())
+}
+
+/// The kept message that was sent under `number` in `generation`.
+pub fn kept_at(
+    conn: &Connection,
+    generation: i64,
+    number: u64,
+) -> Result<Option<Id>, StorageError> {
+    let id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT k.id FROM message_kept k JOIN message_kept_numbers n ON n.id = k.id
+             WHERE k.generation = ?1 AND n.number = ?2",
+            params![generation, to_sql(number)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id.map(|id| id_of(&id)))
+}
+
+/// The relay `relay` has taken the kept message `id`: it answered a push
+/// of it that it stored it, or holds it (decision 2026-10-09 §2.3).
+pub fn taken_by(conn: &Connection, id: &Id, relay: &[u8; 32]) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO message_kept_taken (id, relay) VALUES (?1, ?2)",
+        params![&id[..], &relay[..]],
+    )?;
+    Ok(())
+}
+
+/// The kept message `id` waits to be sent again under the next number.
+pub fn send_again(conn: &Connection, id: &Id) -> Result<(), StorageError> {
+    conn.execute("UPDATE message_kept SET again = 1 WHERE id = ?1", [&id[..]])?;
+    Ok(())
+}
+
+/// Every message the device keeps, oldest first.
+pub fn kept(conn: &Connection) -> Result<Vec<Kept>, StorageError> {
+    let mut all: Vec<Kept> = conn
+        .prepare(
+            "SELECT id, generation, value, sent, again FROM message_kept ORDER BY kept_at, rowid",
+        )?
+        .query_map([], |row| {
+            Ok(Kept {
+                id: id_of(&row.get::<_, Vec<u8>>(0)?),
+                generation: row.get(1)?,
+                value: row.get(2)?,
+                sent: row.get(3)?,
+                numbers: Vec::new(),
+                again: row.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    for kept in &mut all {
+        let numbers: Vec<i64> = conn
+            .prepare("SELECT number FROM message_kept_numbers WHERE id = ?1 ORDER BY number")?
+            .query_map([&kept.id[..]], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        kept.numbers = numbers.into_iter().map(from_sql).collect();
+    }
+    Ok(all)
+}
+
+/// The relays that have taken the kept message `id`.
+pub fn taken_at(conn: &Connection, id: &Id) -> Result<Vec<[u8; 32]>, StorageError> {
+    let relays: Vec<Vec<u8>> = conn
+        .prepare("SELECT relay FROM message_kept_taken WHERE id = ?1 ORDER BY relay")?
+        .query_map([&id[..]], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(relays
+        .into_iter()
+        .filter_map(|relay| relay.try_into().ok())
+        .collect())
+}
+
+/// Drop the kept message `id` (decision 2026-10-09 §2.3). Where not every
+/// relay took it, its index row says that it may not have reached every
+/// relay. Returns whether the device kept it.
+pub fn drop_kept(
+    conn: &Connection,
+    id: &[u8],
+    taken_everywhere: bool,
+) -> Result<bool, StorageError> {
+    if !taken_everywhere {
+        conn.execute(
+            "UPDATE message_index SET not_every_relay = 1 WHERE id = ?1",
+            [id],
+        )?;
+    }
+    Ok(conn.execute("DELETE FROM message_kept WHERE id = ?1", [id])? == 1)
+}
+
+/// Drop each kept message that every one of `relays` has taken: the
+/// relays the device is set up with (decision 2026-10-09 §2.3). With no
+/// relay, what the device sends stays in its own store, and nothing is
+/// kept for a relay. Returns how many went.
+pub fn drop_taken_by_every(conn: &Connection, relays: &[[u8; 32]]) -> Result<usize, StorageError> {
+    let mut dropped = 0;
+    for kept in kept(conn)? {
+        let taken = taken_at(conn, &kept.id)?;
+        if relays.iter().all(|relay| taken.contains(relay)) {
+            dropped += usize::from(drop_kept(conn, &kept.id, true)?);
+        }
+    }
+    Ok(dropped)
+}
+
+/// Drop each kept message that is not of `generation`, or whose `sent` is
+/// 30 days or more before `now` (decision 2026-10-09 §2.3, §9.1): it may
+/// not have reached every relay. Returns how many went.
+pub fn drop_kept_gone(conn: &Connection, generation: i64, now: i64) -> Result<usize, StorageError> {
+    let mut dropped = 0;
+    for kept in kept(conn)? {
+        if kept.generation != generation || has_expired(kept.sent, kept.sent, now) {
+            dropped += usize::from(drop_kept(conn, &kept.id, false)?);
+        }
+    }
+    Ok(dropped)
+}
+
+fn id_of(bytes: &[u8]) -> Id {
+    let mut id = [0; AGENT_MESSAGE_ID_BYTES];
+    let len = bytes.len().min(id.len());
+    id[..len].copy_from_slice(&bytes[..len]);
+    id
 }
 
 /// A count or a number as the store's integer holds it. Every number of

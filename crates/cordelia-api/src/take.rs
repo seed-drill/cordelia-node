@@ -228,7 +228,7 @@ fn taken_as_its_own(
     // this write (decision 2026-10-09 §7.1): an entry it held already, or
     // one below what it holds, is not read again.
     if is_messages && stored == Outcome::Stored {
-        crate::reader::taken(conn, &secret, statement, entry, now)?;
+        crate::reader::taken(conn, &identity.public_key(), &secret, statement, entry, now)?;
     }
     let mut taken = (None, 0);
     if is_personal && stored != Outcome::OlderThanHeld {

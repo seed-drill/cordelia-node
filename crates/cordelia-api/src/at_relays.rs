@@ -754,9 +754,13 @@ pub struct Most {
 /// What a relay answered for one entry that it was pushed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pushed {
-    /// It stored the entry, or holds it, or holds a later one from that
-    /// author in that slot: it is not sent again.
+    /// It stored the entry, or holds it: it is not sent again.
     Holds,
+    /// It holds a later one from that author in that slot: the entry is
+    /// not sent again. In the messages channel it was not taken there,
+    /// and a message waits for the pull that hands back the later one
+    /// (decision 2026-10-09 §2.3, F6).
+    HoldsLater,
     /// It holds another entry from that author in that slot at that
     /// revision, and not this one: the author signed two at one
     /// revision. This one is not sent again: no relay takes it over the
@@ -1081,7 +1085,7 @@ pub fn sent(
                 Item::Again(seq) => (*seq, true),
             };
             match answers.next() {
-                Some(Pushed::Holds) => done.held += 1,
+                Some(Pushed::Holds | Pushed::HoldsLater) => done.held += 1,
                 Some(Pushed::HoldsAnother) => {
                     done.another += 1;
                     done.another_at.push(seq);
@@ -2237,8 +2241,10 @@ mod tests {
             }
         );
         assert_eq!(send(&RELAY, MOST), again);
-        // Both held: there is nothing more for that relay.
-        assert_eq!(answered(&RELAY, &again, &[Pushed::Holds; 2]).held, 2);
+        // Both held, one as a later one is: there is nothing more for that
+        // relay.
+        let done = answered(&RELAY, &again, &[Pushed::Holds, Pushed::HoldsLater]);
+        assert_eq!(done.held, 2);
         assert!(send(&RELAY, MOST).is_empty());
         // An answer for a batch that was answered before moves nothing
         // back.

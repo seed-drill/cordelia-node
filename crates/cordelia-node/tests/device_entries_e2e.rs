@@ -23,6 +23,7 @@ use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::change::make_change;
 use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
+use cordelia_api::sender::{self, At, NotSent, Request, Sent};
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy,
 };
@@ -49,7 +50,9 @@ use cordelia_node::device_entries::{
 };
 use cordelia_storage::acts::{self, TypedKey};
 use cordelia_storage::person::State;
-use cordelia_storage::{at_relays as kept_rows, entries, meta, person as held_rows};
+use cordelia_storage::{
+    at_relays as kept_rows, entries, messages as held_messages, meta, person as held_rows,
+};
 
 use common::*;
 
@@ -453,6 +456,57 @@ impl Device {
         let entry = entry.unwrap().check().unwrap();
         entries::store(&self.db(), &entry, self.now()).unwrap();
         entry
+    }
+
+    /// The device says, in its personal channel, that it syncs `name`.
+    fn says_it_syncs(&self, name: &str) {
+        cordelia_api::names::say(&self.db(), &self.state.identity, name, self.now()).unwrap();
+    }
+
+    /// The agent of `from` on this device sends `body` to `to`, through
+    /// the sender of messages, at the device's clock: as a route will
+    /// (decision 2026-10-09 §2.3, §4.3).
+    fn sends_message(&self, from: &str, to: message::To, body: &str) -> Result<Sent, NotSent> {
+        let db = self.db();
+        let own_channels = &self.state.own_channels;
+        let at = At {
+            now: self.now(),
+            fetched: sender::fetched(&db, own_channels, self.clock.now()).unwrap(),
+            no_place: own_channels.no_place(),
+            per_folder_per_hour: 20,
+        };
+        let request = Request {
+            from: from.into(),
+            to,
+            asks: false,
+            link: None,
+            body: body.into(),
+            thread: [0; 16],
+            answers: [0; 16],
+        };
+        sender::send(&db, &self.state.identity, &at, &request)
+    }
+
+    /// The bodies of the messages it shows now, oldest first, once it has
+    /// given places as a show does.
+    fn shows_messages(&self) -> Vec<String> {
+        let db = self.db();
+        let now = self.now();
+        held_messages::give_places(&db, &self.key(), now).unwrap();
+        held_messages::shown(&db, now)
+            .unwrap()
+            .into_iter()
+            .map(|shown| shown.body)
+            .collect()
+    }
+
+    /// The numbers it keeps its own message `id` sent under, where it
+    /// keeps it: until every relay it is set up with has taken it.
+    fn keeps_message(&self, id: &[u8; 16]) -> Option<Vec<u64>> {
+        let kept = held_messages::kept(&self.db()).unwrap();
+        kept.into_iter()
+            .find(|kept| kept.id == *id)
+            .map(|kept| kept.numbers)
     }
 
     /// What its store holds of `channel`, each by what it is named by.
@@ -5865,4 +5919,192 @@ async fn the_word_that_the_messages_channel_has_no_place_is_said_afresh() {
     device.passes().await;
     device.sends().await;
     assert!(!no_place(&device));
+}
+
+// ── The sender of messages, across a relay ───────────────────────────
+
+/// Laptop and desktop of one person, each saying that it syncs `notes`
+/// and `work`, with sync on, each connected to `relay` and having passed
+/// twice: each has fetched the messages channel.
+async fn two_that_message(relay: &Node) -> (Device, Device) {
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.holds("notes");
+        device.syncs(true);
+        device.says_it_syncs("notes");
+        device.says_it_syncs("work");
+        device.connects("relay", relay).await;
+    }
+    all_pass(&[&laptop, &desktop], 2).await;
+    (laptop, desktop)
+}
+
+/// A message that the sender writes reaches the other device through a
+/// relay, and is shown there; the sender keeps its value only until
+/// every relay it is set up with has taken it (decision 2026-10-09 §2.3).
+/// Before the first fetch nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_sent_reaches_the_other_device_and_is_kept_until_every_relay_took_it() {
+    let relay = relay_started("relay", None);
+    let fresh = Device::new("fresh");
+    fresh.makes_the_phrase(&phrase());
+    fresh.syncs(true);
+    assert!(matches!(
+        fresh.sends_message("notes", message::To::All, "too soon"),
+        Err(NotSent::Refused(sender::Refused::NotFetched))
+    ));
+
+    let (laptop, desktop) = two_that_message(&relay).await;
+    let sent = laptop
+        .sends_message(
+            "notes",
+            message::To::Name("work".into()),
+            "the branch is ready",
+        )
+        .unwrap();
+    assert_eq!(sent.number, 1);
+    assert_eq!(laptop.keeps_message(&sent.id), Some(vec![1]));
+    laptop.sends().await;
+    assert_eq!(laptop.keeps_message(&sent.id), None);
+    desktop.passes().await;
+    assert_eq!(desktop.shows_messages(), ["the branch is ready"]);
+}
+
+/// The device's store goes back to before a message it sent; offline,
+/// after its first fetch, it sends again at that number. The relay holds
+/// the other entry at that revision, and answers so: the message is
+/// written again under the next number in that pass, and reaches the
+/// other device, which shows both messages once each (decision 2026-10-09
+/// §2.3, case 1, §11 "A device restored from a backup").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_sent_offline_after_a_first_fetch_reaches_the_other_device_under_a_new_number() {
+    let relay = relay_started("relay", None);
+    let (mut laptop, desktop) = two_that_message(&relay).await;
+    let to_work = || message::To::Name("work".into());
+    laptop.sends_message("notes", to_work(), "one").unwrap();
+    laptop.sends().await;
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("laptop.db");
+    laptop
+        .db()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    laptop
+        .sends_message("notes", to_work(), "two, in a life forgotten")
+        .unwrap();
+    laptop.sends().await;
+
+    *laptop.db() = cordelia_storage::db::open(&backup).unwrap();
+    laptop.disconnects("relay");
+    let sent = laptop
+        .sends_message("notes", to_work(), "two, again")
+        .unwrap();
+    assert_eq!(sent.number, 2);
+    laptop.connects("relay", &relay).await;
+    laptop.passes().await;
+    assert_eq!(laptop.keeps_message(&sent.id), None);
+    let messages = laptop.messages();
+    let revs: Vec<u64> = held_at(&relay, &messages)
+        .iter()
+        .filter(|entry| entry.author == laptop.key())
+        .map(|entry| entry.rev)
+        .collect();
+    assert_eq!(BTreeSet::from_iter(revs), BTreeSet::from([2, 4, 6]));
+
+    desktop.passes().await;
+    let mut shown = desktop.shows_messages();
+    shown.sort();
+    assert_eq!(shown, ["one", "two, again", "two, in a life forgotten"]);
+}
+
+/// A relay that answers another to a message has it written again under
+/// the next number in the same pass, and pushed there; one that answers
+/// a higher revision is not written again (decision 2026-10-09 §2.3,
+/// F6): the push answers are read as the record says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relays_answer_to_a_message_is_read_for_sending_again() {
+    for (answer, written) in [(PushAnswer::Another, true), (PushAnswer::Older, false)] {
+        let relay = StandIn::started().await;
+        relay.holds_what_is_proved(true);
+        let mut device = Device::new("laptop");
+        device.makes_the_phrase(&phrase());
+        device.syncs(true);
+        device.says_it_syncs("notes");
+        let messages = device.messages();
+        let first = Arc::new(AtomicBool::new(true));
+        let once = first.clone();
+        relay.pushes(move |entry| {
+            let is_first_message = entry.channel == messages && entry.rev == 2;
+            match is_first_message && once.swap(false, Ordering::SeqCst) {
+                true => answer,
+                false => PushAnswer::Stored,
+            }
+        });
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.passes().await;
+        let sent = device
+            .sends_message("notes", message::To::All, "a message")
+            .unwrap();
+        relay.requests();
+        device.passes().await;
+        let pushed: Vec<u64> = relay
+            .requests()
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|bytes| Entry::from_wire(&bytes).unwrap())
+            .filter(|entry| entry.channel == messages)
+            .map(|entry| entry.rev)
+            .collect();
+        match written {
+            true => {
+                assert_eq!(pushed, [2, 4], "{answer:?}");
+                assert_eq!(device.keeps_message(&sent.id), None);
+            }
+            false => {
+                assert_eq!(pushed, [2], "{answer:?}");
+                assert_eq!(device.keeps_message(&sent.id), Some(vec![1]));
+            }
+        }
+    }
+}
+
+/// 30 days after a message was sent, its sender's hourly task writes the
+/// entry that clears it, once the messages channel was fetched; the
+/// relay takes it, and the other device that pulls it drops the message
+/// (decision 2026-10-09 §2.3, §7.1, property 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_cleared_by_its_sender_leaves_the_other_devices_index() {
+    let relay = relay_started("relay", None);
+    let (laptop, desktop) = two_that_message(&relay).await;
+    laptop
+        .sends_message("notes", message::To::All, "for a month")
+        .unwrap();
+    laptop.sends().await;
+    desktop.passes().await;
+    assert_eq!(desktop.shows_messages(), ["for a month"]);
+
+    laptop
+        .clock
+        .run_ahead(Duration::from_secs(30 * 24 * 60 * 60));
+    laptop.engine.messages_hourly();
+    let messages = laptop.messages();
+    laptop.sends().await;
+    let revs: Vec<u64> = held_at(&relay, &messages)
+        .iter()
+        .filter(|entry| entry.author == laptop.key())
+        .map(|entry| entry.rev)
+        .collect();
+    assert_eq!(revs, [3]);
+    desktop.passes().await;
+    let rows: i64 = desktop
+        .db()
+        .query_row("SELECT COUNT(*) FROM message_index", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
 }

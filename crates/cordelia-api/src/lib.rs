@@ -50,6 +50,7 @@ pub mod person;
 pub mod publish;
 pub mod reader;
 pub mod recover;
+pub mod sender;
 #[cfg(test)]
 mod several;
 pub mod state;

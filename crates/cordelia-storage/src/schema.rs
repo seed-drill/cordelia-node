@@ -735,7 +735,10 @@ CREATE TABLE person_left (
 /// - `message_kept`, `message_kept_numbers`, `message_kept_taken`: each
 ///   message of the device's own that not every relay has taken, its
 ///   value as it was sent, the numbers it was sent under, and the relays
-///   that have taken it (§2.3).
+///   that have taken it (§2.3); and `again`, 1 where it waits to be sent
+///   again under the next number: a relay answered that it holds another
+///   entry of the device's at its newest number, or a relay handed back
+///   the device's own entry over it.
 ///
 /// `secure_delete` is not a step: it is set on a personal node's
 /// connection where the node opens its store, before the steps run
@@ -871,7 +874,8 @@ CREATE TABLE message_kept (
                     REFERENCES message_generations(id),
     value       BLOB NOT NULL CHECK(typeof(value) = 'blob' AND length(value) = 1936),
     sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
-    kept_at     INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer')
+    kept_at     INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer'),
+    again       INTEGER NOT NULL DEFAULT 0 CHECK(typeof(again) = 'integer' AND again IN (0, 1))
 );
 
 CREATE TABLE message_kept_numbers (

@@ -34,6 +34,7 @@ use cordelia_core::CordeliaError;
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Value};
+use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::message::{self, NotAMessage, Taken as InTheRing};
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::Statement;
@@ -72,8 +73,15 @@ pub enum Read {
 ///
 /// The generation is the channel's row, made the first time the device
 /// holds it ([`held::generation`]).
+///
+/// **An entry of the device's own, `own`,** that the store kept is one a
+/// relay handed back from the device's later life, over what its store
+/// held: a message of its own there that not every relay had taken waits
+/// to be sent again under the next number (decision 2026-10-09 §2.3, case
+/// 2; [`crate::sender::taken_over`]).
 pub fn taken(
     conn: &Connection,
+    own: &[u8; 32],
     secret: &[u8; 32],
     statement: &Statement,
     entry: &CheckedEntry,
@@ -88,6 +96,8 @@ pub fn taken(
         statement.number,
         now,
     ))?;
+
+    crate::sender::taken_over(conn, own, &slot_key, generation, entry)?;
 
     let is_list = entry.slot == slot_id(&slot_key, &message::read_name(&signer)?);
     let number = message::number_of(entry.rev);
@@ -148,7 +158,7 @@ pub fn taken(
 
 /// The label that this device knows `key` by (decision 2026-10-09 §3):
 /// the statement's, or the one in the record of its addition, or none.
-fn label_of(
+pub(crate) fn label_of(
     conn: &Connection,
     statement: &Statement,
     key: &[u8; 32],
@@ -172,6 +182,8 @@ fn label_of(
 pub struct Hourly {
     /// What went from the index.
     pub gone: held::Gone,
+    /// How many of the device's own messages it cleared at the relays.
+    pub cleared: usize,
     /// Whether the write-ahead log was written back whole and truncated.
     pub checkpointed: bool,
 }
@@ -180,19 +192,26 @@ pub struct Hourly {
 /// `AGENT_MESSAGE_CLEAR_INTERVAL_SECS`), at `now` by the node's clock,
 /// whatever the device's state: first the index rows of messages that
 /// have expired or are held at no live number are overwritten and
-/// dropped, in one write; and last the truncating checkpoint runs, so
-/// that what was overwritten stands in the log no longer than an hour.
-pub fn hourly(conn: &Connection, now: i64) -> Result<Hourly, PersonError> {
+/// dropped, in one write; then, where the device stands applied, has sync
+/// on and has fetched the messages channel since it started (`fetched`),
+/// it clears its own expired messages at the relays
+/// ([`crate::sender::clear_expired`]); and last the truncating checkpoint
+/// runs, so that what was overwritten stands in the log no longer than an
+/// hour.
+pub fn hourly(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: bool,
+) -> Result<Hourly, PersonError> {
     let gone = in_one(conn, || kept(held::drop_gone(conn, now)))?;
-
-    // ── The clearing at the relays (decision 2026-10-09 §2.3) ──────────
-    // Here, between the two, goes the clearing of the device's own
-    // expired messages: where the device stands applied, has sync on and
-    // has fetched the messages channel since it started, it writes the
-    // entry that clears each of them. It is not built yet.
-
+    let cleared = crate::sender::clear_expired(conn, identity, now, fetched)?;
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
-    Ok(Hourly { gone, checkpointed })
+    Ok(Hourly {
+        gone,
+        cleared,
+        checkpointed,
+    })
 }
 
 /// What the store answered, with its error as the device's.
@@ -878,10 +897,10 @@ mod tests {
         assert!(shown_on(&s, 1, held_at + 30 * DAY).is_empty());
         assert_eq!(indexed(&s, 1), ["for a month"]);
 
-        let task = hourly(&s[1].conn, held_at + 30 * DAY - 1).unwrap();
+        let task = hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY - 1, true).unwrap();
         assert_eq!(task.gone, held::Gone::default());
         assert_eq!(indexed(&s, 1), ["for a month"]);
-        let task = hourly(&s[1].conn, held_at + 30 * DAY).unwrap();
+        let task = hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY, true).unwrap();
         assert_eq!(task.gone.expired, 1);
         assert!(indexed(&s, 1).is_empty());
         assert_eq!(rows(&s[1].conn, "message_numbers"), 0);
@@ -963,7 +982,7 @@ mod tests {
                 .unwrap();
             assert_eq!(words_in(&log, &words), words, "{run}");
 
-            let task = hourly(&s[1].conn, s.now + 30 * DAY).unwrap();
+            let task = hourly(&s[1].conn, &s[1].identity, s.now + 30 * DAY, true).unwrap();
             assert_eq!(task.gone.expired, 1, "{run}");
             assert!(task.checkpointed, "{run}");
             assert!(words_in(&path, &words).is_empty(), "{run}");
@@ -1073,7 +1092,7 @@ mod tests {
         let entry = sent(&s, 0, 1, &message);
         assert_eq!(given(&s, 1, &entry), STORED);
         assert_eq!(shown_on(&s, 1, held_at), ["once"]);
-        hourly(&s[1].conn, held_at + 30 * DAY).unwrap();
+        hourly(&s[1].conn, &s[1].identity, held_at + 30 * DAY, true).unwrap();
         assert!(indexed(&s, 1).is_empty());
 
         s[1].conn
