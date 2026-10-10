@@ -105,11 +105,11 @@ use cordelia_api::at_relays::{
     self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
 };
 use cordelia_api::person::{PersonError, Shown};
-use cordelia_api::sender;
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftRead, NoRoom, ProvedBy,
 };
 use cordelia_api::take::Taken;
+use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
@@ -1010,6 +1010,24 @@ impl DeviceEntries {
         }
     }
 
+    /// Write the device's list of what its agents read, where its table
+    /// holds a mark that the list lacks (decision 2026-10-09 §2.4;
+    /// [`cordelia_api::marks::write_list`]): only once the messages
+    /// channel was fetched since the node started. Says whether it wrote
+    /// one.
+    fn write_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        match marks::write_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of what this device's agents read");
+                false
+            }
+        }
+    }
+
     /// Drop each message of the device's own that every relay it is set up
     /// with has taken (decision 2026-10-09 §2.3). Which relays those are
     /// is known by their keys only while every one is connected
@@ -1573,8 +1591,12 @@ impl DeviceEntries {
             // the next number, and pushed in this pass: the pull may have
             // handed back the device's own later entry over it, or the push
             // been answered that the relay holds another entry of the
-            // device's at its revision (decision 2026-10-09 §2.3).
-            if messages && self.write_again() {
+            // device's at its revision (decision 2026-10-09 §2.3). So is
+            // the device's list of what its agents read, where its table
+            // holds a mark the list lacks: a mark made before the first
+            // fetch, the first list of a generation, or the list after the
+            // device's own later one that the pull handed back (§2.4).
+            if messages && (self.write_again() | self.write_list()) {
                 sent = match self.push(&at, channel, Which::Since).await {
                     Step::Done(sent) => sent,
                     Step::Stop => return self.stopped(&at, stopped),
@@ -2058,6 +2080,21 @@ impl DeviceEntries {
                     if let Err(e) = sender::answered(db, own, &relay, channel, &batch.entries, &answers)
                     {
                         tracing::debug!(error = %e, "could not keep what a relay took of messages");
+                    }
+                    // A list that the relay holds another of at its
+                    // revision is written again above it (§2.4).
+                    let fetched = sender::fetched(db, &self.state.own_channels, self.clock.now());
+                    let listed = marks::answered(
+                        db,
+                        own,
+                        channel,
+                        &batch.entries,
+                        &answers,
+                        self.unix(),
+                        fetched.unwrap_or(false),
+                    );
+                    if let Err(e) = listed {
+                        tracing::debug!(error = %e, "could not write the list again");
                     }
                     Some(done)
                 },

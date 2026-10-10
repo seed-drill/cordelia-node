@@ -19,8 +19,9 @@
 //!   only that its number is gone.
 //! - **Then the value** (`message::take`): a message is written into the
 //!   index with its opened fields, a clearing drops the index row of the
-//!   message held at its number and counts that number as gone, and
-//!   anything else is counted as no message.
+//!   message held at its number and counts that number as gone, a list is
+//!   kept as its device's latest ([`crate::marks`]), and anything else is
+//!   counted as no message.
 //!
 //! The reader refuses nothing that the store took: the entry stays in the
 //! store whatever it is, and nothing here changes what the door answers.
@@ -155,10 +156,14 @@ pub fn taken(
         Ok(InTheRing::Clearing { number }) => Ok(Read::Clearing {
             dropped: kept(held::clear(conn, &signer, generation, number, now))?,
         }),
-        // What a list's marks say is kept by whoever keeps the lists of
-        // what each device's agents read (decision 2026-10-09 §7.2): the
-        // reader checks only that it is one.
-        Ok(InTheRing::List(_)) => Ok(Read::List),
+        // A list the store kept is the latest of its device, or the
+        // device's own from its later life (decision 2026-10-09 §7.2):
+        // what it says is matched to no message here, but when one is
+        // shown.
+        Ok(InTheRing::List(list)) => {
+            crate::marks::list_taken(conn, own, &signer, &list.marks, now)?;
+            Ok(Read::List)
+        }
         Err(why) => no_message(why),
     }
 }
@@ -201,7 +206,9 @@ pub struct Hourly {
 /// have expired or are held at no live number are overwritten and
 /// dropped, in one write, with the kept values of the device's own of
 /// every generation other than the one it stands applied under, and then
-/// what is kept of each such generation once none of its rows is left;
+/// what is kept of each such generation once none of its rows is left,
+/// and with the marks' part ([`crate::marks`]): the lists of keys that no
+/// longer count, and the bare hashes found or 30 days old;
 /// then, where the device stands applied, has sync on and has fetched the
 /// messages channel since it started (`fetched`), it clears its own
 /// expired messages at the relays ([`crate::sender::clear_expired`]); and
@@ -222,7 +229,11 @@ pub fn hourly(
         Ok(None) => held::Applied::Nowhere,
         Err(_) => held::Applied::NotKnown,
     };
-    let gone = in_one(conn, || kept(held::drop_gone(conn, now, &applied)))?;
+    let gone = in_one(conn, || {
+        let gone = kept(held::drop_gone(conn, now, &applied))?;
+        crate::marks::hourly(conn, now)?;
+        Ok(gone)
+    })?;
     let cleared = crate::sender::clear_expired(conn, identity, now, fetched)?;
     let checkpointed = kept(cordelia_storage::db::checkpoint_truncating(conn))?;
     Ok(Hourly {
