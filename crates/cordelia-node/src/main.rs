@@ -614,8 +614,9 @@ fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> Stri
 }
 
 /// Open the node's database, as a command that opens it itself does, with
-/// the schema's steps run, and set on the connection what a node of the
-/// role that `config` gives keeps ([`as_its_role_keeps`]). **A database
+/// the schema's steps run, and set on the connection, before they run,
+/// what a node of the role that `config` gives keeps
+/// ([`keeps_secure_delete`]). **A database
 /// from a later version is refused** (decision 2026-10-04 §10.1): the
 /// command names both versions, and changes nothing.
 fn open_database(
@@ -623,11 +624,8 @@ fn open_database(
     config: &Config,
 ) -> anyhow::Result<rusqlite::Connection> {
     use cordelia_storage::StorageError;
-    match cordelia_storage::db::open(db_path) {
-        Ok(conn) => {
-            as_its_role_keeps(&conn, &config.network.role)?;
-            Ok(conn)
-        }
+    match cordelia_storage::db::open_as(db_path, keeps_secure_delete(&config.network.role)) {
+        Ok(conn) => Ok(conn),
         Err(StorageError::LaterVersion { found, own }) => {
             anyhow::bail!("{}", from_a_later_version(db_path, found, own))
         }
@@ -640,37 +638,38 @@ fn open_database(
 /// node then stays up, over a database of its own in memory, with why
 /// (the second of what is returned); a node of any other role does not
 /// start without its database, and says why. The connection is set as a
-/// node of the role that `config` gives keeps it ([`as_its_role_keeps`]).
+/// node of the role that `config` gives keeps it, before the schema's
+/// steps run ([`keeps_secure_delete`]).
 fn open_the_nodes_database(
     db_path: &std::path::Path,
     config: &Config,
 ) -> anyhow::Result<(rusqlite::Connection, Option<String>)> {
     let role = config.network.role.as_str();
-    let (conn, later) = match cordelia_storage::db::open(db_path) {
-        Ok(conn) => (conn, None),
+    let secure_delete = keeps_secure_delete(role);
+    match cordelia_storage::db::open_as(db_path, secure_delete) {
+        Ok(conn) => Ok((conn, None)),
         Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
             let why = from_a_later_version(db_path, found, own);
             if role != "personal" {
                 anyhow::bail!("{why}");
             }
-            (cordelia_storage::db::open_in_memory()?, Some(why))
+            let conn = cordelia_storage::db::open_in_memory()?;
+            if secure_delete {
+                cordelia_storage::db::secure_delete_on(&conn)?;
+            }
+            Ok((conn, Some(why)))
         }
-        Err(e) => return Err(e.into()),
-    };
-    as_its_role_keeps(&conn, role)?;
-    Ok((conn, later))
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// Set on a connection to the store what a node of `role` keeps there
-/// (decision 2026-10-09 §7.1, D10): a personal node keeps SQLite's
-/// `secure_delete` on, so that every row it deletes or moves, of memory
-/// as of messages, is written over with zeros. A relay sets nothing, and
-/// pays nothing for it.
-fn as_its_role_keeps(conn: &rusqlite::Connection, role: &str) -> anyhow::Result<()> {
-    if role == "personal" {
-        cordelia_storage::db::secure_delete_on(conn)?;
-    }
-    Ok(())
+/// Whether a node of `role` keeps SQLite's `secure_delete` on its store's
+/// connection (decision 2026-10-09 §7.1, D10): a personal node does, from
+/// before the schema's steps run, so that every row it deletes or moves,
+/// of memory as of messages, is written over with zeros. A relay does
+/// not, and pays nothing for it.
+fn keeps_secure_delete(role: &str) -> bool {
+    role == "personal"
 }
 
 /// The last line of `cordelia init`. Run by a person, it says how the

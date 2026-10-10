@@ -8,10 +8,22 @@ use crate::schema;
 
 /// Open (or create) the Cordelia database and run migrations.
 pub fn open(path: &Path) -> Result<Connection, StorageError> {
+    open_as(path, false)
+}
+
+/// Open (or create) the Cordelia database and run migrations, with
+/// `secure_delete` set on the connection first where `secure_delete` is
+/// true ([`secure_delete_on`]), as a personal node opens it: a step that
+/// rewrites a table then writes zeros over what it frees (decision
+/// 2026-10-09 §7.1).
+pub fn open_as(path: &Path, secure_delete: bool) -> Result<Connection, StorageError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    if secure_delete {
+        secure_delete_on(&conn)?;
+    }
     schema::init_db(&conn)?;
     Ok(conn)
 }
@@ -72,6 +84,50 @@ mod tests {
     #[test]
     fn test_open_in_memory() {
         let _conn = open_in_memory().unwrap();
+    }
+
+    /// The truncating checkpoint answers whether it wrote the log back
+    /// whole and truncated it (decision 2026-10-09 §7.1): while a reader
+    /// on another connection holds a read transaction, it cannot, and
+    /// says so; once that reader is gone, it does.
+    #[test]
+    fn the_truncating_checkpoint_answers_false_while_a_reader_holds_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let conn = open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        conn.execute(
+            "INSERT INTO node_meta (key, value) VALUES ('a.setting', 'one')",
+            [],
+        )
+        .unwrap();
+
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let read: String = reader
+            .query_row(
+                "SELECT value FROM node_meta WHERE key = 'a.setting'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(read, "one");
+        conn.execute(
+            "UPDATE node_meta SET value = 'two' WHERE key = 'a.setting'",
+            [],
+        )
+        .unwrap();
+        assert!(!checkpoint_truncating(&conn).unwrap(), "a reader holds it");
+
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert!(checkpoint_truncating(&conn).unwrap(), "the reader is gone");
+        assert_eq!(
+            std::fs::metadata(path.with_extension("db-wal"))
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     fn secure_delete(conn: &Connection) -> i64 {

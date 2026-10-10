@@ -21,6 +21,13 @@ use crate::StorageError;
 #[cfg(test)]
 const AGENT_MESSAGE_VALUE_BYTES: usize = 1936;
 
+/// The highest number of a message: the clearing of number k is at
+/// revision 2k + 1, which stays below 2^43 (decision 2026-10-09 §2.3). No
+/// number of the tables, and no highest number held, is above it. Moves
+/// to protocol.rs with slice 1.
+#[cfg(test)]
+const AGENT_MESSAGE_NUMBER_MAX: i64 = (1 << 42) - 1;
+
 /// Drop the index row of the message `id` (decision 2026-10-09 §7.1): at
 /// its 30 days, at a clearing, or when none of its numbers is live. Its
 /// body, link, subject, `from_name` and `to_name` are first written over
@@ -29,9 +36,23 @@ const AGENT_MESSAGE_VALUE_BYTES: usize = 1936;
 /// first holding stay. A field that holds nothing (no link, and no
 /// `to_name` for every name) is left so. Returns whether the device held
 /// the row.
+///
+/// It runs in a savepoint, so it is whole by itself, and part of the
+/// caller's transaction where there is one: the door's write that takes a
+/// clearing, or raises H, drops its rows in that write.
 pub fn drop_row(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    conn.execute_batch("SAVEPOINT drop_row")?;
+    let dropped = overwritten_and_deleted(conn, id);
+    let end = match dropped {
+        Ok(_) => "RELEASE drop_row",
+        Err(_) => "ROLLBACK TO drop_row; RELEASE drop_row",
+    };
+    conn.execute_batch(end)?;
+    dropped
+}
+
+fn overwritten_and_deleted(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
+    conn.execute(
         "UPDATE message_index SET
              body = zeroblob(length(CAST(body AS BLOB))),
              link = CASE WHEN link IS NULL THEN NULL
@@ -43,8 +64,7 @@ pub fn drop_row(conn: &Connection, id: &[u8]) -> Result<bool, StorageError> {
          WHERE id = ?1",
         params![id],
     )?;
-    let dropped = tx.execute("DELETE FROM message_index WHERE id = ?1", params![id])?;
-    tx.commit()?;
+    let dropped = conn.execute("DELETE FROM message_index WHERE id = ?1", params![id])?;
     Ok(dropped == 1)
 }
 
@@ -62,10 +82,21 @@ mod tests {
     const TO: &str = "github.com/owner/agent-of-otter-quince";
     const WORDS: [&str; 5] = [BODY, LINK, SUBJECT, FROM, TO];
 
-    /// Put a message `id` from `signer` in the index, held at `number`,
-    /// with a mark of each kind, a row of first holding, and its text
-    /// in `WORDS`.
+    /// The generation 1: a messages channel of zeros, begun by statement 1.
+    fn generation_1(conn: &Connection) {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_generations (id, channel, statement, first_held)
+             VALUES (1, zeroblob(32), 1, 100)",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Put a message `id` from `signer` in the index, held at `number`
+    /// in the generation 1, with a mark of each kind, a row of first
+    /// holding, and its text in `WORDS`.
     fn indexed(conn: &Connection, id: u8, number: i64) {
+        generation_1(conn);
         let id = [id; 16];
         conn.execute(
             "INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
@@ -83,8 +114,8 @@ mod tests {
                  VALUES (zeroblob(32), 1, {number}, X'{hex}', 100, 100);
              INSERT INTO message_announced (id, name) VALUES (X'{hex}', 'notes');
              INSERT INTO message_read_by_a_person (id) VALUES (X'{hex}');
-             INSERT INTO message_read_here (mark, id, name, made_at)
-                 VALUES (X'{hex}', X'{hex}', 'notes', 102);",
+             INSERT INTO message_read_here (mark, seq, id, name, made_at)
+                 VALUES (X'{hex}', {number}, X'{hex}', 'notes', 102);",
             hex = hex::encode(id),
         ))
         .unwrap();
@@ -141,10 +172,14 @@ mod tests {
         assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
     }
 
-    /// The fields are written over before the row is deleted, so that a
-    /// row that goes leaves nothing of its text in the database even on
-    /// a connection with no `secure_delete` (decision 2026-10-09 §7.1).
-    /// A row deleted without that leaves its text in the file.
+    /// The fields are written over before the row is deleted, as the
+    /// record asks (decision 2026-10-09 §7.1), and a row deleted without
+    /// that leaves its text in the file. Here, on a connection with no
+    /// `secure_delete`, the overwrite leaves nothing of the dropped row's
+    /// text only because its cell never moved: a row that was updated and
+    /// grew leaves its text in the cells it moved from, which only
+    /// `secure_delete` writes over. That nothing is left rests on
+    /// `secure_delete`; the overwrite is what the record asks for besides.
     #[test]
     fn a_dropped_row_is_overwritten_before_it_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
@@ -255,8 +290,8 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO message_numbers (signer, generation, number, id)
                  VALUES (zeroblob(32), 1, 65, X'01010101010101010101010101010101');
-             INSERT INTO message_read_here (mark, made_at, merged_at)
-                 VALUES (X'09090909090909090909090909090909', 90, 103);",
+             INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (X'09090909090909090909090909090909', 0, 90, 103);",
         )
         .unwrap();
 
@@ -295,6 +330,7 @@ mod tests {
     #[test]
     fn a_kept_value_is_of_a_messages_length_and_takes_its_numbers_and_relays_with_it() {
         let conn = db::open_in_memory().unwrap();
+        generation_1(&conn);
         let keep = |id: u8, bytes: usize| {
             conn.execute(
                 "INSERT INTO message_kept (id, generation, value, sent, kept_at)
@@ -316,5 +352,183 @@ mod tests {
         conn.execute("DELETE FROM message_kept", []).unwrap();
         assert_eq!(count(&conn, "message_kept_numbers"), 0);
         assert_eq!(count(&conn, "message_kept_taken"), 0);
+    }
+
+    /// `drop_row` nests in the caller's write (decision 2026-10-09 §7.1):
+    /// inside an open transaction and inside a savepoint it overwrites
+    /// and deletes the row as a part of that write, which the caller then
+    /// keeps or takes back whole.
+    #[test]
+    fn a_row_is_dropped_inside_a_transaction_or_a_savepoint_of_the_callers() {
+        let conn = db::open_in_memory().unwrap();
+        indexed(&conn, 1, 1);
+        let body = |conn: &Connection| -> Option<Vec<u8>> {
+            conn.query_row(
+                "SELECT CAST(body AS BLOB) FROM message_index WHERE id = ?1",
+                [&[1u8; 16][..]],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
+        for begin in ["BEGIN", "SAVEPOINT the_doors_write"] {
+            conn.execute_batch(begin).unwrap();
+            assert!(drop_row(&conn, &[1; 16]).unwrap(), "{begin}");
+            assert_eq!(count(&conn, "message_index"), 0, "{begin}");
+            assert!(!conn.is_autocommit(), "{begin}: the caller's write is open");
+            let back = if begin == "BEGIN" {
+                "ROLLBACK"
+            } else {
+                "ROLLBACK TO the_doors_write; RELEASE the_doors_write"
+            };
+            conn.execute_batch(back).unwrap();
+            assert_eq!(body(&conn), Some(BODY.as_bytes().to_vec()), "{begin}");
+        }
+
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(drop_row(&conn, &[1; 16]).unwrap());
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(body(&conn), None);
+        assert_eq!(count(&conn, "message_numbers"), 0);
+    }
+
+    /// A generation is the messages channel, not the number of the
+    /// statement that began it (decision 2026-10-09 §7.1, §9.2): two
+    /// channels begun under statement 1, as a device alone under a phrase
+    /// that makes a new one has, are two generations, and the same signer
+    /// at the same number in each is two rows that do not collide. A
+    /// channel is one generation, and a generation that the device never
+    /// held is refused in every table.
+    #[test]
+    fn two_channels_under_one_statements_number_are_two_generations() {
+        let conn = db::open_in_memory().unwrap();
+        let begin = |channel: u8| {
+            conn.execute(
+                "INSERT INTO message_generations (channel, statement, first_held)
+                 VALUES (?1, 1, 100)",
+                [&[channel; 32][..]],
+            )
+            .map(|_| conn.last_insert_rowid())
+        };
+        let first = begin(1).unwrap();
+        let second = begin(2).unwrap();
+        assert_ne!(first, second);
+        assert!(begin(1).is_err(), "a channel is one generation");
+
+        for (generation, id) in [(first, 1u8), (second, 2)] {
+            conn.execute(
+                "INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                 VALUES (?1, zeroblob(32), 'laptop', ?2, 2, NULL, '~', 9, 'x', zeroblob(16),
+                         zeroblob(16), 0, NULL, 'x', 9, NULL)",
+                params![&[id; 16][..], generation],
+            )
+            .unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), {generation}, 1, X'{hex}');
+                 INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                 first_held)
+                     VALUES (zeroblob(32), {generation}, 1, X'{hex}', 9, 9);
+                 INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (zeroblob(32), {generation}, 1, 1);
+                 INSERT INTO message_places (signer, generation, placed_at)
+                     VALUES (zeroblob(32), {generation}, 10);
+                 INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                     VALUES (X'{hex}', {generation}, zeroblob(1936), 9, 9);",
+                hex = hex::encode([id; 16]),
+            ))
+            .unwrap();
+        }
+        let held: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT g.statement, n.generation FROM message_numbers n
+                 JOIN message_generations g ON g.id = n.generation ORDER BY n.generation",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(held, [(1, first), (1, second)]);
+
+        let never = second + 1;
+        for refused in [
+            format!(
+                "INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                 VALUES (zeroblob(16), zeroblob(32), 'laptop', {never}, 2, NULL, '~', 9, 'x',
+                         zeroblob(16), zeroblob(16), 0, NULL, 'x', 9, NULL)"
+            ),
+            format!(
+                "INSERT INTO message_numbers (signer, generation, number, id)
+                 VALUES (zeroblob(32), {never}, 1, X'{}')",
+                hex::encode([1u8; 16])
+            ),
+            format!(
+                "INSERT INTO message_first_held (signer, generation, number, id, sent, first_held)
+                 VALUES (zeroblob(32), {never}, 1, zeroblob(16), 9, 9)"
+            ),
+            format!(
+                "INSERT INTO message_signers (signer, generation, highest)
+                 VALUES (zeroblob(32), {never}, 1)"
+            ),
+            format!(
+                "INSERT INTO message_places (signer, generation, placed_at)
+                 VALUES (zeroblob(32), {never}, 10)"
+            ),
+            format!(
+                "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                 VALUES (zeroblob(16), {never}, zeroblob(1936), 9, 9)"
+            ),
+        ] {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+    }
+
+    /// A number, the highest number held, and the number counted from
+    /// are at most the highest number of a message (decision 2026-10-09
+    /// §2.3, §2.5): each table takes it, and refuses one above it.
+    #[test]
+    fn no_number_is_above_the_highest_number_of_a_message() {
+        let conn = db::open_in_memory().unwrap();
+        indexed(&conn, 1, 1);
+        conn.execute_batch(
+            "INSERT INTO message_kept (id, generation, value, sent, kept_at)
+             VALUES (X'01010101010101010101010101010101', 1, zeroblob(1936), 9, 9);",
+        )
+        .unwrap();
+        let id = format!("X'{}'", hex::encode([1u8; 16]));
+        let at = |number: i64| -> Vec<String> {
+            vec![
+                format!(
+                    "INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), 1, {number}, {id})"
+                ),
+                format!(
+                    "INSERT INTO message_first_held (signer, generation, number, id, sent,
+                                                     first_held)
+                     VALUES (zeroblob(32), 1, {number}, {id}, 9, 9)"
+                ),
+                format!(
+                    "INSERT INTO message_signers (signer, generation, highest)
+                     VALUES (zeroblob(32), 1, {number})"
+                ),
+                format!(
+                    "INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (X'{}', 1, 1, {number})",
+                    hex::encode([2u8; 32])
+                ),
+                format!("INSERT INTO message_kept_numbers (id, number) VALUES ({id}, {number})"),
+            ]
+        };
+        for refused in at(AGENT_MESSAGE_NUMBER_MAX + 1) {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        for taken in at(AGENT_MESSAGE_NUMBER_MAX) {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+        }
     }
 }
