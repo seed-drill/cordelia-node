@@ -44,13 +44,17 @@ cordelia-node/
                          #   message (the value of a message, its ID and the ring);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 18). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
                          #   history; meta (the keys of node_meta); first_start (the copy,
-                         #   the step and the guard); the older kind: channels, items, psk,
-                         #   search
+                         #   the step and the guard); messages (step 19: what a device keeps
+                         #   of messages between its agents, a generation being a messages
+                         #   channel it held; a row overwritten before it goes, in the
+                         #   caller's write); db (secure_delete, set before the steps run,
+                         #   and the truncating checkpoint of a personal node); the older
+                         #   kind: channels, items, psk, search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
                          #   the five streams of entries (0x10 to 0x14); transport.rs
                          #   exports the session's value for a proof

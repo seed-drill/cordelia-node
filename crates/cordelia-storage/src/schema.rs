@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -667,6 +667,205 @@ CREATE TABLE person_left (
 );
 "#;
 
+/// Migration v19: what a device keeps of messages between the person's
+/// own agents (decision 2026-10-09 §2.3, §2.5, §6, §7, §9.2).
+///
+/// A signer is the key that signed a message's entry (32 bytes), a
+/// generation is the messages channel an entry is in, kept as the ID of
+/// its row in `message_generations` (§7.1, §9.2), a message's ID is 16
+/// bytes, and a time is in seconds by the device's own clock. A number,
+/// and the highest number held, is at most 2^42 - 1 (§2.3).
+///
+/// - `message_generations`: one row for each messages channel the device
+///   has held, by its ID (an integer, which is the generation in every
+///   other table), with the channel's ID, the number of the statement
+///   that began it, and when the device first held it. A statement's
+///   number is not a generation: a device alone under a phrase that makes
+///   a new phrase is at statement 1 again, with a new messages channel.
+/// - `message_index`: one row for each message the device holds opened,
+///   by its ID, with every field it was opened to: the label the device
+///   knew its signer by, `to_kind` (1: one name, in `to_name`; 2: every
+///   name, and no `to_name`), `from_name`, `sent`, the subject, `thread`
+///   and `answers` (zeros where none), whether it asks for an answer,
+///   the link (NULL where none), the body, when the device first held
+///   it, and its place: when it was first shown, NULL until then (§6,
+///   §7.1); and `not_every_relay`, 1 where it is the device's own and its
+///   kept value was dropped before every relay had taken it, so that
+///   `log` says it may not have reached every relay (§2.3, §4.1). The
+///   body, the link, the subject, `from_name` and `to_name` are
+///   overwritten with zeros before a row is deleted
+///   ([`crate::messages::drop_row`]).
+/// - `message_numbers`: the numbers each message is held at, one row for
+///   each signer, generation and number. A message held at two numbers
+///   is one row of the index and two here. They go with the index row.
+/// - `message_first_held`: one row for each live number held, with its
+///   ID, `sent`, and when it was first held. It outlives the index row,
+///   so that an entry taken again at a live number after its 30 days is
+///   not shown again (§7.1).
+/// - `message_signers`: for each signer and generation, H, the highest
+///   number held of a message or a clearing, with the counts of numbers
+///   that were overwritten before they were shown and of entries that
+///   were not messages, and `counted_from`, the first number of that
+///   signer the device held in that generation, from which what was
+///   overwritten is counted, NULL until it holds one (§2.5).
+/// - `message_places`: the time of each place given to a signer in a
+///   generation, kept for the hour of the reader's rate (§6).
+/// - `message_lists`: the marks of the latest list of each other device,
+///   by its key (§7.2).
+/// - `message_read_here`: this device's own table of what its agents
+///   read: each mark, with the message's ID and the name that read it,
+///   and when it was made; or the mark alone, where it was merged from
+///   the device's own list on a relay and no message has been found for
+///   it, with when it was merged. `seq` is the order of the table, unique
+///   on the device: the newest is the highest, and a mark merged as older
+///   than any held takes one below the lowest, so it may be 0 or below.
+///   A row with an ID goes with its message (§7.2).
+/// - `message_announced`, `message_read_by_a_person`: the device's own
+///   marks, that `summary` announced a message to the agent of a name
+///   here, and that a person read it here. They go with the message.
+/// - `message_sends`: one row for each send by the device's clock, with
+///   the name of the folder's agent that sent and whether it was to every
+///   name; a send again has no name (§6).
+/// - `message_kept`, `message_kept_numbers`, `message_kept_taken`: each
+///   message of the device's own that not every relay has taken, its
+///   value as it was sent, the numbers it was sent under, and the relays
+///   that have taken it (§2.3).
+///
+/// `secure_delete` is not a step: it is set on a personal node's
+/// connection where the node opens its store, before the steps run
+/// (§7.1). A relay keeps nothing in any of these tables.
+const MIGRATION_V19: &str = r#"
+CREATE TABLE message_generations (
+    id          INTEGER PRIMARY KEY,
+    channel     BLOB NOT NULL UNIQUE CHECK(length(channel) = 32),
+    statement   INTEGER NOT NULL CHECK(statement >= 1),
+    first_held  INTEGER NOT NULL
+);
+
+CREATE TABLE message_index (
+    id               BLOB PRIMARY KEY CHECK(length(id) = 16),
+    signer           BLOB NOT NULL CHECK(length(signer) = 32),
+    label            TEXT NOT NULL,
+    generation       INTEGER NOT NULL REFERENCES message_generations(id),
+    to_kind          INTEGER NOT NULL CHECK(to_kind IN (1, 2)),
+    to_name          TEXT CHECK((to_kind = 1) = (to_name IS NOT NULL)),
+    from_name        TEXT NOT NULL,
+    sent             INTEGER NOT NULL,
+    subject          TEXT NOT NULL,
+    thread           BLOB NOT NULL CHECK(length(thread) = 16),
+    answers          BLOB NOT NULL CHECK(length(answers) = 16),
+    asks             INTEGER NOT NULL CHECK(asks IN (0, 1)),
+    link             TEXT,
+    body             TEXT NOT NULL,
+    first_held       INTEGER NOT NULL,
+    placed_at        INTEGER,
+    not_every_relay  INTEGER NOT NULL DEFAULT 0 CHECK(not_every_relay IN (0, 1))
+);
+
+CREATE INDEX idx_message_index_signer ON message_index(signer, generation);
+
+CREATE TABLE message_numbers (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    number      INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    id          BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
+    PRIMARY KEY (signer, generation, number)
+);
+
+CREATE INDEX idx_message_numbers_id ON message_numbers(id);
+
+CREATE TABLE message_first_held (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    number      INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    id          BLOB NOT NULL CHECK(length(id) = 16),
+    sent        INTEGER NOT NULL,
+    first_held  INTEGER NOT NULL,
+    PRIMARY KEY (signer, generation, number)
+);
+
+CREATE TABLE message_signers (
+    signer        BLOB NOT NULL CHECK(length(signer) = 32),
+    generation    INTEGER NOT NULL REFERENCES message_generations(id),
+    highest       INTEGER NOT NULL CHECK(highest >= 0 AND highest <= 4398046511103),
+    overwritten   INTEGER NOT NULL DEFAULT 0 CHECK(overwritten >= 0),
+    not_messages  INTEGER NOT NULL DEFAULT 0 CHECK(not_messages >= 0),
+    counted_from  INTEGER CHECK(counted_from >= 1 AND counted_from <= 4398046511103),
+    PRIMARY KEY (signer, generation)
+);
+
+CREATE TABLE message_places (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    placed_at   INTEGER NOT NULL
+);
+
+CREATE INDEX idx_message_places ON message_places(signer, generation, placed_at);
+
+-- A list is stored without repeats: whoever writes the taking of a list
+-- must keep each of its marks once, since a row is keyed by the device's
+-- key and the mark.
+CREATE TABLE message_lists (
+    key   BLOB NOT NULL CHECK(length(key) = 32),
+    mark  BLOB NOT NULL CHECK(length(mark) = 16),
+    PRIMARY KEY (key, mark)
+);
+
+CREATE INDEX idx_message_lists_mark ON message_lists(mark);
+
+CREATE TABLE message_read_here (
+    mark       BLOB PRIMARY KEY CHECK(length(mark) = 16),
+    seq        INTEGER NOT NULL UNIQUE,
+    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    name       TEXT CHECK(name IS NULL OR length(name) >= 1),
+    made_at    INTEGER NOT NULL,
+    merged_at  INTEGER,
+    CHECK((id IS NULL) = (name IS NULL)),
+    CHECK(id IS NOT NULL OR merged_at IS NOT NULL)
+);
+
+CREATE INDEX idx_message_read_here_id ON message_read_here(id);
+
+CREATE TABLE message_announced (
+    id    BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
+    name  TEXT NOT NULL CHECK(length(name) >= 1),
+    PRIMARY KEY (id, name)
+);
+
+CREATE TABLE message_read_by_a_person (
+    id  BLOB PRIMARY KEY REFERENCES message_index(id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_sends (
+    sent_at  INTEGER NOT NULL,
+    name     TEXT CHECK(name IS NULL OR length(name) >= 1),
+    to_all   INTEGER NOT NULL CHECK(to_all IN (0, 1)),
+    CHECK(name IS NOT NULL OR to_all = 0)
+);
+
+CREATE INDEX idx_message_sends_at ON message_sends(sent_at);
+
+CREATE TABLE message_kept (
+    id          BLOB PRIMARY KEY CHECK(length(id) = 16),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    value       BLOB NOT NULL CHECK(length(value) = 1936),
+    sent        INTEGER NOT NULL,
+    kept_at     INTEGER NOT NULL
+);
+
+CREATE TABLE message_kept_numbers (
+    id      BLOB NOT NULL REFERENCES message_kept(id) ON DELETE CASCADE,
+    number  INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    PRIMARY KEY (id, number)
+);
+
+CREATE TABLE message_kept_taken (
+    id     BLOB NOT NULL REFERENCES message_kept(id) ON DELETE CASCADE,
+    relay  BLOB NOT NULL CHECK(length(relay) = 32),
+    PRIMARY KEY (id, relay)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -706,14 +905,19 @@ fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), Stor
 /// Whoever opens the database is told both versions
 /// ([`StorageError::LaterVersion`]).
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
-    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if found > SCHEMA_VERSION {
-        return Err(StorageError::LaterVersion {
-            found,
-            own: SCHEMA_VERSION,
-        });
-    }
+    refuse_a_later_version(conn, SCHEMA_VERSION)?;
     run_steps(conn, SCHEMA_VERSION)
+}
+
+/// Refuse a database whose version is above `own`, as a schema at version
+/// `own` refuses it: this one's, or, in a test, the version before's
+/// (decision 2026-10-09 §9.2).
+fn refuse_a_later_version(conn: &Connection, own: u32) -> Result<(), StorageError> {
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found > own {
+        return Err(StorageError::LaterVersion { found, own });
+    }
+    Ok(())
 }
 
 /// Initialise a database as the released version of the program does:
@@ -858,6 +1062,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
         migrate_in_one(conn, MIGRATION_V18, 18)?;
     }
 
+    if current < 19 {
+        tracing::info!("applying migration v19 (messages between the person's own agents)");
+        migrate_in_one(conn, MIGRATION_V19, 19)?;
+    }
+
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
@@ -945,6 +1154,7 @@ mod tests {
         assert_eq!(RELEASED_SCHEMA_VERSION, 10);
         assert!(has(&conn, "index_lines") && has(&conn, "channels"));
         assert!(!has(&conn, "entries") && !has(&conn, "person"));
+        assert!(!has(&conn, "message_index") && !has(&conn, "message_kept"));
         // Again: nothing more.
         init_db_as_released(&conn).unwrap();
         assert_eq!(version(&conn), RELEASED_SCHEMA_VERSION);
@@ -952,6 +1162,7 @@ mod tests {
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert!(has(&conn, "entries") && has(&conn, "person"));
+        assert!(has(&conn, "message_index") && has(&conn, "message_kept"));
         // A database that is further on is left where it is.
         init_db_as_released(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
@@ -1433,10 +1644,11 @@ mod tests {
     /// wrote. What a later step adds is left out too: the tables of what
     /// a device holds of its person, the table of the channels a relay
     /// holds, the index of each channel's own order of entries, the
-    /// counts of what `items` holds with the triggers that keep them, and
-    /// what a device keeps of each relay. The definition of the table of
-    /// what a folder agreed is left out, and read by itself
-    /// ([`definition_of`]): a later step adds a column to it.
+    /// counts of what `items` holds with the triggers that keep them,
+    /// what a device keeps of each relay, and the tables of messages. The
+    /// definition of the table of what a folder agreed is left out, and
+    /// read by itself ([`definition_of`]): a later step adds a column to
+    /// it.
     fn held_before_v11(conn: &Connection) -> Vec<String> {
         let mut held: Vec<String> = conn
             .prepare(
@@ -1448,6 +1660,7 @@ mod tests {
                    AND name NOT LIKE '%relay_channels%'
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
+                   AND name NOT LIKE '%message%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1670,6 +1883,7 @@ mod tests {
                AND name NOT LIKE '%person_cleared%'
                AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE '%person_left%'
+               AND name NOT LIKE '%message%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -1878,6 +2092,7 @@ mod tests {
                    AND name NOT LIKE '%person_cleared%'
                    AND name NOT LIKE '%person_names_before%'
                    AND name NOT LIKE '%person_left%'
+                   AND name NOT LIKE '%message%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -2679,7 +2894,6 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 18);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v18(&conn), NEW_IN_V18);
         // Everything it held is as it was, but for the two columns.
@@ -2741,6 +2955,643 @@ mod tests {
         }
     }
 
+    /// A database as a binary from before messages leaves it: what
+    /// [`at_v17`] holds, where a key was typed, and a word that outlived
+    /// a change.
+    fn at_v18() -> Connection {
+        let conn = at_v17();
+        migrate_in_one(&conn, MIGRATION_V18, 18).unwrap();
+        conn.execute_batch(
+            "UPDATE person_typed_keys SET stood = 'alone';
+             INSERT INTO person_left (key, notice, number, noted_at)
+             VALUES (zeroblob(32), zeroblob(32), 2, 9);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// What the step to version 19 adds: fourteen tables, and six
+    /// indexes.
+    const NEW_IN_V19: [&str; 20] = [
+        "idx_message_index_signer",
+        "idx_message_lists_mark",
+        "idx_message_numbers_id",
+        "idx_message_places",
+        "idx_message_read_here_id",
+        "idx_message_sends_at",
+        "message_announced",
+        "message_first_held",
+        "message_generations",
+        "message_index",
+        "message_kept",
+        "message_kept_numbers",
+        "message_kept_taken",
+        "message_lists",
+        "message_numbers",
+        "message_places",
+        "message_read_by_a_person",
+        "message_read_here",
+        "message_sends",
+        "message_signers",
+    ];
+
+    /// What a database holds of the step to version 19, by name.
+    fn new_in_v19(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE '%message%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database holds: each definition, and each row of
+    /// each table, in the order of their names, but what the step to
+    /// version 19 adds.
+    fn everything_but_v19(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V19.contains(&name.as_str()) || name.contains("message") {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 19 adds the tables of messages, empty, and
+    /// changes no older row or definition (decision 2026-10-09 §9.2): it
+    /// is made in one step with its version, so a failure between them
+    /// leaves none of it, and the step asked for twice is run once. What
+    /// the tables keep stays across a start, and each takes no row that
+    /// cannot be what a device keeps.
+    #[test]
+    fn step_19_adds_its_tables_and_changes_no_older_row() {
+        let conn = at_v18();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v19(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 18);
+        assert!(new_in_v19(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V19} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 19).is_err());
+        assert_eq!(version(&conn), 18);
+        assert!(
+            new_in_v19(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 19);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v19(&conn), NEW_IN_V19);
+        assert_eq!(everything_but_v19(&conn), before);
+        for table in NEW_IN_V19.iter().filter(|name| !name.starts_with("idx_")) {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        for (index, on) in [
+            (
+                "idx_message_index_signer",
+                "message_index(signer, generation)",
+            ),
+            ("idx_message_lists_mark", "message_lists(mark)"),
+            ("idx_message_numbers_id", "message_numbers(id)"),
+            (
+                "idx_message_places",
+                "message_places(signer, generation, placed_at)",
+            ),
+            ("idx_message_read_here_id", "message_read_here(id)"),
+            ("idx_message_sends_at", "message_sends(sent_at)"),
+        ] {
+            assert!(definition_of(&conn, index).contains(on), "{index}");
+        }
+
+        // What the device keeps, one row of each table.
+        let id = "X'01010101010101010101010101010101'";
+        let kept_rows = format!(
+            "INSERT INTO message_generations (id, channel, statement, first_held)
+                 VALUES (1, zeroblob(32), 1, 8), (2, X'{second}', 1, 9);
+             INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                        from_name, sent, subject, thread, answers, asks,
+                                        link, body, first_held, placed_at)
+                 VALUES ({id}, zeroblob(32), 'laptop', 1, 1, 'notes', '~', 9, 'a', zeroblob(16),
+                         zeroblob(16), 0, NULL, 'a', 9, NULL),
+                        (X'02020202020202020202020202020202', zeroblob(32), 'laptop', 1, 2, NULL,
+                         '~', 9, 'b', zeroblob(16), zeroblob(16), 1, 'owner/repo#1', 'b', 9, 10);
+             INSERT INTO message_numbers (signer, generation, number, id)
+                 VALUES (zeroblob(32), 1, 1, {id});
+             INSERT INTO message_first_held (signer, generation, number, id, sent, first_held)
+                 VALUES (zeroblob(32), 1, 1, {id}, 9, 9);
+             INSERT INTO message_signers (signer, generation, highest, counted_from)
+                 VALUES (zeroblob(32), 1, 1, 1);
+             INSERT INTO message_places (signer, generation, placed_at)
+                 VALUES (zeroblob(32), 1, 10), (zeroblob(32), 1, 10);
+             INSERT INTO message_lists (key, mark) VALUES (zeroblob(32), zeroblob(16));
+             INSERT INTO message_read_here (mark, seq, id, name, made_at)
+                 VALUES (zeroblob(16), 2, {id}, 'notes', 11);
+             INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (X'09090909090909090909090909090909', 1, 8, 12);
+             INSERT INTO message_announced (id, name) VALUES ({id}, 'notes');
+             INSERT INTO message_read_by_a_person (id) VALUES ({id});
+             INSERT INTO message_sends (sent_at, name, to_all)
+                 VALUES (9, 'notes', 0), (9, 'notes', 1), (10, NULL, 0);
+             INSERT INTO message_kept (id, generation, value, sent, kept_at)
+                 VALUES ({id}, 1, zeroblob(1936), 9, 9);
+             INSERT INTO message_kept_numbers (id, number) VALUES ({id}, 1), ({id}, 65);
+             INSERT INTO message_kept_taken (id, relay) VALUES ({id}, zeroblob(32));
+             UPDATE message_index SET not_every_relay = 1
+                 WHERE id = X'02020202020202020202020202020202';",
+            second = "02".repeat(32),
+        );
+        conn.execute_batch(&kept_rows).unwrap();
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V19
+                .iter()
+                .filter(|name| !name.starts_with("idx_"))
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        let kept = counted(&conn);
+        assert_eq!(kept, [1, 1, 2, 2, 1, 2, 1, 1, 1, 2, 1, 2, 3, 1]);
+        // A message's kept value was not dropped before every relay took
+        // it, but where that is said; and H is counted from no number
+        // until one is held.
+        let flags: Vec<i64> = conn
+            .prepare("SELECT not_every_relay FROM message_index ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(flags, [0, 1]);
+        conn.execute(
+            "INSERT INTO message_signers (signer, generation, highest) VALUES (zeroblob(32), 2, 0)",
+            [],
+        )
+        .unwrap();
+        let counted_from: Option<i64> = conn
+            .query_row(
+                "SELECT counted_from FROM message_signers WHERE generation = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counted_from, None);
+        conn.execute("DELETE FROM message_signers WHERE generation = 2", [])
+            .unwrap();
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V19, 19).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, kept.clone())
+        );
+        assert_eq!(everything_but_v19(&conn), before);
+
+        // A row that cannot be what a device keeps is refused.
+        let one = |table: &str, columns: &str, values: &str| {
+            format!("INSERT INTO {table} ({columns}) VALUES ({values})")
+        };
+        let index = |values: &str| {
+            one(
+                "message_index",
+                "id, signer, label, generation, to_kind, to_name, from_name, sent, subject,
+                 thread, answers, asks, link, body, first_held, placed_at",
+                values,
+            )
+        };
+        let other = "X'03030303030303030303030303030303'";
+        let index_row = |change: (usize, &str)| {
+            let mut values = [
+                other,
+                "zeroblob(32)",
+                "'laptop'",
+                "1",
+                "1",
+                "'notes'",
+                "'~'",
+                "9",
+                "'a'",
+                "zeroblob(16)",
+                "zeroblob(16)",
+                "0",
+                "NULL",
+                "'a'",
+                "9",
+                "NULL",
+            ];
+            values[change.0] = change.1;
+            index(&values.join(", "))
+        };
+        assert_eq!(conn.execute(&index_row((0, other)), []), Ok(1));
+        conn.execute("DELETE FROM message_index WHERE id = ?1", [&[3u8; 16][..]])
+            .unwrap();
+        let mut refused: Vec<String> = [
+            // An ID, a signer, a thread or an answer of another length.
+            (0, "zeroblob(15)"),
+            (0, id),
+            (1, "zeroblob(31)"),
+            (9, "zeroblob(17)"),
+            (10, "zeroblob(15)"),
+            // No generation, a kind of `to` that is neither, a name for
+            // every name, no name for one, and a flag that is neither.
+            (3, "0"),
+            (4, "3"),
+            (4, "2"),
+            (5, "NULL"),
+            (11, "2"),
+            // A field that a message always has, missing.
+            (2, "NULL"),
+            (6, "NULL"),
+            (7, "NULL"),
+            (8, "NULL"),
+            (13, "NULL"),
+            (14, "NULL"),
+        ]
+        .into_iter()
+        .map(index_row)
+        .collect();
+        // A kind of `to` that is neither, with no name, as for every name.
+        refused.push(index_row((4, "3")).replace("3, 'notes'", "3, NULL"));
+        refused.extend([
+            one(
+                "message_numbers",
+                "signer, generation, number, id",
+                &format!("zeroblob(31), 1, 2, {id}"),
+            ),
+            one(
+                "message_numbers",
+                "signer, generation, number, id",
+                &format!("zeroblob(32), 0, 2, {id}"),
+            ),
+            one(
+                "message_numbers",
+                "signer, generation, number, id",
+                &format!("zeroblob(32), 1, 0, {id}"),
+            ),
+            one(
+                "message_numbers",
+                "signer, generation, number, id",
+                &format!("zeroblob(32), 1, 1, {id}"),
+            ),
+            one(
+                "message_numbers",
+                "signer, generation, number, id",
+                &format!("zeroblob(32), 1, 2, {other}"),
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                &format!("zeroblob(33), 1, 2, {id}, 9, 9"),
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                &format!("zeroblob(32), 0, 2, {id}, 9, 9"),
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                &format!("zeroblob(32), 1, 0, {id}, 9, 9"),
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                "zeroblob(32), 1, 2, zeroblob(17), 9, 9",
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent, first_held",
+                &format!("zeroblob(32), 1, 1, {id}, 9, 9"),
+            ),
+            one(
+                "message_first_held",
+                "signer, generation, number, id, sent",
+                &format!("zeroblob(32), 1, 2, {id}, 9"),
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest",
+                "zeroblob(31), 1, 1",
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest",
+                "zeroblob(32), 0, 1",
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest",
+                "zeroblob(32), 2, -1",
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest, overwritten",
+                "zeroblob(32), 2, 1, -1",
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest, not_messages",
+                "zeroblob(32), 2, 1, -1",
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest",
+                "zeroblob(32), 1, 2",
+            ),
+            one(
+                "message_places",
+                "signer, generation, placed_at",
+                "zeroblob(31), 1, 10",
+            ),
+            one(
+                "message_places",
+                "signer, generation, placed_at",
+                "zeroblob(32), 0, 10",
+            ),
+            one("message_places", "signer, generation", "zeroblob(32), 1"),
+            one("message_lists", "key, mark", "zeroblob(31), zeroblob(16)"),
+            one("message_lists", "key, mark", "zeroblob(32), zeroblob(17)"),
+            one("message_lists", "key, mark", "zeroblob(32), zeroblob(16)"),
+            // A mark of another length, a mark held twice, an ID with no
+            // name or a name with no ID, an empty name, a mark with
+            // neither and never merged, no time, an ID of no message, and
+            // no place in the table's order or a place another mark has.
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("zeroblob(15), 3, {id}, 'notes', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("zeroblob(16), 3, {id}, 'other', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, made_at, merged_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, {id}, 11, 12"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, name, made_at, merged_at",
+                "X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, 'notes', 11, 12",
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, {id}, '', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, made_at",
+                "X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, 11",
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, {id}, 'notes'"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 3, {other}, 'notes', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, id, name, made_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', {id}, 'notes', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', NULL, {id}, 'notes', 11"),
+            ),
+            one(
+                "message_read_here",
+                "mark, seq, id, name, made_at",
+                &format!("X'0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A', 2, {id}, 'notes', 11"),
+            ),
+            one("message_announced", "id, name", &format!("{id}, 'notes'")),
+            one("message_announced", "id, name", &format!("{id}, ''")),
+            one("message_announced", "id, name", &format!("{id}, NULL")),
+            one(
+                "message_announced",
+                "id, name",
+                &format!("{other}, 'notes'"),
+            ),
+            one("message_read_by_a_person", "id", id),
+            one("message_read_by_a_person", "id", other),
+            one("message_sends", "sent_at, name, to_all", "9, 'notes', 2"),
+            one("message_sends", "sent_at, name, to_all", "9, NULL, 1"),
+            one("message_sends", "sent_at, name, to_all", "9, '', 0"),
+            one("message_sends", "name, to_all", "'notes', 0"),
+            one(
+                "message_kept",
+                "id, generation, value, sent, kept_at",
+                &format!("{id}, 1, zeroblob(1936), 9, 9"),
+            ),
+            one(
+                "message_kept",
+                "id, generation, value, sent, kept_at",
+                "zeroblob(15), 1, zeroblob(1936), 9, 9",
+            ),
+            one(
+                "message_kept",
+                "id, generation, value, sent, kept_at",
+                &format!("{other}, 0, zeroblob(1936), 9, 9"),
+            ),
+            one(
+                "message_kept",
+                "id, generation, value, sent, kept_at",
+                &format!("{other}, 1, zeroblob(1935), 9, 9"),
+            ),
+            one(
+                "message_kept",
+                "id, generation, value, kept_at",
+                &format!("{other}, 1, zeroblob(1936), 9"),
+            ),
+            one(
+                "message_kept",
+                "id, generation, value, sent",
+                &format!("{other}, 1, zeroblob(1936), 9"),
+            ),
+            one("message_kept_numbers", "id, number", &format!("{id}, 0")),
+            one("message_kept_numbers", "id, number", &format!("{id}, 65")),
+            one("message_kept_numbers", "id, number", &format!("{other}, 2")),
+            one(
+                "message_kept_taken",
+                "id, relay",
+                &format!("{id}, zeroblob(31)"),
+            ),
+            one(
+                "message_kept_taken",
+                "id, relay",
+                &format!("{id}, zeroblob(32)"),
+            ),
+            one(
+                "message_kept_taken",
+                "id, relay",
+                &format!("{other}, zeroblob(32)"),
+            ),
+            // A channel of another length, a channel that is a generation
+            // already, no statement or one below the first, no time; a
+            // number counted from below the first; and a flag that is
+            // neither, or none.
+            one(
+                "message_generations",
+                "channel, statement, first_held",
+                "zeroblob(31), 1, 9",
+            ),
+            one(
+                "message_generations",
+                "channel, statement, first_held",
+                "zeroblob(32), 2, 9",
+            ),
+            one(
+                "message_generations",
+                "channel, statement, first_held",
+                "zeroblob(33), 1, 9",
+            ),
+            one(
+                "message_generations",
+                "channel, first_held",
+                &format!("X'{}', 9", "03".repeat(32)),
+            ),
+            one(
+                "message_generations",
+                "channel, statement, first_held",
+                &format!("X'{}', 0, 9", "03".repeat(32)),
+            ),
+            one(
+                "message_generations",
+                "channel, statement",
+                &format!("X'{}', 1", "03".repeat(32)),
+            ),
+            one(
+                "message_signers",
+                "signer, generation, highest, counted_from",
+                "zeroblob(32), 2, 1, 0",
+            ),
+            "UPDATE message_index SET not_every_relay = 2".to_string(),
+            "UPDATE message_index SET not_every_relay = NULL".to_string(),
+        ]);
+        for refused in refused {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        assert_eq!(counted(&conn), kept);
+    }
+
+    /// A store opened as a personal node opens it has `secure_delete` on
+    /// before the schema's steps run (decision 2026-10-09 §7.1): a step
+    /// that rewrites a table, as step 4 rewrites `channels`, leaves
+    /// nothing of the table it dropped in the file. Opened as a relay's
+    /// is, the dropped table's text stays beside the copy.
+    #[test]
+    fn a_step_that_rewrites_a_table_writes_zeros_where_the_store_is_opened_so() {
+        let words = "a descriptor of grebe-tamarind-cobalt";
+        let dir = tempfile::tempdir().unwrap();
+        let held_after_the_steps = |name: &str, secure_delete: bool| -> usize {
+            let path = dir.path().join(name);
+            let at_v3 = Connection::open(&path).unwrap();
+            at_v3
+                .execute_batch(&format!("{MIGRATION_V1}{MIGRATION_V2}{MIGRATION_V3}"))
+                .unwrap();
+            at_v3.pragma_update(None, "user_version", 3).unwrap();
+            at_v3
+                .execute(
+                    "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                           descriptor, created_at, updated_at)
+                     VALUES ('c', 'group', 'batch', 'open', zeroblob(32), ?1, 't', 't')",
+                    [words.as_bytes()],
+                )
+                .unwrap();
+            drop(at_v3);
+
+            let conn = crate::db::open_as(&path, secure_delete).unwrap();
+            let version: u32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(crate::db::checkpoint_truncating(&conn).unwrap());
+            let bytes = std::fs::read(&path).unwrap();
+            bytes
+                .windows(words.len())
+                .filter(|at| *at == words.as_bytes())
+                .count()
+        };
+        assert_eq!(held_after_the_steps("relay.db", false), 2);
+        assert_eq!(held_after_the_steps("personal.db", true), 1);
+    }
+
+    /// The version before, whose schema is at step 18, stops on a
+    /// database that was stepped to 19 (decision 2026-10-09 §9.2), as
+    /// every version stops on one from a later version: it is refused
+    /// with both versions, and nothing of it is changed. A database at
+    /// step 18 it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_19() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 18);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 19, own: 18 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let at_18 = at_v18();
+        assert!(refuse_a_later_version(&at_18, 18).is_ok());
+        assert!(refuse_a_later_version(&at_18, 17).is_err());
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -2761,7 +3612,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 10] = [
+        let from: [(u32, Connection); 11] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -2772,6 +3623,7 @@ mod tests {
             (15, at_v15()),
             (16, at_v16()),
             (17, at_v17()),
+            (18, at_v18()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -2793,6 +3645,7 @@ mod tests {
             assert_eq!(new_in_v16(&conn), NEW_IN_V16, "from version {at}");
             assert_eq!(new_in_v17(&conn), NEW_IN_V17, "from version {at}");
             assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
+            assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }

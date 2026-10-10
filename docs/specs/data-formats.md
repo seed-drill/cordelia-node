@@ -62,6 +62,17 @@
 > - **v18:** `person_typed_keys` gains `stood`; `person_left_out` gains
 >   `cleared_at`; `person_left`.
 >
+> Step 19, per the decision record of 2026-10-09 (set out in §10.7):
+>
+> - **v19:** the tables of messages between the person's own agents:
+>   `message_generations` (a generation is the messages channel, not its
+>   statement's number), `message_index`, `message_numbers`,
+>   `message_first_held`, `message_signers`, `message_places`,
+>   `message_lists`, `message_read_here`, `message_announced`,
+>   `message_read_by_a_person`, `message_sends`, `message_kept`,
+>   `message_kept_numbers` and `message_kept_taken`. It changes no older
+>   row.
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
@@ -879,7 +890,7 @@ records        1 byte: how many, from 0 to 2; then for each its length and
 
 ---
 
-## 10. Tables of a Channel From Its Secret (Steps 11 to 18)
+## 10. Tables of a Channel From Its Secret (Steps 11 to 19)
 
 Times are in seconds, in UTC, by the clock of the node that writes them. A
 key, a channel's ID and a slot are each 32 bytes, and a signature 64: in the
@@ -1172,6 +1183,205 @@ CREATE TABLE sync_files (
   is.
 - At a personal node's first start on this version both tables are emptied:
   every folder forgets what it had agreed (§12).
+
+### 10.7 Messages Between the Person's Own Agents (v19; decision 2026-10-09 §2.3, §2.5, §6, §7, §9.2)
+
+What a device keeps of the messages channel beside its entries, which are in
+`entries` as every channel's are. A signer is the key that signed a
+message's entry, a generation is the messages channel an entry is in, kept
+as the ID of its row in `message_generations`, a message's ID is 16 bytes, a
+mark 16, and a time is by the device's own clock. A number, and the highest
+number held, is at most 2^42 - 1 (§2.3).
+
+```sql
+CREATE TABLE message_generations (
+    id          INTEGER PRIMARY KEY,
+    channel     BLOB NOT NULL UNIQUE CHECK(length(channel) = 32),
+    statement   INTEGER NOT NULL CHECK(statement >= 1),
+    first_held  INTEGER NOT NULL
+);
+
+CREATE TABLE message_index (
+    id               BLOB PRIMARY KEY CHECK(length(id) = 16),
+    signer           BLOB NOT NULL CHECK(length(signer) = 32),
+    label            TEXT NOT NULL,
+    generation       INTEGER NOT NULL REFERENCES message_generations(id),
+    to_kind          INTEGER NOT NULL CHECK(to_kind IN (1, 2)),
+    to_name          TEXT CHECK((to_kind = 1) = (to_name IS NOT NULL)),
+    from_name        TEXT NOT NULL,
+    sent             INTEGER NOT NULL,
+    subject          TEXT NOT NULL,
+    thread           BLOB NOT NULL CHECK(length(thread) = 16),
+    answers          BLOB NOT NULL CHECK(length(answers) = 16),
+    asks             INTEGER NOT NULL CHECK(asks IN (0, 1)),
+    link             TEXT,
+    body             TEXT NOT NULL,
+    first_held       INTEGER NOT NULL,
+    placed_at        INTEGER,
+    not_every_relay  INTEGER NOT NULL DEFAULT 0 CHECK(not_every_relay IN (0, 1))
+);
+
+CREATE INDEX idx_message_index_signer ON message_index(signer, generation);
+
+CREATE TABLE message_numbers (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    number      INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    id          BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
+    PRIMARY KEY (signer, generation, number)
+);
+
+CREATE INDEX idx_message_numbers_id ON message_numbers(id);
+
+CREATE TABLE message_first_held (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    number      INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    id          BLOB NOT NULL CHECK(length(id) = 16),
+    sent        INTEGER NOT NULL,
+    first_held  INTEGER NOT NULL,
+    PRIMARY KEY (signer, generation, number)
+);
+
+CREATE TABLE message_signers (
+    signer        BLOB NOT NULL CHECK(length(signer) = 32),
+    generation    INTEGER NOT NULL REFERENCES message_generations(id),
+    highest       INTEGER NOT NULL CHECK(highest >= 0 AND highest <= 4398046511103),
+    overwritten   INTEGER NOT NULL DEFAULT 0 CHECK(overwritten >= 0),
+    not_messages  INTEGER NOT NULL DEFAULT 0 CHECK(not_messages >= 0),
+    counted_from  INTEGER CHECK(counted_from >= 1 AND counted_from <= 4398046511103),
+    PRIMARY KEY (signer, generation)
+);
+
+CREATE TABLE message_places (
+    signer      BLOB NOT NULL CHECK(length(signer) = 32),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    placed_at   INTEGER NOT NULL
+);
+
+CREATE INDEX idx_message_places ON message_places(signer, generation, placed_at);
+
+-- A list is stored without repeats: whoever writes the taking of a list
+-- must keep each of its marks once, since a row is keyed by the device's
+-- key and the mark.
+CREATE TABLE message_lists (
+    key   BLOB NOT NULL CHECK(length(key) = 32),
+    mark  BLOB NOT NULL CHECK(length(mark) = 16),
+    PRIMARY KEY (key, mark)
+);
+
+CREATE INDEX idx_message_lists_mark ON message_lists(mark);
+
+CREATE TABLE message_read_here (
+    mark       BLOB PRIMARY KEY CHECK(length(mark) = 16),
+    seq        INTEGER NOT NULL UNIQUE,
+    id         BLOB REFERENCES message_index(id) ON DELETE CASCADE,
+    name       TEXT CHECK(name IS NULL OR length(name) >= 1),
+    made_at    INTEGER NOT NULL,
+    merged_at  INTEGER,
+    CHECK((id IS NULL) = (name IS NULL)),
+    CHECK(id IS NOT NULL OR merged_at IS NOT NULL)
+);
+
+CREATE INDEX idx_message_read_here_id ON message_read_here(id);
+
+CREATE TABLE message_announced (
+    id    BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
+    name  TEXT NOT NULL CHECK(length(name) >= 1),
+    PRIMARY KEY (id, name)
+);
+
+CREATE TABLE message_read_by_a_person (
+    id  BLOB PRIMARY KEY REFERENCES message_index(id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_sends (
+    sent_at  INTEGER NOT NULL,
+    name     TEXT CHECK(name IS NULL OR length(name) >= 1),
+    to_all   INTEGER NOT NULL CHECK(to_all IN (0, 1)),
+    CHECK(name IS NOT NULL OR to_all = 0)
+);
+
+CREATE INDEX idx_message_sends_at ON message_sends(sent_at);
+
+CREATE TABLE message_kept (
+    id          BLOB PRIMARY KEY CHECK(length(id) = 16),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
+    value       BLOB NOT NULL CHECK(length(value) = 1936),
+    sent        INTEGER NOT NULL,
+    kept_at     INTEGER NOT NULL
+);
+
+CREATE TABLE message_kept_numbers (
+    id      BLOB NOT NULL REFERENCES message_kept(id) ON DELETE CASCADE,
+    number  INTEGER NOT NULL CHECK(number >= 1 AND number <= 4398046511103),
+    PRIMARY KEY (id, number)
+);
+
+CREATE TABLE message_kept_taken (
+    id     BLOB NOT NULL REFERENCES message_kept(id) ON DELETE CASCADE,
+    relay  BLOB NOT NULL CHECK(length(relay) = 32),
+    PRIMARY KEY (id, relay)
+);
+```
+
+- `message_generations`: one row for each messages channel the device has
+  held, by an integer ID that is the generation in every other table, with
+  the channel's ID (unique), the number of the statement that began it, and
+  when the device first held it. A statement's number is not a generation: a
+  device alone under a phrase that makes a new phrase is at statement 1
+  again, with a new messages channel (§9.2).
+- `message_index`: one row for each message the device holds opened, by its
+  ID, with every field it was opened to (decision 2026-10-09 §2.2): the label
+  the device knew its signer by, `to_kind` (1: one name, in `to_name`; 2:
+  every name, and no `to_name`), `from_name`, `sent`, the subject, `thread`
+  and `answers` (zeros where none), whether it asks for an answer, the link
+  (NULL where none), the body, when the device first held it, and its place:
+  when it was first shown, NULL until then (§6, §7.1); and `not_every_relay`,
+  1 where it is the device's own and its kept value was dropped before every
+  relay had taken it, which `log` says (§2.3, §4.1). `summary`, `read` and
+  `log` read it, and open no entry. **A row that goes is overwritten first:**
+  its body, link, subject, `from_name` and `to_name` are written over with
+  zeros of the same length, and then it is deleted, with its marks and its
+  rows of numbers held, in one transaction (§7.1).
+- `message_numbers`: the numbers each message is held at. A message held at
+  two numbers is one row of the index and two here.
+- `message_first_held`: one row for each live number held, with its ID,
+  `sent` and when it was first held. It outlives the index row, so that an
+  entry taken again at a live number after its 30 days is not shown again.
+- `message_signers`: for each signer and generation, H (`highest`), the
+  highest number held of a message or a clearing, and the counts of numbers
+  overwritten before they were shown and of entries that were not messages,
+  and `counted_from`, the first number of that signer held in that
+  generation, from which the overwritten are counted, NULL until one is held
+  (§2.5).
+- `message_places`: the time of each place given to a signer, kept for the
+  hour of the reader's rate (§6).
+- `message_lists`: the marks of the latest list of each other device, by its
+  key (§7.2). A list is stored without repeats, which whoever writes the
+  taking of a list must do.
+- `message_read_here`: the device's own table of what its agents read: each
+  mark, with the message's ID and the name that read it, and when it was
+  made; or the mark alone, where it was merged from the device's own list on
+  a relay and no message has been found for it, with when (§7.2). `seq` is
+  the table's order, unique on the device: the newest is the highest, and a
+  mark merged as older than any held takes one below the lowest.
+- `message_announced` and `message_read_by_a_person`: the device's own marks,
+  that `summary` announced a message to the agent of a name here, and that a
+  person read it here. They are never synced.
+- `message_sends`: one row for each send, by the device's clock, with the name
+  of the folder's agent and whether it was to every name; a send again has no
+  name (§6).
+- `message_kept`, `message_kept_numbers` and `message_kept_taken`: each
+  message of the device's own that not every relay has taken: its value as it
+  was sent (always 1,936 bytes), the numbers it was sent under, and the relays
+  that have taken it (§2.3).
+
+**`secure_delete` is not a step.** A personal node sets SQLite's
+`secure_delete` on its store's connection where it opens it, before the
+schema's steps run, and on no relay's: on a personal node it covers every table. After each hourly clearing
+a personal node runs `PRAGMA wal_checkpoint(TRUNCATE)` (§7.1). A relay keeps
+nothing in any of these tables.
 
 ---
 
