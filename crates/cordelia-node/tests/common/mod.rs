@@ -74,8 +74,11 @@ impl Node {
     /// folder is in, and `GIT_DIR` would answer for the caller's), and
     /// `STY`, which says that the tests themselves are run inside GNU
     /// `screen` (a command that shows something once reads it: the test
-    /// of that sets its own). The rest of the environment is left. Of it
-    /// the binary reads `NO_COLOR` and the user's name.
+    /// of that sets its own), and `CLAUDE_PROJECT_DIR`, which says that
+    /// they are run in a Claude Code session (the commands of messages
+    /// act as the agent of the folder it names: the tests of that set
+    /// their own). The rest of the environment is left. Of it the binary
+    /// reads `NO_COLOR` and the user's name.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -100,6 +103,7 @@ impl Node {
                     || name.starts_with("GIT_")
                     || name == "RUST_LOG"
                     || name == "STY"
+                    || name == "CLAUDE_PROJECT_DIR"
                     || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
@@ -1520,6 +1524,12 @@ pub struct PassesOn {
 
 impl PassesOn {
     pub fn to(port: u16) -> Self {
+        Self::holding(port, Duration::ZERO)
+    }
+
+    /// [`Self::to`], holding what the other port answers for `hold`
+    /// before it is passed back: a node that answers late.
+    pub fn holding(port: u16, hold: Duration) -> Self {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1547,6 +1557,7 @@ impl PassesOn {
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 * 1024];
                     while let Ok(n) = node.read(&mut buf) {
+                        std::thread::sleep(hold);
                         if n == 0 || asks.write_all(&buf[..n]).is_err() {
                             break;
                         }
