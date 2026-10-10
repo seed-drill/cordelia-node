@@ -1193,7 +1193,11 @@ as the ID of its row in `message_generations`, a message's ID is 16 bytes, a
 mark 16, and a time is by the device's own clock. A number, and the highest
 number held, is at most 2^42 - 1 (§2.3), and a statement's number at most
 256. Each column takes only its type and its bound: a blob of its length,
-or an integer, and a flag 0 or 1; the fields that a row is overwritten in
+or an integer, and a flag 0 or 1. A flag, and a kind of `to`, need no
+check of their type besides their `IN (...)`: a column of integer affinity
+that holds 0 or 1 holds an integer. Nor does a generation, whose foreign
+key to the integer key of `message_generations` refuses what is not one.
+The fields that a row is overwritten in
 before it goes take any type, since they are written over with a blob of
 zeros. A test ties each bound written in the SQL to `protocol.rs`.
 
@@ -1210,30 +1214,28 @@ CREATE TABLE message_index (
     id               BLOB PRIMARY KEY CHECK(typeof(id) = 'blob' AND length(id) = 16),
     signer           BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
     label            TEXT NOT NULL,
-    generation       INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                         REFERENCES message_generations(id),
-    to_kind          INTEGER NOT NULL CHECK(typeof(to_kind) = 'integer' AND to_kind IN (1, 2)),
+    generation       INTEGER NOT NULL REFERENCES message_generations(id),
+    to_kind          INTEGER NOT NULL CHECK(to_kind IN (1, 2)),
     to_name          TEXT CHECK((to_kind = 1) = (to_name IS NOT NULL)),
     from_name        TEXT NOT NULL,
     sent             INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
     subject          TEXT NOT NULL,
     thread           BLOB NOT NULL CHECK(typeof(thread) = 'blob' AND length(thread) = 16),
     answers          BLOB NOT NULL CHECK(typeof(answers) = 'blob' AND length(answers) = 16),
-    asks             INTEGER NOT NULL CHECK(typeof(asks) = 'integer' AND asks IN (0, 1)),
+    asks             INTEGER NOT NULL CHECK(asks IN (0, 1)),
     link             TEXT,
     body             TEXT NOT NULL,
     first_held       INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
     placed_at        INTEGER CHECK(placed_at IS NULL OR typeof(placed_at) = 'integer'),
     not_every_relay  INTEGER NOT NULL DEFAULT 0
-                         CHECK(typeof(not_every_relay) = 'integer' AND not_every_relay IN (0, 1))
+                         CHECK(not_every_relay IN (0, 1))
 );
 
 CREATE INDEX idx_message_index_signer ON message_index(signer, generation);
 
 CREATE TABLE message_numbers (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
     id          BLOB NOT NULL REFERENCES message_index(id) ON DELETE CASCADE,
@@ -1244,8 +1246,7 @@ CREATE INDEX idx_message_numbers_id ON message_numbers(id);
 
 CREATE TABLE message_first_held (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
     id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
@@ -1257,8 +1258,7 @@ CREATE TABLE message_first_held (
 
 CREATE TABLE message_signers (
     signer        BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation    INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                      REFERENCES message_generations(id),
+    generation    INTEGER NOT NULL REFERENCES message_generations(id),
     highest       INTEGER NOT NULL CHECK(typeof(highest) = 'integer'
                                          AND highest >= 0 AND highest <= 4398046511103),
     overwritten   INTEGER NOT NULL DEFAULT 0
@@ -1273,8 +1273,7 @@ CREATE TABLE message_signers (
 
 CREATE TABLE message_places (
     signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     placed_at   INTEGER NOT NULL CHECK(typeof(placed_at) = 'integer')
 );
 
@@ -1317,7 +1316,7 @@ CREATE TABLE message_read_by_a_person (
 CREATE TABLE message_sends (
     sent_at  INTEGER NOT NULL CHECK(typeof(sent_at) = 'integer'),
     name     TEXT CHECK(name IS NULL OR length(name) >= 1),
-    to_all   INTEGER NOT NULL CHECK(typeof(to_all) = 'integer' AND to_all IN (0, 1)),
+    to_all   INTEGER NOT NULL CHECK(to_all IN (0, 1)),
     CHECK(name IS NOT NULL OR to_all = 0)
 );
 
@@ -1325,8 +1324,7 @@ CREATE INDEX idx_message_sends_at ON message_sends(sent_at);
 
 CREATE TABLE message_kept (
     id          BLOB PRIMARY KEY CHECK(typeof(id) = 'blob' AND length(id) = 16),
-    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer')
-                    REFERENCES message_generations(id),
+    generation  INTEGER NOT NULL REFERENCES message_generations(id),
     value       BLOB NOT NULL CHECK(typeof(value) = 'blob' AND length(value) = 1936),
     sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
     kept_at     INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer'),
