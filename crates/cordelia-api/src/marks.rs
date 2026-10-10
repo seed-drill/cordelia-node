@@ -348,7 +348,7 @@ mod tests {
     use cordelia_crypto::message::{To, read_mark};
     use cordelia_storage::entries::StoredEntry;
 
-    use crate::sender::{At, Request, send};
+    use crate::sender::{At, Request, no_reply, send};
     use crate::several::Several;
     use crate::take::{Taken, take};
 
@@ -378,6 +378,7 @@ mod tests {
             now,
             fetched: true,
             no_place: false,
+            mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
         };
         let request = Request {
@@ -392,7 +393,7 @@ mod tests {
             thread: [0; 16],
             answers: [0; 16],
         };
-        let sent = send(&s[n].conn, &s[n].identity, &at, &request).unwrap();
+        let sent = send(&s[n].conn, &s[n].identity, &at, &request, no_reply).unwrap();
         s[n].conn
             .execute(
                 "INSERT OR IGNORE INTO message_read_by_a_person (id) SELECT id FROM message_index",

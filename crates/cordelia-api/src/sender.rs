@@ -51,7 +51,7 @@ use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::messages::{self as held, Id, Kept, Opened};
 use cordelia_storage::meta;
 
-use crate::at_relays::{Kind, Own, Pushed, Stands, stands};
+use crate::at_relays::{Batch, Kind, Own, Pushed, Stands, stands};
 use crate::person::{PersonError, in_one};
 use crate::publish::Standing;
 use crate::state::OwnChannels;
@@ -73,6 +73,9 @@ pub enum Refused {
     /// connection (step 6, §2.1).
     #[error("this device has no place for the messages channel")]
     NoPlace,
+    /// The folder is not mapped, so no agent runs there (step 7, §3.1).
+    #[error("this folder is not mapped")]
+    NotMapped,
     /// The folder's rate is set to 0 (step 7, §6).
     #[error("sending is off for this folder")]
     SendingOff,
@@ -122,6 +125,7 @@ impl Refused {
             Self::NotApplied => "not_applied",
             Self::SyncOff => "sync_off",
             Self::NoPlace => "no_place",
+            Self::NotMapped => "not_mapped",
             Self::SendingOff => "sending_off",
             Self::NotFetched => "not_fetched",
             Self::NoNumbers => "no_numbers",
@@ -161,6 +165,9 @@ pub struct At {
     /// Whether the messages channel has no place among the proofs of a
     /// connection (`OwnChannels::no_place`).
     pub no_place: bool,
+    /// Whether the folder the command was run in is mapped (§3.1). Where
+    /// it is not, the request's `from` says nothing.
+    pub mapped: bool,
     /// The folder's limit for the hour in the configuration (`[messages]
     /// per_folder_per_hour`). It may lower `AGENT_MESSAGES_PER_FOLDER_
     /// PER_HOUR`, and is never taken above it.
@@ -180,6 +187,21 @@ pub struct Request {
     pub body: String,
     pub thread: Id,
     pub answers: Id,
+}
+
+/// What the node takes of a reply from the message it answers, at step
+/// 9 of §4.3: its recipient, the `from` of that message, its thread and
+/// `answers` (§3). These replace the request's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub to: To,
+    pub thread: Id,
+    pub answers: Id,
+}
+
+/// Step 9 of a message that answers none: nothing to look up.
+pub fn no_reply(_: &Connection) -> Result<Option<Reply>, Refused> {
+    Ok(None)
 }
 
 /// A message that was sent.
@@ -276,16 +298,20 @@ fn next_in(conn: &Connection, ring: &Ring) -> Result<Option<u64>, PersonError> {
 /// Send `request` as this device, at `at` (decision 2026-10-09 §2.3, §4.3,
 /// §6): the node's checks of §4.3 that are the sender's, in their order,
 /// the first that applies refusing, and then the message is written, in
-/// one transaction. The folder's mapping (step 7) and the message a reply
-/// answers (step 9) are the caller's, before this.
+/// one transaction. Whether the folder is mapped (step 7) is the caller's
+/// to say, in `at`; the message a reply answers (step 9) is looked up by
+/// `reply`, which this calls at step 9, in its write: it answers the
+/// reply's fields, `None` for a message that answers none ([`no_reply`]),
+/// or a refusal.
 pub fn send(
     conn: &Connection,
     identity: &NodeIdentity,
     at: &At,
     request: &Request,
+    reply: impl FnOnce(&Connection) -> Result<Option<Reply>, Refused>,
 ) -> Result<Sent, NotSent> {
     // A refusal writes nothing, and a failure takes back what was written.
-    in_one(conn, || match sends(conn, identity, at, request) {
+    in_one(conn, || match sends(conn, identity, at, request, reply) {
         Err(NotSent::Failed(e)) => Err(e),
         done => Ok(done),
     })?
@@ -296,6 +322,7 @@ fn sends(
     identity: &NodeIdentity,
     at: &At,
     request: &Request,
+    reply: impl FnOnce(&Connection) -> Result<Option<Reply>, Refused>,
 ) -> Result<Sent, NotSent> {
     let refused = |why: Refused| Err(NotSent::Refused(why));
     let now = at.now;
@@ -314,7 +341,11 @@ fn sends(
     if at.no_place {
         return refused(Refused::NoPlace);
     }
-    // 7. The folder's rate, where the configuration sets it to 0.
+    // 7. The folder: mapped, then its rate, where the configuration sets
+    // it to 0.
+    if !at.mapped {
+        return refused(Refused::NotMapped);
+    }
     let folder_limit = at
         .per_folder_per_hour
         .min(AGENT_MESSAGES_PER_FOLDER_PER_HOUR);
@@ -332,8 +363,14 @@ fn sends(
     if kept(held::newest_own_sent(conn, &ring.own, now))?.is_some_and(|newest| newest > now) {
         return refused(Refused::ClockBehind);
     }
+    // 9. The message a reply answers.
+    let (to, thread, answers) = match reply(conn) {
+        Ok(Some(reply)) => (reply.to, reply.thread, reply.answers),
+        Ok(None) => (request.to.clone(), request.thread, request.answers),
+        Err(why) => return refused(why),
+    };
     // 10. The recipient: a name that the personal channel lists.
-    if let To::Name(name) = &request.to
+    if let To::Name(name) = &to
         && !crate::names::listed(conn)?
             .iter()
             .any(|listed| listed.name == *name)
@@ -356,11 +393,11 @@ fn sends(
         });
     }
     // 12. The hold.
-    if let Some(other) = held_pair(conn, &request.from, &request.to, now)? {
+    if let Some(other) = held_pair(conn, &request.from, &to, now)? {
         return refused(Refused::PairHeld {
             from: request.from.clone(),
             other,
-            every: request.to == To::All,
+            every: to == To::All,
         });
     }
 
@@ -368,10 +405,10 @@ fn sends(
         asks: request.asks,
         sent: u64::try_from(now).unwrap_or(0),
         nonce: nonce()?,
-        thread: request.thread,
-        answers: request.answers,
+        thread,
+        answers,
         from: request.from.clone(),
-        to: request.to.clone(),
+        to: to.clone(),
         link: request.link.clone(),
         body: request.body.clone(),
     };
@@ -394,7 +431,7 @@ fn sends(
         conn,
         now,
         Some(&request.from),
-        request.to == To::All,
+        to == To::All,
     ))?;
     Ok(Sent { id, number })
 }
@@ -534,8 +571,10 @@ fn own_label(conn: &Connection, own: &[u8; 32]) -> Result<String, PersonError> {
 ///   is written again. It waits: the next pull from that relay hands back
 ///   the device's own later entry, which the reader marks.
 /// - **Another at that revision**: the entry the relay holds is one the
-///   device wrote before its store went back. The message waits to be
-///   sent again under the next number.
+///   device wrote before its store went back. Where the revision is of the
+///   newest number the message was sent under, it waits to be sent again
+///   under the next number; at an older number it was sent again already,
+///   and nothing changes.
 ///
 /// A clearing and a list are not kept, and an answer to them changes
 /// nothing here: a relay's answer of another to a clearing is ignored.
@@ -574,11 +613,64 @@ pub fn answered(
             };
             match answer {
                 Pushed::Holds => kept(held::taken_by(conn, &id, relay))?,
-                Pushed::HoldsAnother => kept(held::send_again(conn, &id))?,
+                Pushed::HoldsAnother if newest_number(conn, &id)? == Some(number) => {
+                    kept(held::send_again(conn, &id))?
+                }
                 _ => {}
             }
         }
         Ok(())
+    })
+}
+
+/// The newest number the kept message `id` was sent under.
+fn newest_number(conn: &Connection, id: &Id) -> Result<Option<u64>, PersonError> {
+    Ok(kept(held::kept(conn))?
+        .into_iter()
+        .find(|kept_value| kept_value.id == *id)
+        .and_then(|kept_value| kept_value.numbers.last().copied()))
+}
+
+/// When a relay's answer is taken, as the node knows it: its clock, and
+/// whether the messages channel was fetched since it started ([`fetched`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnsweredAt {
+    pub now: i64,
+    pub fetched: bool,
+}
+
+/// A relay answered a push of `batch` of `channel` with `answers`: how far
+/// it was sent the channel ([`crate::at_relays::sent`]) and, for the
+/// messages channel, what the device keeps of what it took ([`answered`])
+/// and the list of what its agents read written again above another that
+/// the relay holds ([`crate::marks::answered`], decision 2026-10-09 §2.4),
+/// in one write, so that a process that stops between them loses none.
+/// Every other channel's push is written as `at_relays::sent` writes it.
+pub fn pushed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relay: &[u8; 32],
+    channel: &Own,
+    batch: &Batch,
+    answers: &[Pushed],
+    at: &AnsweredAt,
+) -> Result<crate::at_relays::Sent, PersonError> {
+    if channel.kind != Kind::Messages {
+        return crate::at_relays::sent(conn, relay, channel, batch, answers);
+    }
+    in_one(conn, || {
+        let done = crate::at_relays::sent(conn, relay, channel, batch, answers)?;
+        answered(conn, identity, relay, channel, &batch.entries, answers)?;
+        crate::marks::answered(
+            conn,
+            identity,
+            channel,
+            &batch.entries,
+            answers,
+            at.now,
+            at.fetched,
+        )?;
+        Ok(done)
     })
 }
 
@@ -589,7 +681,9 @@ pub fn answered(
 /// message that not every relay has taken, it is the device's own entry
 /// from its later life over that message, which would otherwise never be
 /// pushed anywhere. The message waits to be sent again under the next
-/// number. In the door's write.
+/// number. In the door's write. Only the device's own entry does this:
+/// the store keeps one entry for each author in a slot, so another key's
+/// entry there replaces nothing of the device's.
 pub(crate) fn taken_over(
     conn: &Connection,
     own: &[u8; 32],
@@ -597,6 +691,9 @@ pub(crate) fn taken_over(
     generation: i64,
     entry: &CheckedEntry,
 ) -> Result<(), PersonError> {
+    if entry.author != *own {
+        return Ok(());
+    }
     for kept_value in kept(held::kept(conn))? {
         if kept_value.generation != generation || kept_value.again {
             continue;
@@ -767,6 +864,13 @@ mod tests {
     const HOUR: i64 = 60 * 60;
     const DAY: i64 = 24 * HOUR;
 
+    /// A relay's answer taken before the messages channel was fetched: no
+    /// list is written again by it.
+    const NOT_FETCHED: AnsweredAt = AnsweredAt {
+        now: 0,
+        fetched: false,
+    };
+
     /// The names each device of a test syncs.
     const NAMES: [&str; 4] = ["notes", "work", "plans", "home"];
 
@@ -792,6 +896,7 @@ mod tests {
             now,
             fetched: true,
             no_place: false,
+            mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
         }
     }
@@ -815,7 +920,7 @@ mod tests {
 
     /// Device `n` sends `request` at `now`.
     fn sends_at(s: &Several, n: usize, request: &Request, now: i64) -> Result<Sent, NotSent> {
-        send(&s[n].conn, &s[n].identity, &at(now), request)
+        send(&s[n].conn, &s[n].identity, &at(now), request, no_reply)
     }
 
     /// Device `n` sends `request` at `now`, which it must.
@@ -1020,14 +1125,14 @@ mod tests {
                     self.answers.unwrap_or(said)
                 })
                 .collect();
-            crate::at_relays::sent(&on.conn, &self.key, &channel, &batch, &answers).unwrap();
-            answered(
+            pushed(
                 &on.conn,
                 &on.identity,
                 &self.key,
                 &channel,
-                &batch.entries,
+                &batch,
                 &answers,
+                &AnsweredAt { now, fetched: true },
             )
             .unwrap();
             answers
@@ -1231,7 +1336,7 @@ mod tests {
             fetched,
             ..at(s.now)
         };
-        let not_fetched = send(conn, &s[0].identity, &at_with(false), &request);
+        let not_fetched = send(conn, &s[0].identity, &at_with(false), &request, no_reply);
         assert!(matches!(
             not_fetched,
             Err(NotSent::Refused(Refused::NotFetched))
@@ -1252,7 +1357,7 @@ mod tests {
         assert!(fetched(conn, &own_channels, after(1) + wait).unwrap());
         own_channels.fetched_from(&channel, "relay-b", after(2));
         assert!(fetched(conn, &own_channels, after(2)).unwrap());
-        assert!(send(conn, &s[0].identity, &at_with(true), &request).is_ok());
+        assert!(send(conn, &s[0].identity, &at_with(true), &request, no_reply).is_ok());
 
         let none = OwnChannels::default();
         none.set_up_with(0);
@@ -1267,9 +1372,11 @@ mod tests {
     /// The sender's checks are made in the order of §4.3 (D5): with every
     /// refusal applying at once, each is answered in turn as the one
     /// before it is taken away: `not_applied`, `sync_off`, `no_place`,
-    /// `sending_off`, `not_fetched`, `no_numbers`, `clock_behind`,
+    /// `not_mapped`, `sending_off`, `not_fetched`, `no_numbers`,
+    /// `clock_behind`, the refusal of the message a reply answers,
     /// `no_such_name`, `folder_rate`, `device_rate`, `pair_held`; and
-    /// then the message is sent.
+    /// then the message is sent, a reply to the recipient, thread and
+    /// `answers` that step 9 gave.
     #[test]
     fn the_senders_checks_are_made_in_the_order_of_the_record() {
         let s = devices(2);
@@ -1306,19 +1413,31 @@ mod tests {
             now: t,
             fetched: false,
             no_place: true,
+            mapped: false,
             per_folder_per_hour: 0,
         };
-        let word =
-            |at_now: &At, request: &Request| match send(conn, &s[0].identity, at_now, request) {
-                Err(NotSent::Refused(why)) => why.word(),
-                other => panic!("{other:?}"),
+        // Step 9's own words are a later slice's: the lookup of a reply
+        // here refuses with this, which `send` gives back as it is.
+        let unanswered = Refused::NoSuchName("the message answered".into());
+        let refusal = |at_now: &At, request: &Request, answering: bool| {
+            let reply = |_: &Connection| match answering {
+                true => Err(unanswered.clone()),
+                false => Ok(None),
             };
+            match send(conn, &s[0].identity, at_now, request, reply) {
+                Err(NotSent::Refused(why)) => why,
+                other => panic!("{other:?}"),
+            }
+        };
+        let word = |at_now: &At, request: &Request| refusal(at_now, request, true).word();
         assert_eq!(word(&at_now, &request), "not_applied");
         cordelia_storage::person::set_state(conn, State::Applied).unwrap();
         assert_eq!(word(&at_now, &request), "sync_off");
         meta::set(conn, meta::SYNC_CLAUDE_DIR, "/c").unwrap();
         assert_eq!(word(&at_now, &request), "no_place");
         at_now.no_place = false;
+        assert_eq!(word(&at_now, &request), "not_mapped");
+        at_now.mapped = true;
         assert_eq!(word(&at_now, &request), "sending_off");
         at_now.per_folder_per_hour = 20;
         assert_eq!(word(&at_now, &request), "not_fetched");
@@ -1331,6 +1450,8 @@ mod tests {
         .unwrap();
         assert_eq!(word(&at_now, &request), "clock_behind");
         at_now.now = ahead_at;
+        assert_eq!(refusal(&at_now, &request, true), unanswered);
+        let word = |at_now: &At, request: &Request| refusal(at_now, request, false).word();
         assert_eq!(word(&at_now, &request), "no_such_name");
         let request = says("notes", "work", "x");
         assert_eq!(word(&at_now, &request), "folder_rate");
@@ -1341,8 +1462,24 @@ mod tests {
         // hour; the ten of work's, and the one ahead, are not counted.
         let request = says("notes", "work", "x");
         assert_eq!(word(&at_now, &request), "pair_held");
-        let request = says("notes", "plans", "x");
-        assert!(send(conn, &s[0].identity, &at_now, &request).is_ok());
+        // A reply goes to the recipient step 9 gave, not the request's.
+        let request = says("notes", "nobody", "x");
+        let reply = |_: &Connection| {
+            Ok(Some(Reply {
+                to: To::Name("plans".into()),
+                thread: [1; 16],
+                answers: [2; 16],
+            }))
+        };
+        let done = send(conn, &s[0].identity, &at_now, &request, reply).unwrap();
+        let row: (Option<String>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT to_name, thread, answers FROM message_index WHERE id = ?1",
+                [&done.id[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (Some("plans".into()), vec![1; 16], vec![2; 16]));
     }
 
     // ── The rates ───────────────────────────────────────────────────
@@ -1379,13 +1516,14 @@ mod tests {
         };
         for k in 0..5 {
             let request = says("notes", "work", &format!("{k}"));
-            send(&s[0].conn, &s[0].identity, &lowered(5), &request).unwrap();
+            send(&s[0].conn, &s[0].identity, &lowered(5), &request, no_reply).unwrap();
         }
         let sixth = send(
             &s[0].conn,
             &s[0].identity,
             &lowered(5),
             &says("notes", "work", "6"),
+            no_reply,
         );
         assert!(matches!(
             sixth,
@@ -1393,7 +1531,14 @@ mod tests {
         ));
         for k in 5..20 {
             let request = says("notes", "work", &format!("{k}"));
-            send(&s[0].conn, &s[0].identity, &lowered(100), &request).unwrap();
+            send(
+                &s[0].conn,
+                &s[0].identity,
+                &lowered(100),
+                &request,
+                no_reply,
+            )
+            .unwrap();
             read_all(&s, 0);
         }
         let raised = send(
@@ -1401,6 +1546,7 @@ mod tests {
             &s[0].identity,
             &lowered(100),
             &says("notes", "work", "21"),
+            no_reply,
         );
         assert!(matches!(
             raised,
@@ -1422,6 +1568,7 @@ mod tests {
             &s[0].identity,
             &off,
             &says("notes", "work", "x"),
+            no_reply,
         );
         assert!(matches!(
             refusal,
@@ -2169,6 +2316,280 @@ mod tests {
             .unwrap();
             assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
         }
+    }
+
+    /// Another device's entry in this device's slot of a kept message's
+    /// newest number, taken through the door, stands beside the device's
+    /// own and replaces nothing of it: nothing is sent again (decision
+    /// 2026-10-09 §2.3, case 2, property 3).
+    #[test]
+    fn another_devices_entry_in_this_devices_slot_sends_nothing_again() {
+        let s = devices(2);
+        let t = s.now;
+        let done = sent(&s, 0, &says("notes", "work", "kept"), t);
+        let others = entry_by(
+            &s[1].identity,
+            &messages_secret(&s, 0),
+            message_rev(1).unwrap(),
+            &message_name(&s.key(0), 1).unwrap(),
+            Value::Other(says_value("desktop's", t)),
+            &[],
+        );
+        assert!(matches!(
+            take(&s[0].conn, &s[0].identity, &others, t).unwrap(),
+            Taken::Own {
+                stored: Outcome::Stored,
+                ..
+            }
+        ));
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+        assert_eq!(
+            write_again(&s[0].conn, &s[0].identity, t + 1, true).unwrap(),
+            Again::default()
+        );
+        assert_eq!(revs_of(&s, 0, 0), [2]);
+    }
+
+    /// A relay's answer of another at a number a message was sent under
+    /// before its newest is a relay behind: nothing is marked. At the
+    /// newest it is sent again (decision 2026-10-09 §2.3, case 1).
+    #[test]
+    fn only_an_answer_of_another_at_the_newest_number_sends_again() {
+        let s = devices(2);
+        let t = s.now;
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let done = sent(&s, 0, &says("notes", "work", "twice"), t);
+        let channel = own_messages(&s, 0);
+        let entry_at = |rev: u64| {
+            let entry = s[0]
+                .stored_in(&messages_secret(&s, 0))
+                .into_iter()
+                .find(|entry| entry.rev == rev)
+                .unwrap();
+            Entry::from_wire(&entry.to_wire()).unwrap()
+        };
+        let another = |entry: Entry| {
+            answered(
+                conn,
+                identity,
+                &[0xa1; 32],
+                &channel,
+                &[entry],
+                &[Pushed::HoldsAnother],
+            )
+            .unwrap();
+        };
+        let first = entry_at(2);
+        another(first.clone());
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], true)));
+        let again = write_again(conn, identity, t + 1, true).unwrap();
+        assert_eq!(again.written, [(done.id, 2)]);
+        another(first);
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1, 2], false)));
+        another(entry_at(4));
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1, 2], true)));
+    }
+
+    /// How far a relay was sent the messages channel, and what the device
+    /// keeps of what it took, are written as one: where keeping what it
+    /// took fails, the relay is not counted as sent the entry either
+    /// (decision 2026-10-09 §2.3).
+    #[test]
+    fn a_relays_answer_and_what_is_kept_of_it_are_one_write() {
+        let s = devices(2);
+        let t = s.now;
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let done = sent(&s, 0, &says("notes", "work", "one write"), t);
+        let channel = own_messages(&s, 0);
+        let relay = [0xa1; 32];
+        let most = Most {
+            entries: 1000,
+            bytes: 100_000_000,
+        };
+        let batch =
+            crate::at_relays::to_send(conn, identity, &relay, &channel, Which::Since, most, true)
+                .unwrap();
+        let sent_to = || -> i64 {
+            conn.query_row(
+                "SELECT IFNULL(MAX(sent_to), 0) FROM at_relays WHERE relay = ?1",
+                [&relay[..]],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER taken_fails BEFORE INSERT ON message_kept_taken
+             BEGIN SELECT RAISE(ABORT, 'a failure'); END;",
+        )
+        .unwrap();
+        let answers = [Pushed::Holds];
+        assert!(
+            pushed(
+                conn,
+                identity,
+                &relay,
+                &channel,
+                &batch,
+                &answers,
+                &NOT_FETCHED
+            )
+            .is_err()
+        );
+        assert_eq!(sent_to(), 0);
+        assert!(held::taken_at(conn, &done.id).unwrap().is_empty());
+        conn.execute_batch("DROP TRIGGER taken_fails").unwrap();
+        pushed(
+            conn,
+            identity,
+            &relay,
+            &channel,
+            &batch,
+            &answers,
+            &NOT_FETCHED,
+        )
+        .unwrap();
+        assert!(sent_to() > 0);
+        assert_eq!(held::taken_at(conn, &done.id).unwrap(), [relay]);
+    }
+
+    /// A relay's answer that comes after the device stopped standing
+    /// applied is still counted as sent to it, and marks nothing kept
+    /// (decision 2026-10-09 §2.3).
+    #[test]
+    fn an_answer_after_the_device_stopped_standing_applied_is_counted_and_marks_nothing() {
+        let s = devices(2);
+        let t = s.now;
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let done = sent(&s, 0, &says("notes", "work", "before"), t);
+        let channel = own_messages(&s, 0);
+        let relay = [0xa1; 32];
+        let most = Most {
+            entries: 1000,
+            bytes: 100_000_000,
+        };
+        let batch =
+            crate::at_relays::to_send(conn, identity, &relay, &channel, Which::Since, most, true)
+                .unwrap();
+        cordelia_storage::person::set_state(conn, State::Removed).unwrap();
+        let answered_now = pushed(
+            conn,
+            identity,
+            &relay,
+            &channel,
+            &batch,
+            &[Pushed::HoldsAnother],
+            &NOT_FETCHED,
+        );
+        assert!(answered_now.is_ok(), "{answered_now:?}");
+        let sent_to: i64 = conn
+            .query_row(
+                "SELECT IFNULL(MAX(sent_to), 0) FROM at_relays WHERE relay = ?1",
+                [&relay[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sent_to > 0);
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+    }
+
+    /// An answer said of the messages channel of a generation the device
+    /// has left marks nothing it kept of that generation, even where the
+    /// entry answered for is in the slot of a kept number in the ring of
+    /// the generation applied (decision 2026-10-09 §2.3, §9.1).
+    #[test]
+    fn an_answer_said_of_a_channel_left_marks_nothing() {
+        let mut s = devices(2);
+        let t = s.now;
+        let done = sent(&s, 0, &says("notes", "work", "before the change"), t);
+        let left = own_messages(&s, 0);
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+        let in_the_ring_now = entry_by(
+            &s[0].identity,
+            &messages_secret(&s, 0),
+            message_rev(1).unwrap(),
+            &message_name(&s.key(0), 1).unwrap(),
+            Value::Other(says_value("after the change", t)),
+            &[],
+        );
+        let wire = Entry::from_wire(&in_the_ring_now.to_wire()).unwrap();
+        answered(
+            &s[0].conn,
+            &s[0].identity,
+            &[0xa1; 32],
+            &left,
+            &[wire],
+            &[Pushed::HoldsAnother],
+        )
+        .unwrap();
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+    }
+
+    /// The device's own entry in the generation it stands applied under,
+    /// taken through the door in the slot of a number that a message kept
+    /// of a generation it has left was sent under, marks nothing of that
+    /// generation (decision 2026-10-09 §2.3, case 2, §9.1).
+    #[test]
+    fn an_own_entry_of_the_generation_applied_marks_nothing_of_one_left() {
+        let mut s = devices(2);
+        let t = s.now;
+        let done = sent(&s, 0, &says("notes", "work", "before the change"), t);
+        s.change(0, &[0, 1], &[]);
+        let later_life = entry_by(
+            &s[0].identity,
+            &messages_secret(&s, 0),
+            message_rev(1).unwrap(),
+            &message_name(&s.key(0), 1).unwrap(),
+            Value::Other(says_value("after the change", t)),
+            &[],
+        );
+        assert!(matches!(
+            take(&s[0].conn, &s[0].identity, &later_life, t).unwrap(),
+            Taken::Own {
+                stored: Outcome::Stored,
+                ..
+            }
+        ));
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+    }
+
+    /// A store restored from a backup keeps a message that a relay had
+    /// not taken; in its later life the device sent it there and cleared
+    /// it at its 30 days. The restored device takes that clearing from the
+    /// relay: the message is not sent again under a new number, its kept
+    /// value goes, and a reader is shown nothing of it (decision
+    /// 2026-10-09 §2.3, Clearing).
+    #[test]
+    fn a_message_its_own_sender_cleared_in_a_later_life_is_not_sent_again() {
+        let mut s = devices(2);
+        let t = s.now;
+        let mut relay = Relay::new(0xa1);
+        let done = sent(&s, 0, &says("notes", "work", "cleared later"), t);
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("laptop.db");
+        s[0].conn
+            .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+            .unwrap();
+        relay.pushed(&s, 0, t);
+        let later = t + 30 * DAY;
+        assert_eq!(
+            clear_expired(&s[0].conn, &s[0].identity, later, true).unwrap(),
+            1
+        );
+        relay.pushed(&s, 0, later);
+        assert_eq!(relay.revs_of(&s, 0), [3]);
+
+        s.machines[0].conn = cordelia_storage::db::open(&backup).unwrap();
+        assert_eq!(kept_of(&s, 0, &done.id), Some((vec![1], false)));
+        let back = later + HOUR;
+        relay.pulled(&s, 0, back);
+        let again = write_again(&s[0].conn, &s[0].identity, back, true).unwrap();
+        assert!(again.written.is_empty(), "{again:?}");
+        assert_eq!(kept_of(&s, 0, &done.id), None);
+        relay.pushed(&s, 0, back);
+        assert_eq!(relay.revs_of(&s, 0), [3]);
+        relay.pulled(&s, 1, back);
+        assert!(shown_on(&s, 1, back).is_empty());
     }
 
     /// A message that waits to be sent again waits for the first fetch,

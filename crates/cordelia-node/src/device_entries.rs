@@ -2072,31 +2072,18 @@ impl DeviceEntries {
                 },
                 |db, answers| {
                     let answers = answers?;
-                    let done = at_relays::sent(db, &relay, channel, batch, &answers).ok()?;
-                    // What the relay took of the device's own messages, and
-                    // what waits to be sent again (decision 2026-10-09
-                    // §2.3).
+                    // For the messages channel, what the relay took of the
+                    // device's own messages, what waits to be sent again,
+                    // and the list written again above another the relay
+                    // holds, in the same write (decision 2026-10-09 §2.3,
+                    // §2.4).
                     let own = &self.state.identity;
-                    if let Err(e) = sender::answered(db, own, &relay, channel, &batch.entries, &answers)
-                    {
-                        tracing::debug!(error = %e, "could not keep what a relay took of messages");
-                    }
-                    // A list that the relay holds another of at its
-                    // revision is written again above it (§2.4).
                     let fetched = sender::fetched(db, &self.state.own_channels, self.clock.now());
-                    let listed = marks::answered(
-                        db,
-                        own,
-                        channel,
-                        &batch.entries,
-                        &answers,
-                        self.unix(),
-                        fetched.unwrap_or(false),
-                    );
-                    if let Err(e) = listed {
-                        tracing::debug!(error = %e, "could not write the list again");
-                    }
-                    Some(done)
+                    let at = sender::AnsweredAt {
+                        now: self.unix(),
+                        fetched: fetched.unwrap_or(false),
+                    };
+                    sender::pushed(db, own, &relay, channel, batch, &answers, &at).ok()
                 },
             )
             .await?;
