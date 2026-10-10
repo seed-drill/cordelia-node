@@ -394,7 +394,7 @@ impl DeviceEntries {
             .collect();
         let mut asking = tokio::task::JoinSet::new();
         if whole {
-            let typed = adding::keys_that_read(&lock(&self.state.db), self.clock.unix());
+            let typed = adding::keys_that_read(&lock(&self.state.db), self.unix());
             let typed = typed.unwrap_or_default();
             for link in links.iter().filter(|_| !typed.is_empty()) {
                 let (engine, link, typed) = (Arc::clone(self), (*link).clone(), typed.clone());
@@ -825,7 +825,7 @@ impl DeviceEntries {
         };
         let said = {
             let db = lock(&self.state.db);
-            at_relays::say_sent(&db, &self.state.identity, &set_up, self.clock.unix())
+            at_relays::say_sent(&db, &self.state.identity, &set_up, self.unix())
         };
         match said {
             Ok(true) => {
@@ -902,7 +902,7 @@ impl DeviceEntries {
         if held_up {
             return;
         }
-        let now = self.clock.unix();
+        let now = self.unix();
         let lately = lock(&self.kept).swept_at.is_some_and(|at| {
             let since = u64::try_from(now.saturating_sub(at));
             since.is_ok_and(|since| since < DEVICE_DELETE_SWEEP_INTERVAL_SECS)
@@ -927,6 +927,18 @@ impl DeviceEntries {
         }
     }
 
+    /// The time of day, in seconds, in UTC, of everything this side of
+    /// the node does: the node's clock, which a test sets
+    /// ([`cordelia_api::state::SyncControl::now`]), and which the routes
+    /// read too; so the time a pass gives the door, at which the reader
+    /// first holds a message, and the time of the hourly task of
+    /// messages are on the one clock that says when a message expires
+    /// (decision 2026-10-09 §13). A test that runs this side's waits
+    /// ahead ([`Clock::run_ahead`]) runs its time of day ahead with them.
+    pub fn unix(&self) -> i64 {
+        self.clock.unix_from(self.state.sync_control.now())
+    }
+
     // ── The hourly task of messages ─────────────────────────────────
 
     /// The hourly task of messages (decision 2026-10-09 §7.1;
@@ -942,7 +954,7 @@ impl DeviceEntries {
         if self.state.held.why().is_some() {
             return;
         }
-        let now = self.clock.unix();
+        let now = self.unix();
         match cordelia_api::reader::hourly(&lock(&self.state.db), now) {
             Ok(task) => {
                 let gone = task.gone.expired + task.gone.not_live;
@@ -968,7 +980,7 @@ impl DeviceEntries {
     /// has gone and that a relay was sent (decision 2026-10-04 §6). The
     /// delete waits in the store, and a pass pushes it.
     fn hand_overs(&self) {
-        let now = self.clock.unix();
+        let now = self.unix();
         let db = lock(&self.state.db);
         match drop_old_hand_overs(&db, now) {
             Ok(0) => {}
@@ -1057,7 +1069,7 @@ impl DeviceEntries {
         else {
             return;
         };
-        let now = self.clock.unix();
+        let now = self.unix();
         // Tried at each pass, it counts as a change of settings only
         // once it is dealt with by applying a statement or by a change of
         // the device's state.
@@ -1289,7 +1301,7 @@ impl DeviceEntries {
     /// `shown`: the entry goes through the one door. Returns whether the
     /// device applied a change by it, and so keeps another entry now.
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
-        let now = self.clock.unix();
+        let now = self.unix();
         let outcome = self.answered_as_a_change(shown, another, now);
         let relay = link.name();
         match outcome {
@@ -1397,7 +1409,7 @@ impl DeviceEntries {
 
     /// The relay at `link` refused something that it would have taken.
     fn no_room(&self, link: &Link, over_allowance: bool, of_the_change: bool) {
-        let at = self.clock.unix();
+        let at = self.unix();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
         if of.no_room.is_none() {
@@ -1726,7 +1738,7 @@ impl DeviceEntries {
                 after,
                 limit: ENTRY_PAGE_MAX_ENTRIES,
             });
-            let now = self.clock.unix();
+            let now = self.unix();
             let taken = self
                 .through(
                     at,
@@ -2222,13 +2234,10 @@ fn refused_wait(refusals: u32) -> Duration {
 mod tests {
     use super::*;
 
-    /// The hourly task of messages runs on a node whatever the device's
-    /// state, here one that follows no phrase: a message whose 30 days
-    /// are up leaves the index (decision 2026-10-09 §7.1). A node that is
-    /// held up changes nothing.
-    #[test]
-    fn the_hourly_task_of_messages_drops_what_expired_unless_the_node_is_held_up() {
-        let state = Arc::new(cordelia_api::state::AppState {
+    /// The state of a node over a store of its own in memory, which
+    /// follows no phrase.
+    fn a_node() -> Arc<cordelia_api::state::AppState> {
+        Arc::new(cordelia_api::state::AppState {
             db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
@@ -2247,7 +2256,16 @@ mod tests {
             own_channels: Default::default(),
             held: Default::default(),
             history: Default::default(),
-        });
+        })
+    }
+
+    /// The hourly task of messages runs on a node whatever the device's
+    /// state, here one that follows no phrase: a message whose 30 days
+    /// are up leaves the index (decision 2026-10-09 §7.1). A node that is
+    /// held up changes nothing.
+    #[test]
+    fn the_hourly_task_of_messages_drops_what_expired_unless_the_node_is_held_up() {
+        let state = a_node();
         lock(&state.db)
             .execute_batch(
                 "INSERT INTO message_generations (id, channel, statement, first_held)
@@ -2277,6 +2295,58 @@ mod tests {
         state.held.release();
         device.messages_hourly();
         assert_eq!(held(), 0);
+    }
+
+    /// The hourly task of messages reads the node's clock, the one a test
+    /// sets and the routes read (decision 2026-10-09 §13): set to a time
+    /// long before the system's, the task drops a message whose 30 days
+    /// are up by it and keeps one with a second left; a second on, it
+    /// drops that one too. The time this side gives the door is the same.
+    #[test]
+    fn the_hourly_task_of_messages_reads_the_nodes_clock() {
+        const DAYS_30: i64 = 30 * 24 * 60 * 60;
+        let state = a_node();
+        let set = 1_000_000_000;
+        state.sync_control.set_now(Some(set));
+        lock(&state.db)
+            .execute_batch(&format!(
+                "INSERT INTO message_generations (id, channel, statement, first_held)
+                     VALUES (1, zeroblob(32), 1, 100);
+                 INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                     VALUES (X'01010101010101010101010101010101', zeroblob(32), 'laptop', 1,
+                             2, NULL, '~', {expired}, 'a', zeroblob(16), zeroblob(16), 0, NULL,
+                             'expired', {expired}, NULL),
+                            (X'02020202020202020202020202020202', zeroblob(32), 'laptop', 1,
+                             2, NULL, '~', {left}, 'a', zeroblob(16), zeroblob(16), 0, NULL,
+                             'a second left', {left}, NULL);
+                 INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), 1, 1, X'01010101010101010101010101010101'),
+                            (zeroblob(32), 1, 2, X'02020202020202020202020202020202');
+                 INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (zeroblob(32), 1, 2, 1);",
+                expired = set - DAYS_30,
+                left = set - DAYS_30 + 1,
+            ))
+            .unwrap();
+        let bodies = || -> Vec<String> {
+            lock(&state.db)
+                .prepare("SELECT body FROM message_index ORDER BY body")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        assert_eq!(device.unix(), set);
+        device.messages_hourly();
+        assert_eq!(bodies(), ["a second left"]);
+        state.sync_control.set_now(Some(set + 1));
+        assert_eq!(device.unix(), set + 1);
+        device.messages_hourly();
+        assert!(bodies().is_empty());
     }
 
     /// What is kept in memory of a relay and a channel is kept while

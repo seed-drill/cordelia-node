@@ -1248,9 +1248,10 @@ CREATE TABLE message_first_held (
                     REFERENCES message_generations(id),
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
                                        AND number >= 1 AND number <= 4398046511103),
-    id          BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
-    sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
+    sent        INTEGER CHECK(sent IS NULL OR typeof(sent) = 'integer'),
     first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    CHECK((id IS NULL) = (sent IS NULL)),
     PRIMARY KEY (signer, generation, number)
 );
 
@@ -1350,7 +1351,10 @@ CREATE TABLE message_kept_taken (
   the channel's ID (unique), the number of the statement that began it, and
   when the device first held it. A statement's number is not a generation: a
   device alone under a phrase that makes a new phrase is at statement 1
-  again, with a new messages channel (§9.2).
+  again, with a new messages channel (§9.2). A generation other than the one
+  the device stands applied under goes at the hourly task once it holds no
+  index row and no kept value, with its rows of first holding, its signers
+  and its places (§7.1).
 - `message_index`: one row for each message the device holds opened, by its
   ID, with every field it was opened to (decision 2026-10-09 §2.2): the label
   the device knew its signer by, `to_kind` (1: one name, in `to_name`; 2:
@@ -1360,15 +1364,19 @@ CREATE TABLE message_kept_taken (
   when it was first shown, NULL until then (§6, §7.1); and `not_every_relay`,
   1 where it is the device's own and its kept value was dropped before every
   relay had taken it, which `log` says (§2.3, §4.1). `summary`, `read` and
-  `log` read it, and open no entry. **A row that goes is overwritten first:**
+  `log` read it, and open no entry. A message is looked up by its ID and its
+  generation: one held in another generation is not shown again, and is not
+  held at a number of this one. **A row that goes is overwritten first:**
   its body, link, subject, `from_name` and `to_name` are written over with
   zeros of the same length, and then it is deleted, with its marks and its
   rows of numbers held, in one transaction (§7.1).
 - `message_numbers`: the numbers each message is held at. A message held at
   two numbers is one row of the index and two here.
 - `message_first_held`: one row for each live number held, with its ID,
-  `sent` and when it was first held. It outlives the index row, so that an
-  entry taken again at a live number after its 30 days is not shown again.
+  `sent` and when it was first held; or with no ID and no `sent` where the
+  number was first held as a clearing, which counts it as gone and never as
+  overwritten (§2.5). It outlives the index row, so that an entry taken
+  again at a live number after its 30 days is not shown again.
 - `message_signers`: for each signer and generation, H (`highest`), the
   highest number held of a message or a clearing, and the counts of numbers
   overwritten before they were shown and of entries that were not messages,
