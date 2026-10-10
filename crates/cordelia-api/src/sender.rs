@@ -1144,7 +1144,15 @@ mod tests {
             )
         );
         assert_eq!(rows(conn, "message_numbers WHERE number = 1"), 1);
-        assert_eq!(rows(conn, "message_first_held WHERE number = 1"), 1);
+        // Its row of first holding has its ID and its `sent`.
+        let first: (i64, Option<Vec<u8>>, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT number, id, sent, first_held FROM message_first_held",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(first, (1, Some(done.id.to_vec()), Some(t), t));
         let generation = held::generation_of(conn, &messages(&s, 0))
             .unwrap()
             .unwrap();
@@ -1797,6 +1805,54 @@ mod tests {
         s.pass(0, 1);
         assert_eq!(shown_on(&s, 1, t + 30 * DAY - 2), ["a day later"]);
         assert_eq!(rows(&s[1].conn, "message_index"), 1);
+    }
+
+    /// What a device keeps of its own message once it has cleared it at its
+    /// 30 days is what a device that held the message keeps once it takes
+    /// that clearing through the door (decision 2026-10-09 §2.3, §2.5):
+    /// H, the count of overwritten and the number counted from, no row of
+    /// numbers held and no index row, and the row of first holding with
+    /// the message's ID and `sent`. A clearing alone at a live number
+    /// counts nothing as overwritten on either.
+    #[test]
+    fn a_device_that_clears_its_own_message_keeps_what_a_reader_of_the_clearing_keeps() {
+        let mut s = devices(2);
+        let t = s.now;
+        sent(&s, 0, &says("notes", "work", "for a month"), t);
+        s.pass(0, 1);
+        let later = t + 30 * DAY;
+        assert_eq!(
+            clear_expired(&s[0].conn, &s[0].identity, later, true).unwrap(),
+            1
+        );
+        s.pass(0, 1);
+        let kept_on = |n: usize| -> Vec<String> {
+            let mut said: Vec<String> = s[n]
+                .conn
+                .prepare(
+                    "SELECT 'first ' || number || ' ' || IFNULL(hex(id), '-') || ' '
+                            || IFNULL(sent, '-')
+                     FROM message_first_held WHERE signer = ?1
+                     UNION ALL
+                     SELECT 'signer ' || highest || ' ' || overwritten || ' '
+                            || IFNULL(counted_from, '-')
+                     FROM message_signers WHERE signer = ?1
+                     UNION ALL
+                     SELECT 'number ' || number FROM message_numbers WHERE signer = ?1
+                     UNION ALL
+                     SELECT 'index ' || hex(id) FROM message_index WHERE signer = ?1",
+                )
+                .unwrap()
+                .query_map([&s.key(0)[..]], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            said.sort();
+            said
+        };
+        assert_eq!(kept_on(0), kept_on(1));
+        assert_eq!(kept_on(0).len(), 2);
+        assert!(kept_on(0).contains(&"signer 1 0 1".to_string()));
     }
 
     /// A device clears only its own messages: what it holds of another
