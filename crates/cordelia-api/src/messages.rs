@@ -25,8 +25,8 @@
 //!   at step 9.
 //!
 //! **Text that another device chose** is cleaned by one function
-//! ([`cleaned`]): the seven Unicode general categories of §4.1 are taken
-//! out of a name, a label, a subject and a link, and a body's are shown
+//! ([`cleaned`]): the set of §4.1, seven Unicode general categories and
+//! the characters that render as nothing, is taken out of a name, a label, a subject and a link, and a body's are shown
 //! as escapes by the command ([`taken_out`]).
 
 use std::cell::RefCell;
@@ -59,11 +59,40 @@ use crate::state::{AppState, OwnChannels};
 
 // ── Text that another device chose ───────────────────────────────────
 
-/// Whether `c` is of the seven Unicode general categories that a command
-/// takes out of text another device chose, and shows as an escape in a
-/// body (decision 2026-10-09 §4.1, C4): Cc, Cf, Co, Cn, Cs, Zl and Zp.
-/// The categories are those of the table the build uses: a character that
-/// a later version of Unicode assigns is unassigned here, and taken out.
+/// The code points of the Unicode property Default_Ignorable_Code_Point,
+/// first and last of each range, from `DerivedCoreProperties.txt` of
+/// Unicode 16.0, the version of the crate `unicode-general-category`
+/// (decision 2026-10-09 §4.1). Each renders as nothing.
+const DEFAULT_IGNORABLE: [(char, char); 17] = [
+    ('\u{00ad}', '\u{00ad}'),
+    ('\u{034f}', '\u{034f}'),
+    ('\u{061c}', '\u{061c}'),
+    ('\u{115f}', '\u{1160}'),
+    ('\u{17b4}', '\u{17b5}'),
+    ('\u{180b}', '\u{180f}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{202a}', '\u{202e}'),
+    ('\u{2060}', '\u{206f}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{fe00}', '\u{fe0f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{ffa0}', '\u{ffa0}'),
+    ('\u{fff0}', '\u{fff8}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0000}', '\u{e0fff}'),
+];
+
+/// The braille pattern blank (So), which shows as a space and is none.
+const BRAILLE_BLANK: char = '\u{2800}';
+
+/// Whether `c` is of the set that a command takes out of text another
+/// device chose, and shows as an escape in a body (decision 2026-10-09
+/// §4.1, C4): the seven Unicode general categories Cc, Cf, Co, Cn, Cs, Zl
+/// and Zp; and every code point that renders as nothing
+/// ([`DEFAULT_IGNORABLE`]), and U+2800. The categories are those of the
+/// table the build uses: a character that a later version of Unicode
+/// assigns is unassigned here, and taken out.
 pub fn taken_out(c: char) -> bool {
     use unicode_general_category::{GeneralCategory as Category, get_general_category};
     matches!(
@@ -75,10 +104,13 @@ pub fn taken_out(c: char) -> bool {
             | Category::Surrogate
             | Category::LineSeparator
             | Category::ParagraphSeparator
-    )
+    ) || DEFAULT_IGNORABLE
+        .iter()
+        .any(|(first, last)| (*first..=*last).contains(&c))
+        || c == BRAILLE_BLANK
 }
 
-/// `text` with every character of the seven categories taken out
+/// `text` with every character of the set taken out
 /// ([`taken_out`]): a name, a label, a subject or a link, wherever a
 /// command prints one.
 pub fn cleaned(text: &str) -> String {
@@ -362,13 +394,18 @@ fn summary_wait(within_ms: u64) -> Duration {
 
 /// The store, where its lock is had before `deadline`: tried until then,
 /// and `None` where it was not. Time spent waiting counts as no answer.
-fn db_by(state: &AppState, deadline: Instant) -> Option<std::sync::MutexGuard<'_, Connection>> {
+/// It waits without holding the worker, which serves other requests
+/// meanwhile.
+async fn db_by(
+    state: &AppState,
+    deadline: Instant,
+) -> Option<std::sync::MutexGuard<'_, Connection>> {
     loop {
         match state.db.try_lock() {
             Ok(db) => return Some(db),
             Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
+                actix_web::rt::time::sleep(Duration::from_millis(1)).await;
             }
             Err(std::sync::TryLockError::WouldBlock) => return None,
         }
@@ -400,7 +437,7 @@ pub async fn summary(
     if body.version != env!("CARGO_PKG_VERSION") {
         return Ok(nothing());
     }
-    let Some(db) = db_by(&state, deadline) else {
+    let Some(db) = db_by(&state, deadline).await else {
         return Ok(nothing());
     };
     let now = state.sync_control.now();
@@ -1111,11 +1148,49 @@ mod tests {
 
     // ── Text ─────────────────────────────────────────────────────────
 
-    /// The seven categories, and no other (decision 2026-10-09 §4.1, C4):
-    /// a letter, a digit, a space, punctuation, a mark and an emoji's
-    /// symbol are kept, and so is nothing of the seven.
+    /// The first and the last code point of each range of the Unicode
+    /// property Default_Ignorable_Code_Point, as `DerivedCoreProperties.
+    /// txt` of Unicode 16.0 lists them, and U+2800.
+    const FIRST_AND_LAST_THAT_RENDER_AS_NOTHING: [char; 31] = [
+        '\u{00ad}',
+        '\u{034f}',
+        '\u{061c}',
+        '\u{115f}',
+        '\u{1160}',
+        '\u{17b4}',
+        '\u{17b5}',
+        '\u{180b}',
+        '\u{180f}',
+        '\u{200b}',
+        '\u{200f}',
+        '\u{202a}',
+        '\u{202e}',
+        '\u{2060}',
+        '\u{206f}',
+        '\u{3164}',
+        '\u{fe00}',
+        '\u{fe0f}',
+        '\u{feff}',
+        '\u{ffa0}',
+        '\u{fff0}',
+        '\u{fff8}',
+        '\u{1bca0}',
+        '\u{1bca3}',
+        '\u{1d173}',
+        '\u{1d17a}',
+        '\u{e0000}',
+        '\u{e0fff}',
+        '\u{e0100}',
+        '\u{e01ef}',
+        '\u{2800}',
+    ];
+
+    /// The seven categories and the characters that render as nothing,
+    /// and no other (decision 2026-10-09 §4.1, C4): a letter, a digit, a
+    /// space, punctuation, a mark and an emoji's symbol are kept, and so
+    /// is nothing of the set.
     #[test]
-    fn the_seven_categories_are_taken_out_and_no_other() {
+    fn the_seven_categories_and_what_renders_as_nothing_are_taken_out_and_no_other() {
         for c in [
             '\u{0}',
             '\u{1b}',
@@ -1137,7 +1212,11 @@ mod tests {
             '\u{2066}',
             '\u{2069}',
             '\u{e0001}',
-            '\u{e0041}', // Cf
+            '\u{e0041}',
+            // Cf, and of no range that renders as nothing.
+            '\u{0600}',
+            '\u{fff9}',
+            '\u{110bd}', // Cf
             '\u{e000}',
             '\u{f8ff}',
             '\u{f0000}', // Co
@@ -1148,6 +1227,19 @@ mod tests {
             '\u{2029}',   // Zp
         ] {
             assert!(taken_out(c), "{:?}", c);
+        }
+        // The first and the last of each range of Default_Ignorable_Code_
+        // Point, as Unicode 16.0 lists them, and the braille blank: those
+        // of Mn, Lo and So are of none of the seven categories.
+        for c in FIRST_AND_LAST_THAT_RENDER_AS_NOTHING {
+            assert!(taken_out(c), "{:?}", c);
+        }
+        // A character beside each range that is of none is kept.
+        for c in [
+            '\u{034e}', '\u{0350}', '\u{115e}', '\u{1161}', '\u{17b3}', '\u{17b6}', '\u{3163}',
+            '\u{3165}', '\u{fdff}', '\u{fe10}', '\u{ff9f}', '\u{ffa1}', '\u{27ff}', '\u{2801}',
+        ] {
+            assert!(!taken_out(c), "{:?}", c);
         }
         for c in [
             'a',
@@ -1881,6 +1973,46 @@ mod tests {
             answer(summary(asked(), state.clone(), summary_asked("work", 50)).await).await;
         assert_eq!(status, 200, "{said}");
         assert_eq!(said["lines"].as_array().unwrap().len(), 1);
+    }
+
+    /// While a summary waits for the store's lock, the worker it runs on
+    /// serves another request: the wait holds no thread (decision
+    /// 2026-10-09 §4.1, C20).
+    #[actix_web::test]
+    async fn another_request_is_served_while_a_summary_waits_for_the_store() {
+        let (state, _) = a_node_with_a_message();
+        let (holding, held) = std::sync::mpsc::channel();
+        let (let_go, told) = std::sync::mpsc::channel::<()>();
+        let other = state.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = other.db.lock().unwrap();
+            holding.send(()).unwrap();
+            let _ = told.recv();
+        });
+        held.recv().unwrap();
+        let began = Instant::now();
+        let waits = async {
+            let answered = summary(asked(), state.clone(), summary_asked("work", 100)).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        // Another request, sent once the summary is waiting: of another
+        // version, which is answered without the store.
+        let another = async {
+            actix_web::rt::time::sleep(Duration::from_millis(10)).await;
+            let mut other = summary_asked("work", 100);
+            other.version = "0.0.0".into();
+            let answered = summary(asked(), state.clone(), other).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        let ((waited, waited_until), (served, served_at)) = tokio::join!(waits, another);
+        let_go.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!((waited, served), (204, 204));
+        assert!(
+            served_at < waited_until,
+            "the other request waited for the summary"
+        );
+        assert!(waited_until.duration_since(began) >= Duration::from_millis(100));
     }
 
     /// `summary` answers nothing to a request of another version, and

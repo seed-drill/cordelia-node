@@ -7,9 +7,9 @@
 //! **What is printed here is put before an agent.** So the printing is the
 //! command's, from what the node answers: a body goes inside a frame whose
 //! two lines carry a value made for that one printing, with every
-//! character of the seven categories of §4.1 but line feed and tab shown
-//! as an escape; every name, label, subject and link that another device
-//! chose is cleaned of them ([`cordelia_api::messages::cleaned`]), and a
+//! character of the set of §4.1 but line feed and tab, and a backslash,
+//! shown as an escape; every name, label, subject and link that another
+//! device chose is cleaned of them ([`cordelia_api::messages::cleaned`]), and a
 //! name is cut at 48 Unicode scalar values; and every command line is
 //! quoted for a shell.
 //!
@@ -21,8 +21,8 @@
 //! ([`summary_asked`]).
 
 use std::ffi::OsString;
-use std::io::{IsTerminal, Read};
-use std::path::{Path, PathBuf};
+use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -39,8 +39,8 @@ use cordelia_core::protocol::{
 use cordelia_crypto::message::is_a_link;
 
 use crate::{
-    NOT_SENT_TO_ANOTHER_VERSION, VERSION_ASKED_FOR, VERSION_NOT_LEARNED, indicator, shell_arg,
-    to_this_machine, version_note,
+    NOT_SENT_TO_ANOTHER_VERSION, VERSION_ASKED_FOR, VERSION_NOT_LEARNED, api_host, indicator,
+    shell_arg, to_this_machine, version_note,
 };
 
 /// The environment variable that Claude Code sets, in the processes of a
@@ -108,6 +108,11 @@ write it on standard input and close it.";
     pub const NOT_TEXT: &str = "The message is not UTF-8 text.";
     pub const NOT_RUNNING: &str =
         "The node is not running, so nothing was done. Start it with: cordelia start";
+    pub const FOLDER_NOT_KNOWN: &str =
+        "git did not answer in time, so this folder's agent is not known, and nothing was done.";
+    pub const SEND_NOT_ANSWERED: &str =
+        "The node did not answer in time, so it is not known whether the message was sent.";
+    pub const READ_NOT_ANSWERED: &str = "The node did not answer in time.";
     pub const SYNC_OFF: &str = "Sync is off on this device, and so are messages: nothing was \
 sent. Turn sync on with: cordelia sync claude";
     pub const NO_PLACE: &str = "This device holds more than 1024 channels of your own, which is \
@@ -167,15 +172,18 @@ pub fn subject_shown(subject: &str, was_cut: bool) -> String {
 }
 
 /// A body as it is printed inside its frame (decision 2026-10-09 §4.1):
-/// every character of the seven categories but line feed and tab shown as
-/// an escape (`char::escape_default`, so U+202E is `\u{202e}`), whether
+/// every character of the set of §4.1 but line feed and tab shown as an
+/// escape (`char::escape_default`, so U+202E is `\u{202e}`), and a `\`
+/// as `\\`, so that a body cannot write what reads as an escape; whether
 /// the output is a terminal or a pipe.
 pub fn body_shown(body: &str) -> String {
     body.chars()
-        .flat_map(|c| match taken_out(c) && !matches!(c, '\n' | '\t') {
-            true => c.escape_default().collect::<Vec<char>>(),
-            false => vec![c],
-        })
+        .flat_map(
+            |c| match (taken_out(c) && !matches!(c, '\n' | '\t')) || c == '\\' {
+                true => c.escape_default().collect::<Vec<char>>(),
+                false => vec![c],
+            },
+        )
         .collect()
 }
 
@@ -213,19 +221,6 @@ fn directory(
         return Some(dir);
     }
     hook_cwd().or_else(|| std::env::current_dir().ok())
-}
-
-/// The folder whose agent a command acts as, as it is sent to the node
-/// (decision 2026-10-09 §3.1): the real path of `dir`, and the directory
-/// whose Claude Code folder holds its memory, as `sync map` takes its
-/// folder. `None` where it cannot be resolved: it is then no folder.
-fn folder_of(dir: &Path) -> Option<String> {
-    let real = dir.canonicalize().ok()?;
-    Some(
-        cordelia_api::found::memory_root(&real)
-            .display()
-            .to_string(),
-    )
 }
 
 /// The `cwd` of a hook's input (decision 2026-10-09 §5): `input` taken as
@@ -313,23 +308,55 @@ impl Node {
         })
     }
 
+    /// How long `read` and `send` wait for git (§3.1): the configuration's
+    /// `[messages] git_wait_ms`, which a test sets, or `STREAM_TIMEOUT_SECS`.
+    fn git_wait(&self) -> Duration {
+        self.config.messages.git_wait_ms.map_or(
+            Duration::from_secs(STREAM_TIMEOUT_SECS),
+            Duration::from_millis,
+        )
+    }
+
+    /// How long `read` and `send` wait for the node to answer what they
+    /// ask (§4.3, step 3): the configuration's `[messages]
+    /// answer_wait_ms`, which a test sets, or `VERSION_ASKED_FOR`.
+    fn answer_wait(&self) -> Duration {
+        self.config
+            .messages
+            .answer_wait_ms
+            .map_or(VERSION_ASKED_FOR, Duration::from_millis)
+    }
+
     /// POST `body` to `path`, waiting for `limit`: the status and what was
-    /// answered. `None` where nothing answered.
-    fn post(&self, path: &str, body: &Value, limit: Duration) -> Option<(u16, Value)> {
-        let (client, url) = to_this_machine(&self.config, path, Some(limit)).ok()?;
+    /// answered, or whether the node was not reached or did not answer in
+    /// time.
+    fn post(&self, path: &str, body: &Value, limit: Duration) -> Posted {
+        let Ok((client, url)) = to_this_machine(&self.config, path, Some(limit)) else {
+            return Posted::NotReached;
+        };
         let agent: ureq::Agent = client.http_status_as_error(false).build().into();
-        let mut answer = agent
+        let asked = agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.token))
-            .send_json(body)
-            .ok()?;
+            .send_json(body);
+        let mut answer = match asked {
+            Ok(answer) => answer,
+            // A node on this machine is connected to at once, or refuses
+            // at once: time that ran out in any other step ran out after
+            // the request was sent.
+            Err(ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect)) => {
+                return Posted::NotReached;
+            }
+            Err(ureq::Error::Timeout(_)) => return Posted::NotInTime,
+            Err(_) => return Posted::NotReached,
+        };
         let status = answer.status();
         // A redirect did not come from the node.
         if status.is_redirection() {
-            return None;
+            return Posted::NotReached;
         }
         let read = answer.body_mut().read_json().unwrap_or(Value::Null);
-        Some((status.as_u16(), read))
+        Posted::Answered(status.as_u16(), read)
     }
 
     /// The node's status, as it answers within `VERSION_ASKED_FOR`, or why
@@ -357,17 +384,10 @@ impl Node {
     /// this command's, and it is not held up. The first that fails is the
     /// refusal, as its line.
     fn asked_first(&self) -> Result<(), String> {
-        let address = format!(
-            "{}:{}",
-            self.config.api.bind_address, self.config.node.http_port
-        );
-        let reached = address
-            .parse::<std::net::SocketAddr>()
-            .ok()
-            .is_some_and(|at| {
-                std::net::TcpStream::connect_timeout(&at, Duration::from_secs(STREAM_TIMEOUT_SECS))
-                    .is_ok()
-            });
+        let reached = api_address(&self.config).is_some_and(|at| {
+            std::net::TcpStream::connect_timeout(&at, Duration::from_secs(STREAM_TIMEOUT_SECS))
+                .is_ok()
+        });
         if !reached {
             return Err(says::NOT_RUNNING.into());
         }
@@ -390,6 +410,27 @@ impl Node {
             )),
         }
     }
+}
+
+/// What a command's request to the node came to ([`Node::post`]).
+#[derive(Debug, Clone, PartialEq)]
+enum Posted {
+    /// The status, and what was answered.
+    Answered(u16, Value),
+    /// The connection was refused or could not be made: the node is not
+    /// running.
+    NotReached,
+    /// The request was sent, and no answer came in time: what the node
+    /// did with it is not known.
+    NotInTime,
+}
+
+/// The address of the node's API, written as the rest of the binary
+/// writes it ([`api_host`], so `::1` in brackets): `None` for an address
+/// that the API may not have.
+fn api_address(config: &Config) -> Option<std::net::SocketAddr> {
+    let host = api_host(&config.api.bind_address)?;
+    format!("{host}:{}", config.node.http_port).parse().ok()
 }
 
 /// The line of a node that is held up (§4.3, step 3).
@@ -576,7 +617,11 @@ pub fn summary(config_path: &str, started: Instant, others: bool) {
         .ok()
         .flatten();
     if let Some(said) = said {
-        print!("{said}");
+        // An output that is closed is not written to, and is no error:
+        // `print!` would panic there, and the process exit 101.
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(said.as_bytes());
+        let _ = out.flush();
     }
 }
 
@@ -602,7 +647,10 @@ fn summarised(config_path: &str, started: Instant) -> Option<String> {
         "within_ms": left.as_millis() as u64,
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let (status, answer) = node.post("/api/v1/messages/summary", &request, left)?;
+    let Posted::Answered(status, answer) = node.post("/api/v1/messages/summary", &request, left)
+    else {
+        return None;
+    };
     if status != 200 || Instant::now() >= deadline {
         return None;
     }
@@ -680,14 +728,16 @@ pub fn read(config_path: &str, id: &str) -> anyhow::Result<()> {
     if !is_an_id(id) {
         refuse(&not_an_id(id));
     }
-    // 3. The node.
+    // 3. The folder's agent, and then the node.
     let node = Node::of(config_path)?;
+    let (folder, shown) =
+        folder_here(node.git_wait()).unwrap_or_else(|| refuse(says::FOLDER_NOT_KNOWN));
     node.asked_first().unwrap_or_else(|line| refuse(&line));
-    let (folder, shown) = folder_here();
     let request = json!({ "folder": folder, "id": id });
-    let Some((status, answer)) = node.post("/api/v1/messages/read", &request, VERSION_ASKED_FOR)
-    else {
-        refuse(says::NOT_RUNNING);
+    let (status, answer) = match node.post("/api/v1/messages/read", &request, node.answer_wait()) {
+        Posted::Answered(status, answer) => (status, answer),
+        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotInTime => refuse(says::READ_NOT_ANSWERED),
     };
     if status != 200 {
         refuse(&refused_by(status, &answer, &shown, Does::Show));
@@ -705,14 +755,21 @@ fn not_an_id(id: &str) -> String {
 }
 
 /// The folder this command runs in, as it is sent to the node, and as it
-/// is printed in the line that maps it: where it cannot be resolved, it is
-/// sent as it is, and is no mapped folder (decision 2026-10-09 §3.1).
-fn folder_here() -> (String, String) {
+/// is printed in the line that maps it (decision 2026-10-09 §3.1): the
+/// real path of the directory, and the directory whose Claude Code folder
+/// holds its memory, as `sync map` takes its folder. Where the directory
+/// cannot be resolved, it is sent as it is, and is no mapped folder.
+/// `None` where git has not answered within `git_wait`: git is killed,
+/// and nothing falls back to the directory itself, which may be another
+/// agent's folder than the repository's.
+fn folder_here(git_wait: Duration) -> Option<(String, String)> {
     let dir = directory(std::env::var_os(PROJECT_DIR), || None).unwrap_or_default();
-    match folder_of(&dir) {
-        Some(folder) => (folder.clone(), folder),
-        None => (String::new(), dir.display().to_string()),
-    }
+    let Ok(real) = dir.canonicalize() else {
+        return Some((String::new(), dir.display().to_string()));
+    };
+    let folder = cordelia_api::found::memory_root_by(&real, Instant::now() + git_wait)?;
+    let folder = folder.display().to_string();
+    Some((folder.clone(), folder))
 }
 
 /// What `read` prints of the message the node answered, with `marker` on
@@ -863,10 +920,11 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
     }
     let body = body_from(stdin, terminal, Duration::from_secs(STREAM_TIMEOUT_SECS))
         .unwrap_or_else(|line| refuse(line));
-    // 3. The node.
+    // 3. The folder's agent, and then the node.
     let node = Node::of(config_path)?;
+    let (folder, shown) =
+        folder_here(node.git_wait()).unwrap_or_else(|| refuse(says::FOLDER_NOT_KNOWN));
     node.asked_first().unwrap_or_else(|line| refuse(&line));
-    let (folder, shown) = folder_here();
     let request = json!({
         "folder": folder,
         "to": flags.to,
@@ -876,9 +934,10 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
         "link": flags.re,
         "body": body,
     });
-    let Some((status, answer)) = node.post("/api/v1/messages/send", &request, VERSION_ASKED_FOR)
-    else {
-        refuse(says::NOT_RUNNING);
+    let (status, answer) = match node.post("/api/v1/messages/send", &request, node.answer_wait()) {
+        Posted::Answered(status, answer) => (status, answer),
+        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotInTime => refuse(says::SEND_NOT_ANSWERED),
     };
     if status != 200 {
         refuse(&refused_by(status, &answer, &shown, Does::Send));
@@ -905,7 +964,7 @@ pub fn sent_says(answer: &Value) -> String {
         out.push_str(&format!(
             "A relay has no room for more messages of yours in this generation: {} fills it with \
              {} entries. This message waits, and may not be taken there.\n",
-            cleaned(filled["label"].as_str().unwrap_or_default()),
+            label_shown(filled["label"].as_str().unwrap_or_default()),
             filled["entries"].as_u64().unwrap_or(0)
         ));
     }
@@ -1078,8 +1137,8 @@ mod tests {
         assert_eq!(
             said,
             "Sent 01234567 to every agent as work.\nA relay has no room for more messages of \
-             yours in this generation: tablet fills it with 5461 entries. This message waits, \
-             and may not be taken there.\n"
+             yours in this generation: \"tablet\" fills it with 5461 entries. This message \
+             waits, and may not be taken there.\n"
         );
         assert_eq!(
             TYPE_THE_MESSAGE,
@@ -1251,6 +1310,16 @@ mod tests {
             "The node is not running, so nothing was done. Start it with: cordelia start"
         );
         assert_eq!(
+            says::FOLDER_NOT_KNOWN,
+            "git did not answer in time, so this folder's agent is not known, and nothing was \
+             done."
+        );
+        assert_eq!(
+            says::SEND_NOT_ANSWERED,
+            "The node did not answer in time, so it is not known whether the message was sent."
+        );
+        assert_eq!(says::READ_NOT_ANSWERED, "The node did not answer in time.");
+        assert_eq!(
             says::REPLY_WITH_TO,
             "--reply sends to the agent that sent the message it answers: give no --to or --all \
              with it."
@@ -1329,15 +1398,50 @@ mod tests {
         assert_eq!(first.replace(&one, &two), second);
     }
 
-    /// Every character of the seven categories is taken out of a subject,
-    /// a name, a label and a link, and shown as an escape in a body, where
-    /// a line feed and a tab are left (decision 2026-10-09 §4.1, C4). A
-    /// body is printed the same whether its output is a terminal or a
-    /// pipe: nothing here asks which.
+    /// Every character of the set, the seven categories and what renders
+    /// as nothing, is taken out of a subject, a name, a label and a link,
+    /// and shown as an escape in a body, where a line feed and a tab are
+    /// left (decision 2026-10-09 §4.1, C4). A body is printed the same
+    /// whether its output is a terminal or a pipe: nothing here asks which.
     #[test]
-    fn every_character_of_the_seven_categories_is_taken_out_of_a_subject_a_name_a_label_and_a_link_and_escaped_in_a_body()
+    fn every_character_of_the_set_is_taken_out_of_a_subject_a_name_a_label_and_a_link_and_escaped_in_a_body()
      {
         let set = [
+            // The first and the last of each range of Default_Ignorable_
+            // Code_Point in Unicode 16.0, and U+2800.
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{061c}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{17b5}',
+            '\u{180b}',
+            '\u{180f}',
+            '\u{200f}',
+            '\u{202a}',
+            '\u{2060}',
+            '\u{206f}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{ffa0}',
+            '\u{fff0}',
+            '\u{fff8}',
+            '\u{1bca0}',
+            '\u{1bca3}',
+            '\u{1d173}',
+            '\u{1d17a}',
+            '\u{e0000}',
+            '\u{e0fff}',
+            '\u{e0100}',
+            '\u{e01ef}',
+            '\u{2800}',
+            // Of the seven categories; the first three are Cf and of no
+            // range that renders as nothing.
+            '\u{0600}',
+            '\u{fff9}',
+            '\u{110bd}',
             '\u{e0001}',
             '\u{e0041}',
             '\u{200b}',
@@ -1356,6 +1460,8 @@ mod tests {
                 laced.push(c);
                 laced.push(set[k % set.len()]);
             }
+            // Every one of the set, in every text.
+            laced.extend(set);
             laced.push_str("\u{1b}[31m");
             laced
         };
@@ -1491,6 +1597,103 @@ mod tests {
             }
             assert_eq!(read_back, label);
         }
+    }
+
+    /// A backslash in a body is printed as two, so that a body that holds
+    /// the text of an escape is printed otherwise than one that holds the
+    /// character (decision 2026-10-09 §4.1).
+    #[test]
+    fn a_backslash_in_a_body_is_escaped() {
+        let written = body_shown("\\u{202e}");
+        let character = body_shown("\u{202e}");
+        assert_eq!(character, "\\u{202e}");
+        assert_eq!(written, "\\\\u{202e}");
+        assert_ne!(written, character);
+        assert_eq!(body_shown("a\\b\n"), "a\\\\b\n");
+    }
+
+    /// The label of the signer that fills the messages channel at a relay
+    /// is printed as every label is: between quotes, cleaned, a quote in it
+    /// escaped (decision 2026-10-09 §4.1, §4.3).
+    #[test]
+    fn the_label_of_the_signer_that_fills_the_channel_is_quoted_and_cleaned() {
+        let said = sent_says(&json!({ "id": "0123456789", "as": "work", "to": "notes",
+            "filled_by": { "label": "tab\"le\nt\u{1b}", "entries": 9 } }));
+        let line = said.lines().nth(1).unwrap();
+        assert_eq!(
+            line,
+            "A relay has no room for more messages of yours in this generation: \"tab\\\"let\" \
+             fills it with 9 entries. This message waits, and may not be taken there."
+        );
+    }
+
+    // ── The node ─────────────────────────────────────────────────────
+
+    /// The node's address is written as the rest of the binary writes it:
+    /// `::1` in brackets, so that both addresses the API may have are
+    /// reached (decision 2026-10-09 §4.3, step 3).
+    #[test]
+    fn the_node_is_reached_at_either_address_the_api_may_have() {
+        let mut config = Config::default();
+        config.node.http_port = 9473;
+        config.api.bind_address = "::1".into();
+        assert_eq!(api_address(&config), Some("[::1]:9473".parse().unwrap()));
+        config.api.bind_address = "127.0.0.1".into();
+        assert_eq!(
+            api_address(&config),
+            Some("127.0.0.1:9473".parse().unwrap())
+        );
+        config.api.bind_address = "192.0.2.1".into();
+        assert_eq!(api_address(&config), None);
+    }
+
+    /// A request that the node took and did not answer in time is told
+    /// from a node that is not there: what it did is not known (decision
+    /// 2026-10-09 §4.3, step 3).
+    #[test]
+    fn a_request_not_answered_in_time_is_not_a_node_that_is_not_running() {
+        let node_at = |port: u16| {
+            let mut config = Config::default();
+            config.node.http_port = port;
+            Node {
+                config,
+                token: "t".into(),
+            }
+        };
+        // Takes the request, and does not answer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (taken, took) = mpsc::channel();
+        std::thread::spawn(move || {
+            for mut asked in listener.incoming().flatten() {
+                let mut request = [0u8; 4096];
+                let _ = asked.read(&mut request);
+                let _ = taken.send(());
+                std::thread::sleep(Duration::from_secs(5));
+                drop(asked);
+            }
+        });
+        let began = Instant::now();
+        let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(300));
+        assert_eq!(posted, Posted::NotInTime);
+        assert!(began.elapsed() < Duration::from_secs(3));
+        took.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Nothing listens.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(300));
+        assert_eq!(posted, Posted::NotReached);
+        // Answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for asked in listener.incoming().flatten() {
+                answers(asked, r#"{"id": "x"}"#);
+            }
+        });
+        let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(3_000));
+        assert_eq!(posted, Posted::Answered(200, json!({ "id": "x" })));
     }
 
     // ── The order of the checks ──────────────────────────────────────

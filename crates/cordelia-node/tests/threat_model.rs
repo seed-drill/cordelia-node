@@ -3250,8 +3250,8 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
     });
     assert!(
         said.lines().nth(1).is_some_and(|line| line.starts_with(
-            "A relay has no room for more messages of yours in this generation: laptop fills \
-             it with "
+            "A relay has no room for more messages of yours in this generation: \"laptop\" \
+             fills it with "
         ) && line
             .ends_with(" entries. This message waits, and may not be taken there.")),
         "{said}"

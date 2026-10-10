@@ -155,6 +155,18 @@ pub struct MessagesConfig {
     /// for every folder of the device. Over it, the configuration is
     /// refused when it is loaded.
     pub per_folder_per_hour: u32,
+    /// How long `msg read` and `msg send` wait for git to say which
+    /// folder they run in, in milliseconds (decision 2026-10-09 §3.1):
+    /// STREAM_TIMEOUT_SECS where it is not set. No deployment sets it: a
+    /// test lowers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_wait_ms: Option<u64>,
+    /// How long `msg read` and `msg send` wait for the node to answer
+    /// what they ask it, in milliseconds (decision 2026-10-09 §4.3, step
+    /// 3): as long as they wait for its version where it is not set. No
+    /// deployment sets it: a test lowers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_wait_ms: Option<u64>,
 }
 
 impl MessagesConfig {
@@ -327,6 +339,8 @@ impl Default for MessagesConfig {
     fn default() -> Self {
         Self {
             per_folder_per_hour: protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR as u32,
+            git_wait_ms: None,
+            answer_wait_ms: None,
         }
     }
 }

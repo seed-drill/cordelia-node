@@ -358,6 +358,25 @@ fn the_summary_prints_nothing_and_exits_0_on_any_error() {
     let said = summary(desktop, "work");
     assert!(said.contains(&format!("  {id}  ")), "{said}");
     assert!(said.contains(": waits\n"), "{said}");
+    // Its output closed before it writes: it writes nothing, says
+    // nothing, and exits 0, where it had a line to print.
+    let (reads, writes) = std::io::pipe().unwrap();
+    drop(reads);
+    let closed = desktop
+        .command_for(&[], &["msg", "summary"])
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .stdout(writes)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(closed.status.code(), Some(0), "{}", err(&closed));
+    assert_eq!(err(&closed), "");
+    let said = summary(desktop, "work");
+    assert!(
+        said.ends_with(&format!("  1 more wait for this agent: {id}\n")),
+        "{said}"
+    );
     // Read, nothing is unread.
     assert!(read(desktop, "work", &id).status.success());
     nothing(
@@ -1475,4 +1494,157 @@ fn a_subdirectory_of_a_mapped_repository_is_its_agent_and_of_another_folder_is_n
          it with: cordelia sync map ~/notes/sub <name>",
     );
     assert_eq!(out(&msg_in(&laptop, &beside, &[], &["summary"], b"")), "");
+}
+
+/// `git` first in the path, answering nothing: `read` and `send` give it
+/// the time the configuration sets, kill it, and refuse; they act as no
+/// folder's agent, neither the repository's nor the directory's own, and
+/// the node is not asked (decision 2026-10-09 §3.1, §4.3).
+#[test]
+fn a_git_that_does_not_answer_is_refused_and_no_folder_is_taken() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let work = folder(&laptop, "work");
+    let made = Command::new("git")
+        .arg("-C")
+        .arg(&work)
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    maps(&laptop, &["notes", "work"]);
+    makes_a_phrase(&laptop, "laptop");
+    let all = [&relay, &laptop];
+    sent(&all, &laptop, "notes", &["--to", "work"], "first\n");
+    // A `git` that answers nothing, first in the path.
+    let bin = laptop.dir.path().join("hanging-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(&git, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_var = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // The node is reached through a pass-through, which keeps what it is
+    // sent.
+    let through = PassesOn::to(laptop.http);
+    let own = std::fs::read_to_string(laptop.config()).unwrap();
+    let config = laptop.dir.path().join("config-git.toml");
+    let changed = own.replace(
+        &format!("http_port = {}", laptop.http),
+        &format!("http_port = {}", through.port),
+    );
+    assert_ne!(own, changed);
+    std::fs::write(
+        &config,
+        format!("{changed}\n[messages]\ngit_wait_ms = 300\n"),
+    )
+    .unwrap();
+    let vars = [("PATH", path_var.as_str())];
+    let line = "git did not answer in time, so this folder's agent is not known, and nothing \
+                was done.";
+    let deep = work.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    for dir in [&work, &deep] {
+        for args in [&["read", "01234567"][..], &["send", "--to", "notes"][..]] {
+            let config = path(&config);
+            let mut command =
+                laptop.command_for(&vars, &[&["msg", "--config", &config], args].concat());
+            command
+                .current_dir(dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let _ = stdin.write_all(b"from a folder not known\n");
+            drop(stdin);
+            let began = Instant::now();
+            let ended = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if began.elapsed() > Duration::from_secs(20) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                ended.is_some(),
+                "{args:?} in {}: it did not end",
+                dir.display()
+            );
+            let said = child.wait_with_output().unwrap();
+            refused_with(&said, line);
+        }
+    }
+    // The node was asked nothing: not even its status.
+    assert_eq!(through.sent(), Vec::<u8>::new());
+    // With git that answers, it is the repository's agent.
+    let said = msg_in(&laptop, &deep, &[], &["send", "--to", "notes"], b"x\n");
+    assert!(
+        out(&said).ends_with(" to notes as work.\n"),
+        "{}",
+        err(&said)
+    );
+}
+
+/// A node that takes a request and does not answer it within the time the
+/// configuration sets is not said to be not running: `send` says that it is
+/// not known whether the message was sent, and it was; `read` says that the
+/// node did not answer in time (decision 2026-10-09 §4.3, step 3).
+#[test]
+fn a_node_that_answers_late_is_not_said_to_be_not_running() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "first\n",
+    );
+    let laptop = &two.laptop;
+    let late = PassesOn::holding(laptop.http, Duration::from_millis(1_500));
+    let own = std::fs::read_to_string(laptop.config()).unwrap();
+    let changed = own.replace(
+        &format!("http_port = {}", laptop.http),
+        &format!("http_port = {}", late.port),
+    );
+    assert_ne!(own, changed);
+    let config = laptop.dir.path().join("config-late.toml");
+    std::fs::write(
+        &config,
+        format!("{changed}\n[messages]\nanswer_wait_ms = 500\n"),
+    )
+    .unwrap();
+    let config = path(&config);
+    let notes = folder(laptop, "notes");
+    let said = msg_in(
+        laptop,
+        &notes,
+        &[],
+        &["--config", &config, "send", "--to", "work"],
+        b"sent late\n",
+    );
+    refused_with(
+        &said,
+        "The node did not answer in time, so it is not known whether the message was sent.",
+    );
+    // The node sent it.
+    summary_with(&two.all(), &two.desktop, "work", "sent late");
+    let said = msg_in(
+        laptop,
+        &notes,
+        &[],
+        &["--config", &config, "read", &id],
+        b"",
+    );
+    refused_with(&said, "The node did not answer in time.");
 }

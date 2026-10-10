@@ -1611,11 +1611,6 @@ mod tests {
         );
     }
 
-    /// A row that goes takes its marks and its rows of numbers held with
-    /// it, and leaves its rows of first holding, and every other row
-    /// (decision 2026-10-09 §7.1, §7.2). A mark merged from the device's
-    /// own list, with no message, stays. Dropping a row the device does
-    /// not hold changes nothing.
     /// That `summary` announced a message is kept for one name, and that a
     /// person read it for the device; each goes with its message
     /// (decision 2026-10-09 §7.2).
@@ -1685,6 +1680,11 @@ mod tests {
         assert!(entries_by_author(&conn, &[3; 32]).unwrap().is_empty());
     }
 
+    /// A row that goes takes its marks and its rows of numbers held with
+    /// it, and leaves its rows of first holding, and every other row
+    /// (decision 2026-10-09 §7.1, §7.2). A mark merged from the device's
+    /// own list, with no message, stays. Dropping a row the device does
+    /// not hold changes nothing.
     #[test]
     fn a_dropped_row_takes_its_marks_and_leaves_its_first_holding() {
         let conn = db::open_in_memory().unwrap();
