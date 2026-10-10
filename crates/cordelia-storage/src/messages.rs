@@ -373,7 +373,7 @@ mod tests {
 
         for begin in ["BEGIN", "SAVEPOINT the_doors_write"] {
             conn.execute_batch(begin).unwrap();
-            assert!(drop_row(&conn, &[1; 16]).unwrap(), "{begin}");
+            assert_eq!(drop_row(&conn, &[1; 16]).ok(), Some(true), "{begin}");
             assert_eq!(count(&conn, "message_index"), 0, "{begin}");
             assert!(!conn.is_autocommit(), "{begin}: the caller's write is open");
             let back = if begin == "BEGIN" {
@@ -386,7 +386,7 @@ mod tests {
         }
 
         conn.execute_batch("BEGIN").unwrap();
-        assert!(drop_row(&conn, &[1; 16]).unwrap());
+        assert_eq!(drop_row(&conn, &[1; 16]).ok(), Some(true));
         conn.execute_batch("COMMIT").unwrap();
         assert_eq!(body(&conn), None);
         assert_eq!(count(&conn, "message_numbers"), 0);
