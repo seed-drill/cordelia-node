@@ -51,7 +51,8 @@ cordelia-node/
                          #   history; meta (the keys of node_meta); first_start (the copy,
                          #   the step and the guard); messages (step 19: what a device keeps
                          #   of messages between its agents, a generation being a messages
-                         #   channel it held; a row overwritten before it goes, in the
+                         #   channel it held; H and the live numbers, the index, places
+                         #   and the shown time; a row overwritten before it goes, in the
                          #   caller's write); db (secure_delete, set before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
                          #   kind: channels, items, psk, search
@@ -66,7 +67,9 @@ cordelia-node/
                          #   asks for, and the phrase's word for it), recover, swept (old
                          #   deletes in a device's own store), found (what `map` would sync,
                          #   and the notice), first_start (a node that is held up), sync,
-                         #   history. The older Channels API (handlers, entries, verify): a
+                         #   history; reader (what a device keeps of an entry of the
+                         #   messages channel that the door stores, and the hourly task of
+                         #   messages). The older Channels API (handlers, entries, verify): a
                          #   relay's and a bootnode's
     cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
                          #   (claude.rs, plan.rs; claude/sequences.rs is the harness of

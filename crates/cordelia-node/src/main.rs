@@ -7488,6 +7488,51 @@ mod tests {
         assert!(open_database(&later, &as_a("personal")).is_err());
     }
 
+    /// The node sets `secure_delete` on a personal node's store before
+    /// the schema's steps run (decision 2026-10-09 §7.1, D10), where it
+    /// starts and where a command opens the store itself: a store of an
+    /// old step whose table the next step rewrites holds its text once
+    /// afterwards, and a relay's twice, the copy and what was freed.
+    #[test]
+    fn a_personal_nodes_store_of_an_old_step_is_stepped_with_secure_delete_on() {
+        let words = "a descriptor of puffin-juniper-sextant";
+        let dir = tempfile::tempdir().unwrap();
+        let as_a = |role: &str| {
+            let mut config = Config::default();
+            config.network.role = role.into();
+            config
+        };
+        let old_store = |name: &str| -> std::path::PathBuf {
+            let path = dir.path().join(name);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            cordelia_storage::schema::at_version_3(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                       descriptor, created_at, updated_at)
+                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), ?1, 't', 't')",
+                [words.as_bytes()],
+            )
+            .unwrap();
+            path
+        };
+        let held = |conn: &rusqlite::Connection, path: &std::path::Path| -> usize {
+            assert!(cordelia_storage::db::checkpoint_truncating(conn).unwrap());
+            let bytes = std::fs::read(path).unwrap();
+            bytes
+                .windows(words.len())
+                .filter(|at| *at == words.as_bytes())
+                .count()
+        };
+        for (role, times) in [("personal", 1), ("relay", 2)] {
+            let path = old_store(&format!("{role}-started.db"));
+            let (started, later) = open_the_nodes_database(&path, &as_a(role)).unwrap();
+            assert_eq!((held(&started, &path), later), (times, None), "{role}");
+            let path = old_store(&format!("{role}-command.db"));
+            let command = open_database(&path, &as_a(role)).unwrap();
+            assert_eq!(held(&command, &path), times, "{role}");
+        }
+    }
+
     #[test]
     fn test_format_uptime() {
         assert_eq!(format_uptime(40), "40s");

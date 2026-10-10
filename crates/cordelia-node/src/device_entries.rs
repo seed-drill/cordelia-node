@@ -924,6 +924,40 @@ impl DeviceEntries {
         }
     }
 
+    // ── The hourly task of messages ─────────────────────────────────
+
+    /// The hourly task of messages (decision 2026-10-09 §7.1;
+    /// [`cordelia_api::reader::hourly`]): the index rows of messages that
+    /// have expired, or are held at no live number, are written over and
+    /// dropped, and the write-ahead log is truncated, whatever the
+    /// device's state: applied or not, with sync on or off.
+    ///
+    /// A node that is held up does nothing: before its first start on
+    /// this version is done its store holds no message, and over a
+    /// database from a later version it writes nothing.
+    pub fn messages_hourly(&self) {
+        if self.state.held.why().is_some() {
+            return;
+        }
+        let now = self.clock.unix();
+        match cordelia_api::reader::hourly(&lock(&self.state.db), now) {
+            Ok(task) => {
+                let gone = task.gone.expired + task.gone.not_live;
+                if gone > 0 {
+                    tracing::info!(
+                        expired = task.gone.expired,
+                        not_live = task.gone.not_live,
+                        "messages left the index, written over first"
+                    );
+                }
+                if !task.checkpointed {
+                    tracing::debug!("the log was not written back whole: the next hour will");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not drop the messages that went"),
+        }
+    }
+
     // ── What the adder of a device owes ─────────────────────────────
 
     /// The hand-overs that this device made and that are two hours old go
@@ -2141,6 +2175,63 @@ fn refused_wait(refusals: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hourly task of messages runs on a node whatever the device's
+    /// state, here one that follows no phrase: a message whose 30 days
+    /// are up leaves the index (decision 2026-10-09 §7.1). A node that is
+    /// held up changes nothing.
+    #[test]
+    fn the_hourly_task_of_messages_drops_what_expired_unless_the_node_is_held_up() {
+        let state = Arc::new(cordelia_api::state::AppState {
+            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
+            bearer_token: "t".into(),
+            home_dir: std::env::temp_dir().join("cordelia-hourly-test-no-such-directory"),
+            started_at: Instant::now(),
+            sync_errors: Default::default(),
+            peers_hot: Default::default(),
+            peers_warm: Default::default(),
+            push_tx: None,
+            announce_tx: None,
+            peers: Default::default(),
+            relays: Default::default(),
+            outbox_refused: Default::default(),
+            relist: Default::default(),
+            sync_control: Default::default(),
+            own_channels: Default::default(),
+            held: Default::default(),
+            history: Default::default(),
+        });
+        lock(&state.db)
+            .execute_batch(
+                "INSERT INTO message_generations (id, channel, statement, first_held)
+                     VALUES (1, zeroblob(32), 1, 100);
+                 INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                     VALUES (zeroblob(16), zeroblob(32), 'laptop', 1, 2, NULL, '~', 100, 'a',
+                             zeroblob(16), zeroblob(16), 0, NULL, 'a', 100, 100);
+                 INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), 1, 1, zeroblob(16));
+                 INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (zeroblob(32), 1, 1, 1);",
+            )
+            .unwrap();
+        let held = || -> i64 {
+            lock(&state.db)
+                .query_row("SELECT COUNT(*) FROM message_index", [], |row| row.get(0))
+                .unwrap()
+        };
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        state
+            .held
+            .hold(cordelia_api::state::Held::FirstStart("a test".into()));
+        device.messages_hourly();
+        assert_eq!(held(), 1);
+        state.held.release();
+        device.messages_hourly();
+        assert_eq!(held(), 0);
+    }
 
     /// What is kept in memory of a relay and a channel is kept while
     /// the channel is the device's own and the relay is one it is set up
