@@ -19,6 +19,7 @@ pub struct Config {
     pub replication: ReplicationConfig,
     pub limits: LimitsConfig,
     pub history: HistoryConfig,
+    pub messages: MessagesConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
     pub swarm: SwarmConfig,
@@ -141,6 +142,34 @@ pub struct HistoryConfig {
     pub days: u32,
     /// The most that is kept. Over it, the oldest records go first.
     pub max_bytes: u64,
+}
+
+/// Messages between the person's own agents (decision 2026-10-09 §6).
+/// Read when the node starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MessagesConfig {
+    /// The most messages the agent of one folder sends in an hour. It may
+    /// lower AGENT_MESSAGES_PER_FOLDER_PER_HOUR and may not raise it: the
+    /// device's limit and the ring are sized on that. 0 turns sending off
+    /// for every folder of the device. Over it, the configuration is
+    /// refused when it is loaded.
+    pub per_folder_per_hour: u32,
+}
+
+impl MessagesConfig {
+    /// Refuse a limit above the protocol's own (decision 2026-10-09 §6).
+    fn check(&self) -> Result<(), CordeliaError> {
+        if self.per_folder_per_hour as usize > protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR {
+            return Err(CordeliaError::Config(format!(
+                "[messages] per_folder_per_hour is {}: it may be from 0 to {}, and may lower \
+                 a folder's limit but not raise it",
+                self.per_folder_per_hour,
+                protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +323,14 @@ impl Default for HistoryConfig {
     }
 }
 
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            per_folder_per_hour: protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR as u32,
+        }
+    }
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -324,6 +361,7 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)
             .map_err(|e| CordeliaError::Config(format!("parse config: {e}")))?;
+        config.messages.check()?;
         Ok(config)
     }
 
@@ -501,6 +539,42 @@ http_port = 8080
         // And it is written out with the rest.
         let written = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(written.contains("[history]\ndays = 30\n"), "{written}");
+    }
+
+    /// A folder's limit of messages in an hour is 20 where it is not set,
+    /// can be set from 0 to 20, and a configuration that sets it over 20
+    /// is refused when it is loaded (decision 2026-10-09 §6).
+    #[test]
+    fn test_a_folders_limit_of_messages_is_from_0_to_20() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let loaded = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|config| config.messages.per_folder_per_hour)
+        };
+        assert_eq!(loaded("").unwrap(), 20);
+        assert_eq!(
+            loaded("").unwrap() as usize,
+            protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR
+        );
+        assert_eq!(loaded("[messages]\nper_folder_per_hour = 0\n").unwrap(), 0);
+        assert_eq!(loaded("[messages]\nper_folder_per_hour = 7\n").unwrap(), 7);
+        assert_eq!(
+            loaded("[messages]\nper_folder_per_hour = 20\n").unwrap(),
+            20
+        );
+        let over = loaded("[messages]\nper_folder_per_hour = 21\n").unwrap_err();
+        assert!(
+            over.to_string().contains("per_folder_per_hour is 21"),
+            "{over}"
+        );
+        assert!(loaded("[messages]\nper_folder_per_hour = -1\n").is_err());
+        // And it is written out with the rest.
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(
+            written.contains("[messages]\nper_folder_per_hour = 20\n"),
+            "{written}"
+        );
     }
 
     #[test]
