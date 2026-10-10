@@ -1099,6 +1099,14 @@ fn added(a: i64, b: i64) -> Result<i64, StorageError> {
     ))
 }
 
+/// `b` taken from `a`, or an error where the difference is past an
+/// integer's range: a `seq` that near it is of a damaged store.
+fn subtracted(a: i64, b: i64) -> Result<i64, StorageError> {
+    a.checked_sub(b).ok_or(StorageError::Sqlite(
+        rusqlite::Error::IntegralValueOutOfRange(0, a),
+    ))
+}
+
 /// The highest `seq` of the table, where it holds a mark.
 fn highest_seq(conn: &Connection) -> Result<Option<i64>, StorageError> {
     Ok(
@@ -1109,7 +1117,7 @@ fn highest_seq(conn: &Connection) -> Result<Option<i64>, StorageError> {
 }
 
 /// The highest `seq` of the table when the device last wrote its list,
-/// as set by a merge since (`MESSAGES_LISTED_SEQ`); none where it never
+/// as raised by a merge since (`MESSAGES_LISTED_SEQ`); none where it never
 /// wrote one from this store. A value that is no integer, is negative, or
 /// is above the table's highest `seq` (or 0) by more than
 /// [`LISTED_AHEAD_MAX`] is of a damaged store, and counts as not kept.
@@ -1196,23 +1204,20 @@ fn marks_held(
 }
 
 /// The device took its own list from a relay, and the store kept it
-/// (decision 2026-10-09 §2.4, §7.2, D7, F8): every one of its `marks` is
-/// placed in the table as one block, in the list's order, in the caller's
-/// write. The later list was written after every mark it holds, and its
-/// order is the order of those marks. The block goes above its anchor: the
-/// highest `seq` of a mark of the list that the table holds, or, where it
-/// holds none, the `seq` when the device last wrote its list. The marks
-/// above the anchor that are not of the list were made since, and are not
-/// yet said: they are moved up over the block, and the block counts as
-/// said. A mark the table holds keeps its ID, its name and its times, and
-/// takes its place in the block; one it lacks is added. Where the table
-/// holds none and the device never wrote a list from this store, every mark
-/// it holds is made since, and the block goes below them all. Each mark
-/// added is given the ID and the name of a message it holds, found by
-/// making the mark of each message with each of `names`, the names mapped
-/// here, and with the name it is to; one that matches none is kept as a
-/// bare hash, merged at `now`. At most 120 bare hashes are kept, and the
-/// oldest goes first. Returns how many were added.
+/// (decision 2026-10-09 §2.4, §7.2, D7, F8): each of its `marks` that the
+/// table lacks is merged into the table, in the list's order, in the
+/// caller's write, below the marks made since the device last wrote its
+/// list and above every other. The later list was written after all that
+/// the store held when it last wrote its own, and before what its agents
+/// have read since, which is not yet said: so the marks made since are
+/// moved up to make room, and the merged ones count as said. Where the
+/// device never wrote a list from this store, every mark it holds is made
+/// since, and the merged go below them all. Each is given the ID and the
+/// name of a message it holds, found by making the mark of each message
+/// with each of `names`, the names mapped here, and with the name it is
+/// to; one that matches none is kept as a bare hash, merged at `now`. At
+/// most 120 bare hashes are kept, and the oldest goes first. Returns how
+/// many were merged.
 pub fn merge_own_list(
     conn: &Connection,
     marks: &[Mark],
@@ -1220,61 +1225,46 @@ pub fn merge_own_list(
     now: i64,
 ) -> Result<usize, StorageError> {
     let held = marks_held(conn, names)?;
-    // The list's marks, each once, in its order, with the seq of each that
-    // the table holds.
-    let mut block: Vec<(&Mark, Option<i64>)> = Vec::new();
+    let mut lacked: Vec<&Mark> = Vec::new();
     for mark in marks {
-        if block.iter().any(|(listed, _)| *listed == mark) {
-            continue;
+        let here: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM message_read_here WHERE mark = ?1",
+            [&mark[..]],
+            |row| row.get(0),
+        )?;
+        if here == 0 && !lacked.contains(&mark) {
+            lacked.push(mark);
         }
-        let here: Option<i64> = conn
-            .query_row(
-                "SELECT seq FROM message_read_here WHERE mark = ?1",
-                [&mark[..]],
-                |row| row.get(0),
-            )
-            .optional()?;
-        block.push((mark, here));
     }
-    let count = i64::try_from(block.len()).unwrap_or(i64::MAX);
-    let anchor = match block.iter().filter_map(|(_, here)| *here).max() {
-        Some(highest_held) => Some(highest_held),
-        None => listed_seq(conn)?,
-    };
-    let top = match anchor {
-        Some(anchor) => {
+    let count = i64::try_from(lacked.len()).unwrap_or(i64::MAX);
+    let listed = listed_seq(conn)?;
+    let top = match listed {
+        Some(listed) => {
             // Up past the highest and back, as the UNIQUE on seq allows.
-            if let Some(highest) = highest_seq(conn)?.filter(|highest| *highest > anchor) {
-                let below = highest - anchor;
+            if let Some(highest) = highest_seq(conn)?.filter(|highest| *highest > listed) {
+                let below = subtracted(highest, listed)?;
                 let up = added(below, count)?;
                 conn.execute(
                     "UPDATE message_read_here SET seq = seq + ?2 WHERE seq > ?1",
-                    params![anchor, up],
+                    params![listed, up],
                 )?;
                 conn.execute(
                     "UPDATE message_read_here SET seq = seq - ?2 WHERE seq > ?1",
                     params![highest, below],
                 )?;
             }
-            added(anchor, count)?
+            added(listed, count)?
         }
-        None => conn
-            .query_row("SELECT MIN(seq) FROM message_read_here", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })?
-            .map_or(0, |lowest| lowest - 1),
+        None => match conn.query_row("SELECT MIN(seq) FROM message_read_here", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })? {
+            Some(lowest) => subtracted(lowest, 1)?,
+            None => 0,
+        },
     };
     let mut seq = top;
     let mut merged = 0;
-    for (mark, here) in block {
-        if here.is_some() {
-            conn.execute(
-                "UPDATE message_read_here SET seq = ?2 WHERE mark = ?1",
-                params![&mark[..], seq],
-            )?;
-            seq -= 1;
-            continue;
-        }
+    for mark in lacked {
         let inserted = match held.get(mark) {
             Some((id, name)) => conn.execute(
                 "INSERT OR IGNORE INTO message_read_here (mark, seq, id, name, made_at, merged_at)
@@ -1292,7 +1282,7 @@ pub fn merge_own_list(
             merged += 1;
         }
     }
-    if anchor.is_some() {
+    if listed.is_some() && merged > 0 {
         set_listed_seq(conn, top)?;
     }
     keep_120_bare(conn)?;
@@ -2477,13 +2467,13 @@ mod tests {
         assert_eq!(left, [vec![4; 32]]);
     }
 
-    /// The device's own list taken from a relay is merged as one block, in
-    /// the list's order (decision 2026-10-09 §7.2, D7): a mark it holds is
-    /// not added again and takes its place in the block, one whose message
+    /// The device's own list taken from a relay is merged as older than
+    /// any mark the table holds, in the list's order (decision 2026-10-09
+    /// §7.2, D7): a mark it holds is not merged again, one whose message
     /// it holds is given the ID and the name, by the names mapped here or
     /// the name the message is to, and the rest are bare hashes.
     #[test]
-    fn a_device_merges_its_own_list_as_one_block_in_the_lists_order() {
+    fn a_device_merges_its_own_list_as_older_than_any_mark_it_holds() {
         let conn = db::open_in_memory().unwrap();
         let ids = shown_messages(&conn, 3, 100);
         mark_read(&conn, &ids[0], "notes", 101).unwrap();
@@ -2501,13 +2491,13 @@ mod tests {
             held,
             [
                 (read_mark(&ids[2], "~"), false),
-                (read_mark(&ids[0], "notes"), true),
                 ([0xb1; 16], false),
                 (read_mark(&ids[1], "work"), true),
+                (read_mark(&ids[0], "notes"), true),
             ]
         );
         let seqs: Vec<i64> = table(&conn).iter().map(|row| row.1).collect();
-        assert_eq!(seqs, [2, 3, 4, 5]);
+        assert_eq!(seqs, [-2, -1, 0, 1]);
         let name: String = conn
             .query_row(
                 "SELECT name FROM message_read_here WHERE mark = ?1",
@@ -2516,21 +2506,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "work");
-        // The mark it held keeps its ID, its name and its times.
-        let kept: (Vec<u8>, String, i64, Option<i64>) = conn
-            .query_row(
-                "SELECT id, name, made_at, merged_at FROM message_read_here WHERE mark = ?1",
-                [&read_mark(&ids[0], "notes")[..]],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(kept, (ids[0].to_vec(), "notes".to_string(), 101, None));
         assert_eq!(
             marks_to_list(&conn).unwrap(),
             [
+                read_mark(&ids[0], "notes"),
                 read_mark(&ids[1], "work"),
                 [0xb1; 16],
-                read_mark(&ids[0], "notes"),
                 read_mark(&ids[2], "~"),
             ]
         );
@@ -2863,86 +2844,6 @@ mod tests {
         );
     }
 
-    /// A restored store's backup held marks it never listed, which its
-    /// later life listed and then read past (decision 2026-10-09 §2.4,
-    /// §7.2): 10 marks listed, then 100 read and never listed; the later
-    /// list is 50 reads of the later life and the newest 70 of the 100. Its
-    /// order is the order of its marks, so the next list holds the 50, then
-    /// the 70, as one block, and the older 30 of the 100 go below them.
-    #[test]
-    fn a_later_list_ranks_its_newer_reads_above_the_marks_the_backup_never_listed() {
-        let conn = db::open_in_memory().unwrap();
-        let ten = read_in_turn(&conn, &[(7, 10)], 100);
-        wrote_list(&conn).unwrap();
-        let hundred = read_in_turn(&conn, &[(8, 50), (9, 50)], 200);
-        let mut later: Vec<Mark> = (1..=50).map(|k| [k; 16]).collect();
-        later.extend(hundred[30..].iter().rev());
-        assert_eq!(merge_own_list(&conn, &later, &[], 400).unwrap(), 50);
-        assert_eq!(marks_to_list(&conn).unwrap(), later);
-        let mut held = later.clone();
-        held.extend(hundred[..30].iter().rev());
-        held.extend(ten.iter().rev());
-        let table: Vec<Mark> = table(&conn).iter().rev().map(|row| row.0).collect();
-        assert_eq!(table, held);
-    }
-
-    /// Two relays hold two later lists (decision 2026-10-09 §2.4, §7.2):
-    /// the device merges the older, then its agents read 110 messages and
-    /// it lists them, then it takes the newer, which adds 30 marks made
-    /// before the restore. The 110 were made since: they stay above the
-    /// block, and the next list holds them, then the newer list's first 10.
-    /// The key is the top of the block, so a list after that holds none of
-    /// the table's marks goes above the block and below the 110 too.
-    #[test]
-    fn the_reads_made_since_a_merge_stay_above_a_newer_list_from_another_relay() {
-        let conn = db::open_in_memory().unwrap();
-        let five = read_in_turn(&conn, &[(7, 5)], 100);
-        wrote_list(&conn).unwrap();
-        let mut older: Vec<Mark> = (1..=20).rev().map(|k| [k; 16]).collect();
-        older.extend(five.iter().rev());
-        assert_eq!(merge_own_list(&conn, &older, &[], 200).unwrap(), 20);
-        let reads = read_in_turn(&conn, &[(8, 55), (9, 55)], 300);
-        wrote_list(&conn).unwrap();
-        let mut newer: Vec<Mark> = (21..=50).rev().map(|k| [k; 16]).collect();
-        newer.extend(&older);
-        assert_eq!(merge_own_list(&conn, &newer, &[], 600).unwrap(), 30);
-        let mut next: Vec<Mark> = reads.iter().rev().copied().collect();
-        next.extend(&newer[..10]);
-        assert_eq!(marks_to_list(&conn).unwrap(), next);
-        let held: Vec<Mark> = table(&conn).iter().rev().map(|row| row.0).collect();
-        assert_eq!(held[110..], newer);
-
-        assert_eq!(merge_own_list(&conn, &[[0xc1; 16]], &[], 700).unwrap(), 1);
-        let held: Vec<Mark> = table(&conn).iter().rev().map(|row| row.0).collect();
-        assert_eq!(held[..110], next[..110]);
-        assert_eq!(held[110], [0xc1; 16]);
-        assert_eq!(held[111..], newer);
-    }
-
-    /// A mark the table holds that the later list ranks first, as its
-    /// later life read that message again, takes the list's place (decision
-    /// 2026-10-09 §7.2): 130 marks listed; the later list is the oldest of
-    /// them, then the newest 119. The next list is the later list, the
-    /// oldest mark first, nothing is added, and the key is the top of the
-    /// block.
-    #[test]
-    fn a_mark_the_later_life_read_again_is_first_of_the_block() {
-        let conn = db::open_in_memory().unwrap();
-        let backup = read_in_turn(&conn, &[(7, 60), (8, 60), (9, 10)], 100);
-        wrote_list(&conn).unwrap();
-        let mut later = vec![backup[0]];
-        later.extend(backup[11..].iter().rev());
-        assert_eq!(merge_own_list(&conn, &later, &[], 300).unwrap(), 0);
-        assert_eq!(marks_to_list(&conn).unwrap(), later);
-        let mut held = later.clone();
-        held.extend(backup[1..11].iter().rev());
-        let table = table(&conn);
-        let marks: Vec<Mark> = table.iter().rev().map(|row| row.0).collect();
-        assert_eq!(marks, held);
-        assert_eq!(table.iter().map(|row| row.1).max(), Some(130 + 120));
-        assert_eq!(listed_seq(&conn).unwrap(), Some(130 + 120));
-    }
-
     /// A list handed again, whose marks the table holds in its order, and
     /// above which the device's agents have read since, changes nothing
     /// that is listed (decision 2026-10-09 §7.2), before the device writes
@@ -3041,10 +2942,30 @@ mod tests {
         );
     }
 
-    /// A `seq` at an integer's end, of a damaged store, makes a mark or a
-    /// merge fail and not panic (decision 2026-10-09 §7.2).
+    /// A `seq` at either end of a 64-bit integer, of a damaged store,
+    /// makes a mark or a merge fail and not panic (decision 2026-10-09
+    /// §7.2): a mark above one at the top, a merge above what was listed
+    /// at the top, a merge below one at the bottom, and a merge into a
+    /// table with marks at both ends, where the rows made since are moved
+    /// up past the top, or where the merged go below the bottom.
     #[test]
     fn a_seq_at_an_integers_end_fails_a_mark_and_a_merge_without_a_panic() {
+        let set = |conn: &Connection, value: &str| {
+            conn.execute(
+                "INSERT INTO node_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![crate::meta::MESSAGES_LISTED_SEQ, value],
+            )
+            .unwrap();
+        };
+        let bare = |conn: &Connection, mark: Mark, seq: i64| {
+            conn.execute(
+                "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+                 VALUES (?1, ?2, 100, 100)",
+                params![&mark[..], seq],
+            )
+            .unwrap();
+        };
         let conn = db::open_in_memory().unwrap();
         let ids = shown_messages(&conn, 2, 100);
         mark_read(&conn, &ids[0], "notes", 101).unwrap();
@@ -3052,13 +2973,26 @@ mod tests {
         conn.execute("UPDATE message_read_here SET seq = ?1", [i64::MAX])
             .unwrap();
         assert!(mark_read(&conn, &ids[1], "notes", 102).is_err());
+        wrote_list(&conn).unwrap();
         assert!(merge_own_list(&conn, &[first, [0xb1; 16]], &[], 200).is_err());
-        conn.execute(
-            "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
-             VALUES (?1, 0, 100, 100)",
-            [&[0xb2; 16][..]],
-        )
-        .unwrap();
+
+        let conn = db::open_in_memory().unwrap();
+        bare(&conn, [0xb2; 16], i64::MIN);
         assert!(merge_own_list(&conn, &[[0xb2; 16], [0xb3; 16]], &[], 200).is_err());
+
+        for listed in [None, Some("0")] {
+            let conn = db::open_in_memory().unwrap();
+            bare(&conn, [0xb4; 16], i64::MIN);
+            bare(&conn, [0xb5; 16], i64::MAX);
+            if let Some(listed) = listed {
+                set(&conn, listed);
+            }
+            assert!(
+                merge_own_list(&conn, &[[0xb6; 16]], &[], 200).is_err(),
+                "{listed:?}"
+            );
+            let seqs: Vec<i64> = table(&conn).iter().map(|row| row.1).collect();
+            assert_eq!(seqs, [i64::MIN, i64::MAX], "{listed:?}");
+        }
     }
 }
