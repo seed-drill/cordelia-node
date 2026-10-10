@@ -1538,6 +1538,10 @@ mod tests {
             flags_refused(&flags(None, false, Some("0123456"), None)),
             Some(not_an_id("0123456"))
         );
+        assert_eq!(
+            flags_refused(&flags(None, false, Some("ghijklmn"), None)),
+            Some(not_an_id("ghijklmn"))
+        );
         // The link, and then nothing.
         assert_eq!(
             flags_refused(&flags(Some("a"), false, None, bad)),

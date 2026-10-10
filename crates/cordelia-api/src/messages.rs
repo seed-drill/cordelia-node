@@ -1369,7 +1369,6 @@ mod tests {
             s.pass(0, 1);
             assert!(summary_on(&s, 1, "work", now).is_some());
             assert!(reads(&s, 1, "work", &given, now).is_ok());
-            assert!(reads(&s, 1, "work", &hex::encode(other), now).is_ok());
             held_rows::set_state(&s[1].conn, state).unwrap();
             assert_eq!(summary_on(&s, 1, "work", now), None, "{state:?}");
             assert_eq!(
@@ -1383,6 +1382,9 @@ mod tests {
             );
             held_rows::set_state(&s[1].conn, State::Applied).unwrap();
             assert!(reads(&s, 1, "work", &given, now).is_ok());
+            // The other waits still, and is counted once it stands again.
+            let counted = summary_on(&s, 1, "work", now).unwrap();
+            assert_eq!(counted.waiting, [other]);
         }
     }
 
@@ -1407,6 +1409,15 @@ mod tests {
         assert_eq!(shown.message.label, "device 0");
         assert_eq!(shown.fingerprint, fingerprint::shown(&s.key(0)));
         assert_eq!((shown.pair_count, shown.pair_unread_by_a_person), (1, 1));
+        // Once a person has read it here, it is read by a person.
+        s[1].conn
+            .execute(
+                "INSERT INTO message_read_by_a_person (id) VALUES (?1)",
+                [&to_work[..]],
+            )
+            .unwrap();
+        let again = reads(&s, 1, "work", &hex::encode(to_work), now).unwrap();
+        assert_eq!((again.pair_count, again.pair_unread_by_a_person), (1, 0));
         assert!(!shown.before_the_last_change);
         assert!(shown.read_on.is_empty());
         // Read, it waits no more.
@@ -1617,6 +1628,11 @@ mod tests {
             sends(&s, 1, &odd, now),
             Err(NotSentHere::Asked(says)) if says.starts_with("xyz is not a message's ID")
         ));
+        odd.reply = Some("ghijklmn".into());
+        assert!(matches!(
+            sends(&s, 1, &odd, now),
+            Err(NotSentHere::Asked(says)) if says.starts_with("ghijklmn is not a message's ID")
+        ));
         // A signer that no longer counts is in no summary.
         let summarised = summary_on(&s, 1, "work", now).unwrap();
         let removed_ids = [twin(1), twin(2), [0xcd; 16]];
@@ -1755,17 +1771,19 @@ mod tests {
             said(held),
             json!({ "from": "a", "other": null, "every": false })
         );
-        for why in [
-            Refused::NoSuchMessage("0123abcd".into()),
-            Refused::SignerRemoved("0123abcd".into()),
-            Refused::AsksNothing("0123abcd".into()),
+        for (why, word) in [
+            (Refused::NoSuchMessage("0123abcd".into()), "no_such_message"),
+            (Refused::SignerRemoved("0123abcd".into()), "signer_removed"),
+            (Refused::AsksNothing("0123abcd".into()), "asks_nothing"),
         ] {
+            assert_eq!(why.word(), word);
             assert_eq!(said(why), json!({ "id": "0123abcd" }));
         }
         let more = Refused::MoreThanOne {
             id: "0123abcd".into(),
             ids: vec!["a".into(), "b".into()],
         };
+        assert_eq!(more.word(), "more_than_one");
         assert_eq!(said(more), json!({ "id": "0123abcd", "ids": ["a", "b"] }));
         held_rows::set_state(conn, State::Fork).unwrap();
         assert_eq!(
@@ -2020,6 +2038,12 @@ mod tests {
         let read_asked = web::Json(ReadRequest {
             folder: folder("work"),
             id: "xyz".into(),
+        });
+        let (status, _) = answer(read(asked(), state.clone(), read_asked).await).await;
+        assert_eq!(status, 400);
+        let read_asked = web::Json(ReadRequest {
+            folder: folder("work"),
+            id: "ghijklmn".into(),
         });
         let (status, _) = answer(read(asked(), state.clone(), read_asked).await).await;
         assert_eq!(status, 400);
