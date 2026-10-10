@@ -5442,6 +5442,60 @@ async fn an_entry_in_the_messages_channel_reaches_the_other_device_through_a_rel
     assert_eq!(desktop.holds_of(&messages).len(), 1);
 }
 
+/// What a device's pass gives the door, and so when its reader first
+/// holds a message, is read from the node's clock, the one a test sets,
+/// and so are the 30 days and the hourly task of messages (decision
+/// 2026-10-09 §13): with desktop's clock set ten days behind the
+/// system's, laptop's message is first held then, is shown until 30 days
+/// after that and not at them, and the hourly task drops it then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_is_first_held_shown_and_dropped_by_the_nodes_clock() {
+    const DAY: i64 = 24 * 60 * 60;
+    let relay = relay_started("relay", None);
+    let (mut laptop, mut desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    for device in [&mut laptop, &mut desktop] {
+        device.holds("notes");
+        device.syncs(true);
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&laptop, &desktop], 2).await;
+    let set = laptop.now() - 10 * DAY;
+    desktop.state.sync_control.set_now(Some(set));
+
+    laptop.writes_message(1, "notes", "by the node's clock");
+    laptop.sends().await;
+    desktop.passes().await;
+    let first_held: i64 = desktop
+        .db()
+        .query_row("SELECT first_held FROM message_first_held", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(first_held, set);
+
+    let shown_at = |at: i64| -> usize {
+        desktop.state.sync_control.set_now(Some(at));
+        let now = desktop.state.sync_control.now();
+        let db = desktop.db();
+        cordelia_storage::messages::give_places(&db, &desktop.key(), now).unwrap();
+        cordelia_storage::messages::shown(&db, now).unwrap().len()
+    };
+    let indexed = || -> i64 {
+        desktop
+            .db()
+            .query_row("SELECT COUNT(*) FROM message_index", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(shown_at(set + 30 * DAY - 1), 1);
+    desktop.engine.messages_hourly();
+    assert_eq!(indexed(), 1);
+    assert_eq!(shown_at(set + 30 * DAY), 0);
+    desktop.engine.messages_hourly();
+    assert_eq!(indexed(), 0);
+}
+
 /// Where sync is off, the device neither proves, pulls nor pushes the
 /// messages channel (decision 2026-10-09 §2.1, C12), though its store
 /// holds an entry of it. With sync on, it does each.

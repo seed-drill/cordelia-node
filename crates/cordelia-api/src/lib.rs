@@ -48,6 +48,7 @@ pub mod look;
 pub mod names;
 pub mod person;
 pub mod publish;
+pub mod reader;
 pub mod recover;
 #[cfg(test)]
 mod several;

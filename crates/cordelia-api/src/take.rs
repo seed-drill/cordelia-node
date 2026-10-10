@@ -8,9 +8,11 @@
 //!   the messages channel, in the generation it has applied.** The entry
 //!   is stored only if its signer counts (§4.4), and by the store's own
 //!   rule. A record of an addition in the personal channel is also taken
-//!   as a record ([`crate::person::see_addition`]). What an entry of the
-//!   messages channel holds is not read here: it is stored as an entry of
-//!   any channel of the person's own is (decision 2026-10-09 §2.1).
+//!   as a record ([`crate::person::see_addition`]). An entry of the
+//!   messages channel is stored as an entry of any channel of the
+//!   person's own is (decision 2026-10-09 §2.1), and what the store keeps
+//!   of it the reader reads in the same write ([`crate::reader::taken`]),
+//!   which refuses nothing.
 //! - **The phrase's channel.** The entry is shown to the device as a
 //!   change entry ([`crate::person::shown`]).
 //! - **A channel of a generation it has left, or any other channel.** The
@@ -222,6 +224,12 @@ fn taken_as_its_own(
     }
 
     let stored = entries::store(conn, entry, now)?;
+    // What the store kept of the messages channel the reader reads in
+    // this write (decision 2026-10-09 §7.1): an entry it held already, or
+    // one below what it holds, is not read again.
+    if is_messages && stored == Outcome::Stored {
+        crate::reader::taken(conn, &secret, statement, entry, now)?;
+    }
     let mut taken = (None, 0);
     if is_personal && stored != Outcome::OlderThanHeld {
         let again = stored == Outcome::AlreadyHeld;
