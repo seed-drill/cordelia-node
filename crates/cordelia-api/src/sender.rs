@@ -1705,10 +1705,11 @@ mod tests {
 
     /// A held pair sends again once its messages pass their 30 days; in a
     /// second run, once 64 more numbers of their signer have made them
-    /// not live (decision 2026-10-09 §6, F2).
+    /// not live; and in a third, where H stands above them before their
+    /// rows have gone (decision 2026-10-09 §6, F2).
     #[test]
     fn a_hold_ends_when_its_messages_expire_or_stop_being_live() {
-        for run in ["expire", "not live"] {
+        for run in ["expire", "not live", "H above"] {
             let s = devices(2);
             let t = s.now;
             for number in 1..=10u64 {
@@ -1725,6 +1726,17 @@ mod tests {
             ));
             let free_at = match run {
                 "expire" => t + 30 * DAY,
+                // H stands where they are no longer live, before their
+                // rows go, as a store can hold it until the hourly task.
+                "H above" => {
+                    s[1].conn
+                        .execute(
+                            "UPDATE message_signers SET highest = 74 WHERE signer = ?1",
+                            [&s.key(0)[..]],
+                        )
+                        .unwrap();
+                    t
+                }
                 _ => {
                     // 64 more of work's signer, to another pair.
                     for k in 0..64i64 {
@@ -2051,8 +2063,9 @@ mod tests {
 
     /// A relay's answer of another to an entry that is not one of the
     /// device's own messages changes nothing it keeps: its list, at the
-    /// revision of a kept message's number, and another device's entry in
-    /// a slot of its own at that number (decision 2026-10-09 §2.3).
+    /// revision of a kept message's number, and another key's entry in
+    /// this device's slot of that number, as a holder of that key writes
+    /// it (decision 2026-10-09 §2.3, property 3).
     #[test]
     fn an_answer_to_a_list_or_another_devices_entry_changes_nothing_kept() {
         let s = devices(2);
@@ -2070,7 +2083,7 @@ mod tests {
             &s[1].identity,
             &messages_secret(&s, 0),
             message_rev(1).unwrap(),
-            &message_name(&s.key(1), 1).unwrap(),
+            &message_name(&s.key(0), 1).unwrap(),
             Value::Other(says_value("desktop's", t)),
             &[],
         );
@@ -2117,9 +2130,11 @@ mod tests {
             Again::default()
         );
         cordelia_storage::person::set_state(conn, State::Applied).unwrap();
-        for k in 0..59 {
+        // With the send itself, 58 sends and one send again fill the hour.
+        for k in 0..58 {
             held::record_send(conn, t + k, Some("plans"), false).unwrap();
         }
+        held::record_send(conn, t + 58, None, false).unwrap();
         assert_eq!(
             write_again(conn, identity, t + 60, true).unwrap(),
             Again::default()
