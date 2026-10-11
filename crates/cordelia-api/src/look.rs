@@ -633,20 +633,23 @@ fn of_its_person(
         }
     };
     if let Some(why) = &why {
-        look.short = Some(
-            match held.state {
-                State::Removed => "this device was removed",
-                State::NotListed => "this device is not in the last change",
-                State::NotOpened => "a change could not be opened here",
-                State::Fork => "two changes were made apart",
-                State::Applied => "a change could not be applied",
-            }
-            .into(),
-        );
+        look.short = Some(short_why(held.state).into());
         look.says.push(why.clone());
     }
     look.cannot_go_on = why;
     Ok(())
+}
+
+/// Why a device in `state` cannot go on, in a few words: what `cordelia
+/// devices` says first, and what a command that the state refuses says.
+pub fn short_why(state: State) -> &'static str {
+    match state {
+        State::Removed => "this device was removed",
+        State::NotListed => "this device is not in the last change",
+        State::NotOpened => "a change could not be opened here",
+        State::Fork => "two changes were made apart",
+        State::Applied => "a change could not be applied",
+    }
 }
 
 /// What is said of the things that a device lists as names and that are

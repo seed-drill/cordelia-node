@@ -19,6 +19,7 @@ pub struct Config {
     pub replication: ReplicationConfig,
     pub limits: LimitsConfig,
     pub history: HistoryConfig,
+    pub messages: MessagesConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
     pub swarm: SwarmConfig,
@@ -141,6 +142,78 @@ pub struct HistoryConfig {
     pub days: u32,
     /// The most that is kept. Over it, the oldest records go first.
     pub max_bytes: u64,
+}
+
+/// Messages between the person's own agents (decision 2026-10-09 §6).
+/// Read when the node starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MessagesConfig {
+    /// The most messages the agent of one folder sends in an hour. It may
+    /// lower AGENT_MESSAGES_PER_FOLDER_PER_HOUR and may not raise it: the
+    /// device's limit and the ring are sized on that. 0 turns sending off
+    /// for every folder of the device. Over it, the configuration is
+    /// refused when it is loaded.
+    pub per_folder_per_hour: u32,
+    /// How long `msg read` and `msg send` wait for git to say which
+    /// folder they run in, in milliseconds (decision 2026-10-09 §3.1):
+    /// STREAM_TIMEOUT_SECS where it is not set. The command's, not the
+    /// node's. No deployment sets it: a test lowers it. From 1 to
+    /// STREAM_TIMEOUT_SECS; outside, the configuration is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_wait_ms: Option<u64>,
+    /// How long `msg read` and `msg send` wait for the node to answer
+    /// what they ask it, in milliseconds (decision 2026-10-09 §4.3, step
+    /// 3): as long as they wait for its version where it is not set
+    /// ([`MESSAGES_ANSWER_WAIT_MAX_MS`]). The command's, not the node's. No
+    /// deployment sets it: a test lowers it. From 1 to that; outside, the
+    /// configuration is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer_wait_ms: Option<u64>,
+}
+
+/// The most `[messages] answer_wait_ms` may be, and what `msg read` and
+/// `msg send` wait where it is not set: as long as a command that changes
+/// something waits for the node to say its version (`VERSION_ASKED_FOR`
+/// in the binary, which a test there holds equal to this).
+pub const MESSAGES_ANSWER_WAIT_MAX_MS: u64 = 30_000;
+
+impl MessagesConfig {
+    /// Refuse a limit above the protocol's own, and a wait of the commands
+    /// outside its range (decision 2026-10-09 §6).
+    fn check(&self) -> Result<(), CordeliaError> {
+        let waits = [
+            (
+                "git_wait_ms",
+                self.git_wait_ms,
+                protocol::STREAM_TIMEOUT_SECS * 1000,
+            ),
+            (
+                "answer_wait_ms",
+                self.answer_wait_ms,
+                MESSAGES_ANSWER_WAIT_MAX_MS,
+            ),
+        ];
+        for (key, wait, most) in waits {
+            if let Some(wait) = wait
+                && !(1..=most).contains(&wait)
+            {
+                return Err(CordeliaError::Config(format!(
+                    "[messages] {key} is {wait}: it may be from 1 to {most}, and is set only \
+                     so that a test need not wait"
+                )));
+            }
+        }
+        if self.per_folder_per_hour as usize > protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR {
+            return Err(CordeliaError::Config(format!(
+                "[messages] per_folder_per_hour is {}: it may be from 0 to {}, and may lower \
+                 a folder's limit but not raise it",
+                self.per_folder_per_hour,
+                protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +367,16 @@ impl Default for HistoryConfig {
     }
 }
 
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            per_folder_per_hour: protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR as u32,
+            git_wait_ms: None,
+            answer_wait_ms: None,
+        }
+    }
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -324,6 +407,7 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)
             .map_err(|e| CordeliaError::Config(format!("parse config: {e}")))?;
+        config.messages.check()?;
         Ok(config)
     }
 
@@ -501,6 +585,67 @@ http_port = 8080
         // And it is written out with the rest.
         let written = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(written.contains("[history]\ndays = 30\n"), "{written}");
+    }
+
+    /// A folder's limit of messages in an hour is 20 where it is not set,
+    /// can be set from 0 to 20, and a configuration that sets it over 20
+    /// is refused when it is loaded (decision 2026-10-09 §6).
+    #[test]
+    fn test_a_folders_limit_of_messages_is_from_0_to_20() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let loaded = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|config| config.messages.per_folder_per_hour)
+        };
+        assert_eq!(loaded("").unwrap(), 20);
+        assert_eq!(
+            loaded("").unwrap() as usize,
+            protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR
+        );
+        assert_eq!(loaded("[messages]\nper_folder_per_hour = 0\n").unwrap(), 0);
+        assert_eq!(loaded("[messages]\nper_folder_per_hour = 7\n").unwrap(), 7);
+        assert_eq!(
+            loaded("[messages]\nper_folder_per_hour = 20\n").unwrap(),
+            20
+        );
+        let over = loaded("[messages]\nper_folder_per_hour = 21\n").unwrap_err();
+        assert!(
+            over.to_string().contains("per_folder_per_hour is 21"),
+            "{over}"
+        );
+        assert!(loaded("[messages]\nper_folder_per_hour = -1\n").is_err());
+        // The commands' two waits, from 1 to their most, and not set
+        // where they are not given.
+        let waits = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|c| (c.messages.git_wait_ms, c.messages.answer_wait_ms))
+        };
+        assert_eq!(waits("").unwrap(), (None, None));
+        let at = |git: u64, answer: u64| {
+            waits(&format!(
+                "[messages]\ngit_wait_ms = {git}\nanswer_wait_ms = {answer}\n"
+            ))
+        };
+        assert_eq!(at(1, 1).unwrap(), (Some(1), Some(1)));
+        assert_eq!(at(10_000, 30_000).unwrap(), (Some(10_000), Some(30_000)));
+        assert_eq!(protocol::STREAM_TIMEOUT_SECS * 1000, 10_000);
+        assert_eq!(MESSAGES_ANSWER_WAIT_MAX_MS, 30_000);
+        for (git, answer, key) in [
+            (0, 1, "git_wait_ms is 0"),
+            (10_001, 1, "git_wait_ms is 10001"),
+            (1, 0, "answer_wait_ms is 0"),
+            (1, 30_001, "answer_wait_ms is 30001"),
+        ] {
+            let refused = at(git, answer).unwrap_err();
+            assert!(refused.to_string().contains(key), "{refused}");
+        }
+        // And it is written out with the rest.
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(
+            written.contains("[messages]\nper_folder_per_hour = 20\n"),
+            "{written}"
+        );
     }
 
     #[test]

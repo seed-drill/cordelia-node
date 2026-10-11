@@ -1265,9 +1265,29 @@ never held, comes in only under **a word that the phrase signed:**
   `outbox_refused`; `held`, which is null, or by what the node is held up
   (`by`: `first_start` or `later_database`) and why (`why`);
   `key_files_in_place`, how many key files of an older version were left in
-  place at this start because no copy holds them; and `no_relay_secs`, for
+  place at this start because no copy holds them; `no_relay_secs`, for
   how long no relay has been connected, by the node's own clock, or null
-  while one is.
+  while one is; and, on a personal node that stands applied and is not
+  held up, `messages` (decision 2026-10-09 §8). Working it out gives
+  places, as a show of messages does. It is absent from a relay, from a
+  node of the version before, and from a device that does not stand
+  applied:
+
+  | Field | What it is |
+  |-------|------------|
+  | `unread_by_an_agent` | For each mapped folder, the messages unread by its agent (§7.2 there), from a signer that counts: a message to every name once for each folder |
+  | `unread_by_a_person` | The messages to a name mapped here or to every name, that have a place, have not expired, were not sent here, and that no person has read here |
+  | `waiting` | This device's messages that not every relay it is set up with has taken |
+  | `refused_for_room` | Of those, the ones a relay refused for room, each once |
+  | `filled_by` | Where a relay refused the messages channel for room since the node started, the signer whose entries fill it, by the count of each author's entries the device holds there: `label` and `entries`. Null otherwise |
+  | `held_back` | Messages held back by the reader's hour (§6 there) |
+  | `overwritten` | Messages that left the live numbers before they had a place (§2.5 there) |
+  | `no_place` | Whether the device has no place for messages among the proofs of a connection (§2.1 there) |
+
+  **Nothing of it feeds the level.** The messages channel is left out of
+  `outbox_waiting` (`leaving::waits_at` passes over it), it never enters
+  `outbox_refused`, and a relay's refusal of it for room sets no
+  `no_room_at` in `devices/list`.
 - **`cordelia status --json`,** which a panel reads, is worked out by the
   command from `GET /api/v1/status` and `sync/status`, and carries what
   `devices/list` answers under `person`. Its `state` is one of seven names
@@ -1291,6 +1311,10 @@ never held, comes in only under **a word that the phrase signed:**
     under `not_asked`); `version`, the command's own, and `node_version`;
     `held` and `key_files_in_place`, where they are set; `uptime_secs`;
     `no_relay_secs`; `peers`; `outbox_waiting` and `outbox_refused`.
+  - **`messages`,** at the top level, as the node gave it, where it gave
+    it, and nothing else of messages (decision 2026-10-09 §8). It changes
+    no `state`, `level`, `summary` or `holds`, and plain `cordelia status`,
+    `--line` and `--waybar` say nothing of messages.
   - Under `sync`: the settings; `projects`, one for each folder that syncs;
     `unmapped`, the found entries; `available`; `stands` and `moved_on`;
     `publishes_nothing`, why nothing is published from this device where

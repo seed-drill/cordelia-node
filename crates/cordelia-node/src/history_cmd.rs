@@ -113,7 +113,7 @@ fn marker() -> String {
 }
 
 /// `--since`: a time (RFC 3339), or how long ago (`30m`, `2h`, `3d`).
-fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+pub(crate) fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
     if let Ok(at) = DateTime::parse_from_rfc3339(text) {
         return Ok(at.with_timezone(&Utc).to_rfc3339());
     }

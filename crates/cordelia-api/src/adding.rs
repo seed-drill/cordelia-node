@@ -1238,8 +1238,11 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     let names = held_rows::names(conn)?;
     for generation in held_rows::secrets(conn)? {
         let personal = derive::personal_secret(&generation.secret)?;
-        entries::remove_channel(conn, &derive::channel_id(&personal)?)?;
-        kept_rows::forget_channel(conn, &derive::channel_id(&personal)?)?;
+        let messages = derive::messages_secret(&generation.secret)?;
+        for secret in [personal, messages] {
+            entries::remove_channel(conn, &derive::channel_id(&secret)?)?;
+            kept_rows::forget_channel(conn, &derive::channel_id(&secret)?)?;
+        }
         for name in &names {
             let own = derive::own_secret(&generation.secret, &name.name)?;
             entries::remove_channel(conn, &derive::channel_id(&own)?)?;

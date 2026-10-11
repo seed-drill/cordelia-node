@@ -2316,6 +2316,12 @@ pub async fn p2p_loop(
         cordelia_core::protocol::ENTRY_CHANNEL_SWEEP_INTERVAL_SECS,
     ));
     entry_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The hourly task of messages (decision 2026-10-09 §7.1), on a
+    // personal node: when it starts, and each hour after.
+    let mut messages_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::AGENT_MESSAGE_CLEAR_INTERVAL_SECS,
+    ));
+    messages_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Entries between relays that work together (§2.4 item 6): what a
     // relay took is passed on, and what it lacks is pulled.
     let mut entry_offer_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -2864,6 +2870,16 @@ pub async fn p2p_loop(
                         tokio::spawn(async move { device.door(&relays, ask).await });
                     }
                     (_, None) => {}
+                }
+            }
+
+            // ── Messages between the person's own agents, on a device ─
+            // What has expired goes from the index, written over first,
+            // and the log is truncated (decision 2026-10-09 §7.1). Off
+            // the select loop: it writes under the db lock.
+            _ = messages_interval.tick(), if device_entries.is_some() => {
+                if let Some(device) = device_entries.clone() {
+                    tokio::task::spawn_blocking(move || device.messages_hourly());
                 }
             }
 

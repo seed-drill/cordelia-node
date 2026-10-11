@@ -17,6 +17,9 @@ pub struct Node {
     pub dir: tempfile::TempDir,
     pub http: u16,
     pub p2p: u16,
+    /// The binary that runs the node and its commands, where it is not
+    /// this build's ([`node_run_by`]).
+    pub bin: Option<PathBuf>,
 }
 
 impl Drop for Node {
@@ -74,8 +77,11 @@ impl Node {
     /// folder is in, and `GIT_DIR` would answer for the caller's), and
     /// `STY`, which says that the tests themselves are run inside GNU
     /// `screen` (a command that shows something once reads it: the test
-    /// of that sets its own). The rest of the environment is left. Of it
-    /// the binary reads `NO_COLOR` and the user's name.
+    /// of that sets its own), and `CLAUDE_PROJECT_DIR`, which says that
+    /// they are run in a Claude Code session (the commands of messages
+    /// act as the agent of the folder it names: the tests of that set
+    /// their own). The rest of the environment is left. Of it the binary
+    /// reads `NO_COLOR` and the user's name.
     fn binary(&self) -> Command {
         self.binary_given(std::env::vars_os().map(|(name, _)| name))
     }
@@ -93,13 +99,17 @@ impl Node {
         config: &std::path::Path,
         inherited: impl Iterator<Item = std::ffi::OsString>,
     ) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = match &self.bin {
+            Some(bin) => Command::new(bin),
+            None => Command::new(BIN),
+        };
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
                 name.starts_with("CORDELIA_")
                     || name.starts_with("GIT_")
                     || name == "RUST_LOG"
                     || name == "STY"
+                    || name == "CLAUDE_PROJECT_DIR"
                     || name.to_lowercase().ends_with("_proxy")
             });
             if theirs {
@@ -196,25 +206,70 @@ impl Node {
     /// is stopped then: whether it ended by itself and succeeded, and
     /// what it wrote to its output and to its errors.
     pub fn at_terminal_into_a_pipe(&self, args: &[&str]) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(None, args, true)
+    }
+
+    /// [`Self::at_terminal_into_a_pipe`], run in the directory `dir`.
+    pub fn at_terminal_into_a_pipe_in(
+        &self,
+        dir: &std::path::Path,
+        args: &[&str],
+    ) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(Some(dir), args, true)
+    }
+
+    /// Its mirror: a CLI command against this node, run in `dir`, its
+    /// input an empty file and its output a terminal, as `cordelia msg log
+    /// < file` runs it at a terminal. Whether it ended by itself within
+    /// twenty seconds and succeeded, what its terminal showed, and what it
+    /// wrote to its errors.
+    pub fn at_terminal_with_input_from_a_file_in(
+        &self,
+        dir: &std::path::Path,
+        args: &[&str],
+    ) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(Some(dir), args, false)
+    }
+
+    /// A command with one end at a terminal of its own and the other not:
+    /// its input, where `input_at_it`, and its output a pipe; or its input
+    /// an empty file and its output the terminal. Its errors go down a
+    /// pipe. What it wrote to its output, and to its errors.
+    fn one_end_at_a_terminal(
+        &self,
+        dir: Option<&std::path::Path>,
+        args: &[&str],
+        input_at_it: bool,
+    ) -> (Option<bool>, String, String) {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         use std::io::Read;
         let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
         grantpt(&ours).unwrap();
         unlockpt(&ours).unwrap();
         let theirs = ptsname(&ours, Vec::new()).unwrap();
-        let input = std::fs::OpenOptions::new()
+        let end = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(theirs.to_str().unwrap())
             .unwrap();
-        let mut child = self
-            .binary()
-            .args(args)
-            .stdin(input)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut command = self.binary();
+        command.args(args).stderr(Stdio::piped());
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        match input_at_it {
+            true => command.stdin(end).stdout(Stdio::piped()),
+            false => {
+                let file = self.dir.path().join("an-empty-input");
+                std::fs::write(&file, b"").unwrap();
+                command
+                    .stdin(std::fs::File::open(&file).unwrap())
+                    .stdout(end)
+            }
+        };
+        let mut child = command.spawn().unwrap();
+        // The command holds its end of the terminal, and the test none.
+        drop(command);
         let reads = |mut from: Box<dyn Read + Send>| {
             std::thread::spawn(move || {
                 let mut said = Vec::new();
@@ -222,7 +277,12 @@ impl Node {
                 String::from_utf8_lossy(&said).into_owned()
             })
         };
-        let out = reads(Box::new(child.stdout.take().unwrap()));
+        // What it writes to a terminal is read at the test's end of it,
+        // to the moment its own end is closed.
+        let out = match child.stdout.take() {
+            Some(pipe) => reads(Box::new(pipe)),
+            None => reads(Box::new(std::fs::File::from(ours.try_clone().unwrap()))),
+        };
         let err = reads(Box::new(child.stderr.take().unwrap()));
         let deadline = Instant::now() + Duration::from_secs(20);
         let ended = loop {
@@ -678,6 +738,24 @@ pub fn node_with_relays(
     role: &str,
     relays: &[(String, Option<String>)],
 ) -> Node {
+    node_made(name, role, relays, None)
+}
+
+/// A personal node whose one relay is the one on this machine at
+/// `relay_p2p`, made, run and asked by the binary at `bin` and not by this
+/// build's: a version before this one. Once [`Node::bin`] is set to none,
+/// it takes this version on the same data directory.
+pub fn node_run_by(bin: PathBuf, name: &'static str, relay_p2p: u16) -> Node {
+    let relays = [(format!("127.0.0.1:{relay_p2p}"), None)];
+    node_made(name, "personal", &relays, Some(bin))
+}
+
+fn node_made(
+    name: &'static str,
+    role: &str,
+    relays: &[(String, Option<String>)],
+    bin: Option<PathBuf>,
+) -> Node {
     assert_a_role_that_is_checked(name, role);
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
@@ -742,6 +820,7 @@ level = "debug"
         dir,
         http,
         p2p,
+        bin,
     };
     n.cli(&["init", "--non-interactive", "--name", name]);
     n
@@ -1520,6 +1599,12 @@ pub struct PassesOn {
 
 impl PassesOn {
     pub fn to(port: u16) -> Self {
+        Self::holding(port, Duration::ZERO)
+    }
+
+    /// [`Self::to`], holding what the other port answers for `hold`
+    /// before it is passed back: a node that answers late.
+    pub fn holding(port: u16, hold: Duration) -> Self {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1547,6 +1632,7 @@ impl PassesOn {
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 * 1024];
                     while let Ok(n) = node.read(&mut buf) {
+                        std::thread::sleep(hold);
                         if n == 0 || asks.write_all(&buf[..n]).is_err() {
                             break;
                         }

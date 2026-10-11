@@ -111,6 +111,20 @@ pub const FIRST_START: &str = "first_start.done";
 /// decision 2026-10-04 §10.1).
 pub const SYNC_CLAUDE_NOTICE: &str = "sync.claude.notice";
 
+/// How many times in a row the device's list of what its agents read was
+/// written again for a relay's answer that it holds another at the
+/// revision pushed, since a list was last written for a mark it lacked
+/// (`cordelia_api::marks`, decision 2026-10-09 §2.4): a list's marks go
+/// under at most `AGENT_MESSAGE_SENDS_MAX` revisions, as a message's do.
+pub const MESSAGES_LIST_AGAIN: &str = "messages.list_again";
+
+/// The highest `seq` of the device's table of what its agents read when it
+/// last wrote its list (`crate::messages::wrote_list`, decision 2026-10-09
+/// §2.4, §7.2): a mark above it is one made since, and not yet said. A
+/// merge of the device's own later list puts what it lacked between the
+/// two, and raises it to the highest of those marks.
+pub const MESSAGES_LISTED_SEQ: &str = "messages.listed_seq";
+
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])

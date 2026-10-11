@@ -8,12 +8,25 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The newest release before messages between a person's own agents: the
+  # upgrade test runs its node beside this build's (decision 2026-10-09
+  # §9.2). The SHA-256 of that release's cordelia-linux-amd64, as this
+  # repository names it: the download is checked against it, and not
+  # against a checksum taken from the same release. The two change
+  # together, at a release, and only so.
+  VERSION_BEFORE: v0.2.0-alpha.10
+  VERSION_BEFORE_SHA256: cf53f451bf939bb218f3ee10cf9ac25c27e71536fa56d44a6d1feaf2d88ee5a8
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The binary of the version before runs in this job: no token of
+          # the job is left on disk for it. Nothing later here pushes or
+          # fetches with git.
+          persist-credentials: false
 
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: rustup toolchain install
@@ -29,6 +42,19 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      - name: Download the version before
+        # The Linux binary of that release, checked against the hash that
+        # this file names; the upgrade test reads where it is from
+        # CORDELIA_TEST_BINARY_BEFORE, and fails in CI without it.
+        run: |
+          dir="$RUNNER_TEMP/before"
+          mkdir -p "$dir"
+          base="https://github.com/${{ github.repository }}/releases/download/$VERSION_BEFORE"
+          curl -fsSL -o "$dir/cordelia-linux-amd64" "$base/cordelia-linux-amd64"
+          echo "$VERSION_BEFORE_SHA256  $dir/cordelia-linux-amd64" | sha256sum -c -
+          chmod +x "$dir/cordelia-linux-amd64"
+          echo "CORDELIA_TEST_BINARY_BEFORE=$dir/cordelia-linux-amd64" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --all

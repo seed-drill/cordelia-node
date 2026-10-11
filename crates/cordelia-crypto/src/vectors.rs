@@ -112,6 +112,7 @@ fn vectors() -> Value {
     let kinds = json!({
         "person_secret": hex::encode(person_secret),
         "personal": hex::encode(derive::personal_secret(&person_secret).unwrap()),
+        "messages": hex::encode(derive::messages_secret(&person_secret).unwrap()),
         "own": own,
         "pair": {
             "one_seed": hex::encode(desktop.seed()),
@@ -174,7 +175,8 @@ fn vectors() -> Value {
 
     json!({
         "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret \
-                  of each kind of channel, the recovery phrase, and the statement. Bytes are in \
+                  of each kind of channel (with the messages channel of decision 2026-10-09), \
+                  the recovery phrase, and the statement. Bytes are in \
                   hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that \
                   crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. \
                   This file is written by crates/cordelia-crypto/src/vectors.rs, and a test \
@@ -288,6 +290,10 @@ fn the_published_vectors_follow_from_their_own_inputs() {
     assert_eq!(
         key(&kinds["personal"]),
         hkdf_sha256(&person, &[], b"cordelia v2 personal").unwrap()
+    );
+    assert_eq!(
+        key(&kinds["messages"]),
+        hkdf_sha256(&person, &[], b"cordelia v2 messages").unwrap()
     );
     for own in kinds["own"].as_array().unwrap() {
         let name = own["name"].as_str().unwrap();

@@ -15,6 +15,7 @@ use cordelia_crypto::identity::NodeIdentity;
 mod carry_cmd;
 mod history_cmd;
 mod indicator;
+mod msg_cmd;
 mod p2p;
 mod person_cmd;
 mod recover_cmd;
@@ -348,6 +349,21 @@ enum Commands {
         /// The ids of the versions, each restored by itself in this order
         ids: Vec<String>,
     },
+    /// Messages between your agents on your devices
+    ///
+    /// An agent sends another agent of yours a short request, and reads
+    /// the requests sent to it. Each message is a request from an agent,
+    /// never an instruction from you. Messages go only between your own
+    /// devices, through the relays, end to end encrypted.
+    ///
+    /// An agent is the name of a folder you map with `cordelia sync map`.
+    /// Each command acts as the agent of the folder it runs in: Claude
+    /// Code's project directory where it is set, or the directory it runs
+    /// in.
+    Msg {
+        #[command(subcommand)]
+        what: MsgCommand,
+    },
     /// Initialise a swarm child node (derive identity from lead, create channels)
     SwarmInit {
         /// HKDF derivation index for this child's identity
@@ -361,6 +377,62 @@ enum Commands {
         /// Entity ID of the lead node (for swarm channel naming)
         #[arg(long)]
         lead_entity_id: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum MsgCommand {
+    /// What waits for this folder's agent: for an agent's hook
+    ///
+    /// It prints nothing when nothing waits, and nothing on any error. It
+    /// prints a message's line, with the first line of its text, once,
+    /// and after that only counts it.
+    #[command(after_long_help = msg_cmd::SUMMARY_HELP)]
+    Summary,
+    /// Print one message, between two lines that say whose it is
+    ///
+    /// It marks the message read by this folder's agent, on every device
+    /// of yours.
+    Read {
+        /// 8 to 32 hex characters of the message's id, as `summary` shows
+        /// it
+        id: String,
+    },
+    /// Send a message, as this folder's agent: its text on standard input
+    ///
+    /// Give one of --to, --all and --reply. A message is at most 1024
+    /// bytes: put the rest in the issue or pull request that --re names.
+    Send {
+        /// The name of one of your agents, as `cordelia sync status` lists
+        /// it
+        #[arg(long)]
+        to: Option<String>,
+        /// Every one of your agents
+        #[arg(long)]
+        all: bool,
+        /// Answer the message with this id: it goes to the agent that sent
+        /// it
+        #[arg(long, value_name = "ID")]
+        reply: Option<String>,
+        /// Say that the message asks for an answer
+        #[arg(long)]
+        ask: bool,
+        /// A link to an issue or a pull request: owner/repo#number
+        #[arg(long, value_name = "OWNER/REPO#N")]
+        re: Option<String>,
+    },
+    /// For a person at a terminal
+    ///
+    /// At a terminal it shows every message of every agent of yours that
+    /// this device holds, with on which devices an agent read it, and asks
+    /// whether to mark them read by a person here: that ends any hold
+    /// between the agents they are between. Anywhere else it shows only
+    /// the messages of this folder's agent, and marks nothing.
+    Log {
+        /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
+        /// the last while (30m, 2h, 3d)
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -528,7 +600,15 @@ enum SyncCommand {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // `cordelia msg summary` keeps to its time from here, and is read
+    // before the command line is parsed (decision 2026-10-09 §4.1).
+    let started = std::time::Instant::now();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some((config, others)) = msg_cmd::summary_asked(&args) {
+        msg_cmd::summary(&config, started, others);
+        return Ok(());
+    }
+    let cli = Cli::parse_from(args);
 
     match cli.command {
         Some(Commands::Init { new_key: true, .. }) => person_cmd::new_key(&cli.config),
@@ -582,6 +662,32 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Some(Commands::Restore { ids }) => history_cmd::restore(&cli.config, &ids),
+        Some(Commands::Msg { what }) => match what {
+            // Read before the command line was parsed: here only where
+            // the parser printed its help and stopped.
+            MsgCommand::Summary => {
+                msg_cmd::summary(&cli.config, started, false);
+                Ok(())
+            }
+            MsgCommand::Read { id } => msg_cmd::read(&cli.config, &id),
+            MsgCommand::Send {
+                to,
+                all,
+                reply,
+                ask,
+                re,
+            } => msg_cmd::send(
+                &cli.config,
+                &msg_cmd::SendFlags {
+                    to,
+                    all,
+                    reply,
+                    ask,
+                    re,
+                },
+            ),
+            MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
+        },
         Some(Commands::SwarmInit {
             index,
             lead_identity,
@@ -614,18 +720,62 @@ fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> Stri
 }
 
 /// Open the node's database, as a command that opens it itself does, with
-/// the schema's steps run. **A database from a later version is refused**
-/// (decision 2026-10-04 §10.1): the command names both versions, and
-/// changes nothing.
-fn open_database(db_path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+/// the schema's steps run, and set on the connection, before they run,
+/// what a node of the role that `config` gives keeps
+/// ([`keeps_secure_delete`]). **A database
+/// from a later version is refused** (decision 2026-10-04 §10.1): the
+/// command names both versions, and changes nothing.
+fn open_database(
+    db_path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<rusqlite::Connection> {
     use cordelia_storage::StorageError;
-    match cordelia_storage::db::open(db_path) {
+    match cordelia_storage::db::open_as(db_path, keeps_secure_delete(&config.network.role)) {
         Ok(conn) => Ok(conn),
         Err(StorageError::LaterVersion { found, own }) => {
             anyhow::bail!("{}", from_a_later_version(db_path, found, own))
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open the database as the node opens it when it starts (decision
+/// 2026-10-04 §10.1). One from a later version is refused: a personal
+/// node then stays up, over a database of its own in memory, with why
+/// (the second of what is returned); a node of any other role does not
+/// start without its database, and says why. The connection is set as a
+/// node of the role that `config` gives keeps it, before the schema's
+/// steps run ([`keeps_secure_delete`]).
+fn open_the_nodes_database(
+    db_path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<(rusqlite::Connection, Option<String>)> {
+    let role = config.network.role.as_str();
+    let secure_delete = keeps_secure_delete(role);
+    match cordelia_storage::db::open_as(db_path, secure_delete) {
+        Ok(conn) => Ok((conn, None)),
+        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
+            let why = from_a_later_version(db_path, found, own);
+            if role != "personal" {
+                anyhow::bail!("{why}");
+            }
+            let conn = cordelia_storage::db::open_in_memory()?;
+            if secure_delete {
+                cordelia_storage::db::secure_delete_on(&conn)?;
+            }
+            Ok((conn, Some(why)))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether a node of `role` keeps SQLite's `secure_delete` on its store's
+/// connection (decision 2026-10-09 §7.1, D10): a personal node does, from
+/// before the schema's steps run, so that every row it deletes or moves,
+/// of memory as of messages, is written over with zeros. A relay does
+/// not, and pays nothing for it.
+fn keeps_secure_delete(role: &str) -> bool {
+    role == "personal"
 }
 
 /// The last line of `cordelia init`. Run by a person, it says how the
@@ -803,7 +953,7 @@ fn init_with(
     // changed, not the node's token either (decision 2026-10-04 §10.1).
     let db_path = data_dir.join("cordelia.db");
     if db_path.exists() && force {
-        drop(open_database(&db_path)?);
+        drop(open_database(&db_path, &config)?);
     }
 
     // The data directory is made its owner's alone before anything is
@@ -859,7 +1009,7 @@ fn init_with(
     // 4. Create database
     if !db_path.exists() || force {
         println!("Creating database...");
-        let _conn = open_database(&db_path)?;
+        let _conn = open_database(&db_path, &config)?;
         println!("  done.");
         #[cfg(unix)]
         {
@@ -1082,6 +1232,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             });
             out["outbox_waiting"] = live["outbox_waiting"].clone();
             out["outbox_refused"] = live["outbox_refused"].clone();
+            // What the node says of messages between its person's agents,
+            // as it gave it, where it gives it (decision 2026-10-09 §8):
+            // here alone, and in nothing the level is worked out from.
+            if live["messages"].is_object() {
+                out["messages"] = live["messages"].clone();
+            }
         }
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
@@ -1206,7 +1362,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     let opened = match (db_path.exists(), beside) {
         (false, _) => None,
         (true, Some(why)) => Some(Err(anyhow::anyhow!(why))),
-        (true, None) => Some(open_database(&db_path)),
+        (true, None) => Some(open_database(&db_path, &config)),
     };
     if let Some(Err(why)) = &opened {
         println!();
@@ -1376,21 +1532,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     let Ok(live) = local_api(&config, false, "/api/v1/status", timeout) else {
         return out;
     };
-    out.facts.running = true;
-    out.facts.uptime_secs = live["uptime_secs"].as_u64();
-    // By the node's own clock. A node that does not say gives none.
-    out.facts.no_relay_secs = live["no_relay_secs"].as_u64();
-    // Only the command knows that the node is another version than it.
-    out.facts.other_version = live["version"].as_str() != Some(env!("CARGO_PKG_VERSION"));
-    out.facts.held = live["held"]["by"].as_str().map(str::to_string);
-    out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
-    out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
-    out.facts.outbox_refused = live["outbox_refused"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["refusals"].as_u64() >= Some(indicator::REFUSALS_BEFORE_ATTENTION))
-        .count() as u64;
+    indicator::running(&mut out.facts, &live);
     out.live = Some(live);
 
     if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {
@@ -1689,17 +1831,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // carries what other nodes hand it, and does not start without its
     // database: it says why, and stops.
     let db_path = data_dir.join("cordelia.db");
-    let (conn, later) = match cordelia_storage::db::open(&db_path) {
-        Ok(conn) => (conn, None),
-        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
-            let why = from_a_later_version(&db_path, found, own);
-            if config.network.role != "personal" {
-                anyhow::bail!("{why}");
-            }
-            (cordelia_storage::db::open_in_memory()?, Some(why))
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (conn, later) = open_the_nodes_database(&db_path, &config)?;
 
     let version = env!("CARGO_PKG_VERSION");
     let role = &config.network.role;
@@ -1796,6 +1928,12 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         held: Default::default(),
         history: Default::default(),
     });
+    // How many messages a folder's agent sends in an hour (decision
+    // 2026-10-09 §6): the configuration may lower it, and was refused on
+    // loading where it raised it.
+    state
+        .own_channels
+        .set_per_folder_per_hour(config.messages.per_folder_per_hour as usize);
 
     // A personal node makes its first start on this version here
     // (decision 2026-10-04 §10.1): after the port of its local API is
@@ -2490,7 +2628,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
     refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
 
     // A personal node carries no channel of the older kind (decision
     // 2026-10-04 §10): what it has is the names that it holds, each with
@@ -2572,7 +2710,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
     refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     // A personal node carries no channel of the older kind (decision
@@ -2776,7 +2914,7 @@ fn cmd_swarm_init(
     // later version is refused, and nothing is changed (decision
     // 2026-10-04 §10.1).
     let db_path = data_dir.join("cordelia.db");
-    let conn = open_database(&db_path)?;
+    let conn = open_database(&db_path, &config)?;
     std::fs::write(&identity_path, child.seed())?;
     #[cfg(unix)]
     {
@@ -7400,6 +7538,48 @@ mod tests {
         assert!(!ABOUT.contains('\n') && !ABOUT.contains("pub/sub"));
     }
 
+    /// `cordelia msg summary --help` prints the hook of Claude Code's
+    /// settings and the line of an instructions file, and that Cordelia
+    /// writes neither (decision 2026-10-09 §5).
+    #[test]
+    fn the_summarys_help_holds_the_hook_and_the_instructions_line() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("msg")
+            .and_then(|msg| msg.find_subcommand_mut("summary"))
+            .expect("msg summary is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(msg_cmd::SUMMARY_HELP), "{help}");
+        assert!(
+            help.contains("\"command\": \"cordelia msg summary\""),
+            "{help}"
+        );
+        assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
+    }
+
+    /// `cordelia msg log --help` gives the command's line of the record,
+    /// and its `--since` (decision 2026-10-09 §4.1).
+    #[test]
+    fn the_logs_help_says_it_is_for_a_person_at_a_terminal() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let msg = cli.find_subcommand_mut("msg").expect("msg is a command");
+        let short = msg.render_help().to_string();
+        assert!(
+            short.contains("log      For a person at a terminal\n"),
+            "{short}"
+        );
+        let help = msg
+            .find_subcommand_mut("log")
+            .expect("msg log is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.starts_with("For a person at a terminal\n"), "{help}");
+        assert!(help.contains("--since <SINCE>"), "{help}");
+    }
+
     /// Run by a person, `cordelia init` ends by saying how the node is
     /// started. Run by a script, as the install script runs it, it says
     /// nothing of that: the script names the command that starts the node
@@ -7411,6 +7591,92 @@ mod tests {
             "Node is ready. Run `cordelia start` to begin."
         );
         assert_eq!(node_is_ready(true), "Node is ready.");
+    }
+
+    /// `PRAGMA secure_delete` reads 1 on the connection a personal node
+    /// opens, where the node starts and where a command opens the store
+    /// itself, and 0 on a relay's (decision 2026-10-09 §7.1, D10). A
+    /// personal node over a database from a later version keeps it on
+    /// over the one it holds in memory.
+    #[test]
+    fn a_personal_nodes_store_has_secure_delete_on_and_a_relays_has_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let secure_delete = |conn: &rusqlite::Connection| -> i64 {
+            conn.pragma_query_value(None, "secure_delete", |row| row.get(0))
+                .unwrap()
+        };
+        let as_a = |role: &str| {
+            let mut config = Config::default();
+            config.network.role = role.into();
+            config
+        };
+        for (role, on) in [("personal", 1), ("relay", 0), ("bootnode", 0)] {
+            let db_path = dir.path().join(format!("{role}.db"));
+            let (started, later) = open_the_nodes_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!((secure_delete(&started), later), (on, None), "{role}");
+            let command = open_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!(secure_delete(&command), on, "{role}");
+        }
+
+        let later = dir.path().join("later.db");
+        rusqlite::Connection::open(&later)
+            .unwrap()
+            .pragma_update(
+                None,
+                "user_version",
+                cordelia_storage::schema::SCHEMA_VERSION + 1,
+            )
+            .unwrap();
+        let (held, why) = open_the_nodes_database(&later, &as_a("personal")).unwrap();
+        assert_eq!(secure_delete(&held), 1);
+        assert!(why.is_some_and(|why| why.contains("later version")));
+        assert!(open_the_nodes_database(&later, &as_a("relay")).is_err());
+        assert!(open_database(&later, &as_a("personal")).is_err());
+    }
+
+    /// The node sets `secure_delete` on a personal node's store before
+    /// the schema's steps run (decision 2026-10-09 §7.1, D10), where it
+    /// starts and where a command opens the store itself: a store of an
+    /// old step whose table the next step rewrites holds its text once
+    /// afterwards, and a relay's twice, the copy and what was freed.
+    #[test]
+    fn a_personal_nodes_store_of_an_old_step_is_stepped_with_secure_delete_on() {
+        let words = "a descriptor of puffin-juniper-sextant";
+        let dir = tempfile::tempdir().unwrap();
+        let as_a = |role: &str| {
+            let mut config = Config::default();
+            config.network.role = role.into();
+            config
+        };
+        let old_store = |name: &str| -> std::path::PathBuf {
+            let path = dir.path().join(name);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            cordelia_storage::schema::at_version_3(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                       descriptor, created_at, updated_at)
+                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), ?1, 't', 't')",
+                [words.as_bytes()],
+            )
+            .unwrap();
+            path
+        };
+        let held = |conn: &rusqlite::Connection, path: &std::path::Path| -> usize {
+            assert!(cordelia_storage::db::checkpoint_truncating(conn).unwrap());
+            let bytes = std::fs::read(path).unwrap();
+            bytes
+                .windows(words.len())
+                .filter(|at| *at == words.as_bytes())
+                .count()
+        };
+        for (role, times) in [("personal", 1), ("relay", 2)] {
+            let path = old_store(&format!("{role}-started.db"));
+            let (started, later) = open_the_nodes_database(&path, &as_a(role)).unwrap();
+            assert_eq!((held(&started, &path), later), (times, None), "{role}");
+            let path = old_store(&format!("{role}-command.db"));
+            let command = open_database(&path, &as_a(role)).unwrap();
+            assert_eq!(held(&command, &path), times, "{role}");
+        }
     }
 
     #[test]

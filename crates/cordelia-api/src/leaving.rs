@@ -349,6 +349,11 @@ pub fn start_again(
 /// nothing. A delete over a hand-over waits only for a relay that was
 /// sent the hand-over ([`crate::at_relays::to_send`]). What the relay
 /// had no room for waits too: it is kept, to be sent again.
+///
+/// **The messages channel is passed over** (decision 2026-10-09 §8): what
+/// waits or was refused there sets no status's level, makes no relay in
+/// `cordelia devices` wait, and is not waited for by a device that leaves
+/// with a new key. Messages are coordination, and not a state of sync.
 pub fn waits_at(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -356,6 +361,9 @@ pub fn waits_at(
 ) -> Result<usize, PersonError> {
     let mut waiting = 0;
     for channel in crate::at_relays::channels(conn, identity)? {
+        if channel.kind == Kind::Messages {
+            continue;
+        }
         let waits = waits_in(conn, identity, relay, &channel)?;
         let refused = !kept_rows::waiting_refused(conn, relay, &channel.id)?.is_empty();
         waiting += usize::from(waits || refused);
@@ -383,7 +391,7 @@ fn waits_in(
         Ok(next.first().map(|held| held.seq))
     };
     Ok(match channel.kind {
-        Kind::Personal => first_after(kept.sent_to)?.is_some(),
+        Kind::Personal | Kind::Messages => first_after(kept.sent_to)?.is_some(),
         // What came since the statement was applied, and what was
         // carried then, each from where it was sent to.
         Kind::Name(_) => {
@@ -715,9 +723,21 @@ mod tests {
         let word = word.unwrap();
         crate::carry::take_once(&on.conn, &word, now).unwrap();
         assert!(crate::carry::is_taken(&on.conn, &word, now).unwrap());
+        // A message of its own in the messages channel, and its place at
+        // a relay there: they go too (decision 2026-10-09 §9.1).
+        let messages = derive::messages_secret(&on.secret()).unwrap();
+        let messages_id = derive::channel_id(&messages).unwrap();
+        let name = cordelia_crypto::message::message_name(&on.key(), 1).unwrap();
+        let inside =
+            cordelia_crypto::message::inside(name, cordelia_crypto::message::clearing_value());
+        let entry = Entry::seal(&messages, &on.identity, 2, &inside).unwrap();
+        entries::store(&on.conn, &entry.check().unwrap(), now).unwrap();
+        kept_rows::keep_place(&on.conn, &[0x77; 32], &messages_id, &[1; 8], 1).unwrap();
         assert!(!on.stored().is_empty());
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
+        let kept = kept_rows::kept(&on.conn, &[0x77; 32], &messages_id).unwrap();
+        assert_eq!(kept.place, None);
         assert!(!on.follows_a_phrase());
         assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
         assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
@@ -905,6 +925,53 @@ mod tests {
         // The other relay was never sent the hand-over: the personal
         // channel waits for it, and no delete does.
         assert_eq!(waits_at(&on.conn, &on.identity, &other).unwrap(), 1);
+    }
+
+    /// The messages channel is passed over in what waits to be sent to a
+    /// relay (decision 2026-10-09 §8): a message that waits, and one that
+    /// the relay had no room for, leave the count as it is without them.
+    /// The same entry in the personal channel is counted.
+    #[test]
+    fn test_the_messages_channel_is_not_counted_as_waiting_or_refused() {
+        let s = Several::of_one_person(2);
+        let relay = [0x77; 32];
+        let on = &s[0];
+        cordelia_storage::meta::set(&on.conn, cordelia_storage::meta::SYNC_CLAUDE_DIR, "/c")
+            .unwrap();
+        let own = at_relays::channels(&on.conn, &on.identity).unwrap();
+        let messages = own.iter().find(|channel| channel.kind == Kind::Messages);
+        let messages = messages.expect("sync is on: the device has the messages channel");
+        for channel in &own {
+            let last = kept_rows::last_taken(&on.conn, &channel.id).unwrap();
+            if channel.kind == Kind::Pair {
+                kept_rows::sending(&on.conn, &relay, &channel.id).unwrap();
+            }
+            kept_rows::sent(&on.conn, &relay, &channel.id, last).unwrap();
+        }
+        assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 0);
+
+        // A message of the device's own waits, and the relay had no room
+        // for an earlier one.
+        let secret = derive::messages_secret(&on.secret()).unwrap();
+        let entry = |number: u64| {
+            let name = cordelia_crypto::message::message_name(&on.key(), number).unwrap();
+            let value = cordelia_crypto::message::clearing_value();
+            let inside = cordelia_crypto::message::inside(name, value);
+            let rev = cordelia_crypto::message::message_rev(number).unwrap();
+            let entry = Entry::seal(&secret, &on.identity, rev, &inside).unwrap();
+            entries::store(&on.conn, &entry.check().unwrap(), s.now).unwrap();
+            kept_rows::last_taken(&on.conn, &messages.id).unwrap()
+        };
+        let refused = entry(1);
+        kept_rows::sent(&on.conn, &relay, &messages.id, refused).unwrap();
+        kept_rows::refused(&on.conn, &relay, &messages.id, refused).unwrap();
+        entry(2);
+        assert!(waits_in(&on.conn, &on.identity, &relay, messages).unwrap());
+        assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 0);
+
+        // The control: what waits in the personal channel is counted.
+        write_word(&on.conn, &on.identity, Value::Text("1".into()), s.now).unwrap();
+        assert_eq!(waits_at(&on.conn, &on.identity, &relay).unwrap(), 1);
     }
 
     /// A device that goes on under its key keeps its word that it has

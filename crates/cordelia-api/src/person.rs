@@ -1411,6 +1411,12 @@ fn come_to(
                 applied.no_version.push(name.name.clone());
             }
         }
+        // Nothing of messages is carried (decision 2026-10-09 §9.1): what
+        // the store holds of the messages channel that is left goes, as
+        // every old channel's does, and what was kept of each relay for it.
+        let messages = derive::channel_id(&derive::messages_secret(&from.secret)?)?;
+        entries::remove_channel(conn, &messages)?;
+        kept_rows::forget_channel(conn, &messages)?;
     }
     // What the store has taken up to here, of this device's own in the
     // channel of a name, is what it carried: what it writes from now on
@@ -4651,6 +4657,38 @@ mod tests {
         for name in ["a.md", "b.md", "c.md", "d.md"] {
             assert!(carried(&conn, &own(3, "team"), name).is_some(), "{name}");
         }
+    }
+
+    /// Nothing of messages is carried at a statement (decision 2026-10-09
+    /// §9.1): what the store held of the messages channel that is left
+    /// goes in the step that applies the statement, with what was kept of
+    /// each relay for it, and the new messages channel holds nothing. A
+    /// message of the device's own left behind would be taken for a
+    /// channel in which it only sends what it wrote.
+    #[test]
+    fn test_applying_a_statement_drops_the_messages_channel_that_is_left_and_carries_none() {
+        let conn = holding();
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        let messages = |n: u8| derive::messages_secret(&secret(n)).unwrap();
+        let name = cordelia_crypto::message::message_name(&key(1), 1).unwrap();
+        let value = Value::Other(cordelia_crypto::message::clearing_value());
+        put(&conn, &messages(2), 1, 2, &name, value.clone(), &[]);
+        put(&conn, &messages(2), 0, 2, &name, value, &[]);
+        let relay = [0x77; 32];
+        kept_rows::keep_place(&conn, &relay, &id_of(&messages(2)), &[1; 8], 2).unwrap();
+        assert!(channels(&conn).contains(&id_of(&messages(2))));
+
+        let entry = change(&phrase, &three, secret(3));
+        assert!(matches!(
+            shown(&conn, &device(1), &entry, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
+        let held = channels(&conn);
+        assert!(!held.contains(&id_of(&messages(2))));
+        assert!(!held.contains(&id_of(&messages(3))));
+        let kept = kept_rows::kept(&conn, &relay, &id_of(&messages(2))).unwrap();
+        assert_eq!(kept.place, None);
     }
 
     /// A version that another key signed is carried as this device's own

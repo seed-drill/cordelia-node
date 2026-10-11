@@ -30,7 +30,11 @@
 //!   and **pushes** what that relay has not been sent, and then what it
 //!   carried into the channel of a name, by the rule of §7.3. Once a day
 //!   it proves the channel of every name that its personal channel lists
-//!   and that it does not hold (§2.5).
+//!   and that it does not hold (§2.5). The messages channel, where sync
+//!   is on, is the last of its own, makes a pass short only where the
+//!   device came to keep another change entry, and is passed over where
+//!   the connection has no room for its proof (decision 2026-10-09
+//!   §2.1).
 //! - **The pass that sends**, as often as the node sends what waits, and
 //!   when something is written: it pushes what each relay has not been
 //!   sent, and nothing else.
@@ -105,6 +109,7 @@ use cordelia_api::state::{
     AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftRead, NoRoom, ProvedBy,
 };
 use cordelia_api::take::Taken;
+use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
@@ -390,7 +395,7 @@ impl DeviceEntries {
             .collect();
         let mut asking = tokio::task::JoinSet::new();
         if whole {
-            let typed = adding::keys_that_read(&lock(&self.state.db), self.clock.unix());
+            let typed = adding::keys_that_read(&lock(&self.state.db), self.unix());
             let typed = typed.unwrap_or_default();
             for link in links.iter().filter(|_| !typed.is_empty()) {
                 let (engine, link, typed) = (Arc::clone(self), (*link).clone(), typed.clone());
@@ -398,6 +403,8 @@ impl DeviceEntries {
             }
         }
         let read_all = self.pass_at(relays, &links, kind).await;
+        self.say_no_place(&links);
+        self.taken_everywhere(relays);
         let mut taken = false;
         while let Some(done) = asking.join_next().await {
             taken |= done.unwrap_or(false);
@@ -820,7 +827,7 @@ impl DeviceEntries {
         };
         let said = {
             let db = lock(&self.state.db);
-            at_relays::say_sent(&db, &self.state.identity, &set_up, self.clock.unix())
+            at_relays::say_sent(&db, &self.state.identity, &set_up, self.unix())
         };
         match said {
             Ok(true) => {
@@ -897,7 +904,7 @@ impl DeviceEntries {
         if held_up {
             return;
         }
-        let now = self.clock.unix();
+        let now = self.unix();
         let lately = lock(&self.kept).swept_at.is_some_and(|at| {
             let since = u64::try_from(now.saturating_sub(at));
             since.is_ok_and(|since| since < DEVICE_DELETE_SWEEP_INTERVAL_SECS)
@@ -922,6 +929,118 @@ impl DeviceEntries {
         }
     }
 
+    /// The time of day, in seconds, in UTC, of everything this side of
+    /// the node does: the node's clock, which a test sets
+    /// ([`cordelia_api::state::SyncControl::now`]), and which the routes
+    /// read too; so the time a pass gives the door, at which the reader
+    /// first holds a message, and the time of the hourly task of
+    /// messages are on the one clock that says when a message expires
+    /// (decision 2026-10-09 §13). A test that runs this side's waits
+    /// ahead ([`Clock::run_ahead`]) runs its time of day ahead with them.
+    pub fn unix(&self) -> i64 {
+        self.clock.unix_from(self.state.sync_control.now())
+    }
+
+    // ── The hourly task of messages ─────────────────────────────────
+
+    /// The hourly task of messages (decision 2026-10-09 §7.1;
+    /// [`cordelia_api::reader::hourly`]): the index rows of messages that
+    /// have expired, or are held at no live number, are written over and
+    /// dropped, and the write-ahead log is truncated, whatever the
+    /// device's state: applied or not, with sync on or off.
+    ///
+    /// A node that is held up does nothing: before its first start on
+    /// this version is done its store holds no message, and over a
+    /// database from a later version it writes nothing.
+    pub fn messages_hourly(&self) {
+        if self.state.held.why().is_some() {
+            return;
+        }
+        let now = self.unix();
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        match cordelia_api::reader::hourly(&db, identity, now, fetched.unwrap_or(false)) {
+            Ok(task) => {
+                let gone = task.gone.expired + task.gone.not_live;
+                if gone > 0 {
+                    tracing::info!(
+                        expired = task.gone.expired,
+                        not_live = task.gone.not_live,
+                        "messages left the index, written over first"
+                    );
+                }
+                if task.cleared > 0 {
+                    tracing::info!(
+                        cleared = task.cleared,
+                        "messages of this device's whose 30 days are up were cleared"
+                    );
+                }
+                if !task.checkpointed {
+                    tracing::debug!("the log was not written back whole: the next hour will");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not drop the messages that went"),
+        }
+    }
+
+    /// Write again, each under the next number, the device's own messages
+    /// that wait to be sent again (decision 2026-10-09 §2.3;
+    /// [`sender::write_again`]): only once the messages channel was
+    /// fetched since the node started. Says whether it wrote any.
+    fn write_again(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        let again = sender::write_again(&db, identity, self.unix(), fetched.unwrap_or(false));
+        match again {
+            Ok(again) => {
+                if !again.dropped.is_empty() {
+                    tracing::info!(
+                        messages = again.dropped.len(),
+                        "messages that would need another number are sent no more: they may not have reached every relay"
+                    );
+                }
+                !again.written.is_empty()
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "could not send messages again");
+                false
+            }
+        }
+    }
+
+    /// Write the device's list of what its agents read, where its table
+    /// holds a mark that the list lacks (decision 2026-10-09 §2.4;
+    /// [`cordelia_api::marks::write_list`]): only once the messages
+    /// channel was fetched since the node started. Says whether it wrote
+    /// one.
+    fn write_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        match marks::write_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of what this device's agents read");
+                false
+            }
+        }
+    }
+
+    /// Drop each message of the device's own that every relay it is set up
+    /// with has taken (decision 2026-10-09 §2.3). Which relays those are
+    /// is known by their keys only while every one is connected
+    /// ([`Self::set_up_by_key`]): nothing is dropped otherwise.
+    fn taken_everywhere(&self, relays: &[Relay]) {
+        let Some(set_up) = self.set_up_by_key(relays) else {
+            return;
+        };
+        if let Err(e) = sender::taken_everywhere(&lock(&self.state.db), &set_up) {
+            tracing::debug!(error = %e, "could not drop what every relay took");
+        }
+    }
+
     // ── What the adder of a device owes ─────────────────────────────
 
     /// The hand-overs that this device made and that are two hours old go
@@ -929,7 +1048,7 @@ impl DeviceEntries {
     /// has gone and that a relay was sent (decision 2026-10-04 §6). The
     /// delete waits in the store, and a pass pushes it.
     fn hand_overs(&self) {
-        let now = self.clock.unix();
+        let now = self.unix();
         let db = lock(&self.state.db);
         match drop_old_hand_overs(&db, now) {
             Ok(0) => {}
@@ -1018,7 +1137,7 @@ impl DeviceEntries {
         else {
             return;
         };
-        let now = self.clock.unix();
+        let now = self.unix();
         // Tried at each pass, it counts as a change of settings only
         // once it is dealt with by applying a statement or by a change of
         // the device's state.
@@ -1250,7 +1369,7 @@ impl DeviceEntries {
     /// `shown`: the entry goes through the one door. Returns whether the
     /// device applied a change by it, and so keeps another entry now.
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
-        let now = self.clock.unix();
+        let now = self.unix();
         let outcome = self.answered_as_a_change(shown, another, now);
         let relay = link.name();
         match outcome {
@@ -1358,7 +1477,7 @@ impl DeviceEntries {
 
     /// The relay at `link` refused something that it would have taken.
     fn no_room(&self, link: &Link, over_allowance: bool, of_the_change: bool) {
-        let at = self.clock.unix();
+        let at = self.unix();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
         if of.no_room.is_none() {
@@ -1391,6 +1510,21 @@ impl DeviceEntries {
     /// end here: not where it ended early, not where a pull stopped
     /// short of the end of what the relay holds, and not where a channel
     /// was passed by because its proof was not sent or not answered.
+    ///
+    /// **The messages channel never makes a pass short** (decision
+    /// 2026-10-09 §2.1, D13): a proof of it that was not sent or not
+    /// answered, a pull of it that did not reach its end, and a relay that
+    /// stopped answering there, leave the pass as it was. A filled
+    /// messages channel never makes a change warn or wait. It is last, so
+    /// nothing of the device's own follows it. But where the pass stops
+    /// there because the device came to keep another change entry, the
+    /// channels of that generation were not read here, and the pass is
+    /// short.
+    ///
+    /// **Past the limit on proofs the messages channel is passed over**
+    /// in either kind of pass: nothing of it is proved, pulled or pushed
+    /// where `prove` finds no room for it on the connection, and that is
+    /// what the device says as the pass ends ([`Self::say_no_place`]).
     async fn relay_pass(&self, link: &Link, kind: Pass) -> bool {
         let read = {
             let db = lock(&self.state.db);
@@ -1409,6 +1543,17 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         let mut read_all = true;
         for channel in &own {
+            let messages = channel.kind == Kind::Messages;
+            // What a pass that stops at this channel says, where the
+            // device still keeps the change entry it began under.
+            let stopped = messages && read_all;
+            // Past the limit on proofs the messages channel is not proved,
+            // and nothing of it is pulled or pushed: the device has no
+            // messages (decision 2026-10-09 §2.1). Its memory comes first.
+            // Its place is what `prove` would find here and now.
+            if messages && !self.has_room(link, &channel.id) {
+                continue;
+            }
             let mut read_to_its_end = false;
             if whole && channel.is_pulled() {
                 match self.prove(&at, channel, true).await {
@@ -1416,30 +1561,47 @@ impl DeviceEntries {
                     // The proof was not sent, or not answered: the
                     // channel is passed by, and the pass has not read it.
                     Step::Done(false) => {
-                        read_all = false;
+                        read_all &= messages;
                         continue;
                     }
-                    Step::Stop => return false,
+                    Step::Stop => return self.stopped(&at, stopped),
                 }
                 match self.pull(&at, channel).await {
                     Step::Done(caught_up) => read_to_its_end = caught_up,
-                    Step::Stop => return false,
+                    Step::Stop => return self.stopped(&at, stopped),
                 }
-                read_all &= read_to_its_end;
+                read_all &= read_to_its_end || messages;
                 // The relay has handed the whole of a name's channel: a
                 // folder with no record there yet waits for that before
-                // its first cycle (decision 2026-10-04 §6).
-                if read_to_its_end && matches!(channel.kind, Kind::Name(_)) {
+                // its first cycle (decision 2026-10-04 §6). And the whole
+                // of the messages channel: a device writes nothing there
+                // before that, after it starts (decision 2026-10-09 §2.3).
+                if read_to_its_end && matches!(channel.kind, Kind::Name(_) | Kind::Messages) {
                     let now = self.clock.now();
                     self.state
                         .own_channels
                         .fetched_from(&channel.id, link.name(), now);
                 }
             }
-            let sent = match self.push(&at, channel, Which::Since).await {
+            let mut sent = match self.push(&at, channel, Which::Since).await {
                 Step::Done(sent) => sent,
-                Step::Stop => return false,
+                Step::Stop => return self.stopped(&at, stopped),
             };
+            // A message that waits to be sent again is written again under
+            // the next number, and pushed in this pass: the pull may have
+            // handed back the device's own later entry over it, or the push
+            // been answered that the relay holds another entry of the
+            // device's at its revision (decision 2026-10-09 §2.3). So is
+            // the device's list of what its agents read, where its table
+            // holds a mark the list lacks: a mark made before the first
+            // fetch, the first list of a generation, or the list after the
+            // device's own later one that the pull handed back (§2.4).
+            if messages && (self.write_again() | self.write_list()) {
+                sent = match self.push(&at, channel, Which::Since).await {
+                    Step::Done(sent) => sent,
+                    Step::Stop => return self.stopped(&at, stopped),
+                };
+            }
             // What was carried into a name goes after the channel was
             // fetched from the relay, and after what came since (§7.3).
             if read_to_its_end
@@ -1454,6 +1616,33 @@ impl DeviceEntries {
             self.prove_listed(&at, own.len()).await;
         }
         read_all
+    }
+
+    /// What a relay's pass that stopped says, where it would say `whole`
+    /// had the device kept the change entry it began under: where it
+    /// keeps another now, the channels of that generation were not read
+    /// at this relay, and the pass is short.
+    fn stopped(&self, at: &At<'_>, whole: bool) -> bool {
+        whole
+            && matches!(at_relays::kept_id(&lock(&self.state.db)), Ok(Some(kept)) if kept == at.under)
+    }
+
+    /// Say, as every pass ends, whether the messages channel has no place
+    /// among the proofs of a connection (decision 2026-10-09 §2.1): of
+    /// one of `links`, those that are open, by the room that `prove`
+    /// finds there ([`Self::has_room`]), which a pass also passes the
+    /// channel over by. No where no relay is connected, and where the
+    /// device has no messages channel: sync is off, or it does not stand
+    /// applied.
+    fn say_no_place(&self, links: &[&Link]) {
+        let own = at_relays::channels(&lock(&self.state.db), &self.state.identity);
+        let messages = own.ok().and_then(|own| {
+            let messages = own.into_iter().find(|own| own.kind == Kind::Messages);
+            messages.map(|messages| messages.id)
+        });
+        let no_place = messages
+            .is_some_and(|messages| links.iter().any(|link| !self.has_room(link, &messages)));
+        self.state.own_channels.say_no_place(no_place);
     }
 
     /// Ask `request` on a stream for a channel of the device's own, at
@@ -1510,14 +1699,9 @@ impl DeviceEntries {
             if lately {
                 return Step::Done(true);
             }
-            // A relay remembers so many channels for a connection, and
-            // looks at no proof beyond them.
-            let room = proved.is_none_or(|proved| {
-                proved.contains_key(&channel.id) || proved.len() < self.most_proved
-            });
-            if !room {
-                return Step::Done(false);
-            }
+        }
+        if !self.has_room(link, &channel.id) {
+            return Step::Done(false);
         }
         let own_key = self.state.identity.public_key();
         let Some(proof) = link
@@ -1563,6 +1747,16 @@ impl DeviceEntries {
             Ok(None) => Step::Done(false),
             Err(_) => Step::Stop,
         }
+    }
+
+    /// Whether the connection at `link` has room for the proof of
+    /// `channel`: a relay remembers so many channels for a connection,
+    /// and looks at no proof beyond them. One that was proved there has
+    /// its place.
+    fn has_room(&self, link: &Link, channel: &[u8; 32]) -> bool {
+        let kept = lock(&self.kept);
+        let proved = kept.links.get(&link.id()).map(|of| &of.proved);
+        proved.is_none_or(|proved| proved.contains_key(channel) || proved.len() < self.most_proved)
     }
 
     /// Once a day on a connection, prove the channel of every name that
@@ -1627,7 +1821,7 @@ impl DeviceEntries {
                 after,
                 limit: ENTRY_PAGE_MAX_ENTRIES,
             });
-            let now = self.clock.unix();
+            let now = self.unix();
             let taken = self
                 .through(
                     at,
@@ -1787,7 +1981,11 @@ impl DeviceEntries {
                     "a relay refused entries as not signed as they must be; they are not sent there again"
                 );
             }
-            if done.another > 0 {
+            // A relay's answer of another form to an entry of the messages
+            // channel is not said where a status reads (decision
+            // 2026-10-09 §8, F7): what is written there again goes under
+            // another revision.
+            if done.another > 0 && channel.kind != Kind::Messages {
                 tracing::warn!(
                     relay = link.name(),
                     entries = done.another,
@@ -1800,7 +1998,17 @@ impl DeviceEntries {
             }
             let stopped = done.refused.is_some();
             if stopped || done.no_room > 0 {
-                self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                // A relay with no room for the messages channel sets no
+                // hold, and changes no status's line (decision 2026-10-09
+                // §8): what it refused still waits, and is sent again.
+                if channel.kind != Kind::Messages {
+                    self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                } else if done.no_room > 0 || done.refused == Some(Pushed::NoRoom) {
+                    // It is kept for `send`, which says so (§4.1, §10).
+                    self.state
+                        .own_channels
+                        .say_no_room_for_messages(&channel.id);
+                }
                 // The wait begins, or doubles, once for what was offered:
                 // and not for what is refused while it lasts.
                 if again || stopped {
@@ -1869,7 +2077,18 @@ impl DeviceEntries {
                 },
                 |db, answers| {
                     let answers = answers?;
-                    at_relays::sent(db, &relay, channel, batch, &answers).ok()
+                    // For the messages channel, what the relay took of the
+                    // device's own messages, what waits to be sent again,
+                    // and the list written again above another the relay
+                    // holds, in the same write (decision 2026-10-09 §2.3,
+                    // §2.4).
+                    let own = &self.state.identity;
+                    let fetched = sender::fetched(db, &self.state.own_channels, self.clock.now());
+                    let at = sender::AnsweredAt {
+                        now: self.unix(),
+                        fetched: fetched.unwrap_or(false),
+                    };
+                    sender::pushed(db, own, &relay, channel, batch, &answers, &at).ok()
                 },
             )
             .await?;
@@ -2082,7 +2301,8 @@ fn paced(of: &mut OfRelay) -> &mut ByteCounter {
 /// What a relay's answer for one entry means for sending it.
 fn pushed_as(answer: &PushAnswer) -> Pushed {
     match answer {
-        PushAnswer::Stored | PushAnswer::Held | PushAnswer::Older => Pushed::Holds,
+        PushAnswer::Stored | PushAnswer::Held => Pushed::Holds,
+        PushAnswer::Older => Pushed::HoldsLater,
         PushAnswer::Another => Pushed::HoldsAnother,
         PushAnswer::Refused(EntryRefused::NotSigned) => Pushed::DoesNotCheck,
         PushAnswer::Refused(EntryRefused::NoRoom) => Pushed::NoRoom,
@@ -2113,6 +2333,121 @@ fn refused_wait(refusals: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state of a node over a store of its own in memory, which
+    /// follows no phrase.
+    fn a_node() -> Arc<cordelia_api::state::AppState> {
+        Arc::new(cordelia_api::state::AppState {
+            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
+            bearer_token: "t".into(),
+            home_dir: std::env::temp_dir().join("cordelia-hourly-test-no-such-directory"),
+            started_at: Instant::now(),
+            sync_errors: Default::default(),
+            peers_hot: Default::default(),
+            peers_warm: Default::default(),
+            push_tx: None,
+            announce_tx: None,
+            peers: Default::default(),
+            relays: Default::default(),
+            outbox_refused: Default::default(),
+            relist: Default::default(),
+            sync_control: Default::default(),
+            own_channels: Default::default(),
+            held: Default::default(),
+            history: Default::default(),
+        })
+    }
+
+    /// The hourly task of messages runs on a node whatever the device's
+    /// state, here one that follows no phrase: a message whose 30 days
+    /// are up leaves the index (decision 2026-10-09 §7.1). A node that is
+    /// held up changes nothing.
+    #[test]
+    fn the_hourly_task_of_messages_drops_what_expired_unless_the_node_is_held_up() {
+        let state = a_node();
+        lock(&state.db)
+            .execute_batch(
+                "INSERT INTO message_generations (id, channel, statement, first_held)
+                     VALUES (1, zeroblob(32), 1, 100);
+                 INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                     VALUES (zeroblob(16), zeroblob(32), 'laptop', 1, 2, NULL, '~', 100, 'a',
+                             zeroblob(16), zeroblob(16), 0, NULL, 'a', 100, 100);
+                 INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), 1, 1, zeroblob(16));
+                 INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (zeroblob(32), 1, 1, 1);",
+            )
+            .unwrap();
+        let held = || -> i64 {
+            lock(&state.db)
+                .query_row("SELECT COUNT(*) FROM message_index", [], |row| row.get(0))
+                .unwrap()
+        };
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        state
+            .held
+            .hold(cordelia_api::state::Held::FirstStart("a test".into()));
+        device.messages_hourly();
+        assert_eq!(held(), 1);
+        state.held.release();
+        device.messages_hourly();
+        assert_eq!(held(), 0);
+    }
+
+    /// The hourly task of messages reads the node's clock, the one a test
+    /// sets and the routes read (decision 2026-10-09 §13): set to a time
+    /// long before the system's, the task drops a message whose 30 days
+    /// are up by it and keeps one with a second left; a second on, it
+    /// drops that one too. The time this side gives the door is the same.
+    #[test]
+    fn the_hourly_task_of_messages_reads_the_nodes_clock() {
+        const DAYS_30: i64 = 30 * 24 * 60 * 60;
+        let state = a_node();
+        let set = 1_000_000_000;
+        state.sync_control.set_now(Some(set));
+        lock(&state.db)
+            .execute_batch(&format!(
+                "INSERT INTO message_generations (id, channel, statement, first_held)
+                     VALUES (1, zeroblob(32), 1, 100);
+                 INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                            from_name, sent, subject, thread, answers, asks,
+                                            link, body, first_held, placed_at)
+                     VALUES (X'01010101010101010101010101010101', zeroblob(32), 'laptop', 1,
+                             2, NULL, '~', {expired}, 'a', zeroblob(16), zeroblob(16), 0, NULL,
+                             'expired', {expired}, NULL),
+                            (X'02020202020202020202020202020202', zeroblob(32), 'laptop', 1,
+                             2, NULL, '~', {left}, 'a', zeroblob(16), zeroblob(16), 0, NULL,
+                             'a second left', {left}, NULL);
+                 INSERT INTO message_numbers (signer, generation, number, id)
+                     VALUES (zeroblob(32), 1, 1, X'01010101010101010101010101010101'),
+                            (zeroblob(32), 1, 2, X'02020202020202020202020202020202');
+                 INSERT INTO message_signers (signer, generation, highest, counted_from)
+                     VALUES (zeroblob(32), 1, 2, 1);",
+                expired = set - DAYS_30,
+                left = set - DAYS_30 + 1,
+            ))
+            .unwrap();
+        let bodies = || -> Vec<String> {
+            lock(&state.db)
+                .prepare("SELECT body FROM message_index ORDER BY body")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        assert_eq!(device.unix(), set);
+        device.messages_hourly();
+        assert_eq!(bodies(), ["a second left"]);
+        state.sync_control.set_now(Some(set + 1));
+        assert_eq!(device.unix(), set + 1);
+        device.messages_hourly();
+        assert!(bodies().is_empty());
+    }
 
     /// What is kept in memory of a relay and a channel is kept while
     /// the channel is the device's own and the relay is one it is set up
@@ -2203,15 +2538,17 @@ mod tests {
         assert_eq!(counted_as_handed(3), entry_cost(0));
     }
 
-    /// Each answer to a push says one of five things for sending: the
-    /// relay holds the entry, whichever way; it holds another at that
-    /// revision; it does not check; there is no room; or the address is
-    /// over its allowance.
+    /// Each answer to a push says one of six things for sending: the
+    /// relay holds the entry, whichever way; it holds a later one, which
+    /// in the messages channel is not taken (decision 2026-10-09 §2.3,
+    /// F6); it holds another at that revision; it does not check; there
+    /// is no room; or the address is over its allowance.
     #[test]
     fn each_answer_to_a_push_is_read_as_what_it_means_for_sending() {
-        for holds in [PushAnswer::Stored, PushAnswer::Held, PushAnswer::Older] {
+        for holds in [PushAnswer::Stored, PushAnswer::Held] {
             assert_eq!(pushed_as(&holds), Pushed::Holds);
         }
+        assert_eq!(pushed_as(&PushAnswer::Older), Pushed::HoldsLater);
         assert_eq!(pushed_as(&PushAnswer::Another), Pushed::HoldsAnother);
         assert_eq!(
             pushed_as(&PushAnswer::Refused(EntryRefused::NotSigned)),

@@ -241,6 +241,18 @@ Local history: the text of a memory file as it was before sync replaced or remov
 
 Both bounds are applied when the node starts, every hour that the machine is awake, and at the end of a sync cycle once more than an eighth of `max_bytes` has been kept since they were last applied. Between two of those the store can hold more than `max_bytes`. A record larger than `max_bytes` goes the next time, and with `max_bytes = 0` nothing stays past it: texts are still kept before each change, and are there to restore only until then.
 
+### 2.12 `[messages]`
+
+Messages between the person's own agents (decision 2026-10-09 §6). Read when the node starts.
+
+| Parameter | Type | Default | Valid Range | Phase | Description | Source |
+|-----------|------|---------|-------------|-------|-------------|--------|
+| `per_folder_per_hour` | integer | `20` | 0 to 20 | 1 | The most messages that the agent of one folder sends in an hour. It may lower a folder's limit and may not raise it: the device's limit of 60 and its ring of 64 are sized on 20. `0` turns sending off for every folder of the device, and `cordelia msg send` is then refused with `sending_off`. | parameter-rationale.md §12.12 |
+| `git_wait_ms` | integer | not set: 10000 | 1 to 10000 (`STREAM_TIMEOUT_SECS` in milliseconds) | 1 | The command's, not the node's: how long `cordelia msg read` and `msg send` wait for git to say which folder they run in, in milliseconds, before they refuse with `folder_not_known`. It exists so that a test need not wait; no deployment sets it. | parameter-rationale.md §6 |
+| `answer_wait_ms` | integer | not set: 30000 | 1 to 30000 (the default wait, in milliseconds) | 1 | The command's, not the node's: how long `cordelia msg read` and `msg send` wait for the node to answer what they ask, in milliseconds, before they say that it did not answer. Not set, they wait as long as a command waits for the node to say its version. It exists so that a test need not wait; no deployment sets it. | parameter-rationale.md §6 |
+
+A value over 20, or a wait outside its range, is refused when the configuration is loaded: the node does not start, and every command that reads the configuration says why. Whatever is set, a device sends at most 60 messages an hour, its sends again included, and a message to every name counts as one.
+
 ## 3. Example Configuration
 
 A complete annotated `config.toml` with all sections and default values:
@@ -359,6 +371,10 @@ file_max_count = 5                         # Rotated log files to retain
 [history]
 days = 30                                  # How long a replaced text is kept (0 = off, and removes what is kept)
 max_bytes = 268435456                      # 256 MB; over it the oldest records go first
+
+# --- Messages between your own agents ---
+[messages]
+per_folder_per_hour = 20                   # 0 to 20; 0 turns sending off for every folder
 ```
 
 ---
@@ -420,6 +436,8 @@ The node validates configuration at startup. Invalid configuration prevents the 
 | Key files (`identity.key`, `node-token`, `channel-keys/*.key`) are world-readable (mode & 0044 != 0) | `permission denied on key file` |
 | `node.http_port` or `node.p2p_port` already in use | `address already in use` |
 | `node.http_port` == `node.p2p_port` | `port conflict: HTTP and P2P ports must differ` |
+| `messages.per_folder_per_hour` is over 20 (SS2.12) | `[messages] per_folder_per_hour is ...: it may be from 0 to 20` |
+| `messages.git_wait_ms` is outside 1 to 10000, or `messages.answer_wait_ms` outside 1 to 30000 (SS2.12) | `[messages] git_wait_ms is ...: it may be from 1 to 10000` (or `answer_wait_ms`, to 30000) |
 
 **Warnings (node starts, logs warning):**
 

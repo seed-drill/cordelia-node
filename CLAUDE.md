@@ -41,15 +41,21 @@ cordelia-node/
                          #   change_entry, entry and wire (an entry, sealed and on the wire),
                          #   chain and version (what an entry was written after; a slot's
                          #   current version), addition, hand_over, proof, fingerprint;
+                         #   message (the value of a message, its ID and the ring);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 18). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
                          #   history; meta (the keys of node_meta); first_start (the copy,
-                         #   the step and the guard); the older kind: channels, items, psk,
-                         #   search
+                         #   the step and the guard); messages (step 19: what a device keeps
+                         #   of messages between its agents, a generation being a messages
+                         #   channel it held; H and the live numbers, the index, places
+                         #   and the shown time; a row overwritten before it goes, in the
+                         #   caller's write); db (secure_delete, set before the steps run,
+                         #   and the truncating checkpoint of a personal node); the older
+                         #   kind: channels, items, psk, search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
                          #   the five streams of entries (0x10 to 0x14); transport.rs
                          #   exports the session's value for a proof
@@ -61,13 +67,26 @@ cordelia-node/
                          #   asks for, and the phrase's word for it), recover, swept (old
                          #   deletes in a device's own store), found (what `map` would sync,
                          #   and the notice), first_start (a node that is held up), sync,
-                         #   history. The older Channels API (handlers, entries, verify): a
+                         #   history; reader (what a device keeps of an entry of the
+                         #   messages channel that the door stores, and the hourly task of
+                         #   messages); sender (what a device does to send a message: the
+                         #   next number, its checks, sending again and clearing); marks
+                         #   (what an agent read: the device's table and its list, the
+                         #   other devices' lists, and whether a message is unread);
+                         #   messages (the routes of `msg summary`, `msg read`, `msg
+                         #   send` and `msg log`: the folder's agent, the message an ID
+                         #   names, the seven categories taken out of text another device
+                         #   chose, what a relay refused for room, and a person's mark). The
+                         #   older Channels API (handlers, entries, verify): a
                          #   relay's and a bootnode's
     cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
                          #   (claude.rs, plan.rs; claude/sequences.rs is the harness of
                          #   sequences over several devices)
     cordelia-node/       # Binary: CLI (main.rs), person_cmd and terminal (the device
                          #   commands and their prompts), carry_cmd (`sync carry`),
+                         #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
+                         #   log`: the folder, the frame, the cleaning, the lines and
+                         #   log's question),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
                          #   device_entries (a device's passes, and leave), indicator (the
@@ -106,7 +125,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -180,7 +199,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (25 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (28 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -220,6 +239,26 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
+
+The constants of messages between your own agents (decision 2026-10-09),
+each with its reason in parameter-rationale.md §12.12:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `LABEL_AGENT_MESSAGES`, `LABEL_AGENT_MESSAGE_ID`, `LABEL_AGENT_MESSAGE_READ` | `cordelia v2 messages`, `cordelia v2 message id`, `cordelia v2 message read` | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_PREFIX`, `AGENT_MESSAGE_READ_PREFIX` | `msg/`, `read/` | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_RING` | 64 (a device's slots for messages; a signer's live numbers; places in an hour) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_CONTENT_BYTES`, `AGENT_MESSAGE_VALUE_BYTES` | 2,048, 1,936 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_BODY_MAX_BYTES`, `AGENT_MESSAGE_NAME_MAX_BYTES` | 1,024, 200 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_LINK_OWNER_MAX_BYTES`, `AGENT_MESSAGE_LINK_REPO_MAX_BYTES`, `AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS`, `AGENT_MESSAGE_LINK_MAX_BYTES` | 39, 100, 10, 151 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_ID_BYTES`, `AGENT_MESSAGE_ID_SHOWN_CHARS`, `AGENT_MESSAGE_READ_MARK_BYTES` | 16, 8, 16 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_READ_MARKS_MAX` | 120 (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_KEPT_DAYS`, `AGENT_MESSAGE_AHEAD_MAX_SECS`, `AGENT_MESSAGE_SENDS_MAX` | 30, 600s, 4 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGES_PER_FOLDER_PER_HOUR`, `AGENT_MESSAGES_PER_DEVICE_PER_HOUR`, `AGENT_MESSAGE_PAIR_UNREAD_MAX` | 20, 60, 10 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_SUMMARY_LINES`, `AGENT_MESSAGE_SUBJECT_CHARS`, `AGENT_MESSAGE_AGENT_NAME_CHARS` | 5, 80, 48 | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_SUMMARY_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES` | 100ms, 20ms, 64KB | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_MARKER_BYTES`, `AGENT_MESSAGE_CLEAR_INTERVAL_SECS` | 6, 3600s (derived) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_NUMBER_MAX` | 2^42 - 1 (derived: a clearing's revision stays below `REV_BAND_HALF`) | parameter-rationale.md §12.12 |
 
 ## Running Tests
 
