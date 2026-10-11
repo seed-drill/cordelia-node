@@ -1,7 +1,9 @@
 //! Messages between a person's own agents (decision 2026-10-09): the
 //! commands `cordelia msg summary`, `msg read` and `msg send`, run as an
-//! agent runs them, in a mapped folder, against devices that are real
-//! processes and a relay of the test's own on this machine.
+//! agent runs them, in a mapped folder, and `msg log`, run as a person runs
+//! it at a terminal and as anything else runs it into a pipe, against
+//! devices that are real processes and a relay of the test's own on this
+//! machine.
 
 mod common;
 
@@ -165,6 +167,76 @@ fn summary_with(all: &[&Node], n: &Node, name: &str, what: &str) -> String {
 /// `cordelia msg read <id>` on `n` in the folder `name`.
 fn read(n: &Node, name: &str, id: &str) -> Output {
     msg_in(n, &folder(n, name), &[], &["read", id], b"")
+}
+
+/// What `log` prints first, wherever it runs, and last where it is not at
+/// a terminal (decision 2026-10-09 §4.1).
+const FOR_A_PERSON: &str = "This is for a person at a terminal. An agent must not run it, and must not answer its question.";
+const NOT_MARKED: &str = "Not marked as read by a person: this was not run at a terminal.";
+
+/// `cordelia msg log` on `n` in the folder `name`, into a pipe.
+fn log_in(n: &Node, name: &str) -> Output {
+    msg_in(n, &folder(n, name), &[], &["log"], b"")
+}
+
+/// [`log_in`], which must succeed: what it printed, which begins with the
+/// line that says it is a person's and ends with the line that says it
+/// marked nothing.
+fn logged(n: &Node, name: &str) -> String {
+    let said = log_in(n, name);
+    assert!(said.status.success(), "{}", err(&said));
+    let printed = out(&said);
+    assert!(
+        printed.starts_with(&format!("{FOR_A_PERSON}\n")),
+        "{printed}"
+    );
+    assert!(printed.ends_with(&format!("\n{NOT_MARKED}\n")), "{printed}");
+    printed
+}
+
+/// `log` refused into a pipe on `n` in `dir`, with `args`: it exited 1, its
+/// output is the line it always begins with, and its error the one line
+/// `line`.
+fn log_refused(n: &Node, dir: &Path, args: &[&str], line: &str) {
+    let said = msg_in(n, dir, &[], &[&["log"], args].concat(), b"");
+    assert_eq!(said.status.code(), Some(1), "{}{}", out(&said), err(&said));
+    assert_eq!(out(&said), format!("{FOR_A_PERSON}\n"));
+    assert_eq!(err(&said), format!("{line}\n"));
+}
+
+/// `log` at a terminal on `n`, which asks about `count` messages and is
+/// answered `typed`: everything its terminal showed.
+fn log_at_a_terminal(n: &Node, count: usize, typed: &str) -> String {
+    let mut at = n.at_terminal(&["msg", "log"]);
+    at.says(&format!(
+        "Mark these {count} messages as read by a person on this device? That ends any hold"
+    ));
+    at.says("Type yes to mark them: ");
+    at.types(typed);
+    at.done()
+}
+
+/// The lines `log` printed of the message `id` before its frame: its
+/// header, and what is said of it.
+fn block_of<'a>(printed: &'a str, id: &str) -> &'a str {
+    let at = printed
+        .find(&format!("\nMessage {id}"))
+        .unwrap_or_else(|| panic!("{id} is not listed: {printed}"));
+    let rest = &printed[at + 1..];
+    let end = rest.find("-----").unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Wait until `log` on `n`, into a pipe in the folder `name`, lists `id`
+/// with what it says: it was given a place.
+fn logs(all: &[&Node], n: &Node, name: &str, id: &str) -> String {
+    wait_for("log lists it", all, 120, || {
+        let printed = logged(n, name);
+        printed
+            .contains(&format!("\nMessage {id}"))
+            .then_some(printed)
+            .filter(|printed| !block_of(printed, id).contains("held back"))
+    })
 }
 
 /// The value of the frame's lines in what `read` printed.
@@ -754,7 +826,8 @@ fn a_message_is_shown_from_the_device_that_signed_it() {
 }
 
 /// With `~` mapped on laptop and desktop, a message from `~` to `~` is
-/// sent, summarised and read, and the unmapped folder's refusal printed:
+/// sent, summarised, read and logged, and the unmapped folder's refusal
+/// printed by `read` and by `log`:
 /// each command line that is printed splits, as a shell splits words with
 /// no expansion, into the words of the command; `~` stands in none of
 /// them bare, and a folder under the home directory is printed `~/...`
@@ -778,8 +851,12 @@ fn command_lines_quote_home_memorys_name() {
         refusal.ends_with("Map it with: cordelia sync map ~/'not mapped' <name>\n"),
         "{refusal}"
     );
+    let printed = logged(&two.desktop, "~");
+    assert!(printed.contains("home to home"), "{printed}");
+    let log_refusal = err(&msg_in(&two.desktop, &unmapped, &[], &["log"], b""));
+    assert_eq!(refusal, log_refusal);
     let mut lines = 0;
-    for said in [&summary, &shown, &refusal] {
+    for said in [&summary, &shown, &refusal, &printed, &log_refusal] {
         for line in said.lines() {
             let Some(at) = line.find("cordelia ") else {
                 continue;
@@ -801,7 +878,7 @@ fn command_lines_quote_home_memorys_name() {
             );
         }
     }
-    assert!(lines >= 3, "{summary}{shown}{refusal}");
+    assert!(lines >= 4, "{summary}{shown}{refusal}{log_refusal}");
     // The header names the agent, which is no command line.
     assert!(summary.contains("messages for this agent (~)"), "{summary}");
 }
@@ -1176,8 +1253,8 @@ fn a_device_that_follows_no_phrase_sends_and_shows_nothing() {
 }
 
 /// Laptop removes desktop; desktop, removed, prints nothing from
-/// `summary`, and `send` and `read` there are refused with `not_applied`
-/// and their lines; laptop sends on (decision 2026-10-09 §1, property 1,
+/// `summary`, and `send`, `read` and `log` there are refused with
+/// `not_applied` and their lines; laptop sends on (decision 2026-10-09 §1, property 1,
 /// T16).
 #[test]
 fn a_removed_device_is_shown_nothing_and_sends_nothing() {
@@ -1216,12 +1293,24 @@ fn a_removed_device_is_shown_nothing_and_sends_nothing() {
              no message.",
         );
     }
+    let shows_none = "This device is not one of your devices now (this device was removed), so \
+                      it shows no message.";
+    log_refused(&two.desktop, &folder(&two.desktop, "work"), &[], shows_none);
+    let at = two.desktop.at_terminal(&["msg", "log"]);
+    let said = at.refused();
+    assert!(said.contains(shows_none), "{said}");
+    assert!(!said.contains("Mark these"), "{said}");
+    assert!(
+        !said.contains("before\r\n") && !said.contains("after\r\n"),
+        "{said}"
+    );
 }
 
 /// Tablet sends; it is removed, and once desktop has applied the removal,
 /// `read` and `send --reply` of its message are refused there with
-/// `signer_removed`, and `summary` shows it no more (decision 2026-10-09
-/// §4.3, §9.1).
+/// `signer_removed`, and `summary` shows it no more; `log` lists it, as
+/// from a device that is no longer one of yours (decision 2026-10-09
+/// §4.1, §4.3, §9.1).
 #[test]
 fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log() {
     let two = Two::new();
@@ -1264,6 +1353,27 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
         ),
     );
     assert_eq!(summary(&two.desktop, "work"), "");
+    // `log` lists it, as from a device that is no longer one of yours: at
+    // a terminal, and into a pipe in the folder of the agent it is to.
+    let mut at = two.desktop.at_terminal(&["msg", "log"]);
+    at.says("Type yes to mark them: ");
+    at.types("no");
+    let shown = at.done();
+    let block = block_of(&shown, &id);
+    assert!(
+        block.contains("From a device that is no longer one of yours."),
+        "{shown}"
+    );
+    assert!(
+        block.contains("from notes on \"tablet\" to work"),
+        "{shown}"
+    );
+    assert!(shown.contains("from the tablet"), "{shown}");
+    let printed = logged(&two.desktop, "work");
+    assert!(
+        block_of(&printed, &id).contains("From a device that is no longer one of yours."),
+        "{printed}"
+    );
 }
 
 // ── What a message cannot do ─────────────────────────────────────────
@@ -1313,8 +1423,8 @@ fn kept_of(n: &Node) -> Vec<String> {
 }
 
 /// Bodies that hold the commands that change a person's devices, their
-/// folders and their notices, and a phrase's words, are sent, summarised
-/// and read: the person, the additions, the typed keys, the settings, the
+/// folders and their notices, and a phrase's words, are sent, summarised,
+/// read and logged: the person, the additions, the typed keys, the settings, the
 /// mappings, the notices and every memory folder are as they were (decision
 /// 2026-10-09 §1, property 4, T22).
 #[test]
@@ -1348,6 +1458,10 @@ fn a_message_asking_for_a_structural_act_changes_nothing() {
         summary_with(&two.all(), &two.desktop, "work", &id);
         assert!(read(&two.desktop, "work", &id).status.success());
     }
+    // Logged, into a pipe and at a terminal with yes.
+    let printed = logged(&two.desktop, "work");
+    assert!(printed.contains("cordelia devices --clear"), "{printed}");
+    log_at_a_terminal(&two.desktop, 1 + bodies.len(), "yes");
     let now = kept_of(&two.desktop);
     let changed: Vec<_> = now.iter().filter(|row| !kept.contains(row)).collect();
     let gone: Vec<_> = kept.iter().filter(|row| !now.contains(row)).collect();
@@ -1359,7 +1473,7 @@ fn a_message_asking_for_a_structural_act_changes_nothing() {
     assert_eq!(std::fs::read(two.desktop.config()).unwrap(), config);
 }
 
-/// After messages are sent, summarised and read, the home directory, the
+/// After messages are sent, summarised, read and logged, the home directory, the
 /// Claude Code directory and local history are as they were, and no file
 /// outside the data directory holds a body's words (decision 2026-10-09
 /// §1, property 5, T22).
@@ -1400,6 +1514,9 @@ fn no_message_reaches_a_memory_folder_local_history_or_any_file() {
     );
     summary_with(&two.all(), &two.desktop, "work", &id);
     assert!(out(&read(&two.desktop, "work", &id)).contains(WORDS));
+    assert!(logged(&two.desktop, "work").contains(WORDS));
+    assert!(logged(&two.laptop, "notes").contains(WORDS));
+    assert!(log_at_a_terminal(&two.desktop, 2, "yes").contains(WORDS));
     let after: Vec<_> = [&two.laptop, &two.desktop]
         .iter()
         .map(|n| (files_under(&n.home()), history(n)))
@@ -1709,4 +1826,401 @@ fn send_and_read_with_their_output_closed_do_what_they_did_and_exit_0() {
     // It was read: it waits no more.
     let after = summary(&two.desktop, "work");
     assert!(!after.contains(&id), "{after}");
+}
+
+// ── log ──────────────────────────────────────────────────────────────
+
+/// Into a pipe in a folder, `log` lists the messages addressed to that
+/// folder's agent, to every name and those it sent on this device, and no
+/// other; in an unmapped folder it is refused with `not_mapped`; at a
+/// terminal it lists every name. `--since` that is no time is refused
+/// before anything, as `cordelia history` refuses it (decision 2026-10-09
+/// §3.1, §4.1, §4.3, F3).
+#[test]
+fn log_outside_a_terminal_shows_only_the_folders_agent() {
+    let mut two = Two::new();
+    // With nothing to show, it asks nothing.
+    let at = two.desktop.at_terminal(&["msg", "log"]);
+    let shown = at.done();
+    assert!(
+        shown.contains("No message was printed with what it says, so none is marked."),
+        "{shown}"
+    );
+    assert!(!shown.contains("Mark these"), "{shown}");
+    let to_work = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "to work\n",
+    );
+    let to_plans = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "plans"],
+        "to plans\n",
+    );
+    let to_all = sent(&two.all(), &two.laptop, "notes", &["--all"], "to all\n");
+    let from_laptops_work = sent(
+        &two.all(),
+        &two.laptop,
+        "work",
+        &["--to", "notes"],
+        "from work on laptop\n",
+    );
+    let from_work = sent(
+        &two.all(),
+        &two.desktop,
+        "work",
+        &["--to", "notes"],
+        "from work on desktop\n",
+    );
+    logs(&two.all(), &two.desktop, "notes", &from_laptops_work);
+    let printed = logs(&two.all(), &two.desktop, "work", &to_all);
+    assert!(
+        printed.starts_with(&format!(
+            "{FOR_A_PERSON}\nMessages of the agent work on this device:\n"
+        )),
+        "{printed}"
+    );
+    for id in [&to_work, &to_all, &from_work] {
+        assert!(
+            printed.contains(&format!("\nMessage {id}")),
+            "{id}: {printed}"
+        );
+    }
+    for id in [&to_plans, &from_laptops_work] {
+        assert!(!printed.contains(id), "{id}: {printed}");
+    }
+    assert!(!printed.contains("to plans") && !printed.contains("from work on laptop"));
+    let block = block_of(&printed, &to_work);
+    assert!(
+        block.contains("from notes on \"laptop\" to work, sent "),
+        "{block}"
+    );
+    assert!(
+        block_of(&printed, &from_work).contains("from work on this device to notes"),
+        "{printed}"
+    );
+    assert!(printed.contains("\nto work\n----- ["), "{printed}");
+
+    // In a folder that is not mapped it is refused; a `--since` that is no
+    // time, before that.
+    let unmapped = two.desktop.home().join("unmapped");
+    std::fs::create_dir_all(&unmapped).unwrap();
+    log_refused(
+        &two.desktop,
+        &unmapped,
+        &[],
+        "This folder is not mapped, so no agent of yours runs here, and nothing was done. Map \
+         it with: cordelia sync map ~/unmapped <name>",
+    );
+    let not_a_time = "yesterday is not a time: give how long ago (30m, 2h, 3d) or a time such as \
+                      2026-10-03T09:00:00Z";
+    log_refused(
+        &two.desktop,
+        &unmapped,
+        &["--since", "yesterday"],
+        not_a_time,
+    );
+    // Only what was sent in the last while.
+    let lately = msg_in(
+        &two.desktop,
+        &folder(&two.desktop, "work"),
+        &[],
+        &["log", "--since", "2d"],
+        b"",
+    );
+    assert!(out(&lately).contains(&to_work), "{}", err(&lately));
+
+    // At a terminal: every name, and the question.
+    let shown = log_at_a_terminal(&two.desktop, 5, "no");
+    assert!(shown.starts_with(FOR_A_PERSON), "{shown}");
+    assert!(
+        shown.contains("Messages of every agent on this device:"),
+        "{shown}"
+    );
+    for id in [&to_work, &to_plans, &to_all, &from_laptops_work, &from_work] {
+        assert!(shown.contains(&format!("\nMessage {id}")), "{id}: {shown}");
+    }
+    assert!(shown.contains("Nothing was marked."), "{shown}");
+    assert!(!shown.contains(NOT_MARKED), "{shown}");
+
+    // With the node stopped, a `--since` that is no time is still refused
+    // first; then the node that is not running.
+    two.desktop.stop();
+    let work = folder(&two.desktop, "work");
+    log_refused(&two.desktop, &work, &["--since", "yesterday"], not_a_time);
+    log_refused(
+        &two.desktop,
+        &work,
+        &[],
+        "The node is not running, so nothing was done. Start it with: cordelia start",
+    );
+}
+
+/// Two agents answer each other in new threads on one device: the
+/// eleventh is refused with `pair_held`; `log` into a pipe frees nothing,
+/// at a terminal answered no frees nothing, and answered yes frees it, and
+/// a send goes. Another pair sends throughout (decision 2026-10-09 §4.1,
+/// §6, property 10, T22).
+#[test]
+fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
+    let two = Two::new();
+    let laptop = &two.laptop;
+    for k in 0..10 {
+        let (from, to) = match k % 2 {
+            0 => ("notes", "work"),
+            _ => ("work", "notes"),
+        };
+        sent(&two.all(), laptop, from, &["--to", to], &format!("{k}\n"));
+    }
+    let held = "Ten messages between work and notes wait to be read by a person on this device, \
+                so no more are sent between them until a person reads them with: cordelia msg \
+                log (at a terminal)";
+    refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
+    let other = send(laptop, "plans", &["--to", "notes"], "another pair\n");
+    assert!(other.status.success(), "{}", err(&other));
+
+    // Into a pipe: it marks nothing.
+    let printed = logged(laptop, "work");
+    assert!(printed.contains("Not read by a person here."), "{printed}");
+    assert!(!printed.contains("Read by a person here."), "{printed}");
+    refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
+
+    // At a terminal, answered no: nothing.
+    let shown = log_at_a_terminal(laptop, 11, "no");
+    assert!(shown.ends_with("Nothing was marked.\r\n"), "{shown:?}");
+    refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
+    let another = send(laptop, "plans", &["--to", "work"], "still another pair\n");
+    assert!(another.status.success(), "{}", err(&another));
+
+    // Answered yes: the twelve it printed are marked, and the pair sends.
+    let shown = log_at_a_terminal(laptop, 12, "yes");
+    assert!(
+        shown.ends_with("Marked 12 messages as read by a person on this device.\r\n"),
+        "{shown:?}"
+    );
+    let freed = send(laptop, "work", &["--to", "notes"], "freed\n");
+    assert!(
+        out(&freed).ends_with(" to notes as work.\n"),
+        "{}",
+        err(&freed)
+    );
+    let printed = logged(laptop, "work");
+    assert!(printed.contains("Read by a person here."), "{printed}");
+}
+
+/// `log` at a terminal prints nine messages of a pair and asks; a tenth
+/// arrives, and the summary shows it, before the yes: it is not marked,
+/// and the pair counts it (decision 2026-10-09 §4.1, §7.2, F2).
+#[test]
+fn a_message_that_arrives_during_logs_question_is_not_marked() {
+    let two = Two::new();
+    let mut nine = Vec::new();
+    for k in 0..9 {
+        nine.push(sent(
+            &two.all(),
+            &two.laptop,
+            "notes",
+            &["--to", "work"],
+            &format!("{k}\n"),
+        ));
+    }
+    logs(&two.all(), &two.desktop, "work", &nine[8]);
+    // The summary announces the nine, five and then four, so that the
+    // tenth has a line of its own when it comes.
+    for _ in 0..2 {
+        summary(&two.desktop, "work");
+    }
+    let mut at = two.desktop.at_terminal(&["msg", "log"]);
+    at.says("Mark these 9 messages as read by a person on this device?");
+    at.says("Type yes to mark them: ");
+    let tenth = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "the tenth\n",
+    );
+    // Shown by the summary: its line, or, where the summary that
+    // announced it answered past its time and printed nothing, the count
+    // of the ten that wait.
+    wait_for("the summary shows it", &two.all(), 120, || {
+        let said = summary(&two.desktop, "work");
+        (said.contains(&tenth) || said.contains("  10 more wait for this agent: ")).then_some(())
+    });
+    at.types("yes");
+    at.says("Marked 9 messages as read by a person on this device.");
+    at.done();
+
+    let printed = logged(&two.desktop, "work");
+    assert!(
+        block_of(&printed, &tenth).contains("Not read by a person here."),
+        "{printed}"
+    );
+    for id in &nine {
+        assert!(
+            block_of(&printed, id).contains("Read by a person here."),
+            "{id}: {printed}"
+        );
+    }
+    let shown = out(&read(&two.desktop, "work", &tenth));
+    assert!(
+        shown.contains(
+            "10 message(s) between notes and work here, 1 of them not yet read by a person here."
+        ),
+        "{shown}"
+    );
+}
+
+/// With the pair of x and y held, `--all` from x and from y is refused with
+/// the second `pair_held` line, and `--all` from z is sent; once a person
+/// has read them, ten messages to every name from x hold the pair of x and
+/// all, and an eleventh is refused (decision 2026-10-09 §6, D6).
+#[test]
+fn a_held_pair_stops_every_name_from_either_side() {
+    let (relay, laptop) = alone("laptop", &["x", "y", "z"], "");
+    let all = [&relay, &laptop];
+    for k in 0..10 {
+        let (from, to) = match k % 2 {
+            0 => ("x", "y"),
+            _ => ("y", "x"),
+        };
+        sent(&all, &laptop, from, &["--to", to], &format!("{k}\n"));
+    }
+    for (from, other) in [("x", "y"), ("y", "x")] {
+        refused_with(
+            &send(&laptop, from, &["--all"], "to all\n"),
+            &format!(
+                "Messages between {from} and {other} wait to be read by a person on this device, \
+                 so {from} sends nothing to every agent until a person reads them with: cordelia \
+                 msg log (at a terminal)"
+            ),
+        );
+    }
+    let from_z = send(&laptop, "z", &["--all"], "from z\n");
+    assert!(
+        out(&from_z).ends_with(" to every agent as z.\n"),
+        "{}",
+        err(&from_z)
+    );
+    log_at_a_terminal(&laptop, 11, "yes");
+    for k in 0..10 {
+        sent(&all, &laptop, "x", &["--all"], &format!("all {k}\n"));
+    }
+    refused_with(
+        &send(&laptop, "x", &["--all"], "11th to all\n"),
+        "Messages between x and every agent wait to be read by a person on this device, so x \
+         sends nothing to every agent until a person reads them with: cordelia msg log (at a \
+         terminal)",
+    );
+    let to_y = send(&laptop, "x", &["--to", "y"], "to a name\n");
+    assert!(to_y.status.success(), "{}", err(&to_y));
+}
+
+/// Laptop maps a folder under y and sends ten messages from it to z;
+/// desktop, where y and z are mapped, refuses y to z, z to y and `--all`
+/// from either, until a person at a terminal on desktop reads `log` and
+/// types yes (decision 2026-10-09 §6, §11, D6, T22).
+#[test]
+fn a_misled_agent_on_one_device_holds_two_other_names_on_another() {
+    let two = Two::mapping(&["y"], &["y", "z"]);
+    let mut ids = Vec::new();
+    for k in 0..10 {
+        ids.push(sent(
+            &two.all(),
+            &two.laptop,
+            "y",
+            &["--to", "z"],
+            &format!("{k}\n"),
+        ));
+    }
+    logs(&two.all(), &two.desktop, "z", &ids[9]);
+    let desktop = &two.desktop;
+    for (from, other) in [("y", "z"), ("z", "y")] {
+        refused_with(
+            &send(desktop, from, &["--to", other], "x\n"),
+            &format!(
+                "Ten messages between {from} and {other} wait to be read by a person on this \
+                 device, so no more are sent between them until a person reads them with: \
+                 cordelia msg log (at a terminal)"
+            ),
+        );
+        refused_with(
+            &send(desktop, from, &["--all"], "x\n"),
+            &format!(
+                "Messages between {from} and {other} wait to be read by a person on this device, \
+                 so {from} sends nothing to every agent until a person reads them with: cordelia \
+                 msg log (at a terminal)"
+            ),
+        );
+    }
+    // The person sees which device they came from.
+    let shown = log_at_a_terminal(desktop, 10, "yes");
+    assert!(
+        block_of(&shown, &ids[0]).contains("from y on \"laptop\" to z"),
+        "{shown}"
+    );
+    let freed = send(desktop, "z", &["--to", "y"], "freed\n");
+    assert!(freed.status.success(), "{}", err(&freed));
+    let to_all = send(desktop, "y", &["--all"], "to all\n");
+    assert!(to_all.status.success(), "{}", err(&to_all));
+}
+
+/// After `read`, the summary no longer counts a message, and it is still
+/// not read by a person here; `log` into a pipe, or at a terminal answered
+/// no, does not change that; `log` at a terminal answered yes does, on
+/// this device alone (decision 2026-10-09 §4.1, §7.2, property 14).
+#[test]
+fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "to be read\n",
+    );
+    summary_with(&two.all(), &two.desktop, "work", &id);
+    let desktop = &two.desktop;
+    let header = |unread: usize| {
+        format!(
+            "1 message(s) between notes and work here, {unread} of them not yet read by a person here."
+        )
+    };
+    let shown = out(&read(desktop, "work", &id));
+    assert!(shown.contains(&header(1)), "{shown}");
+    assert_eq!(summary(desktop, "work"), "");
+    let printed = logged(desktop, "work");
+    let block = block_of(&printed, &id);
+    assert!(
+        block.contains("Read by an agent on this device."),
+        "{block}"
+    );
+    assert!(block.contains("Not read by a person here."), "{block}");
+
+    let shown = log_at_a_terminal(desktop, 1, "no");
+    assert!(shown.contains("Nothing was marked."), "{shown}");
+    assert!(
+        block_of(&logged(desktop, "work"), &id).contains("Not read by a person here."),
+        "{printed}"
+    );
+    assert!(out(&read(desktop, "work", &id)).contains(&header(1)));
+
+    let shown = log_at_a_terminal(desktop, 1, "yes");
+    assert!(
+        shown.contains("Marked 1 messages as read by a person on this device."),
+        "{shown}"
+    );
+    assert!(block_of(&logged(desktop, "work"), &id).contains("Read by a person here."));
+    assert!(out(&read(desktop, "work", &id)).contains(&header(0)));
+    // A person's mark is the device's own: on laptop it is not read by a
+    // person.
+    let there = logged(&two.laptop, "notes");
+    assert!(
+        block_of(&there, &id).contains("Not read by a person here."),
+        "{there}"
+    );
 }

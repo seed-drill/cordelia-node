@@ -1272,12 +1272,21 @@ mod tests {
         .unwrap();
         take(&s[2].conn, &s[2].identity, &entry, t).unwrap();
         assert!(unread_on(&s, 2, "notes", t).is_empty());
-        let log: Vec<String> = held::shown(&s[2].conn, t)
-            .unwrap()
-            .into_iter()
-            .map(|shown| shown.body)
-            .collect();
-        assert_eq!(log, ["never read"]);
+        // `log` lists it, and says on which device an agent read it.
+        let asked = crate::messages::LogAsked {
+            folder: None,
+            since: None,
+            mark: &[],
+        };
+        let log = crate::messages::log_of(&s[2].conn, &s[2].identity, &asked, t, |_| false)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(log.threads.len(), 1);
+        let listed = &log.threads[0].1[0];
+        assert_eq!(listed.id, id);
+        let said = listed.said.as_ref().unwrap();
+        assert_eq!(said.body, "never read");
+        assert_eq!(said.read_on, ["device 1"]);
+        assert!(!said.read_here);
         assert_eq!(
             read_on(&s[2].conn, &id, "notes").unwrap(),
             ReadOn {
