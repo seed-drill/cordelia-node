@@ -2489,7 +2489,10 @@ mod tests {
             .filter(|(_, _, author)| author[..] == own[..])
             .collect();
         assert_eq!((refused.len(), of_its_own.len()), (5, 2));
-        assert!(of_its_own.iter().all(|(_, rev, _)| rev % 2 == 0), "{refused:?}");
+        assert!(
+            of_its_own.iter().all(|(_, rev, _)| rev % 2 == 0),
+            "{refused:?}"
+        );
         for relay in [[0x71; 32], [0x72; 32]] {
             for (seq, _, _) in &refused {
                 cordelia_storage::at_relays::refused(conn, &relay, &channel, *seq).unwrap();
@@ -2509,10 +2512,8 @@ mod tests {
         let channel = messages_channel(conn).unwrap().unwrap();
         let secret = cordelia_crypto::derive::messages_secret(&s[0].secret()).unwrap();
         let name = cordelia_crypto::message::message_name(&s.key(0), 1).unwrap();
-        let inside = cordelia_crypto::message::inside(
-            name,
-            cordelia_crypto::message::clearing_value(),
-        );
+        let inside =
+            cordelia_crypto::message::inside(name, cordelia_crypto::message::clearing_value());
         let rev = cordelia_crypto::message::clearing_rev(1).unwrap();
         let seqs = |conn: &Connection| -> Vec<i64> {
             conn.prepare("SELECT seq FROM entries WHERE channel_id = ?1")
