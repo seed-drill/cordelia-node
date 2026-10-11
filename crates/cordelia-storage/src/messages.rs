@@ -664,6 +664,129 @@ pub fn held_back(
     Ok(from_sql(held))
 }
 
+/// A message that waits for a place at `now` ([`waiting_for_places`]):
+/// `log` lists it by its ID and its sender, as held back, and shows
+/// nothing of what it says (decision 2026-10-09 §4.1, §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldBack {
+    pub id: Vec<u8>,
+    pub signer: Vec<u8>,
+    pub label: String,
+    pub generation: i64,
+    pub to: Option<String>,
+    pub from: String,
+    /// Its shown time ([`shown_at`]).
+    pub shown_at: i64,
+    pub thread: Vec<u8>,
+}
+
+/// Every live message that has not expired and waits for a place at
+/// `now`, held back by the reader's hour (decision 2026-10-09 §6), oldest
+/// first, as [`shown`] orders what has a place.
+pub fn waiting_for_places(conn: &Connection, now: i64) -> Result<Vec<HeldBack>, StorageError> {
+    let held = conn
+        .prepare(&format!(
+            "SELECT i.id, i.signer, i.label, i.generation, i.to_name, i.from_name,
+                    MIN(i.sent, i.first_held) AS shown_at, i.thread
+             FROM message_index i
+             WHERE i.placed_at IS NULL AND ?1 < {expires} AND {live}
+             ORDER BY shown_at, i.id",
+            expires = expires_sql(),
+            live = live_sql(),
+        ))?
+        .query_map([now], |row| {
+            Ok(HeldBack {
+                id: row.get(0)?,
+                signer: row.get(1)?,
+                label: row.get(2)?,
+                generation: row.get(3)?,
+                to: row.get(4)?,
+                from: row.get(5)?,
+                shown_at: row.get(6)?,
+                thread: row.get(7)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(held)
+}
+
+/// What the device keeps of each signer in each generation, in order of
+/// signer and then of generation (decision 2026-10-09 §2.2, §2.5): what
+/// `log` counts of each.
+pub fn signers(conn: &Connection) -> Result<Vec<([u8; 32], i64, Signer)>, StorageError> {
+    let rows: Vec<(Vec<u8>, i64, Signer)> = conn
+        .prepare(
+            "SELECT signer, generation, highest, overwritten, not_messages, counted_from
+             FROM message_signers ORDER BY signer, generation",
+        )?
+        .query_map([], |row| {
+            let kept = Signer {
+                highest: from_sql(row.get(2)?),
+                overwritten: from_sql(row.get(3)?),
+                not_messages: from_sql(row.get(4)?),
+                counted_from: row.get::<_, Option<i64>>(5)?.map(from_sql),
+            };
+            Ok((row.get(0)?, row.get(1)?, kept))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, generation, kept)| Some((key.try_into().ok()?, generation, kept)))
+        .collect())
+}
+
+/// The label that an index row of `signer` was written with, where the
+/// index holds one: how a device that no longer counts is named.
+pub fn label_held(conn: &Connection, signer: &[u8; 32]) -> Result<Option<String>, StorageError> {
+    Ok(conn
+        .query_row(
+            "SELECT label FROM message_index WHERE signer = ?1 AND label != ''
+             ORDER BY first_held DESC LIMIT 1",
+            [&signer[..]],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// The device's own messages, signed by `own`, whose kept value was
+/// dropped before every relay had taken it (decision 2026-10-09 §2.3):
+/// `log` says of each that it may not have reached every relay. In order
+/// of ID.
+pub fn not_every_relay(conn: &Connection, own: &[u8; 32]) -> Result<Vec<Id>, StorageError> {
+    let ids: Vec<Vec<u8>> = conn
+        .prepare(
+            "SELECT id FROM message_index WHERE signer = ?1 AND not_every_relay = 1 ORDER BY id",
+        )?
+        .query_map([&own[..]], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids.iter().map(|id| id_of(id)).collect())
+}
+
+/// The device's own messages, signed by `own`, of the messages channel
+/// `channel`, whose entry a relay had no room for and that wait to be sent
+/// there again (decision 2026-10-09 §10, C15): an entry of the device's
+/// own at a message's number that a relay refused for room, while the
+/// store holds it (`at_relays_refused`). In order of ID.
+pub fn refused_for_room(
+    conn: &Connection,
+    channel: &[u8; 32],
+    own: &[u8; 32],
+) -> Result<Vec<Id>, StorageError> {
+    let ids: Vec<Vec<u8>> = conn
+        .prepare(
+            "SELECT DISTINCT n.id FROM at_relays_refused r
+             JOIN entries e ON e.channel_id = r.channel AND e.seq = r.seq
+             JOIN message_generations g ON g.channel = r.channel
+             JOIN message_numbers n
+                 ON n.signer = e.author AND n.generation = g.id AND n.number = e.rev / 2
+             WHERE r.channel = ?1 AND e.author = ?2 AND e.rev % 2 = 0
+             ORDER BY n.id",
+        )?
+        .query_map(params![&channel[..], &own[..]], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids.iter().map(|id| id_of(id)).collect())
+}
+
 /// What the hourly task dropped ([`drop_gone`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gone {
@@ -1424,6 +1547,17 @@ pub fn is_announced(conn: &Connection, id: &Id, name: &str) -> Result<bool, Stor
         |row| row.get(0),
     )?;
     Ok(held > 0)
+}
+
+/// A person read message `id` on this device (decision 2026-10-09 §7.2,
+/// §6): `log` at a terminal, with yes, marks what it printed. The mark is
+/// the device's own and is never synced, and it goes with its message's
+/// row. In the caller's write. Returns whether it was not marked before.
+pub fn mark_read_by_a_person(conn: &Connection, id: &Id) -> Result<bool, StorageError> {
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO message_read_by_a_person (id) VALUES (?1)",
+        [&id[..]],
+    )? == 1)
 }
 
 /// Whether a person has read message `id` on this device (decision

@@ -421,6 +421,19 @@ enum MsgCommand {
         #[arg(long, value_name = "OWNER/REPO#N")]
         re: Option<String>,
     },
+    /// For a person at a terminal
+    ///
+    /// At a terminal it shows every message of every agent of yours that
+    /// this device holds, with on which devices an agent read it, and asks
+    /// whether to mark them read by a person here: that ends any hold
+    /// between the agents they are between. Anywhere else it shows only
+    /// the messages of this folder's agent, and marks nothing.
+    Log {
+        /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
+        /// the last while (30m, 2h, 3d)
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -673,6 +686,7 @@ fn main() -> anyhow::Result<()> {
                     re,
                 },
             ),
+            MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
         },
         Some(Commands::SwarmInit {
             index,
@@ -7551,6 +7565,27 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
+    }
+
+    /// `cordelia msg log --help` gives the command's line of the record,
+    /// and its `--since` (decision 2026-10-09 §4.1).
+    #[test]
+    fn the_logs_help_says_it_is_for_a_person_at_a_terminal() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let msg = cli.find_subcommand_mut("msg").expect("msg is a command");
+        let short = msg.render_help().to_string();
+        assert!(
+            short.contains("log      For a person at a terminal\n"),
+            "{short}"
+        );
+        let help = msg
+            .find_subcommand_mut("log")
+            .expect("msg log is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.starts_with("For a person at a terminal\n"), "{help}");
+        assert!(help.contains("--since <SINCE>"), "{help}");
     }
 
     /// Run by a person, `cordelia init` ends by saying how the node is
