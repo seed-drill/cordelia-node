@@ -810,18 +810,18 @@ pub fn not_every_relay(conn: &Connection, own: &[u8; 32]) -> Result<Vec<Id>, Sto
     Ok(ids.iter().map(|id| id_of(id)).collect())
 }
 
-/// The device's own messages, signed by `own`, of the messages channel
-/// `channel`, whose entry a relay had no room for and that wait to be sent
-/// there again (decision 2026-10-09 §8, §10, C15): an entry of the
-/// device's own at a message's number that a relay refused for room,
-/// while the store holds it (`at_relays_refused`), outside `list_slot`,
-/// the slot of its list, whose revision says nothing of a number. Of
-/// those that wait ([`kept_count`]): kept in the generation of `channel`
-/// and not expired at `now`. In order of ID.
+/// The device's own messages of the messages channel `channel`, whose
+/// entry a relay had no room for and that wait to be sent there again
+/// (decision 2026-10-09 §8, §10, C15): an entry at a message's number
+/// that a relay refused for room, while the store holds it
+/// (`at_relays_refused`), outside `list_slot`, the slot of the device's
+/// list, whose revision says nothing of a number. Of those that wait
+/// ([`kept_count`]): kept in the generation of `channel` and not expired
+/// at `now`. Only the device's own are kept, and a message's ID is of its
+/// signer, so another's entry is never among them. In order of ID.
 pub fn refused_for_room(
     conn: &Connection,
     channel: &[u8; 32],
-    own: &[u8; 32],
     list_slot: &[u8; 32],
     now: i64,
 ) -> Result<Vec<Id>, StorageError> {
@@ -832,14 +832,13 @@ pub fn refused_for_room(
              JOIN message_generations g ON g.channel = r.channel
              JOIN message_numbers n
                  ON n.signer = e.author AND n.generation = g.id AND n.number = e.rev / 2
-             JOIN message_kept k ON k.id = n.id AND k.generation = g.id AND ?4 - k.sent < ?5
-             WHERE r.channel = ?1 AND e.author = ?2 AND e.rev % 2 = 0 AND e.slot <> ?3
+             JOIN message_kept k ON k.id = n.id AND k.generation = g.id AND ?3 - k.sent < ?4
+             WHERE r.channel = ?1 AND e.rev % 2 = 0 AND e.slot <> ?2
              ORDER BY n.id",
         )?
         .query_map(
             params![
                 &channel[..],
-                &own[..],
                 &list_slot[..],
                 now,
                 i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS

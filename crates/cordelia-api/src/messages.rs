@@ -872,7 +872,7 @@ pub fn room_of(
         &derive::slot_key(&secret)?,
         &cordelia_crypto::message::read_name(own)?,
     );
-    let refused = kept(held::refused_for_room(conn, &channel, own, &list_slot, now))?;
+    let refused = kept(held::refused_for_room(conn, &channel, &list_slot, now))?;
     if !no_room(&channel) && refused.is_empty() {
         return Ok(Room::default());
     }
