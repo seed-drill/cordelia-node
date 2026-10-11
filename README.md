@@ -480,11 +480,13 @@ that only it maps waits at the relays, and it shows that message once it
 upgrades, if the message is not yet 30 days old.
 
 - **Going back from this version is only by a copy.** This version adds
-  tables to the database, and `v0.2.0-alpha.10` refuses to run on it. A
-  machine made its copy (below) once, the first time it started on
-  `v0.2.0-alpha.9` or a later version, and makes none now. So going back
-  is by that copy, which holds nothing since it was made, or by a copy
-  that you made yourself before this version first started.
+  tables to the database. `v0.2.0-alpha.10` started on it is held up, and
+  says why: "the database is from a later version". It reads and writes
+  nothing there. A machine made its copy (below) once, at its first start
+  on `v0.2.0-alpha.9`, or on the first later version it ran if it skipped
+  that one, and no version makes another. So going back is by that copy,
+  which holds nothing since it was made, or by a copy that you made
+  yourself before this version first started.
 
 **From `v0.2.0-alpha.9`:** run the install command again with the new
 version, on each machine. Nothing else is needed.
@@ -512,8 +514,10 @@ folders stopped.** `cordelia sync status` lists them, each with the command
 that maps it. Run `cordelia sync map` for each one that you want to go on
 syncing. Then `cordelia sync status --seen` puts the notice away.
 
-**The first time a machine starts on this version, it copies its
-database** into a folder named `before-<version>` beside it. It does that
+**The first time a machine starts on `v0.2.0-alpha.9` or a later version,
+coming from `v0.2.0-alpha.8` or earlier, it copies its database** into a
+folder named `before-<version>` beside it, once: no later start makes
+another. It does that
 before it empties anything from the earlier version. The copy has what the
 machine had, and some of it is not encrypted. You can delete it once you
 are happy with the upgrade.

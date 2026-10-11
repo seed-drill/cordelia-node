@@ -693,11 +693,22 @@ pub fn overwritten_in_all(conn: &Connection) -> Result<u64, StorageError> {
     Ok(from_sql(overwritten))
 }
 
-/// How many messages of the device's own it keeps, until every relay it
-/// is set up with has taken each (decision 2026-10-09 §2.3, §8): what
-/// waits to be sent.
-pub fn kept_count(conn: &Connection) -> Result<u64, StorageError> {
-    let kept: i64 = conn.query_row("SELECT COUNT(*) FROM message_kept", [], |row| row.get(0))?;
+/// How many messages of the device's own it keeps in `generation`, the
+/// one it stands applied under, that have not expired at `now`, until
+/// every relay it is set up with has taken each (decision 2026-10-09
+/// §2.3, §8): what waits to be sent. A kept value of a generation it has
+/// left, or past its 30 days, is sent nowhere again, and goes when the
+/// device next sends or runs its hourly task.
+pub fn kept_count(conn: &Connection, generation: i64, now: i64) -> Result<u64, StorageError> {
+    let kept: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_kept WHERE generation = ?1 AND ?2 - sent < ?3",
+        params![
+            generation,
+            now,
+            i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS
+        ],
+        |row| row.get(0),
+    )?;
     Ok(from_sql(kept))
 }
 

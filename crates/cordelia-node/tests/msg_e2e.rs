@@ -2027,6 +2027,28 @@ fn held_in(n: &Node, secret: &[u8; 32]) -> Vec<([u8; 32], u64, String, Option<St
         .collect()
 }
 
+/// The marks of the list of `author` that the store of `n` holds in the
+/// channel whose secret is `secret`.
+fn list_in(n: &Node, secret: &[u8; 32], author: &[u8; 32]) -> Vec<[u8; 16]> {
+    let channel = cordelia_crypto::derive::channel_id(secret).unwrap();
+    let name = cordelia_crypto::message::read_name(author).unwrap();
+    cordelia_storage::entries::channel_entries_after(&store_of(n), &channel, 0, 10_000)
+        .unwrap()
+        .into_iter()
+        .map(|held| held.entry.check().unwrap())
+        .filter(|entry| entry.author == *author)
+        .filter_map(|entry| {
+            let inside = entry.open(secret).unwrap();
+            (inside.name == name).then_some(inside.value)
+        })
+        .flat_map(|value| {
+            cordelia_crypto::message::ReadMarks::from_value(&value)
+                .unwrap()
+                .marks
+        })
+        .collect()
+}
+
 /// Laptop, desktop and tablet each send; desktop's agent reads laptop's;
 /// tablet is removed. Once laptop and desktop have applied the removal,
 /// the new generation's messages channel at the relay holds nothing but
@@ -2061,6 +2083,11 @@ fn a_statement_starts_an_empty_messages_channel_and_what_was_held_is_shown_until
     summary_with(&all, &two.laptop, "notes", &from_desktop);
     let said = read(&two.desktop, "work", &from_laptop);
     assert!(said.status.success(), "{}", err(&said));
+    // Its whole ID, from the first line `read` printed.
+    let whole: [u8; 16] = hex::decode(out(&said).split_whitespace().nth(1).unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
     assert!(
         !out(&said).contains("From before the last change"),
         "{}",
@@ -2098,6 +2125,9 @@ fn a_statement_starts_an_empty_messages_channel_and_what_was_held_is_shown_until
         );
         assert_eq!(*body, None);
     }
+    let marks = list_in(&two.relay, &new_secret, &desktop.public_key());
+    let mark = cordelia_crypto::message::read_mark(&whole, "work");
+    assert!(marks.contains(&mark), "{marks:?}");
 
     // Each device's next message is the first of its ring.
     let after = sent(&all, &two.laptop, "notes", &["--to", "work"], "after\n");

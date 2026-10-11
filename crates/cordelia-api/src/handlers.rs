@@ -1556,8 +1556,11 @@ pub(crate) async fn status_with(
             &state.own_channels,
             state.sync_control.now(),
         )
-        .ok()
-        .flatten(),
+        .unwrap_or_else(|e| {
+            // So that a field which comes and goes can be explained.
+            tracing::debug!(error = %e, "the status says nothing of messages");
+            None
+        }),
     };
     drop(db);
 

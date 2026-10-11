@@ -520,7 +520,8 @@ impl Device {
         let db = self.db();
         let now = self.engine.unix();
         held_messages::give_places(&db, &self.key(), now).unwrap();
-        marks::unread(&db, &self.state.identity, name, now)
+        let counting = cordelia_api::person::who_counts(&db).unwrap();
+        marks::unread(&db, &self.state.identity, name, now, &counting)
             .unwrap()
             .into_iter()
             .map(|shown| shown.body)
@@ -6382,7 +6383,8 @@ async fn a_message_read_on_one_device_is_not_counted_unread_on_the_other() {
     assert_eq!(laptop.unread_by("work"), Vec::<String>::new());
     assert_eq!(desktop.unread_by("work"), Vec::<String>::new());
     assert_eq!(desktop.unread_by("notes"), ["for every agent"]);
-    let read_on = marks::read_on(&laptop.db(), &sent.id, "work").unwrap();
+    let counting = cordelia_api::person::who_counts(&laptop.db()).unwrap();
+    let read_on = marks::read_on(&laptop.db(), &sent.id, "work", &counting).unwrap();
     assert_eq!(read_on.devices, [desktop.key()]);
 }
 

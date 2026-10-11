@@ -52,7 +52,7 @@ use cordelia_storage::messages::{self as held, Id, Mark, Shown};
 use cordelia_storage::meta;
 
 use crate::at_relays::{Kind, Own, Pushed, Stands, stands};
-use crate::person::{PersonError, in_one, who_counts};
+use crate::person::{Counting, PersonError, in_one, who_counts};
 use crate::publish::Standing;
 
 /// What [`read_here`] did.
@@ -101,7 +101,7 @@ pub fn read_here(
 /// Whether `message` is one that the agent of `name` on the device whose
 /// key is `own` is shown (decision 2026-10-09 §3, §7.2): to its name or to
 /// every name, and not sent by it from this device.
-fn is_for(message: &Shown, own: &[u8; 32], name: &str) -> bool {
+pub(crate) fn is_for(message: &Shown, own: &[u8; 32], name: &str) -> bool {
     let to_it = message.to.as_deref().is_none_or(|to| to == name);
     let its_own = message.signer[..] == own[..] && message.from == name;
     to_it && !its_own
@@ -308,18 +308,23 @@ impl ReadOn {
 
 /// Where it is said that an agent of `name` read message `id`, worked out
 /// now (decision 2026-10-09 §7.2): from the device's own table, a bare
-/// hash among it, and the latest list of each device that counts. What
+/// hash among it, and the latest list of each device that counts, by
+/// `counting`, which the caller works out once for its request. What
 /// `read` and `log` say of a message, and what decides whether it is
 /// unread.
-pub fn read_on(conn: &Connection, id: &Id, name: &str) -> Result<ReadOn, PersonError> {
+pub fn read_on(
+    conn: &Connection,
+    id: &Id,
+    name: &str,
+    counting: &Counting,
+) -> Result<ReadOn, PersonError> {
     let said = kept(held::read_by(conn, id, name))?;
-    let counting = who_counts(conn).ok();
     Ok(ReadOn {
         here: said.here,
         devices: said
             .lists
             .into_iter()
-            .filter(|key| counting.as_ref().is_some_and(|c| c.counts(key)))
+            .filter(|key| counting.counts(key))
             .collect(),
     })
 }
@@ -327,13 +332,14 @@ pub fn read_on(conn: &Connection, id: &Id, name: &str) -> Result<ReadOn, PersonE
 /// The messages shown at `now` that are unread by the agent of `name` on
 /// this device (decision 2026-10-09 §7.2): addressed to its name or to
 /// every name, not sent by it from this device, and read by no agent of
-/// that name, here or by the list of a device that counts. Oldest first.
-/// It gives no place: a show gives places first.
+/// that name, here or by the list of a device that counts by `counting`.
+/// Oldest first. It gives no place: a show gives places first.
 pub fn unread(
     conn: &Connection,
     identity: &NodeIdentity,
     name: &str,
     now: i64,
+    counting: &Counting,
 ) -> Result<Vec<Shown>, PersonError> {
     let own = identity.public_key();
     let mut unread = Vec::new();
@@ -344,7 +350,7 @@ pub fn unread(
         let id: Id = message.id[..]
             .try_into()
             .map_err(|_| PersonError::Held("a message's ID is not of its length".into()))?;
-        if !read_on(conn, &id, name)?.is_read() {
+        if !read_on(conn, &id, name, counting)?.is_read() {
             unread.push(message);
         }
     }
@@ -435,7 +441,8 @@ mod tests {
     /// at `now`, once places are given.
     fn unread_on(s: &Several, n: usize, name: &str, now: i64) -> Vec<String> {
         shows(s, n, now);
-        unread(&s[n].conn, &s[n].identity, name, now)
+        let counting = who_counts(&s[n].conn).unwrap();
+        unread(&s[n].conn, &s[n].identity, name, now, &counting)
             .unwrap()
             .into_iter()
             .map(|shown| shown.body)
@@ -513,7 +520,12 @@ mod tests {
             (others, true),
         ] {
             assert_eq!(reads(&s, 1, "notes", &id, t, true).marked, marked);
-            assert_eq!(read_on(&s[1].conn, &id, "notes").unwrap().here, marked);
+            assert_eq!(
+                read_on(&s[1].conn, &id, "notes", &who_counts(&s[1].conn).unwrap())
+                    .unwrap()
+                    .here,
+                marked
+            );
         }
         // A message that is not shown yet is not marked.
         let later = sends(&s, 0, "~", "notes", "later", t + 1);
@@ -548,7 +560,7 @@ mod tests {
         assert_eq!(unread_on(&s, 2, "notes", t), Vec::<String>::new());
         assert_eq!(unread_on(&s, 2, "work", t), ["for every agent"]);
         assert_eq!(
-            read_on(&s[2].conn, &id, "notes").unwrap(),
+            read_on(&s[2].conn, &id, "notes", &who_counts(&s[2].conn).unwrap()).unwrap(),
             ReadOn {
                 here: false,
                 devices: vec![s.key(1)]
@@ -999,7 +1011,11 @@ mod tests {
         assert_eq!(table(&s, 1), [([0xb1; 16], false), (mark, true)]);
         hourly(t + month);
         assert_eq!(table(&s, 1), [([0xb1; 16], false), (mark, false)]);
-        assert!(read_on(&s[1].conn, &id, "notes").unwrap().here);
+        assert!(
+            read_on(&s[1].conn, &id, "notes", &who_counts(&s[1].conn).unwrap())
+                .unwrap()
+                .here
+        );
         assert_eq!(
             write_list(&s[1].conn, &s[1].identity, t + month, true).unwrap(),
             Some(2)
@@ -1060,7 +1076,9 @@ mod tests {
         assert_eq!(shown, ["m1"], "the desktop still shows m1");
         assert_eq!(unread_on(&s, 2, "notes", later), Vec::<String>::new());
         assert_eq!(
-            read_on(&s[2].conn, &m1, "notes").unwrap().devices,
+            read_on(&s[2].conn, &m1, "notes", &who_counts(&s[2].conn).unwrap())
+                .unwrap()
+                .devices,
             [s.key(1)]
         );
     }
@@ -1288,7 +1306,7 @@ mod tests {
         assert_eq!(said.read_on, ["device 1"]);
         assert!(!said.read_here);
         assert_eq!(
-            read_on(&s[2].conn, &id, "notes").unwrap(),
+            read_on(&s[2].conn, &id, "notes", &who_counts(&s[2].conn).unwrap()).unwrap(),
             ReadOn {
                 here: false,
                 devices: vec![s.key(1)]
@@ -1310,7 +1328,7 @@ mod tests {
         s.change(0, &[0, 2], &[1]);
         s.meet(&[0, 2]);
         assert_eq!(
-            read_on(&s[2].conn, &id, "notes").unwrap(),
+            read_on(&s[2].conn, &id, "notes", &who_counts(&s[2].conn).unwrap()).unwrap(),
             ReadOn::default()
         );
         assert_eq!(unread_on(&s, 2, "notes", t), ["never read"]);

@@ -28,3 +28,5 @@ unicode-general-category = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The statements a test counts, to bound the work of a request.
+rusqlite = { workspace = true, features = ["trace"] }

@@ -54,19 +54,29 @@ and log), and prints where.
 messages between a person's agents, which
 `a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
 runs beside this build. CI downloads it from the release that `ci.yml`
-names, and checks it against that release's checksum. Where it is not set,
-the test says so and passes without running, but where `CI` is set it
-fails. To run it here:
+names in `VERSION_BEFORE`, and checks it against the SHA-256 that
+`ci.yml` names beside it in `VERSION_BEFORE_SHA256`, and not against a
+checksum taken from the same release, which would not catch an asset
+replaced there. The job's checkout keeps no token on disk while it runs.
+Where the variable is not set, the test says so and passes without
+running, but where `CI` is set it fails. To run it here:
 
 ```bash
-v=v0.2.0-alpha.10; d=$(mktemp -d)
+v=v0.2.0-alpha.10
+sha=cf53f451bf939bb218f3ee10cf9ac25c27e71536fa56d44a6d1feaf2d88ee5a8
+d=$(mktemp -d)
 base=https://github.com/seed-drill/cordelia-node/releases/download/$v
 curl -fsSL -o $d/cordelia-linux-amd64 $base/cordelia-linux-amd64
-curl -fsSL -o $d/cordelia-linux-amd64.sha256 $base/cordelia-linux-amd64.sha256
-(cd $d && sha256sum -c cordelia-linux-amd64.sha256) && chmod +x $d/cordelia-linux-amd64
+echo "$sha  $d/cordelia-linux-amd64" | sha256sum -c - && chmod +x $d/cordelia-linux-amd64
 CORDELIA_TEST_BINARY_BEFORE=$d/cordelia-linux-amd64 \
   cargo test -p cordelia-node --test msg_e2e a_device_of_the_version_before
 ```
+
+The two values change together, at a release: when the release before
+messages is to be another, set `VERSION_BEFORE` to its tag and
+`VERSION_BEFORE_SHA256` to the SHA-256 of its `cordelia-linux-amd64`,
+worked out from the binary downloaded and checked against the release's
+published `.sha256`, in one commit.
 
 ```bash
 cargo test -p cordelia-node --test person_e2e

@@ -311,7 +311,7 @@ pub fn summary_of(
         let counting = who_counts(conn)?;
         let mut lines = Vec::new();
         let mut waiting = Vec::new();
-        for message in marks::unread(conn, identity, &name, now)? {
+        for message in marks::unread(conn, identity, &name, now, &counting)? {
             let id = id_of(&message.id)?;
             if !counting.counts(&key_of(&message.signer)?) {
                 continue;
@@ -563,7 +563,7 @@ fn read_in(
     let mut read_on = Vec::new();
     // A device keeps no list of its own beside its table: every key here
     // is another device's.
-    for key in marks::read_on(conn, &id, &name)?.devices {
+    for key in marks::read_on(conn, &id, &name, &standing.counting)?.devices {
         read_on.push(crate::reader::label_of(conn, statement, &key)?);
     }
     let current = match messages_channel(conn)? {
@@ -981,9 +981,9 @@ pub fn status_of(
     now: i64,
 ) -> Result<Option<Counts>, PersonError> {
     in_one(conn, || {
-        if messages_channel(conn)?.is_none() {
+        let Some(channel) = messages_channel(conn)? else {
             return Ok(None);
-        }
+        };
         let own = identity.public_key();
         kept(held::give_places(conn, &own, now))?;
         let counting = who_counts(conn)?;
@@ -992,23 +992,29 @@ pub fn status_of(
             .into_iter()
             .map(|mapping| mapping.name)
             .collect();
+        // What is shown is read once, and who counts worked out once, for
+        // the whole object: its cost grows with the messages and with the
+        // names, and not with the two multiplied by a read of the index.
         let mut unread_by_an_agent = 0;
-        for name in &names {
-            for message in marks::unread(conn, identity, name, now)? {
-                if counting.counts(&key_of(&message.signer)?) {
-                    unread_by_an_agent += 1;
-                }
-            }
-        }
         let mut unread_by_a_person = 0;
         for message in kept(held::shown(conn, now))? {
+            let id = id_of(&message.id)?;
+            if counting.counts(&key_of(&message.signer)?) {
+                for name in &names {
+                    if marks::is_for(&message, &own, name)
+                        && !marks::read_on(conn, &id, name, &counting)?.is_read()
+                    {
+                        unread_by_an_agent += 1;
+                    }
+                }
+            }
             let to_here = message
                 .to
                 .as_ref()
                 .is_none_or(|to| names.iter().any(|name| name == to));
             if to_here
                 && message.signer[..] != own[..]
-                && !kept(held::is_read_by_a_person(conn, &id_of(&message.id)?))?
+                && !kept(held::is_read_by_a_person(conn, &id))?
             {
                 unread_by_a_person += 1;
             }
@@ -1019,7 +1025,10 @@ pub fn status_of(
         Ok(Some(Counts {
             unread_by_an_agent,
             unread_by_a_person,
-            waiting: kept(held::kept_count(conn))?,
+            waiting: match kept(held::generation_of(conn, &channel))? {
+                Some(generation) => kept(held::kept_count(conn, generation, now))?,
+                None => 0,
+            },
             refused_for_room: room.refused.len() as u64,
             filled_by: room.filled_by,
             held_back: kept(held::held_back_in_all(conn, now))?,
@@ -1274,7 +1283,7 @@ fn log_in(
             None => names.iter().map(String::as_str).collect(),
         };
         for name in read_by {
-            let on = marks::read_on(conn, &id, name)?;
+            let on = marks::read_on(conn, &id, name, &counting)?;
             read_here |= on.here;
             for key in on.devices {
                 if !read_on.contains(&key) {
@@ -3223,6 +3232,33 @@ mod tests {
         assert!(waited_until.duration_since(began) >= Duration::from_millis(100));
     }
 
+    /// The node's status answers the `messages` object on a personal node
+    /// that stands applied, and none on a relay's, and none while the node
+    /// is held up, which reads nothing of its database (decision 2026-10-09
+    /// §8; decision 2026-10-04 §10.1).
+    #[actix_web::test]
+    async fn the_status_of_a_relay_or_of_a_node_held_up_says_nothing_of_messages() {
+        let (state, _) = a_node_with_a_message();
+        let status_of = |older_kind: bool| {
+            let state = state.clone();
+            async move {
+                let get = TestRequest::get()
+                    .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+                    .to_http_request();
+                answer(crate::handlers::status_with(state, get, older_kind).await).await
+            }
+        };
+        let (code, said) = status_of(false).await;
+        assert_eq!(code, 200);
+        assert_eq!(said["messages"]["unread_by_an_agent"], 1, "{said}");
+        let (_, said) = status_of(true).await;
+        assert_eq!(said.get("messages"), None, "{said}");
+        state.held.hold(Held::FirstStart("a copy failed".into()));
+        let (code, said) = status_of(false).await;
+        assert_eq!(code, 200);
+        assert_eq!(said.get("messages"), None, "{said}");
+    }
+
     /// `summary` answers nothing to a request of another version, and
     /// nothing while the node is held up; `read` and `send` are refused
     /// then with `held_up` (decision 2026-10-09 §4.2, §4.3).
@@ -3672,6 +3708,42 @@ mod tests {
         // A signer of which a lap and more was never held: overwritten.
         held::hold_number(conn, &[7; 32], generation, 1, false, now).unwrap();
         held::hold_number(conn, &[7; 32], generation, 200, false, now).unwrap();
+        // Rows that wait for a place too, and are counted nowhere: one past
+        // its 30 days, and one at a number that is not live.
+        for (signer, sent) in [([5u8; 32], now - 31 * 24 * 60 * MINUTE), ([4u8; 32], now)] {
+            for _ in 0..64 {
+                conn.execute(
+                    "INSERT INTO message_places (signer, generation, placed_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![&signer[..], generation, now - 1],
+                )
+                .unwrap();
+            }
+            held::hold_number(conn, &signer, generation, 1, false, sent).unwrap();
+            let message = Message {
+                sent: sent as u64,
+                ..message.clone()
+            };
+            held::index(
+                conn,
+                &Opened {
+                    id: &[signer[0]; 16],
+                    signer: &signer,
+                    label: "elsewhere",
+                    generation,
+                    number: 1,
+                    message: &message,
+                    first_held: sent,
+                    placed_at: None,
+                },
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE message_signers SET highest = 200 WHERE signer = ?1",
+            [&[4u8; 32][..]],
+        )
+        .unwrap();
         let on_1 = counts(1, &channels);
         assert_eq!((on_1.held_back, on_1.overwritten), (1, 136));
         assert_eq!(on_1.unread_by_a_person, 3);
@@ -3739,6 +3811,38 @@ mod tests {
             cordelia_storage::at_relays::refused(conn, &[0x71; 32], &channel, seq).unwrap();
         }
         assert_eq!(counts(0, &channels).refused_for_room, 3);
+        // The second, sent again under number 4 and refused there too, is
+        // one message refused.
+        let second = held::kept(conn).unwrap().remove(1);
+        let generation = held::generation_of(conn, &channel).unwrap().unwrap();
+        let again = cordelia_crypto::message::inside(
+            cordelia_crypto::message::message_name(&s.key(0), 4).unwrap(),
+            second.value.clone(),
+        );
+        let rev_4 = cordelia_crypto::message::message_rev(4).unwrap();
+        let again = cordelia_crypto::entry::Entry::seal(&secret, &s[0].identity, rev_4, &again);
+        cordelia_storage::entries::store(conn, &again.unwrap().check().unwrap(), now).unwrap();
+        held::hold_number(conn, &s.key(0), generation, 4, false, now).unwrap();
+        let value = cordelia_crypto::entry::Value::Other(second.value.clone());
+        let message = Message::from_value(&value, |_| true).unwrap();
+        let opened = Opened {
+            id: &second.id,
+            signer: &s.key(0),
+            label: "",
+            generation,
+            number: 4,
+            message: &message,
+            first_held: now,
+            placed_at: Some(now),
+        };
+        assert_eq!(
+            held::index(conn, &opened).unwrap(),
+            held::Indexed::AnotherNumber
+        );
+        for seq in seqs(conn) {
+            cordelia_storage::at_relays::refused(conn, &[0x71; 32], &channel, seq).unwrap();
+        }
+        assert_eq!(counts(0, &channels).refused_for_room, 3);
         let clearing = cordelia_crypto::entry::Entry::seal(&secret, &s[0].identity, rev, &inside);
         let clearing = clearing.unwrap().check().unwrap();
         cordelia_storage::entries::store(conn, &clearing, now).unwrap();
@@ -3746,16 +3850,36 @@ mod tests {
             cordelia_storage::at_relays::refused(conn, &[0x71; 32], &channel, seq).unwrap();
         }
         assert_eq!(counts(0, &channels).refused_for_room, 2);
+        // A kept value of a generation the device has left, and one past
+        // its 30 days, wait for nothing: they go at the next send or the
+        // hourly task.
+        let left = held::generation(conn, &[0xee; 32], 1, now).unwrap();
+        for (id, generation, sent) in [
+            ([0xe1; 16], left, now),
+            ([0xe2; 16], generation, now - 30 * 24 * 60 * MINUTE),
+        ] {
+            let kept = held::Kept {
+                id,
+                generation,
+                value: vec![0; cordelia_core::protocol::AGENT_MESSAGE_VALUE_BYTES],
+                sent,
+                numbers: Vec::new(),
+                again: false,
+            };
+            held::keep(conn, &kept, now).unwrap();
+        }
+        assert_eq!(held::kept(conn).unwrap().len(), 5);
+        assert_eq!(counts(0, &channels).waiting, 3);
         let full = OwnChannels::default();
         full.say_no_room_for_messages(&messages_channel(&s[0].conn).unwrap().unwrap());
         full.say_no_place(true);
         let on_0 = counts(0, &full);
-        assert_eq!(on_0.filled_by, Some(("device 0".into(), 3)));
+        assert_eq!(on_0.filled_by, Some(("device 0".into(), 4)));
         assert!(on_0.no_place);
         let answered = on_0.answered();
         assert_eq!(
             answered["filled_by"],
-            json!({ "label": "device 0", "entries": 3 })
+            json!({ "label": "device 0", "entries": 4 })
         );
         assert_eq!(answered["no_place"], true);
         assert_eq!(answered["waiting"], 3);
@@ -3777,5 +3901,80 @@ mod tests {
         held_rows::set_state(&s[1].conn, State::Removed).unwrap();
         let removed = status_of(&s[1].conn, &s[1].identity, &channels, now).unwrap();
         assert_eq!(removed, None);
+    }
+
+    thread_local! {
+        /// The statements a connection ran, as its trace gave them.
+        static RAN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn traced(sql: &str) {
+        RAN.with(|ran| ran.borrow_mut().push(sql.to_string()));
+    }
+
+    /// The status of device 0, with `names` folders mapped and `messages`
+    /// messages to every name from each of three other devices, all shown:
+    /// how many times it read who counts (the statement of the additions
+    /// that `who_counts` and every `Standing` read) and what is shown (the
+    /// statement of `held::shown`), and its count of what is unread by an
+    /// agent.
+    fn work_of_a_status(names: usize, messages: u64) -> (usize, usize, u64) {
+        let mut s = devices(4);
+        let now = s.now + MINUTE;
+        let mapped: Vec<Value> = (0..names)
+            .map(|k| json!({ "folder": folder(&format!("name{k}")), "name": format!("name{k}") }))
+            .collect();
+        meta::set(
+            &s[0].conn,
+            meta::SYNC_CLAUDE_MAPPINGS,
+            &Value::from(mapped).to_string(),
+        )
+        .unwrap();
+        for signer in 1..4usize {
+            for number in 1..=messages {
+                let mut id = [0u8; 16];
+                id[0] = signer as u8;
+                id[1] = number as u8;
+                let key = s.key(signer);
+                held_as(&s, 0, id, key, "notes", None, false, (now, now), number);
+            }
+        }
+        RAN.with(|ran| ran.borrow_mut().clear());
+        s.machines[0].conn.trace(Some(traced));
+        let counts = status_of(&s[0].conn, &s[0].identity, &OwnChannels::default(), now)
+            .unwrap()
+            .unwrap();
+        s.machines[0].conn.trace(None);
+        let ran = RAN.with(|ran| ran.borrow().clone());
+        let of = |what: &str| ran.iter().filter(|sql| sql.contains(what)).count();
+        (
+            of("FROM person_additions"),
+            of("MIN(i.sent, i.first_held) AS shown_at, i.subject"),
+            counts.unread_by_an_agent,
+        )
+    }
+
+    /// The work of a status does not grow with the names mapped times the
+    /// messages shown (decision 2026-10-09 §8, property 15): who counts is
+    /// read as often, and what is shown read once, whether 3 or 30 names
+    /// are mapped and whether 2 or 20 messages of each signer are shown. A
+    /// status is asked for every few seconds, inside the store's write, and
+    /// one that took longer than a command waits would say that the node
+    /// had stopped.
+    #[test]
+    fn a_status_reads_who_counts_and_what_is_shown_as_often_whatever_is_mapped() {
+        let (counted, shown, unread) = work_of_a_status(3, 2);
+        assert_eq!(unread, 3 * 3 * 2);
+        assert_eq!(shown, 1);
+        assert!(counted >= 1, "{counted}");
+        for (names, messages) in [(30, 2), (3, 20), (30, 20)] {
+            let (more_counted, more_shown, unread) = work_of_a_status(names, messages);
+            assert_eq!(unread, names as u64 * 3 * messages, "{names} {messages}");
+            assert_eq!(
+                (more_counted, more_shown),
+                (counted, shown),
+                "{names} names, {messages} messages"
+            );
+        }
     }
 }
