@@ -431,6 +431,18 @@ mod tests {
         shown
     }
 
+    /// What `log` on device `n` counts of each signer at `now`.
+    fn logged_counts(s: &Several, n: usize, now: i64) -> Vec<crate::messages::Counted> {
+        let asked = crate::messages::LogAsked {
+            folder: None,
+            since: None,
+            mark: &[],
+        };
+        crate::messages::log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+            .signers
+    }
+
     /// The bodies of the index of device `n`, by body.
     fn indexed(s: &Several, n: usize) -> Vec<String> {
         s[n].conn
@@ -686,6 +698,11 @@ mod tests {
             }
         );
         assert_eq!(signer_on(&s, 2, 1), held::Signer::default());
+        // `log` counts them, for the key that signed.
+        let counted = logged_counts(&s, 2, s.now);
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].label.as_deref(), Some("device 0"));
+        assert_eq!((counted[0].not_messages, counted[0].overwritten), (2, 0));
 
         // The control: in the slot named for the key that signed.
         let own_name = message_name(&s.key(0), 64).unwrap();
@@ -895,6 +912,11 @@ mod tests {
             assert_eq!(numbers(&s, reader, 0, "message_numbers"), [100]);
             assert_eq!(numbers(&s, reader, 0, "message_first_held"), [100]);
             assert_eq!(indexed(&s, reader), ["100"]);
+            // `log` says it, of the signer.
+            let said = logged_counts(&s, reader, s.now);
+            assert_eq!(said.len(), 1, "{reader}");
+            assert_eq!(said[0].overwritten, counted, "{reader}");
+            assert_eq!(said[0].label.as_deref(), Some("device 0"));
         }
     }
 
@@ -1602,84 +1624,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(places, 0);
-    }
-
-    /// At a channel's cap a relay takes a ring slot written again, since it
-    /// is never larger (decision 2026-10-09 §2.2, §10, C15, T3): a 65th
-    /// message over the first in its slot, the entry that clears it, and a
-    /// list written again. A first message of another device, which needs a
-    /// new slot, is refused, and so is a new slot of the device that filled
-    /// it. The device that sent that first message names the signer whose
-    /// entries fill the channel, by the count of each author's entries it
-    /// holds there, in the status's `messages` object, as `send` does.
-    #[test]
-    fn a_ring_slot_written_again_is_taken_by_a_full_relay() {
-        use cordelia_core::protocol::AGENT_MESSAGE_VALUE_BYTES;
-        use cordelia_storage::relay::{self, Asker, Refused, Room};
-
-        let s = Several::of_one_person(2);
-        let conn = cordelia_storage::db::open_in_memory().unwrap();
-        let mut room = Room::new(u64::MAX);
-        let cost = cordelia_core::protocol::entry_cost(2048);
-        room.max_channel_bytes = 4 * cost;
-        let asker = Asker::Address(std::net::IpAddr::from([192, 0, 2, 1]));
-        let mut at_relay =
-            |entry: &CheckedEntry| relay::take(&conn, &mut room, entry, &asker, s.now).unwrap();
-
-        // Device 0 fills the channel: a message, its list, and two entries
-        // of its own in slots that are no message's.
-        let junk = |name: &str| {
-            let value = vec![0; AGENT_MESSAGE_VALUE_BYTES];
-            written(&s, 0, &s[0].identity, name, 1, value)
-        };
-        let filling = [
-            sent(&s, 0, 1, &says("first", s.now)),
-            list(&s, 0, 1),
-            junk("fill/0"),
-            junk("fill/1"),
-        ];
-        for entry in &filling {
-            assert_eq!(entry.content.len(), 2048);
-            assert_eq!(at_relay(entry), relay::Taken::Stored);
-        }
-
-        // Written again in its slots: taken.
-        for entry in [
-            sent(&s, 0, 65, &says("the sixty-fifth", s.now)),
-            clearing(&s, 0, 65),
-            list(&s, 0, 2),
-        ] {
-            assert_eq!(at_relay(&entry), relay::Taken::Stored, "{}", entry.rev);
-        }
-        // A new slot: refused for room, of the other device and of this.
-        let first_of_1 = sent(&s, 1, 1, &says("from device 1", s.now));
-        for entry in [&first_of_1, &sent(&s, 0, 2, &says("second", s.now))] {
-            assert_eq!(
-                at_relay(entry),
-                relay::Taken::Refused(Refused::ChannelFull),
-                "{}",
-                entry.rev
-            );
-        }
-
-        // Device 1 holds what the relay holds of device 0, and its own.
-        let held: Vec<CheckedEntry> =
-            entries::channel_entries_after(&conn, &first_of_1.channel, 0, 100)
-                .unwrap()
-                .into_iter()
-                .map(|held| held.entry.check().unwrap())
-                .collect();
-        assert_eq!(held.len(), 4);
-        for entry in held.iter().chain([&first_of_1]) {
-            given(&s, 1, entry);
-        }
-        let refused = crate::state::OwnChannels::default();
-        refused.say_no_room_for_messages(&first_of_1.channel);
-        let counts = crate::messages::status_of(&s[1].conn, &s[1].identity, &refused, s.now)
-            .unwrap()
-            .unwrap();
-        assert_eq!(counts.filled_by, Some(("device 0".into(), 4)));
-        // WAITS FOR THE LOG: `log` names the signer that fills the channel.
     }
 
     /// The messages of the generation before go on being shown after a

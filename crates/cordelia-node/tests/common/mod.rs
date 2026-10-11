@@ -206,25 +206,70 @@ impl Node {
     /// is stopped then: whether it ended by itself and succeeded, and
     /// what it wrote to its output and to its errors.
     pub fn at_terminal_into_a_pipe(&self, args: &[&str]) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(None, args, true)
+    }
+
+    /// [`Self::at_terminal_into_a_pipe`], run in the directory `dir`.
+    pub fn at_terminal_into_a_pipe_in(
+        &self,
+        dir: &std::path::Path,
+        args: &[&str],
+    ) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(Some(dir), args, true)
+    }
+
+    /// Its mirror: a CLI command against this node, run in `dir`, its
+    /// input an empty file and its output a terminal, as `cordelia msg log
+    /// < file` runs it at a terminal. Whether it ended by itself within
+    /// twenty seconds and succeeded, what its terminal showed, and what it
+    /// wrote to its errors.
+    pub fn at_terminal_with_input_from_a_file_in(
+        &self,
+        dir: &std::path::Path,
+        args: &[&str],
+    ) -> (Option<bool>, String, String) {
+        self.one_end_at_a_terminal(Some(dir), args, false)
+    }
+
+    /// A command with one end at a terminal of its own and the other not:
+    /// its input, where `input_at_it`, and its output a pipe; or its input
+    /// an empty file and its output the terminal. Its errors go down a
+    /// pipe. What it wrote to its output, and to its errors.
+    fn one_end_at_a_terminal(
+        &self,
+        dir: Option<&std::path::Path>,
+        args: &[&str],
+        input_at_it: bool,
+    ) -> (Option<bool>, String, String) {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         use std::io::Read;
         let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
         grantpt(&ours).unwrap();
         unlockpt(&ours).unwrap();
         let theirs = ptsname(&ours, Vec::new()).unwrap();
-        let input = std::fs::OpenOptions::new()
+        let end = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(theirs.to_str().unwrap())
             .unwrap();
-        let mut child = self
-            .binary()
-            .args(args)
-            .stdin(input)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut command = self.binary();
+        command.args(args).stderr(Stdio::piped());
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        match input_at_it {
+            true => command.stdin(end).stdout(Stdio::piped()),
+            false => {
+                let file = self.dir.path().join("an-empty-input");
+                std::fs::write(&file, b"").unwrap();
+                command
+                    .stdin(std::fs::File::open(&file).unwrap())
+                    .stdout(end)
+            }
+        };
+        let mut child = command.spawn().unwrap();
+        // The command holds its end of the terminal, and the test none.
+        drop(command);
         let reads = |mut from: Box<dyn Read + Send>| {
             std::thread::spawn(move || {
                 let mut said = Vec::new();
@@ -232,7 +277,12 @@ impl Node {
                 String::from_utf8_lossy(&said).into_owned()
             })
         };
-        let out = reads(Box::new(child.stdout.take().unwrap()));
+        // What it writes to a terminal is read at the test's end of it,
+        // to the moment its own end is closed.
+        let out = match child.stdout.take() {
+            Some(pipe) => reads(Box::new(pipe)),
+            None => reads(Box::new(std::fs::File::from(ours.try_clone().unwrap()))),
+        };
         let err = reads(Box::new(child.stderr.take().unwrap()));
         let deadline = Instant::now() + Duration::from_secs(20);
         let ended = loop {

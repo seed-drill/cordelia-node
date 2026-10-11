@@ -121,7 +121,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/relay_entries_e2e.rs`: `a_relay_drops_what_nobody_has_used_for_90_days`
 - `crates/cordelia-storage/src/relay.rs`: `test_the_older_kinds_room_and_this_kinds_do_not_touch_each_other`
 - `crates/cordelia-node/src/relay_entries.rs`: `a_key_that_has_pulled_all_it_may_is_still_handed_the_answer_to_a_show`
-- `crates/cordelia-api/src/reader.rs`: `a_ring_slot_written_again_is_taken_by_a_full_relay`
+- `crates/cordelia-api/src/sender.rs`: `a_ring_slot_written_again_is_taken_by_a_full_relay`
 
 ### T10
 - `crates/cordelia-api/tests/api_integration.rs`: `test_group_lifecycle`
