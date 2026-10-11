@@ -5899,6 +5899,13 @@ async fn a_refusal_for_room_of_the_messages_channel_is_said_of_no_relay() {
         let after = device.at("relay");
         assert_eq!(after.no_room, None, "{refused:?}");
         assert_eq!(after, before);
+        // A refusal for room is kept for the status's object and `send`,
+        // and one for the allowance is not (decision 2026-10-09 §8, §10).
+        assert_eq!(
+            device.state.own_channels.no_room_for_messages(&messages),
+            refused == EntryRefused::NoRoom,
+            "{refused:?}"
+        );
         assert_eq!(waits(), 0, "{refused:?}");
         // It is sent again once the wait has gone by.
         device
