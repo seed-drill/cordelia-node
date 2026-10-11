@@ -5740,6 +5740,14 @@ async fn past_the_limit_on_proofs_a_device_has_no_messages_and_says_so() {
         device.passes().await;
         let own = &device.state.own_channels;
         assert_eq!(own.no_place(), no_place, "{most_proved}");
+        // The status's `messages` object says so (§8).
+        let status = cordelia_api::messages::status_of(
+            &device.db(),
+            &device.state.identity,
+            own,
+            device.now(),
+        );
+        assert_eq!(status.unwrap().unwrap().no_place, no_place, "{most_proved}");
         let asked = asked_of(&relay, &messages);
         match no_place {
             true => assert_eq!(asked, (0, 0, 0)),
@@ -5935,6 +5943,36 @@ async fn a_message_answered_another_is_not_said_in_another_form() {
     device.passes().await;
     assert_eq!(asked_of(&relay, &messages).2, 1);
     assert_eq!(device.at("relay").another_form, 0);
+
+    // The entry that clears it, and the device's list, answered so too.
+    let secret = device.messages_secret();
+    let written = |name: String, rev: u64, value: Vec<u8>| {
+        let inside = message::inside(name, value);
+        let entry = Entry::seal(&secret, &device.state.identity, rev, &inside);
+        let entry = entry.unwrap().check().unwrap();
+        entries::store(&device.db(), &entry, device.now()).unwrap();
+    };
+    written(
+        message::message_name(&device.key(), 1).unwrap(),
+        message::clearing_rev(1).unwrap(),
+        message::clearing_value(),
+    );
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages).2, 1, "the clearing");
+    assert_eq!(device.at("relay").another_form, 0, "the clearing");
+    let list = message::ReadMarks {
+        marks: vec![[1; 16]],
+    };
+    written(
+        message::read_name(&device.key()).unwrap(),
+        1,
+        list.to_value().unwrap(),
+    );
+    device.sends().await;
+    device.passes().await;
+    assert!(asked_of(&relay, &messages).2 >= 1, "the list");
+    assert_eq!(device.at("relay").another_form, 0, "the list");
 
     device.writes("notes", "a.md", "a text");
     device.sends().await;

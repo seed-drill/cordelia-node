@@ -17,6 +17,9 @@ pub struct Node {
     pub dir: tempfile::TempDir,
     pub http: u16,
     pub p2p: u16,
+    /// The binary that runs the node and its commands, where it is not
+    /// this build's ([`node_run_by`]).
+    pub bin: Option<PathBuf>,
 }
 
 impl Drop for Node {
@@ -96,7 +99,10 @@ impl Node {
         config: &std::path::Path,
         inherited: impl Iterator<Item = std::ffi::OsString>,
     ) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = match &self.bin {
+            Some(bin) => Command::new(bin),
+            None => Command::new(BIN),
+        };
         for name in inherited {
             let theirs = name.to_str().is_some_and(|name| {
                 name.starts_with("CORDELIA_")
@@ -682,6 +688,24 @@ pub fn node_with_relays(
     role: &str,
     relays: &[(String, Option<String>)],
 ) -> Node {
+    node_made(name, role, relays, None)
+}
+
+/// A personal node whose one relay is the one on this machine at
+/// `relay_p2p`, made, run and asked by the binary at `bin` and not by this
+/// build's: a version before this one. Once [`Node::bin`] is set to none,
+/// it takes this version on the same data directory.
+pub fn node_run_by(bin: PathBuf, name: &'static str, relay_p2p: u16) -> Node {
+    let relays = [(format!("127.0.0.1:{relay_p2p}"), None)];
+    node_made(name, "personal", &relays, Some(bin))
+}
+
+fn node_made(
+    name: &'static str,
+    role: &str,
+    relays: &[(String, Option<String>)],
+    bin: Option<PathBuf>,
+) -> Node {
     assert_a_role_that_is_checked(name, role);
     let dir = tempfile::tempdir().unwrap();
     let http = free_port();
@@ -746,6 +770,7 @@ level = "debug"
         dir,
         http,
         p2p,
+        bin,
     };
     n.cli(&["init", "--non-interactive", "--name", name]);
     n

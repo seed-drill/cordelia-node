@@ -664,6 +664,64 @@ pub fn held_back(
     Ok(from_sql(held))
 }
 
+/// How many live messages that have not expired wait for a place at
+/// `now`, of every signer and generation: what the status counts as held
+/// back by the reader's hour (decision 2026-10-09 §6, §8).
+pub fn held_back_in_all(conn: &Connection, now: i64) -> Result<u64, StorageError> {
+    let held: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM message_index i
+             WHERE i.placed_at IS NULL AND ?1 < {expires} AND {live}",
+            expires = expires_sql(),
+            live = live_sql(),
+        ),
+        [now],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(held))
+}
+
+/// How many numbers of every signer and generation that the device keeps
+/// left the live numbers before their message had a place (decision
+/// 2026-10-09 §2.5, §8): the counts of [`Signer::overwritten`], together.
+pub fn overwritten_in_all(conn: &Connection) -> Result<u64, StorageError> {
+    let overwritten: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(overwritten), 0) FROM message_signers",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(overwritten))
+}
+
+/// How many messages of the device's own it keeps, until every relay it
+/// is set up with has taken each (decision 2026-10-09 §2.3, §8): what
+/// waits to be sent.
+pub fn kept_count(conn: &Connection) -> Result<u64, StorageError> {
+    let kept: i64 = conn.query_row("SELECT COUNT(*) FROM message_kept", [], |row| row.get(0))?;
+    Ok(from_sql(kept))
+}
+
+/// How many messages of `own`'s in `channel` a relay had no room for,
+/// and that wait to be sent there again (decision 2026-10-09 §8, §10):
+/// the entries that `own` signed at an even revision outside `list_slot`,
+/// the slot of its list, each once however many relays refused it. A
+/// clearing's revision is odd, and the list's slot is its own.
+pub fn refused_for_room(
+    conn: &Connection,
+    channel: &[u8; 32],
+    own: &[u8; 32],
+    list_slot: &[u8; 32],
+) -> Result<u64, StorageError> {
+    let refused: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT r.seq) FROM at_relays_refused r
+         JOIN entries e ON e.channel_id = r.channel AND e.seq = r.seq
+         WHERE r.channel = ?1 AND e.author = ?2 AND e.rev % 2 = 0 AND e.slot <> ?3",
+        params![&channel[..], &own[..], &list_slot[..]],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(refused))
+}
+
 /// What the hourly task dropped ([`drop_gone`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gone {

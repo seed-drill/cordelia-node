@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The newest release before messages between a person's own agents: the
+  # upgrade test runs its node beside this build's (decision 2026-10-09
+  # §9.2).
+  VERSION_BEFORE: v0.2.0-alpha.10
 
 jobs:
   test:
@@ -29,6 +33,20 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      - name: Download the version before
+        # The Linux binary of that release, checked against the checksum
+        # the release publishes beside it; the upgrade test reads where it
+        # is from CORDELIA_TEST_BINARY_BEFORE, and fails in CI without it.
+        run: |
+          dir="$RUNNER_TEMP/before"
+          mkdir -p "$dir"
+          base="https://github.com/${{ github.repository }}/releases/download/$VERSION_BEFORE"
+          curl -fsSL -o "$dir/cordelia-linux-amd64" "$base/cordelia-linux-amd64"
+          curl -fsSL -o "$dir/cordelia-linux-amd64.sha256" "$base/cordelia-linux-amd64.sha256"
+          (cd "$dir" && sha256sum -c cordelia-linux-amd64.sha256)
+          chmod +x "$dir/cordelia-linux-amd64"
+          echo "CORDELIA_TEST_BINARY_BEFORE=$dir/cordelia-linux-amd64" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --all

@@ -1544,6 +1544,23 @@ pub(crate) async fn status_with(
         })
         .unwrap_or_default();
 
+    // What a personal node that stands applied says of messages between
+    // its person's agents (decision 2026-10-09 §8): an object of its own,
+    // which nothing that the level is worked out from reads. A node that
+    // is held up reads nothing of its database.
+    let messages = match older_kind || state.held.why().is_some() {
+        true => None,
+        false => crate::messages::status_of(
+            &db,
+            &state.identity,
+            &state.own_channels,
+            state.sync_control.now(),
+        )
+        .ok()
+        .flatten(),
+    };
+    drop(db);
+
     let no_relay_secs = state
         .own_channels
         .no_relay_for(std::time::Instant::now())
@@ -1556,7 +1573,7 @@ pub(crate) async fn status_with(
         .why()
         .map(|held| serde_json::json!({ "by": held.kind(), "why": held.says() }));
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    let mut status = serde_json::json!({
         "status": "running",
         "held": held,
         // How many key files of an older version were left in place at
@@ -1576,5 +1593,9 @@ pub(crate) async fn status_with(
         // clock, which does not run while the machine sleeps (decision
         // 2026-10-04 §10.1). Null while one is connected.
         "no_relay_secs": no_relay_secs,
-    })))
+    });
+    if let Some(messages) = messages {
+        status["messages"] = messages.answered();
+    }
+    Ok(HttpResponse::Ok().json(status))
 }

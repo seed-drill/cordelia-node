@@ -50,6 +50,24 @@ and each node has a directory of its own, which is removed afterwards.
 `CORDELIA_E2E_KEEP=1` keeps each node's directory (its configuration, data
 and log), and prints where.
 
+`CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before
+messages between a person's agents, which
+`a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
+runs beside this build. CI downloads it from the release that `ci.yml`
+names, and checks it against that release's checksum. Where it is not set,
+the test says so and passes without running, but where `CI` is set it
+fails. To run it here:
+
+```bash
+v=v0.2.0-alpha.10; d=$(mktemp -d)
+base=https://github.com/seed-drill/cordelia-node/releases/download/$v
+curl -fsSL -o $d/cordelia-linux-amd64 $base/cordelia-linux-amd64
+curl -fsSL -o $d/cordelia-linux-amd64.sha256 $base/cordelia-linux-amd64.sha256
+(cd $d && sha256sum -c cordelia-linux-amd64.sha256) && chmod +x $d/cordelia-linux-amd64
+CORDELIA_TEST_BINARY_BEFORE=$d/cordelia-linux-amd64 \
+  cargo test -p cordelia-node --test msg_e2e a_device_of_the_version_before
+```
+
 ```bash
 cargo test -p cordelia-node --test person_e2e
 cargo test -p cordelia-node --test memory_e2e
@@ -73,7 +91,7 @@ cargo test -p cordelia-node --test threat_model
 | `relay_entries_e2e.rs` | A relay that carries channels from their secrets, beside the older kind (decision 2026-10-04 §2.4, §2.5). The test is the client: it opens the streams itself. A client with a channel's secret pushes, proves and pulls; one with only the channel's ID gets nothing; a show, whole and short; a relay near its cap; the allowance of new channels; the limits by address, counted for both kinds together; two relays that work together; a channel unused for 90 days; a personal node that answers none of these streams |
 | `device_entries_e2e.rs` | A device's side of its relays (decision 2026-10-04 §4.6, §7.3). The device is in the test's process: the node's own engine over real connections, with a clock of its own that a test runs ahead where a wait is tested. The relays are processes. The show, whole once and short after; leave, when it is given and when it ends; a device that wakes; a device that applies the change its relay holds before it sends anything; what a relay refuses for room; a hand-over that is dropped after two hours; the pair channel of a typed key; the door through which a carry reads a channel that was left; the sweep of the deletes that a device has held for 90 days; a node that is held up makes no pass |
 | `first_start_e2e.rs` | A node's first start on this version (decision 2026-10-04 §10.1): a personal node whose database is in the released version's form copies it and moves it on, once, after its port is bound; a relay makes no copy and keeps every older row, and removes the guard from a device's database; a node that cannot bind changes nothing; a second node on the same data directory says so and changes nothing; a node answers while the copy is being made; a first start that cannot be made holds the node up until it can; a database from a later version is refused; a device whose scope was stored on has the notice of what stopped, and its folders sync again once they are mapped |
-| `msg_e2e.rs` | Messages between a person's own agents (decision 2026-10-09 §3, §4), each command run as an agent runs it, in a mapped folder: `cordelia msg send`, `msg summary` and `msg read` between two devices through a relay; the summary announces once, counts the rest, prints nothing on any error and keeps to its 100 ms; the folder from Claude Code's variable, the hook's input and the working directory; the frame a body cannot close; the names `send` takes, a reply's recipient, the rates of a folder and of the device, a body that is too large or does not end; sync off, no phrase and a removed device; that a message changes nothing and reaches no file |
+| `msg_e2e.rs` | Messages between a person's own agents (decision 2026-10-09 §3, §4), each command run as an agent runs it, in a mapped folder: `cordelia msg send`, `msg summary` and `msg read` between two devices through a relay; the summary announces once, counts the rest, prints nothing on any error and keeps to its 100 ms; the folder from Claude Code's variable, the hook's input and the working directory; the frame a body cannot close; the names `send` takes, a reply's recipient, the rates of a folder and of the device, a body that is too large or does not end; sync off, no phrase and a removed device; that a message changes nothing and reaches no file; the status's `messages` object; a statement, and what a removed device reads; the version before beside this one; the summary's help |
 | `threat_model.rs` | That `docs/security/threat-model.md` names, for every claim it marks as tested, tests that exist and run; and the claims that need real processes |
 
 `crates/cordelia-node/tests/common/mod.rs` is the harness they share: it

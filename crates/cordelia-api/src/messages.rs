@@ -41,9 +41,9 @@ use cordelia_core::protocol::{
     AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_ID_SHOWN_CHARS,
     AGENT_MESSAGE_SUBJECT_CHARS, AGENT_MESSAGE_SUMMARY_LINES, AGENT_MESSAGE_SUMMARY_WAIT_MS,
 };
-use cordelia_crypto::fingerprint;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::message::{To, is_a_link};
+use cordelia_crypto::{derive, fingerprint};
 use cordelia_storage::StorageError;
 use cordelia_storage::messages::{self as held, Id, Shown};
 use cordelia_storage::meta;
@@ -892,6 +892,121 @@ pub async fn send(
             })))
         }
         Err(answer) => answer,
+    }
+}
+
+// ── The status ───────────────────────────────────────────────────────
+
+/// What the status says of messages (decision 2026-10-09 §8, C13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counts {
+    /// For each mapped folder, the messages unread by its agent (§7.2): a
+    /// message to every name once for each folder.
+    pub unread_by_an_agent: u64,
+    /// The messages to a name mapped here or to every name, not sent
+    /// here, that no person has read here.
+    pub unread_by_a_person: u64,
+    /// This device's messages that wait to be sent.
+    pub waiting: u64,
+    /// Of those, the ones a relay refused for room.
+    pub refused_for_room: u64,
+    /// The signer whose entries fill the channel where a relay refused it
+    /// for room, by its label, with the count of its entries (§10).
+    pub filled_by: Option<(String, u64)>,
+    /// Held back by the reader's hour (§6).
+    pub held_back: u64,
+    /// Overwritten before they were shown (§2.5).
+    pub overwritten: u64,
+    /// The device has no place for messages (§2.1).
+    pub no_place: bool,
+}
+
+/// The `messages` object of the status at `now` by the node's clock
+/// (decision 2026-10-09 §8, C13), in one write: working it out gives
+/// places, as a show does (§6). `None` where the device does not stand
+/// applied: the object is absent then.
+///
+/// **It is said nowhere but here.** Nothing of it feeds the level, the
+/// holds or the line, which a command works out from facts that pass
+/// over the messages channel.
+///
+/// What is shown is what a show would show: a message from a signer that
+/// no longer counts is shown by `log` alone (§9.1), and is not counted as
+/// unread by an agent, whose summary never shows it.
+pub fn status_of(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    own_channels: &OwnChannels,
+    now: i64,
+) -> Result<Option<Counts>, PersonError> {
+    in_one(conn, || {
+        let Some(channel) = messages_channel(conn)? else {
+            return Ok(None);
+        };
+        let own = identity.public_key();
+        kept(held::give_places(conn, &own, now))?;
+        let counting = who_counts(conn)?;
+        let names: Vec<String> = crate::sync::mappings(conn)
+            .map_err(said)?
+            .into_iter()
+            .map(|mapping| mapping.name)
+            .collect();
+        let mut unread_by_an_agent = 0;
+        for name in &names {
+            for message in marks::unread(conn, identity, name, now)? {
+                if counting.counts(&key_of(&message.signer)?) {
+                    unread_by_an_agent += 1;
+                }
+            }
+        }
+        let mut unread_by_a_person = 0;
+        for message in kept(held::shown(conn, now))? {
+            let to_here = message
+                .to
+                .as_ref()
+                .is_none_or(|to| names.iter().any(|name| name == to));
+            if to_here
+                && message.signer[..] != own[..]
+                && !kept(held::is_read_by_a_person(conn, &id_of(&message.id)?))?
+            {
+                unread_by_a_person += 1;
+            }
+        }
+        let secret = derive::messages_secret(&Standing::to_write(conn)?.secret)?;
+        let list_slot = cordelia_crypto::slots::slot_id(
+            &derive::slot_key(&secret)?,
+            &cordelia_crypto::message::read_name(&own)?,
+        );
+        Ok(Some(Counts {
+            unread_by_an_agent,
+            unread_by_a_person,
+            waiting: kept(held::kept_count(conn))?,
+            refused_for_room: kept(held::refused_for_room(conn, &channel, &own, &list_slot))?,
+            filled_by: filled_by(conn, |channel| own_channels.no_room_for_messages(channel))?,
+            held_back: kept(held::held_back_in_all(conn, now))?,
+            overwritten: kept(held::overwritten_in_all(conn))?,
+            no_place: own_channels.no_place(),
+        }))
+    })
+}
+
+impl Counts {
+    /// As the status answers it.
+    pub fn answered(&self) -> Value {
+        let filled_by = self
+            .filled_by
+            .as_ref()
+            .map(|(label, entries)| json!({ "label": label, "entries": entries }));
+        json!({
+            "unread_by_an_agent": self.unread_by_an_agent,
+            "unread_by_a_person": self.unread_by_a_person,
+            "waiting": self.waiting,
+            "refused_for_room": self.refused_for_room,
+            "filled_by": filled_by,
+            "held_back": self.held_back,
+            "overwritten": self.overwritten,
+            "no_place": self.no_place,
+        })
     }
 }
 
@@ -2225,5 +2340,229 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full.filled_by, Some(("device 0".into(), 3)));
+    }
+
+    // ── The status ───────────────────────────────────────────────────
+
+    /// The `messages` object of the status counts each of its fields by
+    /// its rule (decision 2026-10-09 §8, C13): unread by an agent, for each
+    /// mapped folder, a message to every name once for each, and none of
+    /// a signer that no longer counts; unread by a person, of what was not
+    /// sent here; what waits, and what a relay refused for room, each
+    /// message once and no list; the signer that fills the channel; what is
+    /// held back and overwritten; and whether there is no place. It is
+    /// absent on a device that does not stand applied.
+    #[test]
+    fn the_status_counts_messages_each_by_its_rule() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        let a1 = sent(&s, 0, &asking("notes", Some("work"), "first"), t);
+        let a2 = sent(&s, 0, &asking("notes", Some("work"), "second"), t + 1);
+        let b = sent(&s, 0, &asking("notes", None, "to every name"), t + 2);
+        s.pass(0, 1);
+        sent(&s, 1, &asking("work", Some("notes"), "from here"), t + 3);
+        let now = s.now + MINUTE;
+        let channels = OwnChannels::default();
+        let counts = |n: usize, channels: &OwnChannels| {
+            status_of(&s[n].conn, &s[n].identity, channels, now)
+                .unwrap()
+                .unwrap()
+        };
+
+        // On the device they were sent to: `notes` is shown the message to
+        // every name and this device's own from `work`; `work` the two to
+        // it and the one to every name; `plans` the one to every name. A
+        // person here is shown the three that were not sent here.
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.unread_by_an_agent, on_1.unread_by_a_person), (6, 3));
+        assert_eq!((on_1.waiting, on_1.refused_for_room), (1, 0));
+        assert_eq!(on_1.filled_by, None);
+        assert_eq!(
+            (on_1.held_back, on_1.overwritten, on_1.no_place),
+            (0, 0, false)
+        );
+
+        // A person read one: an agent has not.
+        s[1].conn
+            .execute(
+                "INSERT INTO message_read_by_a_person (id) VALUES (?1)",
+                [&a1[..]],
+            )
+            .unwrap();
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.unread_by_an_agent, on_1.unread_by_a_person), (6, 2));
+        // An agent read two: a person has not.
+        reads(&s, 1, "work", &hex::encode(a2), now).unwrap();
+        reads(&s, 1, "work", &hex::encode(b), now).unwrap();
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.unread_by_an_agent, on_1.unread_by_a_person), (4, 2));
+
+        // A signer that does not count: a person is shown it by `log`, and
+        // no agent by its summary.
+        held_as(
+            &s,
+            1,
+            [0x99; 16],
+            [9; 32],
+            "notes",
+            Some("work"),
+            false,
+            (now, now),
+            1,
+        );
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.unread_by_an_agent, on_1.unread_by_a_person), (4, 3));
+        // A message to a name that no folder here maps: shown to nobody here.
+        held_as(
+            &s,
+            1,
+            [0x66; 16],
+            [6; 32],
+            "notes",
+            Some("elsewhere"),
+            false,
+            (now, now),
+            1,
+        );
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.unread_by_an_agent, on_1.unread_by_a_person), (4, 3));
+
+        // A signer that had its hour of places: its next waits, held back.
+        let conn = &s[1].conn;
+        let channel = messages_channel(conn).unwrap().unwrap();
+        let generation = held::generation(conn, &channel, s[1].number(), now).unwrap();
+        for _ in 0..64 {
+            conn.execute(
+                "INSERT INTO message_places (signer, generation, placed_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&[8u8; 32][..], generation, now - 1],
+            )
+            .unwrap();
+        }
+        held::hold_number(conn, &[8; 32], generation, 1, false, now).unwrap();
+        let message = Message {
+            asks: false,
+            sent: now as u64,
+            nonce: [0; 16],
+            thread: [0; 16],
+            answers: [0; 16],
+            from: "notes".into(),
+            to: To::Name("work".into()),
+            link: None,
+            body: "held back".into(),
+        };
+        held::index(
+            conn,
+            &Opened {
+                id: &[0x88; 16],
+                signer: &[8; 32],
+                label: "elsewhere",
+                generation,
+                number: 1,
+                message: &message,
+                first_held: now,
+                placed_at: None,
+            },
+        )
+        .unwrap();
+        // A signer of which a lap and more was never held: overwritten.
+        held::hold_number(conn, &[7; 32], generation, 1, false, now).unwrap();
+        held::hold_number(conn, &[7; 32], generation, 200, false, now).unwrap();
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.held_back, on_1.overwritten), (1, 136));
+        assert_eq!(on_1.unread_by_a_person, 3);
+
+        // What a relay refused of this device's own: its message, once for
+        // two relays, and not its list, which stands at an even revision,
+        // nor another device's entries that it holds, said refused too.
+        let own = s.key(1);
+        let refused: Vec<(i64, u64, Vec<u8>)> = conn
+            .prepare("SELECT seq, rev, author FROM entries WHERE channel_id = ?1")
+            .unwrap()
+            .query_map([&channel[..]], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let of_its_own: Vec<_> = refused
+            .iter()
+            .filter(|(_, _, author)| author[..] == own[..])
+            .collect();
+        assert_eq!((refused.len(), of_its_own.len()), (5, 2));
+        assert!(of_its_own.iter().all(|(_, rev, _)| rev % 2 == 0), "{refused:?}");
+        for relay in [[0x71; 32], [0x72; 32]] {
+            for (seq, _, _) in &refused {
+                cordelia_storage::at_relays::refused(conn, &relay, &channel, *seq).unwrap();
+            }
+        }
+        let on_1 = counts(1, &channels);
+        assert_eq!((on_1.waiting, on_1.refused_for_room), (1, 1));
+        assert_eq!(on_1.filled_by, None);
+
+        // The sender keeps what it sent until every relay takes it; where
+        // a relay refused the channel for room, the signer that fills it
+        // is named, by its entries.
+        assert_eq!(counts(0, &channels).waiting, 3);
+        // A relay refused the three, and the first is cleared since: the
+        // clearing, refused in its turn, is no message.
+        let conn = &s[0].conn;
+        let channel = messages_channel(conn).unwrap().unwrap();
+        let secret = cordelia_crypto::derive::messages_secret(&s[0].secret()).unwrap();
+        let name = cordelia_crypto::message::message_name(&s.key(0), 1).unwrap();
+        let inside = cordelia_crypto::message::inside(
+            name,
+            cordelia_crypto::message::clearing_value(),
+        );
+        let rev = cordelia_crypto::message::clearing_rev(1).unwrap();
+        let seqs = |conn: &Connection| -> Vec<i64> {
+            conn.prepare("SELECT seq FROM entries WHERE channel_id = ?1")
+                .unwrap()
+                .query_map([&channel[..]], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for seq in seqs(conn) {
+            cordelia_storage::at_relays::refused(conn, &[0x71; 32], &channel, seq).unwrap();
+        }
+        assert_eq!(counts(0, &channels).refused_for_room, 3);
+        let clearing = cordelia_crypto::entry::Entry::seal(&secret, &s[0].identity, rev, &inside);
+        let clearing = clearing.unwrap().check().unwrap();
+        cordelia_storage::entries::store(conn, &clearing, now).unwrap();
+        for seq in seqs(conn) {
+            cordelia_storage::at_relays::refused(conn, &[0x71; 32], &channel, seq).unwrap();
+        }
+        assert_eq!(counts(0, &channels).refused_for_room, 2);
+        let full = OwnChannels::default();
+        full.say_no_room_for_messages(&messages_channel(&s[0].conn).unwrap().unwrap());
+        full.say_no_place(true);
+        let on_0 = counts(0, &full);
+        assert_eq!(on_0.filled_by, Some(("device 0".into(), 3)));
+        assert!(on_0.no_place);
+        let answered = on_0.answered();
+        assert_eq!(
+            answered["filled_by"],
+            json!({ "label": "device 0", "entries": 3 })
+        );
+        assert_eq!(answered["no_place"], true);
+        assert_eq!(answered["waiting"], 3);
+        for key in [
+            "unread_by_an_agent",
+            "unread_by_a_person",
+            "waiting",
+            "refused_for_room",
+            "filled_by",
+            "held_back",
+            "overwritten",
+            "no_place",
+        ] {
+            assert!(answered.get(key).is_some(), "{key}");
+        }
+        assert_eq!(answered.as_object().unwrap().len(), 8);
+
+        // A device that does not stand applied says nothing of messages.
+        held_rows::set_state(&s[1].conn, State::Removed).unwrap();
+        let removed = status_of(&s[1].conn, &s[1].identity, &channels, now).unwrap();
+        assert_eq!(removed, None);
     }
 }
