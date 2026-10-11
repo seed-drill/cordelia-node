@@ -1242,7 +1242,7 @@ pub fn merge_own_list(
         Some(listed) => {
             // Up past the highest and back, as the UNIQUE on seq allows.
             if let Some(highest) = highest_seq(conn)?.filter(|highest| *highest > listed) {
-                let below = subtracted(highest, listed)?;
+                let below = highest - listed;
                 let up = added(below, count)?;
                 conn.execute(
                     "UPDATE message_read_here SET seq = seq + ?2 WHERE seq > ?1",
@@ -1278,7 +1278,7 @@ pub fn merge_own_list(
             )?,
         };
         if inserted == 1 {
-            seq -= 1;
+            seq = subtracted(seq, 1)?;
             merged += 1;
         }
     }
@@ -3071,7 +3071,8 @@ mod tests {
     /// A `seq` at either end of a 64-bit integer, of a damaged store,
     /// makes a mark or a merge fail and not panic (decision 2026-10-09
     /// §7.2): a mark above one at the top, a merge above what was listed
-    /// at the top, a merge below one at the bottom, and a merge into a
+    /// at the top, a merge below one at the bottom, a merge of two whose
+    /// first goes at the lowest an integer has, and a merge into a
     /// table with marks at both ends, where the rows made since are moved
     /// up past the top, or where the merged go below the bottom.
     #[test]
@@ -3105,6 +3106,12 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         bare(&conn, [0xb2; 16], i64::MIN);
         assert!(merge_own_list(&conn, &[[0xb2; 16], [0xb3; 16]], &[], 200).is_err());
+
+        // The lowest one above an integer's lowest, and no list written: a
+        // list of two goes at the lowest and then below it.
+        let conn = db::open_in_memory().unwrap();
+        bare(&conn, [0xb7; 16], i64::MIN + 1);
+        assert!(merge_own_list(&conn, &[[0xb8; 16], [0xb9; 16]], &[], 200).is_err());
 
         for listed in [None, Some("0")] {
             let conn = db::open_in_memory().unwrap();

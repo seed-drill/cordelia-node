@@ -110,9 +110,9 @@ write it on standard input and close it.";
         "The node is not running, so nothing was done. Start it with: cordelia start";
     pub const FOLDER_NOT_KNOWN: &str =
         "git did not answer in time, so this folder's agent is not known, and nothing was done.";
-    pub const SEND_NOT_ANSWERED: &str =
-        "The node did not answer in time, so it is not known whether the message was sent.";
-    pub const READ_NOT_ANSWERED: &str = "The node did not answer in time.";
+    pub const SEND_NOT_ANSWERED: &str = "The node did not answer, or its answer could not be \
+read, so it is not known whether the message was sent.";
+    pub const READ_NOT_ANSWERED: &str = "The node did not answer, or its answer could not be read.";
     pub const SYNC_OFF: &str = "Sync is off on this device, and so are messages: nothing was \
 sent. Turn sync on with: cordelia sync claude";
     pub const NO_PLACE: &str = "This device holds more than 1024 channels of your own, which is \
@@ -328,8 +328,8 @@ impl Node {
     }
 
     /// POST `body` to `path`, waiting for `limit`: the status and what was
-    /// answered, or whether the node was not reached or did not answer in
-    /// time.
+    /// answered, or whether the node was not reached, or what it did is not
+    /// known.
     fn post(&self, path: &str, body: &Value, limit: Duration) -> Posted {
         let Ok((client, url)) = to_this_machine(&self.config, path, Some(limit)) else {
             return Posted::NotReached;
@@ -341,22 +341,20 @@ impl Node {
             .send_json(body);
         let mut answer = match asked {
             Ok(answer) => answer,
-            // A node on this machine is connected to at once, or refuses
-            // at once: time that ran out in any other step ran out after
-            // the request was sent.
-            Err(ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect)) => {
-                return Posted::NotReached;
-            }
-            Err(ureq::Error::Timeout(_)) => return Posted::NotInTime,
-            Err(_) => return Posted::NotReached,
+            Err(e) if not_connected(&e) => return Posted::NotReached,
+            Err(_) => return Posted::NotKnown,
         };
         let status = answer.status();
         // A redirect did not come from the node.
         if status.is_redirection() {
             return Posted::NotReached;
         }
-        let read = answer.body_mut().read_json().unwrap_or(Value::Null);
-        Posted::Answered(status.as_u16(), read)
+        match (status.as_u16(), answer.body_mut().read_json()) {
+            (200, Ok(read)) => Posted::Answered(200, read),
+            // Done, or not: the answer was cut short, or its read timed out.
+            (200, Err(_)) => Posted::NotKnown,
+            (status, read) => Posted::Answered(status, read.unwrap_or(Value::Null)),
+        }
     }
 
     /// The node's status, as it answers within `VERSION_ASKED_FOR`, or why
@@ -417,12 +415,53 @@ impl Node {
 enum Posted {
     /// The status, and what was answered.
     Answered(u16, Value),
-    /// The connection was refused or could not be made: the node is not
-    /// running.
+    /// The connection was refused or could not be made, before anything
+    /// of the request was written: the node is not running.
     NotReached,
-    /// The request was sent, and no answer came in time: what the node
-    /// did with it is not known.
-    NotInTime,
+    /// Anything after that: no answer in time, a connection closed or
+    /// reset, an answer of 200 that could not be read. What the node did
+    /// with the request is not known.
+    NotKnown,
+}
+
+/// What `read` and `send` take of what the node answered: an answer of 200
+/// that is not the route's, which names the message by its `id`, is no
+/// answer that was read, and what the node did is not known.
+fn of_the_route(posted: Posted) -> Posted {
+    match posted {
+        Posted::Answered(200, answer) if !answer["id"].is_string() => Posted::NotKnown,
+        posted => posted,
+    }
+}
+
+/// Whether `e` is of a request of which nothing was written: the request
+/// could not be made, or its connection was refused or could not be made.
+/// Each of these is said only before a connection stands.
+fn not_connected(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::AddrNotAvailable
+        ),
+        ureq::Error::ConnectionFailed
+        | ureq::Error::HostNotFound
+        | ureq::Error::BadUri(_)
+        | ureq::Error::Http(_) => true,
+        _ => false,
+    }
+}
+
+/// Write `text` on standard output, where it can be: an output that is
+/// closed is no error of the command's, which has done what it did. (`print!`
+/// would panic there, and the process exit 101.)
+fn written(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
 }
 
 /// The address of the node's API, written as the rest of the binary
@@ -617,11 +656,7 @@ pub fn summary(config_path: &str, started: Instant, others: bool) {
         .ok()
         .flatten();
     if let Some(said) = said {
-        // An output that is closed is not written to, and is no error:
-        // `print!` would panic there, and the process exit 101.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(said.as_bytes());
-        let _ = out.flush();
+        written(&said);
     }
 }
 
@@ -734,15 +769,16 @@ pub fn read(config_path: &str, id: &str) -> anyhow::Result<()> {
         folder_here(node.git_wait()).unwrap_or_else(|| refuse(says::FOLDER_NOT_KNOWN));
     node.asked_first().unwrap_or_else(|line| refuse(&line));
     let request = json!({ "folder": folder, "id": id });
-    let (status, answer) = match node.post("/api/v1/messages/read", &request, node.answer_wait()) {
+    let posted = node.post("/api/v1/messages/read", &request, node.answer_wait());
+    let (status, answer) = match of_the_route(posted) {
         Posted::Answered(status, answer) => (status, answer),
         Posted::NotReached => refuse(says::NOT_RUNNING),
-        Posted::NotInTime => refuse(says::READ_NOT_ANSWERED),
+        Posted::NotKnown => refuse(says::READ_NOT_ANSWERED),
     };
     if status != 200 {
         refuse(&refused_by(status, &answer, &shown, Does::Show));
     }
-    print!("{}", readout_says(&answer, &marker()));
+    written(&readout_says(&answer, &marker()));
     Ok(())
 }
 
@@ -934,15 +970,16 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
         "link": flags.re,
         "body": body,
     });
-    let (status, answer) = match node.post("/api/v1/messages/send", &request, node.answer_wait()) {
+    let posted = node.post("/api/v1/messages/send", &request, node.answer_wait());
+    let (status, answer) = match of_the_route(posted) {
         Posted::Answered(status, answer) => (status, answer),
         Posted::NotReached => refuse(says::NOT_RUNNING),
-        Posted::NotInTime => refuse(says::SEND_NOT_ANSWERED),
+        Posted::NotKnown => refuse(says::SEND_NOT_ANSWERED),
     };
     if status != 200 {
         refuse(&refused_by(status, &answer, &shown, Does::Send));
     }
-    print!("{}", sent_says(&answer));
+    written(&sent_says(&answer));
     Ok(())
 }
 
@@ -1316,9 +1353,17 @@ mod tests {
         );
         assert_eq!(
             says::SEND_NOT_ANSWERED,
-            "The node did not answer in time, so it is not known whether the message was sent."
+            "The node did not answer, or its answer could not be read, so it is not known \
+             whether the message was sent."
         );
-        assert_eq!(says::READ_NOT_ANSWERED, "The node did not answer in time.");
+        assert_eq!(
+            says::READ_NOT_ANSWERED,
+            "The node did not answer, or its answer could not be read."
+        );
+        assert_eq!(
+            VERSION_ASKED_FOR,
+            Duration::from_millis(cordelia_core::config::MESSAGES_ANSWER_WAIT_MAX_MS)
+        );
         assert_eq!(
             says::REPLY_WITH_TO,
             "--reply sends to the agent that sent the message it answers: give no --to or --all \
@@ -1647,8 +1692,9 @@ mod tests {
         assert_eq!(api_address(&config), None);
     }
 
-    /// A request that the node took and did not answer in time is told
-    /// from a node that is not there: what it did is not known (decision
+    /// A request that the node took and did not answer in time, or that
+    /// it closed, or answered with what could not be read, is told from a
+    /// node that is not there: what it did is not known (decision
     /// 2026-10-09 §4.3, step 3).
     #[test]
     fn a_request_not_answered_in_time_is_not_a_node_that_is_not_running() {
@@ -1675,9 +1721,56 @@ mod tests {
         });
         let began = Instant::now();
         let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(300));
-        assert_eq!(posted, Posted::NotInTime);
+        assert_eq!(posted, Posted::NotKnown);
         assert!(began.elapsed() < Duration::from_secs(3));
         took.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Takes the whole request, and closes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut asked in listener.incoming().flatten() {
+                let mut request = [0u8; 4096];
+                let _ = asked.read(&mut request);
+                drop(asked);
+            }
+        });
+        let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(3_000));
+        assert_eq!(posted, Posted::NotKnown);
+        // Answers 200 with a body cut short, and closes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut asked in listener.incoming().flatten() {
+                use std::io::Write;
+                let mut request = [0u8; 4096];
+                let _ = asked.read(&mut request);
+                let _ = write!(
+                    asked,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 40\r\n\
+                     connection: close\r\n\r\n{{\"id\": \"01"
+                );
+            }
+        });
+        let posted = node_at(port).post("/x", &json!({}), Duration::from_millis(3_000));
+        assert_eq!(posted, Posted::NotKnown);
+        // An answer of 200 that is not the route's is not known either; a
+        // refusal, and the route's answer, are answers.
+        assert_eq!(
+            of_the_route(Posted::Answered(200, json!({}))),
+            Posted::NotKnown
+        );
+        assert_eq!(
+            of_the_route(Posted::Answered(200, Value::Null)),
+            Posted::NotKnown
+        );
+        assert_eq!(
+            of_the_route(Posted::Answered(409, json!({}))),
+            Posted::Answered(409, json!({}))
+        );
+        assert_eq!(
+            of_the_route(Posted::Answered(200, json!({ "id": "x" }))),
+            Posted::Answered(200, json!({ "id": "x" }))
+        );
         // Nothing listens.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

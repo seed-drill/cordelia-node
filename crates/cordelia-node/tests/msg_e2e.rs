@@ -1639,7 +1639,8 @@ fn a_node_that_answers_late_is_not_said_to_be_not_running() {
     );
     refused_with(
         &said,
-        "The node did not answer in time, so it is not known whether the message was sent.",
+        "The node did not answer, or its answer could not be read, so it is not known whether \
+         the message was sent.",
     );
     // The node sent it.
     summary_with(&two.all(), &two.desktop, "work", "sent late");
@@ -1650,5 +1651,62 @@ fn a_node_that_answers_late_is_not_said_to_be_not_running() {
         &["--config", &config, "read", &id],
         b"",
     );
-    refused_with(&said, "The node did not answer in time.");
+    refused_with(
+        &said,
+        "The node did not answer, or its answer could not be read.",
+    );
+}
+
+/// `send` and `read` with their standard output closed before they write:
+/// the message is sent, and read, and each exits 0 and says nothing; a
+/// closed output does not make a thing done a failure (decision 2026-10-09
+/// §4.1).
+#[test]
+fn send_and_read_with_their_output_closed_do_what_they_did_and_exit_0() {
+    let two = Two::new();
+    // A message first, so that the device has fetched its ring and sends.
+    sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "first\n",
+    );
+    let closed = |n: &Node, name: &str, args: &[&str], input: &[u8]| {
+        let (reads, writes) = std::io::pipe().unwrap();
+        drop(reads);
+        let mut child = n
+            .command_for(&[], &[&["msg"], args].concat())
+            .current_dir(folder(n, name))
+            .stdin(Stdio::piped())
+            .stdout(writes)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(input);
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+    let said = closed(
+        &two.laptop,
+        "notes",
+        &["send", "--to", "work"],
+        b"sent into a closed pipe\n",
+    );
+    assert_eq!(said.status.code(), Some(0), "{}", err(&said));
+    assert_eq!(err(&said), "");
+    // It was sent.
+    let shown = summary_with(&two.all(), &two.desktop, "work", "sent into a closed pipe");
+    let line = shown
+        .lines()
+        .find(|line| line.ends_with(": sent into a closed pipe"))
+        .unwrap();
+    let id = line.split_whitespace().next().unwrap().to_string();
+    let said = closed(&two.desktop, "work", &["read", &id], b"");
+    assert_eq!(said.status.code(), Some(0), "{}", err(&said));
+    assert_eq!(err(&said), "");
+    // It was read: it waits no more.
+    let after = summary(&two.desktop, "work");
+    assert!(!after.contains(&id), "{after}");
 }
