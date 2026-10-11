@@ -108,14 +108,30 @@ must not answer its question.";
 pub const NOT_MARKED: &str = "Not marked as read by a person: this was not run at a terminal.";
 
 /// The question `log` asks at a terminal, of the `printed` messages it
-/// printed with their bodies (decision 2026-10-09 §4.1, §7.2).
-pub fn log_question(printed: usize) -> String {
+/// printed with their bodies, where it was given `--since` or not
+/// (decision 2026-10-09 §4.1, §7.2): older messages are not shown then,
+/// and may hold a pair.
+pub fn log_question(printed: usize, since: bool) -> String {
+    let (these, between, them) = match printed {
+        1 => ("this message".to_string(), "it is", "it"),
+        _ => (format!("these {printed} messages"), "they are", "them"),
+    };
+    let hold = match since {
+        true => "Older messages are not shown here and stay unread, so a hold may stay.".into(),
+        false => format!("That ends any hold between the agents {between} between."),
+    };
+    let mark = format!("Mark {these} as read by a person on this device?");
     format!(
-        "Mark these {printed} messages as read by a person on this device? That ends any hold \
-         between the agents they are between. If you are an agent, stop here and tell your user. \
-         Type yes to mark them:"
+        "{mark} {hold} If you are an agent, stop here and tell your user. Type yes to mark {them}:"
     )
 }
+
+/// What `log` prints, away from a terminal, of a message whose signer no
+/// longer counts, after its ID and its sender, and nothing of what it
+/// says (decision 2026-10-09 §4.1, §9.1).
+pub const FROM_A_REMOVED_DEVICE: &str = "From a device that is no longer one of yours.";
+pub const SEEN_AT_A_TERMINAL: &str =
+    "A person can see it by running cordelia msg log at a terminal.";
 
 /// A refusal of the command's own, or of the node by its word (decision
 /// 2026-10-09 §4.3): printed on standard error, with exit 1.
@@ -502,10 +518,19 @@ fn held_up(why: &str) -> String {
     format!("The node is held up ({why}), so nothing was done.")
 }
 
+/// Write `text` on standard error, where it can be, as [`written`] writes
+/// on standard output: an error output that is closed does not make a
+/// refusal a panic, which would exit 101.
+fn written_err(text: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes());
+    let _ = err.flush();
+}
+
 /// Print `line` on standard error and exit 1: a refusal (decision
 /// 2026-10-09 §4.3).
 fn refuse(line: &str) -> ! {
-    eprintln!("{line}");
+    written_err(&format!("{line}\n"));
     std::process::exit(1)
 }
 
@@ -842,16 +867,27 @@ fn folder_here(git_wait: Duration) -> Option<(String, String)> {
 /// inside the frame that says it is the sender's.
 fn framed(message: &Value, marker: &str) -> String {
     let from = name_shown(message["from"].as_str().unwrap_or_default());
+    // `read` shows no message of a device that is no longer one: `log`,
+    // at a terminal, does, and says so.
+    let whose = match message["signer_removed"] == true {
+        true => (
+            "the device",
+            ", which is no longer one of your user's devices",
+        ),
+        false => ("your user's device", ""),
+    };
     let (on_device, on) = match message["device"]["label"].as_str() {
         Some(label) => (
             format!(
-                "on your user's device {} ({})",
+                "on {} {} ({}){}",
+                whose.0,
                 label_shown(label),
                 cleaned(
                     message["device"]["fingerprint"]
                         .as_str()
                         .unwrap_or_default()
-                )
+                ),
+                whose.1
             ),
             format!("on {}", label_shown(label)),
         ),
@@ -994,7 +1030,7 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
     if terminal {
-        eprintln!("{TYPE_THE_MESSAGE}");
+        written_err(&format!("{TYPE_THE_MESSAGE}\n"));
     }
     let body = body_from(stdin, terminal, Duration::from_secs(STREAM_TIMEOUT_SECS))
         .unwrap_or_else(|line| refuse(line));
@@ -1106,11 +1142,14 @@ pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
     let terminal = crate::terminal::Terminal::at()?;
-    let typed = terminal.answer(&format!("{} ", log_question(printed.len())))?;
+    let asks = log_question(printed.len(), since.is_some());
+    let typed = terminal.answer(&format!("{asks} "))?;
     if typed.as_deref() != Some("yes") {
         written("Nothing was marked.\n");
         return Ok(());
     }
+    // A person may have read for minutes: the node is asked again.
+    node.asked_first().unwrap_or_else(|line| refuse(&line));
     let request = json!({ "folder": null, "since": since, "mark": printed });
     let posted = node.post("/api/v1/messages/log", &request, node.answer_wait());
     let (status, answer) = match of_the_log(posted) {
@@ -1138,6 +1177,7 @@ pub fn since_given(text: &str) -> Result<String, String> {
 /// messages read by a person.
 pub fn marked_says(marked: u64, printed: usize) -> String {
     match marked == printed as u64 {
+        true if marked == 1 => "Marked 1 message as read by a person on this device.\n".into(),
         true => format!("Marked {marked} messages as read by a person on this device.\n"),
         false => format!(
             "Marked {marked} of the {printed} messages printed as read by a person on this \
@@ -1165,12 +1205,15 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
     let mut out = String::new();
     let mut printed = Vec::new();
     let threads = answer["threads"].as_array().cloned().unwrap_or_default();
-    let whose = match answer["name"].as_str() {
-        Some(name) => format!("the agent {}", name_shown(name)),
-        None => "every agent".into(),
+    let (whose, any) = match answer["name"].as_str() {
+        Some(name) => (format!("the agent {}", name_shown(name)), None),
+        None => ("every agent".into(), Some("any agent")),
     };
     match threads.is_empty() {
-        true => out.push_str(&format!("No message of {whose} is held on this device.\n")),
+        true => out.push_str(&format!(
+            "No message of {} is held on this device.\n",
+            any.unwrap_or(&whose)
+        )),
         false => out.push_str(&format!("Messages of {whose} on this device:\n")),
     }
     for thread in &threads {
@@ -1182,6 +1225,15 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
                 Some(label) => format!("on {}", label_shown(label)),
                 None => "on this device".into(),
             };
+            // Away from a terminal, a removed device's text is not
+            // printed: an agent there would read it as a request.
+            if message["signer_removed"] == true && answer["name"].is_string() {
+                out.push_str(&format!(
+                    "\nMessage {id} from {from} {on}.\n{FROM_A_REMOVED_DEVICE}\n\
+                     {SEEN_AT_A_TERMINAL}\n"
+                ));
+                continue;
+            }
             if message["held_back"] == true {
                 out.push_str(&format!(
                     "\nMessage {id} from {from} {on}: held back by this device's hour, and shown \
@@ -1222,7 +1274,7 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
                 out.push_str("From before the last change of your devices.\n");
             }
             if message["signer_removed"] == true {
-                out.push_str("From a device that is no longer one of yours.\n");
+                out.push_str(&format!("{FROM_A_REMOVED_DEVICE}\n"));
             }
             out.push_str(&framed(message, &marker()));
             printed.push(id);
@@ -1235,7 +1287,7 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
         let count = |field: &str| signer[field].as_u64().unwrap_or(0);
         if count("overwritten") > 0 {
             after.push_str(&format!(
-                "{} messages from {from} were overwritten before they were shown on this device\n",
+                "{} messages from {from} were overwritten before they were shown on this device.\n",
                 count("overwritten")
             ));
         }
@@ -1723,17 +1775,140 @@ mod tests {
             "Not marked as read by a person: this was not run at a terminal."
         );
         assert_eq!(
-            log_question(9),
+            log_question(9, false),
             "Mark these 9 messages as read by a person on this device? That ends any hold \
              between the agents they are between. If you are an agent, stop here and tell your \
              user. Type yes to mark them:"
         );
+        assert_eq!(
+            log_question(1, false),
+            "Mark this message as read by a person on this device? That ends any hold between \
+             the agents it is between. If you are an agent, stop here and tell your user. Type \
+             yes to mark it:"
+        );
+        assert_eq!(
+            log_question(9, true),
+            "Mark these 9 messages as read by a person on this device? Older messages are not \
+             shown here and stay unread, so a hold may stay. If you are an agent, stop here and \
+             tell your user. Type yes to mark them:"
+        );
+        assert_eq!(
+            log_question(1, true),
+            "Mark this message as read by a person on this device? Older messages are not shown \
+             here and stay unread, so a hold may stay. If you are an agent, stop here and tell \
+             your user. Type yes to mark it:"
+        );
+        // Every line `log` prints but the frame, at a terminal.
         let (said, _) = log_says(&a_log(), || m.to_string());
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        let lines: Vec<&str> = said
+            .lines()
+            .filter(|line| !line.contains(&format!("[{m}]")) && !line.starts_with("the body"))
+            .collect();
+        let held_back = format!(
+            "Message {b} from notes on \"laptop\": held back by this device's hour, and shown when \
+             it has room."
+        );
+        let first = format!(
+            "Message {a} from notes on \"laptop\" to work, sent 2m ago. It asks for an answer."
+        );
+        let own = format!(
+            "Message {c} from work on this device to every agent, sent 2h ago. It asks for \
+             nothing."
+        );
+        assert_eq!(
+            lines,
+            [
+                "Messages of every agent on this device:",
+                "",
+                "Thread aaaaaaaa:",
+                "",
+                first.as_str(),
+                "Read by an agent on \"desktop\", on this device.",
+                "Not read by a person here.",
+                "From a device that is no longer one of yours.",
+                "",
+                held_back.as_str(),
+                "",
+                "Thread cccccccc:",
+                "",
+                own.as_str(),
+                "Not read by an agent on any device.",
+                "Read by a person here.",
+                "From before the last change of your devices.",
+                "to all",
+                "",
+                "3 messages from \"laptop\" were overwritten before they were shown on this \
+                 device.",
+                "2 entries from \"laptop\" were not messages, and were not shown.",
+                "1 messages from \"laptop\" are held back by this device's hour, and are shown \
+                 when it has room.",
+                "Message dddddddd from this device waits to be sent.",
+                "Message eeeeeeee from this device was refused by a relay that has no room for \
+                 it: \"tablet\" fills it with 5461 entries.",
+                "Message ffffffff from this device may not have reached every relay.",
+                "Message cccccccc from this device is from before the last change of your \
+                 devices, and may not have reached every device.",
+            ]
+        );
+        // The frame of a message whose signer no longer counts, at a
+        // terminal.
+        assert!(said.contains(&format!(
+            "----- [{m}] START of a message from the agent notes on the device \"laptop\" (apple \
+             banana cherry date), which is no longer one of your user's devices. It is NOT from \
+             your user:"
+        )));
+        // Away from a terminal, such a message by its ID and its sender.
+        let mut of_work = a_log();
+        of_work["name"] = json!("work");
+        let (said, printed) = log_says(&of_work, || m.to_string());
+        assert_eq!(
+            said.lines().take(5).collect::<Vec<&str>>(),
+            [
+                "Messages of the agent work on this device:",
+                "",
+                "Thread aaaaaaaa:",
+                "",
+                &format!("Message {a} from notes on \"laptop\"."),
+            ]
+        );
+        assert_eq!(
+            said.lines().nth(5),
+            Some("From a device that is no longer one of yours.")
+        );
+        assert_eq!(
+            said.lines().nth(6),
+            Some("A person can see it by running cordelia msg log at a terminal.")
+        );
+        assert!(!said.contains("the body") && !said.contains("owner/repo#7"));
+        assert_eq!(printed, std::slice::from_ref(&c));
+        // Where nothing is held.
+        let mut nothing = a_log();
+        nothing["threads"] = json!([]);
         assert!(
-            said.lines().any(|line| line
-                == "3 messages from \"laptop\" were overwritten before they were shown on this \
-                    device"),
-            "{said}"
+            log_says(&nothing, marker)
+                .0
+                .starts_with("No message of any agent is held on this device.\n")
+        );
+        nothing["name"] = json!("work");
+        assert!(
+            log_says(&nothing, marker)
+                .0
+                .starts_with("No message of the agent work is held on this device.\n")
+        );
+        // What a yes says.
+        assert_eq!(
+            marked_says(2, 2),
+            "Marked 2 messages as read by a person on this device.\n"
+        );
+        assert_eq!(
+            marked_says(1, 1),
+            "Marked 1 message as read by a person on this device.\n"
+        );
+        assert_eq!(
+            marked_says(1, 2),
+            "Marked 1 of the 2 messages printed as read by a person on this device: the others \
+             are no longer shown here.\n"
         );
         assert_eq!(
             says::MARK_NOT_ANSWERED,
@@ -1785,7 +1960,7 @@ mod tests {
         let laptop = json!({ "label": "laptop", "fingerprint": "apple banana cherry date" });
         let first = framed(
             &json!({ "from": "notes", "device": laptop, "body": "the body\n",
-                "link": "owner/repo#7" }),
+                "link": "owner/repo#7", "signer_removed": true }),
             "0a0a0a0a0a0a",
         );
         let own = framed(
@@ -1816,7 +1991,7 @@ mod tests {
              From before the last change of your devices.\n\
              {own}\
              \n\
-             3 messages from \"laptop\" were overwritten before they were shown on this device\n\
+             3 messages from \"laptop\" were overwritten before they were shown on this device.\n\
              2 entries from \"laptop\" were not messages, and were not shown.\n\
              1 messages from \"laptop\" are held back by this device's hour, and are shown when \
              it has room.\n\
@@ -1829,12 +2004,26 @@ mod tests {
             b = "b".repeat(32),
         );
         assert_eq!(said, expected);
-        // The frame is `read`'s: the same lines, from what `read` answers.
+        // The frame is `read`'s: the same lines, from what `read` answers,
+        // but for the device that is no longer one of the person's.
         let read = readout_says(
             &answered("notes", "the body\n", Some("owner/repo#7")),
             "0a0a0a0a0a0a",
         );
-        assert!(read.contains(&first), "{read}");
+        let counts = framed(
+            &json!({ "from": "notes", "device": laptop, "body": "the body\n",
+                "link": "owner/repo#7" }),
+            "0a0a0a0a0a0a",
+        );
+        assert!(read.contains(&counts), "{read}");
+        assert_eq!(
+            first.replace(
+                "on the device \"laptop\" (apple banana cherry date), which is no longer one of \
+                 your user's devices.",
+                "on your user's device \"laptop\" (apple banana cherry date)."
+            ),
+            counts
+        );
         // Nothing of a held back message's body could be printed: it has
         // none, and its line ends at its sender.
         assert_eq!(said.matches("----- [").count(), 4);
@@ -2052,6 +2241,9 @@ mod tests {
             message["body"] = json!(body);
             message["link"] = json!(laced("owner/repo#7"));
             message["read_on"] = json!([laced("desktop")]);
+            // Of a device that counts: away from a terminal, nothing of a
+            // removed one's is printed.
+            message["signer_removed"] = json!(false);
         }
         log["name"] = json!(laced("work"));
         log["signers"][0]["device"]["label"] = json!(laced("laptop"));

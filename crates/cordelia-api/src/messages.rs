@@ -34,6 +34,7 @@
 //! as escapes by the command ([`taken_out`]).
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use actix_web::{HttpRequest, HttpResponse, web};
@@ -818,9 +819,14 @@ pub fn send_of(
         Err(NotSent::Failed(e)) => return Err(NotSentHere::Failed(e)),
     };
     let to = replied_to.into_inner().unwrap_or(to);
-    let filled_by = room_of(conn, &identity.public_key(), no_room)
-        .map_err(NotSentHere::Failed)?
-        .filled_by;
+    // The message is sent: what is not known of the room is no refusal.
+    let filled_by = match room_of(conn, &identity.public_key(), no_room) {
+        Ok(room) => room.filled_by,
+        Err(e) => {
+            tracing::warn!("messages: a message was sent, and its room is not known: {e}");
+            None
+        }
+    };
     Ok(Sent {
         id: done.id,
         from,
@@ -950,7 +956,8 @@ pub struct Logged {
     /// Its signer no longer counts: `log` alone lists it.
     pub signer_removed: bool,
     /// What it says, and what is said of it here; `None` where it has no
-    /// place yet, held back by the reader's hour.
+    /// place yet, held back by the reader's hour, and, where a folder is
+    /// given, where its signer no longer counts.
     pub said: Option<Said>,
 }
 
@@ -1046,7 +1053,8 @@ fn every_name(conn: &Connection) -> Result<Vec<String>, PersonError> {
 /// none is given: those addressed to its name or to every name, and those
 /// it sent here, as `read` reaches them; a message whose signer no longer
 /// counts among them, which `log` alone lists. A message held back by the
-/// reader's hour is listed without what it says. Whether an agent read a
+/// reader's hour is listed without what it says, and so, where a folder is
+/// given, is one whose signer no longer counts. Whether an agent read a
 /// message is worked out now, from the device's own table and the latest
 /// list of each device that counts, so a device that lies in its list
 /// hides nothing from `log`.
@@ -1062,8 +1070,10 @@ pub fn log_of(
     now: i64,
     no_room: impl FnOnce(&[u8; 32]) -> bool,
 ) -> Result<Log, NotRead> {
+    // A set, made before the write: each ID shown is looked up in it once.
+    let mark: HashSet<Id> = asked.mark.iter().copied().collect();
     in_one(conn, || {
-        Ok(match log_in(conn, identity, asked, now, no_room) {
+        Ok(match log_in(conn, identity, asked, &mark, now, no_room) {
             Err(NotRead::Failed(e)) => return Err(e),
             done => done,
         })
@@ -1074,6 +1084,7 @@ fn log_in(
     conn: &Connection,
     identity: &NodeIdentity,
     asked: &LogAsked,
+    mark: &HashSet<Id>,
     now: i64,
     no_room: impl FnOnce(&[u8; 32]) -> bool,
 ) -> Result<Log, NotRead> {
@@ -1113,11 +1124,28 @@ fn log_in(
             continue;
         }
         let id = id_of(&message.id)?;
-        if asked.mark.contains(&id) {
+        if mark.contains(&id) {
             kept(held::mark_read_by_a_person(conn, &id))?;
             marked += 1;
         }
         if asked.since.is_some_and(|since| message.shown_at < since) {
+            continue;
+        }
+        // Away from a terminal, nothing that such a signer wrote.
+        if name.is_some() && !counting.counts(&key_of(&message.signer)?) {
+            listed.push(logged_of(
+                message.id.as_slice(),
+                message.signer.as_slice(),
+                &message.label,
+                &message.thread,
+                (&message.from, message.to.as_deref()),
+                message.shown_at,
+                now,
+                current != Some(message.generation),
+                None,
+                &own,
+                &counting,
+            )?);
             continue;
         }
         let mut read_on: Vec<[u8; 32]> = Vec::new();
@@ -1360,7 +1388,8 @@ impl Log {
                             "ago_secs": m.ago_secs,
                             "before_the_last_change": m.before_the_last_change,
                             "signer_removed": m.signer_removed,
-                            "held_back": m.said.is_none(),
+                            "held_back": m.said.is_none()
+                                && !(self.name.is_some() && m.signer_removed),
                         });
                         if let Some(shown) = &m.said {
                             said["asks"] = json!(shown.asks);
@@ -2820,6 +2849,40 @@ mod tests {
             .unwrap();
         assert_eq!(counted.label.as_deref(), Some("elsewhere"));
         assert_eq!(counted.not_messages, 1);
+        // With no folder, at a terminal, what it says is answered; given a
+        // folder, it is listed by its ID and its sender alone, and is not
+        // said to be held back.
+        let gone = [0x43; 16];
+        let body = format!("the body of {}", hex::encode(gone));
+        assert_eq!(logged(&again, &gone).said.as_ref().unwrap().body, body);
+        let of = |log: &Log| -> Value {
+            log.answered()["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|thread| thread["messages"].as_array().unwrap().clone())
+                .find(|m| m["id"] == hex::encode(gone))
+                .unwrap()
+        };
+        assert_eq!(of(&again)["body"], json!(body));
+        let away = log_on(&s, 1, Some("work"), &[], t + 1).unwrap();
+        let listed = logged(&away, &gone);
+        assert!(listed.signer_removed);
+        assert_eq!(listed.said, None);
+        assert_eq!(
+            (listed.from.as_str(), listed.label.as_deref()),
+            ("notes", Some("elsewhere"))
+        );
+        assert!(away.printed().is_empty());
+        let answered = of(&away);
+        assert_eq!(
+            (&answered["signer_removed"], &answered["held_back"]),
+            (&json!(true), &json!(false))
+        );
+        for field in ["body", "link", "subject", "asks", "read_on"] {
+            assert!(answered.get(field).is_none(), "{field}: {answered}");
+        }
+        assert!(!away.answered().to_string().contains(&body));
         let answered = log.answered();
         let first = &answered["threads"][0]["messages"][0];
         assert_eq!(first["held_back"], true);
@@ -3289,6 +3352,27 @@ mod tests {
         assert_eq!(status, 401);
     }
 
+    /// A `mark` of as many IDs as a body of 2 MiB holds, each whole and
+    /// none held here, is answered, and marks nothing (decision 2026-10-09
+    /// §4.2): each ID shown is looked up in a set of them.
+    #[actix_web::test]
+    async fn a_mark_of_many_thousands_of_ids_held_nowhere_is_answered_and_marks_nothing() {
+        let (state, id) = a_node_with_a_message();
+        let many: Vec<Id> = (0..58_000u32)
+            .map(|k| {
+                let mut other = [0xee; 16];
+                other[..4].copy_from_slice(&k.to_be_bytes());
+                other
+            })
+            .collect();
+        let (status, said) =
+            answer(log(asked(), state.clone(), log_asked(None, &many)).await).await;
+        assert_eq!((status, &said["marked"]), (200, &json!(0)), "{said}");
+        assert_eq!(said["threads"][0]["messages"][0]["id"], hex::encode(id));
+        assert_eq!(said["threads"][0]["messages"][0]["read_by_a_person"], false);
+        assert!(!held::is_read_by_a_person(&state.db.lock().unwrap(), &id).unwrap());
+    }
+
     /// Where a relay refused the messages channel for room since the node
     /// started, `send` names the signer whose entries fill it, by the count
     /// of each author's entries the device holds (decision 2026-10-09
@@ -3319,5 +3403,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full.filled_by, Some(("device 0".into(), 3)));
+    }
+
+    /// A message is written before its room is looked at: where that
+    /// cannot be read, the send is still answered as sent, with no signer
+    /// named, and the message is held (decision 2026-10-09 §4.1).
+    #[test]
+    fn a_send_whose_room_cannot_be_read_is_answered_as_sent() {
+        let s = devices(1);
+        let conn = &s[0].conn;
+        let request = asking("work", Some("notes"), "sent all the same");
+        // The store breaks once the message is written, before its room
+        // is read.
+        let breaks = |_: &[u8; 32]| {
+            conn.execute_batch("ALTER TABLE entries RENAME TO entries_gone")
+                .unwrap();
+            true
+        };
+        let sent = send_of(conn, &s[0].identity, &request, &at(s.now + MINUTE), breaks)
+            .unwrap_or_else(|not| panic!("{not:?}"));
+        assert_eq!(sent.filled_by, None);
+        conn.execute_batch("ALTER TABLE entries_gone RENAME TO entries")
+            .unwrap();
+        assert_eq!(row(conn, &sent.id).0.as_deref(), Some("notes"));
     }
 }

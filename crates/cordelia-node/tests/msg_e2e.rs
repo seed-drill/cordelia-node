@@ -208,10 +208,19 @@ fn log_refused(n: &Node, dir: &Path, args: &[&str], line: &str) {
 /// answered `typed`: everything its terminal showed.
 fn log_at_a_terminal(n: &Node, count: usize, typed: &str) -> String {
     let mut at = n.at_terminal(&["msg", "log"]);
-    at.says(&format!(
-        "Mark these {count} messages as read by a person on this device? That ends any hold"
-    ));
-    at.says("Type yes to mark them: ");
+    match count {
+        1 => at.says(
+            "Mark this message as read by a person on this device? That ends any hold between \
+             the agents it is between.",
+        ),
+        _ => at.says(&format!(
+            "Mark these {count} messages as read by a person on this device? That ends any hold"
+        )),
+    };
+    at.says(match count {
+        1 => "Type yes to mark it: ",
+        _ => "Type yes to mark them: ",
+    });
     at.types(typed);
     at.done()
 }
@@ -1308,9 +1317,11 @@ fn a_removed_device_is_shown_nothing_and_sends_nothing() {
 
 /// Tablet sends; it is removed, and once desktop has applied the removal,
 /// `read` and `send --reply` of its message are refused there with
-/// `signer_removed`, and `summary` shows it no more; `log` lists it, as
-/// from a device that is no longer one of yours (decision 2026-10-09
-/// §4.1, §4.3, §9.1).
+/// `signer_removed`, and `summary` shows it no more; `log` at a terminal
+/// shows it, in a frame that says its device is no longer one of the
+/// person's, and into a pipe lists it by its ID and its sender alone,
+/// with nothing of its body (decision 2026-10-09 §1, property 1, §4.1,
+/// §4.3, §9.1).
 #[test]
 fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log() {
     let two = Two::new();
@@ -1353,10 +1364,10 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
         ),
     );
     assert_eq!(summary(&two.desktop, "work"), "");
-    // `log` lists it, as from a device that is no longer one of yours: at
-    // a terminal, and into a pipe in the folder of the agent it is to.
+    // `log` at a terminal shows it, as from a device that is no longer
+    // one of yours, and its frame does not call that device the person's.
     let mut at = two.desktop.at_terminal(&["msg", "log"]);
-    at.says("Type yes to mark them: ");
+    at.says("Type yes to mark it: ");
     at.types("no");
     let shown = at.done();
     let block = block_of(&shown, &id);
@@ -1369,11 +1380,33 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
         "{shown}"
     );
     assert!(shown.contains("from the tablet"), "{shown}");
-    let printed = logged(&two.desktop, "work");
     assert!(
-        block_of(&printed, &id).contains("From a device that is no longer one of yours."),
+        shown.contains("START of a message from the agent notes on the device \"tablet\" ("),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "), which is no longer one of your user's devices. It is NOT from your user:"
+        ),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("on your user's device \"tablet\""),
+        "{shown}"
+    );
+    // Into a pipe in the folder of the agent it is to: by its ID and its
+    // sender, and nothing of what it says.
+    let printed = logged(&two.desktop, "work");
+    let block = block_of(&printed, &id);
+    assert!(
+        block.contains(
+            " from notes on \"tablet\".\nFrom a device that is no longer one of yours.\nA \
+             person can see it by running cordelia msg log at a terminal.\n"
+        ),
         "{printed}"
     );
+    assert!(!printed.contains("from the tablet"), "{printed}");
+    assert!(!printed.contains("----- ["), "{printed}");
 }
 
 // ── What a message cannot do ─────────────────────────────────────────
@@ -2211,7 +2244,7 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
 
     let shown = log_at_a_terminal(desktop, 1, "yes");
     assert!(
-        shown.contains("Marked 1 messages as read by a person on this device."),
+        shown.contains("Marked 1 message as read by a person on this device."),
         "{shown}"
     );
     assert!(block_of(&logged(desktop, "work"), &id).contains("Read by a person here."));
@@ -2223,4 +2256,234 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
         block_of(&there, &id).contains("Not read by a person here."),
         "{there}"
     );
+}
+
+/// Laptop alone, with the folders of `NAMES` mapped: notes sends one
+/// message to work and one to plans, and `log` in work has given the first
+/// a place. The relay, laptop, and the two IDs.
+fn one_to_work_and_one_to_plans() -> (Node, Node, String, String) {
+    let (relay, laptop) = alone("laptop", &NAMES, "");
+    let all = [&relay, &laptop];
+    let to_work = sent(&all, &laptop, "notes", &["--to", "work"], "to work\n");
+    let to_plans = sent(&all, &laptop, "notes", &["--to", "plans"], "to plans\n");
+    logs(&all, &laptop, "work", &to_work);
+    (relay, laptop, to_work, to_plans)
+}
+
+/// What `log` in work did with one end not a terminal: it ended by itself
+/// and succeeded, showed the folder's agent's messages alone, asked
+/// nothing, ended with the line that says so, and marked nothing.
+fn not_at_a_terminal(
+    laptop: &Node,
+    (ended, printed, errors): (Option<bool>, String, String),
+    to_work: &str,
+    to_plans: &str,
+) {
+    let printed = printed.replace("\r\n", "\n");
+    assert_eq!(ended, Some(true), "{printed}{errors}");
+    assert!(
+        printed.starts_with(&format!(
+            "{FOR_A_PERSON}\nMessages of the agent work on this device:\n"
+        )),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(&format!("\nMessage {to_work}")),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains(to_plans) && !printed.contains("to plans"),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains("Mark this") && !printed.contains("Mark these"),
+        "{printed}"
+    );
+    assert!(printed.ends_with(&format!("\n{NOT_MARKED}\n")), "{printed}");
+    let after = logged(laptop, "work");
+    assert!(
+        block_of(&after, to_work).contains("Not read by a person here."),
+        "{after}"
+    );
+}
+
+/// `log` with its input at a terminal and its output a pipe, as `cordelia
+/// msg log | cat` runs at a terminal: it is not at a terminal, so it shows
+/// the folder's agent's messages alone, asks nothing and marks nothing
+/// (decision 2026-10-09 §4.1, property 14).
+#[test]
+fn log_with_its_input_at_a_terminal_and_its_output_a_pipe_is_not_at_a_terminal() {
+    let (_relay, laptop, to_work, to_plans) = one_to_work_and_one_to_plans();
+    let said = laptop.at_terminal_into_a_pipe_in(&folder(&laptop, "work"), &["msg", "log"]);
+    not_at_a_terminal(&laptop, said, &to_work, &to_plans);
+}
+
+/// `log` with its input from a file and its output a terminal, as
+/// `cordelia msg log < file` runs at a terminal: it is not at a terminal
+/// either (decision 2026-10-09 §4.1, property 14).
+#[test]
+fn log_with_its_input_from_a_file_and_its_output_a_terminal_is_not_at_a_terminal() {
+    let (_relay, laptop, to_work, to_plans) = one_to_work_and_one_to_plans();
+    let said =
+        laptop.at_terminal_with_input_from_a_file_in(&folder(&laptop, "work"), &["msg", "log"]);
+    not_at_a_terminal(&laptop, said, &to_work, &to_plans);
+}
+
+/// A stand-in for a node of this command's version on this machine: it
+/// answers the status, held up or of another version once `state` is set
+/// to 1 or 2, and `log` with one message to work, counting each request
+/// to log that marks.
+struct StandIn {
+    port: u16,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    marks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StandIn {
+    fn new() -> Self {
+        use std::io::{BufRead, BufReader, Read};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let marks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (now, marked) = (state.clone(), marks.clone());
+        std::thread::spawn(move || {
+            for asked in listener.incoming().flatten() {
+                let mut reader = BufReader::new(asked.try_clone().unwrap());
+                let mut first = String::new();
+                // A connection that sends nothing: the command looking
+                // whether the node listens.
+                if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let answer = match first.starts_with("GET /api/v1/status") {
+                    true => match now.load(Ordering::SeqCst) {
+                        0 => json!({ "version": env!("CARGO_PKG_VERSION"), "held": null }),
+                        1 => json!({ "version": env!("CARGO_PKG_VERSION"),
+                                     "held": { "why": "a copy failed" } }),
+                        _ => json!({ "version": "0.0.0", "held": null }),
+                    },
+                    false => {
+                        let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let mark = asked["mark"].as_array().map_or(0, Vec::len);
+                        if mark > 0 {
+                            marked.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let a = "a".repeat(32);
+                        json!({
+                            "name": null,
+                            "threads": [{ "thread": a, "messages": [{
+                                "id": a, "thread": a, "from": "notes", "to": "work",
+                                "device": { "label": "desktop",
+                                            "fingerprint": "apple banana cherry date" },
+                                "ago_secs": 60, "before_the_last_change": false,
+                                "signer_removed": false, "held_back": false, "asks": false,
+                                "link": null, "body": "a body\n", "read_on": [],
+                                "read_here": false, "read_by_a_person": false }] }],
+                            "signers": [], "waiting": [], "refused_for_room": [],
+                            "filled_by": null, "not_every_relay": [], "not_every_device": [],
+                            "marked": mark,
+                        })
+                    }
+                };
+                let answer = answer.to_string();
+                let mut asked = asked;
+                let _ = write!(
+                    asked,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                     {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        Self { port, state, marks }
+    }
+}
+
+/// After the yes, `log` asks the node again before the request that
+/// marks: a node held up by then, or of another version by then, is
+/// refused with its line, and nothing is marked (decision 2026-10-09
+/// §4.1, §4.3, step 3).
+#[test]
+fn log_asks_the_node_again_after_the_yes_before_it_marks() {
+    use std::sync::atomic::Ordering;
+    let laptop = node("laptop", "personal", None);
+    for (state, line) in [
+        (
+            1,
+            "The node is held up (a copy failed), so nothing was done.",
+        ),
+        (
+            2,
+            "This command changes something, and is not sent to a node of another version: \
+             nothing was done.",
+        ),
+    ] {
+        let stand_in = StandIn::new();
+        let mut at = laptop.at_terminal_through(stand_in.port, &["msg", "log"]);
+        at.says("Mark this message as read by a person on this device?");
+        at.says("Type yes to mark it: ");
+        stand_in.state.store(state, Ordering::SeqCst);
+        at.types("yes");
+        let said = at.refused();
+        assert!(said.contains(line), "{said}");
+        assert!(!said.contains("Marked"), "{said}");
+        assert_eq!(stand_in.marks.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A refusal with standard error closed exits 1, and not 101: the line
+/// that cannot be written is no panic (decision 2026-10-09 §4.3).
+#[test]
+fn a_refusal_with_standard_error_closed_exits_1() {
+    let laptop = node("laptop", "personal", None);
+    let dir = folder(&laptop, "work");
+    for args in [&["read", "xyz"][..], &["log", "--since", "yesterday"][..]] {
+        let (reads, writes) = std::io::pipe().unwrap();
+        drop(reads);
+        let said = laptop
+            .command_for(&[], &[&["msg"], args].concat())
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(writes)
+            .output()
+            .unwrap();
+        assert_eq!(said.status.code(), Some(1), "{args:?}: {}", out(&said));
+    }
+}
+
+/// With `--since`, the question at a terminal says that a hold may stay,
+/// for older messages are not shown and stay unread (decision 2026-10-09
+/// §4.1).
+#[test]
+fn log_with_since_at_a_terminal_says_that_a_hold_may_stay() {
+    let laptop = node("laptop", "personal", None);
+    let stand_in = StandIn::new();
+    let mut at = laptop.at_terminal_through(stand_in.port, &["msg", "log", "--since", "2d"]);
+    at.says(
+        "Mark this message as read by a person on this device? Older messages are not shown \
+         here and stay unread, so a hold may stay. If you are an agent, stop here and tell your \
+         user. Type yes to mark it: ",
+    );
+    at.types("no");
+    let said = at.done();
+    assert!(!said.contains("That ends any hold"), "{said}");
+    assert!(said.contains("Nothing was marked."), "{said}");
 }
