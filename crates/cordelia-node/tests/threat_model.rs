@@ -505,6 +505,91 @@ fn t01_a_relay_holds_nothing_it_can_read() {
     }
 }
 
+/// `cordelia msg` with `args` on `n`, in its folder `notes`, given `body`
+/// on its input: what it said.
+fn msg_in_notes(n: &Node, args: &[&str], body: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = n
+        .command_for(&[], &[&["msg"], args].concat())
+        .current_dir(n.home().join("notes"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(body.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+/// T1. A relay holds no message it can read (decision 2026-10-09 §1,
+/// property 7, §10). Two devices of one person map a folder under a name,
+/// and one sends the other a message with a link, which the other reads
+/// through the relay. Afterwards nothing the relay wrote to disk holds the
+/// message's subject, the rest of its body, the name it is from and to, or
+/// its link; it did carry the messages channel, whose ID is there. The same
+/// search finds each of them on the device that sent it.
+#[test]
+fn t01_a_relay_holds_no_message_it_can_read() {
+    const NAME: &str = "t01-canary-agent";
+    const SUBJECT: &str = "t01 canary subject of a message";
+    const REST: &str = "t01 canary body that nothing else says";
+    const LINK: &str = "t01canaryowner/t01-canary-repo#4242";
+
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let all = [&relay, &a, &b];
+    syncs_notes_as(&a, NAME);
+    syncs_notes_as(&b, NAME);
+    pair(&a, &b, "laptop", &all);
+    let body = format!("{SUBJECT}\n{REST}\n");
+    let said = wait_for("a sends", &all, 120, || {
+        let said = msg_in_notes(&a, &["send", "--to", NAME, "--ask", "--re", LINK], &body);
+        said.status.success().then_some(said)
+    });
+    let sent = String::from_utf8_lossy(&said.stdout).into_owned();
+    let id = sent.split_whitespace().nth(1).unwrap().to_string();
+    // B reads it, so it went through the relay: the two devices have no
+    // other path to each other.
+    let read = wait_for("b reads a's message", &all, 120, || {
+        let said = msg_in_notes(&b, &["read", &id], "");
+        said.status.success().then_some(said)
+    });
+    let read = String::from_utf8_lossy(&read.stdout).into_owned();
+    assert!(read.contains(&body) && read.contains(LINK), "{read}");
+    let channel =
+        channel_of(&cordelia_crypto::derive::messages_secret(&person_secret_of(&a)).unwrap());
+
+    relay.stop();
+    let dir = relay.dir.path();
+    assert!(
+        !files_containing(dir, channel).is_empty(),
+        "the relay carried the messages channel, so its ID should be on its disk"
+    );
+    let canaries = [
+        ("subject", SUBJECT),
+        ("body", REST),
+        ("agent's name", NAME),
+        ("link", LINK),
+    ];
+    for (what, needle) in canaries {
+        let found = files_containing(dir, needle);
+        assert!(
+            found.is_empty(),
+            "the relay's disk holds a message's {what} in {found:?}"
+        );
+    }
+    // The same search finds them on the device that sent it, so an empty
+    // result above means something.
+    a.stop();
+    for (what, needle) in canaries {
+        assert!(
+            !files_containing(a.dir.path(), needle).is_empty(),
+            "the {what} should be on the device that sent it"
+        );
+    }
+}
+
 /// What a stand-in for a relay was sent on a stream of entries: the
 /// stream it came on, its bytes as they travelled, and the request that
 /// they are, where they are one.
@@ -3244,8 +3329,12 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
                 .then_some(())
         },
     );
+    // Each send that goes is counted, whether or not it says so.
+    let said_no_room = std::cell::Cell::new(0u64);
     let said = wait_for("send says a relay has no room", &[&a], 90, || {
-        let said = String::from_utf8_lossy(&sends("the next\n").stdout).into_owned();
+        let output = sends("the next\n");
+        said_no_room.set(said_no_room.get() + u64::from(output.status.success()));
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
         said.contains("no room").then_some(said)
     });
     assert!(
@@ -3258,5 +3347,24 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
     );
     // Passes go on, and what was refused is offered again.
     std::thread::sleep(std::time::Duration::from_secs(10));
+    assert_eq!(how_it_stands(&a), before);
+
+    // The `messages` object counts what was refused, each message once,
+    // and names who fills the channel; nothing of it is in what the level
+    // is worked out from, and no message enters the outbox of the older
+    // kind, which a relay's refusal there would fill.
+    let sent = 1 + said_no_room.get();
+    let status = wait_for("the status counts every message refused", &[&a], 60, || {
+        let status: serde_json::Value =
+            serde_json::from_str(&a.cli(&["status", "--json"])).unwrap();
+        (status["messages"]["refused_for_room"] == sent).then_some(status)
+    });
+    let messages = &status["messages"];
+    assert_eq!(messages["waiting"], sent, "{messages}");
+    assert_eq!(messages["filled_by"]["label"], "laptop", "{messages}");
+    assert_eq!(messages["filled_by"]["entries"], sent, "{messages}");
+    assert_eq!(messages["no_place"], false, "{messages}");
+    assert_eq!(status["outbox_refused"], serde_json::json!([]), "{status}");
+    assert_eq!(status["outbox_waiting"], 0, "{status}");
     assert_eq!(how_it_stands(&a), before);
 }

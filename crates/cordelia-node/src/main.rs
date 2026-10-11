@@ -1218,6 +1218,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             });
             out["outbox_waiting"] = live["outbox_waiting"].clone();
             out["outbox_refused"] = live["outbox_refused"].clone();
+            // What the node says of messages between its person's agents,
+            // as it gave it, where it gives it (decision 2026-10-09 §8):
+            // here alone, and in nothing the level is worked out from.
+            if live["messages"].is_object() {
+                out["messages"] = live["messages"].clone();
+            }
         }
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
@@ -1512,21 +1518,7 @@ fn gather_status(config_path: &str) -> GatheredStatus {
     let Ok(live) = local_api(&config, false, "/api/v1/status", timeout) else {
         return out;
     };
-    out.facts.running = true;
-    out.facts.uptime_secs = live["uptime_secs"].as_u64();
-    // By the node's own clock. A node that does not say gives none.
-    out.facts.no_relay_secs = live["no_relay_secs"].as_u64();
-    // Only the command knows that the node is another version than it.
-    out.facts.other_version = live["version"].as_str() != Some(env!("CARGO_PKG_VERSION"));
-    out.facts.held = live["held"]["by"].as_str().map(str::to_string);
-    out.facts.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
-    out.facts.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
-    out.facts.outbox_refused = live["outbox_refused"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["refusals"].as_u64() >= Some(indicator::REFUSALS_BEFORE_ATTENTION))
-        .count() as u64;
+    indicator::running(&mut out.facts, &live);
     out.live = Some(live);
 
     if let Ok(sync) = local_api(&config, true, "/api/v1/sync/status", timeout) {

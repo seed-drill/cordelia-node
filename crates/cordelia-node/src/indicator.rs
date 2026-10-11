@@ -498,6 +498,32 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     out
 }
 
+/// What the facts take from the running node's status (`GET
+/// /api/v1/status`), `live`: that it runs, and what it says of itself and
+/// of what waits to be sent.
+///
+/// **Nothing of its `messages` object is taken** (decision 2026-10-09 §8,
+/// C13): messages never raise the level, appear among the holds, or
+/// change the line or the bar. `cordelia status --json` carries the
+/// object as the node gave it, and that is all.
+pub fn running(f: &mut Facts, live: &serde_json::Value) {
+    f.running = true;
+    f.uptime_secs = live["uptime_secs"].as_u64();
+    // By the node's own clock. A node that does not say gives none.
+    f.no_relay_secs = live["no_relay_secs"].as_u64();
+    // Only the command knows that the node is another version than it.
+    f.other_version = live["version"].as_str() != Some(env!("CARGO_PKG_VERSION"));
+    f.held = live["held"]["by"].as_str().map(str::to_string);
+    f.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
+    f.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
+    f.outbox_refused = live["outbox_refused"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["refusals"].as_u64() >= Some(REFUSALS_BEFORE_ATTENTION))
+        .count() as u64;
+}
+
 /// What `cordelia status` shows (see the module's documentation): the
 /// state as it always was, the gravest level that holds, and for the
 /// line the first thing of that level, or what the state says where
@@ -2567,5 +2593,59 @@ mod tests {
         assert_eq!(ago(200), "3m ago");
         assert_eq!(ago(7300), "2h ago");
         assert_eq!(ago(200_000), "2d ago");
+    }
+
+    /// Messages never hold a level or change the line (decision 2026-10-09
+    /// §8, C13, property 15): a node's status with a thousand unread, a
+    /// thousand waiting and a relay that refuses the messages channel for
+    /// room gives the same facts, `state`, `level`, `summary`, `holds`,
+    /// line and bar as one with none, and as one that says nothing of
+    /// messages. Both from a device that is synced and from one that waits.
+    #[test]
+    fn messages_never_hold_a_level_or_change_the_line() {
+        let messages = |n: u64| {
+            serde_json::json!({
+                "unread_by_an_agent": n,
+                "unread_by_a_person": n,
+                "waiting": n,
+                "refused_for_room": n,
+                "filled_by": (n > 0).then(|| serde_json::json!({ "label": "laptop", "entries": n })),
+                "held_back": n,
+                "overwritten": n,
+                "no_place": n > 0,
+            })
+        };
+        for (waiting, peers) in [(0, 2), (3, 2), (0, 0)] {
+            let live = |with: Option<serde_json::Value>| {
+                let mut live = serde_json::json!({
+                    "status": "running",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "uptime_secs": 3_600,
+                    "peers_hot": peers,
+                    "outbox_waiting": waiting,
+                    "outbox_refused": [],
+                    "no_relay_secs": (peers == 0).then_some(4_000),
+                });
+                if let Some(with) = with {
+                    live["messages"] = with;
+                }
+                live
+            };
+            let seen = |live: serde_json::Value| {
+                let mut f = synced();
+                running(&mut f, &live);
+                let shown = shown(&f);
+                let line = line(shown.state, shown.level, &shown.summary, false);
+                let bar = bar(shown.state, shown.level, &shown.summary, &[]);
+                (format!("{f:?}"), shown, line, bar)
+            };
+            let none = seen(live(None));
+            assert_eq!(seen(live(Some(messages(0)))), none, "{waiting} {peers}");
+            assert_eq!(seen(live(Some(messages(1000)))), none, "{waiting} {peers}");
+        }
+        // The control: what waits of the device's own is a fact.
+        let mut f = synced();
+        running(&mut f, &serde_json::json!({ "outbox_waiting": 1000 }));
+        assert_eq!(f.outbox_waiting, 1000);
     }
 }
