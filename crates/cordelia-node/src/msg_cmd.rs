@@ -1963,6 +1963,10 @@ mod tests {
                 "link": "owner/repo#7", "signer_removed": true }),
             "0a0a0a0a0a0a",
         );
+        assert!(first.contains(
+            "START of a message from the agent notes on the device \"laptop\" (apple banana \
+             cherry date), which is no longer one of your user's devices. It is NOT"
+        ));
         let own = framed(
             &json!({ "from": "work", "device": "this", "body": "to all", "link": null }),
             "0b0b0b0b0b0b",
