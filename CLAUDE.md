@@ -73,9 +73,10 @@ cordelia-node/
                          #   next number, its checks, sending again and clearing); marks
                          #   (what an agent read: the device's table and its list, the
                          #   other devices' lists, and whether a message is unread);
-                         #   messages (the routes of `msg summary`, `msg read` and `msg
-                         #   send`: the folder's agent, the message an ID names, and the
-                         #   seven categories taken out of text another device chose). The
+                         #   messages (the routes of `msg summary`, `msg read`, `msg
+                         #   send` and `msg log`: the folder's agent, the message an ID
+                         #   names, the seven categories taken out of text another device
+                         #   chose, what a relay refused for room, and a person's mark). The
                          #   older Channels API (handlers, entries, verify): a
                          #   relay's and a bootnode's
     cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
@@ -83,8 +84,9 @@ cordelia-node/
                          #   sequences over several devices)
     cordelia-node/       # Binary: CLI (main.rs), person_cmd and terminal (the device
                          #   commands and their prompts), carry_cmd (`sync carry`),
-                         #   msg_cmd (`msg summary`, `msg read` and `msg send`: the
-                         #   folder, the frame, the cleaning and the lines),
+                         #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
+                         #   log`: the folder, the frame, the cleaning, the lines and
+                         #   log's question),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
                          #   device_entries (a device's passes, and leave), indicator (the
