@@ -1242,7 +1242,7 @@ pub fn merge_own_list(
         Some(listed) => {
             // Up past the highest and back, as the UNIQUE on seq allows.
             if let Some(highest) = highest_seq(conn)?.filter(|highest| *highest > listed) {
-                let below = subtracted(highest, listed)?;
+                let below = highest - listed;
                 let up = added(below, count)?;
                 conn.execute(
                     "UPDATE message_read_here SET seq = seq + ?2 WHERE seq > ?1",
@@ -1278,7 +1278,7 @@ pub fn merge_own_list(
             )?,
         };
         if inserted == 1 {
-            seq -= 1;
+            seq = subtracted(seq, 1)?;
             merged += 1;
         }
     }
@@ -1399,6 +1399,63 @@ pub fn read_by(conn: &Connection, id: &Id, name: &str) -> Result<ReadBy, Storage
             .filter_map(|key| key.try_into().ok())
             .collect(),
     })
+}
+
+// ── The device's own marks of what it showed ────────────────────────
+
+/// `summary` printed the line of message `id` to the agent of `name` on
+/// this device (decision 2026-10-09 §4.1, §7.2, C5): from then on it is
+/// only counted there. In the caller's write. The mark goes with its
+/// message.
+pub fn announce(conn: &Connection, id: &Id, name: &str) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO message_announced (id, name) VALUES (?1, ?2)",
+        params![&id[..], name],
+    )?;
+    Ok(())
+}
+
+/// Whether `summary` has printed the line of message `id` to the agent of
+/// `name` on this device.
+pub fn is_announced(conn: &Connection, id: &Id, name: &str) -> Result<bool, StorageError> {
+    let held: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_announced WHERE id = ?1 AND name = ?2",
+        params![&id[..], name],
+        |row| row.get(0),
+    )?;
+    Ok(held > 0)
+}
+
+/// Whether a person has read message `id` on this device (decision
+/// 2026-10-09 §7.2): only `log` at a terminal, with yes, marks it.
+pub fn is_read_by_a_person(conn: &Connection, id: &Id) -> Result<bool, StorageError> {
+    let held: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_read_by_a_person WHERE id = ?1",
+        [&id[..]],
+        |row| row.get(0),
+    )?;
+    Ok(held > 0)
+}
+
+/// How many entries of the channel `channel` the store holds of each
+/// author, the most first, and between two of one count by key (decision
+/// 2026-10-09 §10): the signer whose entries fill the messages channel at
+/// a relay that refused it for room is the first.
+pub fn entries_by_author(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<([u8; 32], u64)>, StorageError> {
+    let rows: Vec<(Vec<u8>, i64)> = conn
+        .prepare(
+            "SELECT author, COUNT(*) AS held FROM entries WHERE channel_id = ?1
+             GROUP BY author ORDER BY held DESC, author",
+        )?
+        .query_map([&channel[..]], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(author, held)| Some((author.try_into().ok()?, from_sql(held))))
+        .collect())
 }
 
 fn mark_of(bytes: &[u8]) -> Mark {
@@ -1699,6 +1756,75 @@ mod tests {
                 (vec![2; 16], "desktop".to_string(), 9, vec![0; 3], 2),
             ]
         );
+    }
+
+    /// That `summary` announced a message is kept for one name, and that a
+    /// person read it for the device; each goes with its message
+    /// (decision 2026-10-09 §7.2).
+    #[test]
+    fn the_marks_of_what_a_device_showed_are_by_name_and_go_with_their_message() {
+        let conn = db::open_in_memory().unwrap();
+        indexed(&conn, 1, 1);
+        indexed(&conn, 2, 2);
+        conn.execute_batch("DELETE FROM message_announced; DELETE FROM message_read_by_a_person;")
+            .unwrap();
+        let (one, two) = ([1; 16], [2; 16]);
+        assert!(!is_announced(&conn, &one, "notes").unwrap());
+        announce(&conn, &one, "notes").unwrap();
+        // Twice is once.
+        announce(&conn, &one, "notes").unwrap();
+        assert!(is_announced(&conn, &one, "notes").unwrap());
+        assert!(!is_announced(&conn, &one, "work").unwrap());
+        assert!(!is_announced(&conn, &two, "notes").unwrap());
+        assert_eq!(count(&conn, "message_announced"), 1);
+
+        assert!(!is_read_by_a_person(&conn, &one).unwrap());
+        conn.execute(
+            "INSERT INTO message_read_by_a_person (id) VALUES (?1)",
+            [&one[..]],
+        )
+        .unwrap();
+        assert!(is_read_by_a_person(&conn, &one).unwrap());
+        assert!(!is_read_by_a_person(&conn, &two).unwrap());
+
+        drop_row(&conn, &one, 200).unwrap();
+        assert!(!is_announced(&conn, &one, "notes").unwrap());
+        assert!(!is_read_by_a_person(&conn, &one).unwrap());
+    }
+
+    /// The entries of a channel are counted by author, the most first,
+    /// and those of another channel are not counted (decision 2026-10-09
+    /// §10).
+    #[test]
+    fn entries_are_counted_by_author_the_most_first() {
+        let conn = db::open_in_memory().unwrap();
+        let mut seq = 0;
+        let mut entry = |channel: u8, slot: u8, author: u8| {
+            seq += 1;
+            conn.execute(
+                "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                      author_sig, channel_sig, seq, stored_at, channel_place)
+                 VALUES (?1, ?2, ?3, 1, 0, X'00', zeroblob(64), zeroblob(64), ?4, 0, ?4)",
+                params![&[channel; 32][..], &[slot; 32][..], &[author; 32][..], seq],
+            )
+            .unwrap();
+        };
+        for slot in 0..3 {
+            entry(1, slot, 9);
+        }
+        for slot in 0..5 {
+            entry(1, slot, 4);
+        }
+        entry(1, 0, 6);
+        entry(1, 1, 5);
+        for slot in 0..8 {
+            entry(2, slot, 7);
+        }
+        assert_eq!(
+            entries_by_author(&conn, &[1; 32]).unwrap(),
+            vec![([4; 32], 5), ([9; 32], 3), ([5; 32], 1), ([6; 32], 1)]
+        );
+        assert!(entries_by_author(&conn, &[3; 32]).unwrap().is_empty());
     }
 
     /// A mark as the table keeps it: the mark, its ID and name, and when it
@@ -2945,7 +3071,8 @@ mod tests {
     /// A `seq` at either end of a 64-bit integer, of a damaged store,
     /// makes a mark or a merge fail and not panic (decision 2026-10-09
     /// §7.2): a mark above one at the top, a merge above what was listed
-    /// at the top, a merge below one at the bottom, and a merge into a
+    /// at the top, a merge below one at the bottom, a merge of two whose
+    /// first goes at the lowest an integer has, and a merge into a
     /// table with marks at both ends, where the rows made since are moved
     /// up past the top, or where the merged go below the bottom.
     #[test]
@@ -2979,6 +3106,12 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         bare(&conn, [0xb2; 16], i64::MIN);
         assert!(merge_own_list(&conn, &[[0xb2; 16], [0xb3; 16]], &[], 200).is_err());
+
+        // The lowest one above an integer's lowest, and no list written: a
+        // list of two goes at the lowest and then below it.
+        let conn = db::open_in_memory().unwrap();
+        bare(&conn, [0xb7; 16], i64::MIN + 1);
+        assert!(merge_own_list(&conn, &[[0xb8; 16], [0xb9; 16]], &[], 200).is_err());
 
         for listed in [None, Some("0")] {
             let conn = db::open_in_memory().unwrap();

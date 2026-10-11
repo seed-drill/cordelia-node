@@ -22,6 +22,9 @@ thiserror = { workspace = true }
 # Overwrites a secret when its value is dropped. The crypto crate already
 # brings it: this adds no crate to the build.
 zeroize = { workspace = true }
+# The seven categories of characters that the messages' commands take out
+# of a name, a label, a subject or a link, and escape in a body.
+unicode-general-category = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

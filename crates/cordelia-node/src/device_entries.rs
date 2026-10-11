@@ -2003,6 +2003,11 @@ impl DeviceEntries {
                 // §8): what it refused still waits, and is sent again.
                 if channel.kind != Kind::Messages {
                     self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                } else if done.no_room > 0 || done.refused == Some(Pushed::NoRoom) {
+                    // It is kept for `send`, which says so (§4.1, §10).
+                    self.state
+                        .own_channels
+                        .say_no_room_for_messages(&channel.id);
                 }
                 // The wait begins, or doubles, once for what was offered:
                 // and not for what is refused while it lasts.

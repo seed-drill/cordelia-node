@@ -24,6 +24,10 @@
 //! says which names a device syncs through [`names`], and a device's
 //! local API for the names it holds is [`local`], through the same path.
 //!
+//! Messages between the person's own agents are sent and read through
+//! [`messages`], behind the sender ([`sender`]), the reader ([`reader`])
+//! and the marks ([`marks`]).
+//!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
 //! other role serves [`configure_routes`], with the Channels API of the
@@ -46,6 +50,7 @@ pub mod leaving;
 pub mod local;
 pub mod look;
 pub mod marks;
+pub mod messages;
 pub mod names;
 pub mod person;
 pub mod publish;
@@ -124,6 +129,14 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
     // channels, and of nothing of the older kind.
     cfg.route("/api/v1/status", web::get().to(local::status));
     cfg.route("/api/v1/metrics", web::get().to(local::metrics));
+    // Messages between the person's own agents (decision 2026-10-09
+    // §4.2): each needs the node's token, and is a personal node's.
+    cfg.service(
+        web::scope("/api/v1/messages")
+            .route("/summary", web::post().to(messages::summary))
+            .route("/read", web::post().to(messages::read))
+            .route("/send", web::post().to(messages::send)),
+    );
     shared_routes(cfg);
 }
 
