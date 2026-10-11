@@ -103,9 +103,12 @@ fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
         return Some(Layout::GitNotRun);
     };
     loop {
+        // The time is taken before git is looked at: an answer seen after
+        // the deadline is not taken, however soon after it git ended.
+        let in_time = std::time::Instant::now() < deadline;
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
+            Ok(Some(_)) if in_time => break,
+            Ok(None) if in_time => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             _ => {
@@ -1683,7 +1686,12 @@ mod tests {
         assert!(made.status.success());
         assert_eq!(memory_root_by(&notes, in_time()), Some(base.join("repo")));
         assert_eq!(memory_root_by(&notes, in_time()), Some(memory_root(&notes)));
-        assert_eq!(memory_root_by(&notes, Instant::now()), None);
+        // A deadline past before git is looked at gives no answer, though
+        // git ended before that look, as it may on a loaded machine: asked
+        // often, so that one such end is likely among them.
+        for _ in 0..500 {
+            assert_eq!(memory_root_by(&notes, Instant::now()), None);
+        }
     }
 
     /// The notice as a status carries it: one record for each time it

@@ -812,15 +812,18 @@ pub fn not_every_relay(conn: &Connection, own: &[u8; 32]) -> Result<Vec<Id>, Sto
 
 /// The device's own messages, signed by `own`, of the messages channel
 /// `channel`, whose entry a relay had no room for and that wait to be sent
-/// there again (decision 2026-10-09 §10, C15): an entry of the device's
-/// own at a message's number that a relay refused for room, while the
-/// store holds it (`at_relays_refused`), outside `list_slot`, the slot of
-/// its list, whose revision says nothing of a number. In order of ID.
+/// there again (decision 2026-10-09 §8, §10, C15): an entry of the
+/// device's own at a message's number that a relay refused for room,
+/// while the store holds it (`at_relays_refused`), outside `list_slot`,
+/// the slot of its list, whose revision says nothing of a number. Of
+/// those that wait ([`kept_count`]): kept in the generation of `channel`
+/// and not expired at `now`. In order of ID.
 pub fn refused_for_room(
     conn: &Connection,
     channel: &[u8; 32],
     own: &[u8; 32],
     list_slot: &[u8; 32],
+    now: i64,
 ) -> Result<Vec<Id>, StorageError> {
     let ids: Vec<Vec<u8>> = conn
         .prepare(
@@ -829,12 +832,20 @@ pub fn refused_for_room(
              JOIN message_generations g ON g.channel = r.channel
              JOIN message_numbers n
                  ON n.signer = e.author AND n.generation = g.id AND n.number = e.rev / 2
+             JOIN message_kept k ON k.id = n.id AND k.generation = g.id AND ?4 - k.sent < ?5
              WHERE r.channel = ?1 AND e.author = ?2 AND e.rev % 2 = 0 AND e.slot <> ?3
              ORDER BY n.id",
         )?
-        .query_map(params![&channel[..], &own[..], &list_slot[..]], |row| {
-            row.get(0)
-        })?
+        .query_map(
+            params![
+                &channel[..],
+                &own[..],
+                &list_slot[..],
+                now,
+                i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS
+            ],
+            |row| row.get(0),
+        )?
         .collect::<Result<_, _>>()?;
     Ok(ids.iter().map(|id| id_of(id)).collect())
 }
@@ -1572,6 +1583,38 @@ pub fn read_by(conn: &Connection, id: &Id, name: &str) -> Result<ReadBy, Storage
         lists: lists
             .into_iter()
             .filter_map(|key| key.try_into().ok())
+            .collect(),
+    })
+}
+
+/// Every mark that says a message read by an agent (decision 2026-10-09
+/// §7.2), as [`read_marks`] reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarksRead {
+    /// The marks of the device's own table, with their IDs and names or
+    /// as bare hashes.
+    pub here: Vec<Mark>,
+    /// The marks of each list kept, with its key.
+    pub lists: Vec<([u8; 32], Mark)>,
+}
+
+/// Every mark that says a message read by an agent, read with two
+/// statements for all messages at once: what [`read_by`] reads of one
+/// message. Which keys count is the caller's to say.
+pub fn read_marks(conn: &Connection) -> Result<MarksRead, StorageError> {
+    let here: Vec<Vec<u8>> = conn
+        .prepare("SELECT mark FROM message_read_here")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let lists: Vec<(Vec<u8>, Vec<u8>)> = conn
+        .prepare("SELECT key, mark FROM message_lists")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(MarksRead {
+        here: here.iter().map(|mark| mark_of(mark)).collect(),
+        lists: lists
+            .into_iter()
+            .filter_map(|(key, mark)| Some((key.try_into().ok()?, mark_of(&mark))))
             .collect(),
     })
 }

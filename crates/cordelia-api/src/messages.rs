@@ -820,7 +820,7 @@ pub fn send_of(
     };
     let to = replied_to.into_inner().unwrap_or(to);
     // The message is sent: what is not known of the room is no refusal.
-    let filled_by = match room_of(conn, &identity.public_key(), no_room) {
+    let filled_by = match room_of(conn, &identity.public_key(), at.now, no_room) {
         Ok(room) => room.filled_by,
         Err(e) => {
             tracing::warn!("messages: a message was sent, and its room is not known: {e}");
@@ -852,14 +852,15 @@ pub struct Room {
 
 /// What a relay refused of the messages channel of the generation applied
 /// for room (decision 2026-10-09 §4.1, §10, C15): the messages of this
-/// device's own, signed by `own`, that wait refused at a relay; and, where
-/// a relay refused the channel for room since the node started (`no_room`,
-/// of the channel's ID) or such a message waits, the signer whose entries
-/// fill the channel, by the count of entries of each author that the
-/// device holds of it, with that count.
+/// device's own, signed by `own`, that wait refused at a relay at `now`;
+/// and, where a relay refused the channel for room since the node started
+/// (`no_room`, of the channel's ID) or such a message waits, the signer
+/// whose entries fill the channel, by the count of entries of each author
+/// that the device holds of it, with that count.
 pub fn room_of(
     conn: &Connection,
     own: &[u8; 32],
+    now: i64,
     no_room: impl FnOnce(&[u8; 32]) -> bool,
 ) -> Result<Room, PersonError> {
     let Some(channel) = messages_channel(conn)? else {
@@ -871,7 +872,7 @@ pub fn room_of(
         &derive::slot_key(&secret)?,
         &cordelia_crypto::message::read_name(own)?,
     );
-    let refused = kept(held::refused_for_room(conn, &channel, own, &list_slot))?;
+    let refused = kept(held::refused_for_room(conn, &channel, own, &list_slot, now))?;
     if !no_room(&channel) && refused.is_empty() {
         return Ok(Room::default());
     }
@@ -992,18 +993,18 @@ pub fn status_of(
             .into_iter()
             .map(|mapping| mapping.name)
             .collect();
-        // What is shown is read once, and who counts worked out once, for
-        // the whole object: its cost grows with the messages and with the
-        // names, and not with the two multiplied by a read of the index.
+        // What is shown is read once, who counts worked out once, and the
+        // marks read once, for the whole object: its cost grows with the
+        // messages and with the names, and not with the two multiplied by
+        // a read of the store.
+        let read = marks::read_now(conn, &counting)?;
         let mut unread_by_an_agent = 0;
         let mut unread_by_a_person = 0;
         for message in kept(held::shown(conn, now))? {
             let id = id_of(&message.id)?;
             if counting.counts(&key_of(&message.signer)?) {
                 for name in &names {
-                    if marks::is_for(&message, &own, name)
-                        && !marks::read_on(conn, &id, name, &counting)?.is_read()
-                    {
+                    if marks::is_for(&message, &own, name) && !read.is_read(&id, name) {
                         unread_by_an_agent += 1;
                     }
                 }
@@ -1019,7 +1020,7 @@ pub fn status_of(
                 unread_by_a_person += 1;
             }
         }
-        let room = room_of(conn, &own, |channel| {
+        let room = room_of(conn, &own, now, |channel| {
             own_channels.no_room_for_messages(channel)
         })?;
         Ok(Some(Counts {
@@ -1395,7 +1396,7 @@ fn log_in(
             .iter()
             .any(|m| m.id[..] == id[..] && m.signer[..] == own[..] && m.from == *name),
     };
-    let room = room_of(conn, &own, no_room)?;
+    let room = room_of(conn, &own, now, no_room)?;
     let waiting = kept(held::kept(conn))?
         .into_iter()
         .filter(|kept| Some(kept.generation) == current && !room.refused.contains(&kept.id))
@@ -3896,6 +3897,15 @@ mod tests {
             assert!(answered.get(key).is_some(), "{key}");
         }
         assert_eq!(answered.as_object().unwrap().len(), 8);
+        // A message refused whose 30 days are up waits no more, and is
+        // refused of those that wait no more, until the hourly task.
+        conn.execute(
+            "UPDATE message_kept SET sent = ?2 WHERE id = ?1",
+            rusqlite::params![&second.id[..], now - 30 * 24 * 60 * MINUTE],
+        )
+        .unwrap();
+        let on_0 = counts(0, &channels);
+        assert_eq!((on_0.waiting, on_0.refused_for_room), (2, 1));
 
         // A device that does not stand applied says nothing of messages.
         held_rows::set_state(&s[1].conn, State::Removed).unwrap();
@@ -3915,10 +3925,10 @@ mod tests {
     /// The status of device 0, with `names` folders mapped and `messages`
     /// messages to every name from each of three other devices, all shown:
     /// how many times it read who counts (the statement of the additions
-    /// that `who_counts` and every `Standing` read) and what is shown (the
-    /// statement of `held::shown`), and its count of what is unread by an
-    /// agent.
-    fn work_of_a_status(names: usize, messages: u64) -> (usize, usize, u64) {
+    /// that `who_counts` and every `Standing` read), what is shown (the
+    /// statement of `held::shown`), the device's own marks and the lists
+    /// kept, and its count of what is unread by an agent.
+    fn work_of_a_status(names: usize, messages: u64) -> ([usize; 4], u64) {
         let mut s = devices(4);
         let now = s.now + MINUTE;
         let mapped: Vec<Value> = (0..names)
@@ -3948,33 +3958,36 @@ mod tests {
         let ran = RAN.with(|ran| ran.borrow().clone());
         let of = |what: &str| ran.iter().filter(|sql| sql.contains(what)).count();
         (
-            of("FROM person_additions"),
-            of("MIN(i.sent, i.first_held) AS shown_at, i.subject"),
+            [
+                of("FROM person_additions"),
+                of("MIN(i.sent, i.first_held) AS shown_at, i.subject"),
+                of("FROM message_read_here"),
+                of("FROM message_lists"),
+            ],
             counts.unread_by_an_agent,
         )
     }
 
     /// The work of a status does not grow with the names mapped times the
-    /// messages shown (decision 2026-10-09 §8, property 15): who counts is
-    /// read as often, and what is shown read once, whether 3 or 30 names
-    /// are mapped and whether 2 or 20 messages of each signer are shown. A
+    /// messages shown (decision 2026-10-09 §8, property 15): who counts,
+    /// the device's own marks and the lists kept are read as often, and
+    /// what is shown read once, whether 3 or 30 names are mapped and
+    /// whether 2 or 20 messages of each signer are shown. A
     /// status is asked for every few seconds, inside the store's write, and
     /// one that took longer than a command waits would say that the node
     /// had stopped.
     #[test]
     fn a_status_reads_who_counts_and_what_is_shown_as_often_whatever_is_mapped() {
-        let (counted, shown, unread) = work_of_a_status(3, 2);
+        let (work, unread) = work_of_a_status(3, 2);
         assert_eq!(unread, 3 * 3 * 2);
+        let [counted, shown, here, lists] = work;
         assert_eq!(shown, 1);
         assert!(counted >= 1, "{counted}");
+        assert!(here >= 1 && lists >= 1, "{work:?}");
         for (names, messages) in [(30, 2), (3, 20), (30, 20)] {
-            let (more_counted, more_shown, unread) = work_of_a_status(names, messages);
+            let (more, unread) = work_of_a_status(names, messages);
             assert_eq!(unread, names as u64 * 3 * messages, "{names} {messages}");
-            assert_eq!(
-                (more_counted, more_shown),
-                (counted, shown),
-                "{names} names, {messages} messages"
-            );
+            assert_eq!(more, work, "{names} names, {messages} messages");
         }
     }
 }

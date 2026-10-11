@@ -329,6 +329,33 @@ pub fn read_on(
     })
 }
 
+/// What [`read_on`] says of every message and name at once, read with two
+/// statements (decision 2026-10-09 §7.2, §8): the marks of the device's
+/// own table, a bare hash among them, and those of the latest list of
+/// each key that counts by `counting`. The status asks it of each message
+/// and each name mapped.
+pub struct ReadNow(std::collections::HashSet<Mark>);
+
+/// The marks that say a message read now.
+pub fn read_now(conn: &Connection, counting: &Counting) -> Result<ReadNow, PersonError> {
+    let read = kept(held::read_marks(conn))?;
+    let mut marks: std::collections::HashSet<Mark> = read.here.into_iter().collect();
+    marks.extend(
+        read.lists
+            .into_iter()
+            .filter(|(key, _)| counting.counts(key))
+            .map(|(_, mark)| mark),
+    );
+    Ok(ReadNow(marks))
+}
+
+impl ReadNow {
+    /// Whether an agent of `name` read message `id`.
+    pub fn is_read(&self, id: &Id, name: &str) -> bool {
+        self.0.contains(&message::read_mark(id, name))
+    }
+}
+
 /// The messages shown at `now` that are unread by the agent of `name` on
 /// this device (decision 2026-10-09 §7.2): addressed to its name or to
 /// every name, not sent by it from this device, and read by no agent of
@@ -532,6 +559,45 @@ mod tests {
         s.pass(0, 1);
         let marked = read_here(&s[1].conn, &s[1].identity, "notes", &later, t + 1, true);
         assert_eq!(marked.unwrap(), Marked::default());
+    }
+
+    /// The marks read at once say what `read_on` says of each message and
+    /// name (decision 2026-10-09 §7.2): a mark of the device's own table
+    /// counts, with its ID and name or as a bare hash, and a list's mark
+    /// counts only where its key counts now.
+    #[test]
+    fn the_marks_read_at_once_say_what_read_on_says() {
+        let s = devices(2);
+        let t = s.now;
+        let conn = &s[0].conn;
+        let marked = sends(&s, 0, "~", "notes", "marked here", t);
+        held::mark_read(conn, &marked, "notes", t).unwrap();
+        let bare = [0xb1; 16];
+        conn.execute(
+            "INSERT INTO message_read_here (mark, seq, made_at, merged_at)
+             VALUES (?1, 1000, ?2, ?2)",
+            rusqlite::params![&read_mark(&bare, "notes")[..], t],
+        )
+        .unwrap();
+        let listed = [0xc1; 16];
+        held::keep_list(conn, &s.key(1), &[read_mark(&listed, "notes")]).unwrap();
+        let not_counted = [0xd1; 16];
+        held::keep_list(conn, &[0x99; 32], &[read_mark(&not_counted, "notes")]).unwrap();
+        let counting = who_counts(conn).unwrap();
+        let now = read_now(conn, &counting).unwrap();
+        for (id, read) in [
+            (marked, true),
+            (bare, true),
+            (listed, true),
+            (not_counted, false),
+            ([0xe1; 16], false),
+        ] {
+            for name in ["notes", "work"] {
+                let one = read_on(conn, &id, name, &counting).unwrap().is_read();
+                assert_eq!(one, read && name == "notes", "{id:?} {name}");
+                assert_eq!(now.is_read(&id, name), one, "{id:?} {name}");
+            }
+        }
     }
 
     /// A list that arrives before the message it marks loses nothing
