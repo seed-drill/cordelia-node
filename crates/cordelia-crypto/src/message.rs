@@ -851,6 +851,26 @@ mod tests {
             ..smallest()
         };
         assert_eq!(body.to_value(names), Err(NotAMessage::BodyTooLong(65_537)));
+        // Where what it would read back as is no message, it is refused for
+        // its length still, and not for what it would read back as: a from
+        // of `A`s as a name that is none, a to of `t`s and a link of `1`s as
+        // a link that is none.
+        for long in [
+            Message {
+                from: "A".repeat(65_537),
+                ..smallest()
+            },
+            Message {
+                to: To::Name("t".repeat(65_537)),
+                ..smallest()
+            },
+            Message {
+                link: Some("1".repeat(2_053)),
+                ..smallest()
+            },
+        ] {
+            assert_eq!(long.to_value(names), Err(NotAMessage::Field));
+        }
     }
 
     /// What a relay sees of a message and of its clearing: the same
@@ -1332,6 +1352,13 @@ mod tests {
             .link,
             None
         );
+        // The sender refuses a link given as nothing as a link: written, it
+        // would read back as none.
+        let nothing = Message {
+            link: Some(String::new()),
+            ..smallest()
+        };
+        assert_eq!(nothing.to_value(names), Err(NotAMessage::Link));
 
         // A body empty, past its bound, or not UTF-8.
         assert_eq!(

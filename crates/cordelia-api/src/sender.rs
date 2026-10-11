@@ -2325,8 +2325,9 @@ mod tests {
     /// written again, none larger than what it replaces. A first message of
     /// another device is refused for room, and that device's `log` says so,
     /// and names the signer whose entries fill the channel, by the count of
-    /// each author's entries that it holds of the channel (decision
-    /// 2026-10-09 §2.2, §4.1, §10, C15, T3).
+    /// each author's entries that it holds of the channel, as its status's
+    /// `messages` object does (decision 2026-10-09 §2.2, §4.1, §8, §10,
+    /// C15, T3).
     #[test]
     fn a_ring_slot_written_again_is_taken_by_a_full_relay() {
         let s = devices(3);
@@ -2388,6 +2389,17 @@ mod tests {
             .find(|c| c.label.as_deref() == Some("device 1"))
             .unwrap();
         assert_eq!(counted.not_messages, 79);
+        // The status says the same, from the same count (§8).
+        let status = crate::messages::status_of(
+            &s[2].conn,
+            &s[2].identity,
+            &crate::state::OwnChannels::default(),
+            later,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.refused_for_room, 1);
+        assert_eq!(status.filled_by, Some(("device 1".into(), 81)));
 
         // Laptop's 65th, the clearing of its third, and its list written
         // again: each in a slot the relay holds, and taken.

@@ -48,10 +48,10 @@ use crate::{
     shell_arg, to_this_machine, version_note,
 };
 
-/// The environment variable that Claude Code sets, in the processes of a
-/// session, to the directory the session was started in (decision
-/// 2026-10-09 §3.1). It does not change when an agent's shell changes
-/// directory.
+/// The environment variable that Claude Code gives a hook, and not the
+/// commands an agent runs, set to the directory the session was started
+/// in (decision 2026-10-09 §3.1). A command an agent runs takes the
+/// directory its shell stands in.
 pub const PROJECT_DIR: &str = "CLAUDE_PROJECT_DIR";
 
 // ── What the commands say ────────────────────────────────────────────

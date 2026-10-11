@@ -1626,6 +1626,43 @@ mod tests {
         assert_eq!(places, 0);
     }
 
+    /// The messages of the generation before go on being shown after a
+    /// statement, from the index, and each goes at its own 30 days
+    /// (decision 2026-10-09 §9.1, C11): the old channel's entries leave the
+    /// store when the statement is applied, the old row is shown beside the
+    /// new generation's until its 30 days are up, and is not shown at them;
+    /// the hourly task then drops it, and with it what was kept of its
+    /// generation, while the new generation's message stays to its own 30
+    /// days.
+    #[test]
+    fn the_old_generations_messages_expire_on_time() {
+        let mut s = Several::of_one_person(2);
+        let start = s.now;
+        let old_channel = derive::channel_id(&messages(&s, 1)).unwrap();
+        assert_eq!(given(&s, 1, &sent(&s, 0, 1, &says("old", start))), STORED);
+        let old = generation(&s, 1);
+        renewed(&mut s);
+        assert!(s[1].stored_in(&old_channel).is_empty());
+        assert_eq!(indexed(&s, 1), ["old"]);
+
+        let later = start + DAY;
+        let entry = sent(&s, 0, 1, &says("new", later));
+        assert_eq!(given_at(&s, 1, &entry, later), STORED);
+        let new = generation(&s, 1);
+        assert_ne!(new, old);
+        assert_eq!(shown_on(&s, 1, later), ["old", "new"]);
+        assert_eq!(shown_on(&s, 1, start + 30 * DAY - 1), ["old", "new"]);
+        assert_eq!(shown_on(&s, 1, start + 30 * DAY), ["new"]);
+
+        let task = hourly(&s[1].conn, &s[1].identity, start + 30 * DAY, true).unwrap();
+        assert_eq!(task.gone.expired, 1);
+        assert_eq!(indexed(&s, 1), ["new"]);
+        assert_eq!(generations_in(&s, 1, "message_generations"), [new]);
+        assert_eq!(generations_in(&s, 1, "message_first_held"), [new]);
+        assert_eq!(shown_on(&s, 1, later + 30 * DAY - 1), ["new"]);
+        assert!(shown_on(&s, 1, later + 30 * DAY).is_empty());
+    }
+
     /// Where the channel the device stands applied under cannot be read,
     /// the hourly task drops no generation, and still drops what has
     /// expired (decision 2026-10-09 §7.1): here the device's secret has

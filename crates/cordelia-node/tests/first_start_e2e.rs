@@ -436,6 +436,9 @@ fn a_node_answers_while_the_copy_of_its_first_start_is_being_made() {
         };
         assert_eq!(status["held"]["by"], "first_start", "{status}");
         assert!(why.contains("is under way"), "{why}");
+        // A node that is held up says nothing of messages (decision
+        // 2026-10-09 §8).
+        assert_eq!(status.get("messages"), None, "{status}");
         if under_way.is_none() {
             // A command is told how the node stands, and one that
             // changes anything is refused with the same words.

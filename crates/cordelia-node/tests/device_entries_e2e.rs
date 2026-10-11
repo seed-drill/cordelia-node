@@ -520,7 +520,8 @@ impl Device {
         let db = self.db();
         let now = self.engine.unix();
         held_messages::give_places(&db, &self.key(), now).unwrap();
-        marks::unread(&db, &self.state.identity, name, now)
+        let counting = cordelia_api::person::who_counts(&db).unwrap();
+        marks::unread(&db, &self.state.identity, name, now, &counting)
             .unwrap()
             .into_iter()
             .map(|shown| shown.body)
@@ -5740,6 +5741,14 @@ async fn past_the_limit_on_proofs_a_device_has_no_messages_and_says_so() {
         device.passes().await;
         let own = &device.state.own_channels;
         assert_eq!(own.no_place(), no_place, "{most_proved}");
+        // The status's `messages` object says so (§8).
+        let status = cordelia_api::messages::status_of(
+            &device.db(),
+            &device.state.identity,
+            own,
+            device.now(),
+        );
+        assert_eq!(status.unwrap().unwrap().no_place, no_place, "{most_proved}");
         let asked = asked_of(&relay, &messages);
         match no_place {
             true => assert_eq!(asked, (0, 0, 0)),
@@ -5890,6 +5899,13 @@ async fn a_refusal_for_room_of_the_messages_channel_is_said_of_no_relay() {
         let after = device.at("relay");
         assert_eq!(after.no_room, None, "{refused:?}");
         assert_eq!(after, before);
+        // A refusal for room is kept for the status's object and `send`,
+        // and one for the allowance is not (decision 2026-10-09 §8, §10).
+        assert_eq!(
+            device.state.own_channels.no_room_for_messages(&messages),
+            refused == EntryRefused::NoRoom,
+            "{refused:?}"
+        );
         assert_eq!(waits(), 0, "{refused:?}");
         // It is sent again once the wait has gone by.
         device
@@ -5935,6 +5951,36 @@ async fn a_message_answered_another_is_not_said_in_another_form() {
     device.passes().await;
     assert_eq!(asked_of(&relay, &messages).2, 1);
     assert_eq!(device.at("relay").another_form, 0);
+
+    // The entry that clears it, and the device's list, answered so too.
+    let secret = device.messages_secret();
+    let written = |name: String, rev: u64, value: Vec<u8>| {
+        let inside = message::inside(name, value);
+        let entry = Entry::seal(&secret, &device.state.identity, rev, &inside);
+        let entry = entry.unwrap().check().unwrap();
+        entries::store(&device.db(), &entry, device.now()).unwrap();
+    };
+    written(
+        message::message_name(&device.key(), 1).unwrap(),
+        message::clearing_rev(1).unwrap(),
+        message::clearing_value(),
+    );
+    device.sends().await;
+    device.passes().await;
+    assert_eq!(asked_of(&relay, &messages).2, 1, "the clearing");
+    assert_eq!(device.at("relay").another_form, 0, "the clearing");
+    let list = message::ReadMarks {
+        marks: vec![[1; 16]],
+    };
+    written(
+        message::read_name(&device.key()).unwrap(),
+        1,
+        list.to_value().unwrap(),
+    );
+    device.sends().await;
+    device.passes().await;
+    assert!(asked_of(&relay, &messages).2 >= 1, "the list");
+    assert_eq!(device.at("relay").another_form, 0, "the list");
 
     device.writes("notes", "a.md", "a text");
     device.sends().await;
@@ -6344,7 +6390,8 @@ async fn a_message_read_on_one_device_is_not_counted_unread_on_the_other() {
     assert_eq!(laptop.unread_by("work"), Vec::<String>::new());
     assert_eq!(desktop.unread_by("work"), Vec::<String>::new());
     assert_eq!(desktop.unread_by("notes"), ["for every agent"]);
-    let read_on = marks::read_on(&laptop.db(), &sent.id, "work").unwrap();
+    let counting = cordelia_api::person::who_counts(&laptop.db()).unwrap();
+    let read_on = marks::read_on(&laptop.db(), &sent.id, "work", &counting).unwrap();
     assert_eq!(read_on.devices, [desktop.key()]);
 }
 

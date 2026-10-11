@@ -664,6 +664,54 @@ pub fn held_back(
     Ok(from_sql(held))
 }
 
+/// How many live messages that have not expired wait for a place at
+/// `now`, of every signer and generation: what the status counts as held
+/// back by the reader's hour (decision 2026-10-09 §6, §8).
+pub fn held_back_in_all(conn: &Connection, now: i64) -> Result<u64, StorageError> {
+    let held: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM message_index i
+             WHERE i.placed_at IS NULL AND ?1 < {expires} AND {live}",
+            expires = expires_sql(),
+            live = live_sql(),
+        ),
+        [now],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(held))
+}
+
+/// How many numbers of every signer and generation that the device keeps
+/// left the live numbers before their message had a place (decision
+/// 2026-10-09 §2.5, §8): the counts of [`Signer::overwritten`], together.
+pub fn overwritten_in_all(conn: &Connection) -> Result<u64, StorageError> {
+    let overwritten: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(overwritten), 0) FROM message_signers",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(overwritten))
+}
+
+/// How many messages of the device's own it keeps in `generation`, the
+/// one it stands applied under, that have not expired at `now`, until
+/// every relay it is set up with has taken each (decision 2026-10-09
+/// §2.3, §8): what waits to be sent. A kept value of a generation it has
+/// left, or past its 30 days, is sent nowhere again, and goes when the
+/// device next sends or runs its hourly task.
+pub fn kept_count(conn: &Connection, generation: i64, now: i64) -> Result<u64, StorageError> {
+    let kept: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_kept WHERE generation = ?1 AND ?2 - sent < ?3",
+        params![
+            generation,
+            now,
+            i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(from_sql(kept))
+}
+
 /// A message that waits for a place at `now` ([`waiting_for_places`]):
 /// `log` lists it by its ID and its sender, as held back, and shows
 /// nothing of what it says (decision 2026-10-09 §4.1, §6).
@@ -762,15 +810,20 @@ pub fn not_every_relay(conn: &Connection, own: &[u8; 32]) -> Result<Vec<Id>, Sto
     Ok(ids.iter().map(|id| id_of(id)).collect())
 }
 
-/// The device's own messages, signed by `own`, of the messages channel
-/// `channel`, whose entry a relay had no room for and that wait to be sent
-/// there again (decision 2026-10-09 §10, C15): an entry of the device's
-/// own at a message's number that a relay refused for room, while the
-/// store holds it (`at_relays_refused`). In order of ID.
+/// The device's own messages of the messages channel `channel`, whose
+/// entry a relay had no room for and that wait to be sent there again
+/// (decision 2026-10-09 §8, §10, C15): an entry at a message's number
+/// that a relay refused for room, while the store holds it
+/// (`at_relays_refused`), outside `list_slot`, the slot of the device's
+/// list, whose revision says nothing of a number. Of those that wait
+/// ([`kept_count`]): kept in the generation of `channel` and not expired
+/// at `now`. Only the device's own are kept, and a message's ID is of its
+/// signer, so another's entry is never among them. In order of ID.
 pub fn refused_for_room(
     conn: &Connection,
     channel: &[u8; 32],
-    own: &[u8; 32],
+    list_slot: &[u8; 32],
+    now: i64,
 ) -> Result<Vec<Id>, StorageError> {
     let ids: Vec<Vec<u8>> = conn
         .prepare(
@@ -779,10 +832,19 @@ pub fn refused_for_room(
              JOIN message_generations g ON g.channel = r.channel
              JOIN message_numbers n
                  ON n.signer = e.author AND n.generation = g.id AND n.number = e.rev / 2
-             WHERE r.channel = ?1 AND e.author = ?2 AND e.rev % 2 = 0
+             JOIN message_kept k ON k.id = n.id AND k.generation = g.id AND ?3 - k.sent < ?4
+             WHERE r.channel = ?1 AND e.rev % 2 = 0 AND e.slot <> ?2
              ORDER BY n.id",
         )?
-        .query_map(params![&channel[..], &own[..]], |row| row.get(0))?
+        .query_map(
+            params![
+                &channel[..],
+                &list_slot[..],
+                now,
+                i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS
+            ],
+            |row| row.get(0),
+        )?
         .collect::<Result<_, _>>()?;
     Ok(ids.iter().map(|id| id_of(id)).collect())
 }
@@ -1520,6 +1582,38 @@ pub fn read_by(conn: &Connection, id: &Id, name: &str) -> Result<ReadBy, Storage
         lists: lists
             .into_iter()
             .filter_map(|key| key.try_into().ok())
+            .collect(),
+    })
+}
+
+/// Every mark that says a message read by an agent (decision 2026-10-09
+/// §7.2), as [`read_marks`] reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarksRead {
+    /// The marks of the device's own table, with their IDs and names or
+    /// as bare hashes.
+    pub here: Vec<Mark>,
+    /// The marks of each list kept, with its key.
+    pub lists: Vec<([u8; 32], Mark)>,
+}
+
+/// Every mark that says a message read by an agent, read with two
+/// statements for all messages at once: what [`read_by`] reads of one
+/// message. Which keys count is the caller's to say.
+pub fn read_marks(conn: &Connection) -> Result<MarksRead, StorageError> {
+    let here: Vec<Vec<u8>> = conn
+        .prepare("SELECT mark FROM message_read_here")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let lists: Vec<(Vec<u8>, Vec<u8>)> = conn
+        .prepare("SELECT key, mark FROM message_lists")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(MarksRead {
+        here: here.iter().map(|mark| mark_of(mark)).collect(),
+        lists: lists
+            .into_iter()
+            .filter_map(|(key, mark)| Some((key.try_into().ok()?, mark_of(&mark))))
             .collect(),
     })
 }
