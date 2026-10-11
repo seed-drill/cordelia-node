@@ -874,7 +874,9 @@ fn kept<T>(answer: Result<T, StorageError>) -> Result<T, PersonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordelia_core::protocol::{AGENT_MESSAGE_CONTENT_BYTES, AGENT_MESSAGE_NUMBER_MAX};
+    use cordelia_core::protocol::{
+        AGENT_MESSAGE_CONTENT_BYTES, AGENT_MESSAGE_NUMBER_MAX, AGENT_MESSAGE_VALUE_BYTES,
+    };
     use cordelia_crypto::message::{ReadMarks, read_name};
     use cordelia_storage::entries::Outcome;
     use cordelia_storage::person::State;
@@ -956,18 +958,27 @@ mod tests {
     /// the hold.
     fn sent_read(s: &Several, n: usize, request: &Request, now: i64) -> Sent {
         let done = sent(s, n, request, now);
-        read_all(s, n);
+        read_all(s, n, now);
         done
     }
 
-    /// A person reads everything device `n` holds.
-    fn read_all(s: &Several, n: usize) {
-        s[n].conn
-            .execute(
-                "INSERT OR IGNORE INTO message_read_by_a_person (id) SELECT id FROM message_index",
-                [],
-            )
-            .unwrap();
+    /// `log` on device `n` at `now`, of every name, marking `mark`: as a
+    /// person at a terminal sees it, and with yes.
+    fn log_at(s: &Several, n: usize, mark: &[Id], now: i64) -> crate::messages::Log {
+        let asked = crate::messages::LogAsked {
+            folder: None,
+            since: None,
+            mark,
+        };
+        crate::messages::log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    /// A person at a terminal on device `n` reads everything `log` shows
+    /// there at `now`, and types yes.
+    fn read_all(s: &Several, n: usize, now: i64) {
+        let printed = log_at(s, n, &[], now).printed();
+        assert_eq!(log_at(s, n, &printed, now).marked, printed.len());
     }
 
     /// What device `n` was refused, sending `request` at `now`.
@@ -1562,7 +1573,7 @@ mod tests {
                 no_reply,
             )
             .unwrap();
-            read_all(&s, 0);
+            read_all(&s, 0, t);
         }
         let raised = send(
             &s[0].conn,
@@ -1798,13 +1809,9 @@ mod tests {
         sent(&s, 0, &says("plans", "*", "a third to all"), step());
 
         // A person reads one here: nine are left, and the pair sends.
-        s[0].conn
-            .execute(
-                "INSERT INTO message_read_by_a_person (id) VALUES (?1)",
-                [&ids[0][..]],
-            )
-            .unwrap();
-        sent(&s, 0, &says("notes", "work", "freed"), step());
+        let at = step();
+        assert_eq!(log_at(&s, 0, &ids[..1], at).marked, 1);
+        sent(&s, 0, &says("notes", "work", "freed"), at);
         assert!(matches!(
             refused(&s, 0, &says("work", "notes", "held again"), step()),
             Refused::PairHeld { .. }
@@ -1875,13 +1882,24 @@ mod tests {
             gives(number, t + 60);
         }
         assert_eq!(held::give_places(&s[1].conn, &s.key(1), t + 60).unwrap(), 0);
-        s[1].conn
-            .execute(
-                "INSERT INTO message_read_by_a_person (id)
-                 SELECT id FROM message_index WHERE placed_at IS NOT NULL",
-                [],
-            )
-            .unwrap();
+        // A person at a terminal reads what has a place, and types yes:
+        // the 48 placed that are live. The 16 held back were not printed,
+        // and are not marked though they are given.
+        let shown = log_at(&s, 1, &[], t + 60);
+        let printed = shown.printed();
+        assert_eq!(printed.len(), 48);
+        assert_eq!(shown.signers.len(), 1);
+        assert_eq!(shown.signers[0].held_back, 16);
+        let every: Vec<Id> = s[1]
+            .conn
+            .prepare("SELECT id FROM message_index")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|id| id.unwrap().try_into().unwrap())
+            .collect();
+        assert_eq!(every.len(), 64);
+        assert_eq!(log_at(&s, 1, &every, t + 60).marked, 48);
         sent(&s, 1, &says("notes", "work", "goes"), t + 120);
         assert_eq!(
             held::give_places(&s[1].conn, &s.key(1), t + HOUR).unwrap(),
@@ -2285,6 +2303,8 @@ mod tests {
         );
         assert_eq!(kept_of(&s, 0, &done.id), None);
         assert!(not_every_relay(&s, 0, &done.id));
+        // `log` says it may not have reached every relay.
+        assert_eq!(log_at(&s, 0, &[], t).not_every_relay, [done.id]);
         assert_eq!(revs_of(&s, 0, 0), [2, 4, 6, 8]);
         assert_eq!(held::sent_lately(&s[0].conn, "", t).unwrap().again.len(), 3);
 
@@ -2297,6 +2317,107 @@ mod tests {
         assert_eq!(again.dropped, [done.id]);
         assert!(again.written.is_empty());
         assert!(not_every_relay(&s, 0, &done.id));
+        assert_eq!(log_at(&s, 0, &[], t).not_every_relay, [done.id]);
+    }
+
+    /// At a channel's cap at a relay, what is written again in a slot that
+    /// the relay holds is taken: a 65th message, a clearing and a list
+    /// written again, none larger than what it replaces. A first message of
+    /// another device is refused for room, and that device's `log` says so,
+    /// and names the signer whose entries fill the channel, by the count of
+    /// each author's entries that it holds of the channel (decision
+    /// 2026-10-09 §2.2, §4.1, §10, C15, T3).
+    #[test]
+    fn a_ring_slot_written_again_is_taken_by_a_full_relay() {
+        let s = devices(3);
+        let t = s.now;
+        let mut relay = Relay::new(0xa1);
+        let cost = cordelia_core::protocol::entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        // Two messages of desktop's and 79 more entries of its key in
+        // slots of no ring; 64 of laptop's and its list: 146 in all.
+        relay.room.max_channel_bytes = 146 * cost;
+        let to_laptop: Vec<Id> = (1..=2)
+            .map(|k| sent_read(&s, 1, &says("plans", "work", &format!("{k}")), t + k).id)
+            .collect();
+        for k in 0..79 {
+            let entry = entry_by(
+                &s[1].identity,
+                &messages_secret(&s, 1),
+                1,
+                &format!("filler/{k}"),
+                Value::Other(vec![0; AGENT_MESSAGE_VALUE_BYTES]),
+                &[],
+            );
+            entries::store(&s[1].conn, &entry, t).unwrap();
+        }
+        assert!(relay.pushed(&s, 1, t).iter().all(|a| *a == Pushed::Holds));
+        for k in 0..64i64 {
+            let request = says("notes", "work", &format!("lap {k}"));
+            sent_read(&s, 0, &request, t + 10 + k * 4 * 60);
+        }
+        let later = t + 10 + 64 * 4 * 60;
+        relay.pulled(&s, 0, later);
+        // Laptop's agent reads desktop's first: its list is written.
+        log_at(&s, 0, &[], later);
+        let marked = crate::marks::read_here(
+            &s[0].conn,
+            &s[0].identity,
+            "work",
+            &to_laptop[0],
+            later,
+            true,
+        )
+        .unwrap();
+        assert!(marked.list.is_some());
+        let pushed = relay.pushed(&s, 0, later);
+        assert!(pushed.iter().all(|a| *a == Pushed::Holds), "{pushed:?}");
+        assert_eq!(relay.revs_of(&s, 0).len(), 65);
+
+        // The third device's first message: a new slot, refused for room.
+        let first = sent(&s, 2, &says("home", "work", "no room"), later);
+        assert_eq!(relay.pushed(&s, 2, later), [Pushed::NoRoom]);
+        relay.pulled(&s, 2, later);
+        let log = log_at(&s, 2, &[], later);
+        assert_eq!(log.room.refused, [first.id]);
+        assert_eq!(log.room.filled_by, Some(("device 1".into(), 81)));
+        assert!(log.waiting.is_empty());
+        // Desktop's entries that are no message are counted so there.
+        let counted = log
+            .signers
+            .iter()
+            .find(|c| c.label.as_deref() == Some("device 1"))
+            .unwrap();
+        assert_eq!(counted.not_messages, 79);
+
+        // Laptop's 65th, the clearing of its third, and its list written
+        // again: each in a slot the relay holds, and taken.
+        let sixty_fifth = sent(&s, 0, &says("notes", "work", "65th"), later + 60);
+        assert_eq!(sixty_fifth.number, 65);
+        writes_own(&s, 0, 3, clearing_rev(3).unwrap(), clearing_value());
+        log_at(&s, 0, &[], later + 60);
+        let again = crate::marks::read_here(
+            &s[0].conn,
+            &s[0].identity,
+            "work",
+            &to_laptop[1],
+            later + 60,
+            true,
+        )
+        .unwrap();
+        assert!(again.list.is_some());
+        let before = relay.revs_of(&s, 0);
+        let pushed = relay.pushed(&s, 0, later + 60);
+        assert_eq!(pushed, [Pushed::Holds; 3]);
+        let after = relay.revs_of(&s, 0);
+        assert_eq!(after.len(), 65);
+        assert_ne!(after, before);
+        assert!(after.contains(&message_rev(65).unwrap()));
+        assert!(after.contains(&clearing_rev(3).unwrap()));
+        // Laptop was refused nothing, and its `log` names no one.
+        assert_eq!(
+            log_at(&s, 0, &[], later + 60).room,
+            crate::messages::Room::default()
+        );
     }
 
     /// A relay's answer of another to an entry that is not one of the

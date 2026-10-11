@@ -431,6 +431,18 @@ mod tests {
         shown
     }
 
+    /// What `log` on device `n` counts of each signer at `now`.
+    fn logged_counts(s: &Several, n: usize, now: i64) -> Vec<crate::messages::Counted> {
+        let asked = crate::messages::LogAsked {
+            folder: None,
+            since: None,
+            mark: &[],
+        };
+        crate::messages::log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+            .signers
+    }
+
     /// The bodies of the index of device `n`, by body.
     fn indexed(s: &Several, n: usize) -> Vec<String> {
         s[n].conn
@@ -686,6 +698,11 @@ mod tests {
             }
         );
         assert_eq!(signer_on(&s, 2, 1), held::Signer::default());
+        // `log` counts them, for the key that signed.
+        let counted = logged_counts(&s, 2, s.now);
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].label.as_deref(), Some("device 0"));
+        assert_eq!((counted[0].not_messages, counted[0].overwritten), (2, 0));
 
         // The control: in the slot named for the key that signed.
         let own_name = message_name(&s.key(0), 64).unwrap();
@@ -895,6 +912,11 @@ mod tests {
             assert_eq!(numbers(&s, reader, 0, "message_numbers"), [100]);
             assert_eq!(numbers(&s, reader, 0, "message_first_held"), [100]);
             assert_eq!(indexed(&s, reader), ["100"]);
+            // `log` says it, of the signer.
+            let said = logged_counts(&s, reader, s.now);
+            assert_eq!(said.len(), 1, "{reader}");
+            assert_eq!(said[0].overwritten, counted, "{reader}");
+            assert_eq!(said[0].label.as_deref(), Some("device 0"));
         }
     }
 
