@@ -265,8 +265,10 @@ MUTATIONS = [
      '''                 WHERE n.id = i.id AND n.number >= COALESCE(s.highest, 0) - {RING})"''',
      [HOURLY]),
     ("T6 what is shown is by ID the other way", MESSAGES,
-     '''             ORDER BY shown_at, i.id",''',
-     '''             ORDER BY shown_at, i.id DESC",''',
+     '''             WHERE i.placed_at IS NOT NULL AND ?1 < {expires} AND {live}
+             ORDER BY shown_at, i.id",''',
+     '''             WHERE i.placed_at IS NOT NULL AND ?1 < {expires} AND {live}
+             ORDER BY shown_at, i.id DESC",''',
      [ORDER]),
     ("T7 a message with no place is shown", MESSAGES,
      '''             WHERE i.placed_at IS NOT NULL AND ?1 < {expires} AND {live}
