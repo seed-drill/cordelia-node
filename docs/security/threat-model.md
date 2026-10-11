@@ -257,6 +257,8 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/msg_e2e.rs`: `no_message_reaches_a_memory_folder_local_history_or_any_file`
 - `crates/cordelia-node/tests/msg_e2e.rs`: `a_body_is_read_inside_a_frame_that_it_cannot_close`
 - `crates/cordelia-node/tests/msg_e2e.rs`: `a_folder_over_its_hour_sends_nothing_more`
+- `crates/cordelia-node/tests/msg_e2e.rs`: `a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes`
+- `crates/cordelia-node/tests/msg_e2e.rs`: `a_misled_agent_on_one_device_holds_two_other_names_on_another`
 - `crates/cordelia-api/src/reader.rs`: `a_holder_of_the_key_that_laps_its_ring_is_shown_at_most_64_in_an_hour`
 - `crates/cordelia-api/src/marks.rs`: `a_device_that_lies_in_its_list_hides_from_summaries_and_not_from_log`
 - `crates/cordelia-api/src/reader.rs`: `a_signer_that_rewrites_its_ring_ten_thousand_times_leaves_one_lap_in_a_readers_store`

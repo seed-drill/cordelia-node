@@ -1242,7 +1242,12 @@ fn with_sync_off_messages_are_off() {
     assert_eq!(summary(&two.desktop, "work"), "");
     let shown = read(&two.desktop, "work", &held);
     assert!(out(&shown).contains("held\n"), "{}", err(&shown));
-    // WAITS FOR THE LOG: `log` shows what was held, with sync off.
+    let printed = logged(&two.desktop, "work");
+    assert!(
+        block_of(&printed, &held).starts_with("Message "),
+        "{printed}"
+    );
+    assert!(printed.contains("\nheld\n"), "{printed}");
     // The device's own channels list the messages channel no longer, so
     // no pass proves, pulls or pushes it.
     assert!(!lists_the_messages_channel(&two.desktop));
@@ -1898,18 +1903,6 @@ fn status_of(n: &Node) -> serde_json::Value {
     serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
 }
 
-/// The whole ID of a message, from the first line that `read` printed of
-/// it.
-fn whole_id(said: &Output) -> String {
-    let shown = out(said);
-    let id = shown
-        .strip_prefix("Message ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or_else(|| panic!("{shown}"));
-    assert_eq!(id.len(), 32, "{shown}");
-    id.to_string()
-}
-
 /// The `messages` object that `cordelia status --json` carries, on a device
 /// that stands applied, with every field counted by its rule; nothing else
 /// that the status prints says anything of messages, and it is absent
@@ -1967,25 +1960,19 @@ fn the_status_carries_the_messages_object_in_json() {
     // Read by the agent of `work` on desktop: a person has not read it.
     let said = read(&two.desktop, "work", &a1);
     assert!(said.status.success(), "{}", err(&said));
-    let a1_whole = whole_id(&said);
     let messages = &status_of(&two.desktop)["messages"];
     assert_eq!(messages["unread_by_an_agent"], 4, "{messages}");
     assert_eq!(messages["unread_by_a_person"], 3, "{messages}");
-    // WAITS FOR THE LOG: a person reads at a terminal with `log` and types
-    // yes. Until then the mark is written here by the test's own hand, in
-    // the table that `log` writes.
-    {
-        let db = rusqlite::Connection::open(two.desktop.data_dir().join("cordelia.db")).unwrap();
-        db.busy_timeout(Duration::from_secs(10)).unwrap();
-        db.execute(
-            "INSERT INTO message_read_by_a_person (id) VALUES (?1)",
-            [hex::decode(&a1_whole).unwrap()],
-        )
-        .unwrap();
-    }
+    // Into a pipe, and at a terminal answered no, `log` marks nothing.
+    logged(&two.desktop, "work");
+    log_at_a_terminal(&two.desktop, 3, "no");
+    let messages = &status_of(&two.desktop)["messages"];
+    assert_eq!(messages["unread_by_a_person"], 3, "{messages}");
+    // A person reads the three at a terminal, and types yes: no agent has.
+    log_at_a_terminal(&two.desktop, 3, "yes");
     let messages = &status_of(&two.desktop)["messages"];
     assert_eq!(messages["unread_by_an_agent"], 4, "{messages}");
-    assert_eq!(messages["unread_by_a_person"], 2, "{messages}");
+    assert_eq!(messages["unread_by_a_person"], 0, "{messages}");
 
     // Nothing else that the status prints says anything of messages.
     for args in [
@@ -2158,9 +2145,22 @@ fn a_statement_starts_an_empty_messages_channel_and_what_was_held_is_shown_until
         ),
     );
     assert!(!summary(&two.desktop, "work").contains(&from_tablet));
-    // WAITS FOR THE LOG: `log` at a terminal on desktop lists tablet's
-    // message, as from a device that is no longer one of yours and from
-    // before the last change of your devices.
+    // `log` at a terminal lists it, as from a device that is no longer
+    // one of yours and from before the last change of your devices.
+    let mut at = two.desktop.at_terminal(&["msg", "log"]);
+    at.says("Type yes to mark");
+    at.types("no");
+    let shown = at.done();
+    let block = block_of(&shown, &from_tablet);
+    assert!(
+        block.contains("From a device that is no longer one of yours."),
+        "{block}"
+    );
+    assert!(
+        block.contains("From before the last change of your devices."),
+        "{block}"
+    );
+    assert!(shown.contains("from tablet"), "{shown}");
 }
 
 /// Laptop sends; desktop holds it; laptop removes desktop, and sends
@@ -2224,7 +2224,13 @@ fn a_removed_device_reads_what_was_sent_in_its_generation_and_nothing_after_its_
         );
     }
     assert_eq!(summary(&two.desktop, "work"), "");
-    // WAITS FOR THE LOG: `log` on desktop is refused with `not_applied`.
+    log_refused(
+        &two.desktop,
+        &folder(&two.desktop, "work"),
+        &[],
+        "This device is not one of your devices now (this device was removed), so it shows no \
+         message.",
+    );
 }
 
 // ── The upgrade ──────────────────────────────────────────────────────
@@ -2576,6 +2582,9 @@ fn a_message_that_arrives_during_logs_question_is_not_marked() {
     at.types("yes");
     at.says("Marked 9 messages as read by a person on this device.");
     at.done();
+    // The status counts the tenth as unread by a person, and only it.
+    let messages = &status_of(&two.desktop)["messages"];
+    assert_eq!(messages["unread_by_a_person"], 1, "{messages}");
 
     let printed = logged(&two.desktop, "work");
     assert!(
@@ -2712,9 +2721,13 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
             "1 message(s) between notes and work here, {unread} of them not yet read by a person here."
         )
     };
+    let unread_by_a_person = || status_of(desktop)["messages"]["unread_by_a_person"].clone();
+    assert_eq!(unread_by_a_person(), 1);
     let shown = out(&read(desktop, "work", &id));
     assert!(shown.contains(&header(1)), "{shown}");
     assert_eq!(summary(desktop, "work"), "");
+    // Read by an agent: not by a person.
+    assert_eq!(unread_by_a_person(), 1);
     let printed = logged(desktop, "work");
     let block = block_of(&printed, &id);
     assert!(
@@ -2723,8 +2736,10 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
     );
     assert!(block.contains("Not read by a person here."), "{block}");
 
+    assert_eq!(unread_by_a_person(), 1);
     let shown = log_at_a_terminal(desktop, 1, "no");
     assert!(shown.contains("Nothing was marked."), "{shown}");
+    assert_eq!(unread_by_a_person(), 1);
     assert!(
         block_of(&logged(desktop, "work"), &id).contains("Not read by a person here."),
         "{printed}"
@@ -2738,6 +2753,7 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
     );
     assert!(block_of(&logged(desktop, "work"), &id).contains("Read by a person here."));
     assert!(out(&read(desktop, "work", &id)).contains(&header(0)));
+    assert_eq!(unread_by_a_person(), 0);
     // A person's mark is the device's own: on laptop it is not read by a
     // person.
     let there = logged(&two.laptop, "notes");
