@@ -376,6 +376,8 @@ Additional preferences (applied before shuffle):
 
 **Address filtering on share:** The node MUST only share addresses of relay and bootnode peers. Personal node addresses are never shared (§8.2: personal nodes are outbound-only and should not receive unsolicited inbound connections).
 
+**A personal node shares no peers.** A personal node answers every `PeerShareRequest` with an empty `PeerShareResponse`, whatever it is connected to. It answers, and does not refuse the stream. Only a relay and a bootnode answer with the peers they know ([decision record of 2026-10-14](../decisions/2026-10-14-a-personal-node-shares-no-peers.md)).
+
 **Address validation on receive:** Before adding received addresses to the cold peer table, the node MUST filter out:
 - RFC 1918 private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
 - Loopback (127.0.0.0/8, ::1)
