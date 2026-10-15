@@ -26,6 +26,11 @@ zeroize = { workspace = true }
 # of a name, a label, a subject or a link, and escape in a body.
 unicode-general-category = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# To kill git's process group at its deadline. Tokio already brings it:
+# this adds no crate to the build.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The statements a test counts, to bound the work of a request.

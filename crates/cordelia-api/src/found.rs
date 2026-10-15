@@ -98,13 +98,18 @@ fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
 }
 
 /// Run `git`, given until `deadline`: `None` where it has not answered by
-/// then, and is killed; an error where it cannot be run. What it writes
-/// must be a few short lines, which the pipe holds whole.
+/// then, and is killed, with what it started; an error where it cannot be
+/// run. What it writes must be a few short lines, which the pipe holds
+/// whole.
 pub fn git_output_by(
     git: &mut Command,
     deadline: std::time::Instant,
 ) -> Option<std::io::Result<std::process::Output>> {
     use std::process::Stdio;
+    // A process group of its own: a `git` that is a wrapper (a version
+    // manager's shim) may run git, or anything, without `exec`.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(git, 0);
     let mut child = match git
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -124,6 +129,13 @@ pub fn git_output_by(
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             _ => {
+                // Its group, while git is not yet waited for and the
+                // group's ID cannot be another's.
+                #[cfg(unix)]
+                if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                    // SAFETY: kill(2) is given no pointer.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -1698,6 +1710,53 @@ mod tests {
         for _ in 0..500 {
             assert_eq!(memory_root_by(&notes, Instant::now()), None);
         }
+    }
+
+    /// A `git` that is a wrapper, and runs a child without `exec`, as some
+    /// version managers' shims do: at the deadline, nothing it started is
+    /// left running.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_git_that_is_a_wrapper_leaves_nothing_running() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("git");
+        let pid_file = tmp.path().join("child.pid");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nsh -c 'echo $$ > \"$PID_FILE\"; exec sleep 30'\necho done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut wrapper = Command::new(&git);
+        wrapper.env("PID_FILE", &pid_file);
+        assert!(git_output_by(&mut wrapper, deadline).is_none());
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Running: listed, and not a zombie that no one has reaped yet.
+        let running = || {
+            let ps = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while running() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let left = running();
+        if left {
+            // SAFETY: kill(2) is given no pointer.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!left, "the wrapper's child {pid} is still running");
     }
 
     /// The notice as a status carries it: one record for each time it

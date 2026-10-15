@@ -146,8 +146,11 @@ pub(crate) fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<Strin
 /// ([`unseen`]). The joiners, and a variation selector after a character
 /// it can change, are part of ordinary writing (Persian, Devanagari, an
 /// emoji) and are left as they are; a selector with no such character
-/// before it is escaped. The commands of messages take out a wider set, of
-/// text another device chose (decision 2026-10-09 §4.1).
+/// before it is escaped, and so is a joiner that does not stand between
+/// two characters that are neither joiners nor escaped. A selector of the
+/// supplement changes a Han ideograph alone. The commands of messages take
+/// out a wider set, of text another device chose (decision 2026-10-09
+/// §4.1).
 pub(crate) fn printable(text: &str) -> String {
     escaped(text, |_| false)
 }
@@ -163,14 +166,29 @@ fn escaped(text: &str, left: impl Fn(char) -> bool) -> String {
     // Whether the character before is one a selector can change: not at
     // the start, and not a selector or a joiner.
     let mut after_base = false;
-    for c in text.chars() {
+    // The character before, and whether it is neither a joiner nor escaped.
+    let mut before = None;
+    let mut joins = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         let escape = !left(c)
             && match c {
-                _ if selector(c) => !after_base,
-                '\u{200c}' | '\u{200d}' => false,
+                _ if selector(c) => {
+                    !after_base
+                        || ('\u{e0100}'..='\u{e01ef}').contains(&c) && !before.is_some_and(han)
+                }
+                '\u{200c}' | '\u{200d}' => {
+                    // So must the character after: a selector after a
+                    // joiner is escaped.
+                    let next_joins =
+                        |n: &char| !joiner(*n) && !selector(*n) && (left(*n) || !unseen(*n));
+                    !joins || !chars.peek().is_some_and(next_joins)
+                }
                 _ => unseen(c),
             };
-        after_base = !selector(c) && !matches!(c, '\u{200c}' | '\u{200d}');
+        after_base = !selector(c) && !joiner(c);
+        before = Some(c);
+        joins = !escape && !joiner(c);
         match escape {
             true => out.extend(c.escape_default()),
             false => out.push(c),
@@ -181,15 +199,32 @@ fn escaped(text: &str, left: impl Fn(char) -> bool) -> String {
 
 /// Whether `c` is shown as an escape wherever it is: a control character,
 /// a mark that changes the direction of text, and what cannot be seen and
-/// is no part of ordinary writing (a zero-width space, the word joiner and
-/// the invisible operators, the byte order mark, the tag block).
+/// is no part of ordinary writing (a zero-width space, U+2060 to U+206F
+/// whole, the byte order mark, the tag block).
 fn unseen(c: char) -> bool {
     c.is_control()
         || lays_out(c)
         || matches!(
             c,
-            '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}'
+            '\u{200b}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}'
         )
+}
+
+/// A zero-width non-joiner or joiner.
+fn joiner(c: char) -> bool {
+    matches!(c, '\u{200c}' | '\u{200d}')
+}
+
+/// A Han ideograph: one of the CJK blocks of unified and compatibility
+/// ideographs, the only characters the selectors of the supplement change.
+fn han(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{3ffff}'
+    )
 }
 
 /// The characters that set the direction of the text around them, and
@@ -807,8 +842,8 @@ mod tests {
 
     /// Ordinary writing prints as it is, as a file name and as a kept
     /// text: Persian's zero-width non-joiner, Devanagari's joiner, an
-    /// emoji's variation selector, a family emoji's joiners and a
-    /// Mongolian free variation selector. A command to copy is offered for
+    /// emoji's variation selector, a family emoji's joiners, a
+    /// Mongolian free variation selector and a Han ideograph's selector. A command to copy is offered for
     /// such a name. A selector with nothing before it that it can change
     /// is escaped: at the start, after another selector, after a joiner.
     #[test]
@@ -819,6 +854,7 @@ mod tests {
             "\u{2764}\u{fe0f}",
             "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
             "\u{1820}\u{180b}\u{1821}\u{180c}",
+            "\u{845b}\u{e0100}",
         ];
         let record = json!({
             "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
@@ -844,10 +880,33 @@ mod tests {
         for (text, escaped_as) in [
             ("\u{fe0f}a", "\\u{fe0f}a"),
             ("\u{2764}\u{fe0f}\u{fe0f}", "\u{2764}\u{fe0f}\\u{fe0f}"),
-            ("a\u{200d}\u{e0100}", "a\u{200d}\\u{e0100}"),
+            ("a\u{200d}\u{e0100}", "a\\u{200d}\\u{e0100}"),
             ("\u{180b}", "\\u{180b}"),
         ] {
             assert_eq!(printable(text), escaped_as, "{text:?}");
+        }
+        // A joiner at the start, at the end or in a run, and a selector of
+        // the supplement after what is not a Han ideograph, are escaped:
+        // two names that differ by them do not print the same.
+        for (text, escaped_as) in [
+            ("\u{200d}notes.md", "\\u{200d}notes.md"),
+            ("notes.md\u{200d}", "notes.md\\u{200d}"),
+            (
+                "no\u{200c}\u{200d}\u{200c}\u{200d}\u{200c}tes.md",
+                "no\\u{200c}\\u{200d}\\u{200c}\\u{200d}\\u{200c}tes.md",
+            ),
+            (
+                "n\u{e0141}o\u{e0142}t\u{e0143}e\u{e0144}s.md",
+                "n\\u{e0141}o\\u{e0142}t\\u{e0143}e\\u{e0144}s.md",
+            ),
+        ] {
+            assert_eq!(printable(text), escaped_as, "{text:?}");
+        }
+        for c in [
+            '\u{2065}', '\u{206a}', '\u{206b}', '\u{206c}', '\u{206d}', '\u{206e}', '\u{206f}',
+        ] {
+            let escaped_as = format!("notes{}.md", c.escape_default());
+            assert_eq!(printable(&format!("notes{c}.md")), escaped_as);
         }
         // What is no part of ordinary writing is escaped.
         for (text, escaped_as) in [
