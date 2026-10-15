@@ -816,6 +816,18 @@ fn the_bar_counts_every_relay_the_device_is_connected_to() {
     assert!(tooltip.contains("\nRelays: 3 connected"), "{tooltip}");
 }
 
+/// `cordelia channels` names no command that does not exist: a relay that
+/// holds no channel lists none, and says nothing more.
+#[test]
+fn channels_names_no_command_that_does_not_exist() {
+    let relay = node("relay", "relay", None);
+    let said = relay.cli(&["channels"]);
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 1, "{said}");
+    assert!(lines[0].starts_with("CHANNEL "), "{said}");
+    assert!(!said.contains("subscribe"), "{said}");
+}
+
 #[test]
 fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
     const ENTRIES: u64 = 1100;

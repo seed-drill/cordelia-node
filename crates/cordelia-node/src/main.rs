@@ -2687,10 +2687,6 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
         );
     }
 
-    if all.is_empty() {
-        println!("No channels. Subscribe with `cordelia subscribe <channel>`.");
-    }
-
     Ok(())
 }
 
