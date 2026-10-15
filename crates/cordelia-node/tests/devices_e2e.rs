@@ -781,6 +781,41 @@ async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
 /// entry takes beyond it, and a device paces itself by the same count: if
 /// it counted content alone, it would send several times what the relay
 /// allows a connection, and be refused and then cut off.
+/// The bar's form of `cordelia status` counts every relay that the device
+/// is connected to: here three of the test's own, while the node holds
+/// fewer of its peers hot, and never more than `HOT_MAX`.
+#[test]
+fn the_bar_counts_every_relay_the_device_is_connected_to() {
+    use cordelia_core::protocol::HOT_MAX;
+    let relays: Vec<Node> = (0..3).map(|_| relay_started()).collect();
+    let dialled: Vec<String> = relays
+        .iter()
+        .map(|relay| format!("127.0.0.1:{}", relay.p2p))
+        .collect();
+    let mut device = node_with_bootnodes("laptop", "personal", &dialled);
+    device.start();
+    let mut all: Vec<&Node> = relays.iter().collect();
+    all.push(&device);
+    wait_for("device healthy", &all, 30, || healthy(&device));
+    wait_for(
+        "three relays connected, and fewer peers hot",
+        &all,
+        90,
+        || {
+            let connected = relays_of(&device)
+                .iter()
+                .filter(|relay| relay["state"] == "connected")
+                .count();
+            let hot = device.get("/api/v1/status")?["peers_hot"].as_u64()?;
+            (connected == 3 && (1..=u64::from(HOT_MAX)).contains(&hot)).then_some(())
+        },
+    );
+    let bar: serde_json::Value =
+        serde_json::from_str(&device.cli(&["status", "--waybar"])).unwrap();
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(tooltip.contains("\nRelays: 3 connected"), "{tooltip}");
+}
+
 #[test]
 fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
     const ENTRIES: u64 = 1100;

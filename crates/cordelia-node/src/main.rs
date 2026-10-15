@@ -1117,11 +1117,15 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             details.push(format!("Held up: {why}"));
         }
         if status.facts.running {
-            let relays = status.facts.peers_hot;
-            details.push(match relays {
-                0 => "Relays: none connected".to_string(),
-                n => format!("Relays: {n} connected"),
-            });
+            // Every relay the device is connected to, as the node lists
+            // them: not its hot peers, of which there are at most
+            // `HOT_MAX`.
+            if let Some(relays) = relays_connected(config_path) {
+                details.push(match relays {
+                    0 => "Relays: none connected".to_string(),
+                    n => format!("Relays: {n} connected"),
+                });
+            }
             if status.facts.outbox_waiting > 0 {
                 details.push(format!("Waiting to send: {}", status.facts.outbox_waiting));
             }
@@ -1476,6 +1480,22 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     }
 
     Ok(())
+}
+
+/// How many of the relays the node is set up with are connected, as it
+/// lists them (`GET /api/v1/peers`). `None` where it did not answer.
+fn relays_connected(config_path: &str) -> Option<usize> {
+    let mut config = Config::load(&config::expand_tilde(config_path)).ok()?;
+    config.apply_env_overrides();
+    let timeout = std::time::Duration::from_secs(1);
+    let peers = local_api(&config, false, "/api/v1/peers", timeout).ok()?;
+    let relays = peers["relays"].as_array()?;
+    Some(
+        relays
+            .iter()
+            .filter(|relay| relay["state"] == "connected")
+            .count(),
+    )
 }
 
 /// What `cordelia status` knows about this device and its running node.
