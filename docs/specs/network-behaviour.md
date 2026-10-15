@@ -247,7 +247,7 @@ If a Hot peer is detected as dead (last_activity > keepalive_timeout):
 
 | Failure | Detection | Impact | Recovery |
 |---------|-----------|--------|----------|
-| **Single relay death** | Keepalive timeout (90s) | Items stop flowing through that relay. Other relays continue. | Governor demotes relay to Cold. Personal nodes discover alternative relays via peer-sharing. Convergence continues via remaining relay mesh. |
+| **Single relay death** | Keepalive timeout (90s) | Items stop flowing through that relay. Other relays continue. | Governor demotes relay to Cold. Personal nodes go on through the other relays they are set up with; they do not discover relays by peer-sharing. Convergence continues via remaining relay mesh. |
 | **All relays dead** | All relay hot peers demoted | Items flow peer-to-peer only (direct push between personal nodes that share channels). No relay fan-out. | Network operates in degraded mode. Items still reach directly-connected subscribers. Pull-sync provides eventual consistency. |
 | **Bootnode unreachable** | Bootstrap timeout (10s per bootnode) | New nodes can't discover peers. Existing nodes unaffected (already have peers). | Fallback peers compiled into binary. DNS SRV provides alternative discovery. Existing peer-sharing continues. |
 | **All bootnodes unreachable** | All bootstrap connections fail | New nodes start with 0 peers. | Fallback peers (hardcoded). Manual peer configuration. Existing network continues without new joins. |

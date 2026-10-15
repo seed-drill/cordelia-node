@@ -1900,6 +1900,15 @@ fn carries_older_kind(node_role: &str) -> bool {
     node_role != "personal"
 }
 
+/// Whether a node answers a request for peers with the peers it knows. A
+/// personal node answers with an empty list, whatever it is connected to:
+/// a person's relays are theirs, and a device is never the way that one
+/// relay learns of another (decision 2026-10-14). It still answers, as
+/// Peer-Sharing runs on every warm and hot peer.
+fn shares_peers(node_role: &str) -> bool {
+    node_role != "personal"
+}
+
 /// Canonical post-connection sequence (connection-lifecycle.md §1.2).
 /// ALL connection paths MUST call this after successful connection.
 #[allow(clippy::too_many_arguments)]
@@ -4144,7 +4153,14 @@ pub async fn handle_peer_streams(
             }
             cordelia_network::messages::Protocol::PeerSharing => {
                 // Allowed on Warm + Hot (§2.1)
-                handle_inbound_peer_share(&mut send, &mut recv, &peer_id, &shared_peers).await;
+                handle_inbound_peer_share(
+                    &mut send,
+                    &mut recv,
+                    &peer_id,
+                    &shared_peers,
+                    &node_role,
+                )
+                .await;
             }
             cordelia_network::messages::Protocol::ChannelAnnounce => {
                 handle_inbound_channel_announce(&mut recv, &peer_id, &gov_tx).await;
@@ -4647,6 +4663,7 @@ async fn handle_inbound_peer_share(
     recv: &mut quinn::RecvStream,
     peer_id: &NodeId,
     shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
+    node_role: &str,
 ) {
     let msg = match cordelia_network::codec::read_frame(recv).await {
         Ok(m) => m,
@@ -4660,6 +4677,8 @@ async fn handle_inbound_peer_share(
         let max = req.max_peers as usize;
         let current_peers = shared_peers
             .read()
+            .ok()
+            .filter(|_| shares_peers(node_role))
             .map(|p| {
                 // Shuffle before returning (§4.3): each requester gets a random
                 // subset in a random order, distributing load across the relay mesh.
@@ -7032,5 +7051,103 @@ mod tests {
         assert_eq!(secs(3), 16);
         assert_eq!(secs(9), OUTBOX_REFUSED_RETRY_MAX_SECS);
         assert_eq!(secs(u32::MAX), OUTBOX_REFUSED_RETRY_MAX_SECS);
+    }
+
+    /// A personal node answers a request for peers with an empty list,
+    /// whatever it is connected to; a relay and a bootnode answer with the
+    /// relays they know, as before (decision 2026-10-14). The node here is
+    /// connected to two relays, and one of them asks it, once for each
+    /// role.
+    #[tokio::test]
+    async fn a_personal_node_answers_a_request_for_peers_with_none() {
+        use cordelia_network::messages::{PeerShareRequest, Protocol, WireMessage};
+        use cordelia_network::{codec, connection, transport};
+        type Shared =
+            std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>;
+        let identity = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // The node, connected to two relays that listen.
+        let node = identity(1);
+        let node_end = transport::create_endpoint(&node, here).unwrap();
+        let mut conn_mgr =
+            connection::ConnectionManager::new(node.clone(), node_end, vec![], vec![], 9474);
+        let mut relays = Vec::new();
+        for seed in [2, 3] {
+            let relay = identity(seed);
+            let end = transport::create_endpoint(&relay, here).unwrap();
+            let addr = end.local_addr().unwrap();
+            let roles = vec!["relay".to_string()];
+            let mgr =
+                connection::ConnectionManager::new(relay.clone(), end, vec![], roles, addr.port());
+            let (accepts, as_relay) = (mgr.endpoint(), mgr.connect_context());
+            let accepted = tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_relay, incoming)
+                    .await
+                    .unwrap()
+            });
+            conn_mgr.connect_to(addr).await.unwrap();
+            let conn = accepted.await.unwrap().conn;
+            relays.push((NodeId(relay.public_key()), conn, mgr));
+        }
+        let shared: Shared =
+            std::sync::Arc::new(std::sync::RwLock::new(conn_mgr.known_peer_addresses()));
+        let mut both: Vec<Vec<u8>> = relays.iter().map(|(id, ..)| id.0.to_vec()).collect();
+        both.sort();
+
+        // The keys of the peers that the node answers the first relay with,
+        // as a node of `role`.
+        let (asker_id, asker, _) = &relays[0];
+        let node_side = conn_mgr.get_connection(asker_id).unwrap().clone();
+        let answered = |role: &'static str| {
+            let (asker, node_side, asker_id, shared) = (
+                asker.clone(),
+                node_side.clone(),
+                asker_id.clone(),
+                shared.clone(),
+            );
+            async move {
+                let (mut send, mut recv) = asker.open_bi().await.unwrap();
+                codec::write_protocol_byte(&mut send, Protocol::PeerSharing)
+                    .await
+                    .unwrap();
+                let ask = WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 });
+                codec::write_frame(&mut send, &ask).await.unwrap();
+                let (mut out, mut into) = node_side.accept_bi().await.unwrap();
+                let protocol = codec::read_protocol_byte(&mut into).await.unwrap();
+                assert_eq!(protocol, Protocol::PeerSharing);
+                handle_inbound_peer_share(&mut out, &mut into, &asker_id, &shared, role).await;
+                let _ = out.finish();
+                match codec::read_frame(&mut recv).await {
+                    Ok(WireMessage::PeerShareResponse(answer)) => {
+                        let mut keys: Vec<Vec<u8>> =
+                            answer.peers.into_iter().map(|p| p.node_id).collect();
+                        keys.sort();
+                        keys
+                    }
+                    other => panic!("a {role} node did not answer with peers: {other:?}"),
+                }
+            }
+        };
+
+        assert!(
+            answered("personal").await.is_empty(),
+            "a personal node told a relay of the relays it is connected to"
+        );
+        assert_eq!(
+            answered("relay").await,
+            both,
+            "a relay shares the relays it knows"
+        );
+        assert_eq!(
+            answered("bootnode").await,
+            both,
+            "a bootnode shares the relays it knows"
+        );
     }
 }
