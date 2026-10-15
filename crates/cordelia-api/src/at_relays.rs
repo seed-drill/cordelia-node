@@ -344,8 +344,10 @@ pub fn messages_channel(conn: &Connection) -> Result<Option<[u8; 32]>, PersonErr
 ///
 /// A name is listed where a key that counts has an entry of its own under
 /// the name's place in the personal channel
-/// (PERSONAL_NAME_PREFIX and the name) that is no delete. A name that is
-/// not in its one spelling is no name, and is passed over.
+/// (PERSONAL_NAME_PREFIX and the name) that is no delete. A word that is
+/// no name that this version would itself map, in its one spelling
+/// ([`crate::names::is_a_name`]), is passed over (decision 2026-10-04
+/// §16).
 pub fn listed(conn: &Connection, most: usize) -> Result<Vec<Own>, PersonError> {
     if stands(conn)? != Stands::Applied {
         return Ok(Vec::new());
@@ -369,6 +371,9 @@ pub fn listed(conn: &Connection, most: usize) -> Result<Vec<Own>, PersonError> {
             let Some(name) = inside.name.strip_prefix(PERSONAL_NAME_PREFIX) else {
                 continue;
             };
+            if !crate::names::is_a_name(name) {
+                continue;
+            }
             if !held.iter().any(|held| held == name) && !names.iter().any(|seen| seen == name) {
                 names.push(name.to_string());
             }
@@ -1597,7 +1602,7 @@ mod tests {
         let other = &s[1].identity;
         // Device 1 lists three names, one of which this device holds, and
         // this device lists one that it does not hold itself.
-        for name in ["name/work", "name/notes", "name/a team"] {
+        for name in ["name/work", "name/notes", "name/a-team"] {
             assert_eq!(says(other, 1, name, text("")), STORED);
         }
         assert_eq!(says(&on.identity, 1, "name/music", text("")), STORED);
@@ -1609,6 +1614,15 @@ mod tests {
         assert_eq!(says(other, 1, "names/films", text("")), STORED);
         assert_eq!(says(other, 1, "name/gone", Value::Delete), STORED);
         assert_eq!(says(other, 1, "name/Films ", text("")), STORED);
+        // And a word in its one spelling that is no name this version
+        // would map: a space, a first `-` or `~`, an empty segment, a
+        // character outside the set, more than 200 bytes.
+        let long = "x".repeat(201);
+        for word in ["a team", "-lab", "~lab", "a//b", "caf\u{e9}", &long] {
+            assert_eq!(cordelia_core::sync_name::tidy(word), word);
+            let word = format!("{PERSONAL_NAME_PREFIX}{word}");
+            assert_eq!(says(other, 1, &word, text("")), STORED);
+        }
         assert_eq!(
             says(&identity_of(9), 1, "name/strangers", text("")),
             Taken::Refused(NotTaken::SignerDoesNotCount)
@@ -1633,8 +1647,8 @@ mod tests {
                 .collect()
         };
         let name = |name: &str| Kind::Name(name.into());
-        assert_eq!(names(1024), [name("a team"), name("music"), name("work")]);
-        assert_eq!(names(2), [name("a team"), name("music")]);
+        assert_eq!(names(1024), [name("a-team"), name("music"), name("work")]);
+        assert_eq!(names(2), [name("a-team"), name("music")]);
         assert!(names(0).is_empty());
         // Each is the name's channel in the generation applied, and is
         // proved with its key.
@@ -1645,9 +1659,9 @@ mod tests {
         // A name that it comes to hold is one that a pass goes through,
         // and is listed here no more.
         hold_name_on(on, "work", now);
-        assert_eq!(names(1024), [name("a team"), name("music")]);
+        assert_eq!(names(1024), [name("a-team"), name("music")]);
         // A delete over the word takes the name from the list.
-        assert_eq!(says(other, 2, "name/a team", Value::Delete), STORED);
+        assert_eq!(says(other, 2, "name/a-team", Value::Delete), STORED);
         assert_eq!(names(1024), [name("music")]);
     }
 
