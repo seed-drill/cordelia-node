@@ -667,6 +667,7 @@ dependencies = [
  "cordelia-crypto",
  "cordelia-storage",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

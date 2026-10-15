@@ -25,7 +25,7 @@
 //! ([`discover::claude_folder`]), never one chosen by reading transcripts:
 //! a mapping cannot come to sync a different folder than the one declared.
 //! Claude Code keeps one memory per git repository, so the folder to map
-//! is the repository's main working tree ([`discover::memory_root`]).
+//! is the repository's main working tree ([`discover::memory_root_known`]).
 //!
 //! Each cycle reads a name's channel ([`publish::read_name`]: the slots
 //! and who counts, of one moment), plans every file with [`crate::plan`]
@@ -411,15 +411,17 @@ impl ClaudeAdapter {
 
     /// Where Claude Code keeps the memory of a mapped directory now, if
     /// that is no longer the directory itself: a git repository has
-    /// appeared above it since it was mapped. Cached like `seen`.
+    /// appeared above it since it was mapped. Cached like `seen`. Where
+    /// git does not answer in time it is not known to have moved, and the
+    /// folder syncs as it was mapped.
     fn moved_to(&mut self, mapped: &str) -> Option<PathBuf> {
         if let Some((at, moved)) = self.moved.get(mapped)
             && at.elapsed() < PROJECT_CACHE
         {
             return moved.clone();
         }
-        let root = discover::memory_root(Path::new(mapped));
-        let moved = (root != Path::new(mapped)).then_some(root);
+        let moved = discover::memory_root_by(Path::new(mapped), discover::git_deadline())
+            .filter(|root| root != Path::new(mapped));
         self.moved
             .insert(mapped.to_string(), (Instant::now(), moved.clone()));
         moved
