@@ -25,7 +25,7 @@ There are exactly four ways a connection is established:
 |------|-----------|---------|---------------|
 | **Bootstrap** | This node | Startup, config bootnodes | `main.rs` bootstrap loop |
 | **Accept** | Remote peer | Inbound QUIC connection | `p2p_loop` select! `accept_incoming` |
-| **Peer-sharing** | This node | Peer-sharing discovery | `p2p_loop` select! `peer_share_interval` |
+| **Peer-sharing** | This node | Peer-sharing discovery (never on a personal node or a relay) | `p2p_loop` select! `peer_share_interval` |
 | **Governor** | This node | Governor `actions.connect` | `p2p_loop` select! `gov_interval` |
 
 ### 1.2 Canonical Post-Connection Sequence

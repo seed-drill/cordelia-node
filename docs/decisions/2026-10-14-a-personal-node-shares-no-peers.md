@@ -21,7 +21,7 @@ It still answers. Peer-Sharing runs on every warm and hot peer ([`2026-03-15-pee
 
 A person's relays are theirs. A device is set up with the relays it uses, and each of them is the person's choice.
 
-One relay has no need to learn the others from a device. A relay learns its peers from relays and bootnodes. A device asks no peer for peers at all: it has no use for an answer, since it dials only the relays it is set up with.
+One relay has no need to learn the others from a device. A relay learns its peers from its operator's configuration. A device asks no peer for peers at all: it has no use for an answer, since it dials only the relays it is set up with.
 
 A device must not be the way that a relay learns of another. A person may keep a relay of their own private, and use it beside a public one. The device is connected to both, and tells neither of the other.
 
