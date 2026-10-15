@@ -3912,8 +3912,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 anyhow::bail!("{folder} is not a folder");
             }
             // Claude Code keeps one memory per repository, in the folder
-            // of its main working tree: that is the folder to map.
-            let root = discover::memory_root(&given);
+            // of its main working tree: that is the folder to map. Where
+            // git does not answer in time, no other folder is taken in its
+            // place.
+            let Some(root) = discover::memory_root_by(&given, discover::git_deadline()) else {
+                anyhow::bail!(
+                    "git did not answer in time, so the folder that holds the memory of {} is not \
+                     known, and nothing was mapped.",
+                    short_path(&given.display().to_string())
+                );
+            };
             let mapped_folder = root.display().to_string();
             let home_dir = real_home();
             let is_home = root == home_dir;
@@ -4122,11 +4130,13 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 };
                 let path = config::expand_tilde(trimmed);
                 // The folder as typed, then its real path, then the
-                // repository it is in.
+                // repository it is in, where git answers in time.
                 let mut spellings = vec![path.display().to_string()];
                 if let Ok(real) = std::fs::canonicalize(&path) {
                     spellings.push(real.display().to_string());
-                    spellings.push(discover::memory_root(&real).display().to_string());
+                    if let Some(root) = discover::memory_root_by(&real, discover::git_deadline()) {
+                        spellings.push(root.display().to_string());
+                    }
                 }
                 mapping_at(&mappings, &spellings)
             };

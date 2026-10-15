@@ -7,7 +7,7 @@
 //! different machines. Session transcripts go in the folder of the
 //! directory the session started in. Memory goes in one folder per git
 //! repository, shared by its subdirectories and worktrees: the folder of
-//! the repository's main working tree ([`memory_root`]). Outside a
+//! the repository's main working tree ([`memory_root_known`]). Outside a
 //! repository the two are the same folder.
 //!
 //! A folder found on disk is matched to its project by the working
@@ -57,8 +57,8 @@ pub fn folders(claude_dir: &Path) -> Vec<Folder> {
 // found for a directory that is being mapped, and so kept beside the one
 // function that says whether `cordelia sync map` would sync a folder.
 pub use cordelia_api::found::{
-    claude_folder, claude_folder_name, is_claude_folder_for, memory_root, memory_root_is_assumed,
-    memory_root_known, recorded_cwds,
+    claude_folder, claude_folder_name, git_deadline, is_claude_folder_for, memory_root_by,
+    memory_root_is_assumed, memory_root_known, recorded_cwds,
 };
 
 /// The working directory recorded first in the folder's newest transcript.
@@ -337,6 +337,7 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
+        let memory_root = |dir: &Path| memory_root_by(dir, git_deadline()).unwrap();
 
         // Not a repository: the directory itself, even if it does not exist.
         let plain = base.join("plain");

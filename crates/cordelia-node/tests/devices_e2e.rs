@@ -1872,6 +1872,60 @@ fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
     repo
 }
 
+/// A `git` that answers nothing, first in the path: `cordelia sync map`
+/// gives it as long as a stream is given and no more, kills it, and
+/// refuses. No other folder is taken in the place of the repository's:
+/// nothing is mapped. With a git that answers, the same command maps the
+/// repository.
+#[cfg(unix)]
+#[test]
+fn a_map_whose_git_does_not_answer_is_refused_in_time_and_maps_nothing() {
+    use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
+    use std::os::unix::fs::PermissionsExt;
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
+    sync_on(&laptop);
+    let repo = clone_at(&laptop.home(), "work/tools");
+    let deep = repo.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let bin = laptop.dir.path().join("hanging-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(&git, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let began = Instant::now();
+    let said = laptop.command_given(
+        &[("PATH", path_var.as_str())],
+        &["sync", "map", &path(&deep), "tools"],
+    );
+    let took = began.elapsed();
+    assert!(!said.status.success(), "{said:?}");
+    let refused = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        refused.contains(
+            "git did not answer in time, so the folder that holds the memory of ~/work/tools/src \
+             is not known, and nothing was mapped."
+        ),
+        "{refused}"
+    );
+    assert!(
+        took < Duration::from_secs(STREAM_TIMEOUT_SECS + 15),
+        "{took:?}"
+    );
+    assert!(mapped_names(&state(&laptop)).is_empty());
+
+    let said = laptop.cli(&["sync", "map", &path(&deep), "tools"]);
+    assert!(said.contains("Mapped ~/work/tools to tools."), "{said}");
+    assert_eq!(mapped_names(&state(&laptop)), ["tools"]);
+}
+
 /// The names a device has mapped, from its status snapshot.
 fn mapped_names(snapshot: &serde_json::Value) -> Vec<String> {
     let mut names: Vec<String> = snapshot["sync"]["mappings"]
