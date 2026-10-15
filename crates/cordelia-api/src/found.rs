@@ -33,6 +33,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use cordelia_core::claude_code::{FOLDER_NAME_MAX, folder_name};
+use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
 use cordelia_storage::first_start::Notice;
 
 use crate::types::SyncMapping;
@@ -51,14 +52,10 @@ enum Layout {
     Repository { top: PathBuf, common: PathBuf },
 }
 
-/// Ask git for the work tree `cwd` is in and the repository's common
-/// directory.
-fn git_layout(cwd: &Path) -> Layout {
-    let asked = git_rev_parse(cwd).output();
-    let Ok(output) = asked else {
-        return Layout::GitNotRun;
-    };
-    layout_of(cwd, &output)
+/// The deadline that git is given where its caller has no bound of its
+/// own: [`STREAM_TIMEOUT_SECS`] from now.
+pub fn git_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(STREAM_TIMEOUT_SECS)
 }
 
 /// The command that asks git where `cwd` is.
@@ -90,17 +87,37 @@ fn layout_of(cwd: &Path, output: &std::process::Output) -> Layout {
     }
 }
 
-/// [`git_layout`], with git given until `deadline`: `None` where it has
-/// not answered by then, and is killed.
+/// Ask git for the work tree `cwd` is in and the repository's common
+/// directory, with git given until `deadline`: `None` where it has not
+/// answered by then, and is killed.
 fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
+    Some(match git_output_by(&mut git_rev_parse(cwd), deadline)? {
+        Ok(output) => layout_of(cwd, &output),
+        Err(_) => Layout::GitNotRun,
+    })
+}
+
+/// Run `git`, given until `deadline`: `None` where it has not answered by
+/// then, and is killed, with what it started; an error where it cannot be
+/// run. What it writes must be a few short lines, which the pipe holds
+/// whole.
+pub fn git_output_by(
+    git: &mut Command,
+    deadline: std::time::Instant,
+) -> Option<std::io::Result<std::process::Output>> {
     use std::process::Stdio;
-    let Ok(mut child) = git_rev_parse(cwd)
+    // A process group of its own: a `git` that is a wrapper (a version
+    // manager's shim) may run git, or anything, without `exec`.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(git, 0);
+    let mut child = match git
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return Some(Layout::GitNotRun);
+    {
+        Ok(child) => child,
+        Err(e) => return Some(Err(e)),
     };
     loop {
         // The time is taken before git is looked at: an answer seen after
@@ -112,27 +129,31 @@ fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             _ => {
+                // Its group, while git is not yet waited for and the
+                // group's ID cannot be another's.
+                #[cfg(unix)]
+                if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                    // SAFETY: kill(2) is given no pointer.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
     }
-    // What it wrote is two short lines, which the pipe holds whole.
-    child
-        .wait_with_output()
-        .ok()
-        .map(|output| layout_of(cwd, &output))
+    child.wait_with_output().ok().map(Ok)
 }
 
 /// The directory whose folder holds the memory for sessions started in
 /// `cwd`, where git can be run. Claude Code keeps one memory per git
 /// repository, shared by its subdirectories and worktrees, in the folder
 /// of the repository's main working tree. Outside a repository it is
-/// `cwd` itself. `None` where git cannot be run: the repository that
-/// `cwd` may be in is then not known.
+/// `cwd` itself. `None` where git cannot be run, or has not answered by
+/// [`git_deadline`]: the repository that `cwd` may be in is then not
+/// known.
 pub fn memory_root_known(cwd: &Path) -> Option<PathBuf> {
-    root_of(cwd, git_layout(cwd))
+    root_of(cwd, git_layout_by(cwd, git_deadline())?)
 }
 
 /// [`memory_root_known`] of `cwd`, given what git says of it.
@@ -153,28 +174,25 @@ fn root_of(cwd: &Path, layout: Layout) -> Option<PathBuf> {
     })
 }
 
-/// [`memory_root_known`], or `cwd` itself where git cannot be run.
-pub fn memory_root(cwd: &Path) -> PathBuf {
-    memory_root_known(cwd).unwrap_or_else(|| cwd.to_path_buf())
-}
-
-/// [`memory_root`], with git given until `deadline` (decision 2026-10-09
-/// §4.1, C20): `None` where git has not answered by then. Git is killed,
-/// and nothing falls back to `cwd` itself, which may be another agent's
-/// folder than the repository's.
+/// [`memory_root_known`], or `cwd` itself where git cannot be run, with
+/// git given until `deadline` (decision 2026-10-09 §4.1, C20): `None`
+/// where git has not answered by then. Git is killed, and nothing falls
+/// back to `cwd` itself, which may be another agent's folder than the
+/// repository's.
 pub fn memory_root_by(cwd: &Path, deadline: std::time::Instant) -> Option<PathBuf> {
     let layout = git_layout_by(cwd, deadline)?;
     Some(root_of(cwd, layout).unwrap_or_else(|| cwd.to_path_buf()))
 }
 
-/// Whether [`memory_root`] is a guess for `cwd`: it is in a repository
+/// Whether [`memory_root_known`] is a guess for `cwd`: it is in a repository
 /// whose common directory is not a plain `.git`, which is a submodule or a
 /// worktree of a bare repository. Where Claude Code keeps memory for those
-/// has not been confirmed.
+/// has not been confirmed. Not where git has not answered by
+/// [`git_deadline`]: nothing is known of the directory then.
 pub fn memory_root_is_assumed(cwd: &Path) -> bool {
-    match git_layout(cwd) {
-        Layout::Repository { common, .. } => common.file_name().is_none_or(|n| n != ".git"),
-        Layout::GitNotRun | Layout::NoRepository => false,
+    match git_layout_by(cwd, git_deadline()) {
+        Some(Layout::Repository { common, .. }) => common.file_name().is_none_or(|n| n != ".git"),
+        Some(Layout::GitNotRun | Layout::NoRepository) | None => false,
     }
 }
 
@@ -1685,13 +1703,60 @@ mod tests {
             .unwrap();
         assert!(made.status.success());
         assert_eq!(memory_root_by(&notes, in_time()), Some(base.join("repo")));
-        assert_eq!(memory_root_by(&notes, in_time()), Some(memory_root(&notes)));
+        assert_eq!(memory_root_by(&notes, in_time()), memory_root_known(&notes));
         // A deadline past before git is looked at gives no answer, though
         // git ended before that look, as it may on a loaded machine: asked
         // often, so that one such end is likely among them.
         for _ in 0..500 {
             assert_eq!(memory_root_by(&notes, Instant::now()), None);
         }
+    }
+
+    /// A `git` that is a wrapper, and runs a child without `exec`, as some
+    /// version managers' shims do: at the deadline, nothing it started is
+    /// left running.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_git_that_is_a_wrapper_leaves_nothing_running() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("git");
+        let pid_file = tmp.path().join("child.pid");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nsh -c 'echo $$ > \"$PID_FILE\"; exec sleep 30'\necho done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut wrapper = Command::new(&git);
+        wrapper.env("PID_FILE", &pid_file);
+        assert!(git_output_by(&mut wrapper, deadline).is_none());
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Running: listed, and not a zombie that no one has reaped yet.
+        let running = || {
+            let ps = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while running() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let left = running();
+        if left {
+            // SAFETY: kill(2) is given no pointer.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!left, "the wrapper's child {pid} is still running");
     }
 
     /// The notice as a status carries it: one record for each time it

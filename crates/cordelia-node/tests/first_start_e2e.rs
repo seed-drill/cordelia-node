@@ -810,6 +810,111 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
     assert_eq!(scope(&device).as_deref(), Some("off"));
 }
 
+/// What is left of a copy, and cannot be removed: a folder in it that
+/// cannot be looked into. Where that does not keep out whoever runs the
+/// test, as it does not keep out root, the file in it is also made one
+/// that cannot be removed. Both are undone when it is dropped. `None`,
+/// with a message, where neither can be done: where `chattr` cannot make
+/// such a file, as on a file system that has no such files.
+#[cfg(unix)]
+struct CannotBeRemoved {
+    closed: std::path::PathBuf,
+    fixed: bool,
+}
+
+#[cfg(unix)]
+impl CannotBeRemoved {
+    fn in_place_of(partial: &Path) -> Option<Self> {
+        let closed = partial.join("closed");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::write(closed.join("a-file"), "x").unwrap();
+        set_mode(&closed, 0o000);
+        let mut left = Self {
+            closed,
+            fixed: false,
+        };
+        if std::fs::read_dir(&left.closed).is_ok() {
+            let made = std::process::Command::new("chattr")
+                .arg("+i")
+                .arg(left.closed.join("a-file"))
+                .status();
+            if !made.as_ref().is_ok_and(|made| made.success()) {
+                eprintln!(
+                    "skipped: a closed folder does not keep this test's user out, and chattr \
+                     cannot make a file that cannot be removed here ({made:?})"
+                );
+                return None;
+            }
+            left.fixed = true;
+        }
+        Some(left)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CannotBeRemoved {
+    fn drop(&mut self) {
+        if self.fixed {
+            let _ = std::process::Command::new("chattr")
+                .arg("-i")
+                .arg(self.closed.join("a-file"))
+                .status();
+        }
+        set_mode(&self.closed, 0o700);
+    }
+}
+
+/// `cordelia status --json` lists in `sync.projects` only the folders that
+/// sync. A node that is held at its first start runs no cycle, and goes
+/// on giving the report that the released version stored: it lists a
+/// folder that is mapped, and two that synced there because every folder
+/// found did. Only the mapped one is a project, and only it is counted.
+#[cfg(unix)]
+#[test]
+fn a_node_held_at_its_first_start_lists_only_the_folders_that_sync() {
+    let mut device = node("laptop", "personal", None);
+    drop(in_the_released_form(&device));
+    let Some(_left) =
+        CannotBeRemoved::in_place_of(&device.data_dir().join(format!("before-{VERSION}.partial")))
+    else {
+        return;
+    };
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    let status = wait_for("the first try has failed", &[&device], 30, || {
+        let status = status_of(&device);
+        let not_done = status["held"]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("is not done"));
+        not_done.then_some(status)
+    });
+    // The report is the released version's, with its three folders.
+    assert_eq!(
+        status["sync"]["last_cycle_at"], "2026-10-05T09:12:44.512203817+00:00",
+        "{status}"
+    );
+    assert_eq!(status["sync"]["folders"], 1, "{status}");
+    let projects: Vec<(&str, &serde_json::Value)> = status["sync"]["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| (project["project"].as_str().unwrap(), &project["mapped"]))
+        .collect();
+    assert_eq!(
+        projects,
+        [("github.com/sam/lab", &serde_json::json!(true))],
+        "{status}"
+    );
+    // The bar counts the same folders.
+    let bar: serde_json::Value =
+        serde_json::from_str(&device.cli(&["status", "--waybar"])).unwrap();
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(
+        tooltip.lines().any(|line| line == "Folders syncing: 1"),
+        "{tooltip}"
+    );
+}
+
 /// Leave `node`'s database as a later version of the program would: with
 /// a table that this version does not know, at a schema version above
 /// this one's. Returns that version, and the bytes of the file.

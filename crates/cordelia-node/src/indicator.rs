@@ -695,11 +695,11 @@ fn of_its_folders(f: &Facts) -> (State, String) {
         }
         Some(_) => {}
     }
-    if f.folders == 0 {
-        return match stopped {
-            Some(notice) => (Attention, notice.says()),
-            None => (Off, "memory: nothing mapped".into()),
-        };
+    // A conflict and a file too large are counted from every folder of
+    // the report, so they are said where nothing syncs, as `holds` says
+    // them; with no mapping, the notice is ahead of them, as there.
+    if let Some(notice) = stopped.filter(|_| f.folders == 0 && f.mapped == 0) {
+        return (Attention, notice.says());
     }
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
@@ -711,6 +711,12 @@ fn of_its_folders(f: &Facts) -> (State, String) {
             Attention,
             format!("memory: {n} {} too large", plural(n, "file")),
         );
+    }
+    if f.folders == 0 {
+        return match stopped {
+            Some(notice) => (Attention, notice.says()),
+            None => (Off, "memory: nothing mapped".into()),
+        };
     }
     if let Some(notice) = stopped {
         return (Attention, notice.says());
@@ -1849,6 +1855,60 @@ mod tests {
         });
         assert_eq!(names_none.level, Some(Level::Red));
         assert_eq!(names_none.summary, "memory: folders stopped syncing");
+    }
+
+    /// A conflict and a file too large in a report whose folders do not
+    /// sync: the state says them as the level does, and not "nothing
+    /// mapped". With no mapping, the notice is ahead of them in both.
+    #[test]
+    fn the_state_says_a_conflict_where_no_folder_of_the_report_syncs() {
+        let agree = |edit: &dyn Fn(&mut Facts), says: &str| {
+            let mut f = synced();
+            f.folders = 0;
+            edit(&mut f);
+            let shown = shown(&f);
+            assert_eq!(derive(&f), (State::Attention, says.into()), "{f:?}");
+            assert_eq!(
+                (shown.level, shown.summary.as_str()),
+                (Some(Level::Red), says)
+            );
+        };
+        for mapped in [0, 1] {
+            agree(
+                &|f| {
+                    f.mapped = mapped;
+                    f.conflicts = vec!["x".into()];
+                },
+                "memory: 1 conflict",
+            );
+            agree(
+                &|f| {
+                    f.mapped = mapped;
+                    f.too_large = vec!["a/memory/b.md".into()];
+                },
+                "memory: 1 file too large",
+            );
+        }
+        let notice = Some(Stopped {
+            folders: 2,
+            not_known: false,
+        });
+        agree(
+            &|f| {
+                f.mapped = 0;
+                f.conflicts = vec!["x".into()];
+                f.notice = notice.clone();
+            },
+            "memory: 2 folders stopped syncing",
+        );
+        agree(
+            &|f| {
+                f.mapped = 1;
+                f.conflicts = vec!["x".into()];
+                f.notice = notice.clone();
+            },
+            "memory: 1 conflict",
+        );
     }
 
     /// The waits (decision 2026-10-04 §10.1). No relay: none at four

@@ -1117,11 +1117,20 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             details.push(format!("Held up: {why}"));
         }
         if status.facts.running {
-            let relays = status.facts.peers_hot;
-            details.push(match relays {
-                0 => "Relays: none connected".to_string(),
-                n => format!("Relays: {n} connected"),
-            });
+            // Every relay the device is connected to, as the node lists
+            // them: not its hot peers, of which there are at most
+            // `HOT_MAX`. A relay node is set up with no relay: its line
+            // counts its hot peers, as it did.
+            let relays = match status.facts.role.as_str() {
+                "personal" => relays_connected(config_path),
+                _ => Some(status.facts.peers_hot as usize),
+            };
+            if let Some(relays) = relays {
+                details.push(match relays {
+                    0 => "Relays: none connected".to_string(),
+                    n => format!("Relays: {n} connected"),
+                });
+            }
             if status.facts.outbox_waiting > 0 {
                 details.push(format!("Waiting to send: {}", status.facts.outbox_waiting));
             }
@@ -1133,10 +1142,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             }
         }
         if let Some(sync) = &status.sync {
-            if let Some(folders) = sync["report"]["folders"].as_array()
-                && !folders.is_empty()
-            {
-                details.push(format!("Folders syncing: {}", folders.len()));
+            let folders = folders_that_sync(&sync["report"]).count();
+            if folders > 0 {
+                details.push(format!("Folders syncing: {folders}"));
             }
             if let Some(at) = sync["last_change_at"]
                 .as_str()
@@ -1241,11 +1249,9 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         }
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
-            // One entry per synced folder: what a panel lists and toggles.
-            let projects: Vec<serde_json::Value> = report["folders"]
-                .as_array()
-                .into_iter()
-                .flatten()
+            // One entry per synced folder: what a panel lists and toggles
+            // ([`folders_that_sync`]).
+            let projects: Vec<serde_json::Value> = folders_that_sync(report)
                 .map(|f| {
                     serde_json::json!({
                         "project": f["project"],
@@ -1279,7 +1285,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 "available": report["available"],
                 "last_cycle_at": report["at"],
                 "last_change_at": sync["last_change_at"],
-                "folders": report["folders"].as_array().map_or(0, Vec::len),
+                "folders": folders_that_sync(report).count(),
                 "projects": projects,
                 "projects_waiting": status.facts.projects_waiting,
                 "conflicts": status.facts.conflicts,
@@ -1473,6 +1479,74 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     Ok(())
 }
 
+/// What the folders of a sync report say, for the level: how many sync,
+/// what conflicts and what is too large in them, and how many wait.
+fn folder_facts(facts: &mut indicator::Facts, report: &serde_json::Value) {
+    let Some(folders) = report["folders"].as_array() else {
+        return;
+    };
+    facts.folders = folders_that_sync(report).count();
+    for f in folders {
+        facts.conflicts.extend(strings(&f["conflict_files"]));
+        let folder = f["folder"].as_str().unwrap_or_default();
+        facts.too_large.extend(
+            strings(&f["too_large"])
+                .into_iter()
+                .map(|name| format!("{folder}/memory/{name}")),
+        );
+        // A folder that does not sync waits for nothing.
+        if f["waiting"].as_bool().unwrap_or(false) && syncs(f) {
+            facts.projects_waiting += 1;
+        }
+    }
+}
+
+/// The strings of a list, where it is one.
+fn strings(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The folders of a sync report that sync. Only a mapped folder syncs. A
+/// report that an earlier version stored, which a node held at its first
+/// start goes on giving, can list folders that synced there when every
+/// folder found did: those are left out.
+fn folders_that_sync(report: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    report["folders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| syncs(f))
+}
+
+/// Whether a folder of a sync report syncs: it is mapped. A report of a
+/// version before a folder said whether it was mapped listed only folders
+/// that synced, so a folder that does not say is taken to be mapped.
+fn syncs(folder: &serde_json::Value) -> bool {
+    folder["mapped"].as_bool() != Some(false)
+}
+
+/// How many of the relays the node is set up with are connected, as it
+/// lists them (`GET /api/v1/peers`). `None` where it did not answer.
+fn relays_connected(config_path: &str) -> Option<usize> {
+    let mut config = Config::load(&config::expand_tilde(config_path)).ok()?;
+    config.apply_env_overrides();
+    let timeout = std::time::Duration::from_secs(1);
+    let peers = local_api(&config, false, "/api/v1/peers", timeout).ok()?;
+    let relays = peers["relays"].as_array()?;
+    Some(
+        relays
+            .iter()
+            .filter(|relay| relay["state"] == "connected")
+            .count(),
+    )
+}
+
 /// What `cordelia status` knows about this device and its running node.
 struct GatheredStatus {
     facts: indicator::Facts,
@@ -1553,31 +1627,8 @@ fn gather_status(config_path: &str) -> GatheredStatus {
             .map(|at| (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds());
         // For how long the node has stored none, by its own clock.
         out.facts.no_report_secs = sync["no_report_secs"].as_u64();
-        let strings = |v: &serde_json::Value| -> Vec<String> {
-            v.as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
         out.facts.errors = strings(&report["errors"]);
-        if let Some(folders) = report["folders"].as_array() {
-            out.facts.folders = folders.len();
-            for f in folders {
-                out.facts.conflicts.extend(strings(&f["conflict_files"]));
-                let folder = f["folder"].as_str().unwrap_or_default();
-                out.facts.too_large.extend(
-                    strings(&f["too_large"])
-                        .into_iter()
-                        .map(|name| format!("{folder}/memory/{name}")),
-                );
-                if f["waiting"].as_bool().unwrap_or(false) {
-                    out.facts.projects_waiting += 1;
-                }
-            }
-        }
+        folder_facts(&mut out.facts, report);
         out.sync = Some(sync);
     }
     // What the node holds of this person's devices (decision 2026-10-04
@@ -2660,10 +2711,6 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
             "{:<24} {:<10} {:>6}   {:<20} {}",
             name, ch.mode, count, activity, ch.channel_type
         );
-    }
-
-    if all.is_empty() {
-        println!("No channels. Subscribe with `cordelia subscribe <channel>`.");
     }
 
     Ok(())
@@ -3907,8 +3954,19 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 anyhow::bail!("{folder} is not a folder");
             }
             // Claude Code keeps one memory per repository, in the folder
-            // of its main working tree: that is the folder to map.
-            let root = discover::memory_root(&given);
+            // of its main working tree: that is the folder to map. Where
+            // git does not answer in time, no other folder is taken in its
+            // place.
+            let not_in_time = || {
+                anyhow::anyhow!(
+                    "git did not answer in time, so the folder that holds the memory of {} is not \
+                     known, and nothing was mapped.",
+                    short_path(&given.display().to_string())
+                )
+            };
+            let Some(root) = discover::memory_root_by(&given, discover::git_deadline()) else {
+                return Err(not_in_time());
+            };
             let mapped_folder = root.display().to_string();
             let home_dir = real_home();
             let is_home = root == home_dir;
@@ -4031,7 +4089,12 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                                 shell_arg(&mapped_folder)
                             )
                         };
-                        match discover::project_for(&root, &home_dir) {
+                        // Where git does not answer in time, no name is
+                        // taken: the folder is not taken to have none.
+                        let project =
+                            discover::project_by(&root, &home_dir, discover::git_deadline())
+                                .ok_or_else(not_in_time)?;
+                        match project {
                             Some(Project::Repo(remote))
                                 if cordelia_api::sync::valid_sync_name(&remote) =>
                             {
@@ -4117,11 +4180,13 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 };
                 let path = config::expand_tilde(trimmed);
                 // The folder as typed, then its real path, then the
-                // repository it is in.
+                // repository it is in, where git answers in time.
                 let mut spellings = vec![path.display().to_string()];
                 if let Ok(real) = std::fs::canonicalize(&path) {
                     spellings.push(real.display().to_string());
-                    spellings.push(discover::memory_root(&real).display().to_string());
+                    if let Some(root) = discover::memory_root_by(&real, discover::git_deadline()) {
+                        spellings.push(root.display().to_string());
+                    }
                 }
                 mapping_at(&mappings, &spellings)
             };
@@ -4302,8 +4367,9 @@ fn notice_row(named: &serde_json::Value) -> Option<Vec<String>> {
 }
 
 /// A row as it is safe to print (decision 2026-10-04 §16): each cell with
-/// its control characters, and the marks that change the direction text
-/// is laid out in, shown as escapes, as local history prints a name. A
+/// its control characters, the marks that change the direction text is
+/// laid out in, and what cannot be seen and is no part of ordinary
+/// writing, shown as escapes, as local history prints a name. A
 /// folder, a directory and a name are whatever is on the disk, in a
 /// transcript or in a notice that an earlier version stored: none of them
 /// moves the cursor or hides a line.
@@ -5073,6 +5139,27 @@ fn init_tracing(level: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// The counts of one report agree: a folder that is not mapped does
+    /// not sync, and is neither counted nor waits; a folder of a report
+    /// that does not say whether it is mapped is taken to be, so that
+    /// nothing disappears.
+    #[test]
+    fn test_the_counts_of_a_report_are_of_the_folders_that_sync() {
+        use serde_json::json;
+        let report = json!({ "folders": [
+            { "project": "mapped", "mapped": true, "waiting": true },
+            { "project": "found", "mapped": false, "waiting": true },
+            { "project": "older", "waiting": false },
+        ]});
+        let listed: Vec<&serde_json::Value> = super::folders_that_sync(&report)
+            .map(|f| &f["project"])
+            .collect();
+        assert_eq!(listed, [&json!("mapped"), &json!("older")]);
+        let mut facts = super::indicator::Facts::default();
+        super::folder_facts(&mut facts, &report);
+        assert_eq!((facts.folders, facts.projects_waiting), (2, 1));
+    }
+
     /// A folder's row says why it does not sync, or that it does and how
     /// many of its files failed in the last cycle: those listed, and those
     /// only counted.

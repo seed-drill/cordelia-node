@@ -776,6 +776,68 @@ async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     assert_names_channels_only_for_debugging(&relay, &[OLDER]);
 }
 
+/// The bar's form of `cordelia status` counts every relay that the device
+/// is connected to: here three of the test's own, while the node holds
+/// fewer of its peers hot, and never more than `HOT_MAX`. A relay's bar
+/// counts its hot peers.
+#[test]
+fn the_bar_counts_every_relay_the_device_is_connected_to() {
+    use cordelia_core::protocol::HOT_MAX;
+    let relays: Vec<Node> = (0..3).map(|_| relay_started()).collect();
+    let dialled: Vec<String> = relays
+        .iter()
+        .map(|relay| format!("127.0.0.1:{}", relay.p2p))
+        .collect();
+    let mut device = node_with_bootnodes("laptop", "personal", &dialled);
+    device.start();
+    let mut all: Vec<&Node> = relays.iter().collect();
+    all.push(&device);
+    wait_for("device healthy", &all, 30, || healthy(&device));
+    wait_for(
+        "three relays connected, and fewer peers hot",
+        &all,
+        90,
+        || {
+            let connected = relays_of(&device)
+                .iter()
+                .filter(|relay| relay["state"] == "connected")
+                .count();
+            let hot = device.get("/api/v1/status")?["peers_hot"].as_u64()?;
+            (connected == 3 && (1..=u64::from(HOT_MAX)).contains(&hot)).then_some(())
+        },
+    );
+    let bar: serde_json::Value =
+        serde_json::from_str(&device.cli(&["status", "--waybar"])).unwrap();
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(tooltip.contains("\nRelays: 3 connected"), "{tooltip}");
+    // A relay node is set up with no relay: its line counts its hot
+    // peers, as it did, as its level does.
+    let relay = &relays[0];
+    let hot = wait_for("a relay with a hot peer", &all, 30, || {
+        relay.get("/api/v1/status")?["peers_hot"]
+            .as_u64()
+            .filter(|hot| *hot > 0)
+    });
+    let bar: serde_json::Value = serde_json::from_str(&relay.cli(&["status", "--waybar"])).unwrap();
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(
+        tooltip.contains(&format!("Relays: {hot} connected")),
+        "{tooltip}"
+    );
+}
+
+/// `cordelia channels` names no command that does not exist: a relay that
+/// holds no channel lists none, and says nothing more.
+#[test]
+fn channels_names_no_command_that_does_not_exist() {
+    let relay = node("relay", "relay", None);
+    let said = relay.cli(&["channels"]);
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 1, "{said}");
+    assert!(lines[0].starts_with("CHANNEL "), "{said}");
+    assert!(!said.contains("subscribe"), "{said}");
+}
+
 /// A device with a great many small entries to send is never the one its
 /// relay refuses. A relay counts each entry as its content and what an
 /// entry takes beyond it, and a device paces itself by the same count: if
@@ -1870,6 +1932,156 @@ fn clone_at(home: &std::path::Path, rel: &str) -> PathBuf {
         );
     }
     repo
+}
+
+/// A `git` that answers nothing, first in the path: `cordelia sync map`
+/// gives it as long as a stream is given and no more, kills it, and
+/// refuses. No other folder is taken in the place of the repository's:
+/// nothing is mapped. With a git that answers, the same command maps the
+/// repository.
+#[cfg(unix)]
+#[test]
+fn a_map_whose_git_does_not_answer_is_refused_in_time_and_maps_nothing() {
+    use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
+    use std::os::unix::fs::PermissionsExt;
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
+    sync_on(&laptop);
+    let repo = clone_at(&laptop.home(), "work/tools");
+    let deep = repo.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let bin = laptop.dir.path().join("hanging-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(&git, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let began = Instant::now();
+    let said = laptop.command_given(
+        &[("PATH", path_var.as_str())],
+        &["sync", "map", &path(&deep), "tools"],
+    );
+    let took = began.elapsed();
+    assert!(!said.status.success(), "{said:?}");
+    let refused = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        refused.contains(
+            "git did not answer in time, so the folder that holds the memory of ~/work/tools/src \
+             is not known, and nothing was mapped."
+        ),
+        "{refused}"
+    );
+    assert!(
+        took < Duration::from_secs(STREAM_TIMEOUT_SECS + 15),
+        "{took:?}"
+    );
+    assert!(mapped_names(&state(&laptop)).is_empty());
+
+    let said = laptop.cli(&["sync", "map", &path(&deep), "tools"]);
+    assert!(said.contains("Mapped ~/work/tools to tools."), "{said}");
+    assert_eq!(mapped_names(&state(&laptop)), ["tools"]);
+}
+
+/// A `git`, first in the path that is returned, that answers nothing when
+/// it is asked for a remote (`git remote get-url`), and is the real git
+/// for everything else.
+#[cfg(unix)]
+fn git_that_hangs_for_get_url(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path_now = std::env::var("PATH").unwrap_or_default();
+    let real = std::env::split_paths(&path_now)
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .expect("git is in the path");
+    let bin = dir.join("hanging-get-url-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" get-url \"*) exec sleep 600;; esac\nexec {} \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{path_now}", bin.display())
+}
+
+/// `cordelia sync map` with no name asks git for the repository's remote.
+/// A git that does not answer that is given as long as a stream is given
+/// and no more, is killed, and the map is refused: the folder is not taken
+/// to have no remote, and nothing is mapped.
+#[cfg(unix)]
+#[test]
+fn a_map_with_no_name_whose_git_does_not_give_the_remote_is_refused_in_time() {
+    use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
+    let mut laptop = node("laptop", "personal", None);
+    laptop.start();
+    wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
+    sync_on(&laptop);
+    let repo = clone_at(&laptop.home(), "work/tools");
+    let path_var = git_that_hangs_for_get_url(laptop.dir.path());
+
+    let began = Instant::now();
+    let said = laptop.command_given(
+        &[("PATH", path_var.as_str())],
+        &["sync", "map", &path(&repo)],
+    );
+    let took = began.elapsed();
+    assert!(!said.status.success(), "{said:?}");
+    let refused = String::from_utf8_lossy(&said.stderr);
+    assert!(
+        refused.contains(
+            "git did not answer in time, so the folder that holds the memory of ~/work/tools \
+             is not known, and nothing was mapped."
+        ),
+        "{refused}"
+    );
+    assert!(
+        took < Duration::from_secs(STREAM_TIMEOUT_SECS + 15),
+        "{took:?}"
+    );
+    assert!(mapped_names(&state(&laptop)).is_empty());
+}
+
+/// A sync cycle asks git for the remote of each folder it finds. A git
+/// that does not answer that is killed at the deadline, the folder is
+/// taken to have no project, and the cycle goes on: it reports the mapped
+/// folder, where it would otherwise wait on git.
+#[cfg(unix)]
+#[test]
+fn a_sync_cycle_goes_on_when_git_does_not_give_a_remote() {
+    use cordelia_core::protocol::STREAM_TIMEOUT_SECS;
+    let mut laptop = node("laptop", "personal", None);
+    let path_var = git_that_hangs_for_get_url(laptop.dir.path());
+    laptop.start_given(&[("PATH", path_var.as_str())]);
+    wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
+    let repo = clone_at(&laptop.home(), "work/tools");
+    let memory = claude_folder(&laptop.home(), &repo);
+    std::fs::write(memory.join("note.md"), "a note\n").unwrap();
+    sync_on(&laptop);
+    laptop.cli(&["sync", "map", &path(&repo), "tools"]);
+
+    wait_for(
+        "a cycle that reports the mapped folder",
+        &[&laptop],
+        STREAM_TIMEOUT_SECS + 30,
+        || {
+            let s = state(&laptop);
+            s["sync"]["projects"]
+                .as_array()?
+                .iter()
+                .any(|p| p["project"] == "tools" && p["mapped"] == true)
+                .then_some(())
+        },
+    );
 }
 
 /// The names a device has mapped, from its status snapshot.
