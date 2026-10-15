@@ -7,7 +7,6 @@
 //! person or an agent, can tell where it starts and ends and whose it was.
 
 use chrono::{DateTime, Utc};
-use cordelia_api::messages::taken_out;
 use serde_json::{Value, json};
 
 use crate::{api_post, api_post_within, shell_word, short_path, sync_label};
@@ -140,12 +139,15 @@ pub(crate) fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<Strin
     }
 }
 
-/// Text from a record as it is safe to print: every character of the set
-/// that the commands of messages take out of text another device chose
-/// ([`taken_out`]: control and format characters, what renders as
-/// nothing, and the rest of that set) shown as an escape, so that a file
-/// name cannot move the cursor, hide a line, turn the text round or carry
-/// text that cannot be seen.
+/// Text from a record as it is safe to print: control characters shown as
+/// escapes, so that a file name cannot move the cursor or hide a line, and
+/// so are the marks that change the direction text is laid out in, and the
+/// characters that cannot be seen and are no part of ordinary writing
+/// ([`unseen`]). The joiners, and a variation selector after a character
+/// it can change, are part of ordinary writing (Persian, Devanagari, an
+/// emoji) and are left as they are; a selector with no such character
+/// before it is escaped. The commands of messages take out a wider set, of
+/// text another device chose (decision 2026-10-09 §4.1).
 pub(crate) fn printable(text: &str) -> String {
     escaped(text, |_| false)
 }
@@ -157,15 +159,59 @@ fn for_a_terminal(text: &str) -> String {
 }
 
 fn escaped(text: &str, left: impl Fn(char) -> bool) -> String {
-    text.chars()
-        .flat_map(|c| {
-            if taken_out(c) && !left(c) {
-                c.escape_default().collect::<Vec<char>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    let mut out = String::new();
+    // Whether the character before is one a selector can change: not at
+    // the start, and not a selector or a joiner.
+    let mut after_base = false;
+    for c in text.chars() {
+        let escape = !left(c)
+            && match c {
+                _ if selector(c) => !after_base,
+                '\u{200c}' | '\u{200d}' => false,
+                _ => unseen(c),
+            };
+        after_base = !selector(c) && !matches!(c, '\u{200c}' | '\u{200d}');
+        match escape {
+            true => out.extend(c.escape_default()),
+            false => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether `c` is shown as an escape wherever it is: a control character,
+/// a mark that changes the direction of text, and what cannot be seen and
+/// is no part of ordinary writing (a zero-width space, the word joiner and
+/// the invisible operators, the byte order mark, the tag block).
+fn unseen(c: char) -> bool {
+    c.is_control()
+        || lays_out(c)
+        || matches!(
+            c,
+            '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
+/// The characters that set the direction of the text around them, and
+/// the two that end a line or a paragraph without being a line feed.
+fn lays_out(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// A variation selector, which changes how the character before it is
+/// drawn: Mongolian's free ones, the sixteen, and the supplement.
+fn selector(c: char) -> bool {
+    matches!(
+        c,
+        '\u{180b}'..='\u{180f}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+    )
 }
 
 /// A kept text as it is printed: as it is, or with what could act on a
@@ -590,7 +636,7 @@ mod tests {
     #[test]
     fn test_what_is_printed_from_a_record_has_no_control_characters() {
         let hostile = "notes\u{1b}[2K\rgone.md\nrestore everything\u{202e}dm.";
-        let acts = taken_out;
+        let acts = unseen;
         let safe = printable(hostile);
         assert!(!safe.chars().any(acts), "{safe:?}");
         assert_eq!(printable("café — ünïcode.md"), "café — ünïcode.md");
@@ -707,10 +753,10 @@ mod tests {
         );
     }
 
-    /// What a person cannot see in a kept text is shown on a terminal as
-    /// an escape, and never printed: of each kind, the set that the
-    /// commands of messages clean text by (decision 2026-10-09 §4.1). Its
-    /// lines and tabs are left as they are, and so is what can be seen.
+    /// What a person cannot see in a kept text, and is no part of ordinary
+    /// writing, is shown on a terminal as an escape, and never printed: of
+    /// each kind that [`printable`] escapes. Its lines and tabs are left as
+    /// they are, and so is what can be seen.
     #[test]
     fn test_a_kept_text_shows_every_character_that_cannot_be_seen_as_an_escape() {
         let unseen = [
@@ -718,28 +764,16 @@ mod tests {
             '\u{e0001}',
             '\u{e0041}',
             '\u{e007f}',
-            // Zero-width characters.
+            // Zero-width characters that join nothing, and the invisible
+            // operators.
             '\u{200b}',
-            '\u{200c}',
-            '\u{200d}',
             '\u{2060}',
+            '\u{2064}',
             '\u{feff}',
-            // The rest of Cf: a soft hyphen, a number sign, an annotation.
-            '\u{ad}',
-            '\u{600}',
-            '\u{fff9}',
-            // What renders as nothing and is of no such category: variation
-            // selectors and fillers.
-            '\u{34f}',
-            '\u{fe0f}',
-            '\u{e0100}',
-            '\u{115f}',
-            '\u{3164}',
-            // The braille blank, private use, an unassigned code point, and
-            // a line and a paragraph that end with no line feed.
-            '\u{2800}',
-            '\u{e000}',
-            '\u{378}',
+            // Marks that change the direction of text, and a line and a
+            // paragraph that end with no line feed.
+            '\u{202e}',
+            '\u{2066}',
             '\u{2028}',
             '\u{2029}',
         ];
@@ -768,6 +802,67 @@ mod tests {
         assert!(
             out.contains(seen) && !out.contains("shown as escapes"),
             "{out:?}"
+        );
+    }
+
+    /// Ordinary writing prints as it is, as a file name and as a kept
+    /// text: Persian's zero-width non-joiner, Devanagari's joiner, an
+    /// emoji's variation selector, a family emoji's joiners and a
+    /// Mongolian free variation selector. A command to copy is offered for
+    /// such a name. A selector with nothing before it that it can change
+    /// is escaped: at the start, after another selector, after a joiner.
+    #[test]
+    fn test_ordinary_writing_prints_as_it_is() {
+        let ordinary = [
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+            "\u{915}\u{94d}\u{200d}\u{937}",
+            "\u{2764}\u{fe0f}",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+            "\u{1820}\u{180b}\u{1821}\u{180c}",
+        ];
+        let record = json!({
+            "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
+            "at": "2026-10-03T11:00:00Z", "change": "pulled",
+            "text_of": { "here": { "agreed": 4 } }, "interrupted": false,
+        });
+        for text in ordinary {
+            let name = format!("{text}.md");
+            assert_eq!(printable(&name), name);
+            let kept = format!("one\n\t{text}\n");
+            let answer = json!({ "record": record, "text": kept });
+            let out = shown(&answer, "a1b2c3d4e5f6", true);
+            assert!(
+                out.contains(&kept) && !out.contains("shown as escapes"),
+                "{text:?}: {out:?}"
+            );
+            let results = json!({ "results": [{ "id": "68dfb3a4c91e07", "done": true,
+                "message": format!("{name} restored"), "file": name,
+                "undo": null, "was_absent": true, "syncs": "yes" }] });
+            let (out, _) = restored(&results, "a1b2c3d4e5f6", true);
+            assert!(out.contains("To undo: rm "), "{text:?}: {out:?}");
+        }
+        for (text, escaped_as) in [
+            ("\u{fe0f}a", "\\u{fe0f}a"),
+            ("\u{2764}\u{fe0f}\u{fe0f}", "\u{2764}\u{fe0f}\\u{fe0f}"),
+            ("a\u{200d}\u{e0100}", "a\u{200d}\\u{e0100}"),
+            ("\u{180b}", "\\u{180b}"),
+        ] {
+            assert_eq!(printable(text), escaped_as, "{text:?}");
+        }
+        // What is no part of ordinary writing is escaped.
+        for (text, escaped_as) in [
+            ("a\u{200b}b", "a\\u{200b}b"),
+            ("a\u{e0067}b", "a\\u{e0067}b"),
+            ("a\u{202e}b", "a\\u{202e}b"),
+            ("a\u{1b}b", "a\\u{1b}b"),
+        ] {
+            assert_eq!(printable(text), escaped_as, "{text:?}");
+        }
+        // The flag of Scotland is a black flag and six tag characters: its
+        // tags are escaped.
+        assert_eq!(
+            printable("\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}"),
+            "\u{1f3f4}\\u{e0067}\\u{e0062}\\u{e0073}\\u{e0063}\\u{e0074}\\u{e007f}"
         );
     }
 

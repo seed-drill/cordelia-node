@@ -207,9 +207,10 @@ pub(crate) fn list<'a>(value: &'a Value, field: &str) -> impl Iterator<Item = &'
 
 /// A file's name, or a line that may hold one, as it is printed
 /// (decision 2026-10-04 §16): another device may have written the name.
-/// It is cut where a name is cut, and its control characters and the
-/// marks that change the direction of text are shown as escapes, as
-/// local history prints names.
+/// It is cut where a name is cut, and its control characters, the marks
+/// that change the direction of text, and what cannot be seen and is no
+/// part of ordinary writing, are shown as escapes, as local history
+/// prints names.
 pub(crate) fn file_shown(name: &str) -> String {
     crate::history_cmd::printable(&cordelia_api::look::name_shown(name))
 }

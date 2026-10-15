@@ -813,7 +813,9 @@ fn a_node_whose_first_start_cannot_be_made_stays_up_and_makes_it_once_it_can() {
 /// What is left of a copy, and cannot be removed: a folder in it that
 /// cannot be looked into. Where that does not keep out whoever runs the
 /// test, as it does not keep out root, the file in it is also made one
-/// that cannot be removed. Both are undone when it is dropped.
+/// that cannot be removed. Both are undone when it is dropped. `None`,
+/// with a message, where neither can be done: where `chattr` cannot make
+/// such a file, as on a file system that has no such files.
 #[cfg(unix)]
 struct CannotBeRemoved {
     closed: std::path::PathBuf,
@@ -822,20 +824,30 @@ struct CannotBeRemoved {
 
 #[cfg(unix)]
 impl CannotBeRemoved {
-    fn in_place_of(partial: &Path) -> Self {
+    fn in_place_of(partial: &Path) -> Option<Self> {
         let closed = partial.join("closed");
         std::fs::create_dir_all(&closed).unwrap();
         std::fs::write(closed.join("a-file"), "x").unwrap();
         set_mode(&closed, 0o000);
-        let fixed = std::fs::read_dir(&closed).is_ok();
-        if fixed {
+        let mut left = Self {
+            closed,
+            fixed: false,
+        };
+        if std::fs::read_dir(&left.closed).is_ok() {
             let made = std::process::Command::new("chattr")
                 .arg("+i")
-                .arg(closed.join("a-file"))
+                .arg(left.closed.join("a-file"))
                 .status();
-            assert!(made.as_ref().is_ok_and(|made| made.success()), "{made:?}");
+            if !made.as_ref().is_ok_and(|made| made.success()) {
+                eprintln!(
+                    "skipped: a closed folder does not keep this test's user out, and chattr \
+                     cannot make a file that cannot be removed here ({made:?})"
+                );
+                return None;
+            }
+            left.fixed = true;
         }
-        Self { closed, fixed }
+        Some(left)
     }
 }
 
@@ -856,14 +868,17 @@ impl Drop for CannotBeRemoved {
 /// sync. A node that is held at its first start runs no cycle, and goes
 /// on giving the report that the released version stored: it lists a
 /// folder that is mapped, and two that synced there because every folder
-/// found did. Only the mapped one is a project.
+/// found did. Only the mapped one is a project, and only it is counted.
 #[cfg(unix)]
 #[test]
 fn a_node_held_at_its_first_start_lists_only_the_folders_that_sync() {
     let mut device = node("laptop", "personal", None);
     drop(in_the_released_form(&device));
-    let _left =
-        CannotBeRemoved::in_place_of(&device.data_dir().join(format!("before-{VERSION}.partial")));
+    let Some(_left) =
+        CannotBeRemoved::in_place_of(&device.data_dir().join(format!("before-{VERSION}.partial")))
+    else {
+        return;
+    };
     device.start();
     wait_for("device healthy", &[&device], 30, || healthy(&device));
     let status = wait_for("the first try has failed", &[&device], 30, || {
@@ -878,7 +893,7 @@ fn a_node_held_at_its_first_start_lists_only_the_folders_that_sync() {
         status["sync"]["last_cycle_at"], "2026-10-05T09:12:44.512203817+00:00",
         "{status}"
     );
-    assert_eq!(status["sync"]["folders"], 3, "{status}");
+    assert_eq!(status["sync"]["folders"], 1, "{status}");
     let projects: Vec<(&str, &serde_json::Value)> = status["sync"]["projects"]
         .as_array()
         .unwrap()
@@ -889,6 +904,14 @@ fn a_node_held_at_its_first_start_lists_only_the_folders_that_sync() {
         projects,
         [("github.com/sam/lab", &serde_json::json!(true))],
         "{status}"
+    );
+    // The bar counts the same folders.
+    let bar: serde_json::Value =
+        serde_json::from_str(&device.cli(&["status", "--waybar"])).unwrap();
+    let tooltip = bar["tooltip"].as_str().unwrap();
+    assert!(
+        tooltip.lines().any(|line| line == "Folders syncing: 1"),
+        "{tooltip}"
     );
 }
 

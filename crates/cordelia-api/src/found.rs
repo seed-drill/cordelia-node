@@ -91,14 +91,28 @@ fn layout_of(cwd: &Path, output: &std::process::Output) -> Layout {
 /// directory, with git given until `deadline`: `None` where it has not
 /// answered by then, and is killed.
 fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
+    Some(match git_output_by(&mut git_rev_parse(cwd), deadline)? {
+        Ok(output) => layout_of(cwd, &output),
+        Err(_) => Layout::GitNotRun,
+    })
+}
+
+/// Run `git`, given until `deadline`: `None` where it has not answered by
+/// then, and is killed; an error where it cannot be run. What it writes
+/// must be a few short lines, which the pipe holds whole.
+pub fn git_output_by(
+    git: &mut Command,
+    deadline: std::time::Instant,
+) -> Option<std::io::Result<std::process::Output>> {
     use std::process::Stdio;
-    let Ok(mut child) = git_rev_parse(cwd)
+    let mut child = match git
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return Some(Layout::GitNotRun);
+    {
+        Ok(child) => child,
+        Err(e) => return Some(Err(e)),
     };
     loop {
         // The time is taken before git is looked at: an answer seen after
@@ -116,11 +130,7 @@ fn git_layout_by(cwd: &Path, deadline: std::time::Instant) -> Option<Layout> {
             }
         }
     }
-    // What it wrote is two short lines, which the pipe holds whole.
-    child
-        .wait_with_output()
-        .ok()
-        .map(|output| layout_of(cwd, &output))
+    child.wait_with_output().ok().map(Ok)
 }
 
 /// The directory whose folder holds the memory for sessions started in

@@ -416,11 +416,11 @@ impl Node {
     /// at where it will dial. That look is at the file, and a variable
     /// could stand in place of what the file says. So only a variable
     /// that is known not to change where a node dials is let through: the
-    /// address of its API.
+    /// address of its API, and the path it finds git in.
     pub fn start_given(&mut self, vars: &[(&str, &str)]) {
         for (variable, _) in vars {
             assert!(
-                *variable == "CORDELIA_BIND_ADDRESS",
+                matches!(*variable, "CORDELIA_BIND_ADDRESS" | "PATH"),
                 "{}: a test node may not be started with {variable}",
                 self.name
             );

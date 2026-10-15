@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 /// A Claude Code project folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +58,8 @@ pub fn folders(claude_dir: &Path) -> Vec<Folder> {
 // found for a directory that is being mapped, and so kept beside the one
 // function that says whether `cordelia sync map` would sync a folder.
 pub use cordelia_api::found::{
-    claude_folder, claude_folder_name, git_deadline, is_claude_folder_for, memory_root_by,
-    memory_root_is_assumed, memory_root_known, recorded_cwds,
+    claude_folder, claude_folder_name, git_deadline, git_output_by, is_claude_folder_for,
+    memory_root_by, memory_root_is_assumed, memory_root_known, recorded_cwds,
 };
 
 /// The working directory recorded first in the folder's newest transcript.
@@ -68,21 +69,27 @@ pub fn recorded_cwd(folder: &Path) -> Option<PathBuf> {
 
 /// The project a working directory belongs to: the home directory itself,
 /// or a git repository with a portable remote. `None` for anything else
-/// (not a repository, no `origin`, or an origin that is a local path).
+/// (not a repository, no `origin`, or an origin that is a local path), and
+/// where git has not answered by [`git_deadline`].
 pub fn project_for(cwd: &Path, home: &Path) -> Option<Project> {
+    project_by(cwd, home, git_deadline()).flatten()
+}
+
+/// [`project_for`], with git given until `deadline`: `None` where it has
+/// not answered by then, and is killed.
+pub fn project_by(cwd: &Path, home: &Path, deadline: Instant) -> Option<Option<Project>> {
     if cwd == home {
-        return Some(Project::Home);
+        return Some(Some(Project::Home));
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+    let mut git = Command::new("git");
+    git.arg("-C").arg(cwd).args(["remote", "get-url", "origin"]);
+    let Ok(output) = git_output_by(&mut git, deadline)? else {
+        return Some(None);
+    };
     if !output.status.success() {
-        return None;
+        return Some(None);
     }
-    normalize_remote(String::from_utf8_lossy(&output.stdout).trim()).map(Project::Repo)
+    Some(normalize_remote(String::from_utf8_lossy(&output.stdout).trim()).map(Project::Repo))
 }
 
 /// Normalise a git remote URL to `host/path`, so every clone of the same

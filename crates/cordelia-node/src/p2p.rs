@@ -4714,8 +4714,9 @@ async fn handle_inbound_peer_share(
 }
 
 /// Text that a peer chose, as it is safe to put in a warning: its first 64
-/// characters, with control characters and the marks that change the
-/// direction of text shown as escapes. A peer chooses what the text holds
+/// characters, with control characters, the marks that change the
+/// direction of text, and what cannot be seen and is no part of ordinary
+/// writing, shown as escapes. A peer chooses what the text holds
 /// and how long it is.
 fn as_a_peer_sent_it(text: &str) -> String {
     const MOST: usize = 64;
