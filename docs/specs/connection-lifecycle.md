@@ -25,7 +25,7 @@ There are exactly four ways a connection is established:
 |------|-----------|---------|---------------|
 | **Bootstrap** | This node | Startup, config bootnodes | `main.rs` bootstrap loop |
 | **Accept** | Remote peer | Inbound QUIC connection | `p2p_loop` select! `accept_incoming` |
-| **Peer-sharing** | This node | Peer-sharing discovery | `p2p_loop` select! `peer_share_interval` |
+| **Peer-sharing** | This node | Peer-sharing discovery (never on a personal node or a relay) | `p2p_loop` select! `peer_share_interval` |
 | **Governor** | This node | Governor `actions.connect` | `p2p_loop` select! `gov_interval` |
 
 ### 1.2 Canonical Post-Connection Sequence
@@ -49,6 +49,7 @@ ALL four paths MUST execute this exact sequence:
 
 5. UPDATE shared peer list
    shared_peers.write() = conn_mgr.known_peer_addresses()
+   (a personal node answers a request for peers with none of them: §2.1)
 
 6. UPDATE counters
    state.peers_hot = governor.counts().hot
@@ -152,7 +153,10 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
             // Keep-Alive: allowed on Warm + Hot
             (KeepAlive,    Warm | Hot) => handle_keepalive(stream)
 
-            // Peer-Sharing: Warm (after min_warm_tenure) + Hot
+            // Peer-Sharing: Warm (after min_warm_tenure) + Hot.
+            // A relay and a bootnode answer with shared_peers; a personal
+            // node answers with an empty list, whatever it is connected to
+            // (decision 2026-10-14).
             (PeerSharing,  Hot) => handle_peer_sharing(stream)
             (PeerSharing,  Warm) =>
                 if peer.state_tenure() >= min_warm_tenure:

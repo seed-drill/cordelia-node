@@ -632,6 +632,9 @@ struct StandIn {
     streams: Arc<Mutex<Vec<Protocol>>>,
     heard: Arc<Mutex<Vec<Heard>>>,
     script: Arc<Mutex<Script>>,
+    /// Each connection that a node made to it, on which it can ask that
+    /// node what a relay may ask.
+    connections: Arc<Mutex<Vec<quinn::Connection>>>,
 }
 
 /// A stand-in relay that has room.
@@ -661,22 +664,26 @@ fn stand_in_relay() -> StandIn {
             holds: BTreeSet::new(),
             no_room_in: None,
         })),
+        connections: Arc::default(),
     };
 
-    let (streams, heard, script) = (
+    let (streams, heard, script, connections) = (
         relay.streams.clone(),
         relay.heard.clone(),
         relay.script.clone(),
+        relay.connections.clone(),
     );
     tokio::spawn(async move {
         let _manager = manager; // keeps the endpoint's context alive
         while let Some(incoming) = endpoint.accept().await {
             let ctx = ctx.clone();
             let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
+            let connections = connections.clone();
             tokio::spawn(async move {
                 let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
                     return;
                 };
+                connections.lock().unwrap().push(outcome.conn.clone());
                 while let Ok((send, recv)) = outcome.conn.accept_bi().await {
                     let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
                     tokio::spawn(StandIn::answers(streams, heard, script, send, recv));
@@ -1064,6 +1071,59 @@ async fn t19_a_device_asks_no_peer_for_addresses_to_dial() {
         !opened.contains(&Protocol::PeerSharing),
         "the device asked its relay for other peers' addresses: {opened:?}"
     );
+}
+
+/// T19. A device tells no relay which other relays it uses. A device set
+/// up with three relays of the test's own, two of them real ones, is asked
+/// for peers by the third over the connection that the device made to it,
+/// as a relay may ask a peer. It answers, and the answer is empty
+/// (decision 2026-10-14).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t19_a_device_tells_no_relay_of_its_other_relays() {
+    use cordelia_network::messages::PeerShareRequest;
+
+    let mut one = node("relay-one", "relay", None);
+    let mut two = node("relay-two", "relay", None);
+    one.start();
+    two.start();
+    wait_for("relays healthy", &[&one, &two], 30, || {
+        healthy(&one).and(healthy(&two))
+    });
+    let asker = stand_in_relay();
+    let at = |port: u16| format!("127.0.0.1:{port}");
+    let mut a = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (at(one.p2p), Some(key_of(&one))),
+            (at(two.p2p), Some(key_of(&two))),
+            (at(asker.port), Some(asker.key.clone())),
+        ],
+    );
+    a.start();
+    let all = [&one, &two, &a];
+    wait_for("node healthy", &all, 30, || healthy(&a));
+    wait_for(
+        "the device is connected to its three relays",
+        &all,
+        60,
+        || {
+            let relays = relays_of(&a);
+            (relays.len() == 3 && relays.iter().all(|r| r["state"] == "connected")).then_some(())
+        },
+    );
+    let conn = asker.connections.lock().unwrap().last().cloned();
+    let conn = conn.expect("the device connected to the relay that asks");
+
+    let ask = WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 });
+    match ask_on(&conn, Protocol::PeerSharing, ask).await {
+        Ok(WireMessage::PeerShareResponse(answer)) => assert!(
+            answer.peers.is_empty(),
+            "the device told a relay of the relays it uses: {:?}",
+            answer.peers
+        ),
+        other => panic!("the device did not answer a request for peers: {other:?}"),
+    }
 }
 
 /// T19. Being a relay is a property of configuration. A stranger that
