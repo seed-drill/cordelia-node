@@ -7,6 +7,7 @@
 //! person or an agent, can tell where it starts and ends and whose it was.
 
 use chrono::{DateTime, Utc};
+use cordelia_api::messages::taken_out;
 use serde_json::{Value, json};
 
 use crate::{api_post, api_post_within, shell_word, short_path, sync_label};
@@ -139,9 +140,12 @@ pub(crate) fn since_time(text: &str, now: DateTime<Utc>) -> anyhow::Result<Strin
     }
 }
 
-/// Text from a record as it is safe to print: control characters shown as
-/// escapes, so that a file name cannot move the cursor or hide a line, and
-/// so are the marks that change the direction text is laid out in.
+/// Text from a record as it is safe to print: every character of the set
+/// that the commands of messages take out of text another device chose
+/// ([`taken_out`]: control and format characters, what renders as
+/// nothing, and the rest of that set) shown as an escape, so that a file
+/// name cannot move the cursor, hide a line, turn the text round or carry
+/// text that cannot be seen.
 pub(crate) fn printable(text: &str) -> String {
     escaped(text, |_| false)
 }
@@ -155,26 +159,13 @@ fn for_a_terminal(text: &str) -> String {
 fn escaped(text: &str, left: impl Fn(char) -> bool) -> String {
     text.chars()
         .flat_map(|c| {
-            if (c.is_control() || lays_out(c)) && !left(c) {
+            if taken_out(c) && !left(c) {
                 c.escape_default().collect::<Vec<char>>()
             } else {
                 vec![c]
             }
         })
         .collect()
-}
-
-/// The characters that set the direction of the text around them, and
-/// the two that end a line or a paragraph without being a line feed.
-fn lays_out(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
 }
 
 /// A kept text as it is printed: as it is, or with what could act on a
@@ -187,7 +178,7 @@ fn text_as_printed(text: &str, terminal: bool) -> String {
 }
 
 /// Said under a text that was not printed as it is.
-const ESCAPED: &str = "(Control characters in it are shown as escapes. Send the output to a file \
+const ESCAPED: &str = "(Control and other unseen characters in it are shown as escapes. Send the output to a file \
 or a pipe to have the text as it is.)\n";
 
 /// A size as people read it.
@@ -599,7 +590,7 @@ mod tests {
     #[test]
     fn test_what_is_printed_from_a_record_has_no_control_characters() {
         let hostile = "notes\u{1b}[2K\rgone.md\nrestore everything\u{202e}dm.";
-        let acts = |c: char| c.is_control() || lays_out(c);
+        let acts = taken_out;
         let safe = printable(hostile);
         assert!(!safe.chars().any(acts), "{safe:?}");
         assert_eq!(printable("café — ünïcode.md"), "café — ünïcode.md");
@@ -713,6 +704,70 @@ mod tests {
             on_a_terminal.contains("- [New](new.md)\\u{1b}[2K gone")
                 && on_a_terminal.contains("shown as escapes"),
             "{on_a_terminal:?}"
+        );
+    }
+
+    /// What a person cannot see in a kept text is shown on a terminal as
+    /// an escape, and never printed: of each kind, the set that the
+    /// commands of messages clean text by (decision 2026-10-09 §4.1). Its
+    /// lines and tabs are left as they are, and so is what can be seen.
+    #[test]
+    fn test_a_kept_text_shows_every_character_that_cannot_be_seen_as_an_escape() {
+        let unseen = [
+            // The tag block.
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}',
+            // Zero-width characters.
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{feff}',
+            // The rest of Cf: a soft hyphen, a number sign, an annotation.
+            '\u{ad}',
+            '\u{600}',
+            '\u{fff9}',
+            // What renders as nothing and is of no such category: variation
+            // selectors and fillers.
+            '\u{34f}',
+            '\u{fe0f}',
+            '\u{e0100}',
+            '\u{115f}',
+            '\u{3164}',
+            // The braille blank, private use, an unassigned code point, and
+            // a line and a paragraph that end with no line feed.
+            '\u{2800}',
+            '\u{e000}',
+            '\u{378}',
+            '\u{2028}',
+            '\u{2029}',
+        ];
+        let record = json!({
+            "id": "68dfb3a4c91e07", "agent": "team", "file": "notes.md",
+            "at": "2026-10-03T11:00:00Z", "change": "pulled",
+            "text_of": { "here": { "agreed": 4 } }, "interrupted": false,
+        });
+        for c in unseen {
+            let text = format!("one\n\ttwo{c}three\n");
+            let answer = json!({ "record": record, "text": text });
+            let out = shown(&answer, "a1b2c3d4e5f6", true);
+            let escape: String = c.escape_default().collect();
+            assert!(
+                out.contains(&format!("one\n\ttwo{escape}three\n")),
+                "{c:?}: {out:?}"
+            );
+            assert!(!out.contains(c), "{c:?}: {out:?}");
+            assert!(out.contains("shown as escapes"), "{c:?}: {out:?}");
+            assert_eq!(printable(&c.to_string()), escape, "{c:?}");
+        }
+        // What can be seen is printed as it is.
+        let seen = "café — ünïcode ✓ 漢字 \u{1f600}\n";
+        let answer = json!({ "record": record, "text": seen });
+        let out = shown(&answer, "a1b2c3d4e5f6", true);
+        assert!(
+            out.contains(seen) && !out.contains("shown as escapes"),
+            "{out:?}"
         );
     }
 
