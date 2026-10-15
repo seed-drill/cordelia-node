@@ -1242,10 +1242,15 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         if let Some(sync) = &status.sync {
             let report = &sync["report"];
             // One entry per synced folder: what a panel lists and toggles.
+            // Only a mapped folder syncs. A report that an earlier version
+            // stored, which a node held at its first start goes on giving,
+            // can list folders that synced there when every folder found
+            // did: those are left out.
             let projects: Vec<serde_json::Value> = report["folders"]
                 .as_array()
                 .into_iter()
                 .flatten()
+                .filter(|f| f["mapped"].as_bool() == Some(true))
                 .map(|f| {
                     serde_json::json!({
                         "project": f["project"],
