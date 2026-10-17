@@ -253,6 +253,48 @@ pub fn would_bring(
     Ok(left.unwrap_or(Brought::Carried))
 }
 
+/// Whether the name's channel in the generation applied holds, in the
+/// slot of `version`, a later revision written by the same author as
+/// `version` (decision 2026-10-04 §7.3): an entry of one of its authors,
+/// or one that carried what such an author signed. A carry's chain begins
+/// with the link of the value it carries, signed by whoever it carried it
+/// from ([`chain::carried_from`]), and a carry of a carry adds another
+/// link of that same value before it: **so only the leading run of links
+/// whose hash is the held value's is a carry's, and the entry is that
+/// author's where a link in that run is signed by it.** A link further
+/// on is of a version that the entry was written over: an entry by
+/// another key that holds an earlier text of the author's again (a revert)
+/// is that key's work, and what lies under it was not brought back. One
+/// that lost the tie at its revision is held all the same.
+///
+/// [`chain::carried_from`]: cordelia_crypto::chain::carried_from
+pub fn later_by_its_author(
+    conn: &Connection,
+    name: &str,
+    version: &Version,
+) -> Result<bool, PersonError> {
+    let standing = Standing::to_write(conn)?;
+    let secret = standing.name_secret(conn, name)?;
+    let slot = standing.slot(conn, &secret, &version.name)?;
+    let rev = lifted(version.rev);
+    let authors: Vec<[u8; 32]> = version.entries.iter().map(|entry| entry.author).collect();
+    let by_them = |held: &Version| {
+        held.rev > rev
+            && held.entries.iter().any(|entry| {
+                let hash = held.value.chain_hash();
+                let carried_from = |author: &[u8; 32]| {
+                    let signer = Link::signer_of(author);
+                    let carries = entry.chain.iter().flatten();
+                    carries
+                        .take_while(|link| link.hash == hash)
+                        .any(|link| link.signer == signer)
+                };
+                authors.contains(&entry.author) || authors.iter().any(carried_from)
+            })
+    };
+    Ok(slot.current.iter().chain(&slot.lost).any(by_them))
+}
+
 /// The one judgement of a version for a carry: why it is left, or `None`
 /// where it may be carried into the channel whose secret is `secret`,
 /// which is the name's in the generation applied.

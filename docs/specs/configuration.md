@@ -76,7 +76,7 @@ Core node settings: ports, storage location, storage quota.
 |-----------|------|---------|-------------|-------------|--------|
 | `http_port` | integer | `9473` | 1-65535 | REST API port (TCP, localhost only). | operations.md SS5.1 |
 | `p2p_port` | integer | `9474` | 1-65535 | P2P transport port (UDP, QUIC). | operations.md SS5.1 |
-| `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700). | operations.md SS5.1 |
+| `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700); one that is there is set to 0700 only where others than its owner and its group can read, write or enter it (§5.4). | operations.md SS5.1 |
 | `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of each kind of channel. The older kind and the channels from their secrets are each counted against a cap of this size, so for the one version that carries both a relay can hold twice this. Each is counted by what its entries are counted at (an entry's content and 1 KB), and not by the database's pages. At a cap a relay takes no channel of that kind which it does not already hold; over it, it drops the channels of that kind that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
 
 ### 2.3 `[network]`
@@ -481,15 +481,20 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 > of the person's. The copy folder `before-<version>` is mode 0700, and each
 > file in it 0600.
 >
-> **The data directory is its owner's alone.** `cordelia init` makes it with
-> mode 0700, or sets it so where it is there already, and the configuration
-> file that it writes is 0600; the install script sets both as well. Where
+> **The data directory is its owner's alone.** `cordelia init`, `cordelia
+> swarm-init` and the install script make it with mode 0700, and the
+> configuration file that `init` writes is 0600; the install script sets the
+> one in a directory that it makes 0600 as well. **A directory that is there
+> already is set to 0700 only where others than its owner and its group can
+> read, write or enter it,** by `init`, the install script and a node that
+> starts, and each says so (`init` and the script on their output, the node
+> once in its log): a directory shared with its group on purpose, and open to
+> nobody else, is left as it is, with the configuration file in it. Where
 > `init` cannot set the directory's mode (the directory is another's, or its
 > volume refuses the change) it says so in one line, with why, and goes on:
-> only a directory that cannot be made is an error. A node
-> that starts on a data directory that others can read, write or enter sets
-> it to 0700, and the configuration file to 0600 where that file is in the
-> directory, and says so once in its log. It does so after its port is bound
+> only a directory that cannot be made is an error. A node that starts on a
+> data directory that is open to others sets it to 0700, and the
+> configuration file to 0600 where that file is in the directory. It does so after its port is bound
 > and its lock is held: a node that does not start changes nothing. Nothing
 > else's mode changes, and a configuration file that is kept elsewhere is
 > left as whoever put it there set it. That holds for a `config.toml` in the

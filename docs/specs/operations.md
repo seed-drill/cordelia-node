@@ -194,10 +194,12 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > §10.5. A relay keeps `channel-keys/` for the older kind.
 >
 > **The data directory itself is mode 0700, and `config.toml` in it 0600.**
-> `cordelia init` and the install script make them so. A node that starts on
-> a data directory that others can read, write or enter sets it to 0700, and
-> the configuration file in it to 0600, and says so once in its log
-> (configuration.md §5.4).
+> `cordelia init`, `cordelia swarm-init` and the install script make them
+> so. One that is there already is set to 0700, with the configuration file
+> in it to 0600, only where others than its owner and its group can read,
+> write or enter it: by `init`, the install script and a node that starts,
+> and each says so, the node once in its log. A directory shared with its
+> group on purpose is left as it is (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
@@ -385,13 +387,27 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   the exception. `cordelia status`, `cordelia sync status`, `cordelia
 >   devices` and `cordelia history` still answer beside such a node, with the
 >   note (decision 2026-10-04 §10.1, rule 6).
-> - **A command that opens the database itself opens none beside a running
->   node of another version:** opening runs the schema's steps, and a later
->   command would step the database under an earlier node. `cordelia stats`,
->   `cordelia channels`, `cordelia swarm-init`, and `cordelia init` where it
->   makes the database or is given `--force`, say the note that names the
->   restart, and open nothing. `cordelia status` says the note, and reads
->   nothing of the database. Where no node answers, each goes on.
+> - **A command that opens the database itself asks the data directory's
+>   lock first,** the one a node holds for as long as it runs (§10.5), and
+>   asks the port only where the lock tells nothing (below): opening runs
+>   the schema's steps, and would step the database under the node. Where a node holds the lock, `cordelia
+>   swarm-init`, and `cordelia init` where it makes the database or is given
+>   `--force`, open nothing and name the command that stops the node;
+>   `cordelia stats`, `cordelia channels` and what `cordelia status` says of
+>   what is stored read the database for reading only, with no step run,
+>   and only where it is at their own schema version: at another the node
+>   is of another version, and they open nothing, and name `cordelia status`
+>   and the restart instead. Where the directory has no lock file, or its
+>   lock cannot be asked, a node that takes no lock may run there: the port
+>   is asked as well, and a node of another version there refuses them.
+>   Where the lock file is there and no node holds it, each goes on, and a
+>   node on another data directory never refuses them.
+> - **A command that cannot reach the node says how it is started:** the
+>   command that starts the service on the system (`systemctl --user start
+>   cordelia` on Linux, `launchctl load
+>   ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist` on macOS), and
+>   `cordelia start` where the node does not run as that service. `cordelia
+>   status` says the same where the node is not running.
 > - `cordelia sync exclude`, `cordelia sync include`, `cordelia sync claude
 >   --exclude` and `cordelia sync claude --all` are refused, before anything
 >   is sent to the node, with what to do instead: only what is mapped syncs,
@@ -1085,7 +1101,9 @@ before makes a copy and then one step, when it starts (data-formats.md §12):
 - **A data directory is one node's.** A node takes a lock on the directory
   (a file in it, `node.lock`) before it opens the database. A second node
   that is started on the same directory, whatever ports it was given, says
-  that another is running there, changes nothing, and stops.
+  that another is running there, changes nothing, and stops, once it has
+  found the lock held for half a second (`NODE_LOCK_WAIT_MS`): a command
+  that asks the lock holds it for a moment only.
 - **The copy** is a folder beside the database, `before-<version>`: the
   database as its opening left it (the schema's steps have added tables, and
   have changed no row that was there), and the key files of the older

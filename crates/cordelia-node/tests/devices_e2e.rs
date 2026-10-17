@@ -1833,7 +1833,8 @@ fn a_command_follows_no_redirect() {
     let out = n.command(&["status"]);
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}");
-    assert!(said.contains("Running:   no (start it"), "{said}");
+    let start = cordelia_api::commands::start_says(std::env::consts::OS);
+    assert!(said.contains(&format!("Running:   no. {start}")), "{said}");
     // One that reads, and one that posts: each fails, says that what
     // answered is not the node, and repeats nothing of what it said.
     for args in [&["peers", "--json"][..], &["devices"]] {
@@ -1848,15 +1849,44 @@ fn a_command_follows_no_redirect() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// A command that cannot reach the node, and `cordelia status` where it
+/// is not running, say how it is started in one sentence: the command
+/// that starts the service on this system, and `cordelia start` only for
+/// a node that does not run as that service. None says the older words,
+/// which named `cordelia start` alone.
 #[test]
 fn cli_reports_when_the_node_is_not_running() {
     let n = node("idle", "personal", None);
-    let stderr = n.refused(&["devices"]);
-    assert!(stderr.contains("cordelia start"), "{stderr}");
+    let start = cordelia_api::commands::start_says(std::env::consts::OS);
+    let service = cordelia_api::commands::start_command(std::env::consts::OS);
+    for args in [&["devices"][..], &["peers"], &["sync", "status"]] {
+        let stderr = n.refused(args);
+        assert!(
+            stderr.contains("cannot reach the local node at"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains(&start), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!("`{service}`")),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Start it with `cordelia start`"),
+            "{args:?}: {stderr}"
+        );
+    }
 
-    // `status` still works, and says the node is not running.
+    // `status` still works, and says the node is not running, and how it
+    // is started.
     let status = n.cli(&["status"]);
-    assert!(status.contains("Running:   no"), "{status}");
+    assert!(
+        status.contains(&format!("Running:   no. {start}\n")),
+        "{status}"
+    );
+    assert!(
+        !status.contains("start it with `cordelia start`"),
+        "{status}"
+    );
     let line = n.cli(&["status", "--line"]);
     assert!(line.contains("memory: node stopped"), "{line}");
     let json: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
@@ -3594,6 +3624,22 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
     let moved_on = said("the database was copied and moved on");
     assert_eq!(moved_on.len(), 1, "{log}");
     assert!(moved_on[0].contains("INFO"), "{}", moved_on[0]);
+    // It says what the device's status says of it: not added yet, and
+    // the three ways on, in their order. Not the two of before.
+    let says = cordelia_api::first_start::moved_on_says();
+    assert!(moved_on[0].contains(&says), "{}", moved_on[0]);
+    for way in [
+        "(`cordelia phrase`)",
+        "`cordelia accept` here",
+        "(`cordelia recover`)",
+    ] {
+        assert!(moved_on[0].contains(way), "{way}: {}", moved_on[0]);
+    }
+    assert!(
+        !moved_on[0].contains("is added again with"),
+        "{}",
+        moved_on[0]
+    );
     let removed = said("removed the key files of the older channels");
     assert_eq!(removed.len(), 1, "{log}");
     for count in ["INFO", "key_files=1"] {

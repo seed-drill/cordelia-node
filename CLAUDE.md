@@ -239,6 +239,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
+| `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |
 
 The constants of messages between your own agents (decision 2026-10-09),
 each with its reason in parameter-rationale.md §12.12:
