@@ -1705,6 +1705,23 @@ pub const CARRY_READ_MAX_SECS: u64 = CHANGE_FETCH_MAX_SECS;
 /// Derived: a little longer than the carry may read, CARRY_READ_MAX_SECS.
 pub const CARRY_FIRST_MAX_SECS: u64 = CARRY_READ_MAX_SECS + 60;
 
+/// How long a recovery reads the personal channel of the change it
+/// recovers from, at most, counted from its first round (decision
+/// 2026-10-17 §3.2): it reads on from the place each relay reached, a
+/// round of CARRY_READ_MAX_SECS at a time, and begins no round that
+/// would end after this. Derived: what a channel at its cap
+/// (MAX_ENTRY_CHANNEL_BYTES_AT_RELAY) takes to read at what a device
+/// takes from one relay in a minute (PUSH_BYTES_PER_PEER_PER_MINUTE),
+/// less the room a relay keeps for the answer to a show
+/// (SHOW_ANSWER_ROOM_BYTES), and one round more: so a relay that hands
+/// what it may is read to its end.
+pub const RECOVERY_READ_ON_MAX_SECS: u64 = 60 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+    / (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES)
+    + CARRY_READ_MAX_SECS;
+
+// Checked at compile time: a recovery reads on for more than one round.
+const _: () = assert!(RECOVERY_READ_ON_MAX_SECS > CARRY_READ_MAX_SECS);
+
 /// How many words of a key's fingerprint name a removed key at `cordelia
 /// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
 /// 66 bits. A statement lists removed keys bare, so a machine that never
@@ -2760,6 +2777,31 @@ mod tests {
         // A recovery shows every device that a reader may count, and
         // every record that it may keep as not counted beside them.
         const { assert!(RECOVERY_MAX_DEVICES_SHOWN >= MAX_COUNTED_DEVICES) };
+    }
+
+    /// How long a recovery reads its personal channel on (decision
+    /// 2026-10-17 §3.2): what a channel at its cap takes at what a device
+    /// takes from one relay in a minute, less a show's room, and a round
+    /// more.
+    #[test]
+    fn test_a_recovery_reads_on_for_what_a_channel_at_its_cap_takes_decision_2026_10_17_3() {
+        assert_eq!(RECOVERY_READ_ON_MAX_SECS, 615);
+        assert_eq!(
+            16 * 1024 * 1024 * 60 / (2 * 1024 * 1024 - (65_536 + 1024)),
+            495
+        );
+        assert_eq!(
+            RECOVERY_READ_ON_MAX_SECS,
+            60 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+                / (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES)
+                + CARRY_READ_MAX_SECS
+        );
+        // Five whole rounds fit in it, and a sixth does not: five reach a
+        // channel at its cap.
+        assert_eq!(RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS, 5);
+        let per_round =
+            CARRY_READ_MAX_SECS * (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES) / 60;
+        assert!(5 * per_round >= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
     }
 
     /// What the sync adapter goes by in a channel from its secret: how

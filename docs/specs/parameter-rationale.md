@@ -1611,6 +1611,24 @@ may read.
 the first cycle of a folder that has just been mapped to its name, at most.
 A carry that never says it has ended holds nothing up for longer.
 
+#### RECOVERY_READ_ON_MAX_SECS = 615
+
+**Derivation:** 60 × `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` /
+(`PUSH_BYTES_PER_PEER_PER_MINUTE` − `SHOW_ANSWER_ROOM_BYTES`) +
+`CARRY_READ_MAX_SECS`: 60 × 16,777,216 / 2,030,592 = 495, and 495 + 120 =
+615.
+
+**Rationale:** How long a recovery reads the personal channel of the change
+it recovers from, at most, counted from its first round, and how long the
+check before a carried name is let go reads the name's channel (decision
+2026-10-17 §3, §4.2). It is what a channel at its cap takes to read at what
+a device takes from one relay in a minute, less the room a relay keeps for
+the answer to a show, and one round more: so a relay that hands what it may
+is read to its end. What a person's devices write in the personal channel is
+small, so this is reached only where a channel is near its cap, or a relay
+is slow. A round is `CARRY_READ_MAX_SECS`, and no round is begun that would
+end after this: five rounds fit, and reach a channel at its cap.
+
 #### CARRY_FROM_WORDS = 6
 
 **Rationale:** How many words of a key's fingerprint name a removed key at
