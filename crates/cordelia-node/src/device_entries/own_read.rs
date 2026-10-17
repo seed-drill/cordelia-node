@@ -141,9 +141,6 @@ impl DeviceEntries {
     /// relay for a channel that the device has left.
     async fn read_own(self: &Arc<Self>, relays: &[Relay], read: &ReadId, until: Instant) -> bool {
         let reads = self.state.own_channels.reads();
-        if !reads.stands(read) {
-            return false;
-        }
         let wait = until.saturating_duration_since(self.clock.now());
         let Ok(_one_round) = tokio::time::timeout(wait, self.own_rounds.lock()).await else {
             return reads.stands(read);
