@@ -3475,6 +3475,72 @@ async fn a_device_takes_from_one_relay_only_so_much_in_a_minute() {
     assert_eq!(device.has_leave("relay"), Ok(()));
 }
 
+/// **A device takes from one relay in a minute no more than the relay
+/// hands: what a relay may hand a connection, less the room it keeps for
+/// the answer to a show** (decision 2026-10-17 §3.1, §3.2). A relay that
+/// hands one entry of the largest size in a page is pulled from until
+/// what is left of the minute, beside that room, holds no other: so many
+/// pages as the relay would hand, and not one that it would refuse. A
+/// read of a channel of a generation that was left waits there, and goes
+/// on in the next minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_takes_from_a_relay_no_page_from_the_room_kept_for_a_show() {
+    use cordelia_core::protocol::{
+        MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, PUSH_BYTES_PER_PEER_PER_MINUTE,
+        SHOW_ANSWER_ROOM_BYTES,
+    };
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let notes = device.channel("notes");
+    let secret = device.name_secret("notes");
+    let author = NodeIdentity::from_seed(*device.state.identity.seed()).unwrap();
+    let largest = move |n: u64| -> Vec<u8> {
+        let name = format!("{n}.md");
+        let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - name.len());
+        let entry = sealed(&author, &secret, 1, &name, Value::Text(text));
+        assert_eq!(entry.content.len(), MAX_ITEM_BYTES);
+        entry.to_wire()
+    };
+    relay.pulls(move |pull| {
+        if pull.channel != notes {
+            return EntryPulled {
+                entries: Vec::new(),
+                next: pull.after,
+                mark: pull.mark,
+            };
+        }
+        let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+        EntryPulled {
+            entries: vec![largest(after).into()],
+            next: after + 1,
+            mark: [5; 8],
+        }
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    let pulls_of_notes = |relay: &StandIn| {
+        let of_notes = |one: &WireMessage| matches!(one, WireMessage::EntryPull(pull) if pull.channel == notes);
+        relay.requests().iter().filter(|one| of_notes(one)).count() as u64
+    };
+    // As many as a relay hands in a minute: 30 of the largest.
+    let hands =
+        (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES) / entry_cost(MAX_ITEM_BYTES);
+    assert_eq!(hands, 30);
+    // A pass pulls so many pages of a channel: pass after pass, until a
+    // pass pulls nothing.
+    let mut pulled = 0;
+    loop {
+        device.passes().await;
+        match pulls_of_notes(&relay) {
+            0 => break,
+            more => pulled += more,
+        }
+    }
+    assert_eq!(pulled, hands);
+    assert_eq!(device.counts("relay").pulled, hands);
+}
+
 /// An entry that is sealed by `author` in the channel whose secret is
 /// `secret`: for what a test writes with a key that is no device's here.
 fn sealed(author: &NodeIdentity, secret: &[u8; 32], rev: u64, name: &str, value: Value) -> Entry {
