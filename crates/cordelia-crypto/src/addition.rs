@@ -218,6 +218,19 @@ impl SignedAddition {
         Ok(out)
     }
 
+    /// The time that the bytes of a signed record say it was made, read
+    /// from where the canonical form holds it, and nothing else checked:
+    /// for bytes kept from a record that was verified when it was taken,
+    /// which a reader orders often (decision 2026-10-17 §2.2). `None`
+    /// where the bytes end before the time.
+    pub fn time_of(bytes: &[u8]) -> Option<u64> {
+        let mut reader = Reader::new(bytes);
+        let _key: [u8; 32] = reader.array()?;
+        let length = reader.count()?;
+        reader.take(length)?;
+        reader.u64()
+    }
+
     /// Read a signed record. The signature is not checked here:
     /// [`SignedAddition::verify`] checks it.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AdditionError> {
@@ -307,6 +320,37 @@ mod tests {
             out.extend_from_slice(&self.adder);
             out
         }
+    }
+
+    /// The time of a signed record's bytes is read from its place in the
+    /// canonical form, and nothing else is checked: a form that is no
+    /// record says its time too. Bytes that end before the time say none.
+    #[test]
+    fn the_time_of_a_signed_record_is_read_without_checking_the_record() {
+        let signed = sample().sign(&identity(0)).unwrap();
+        let bytes = signed.to_bytes().unwrap();
+        assert_eq!(SignedAddition::time_of(&bytes), Some(1_800_000_000));
+        // A record that adds its own adder is refused as a record, and
+        // its time is read all the same.
+        let mut raw = Raw::of(&sample());
+        raw.key = raw.adder;
+        raw.at = 77;
+        let mut not_a_record = raw.bytes();
+        not_a_record.extend_from_slice(&[0u8; 64]);
+        assert!(SignedAddition::from_bytes(&not_a_record).is_err());
+        assert_eq!(SignedAddition::time_of(&not_a_record), Some(77));
+        // The label's length is where the time is found from.
+        raw.label = b"a longer label than before".to_vec();
+        assert_eq!(SignedAddition::time_of(&raw.bytes()), Some(77));
+        // Bytes that end before the time.
+        let label_end = 32 + 2 + raw.label.len();
+        for end in [0, 31, 33, label_end, label_end + 7] {
+            assert_eq!(SignedAddition::time_of(&raw.bytes()[..end]), None, "{end}");
+        }
+        assert_eq!(
+            SignedAddition::time_of(&raw.bytes()[..label_end + 8]),
+            Some(77)
+        );
     }
 
     #[test]

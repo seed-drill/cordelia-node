@@ -865,6 +865,121 @@ mod tests {
         }
     }
 
+    /// A record that went at the bound comes to count when its entry is
+    /// given again through the door, where its adder has come to add since
+    /// and there is room (decision 2026-10-17 §2.7). Twenty keys that may
+    /// not add yet each sign 13 records: 260, four more than the device
+    /// keeps, and the four that go are the last turn of the four adders
+    /// last by key. The last of them then comes to add.
+    #[test]
+    fn test_a_record_that_went_at_the_bound_counts_when_its_entry_is_given_again() {
+        const MAY_NOT: AdditionSeen = AdditionSeen::NotCounted(NotCounted::MayNotAdd);
+        // Device 1 is given everything. The statement lists device 0,
+        // which added device 1.
+        let s = Several::of_one_person(2);
+        let on = &s[1];
+        let statement = on.held().statement.statement;
+        let personal = on.personal();
+        let adds = |adder: u16, new: u16| {
+            let by = identity_of(adder);
+            let record = Addition::under(&statement, listed_as(new), by.public_key(), 1)
+                .unwrap()
+                .sign(&by)
+                .unwrap();
+            let name = added_name(&record.addition.device.key).unwrap();
+            let value = Value::Other(record.to_bytes().unwrap());
+            entry_by(&by, &personal, 1, &name, value, &[])
+        };
+        let seen = |entry: &CheckedEntry| match given(&s, 1, entry) {
+            Taken::Own {
+                record: Some(Record::Seen(seen)),
+                came_to_count,
+                ..
+            } => (seen, came_to_count),
+            other => panic!("{other:?}"),
+        };
+        let keeps = |entry: &CheckedEntry| {
+            let Value::Other(record) = entry.open(&personal).unwrap().value else {
+                panic!("a record is bytes");
+            };
+            let kept = held_rows::additions(&on.conn).unwrap();
+            kept.iter().any(|one| one.record == record)
+        };
+        let key_of = |n: u16| identity_of(n).public_key();
+
+        // Device 1, added since, adds keys 10 to 29: they count, and may
+        // not add. 22 count, and there is room for 42 more.
+        let adders: Vec<u16> = (10..30).collect();
+        for adder in &adders {
+            assert_eq!(seen(&adds(1, *adder)).0, AdditionSeen::Counted);
+        }
+        // Each adder's entries, as they were given: an entry is sealed
+        // anew each time it is made.
+        let of: Vec<Vec<CheckedEntry>> = adders
+            .iter()
+            .map(|adder| {
+                (0..13)
+                    .map(|n| adds(*adder, 1000 + 13 * (adder - 10) + n))
+                    .collect()
+            })
+            .collect();
+        for entry in of.iter().flatten() {
+            assert_eq!(seen(entry), (MAY_NOT, 0));
+        }
+        assert_eq!(
+            held_rows::additions(&on.conn)
+                .unwrap()
+                .iter()
+                .filter(|one| !one.counted)
+                .count(),
+            MAX_NOT_COUNTED_RECORDS
+        );
+        // The adder last by key, and its key last by key: the record that
+        // went last.
+        let last = *adders.iter().max_by_key(|n| key_of(**n)).unwrap();
+        let mut its = of[(last - 10) as usize].clone();
+        its.sort_by_key(|entry| {
+            let Value::Other(record) = entry.open(&personal).unwrap().value else {
+                panic!("a record is bytes");
+            };
+            SignedAddition::from_bytes(&record)
+                .unwrap()
+                .addition
+                .device
+                .key
+        });
+        let (went, stayed) = its.split_last().unwrap();
+        assert!(!keeps(went) && stayed.iter().all(keeps));
+
+        // Device 0 adds it too: it may add, and its twelve that were kept
+        // come to count.
+        assert_eq!(seen(&adds(0, last)).1, 12);
+        // The record that went is given again: the store holds its entry
+        // already, and it is judged as a record never seen. It counts.
+        assert_eq!(
+            given(&s, 1, went),
+            Taken::Own {
+                stored: Outcome::AlreadyHeld,
+                record: Some(Record::Seen(AdditionSeen::Counted)),
+                came_to_count: 1,
+                came_to_add: 0,
+            }
+        );
+        assert!(keeps(went));
+        let counting = who_counts(&on.conn).unwrap();
+        let went_adds = {
+            let Value::Other(record) = went.open(&personal).unwrap().value else {
+                panic!("a record is bytes");
+            };
+            SignedAddition::from_bytes(&record)
+                .unwrap()
+                .addition
+                .device
+                .key
+        };
+        assert!(counting.counts(&went_adds));
+    }
+
     /// An entry of the phrase's channel is shown to the device, which
     /// does with it what a change entry has it do.
     #[test]
