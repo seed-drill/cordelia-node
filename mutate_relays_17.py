@@ -53,6 +53,7 @@ TRUSTED_WARM = governor("test_churn_warm_closes_no_trusted_peer")
 TRUSTED_EXCESS = governor("test_excess_hot_demotes_no_trusted_peer")
 NO_LINK = device_e2e("a_relay_given_with_no_connection_keeps_what_the_device_says_and_forgets")
 BY_KEY = p2p("a_connection_to_make_again_is_found_by_its_key")
+FORGET_TRIES = p2p("the_tries_forgotten_are_those_of_the_relays_the_connection_reached")
 MESSAGES_PLACE = device_e2e("a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none")
 REPOSITORY = config("test_the_configurations_in_this_repository_load")
 
@@ -217,6 +218,23 @@ MUTATIONS = [
             .and_then(|set_up| set_up.link.as_ref())
             .map(|link| link.relay().clone()),''',
      [BY_KEY]),
+    ("X1 an answer that has not come is taken for a refusal", DEVICE,
+     '''Some(Err(TryRecvError::Empty)) | None => false,''',
+     '''Some(Err(TryRecvError::Empty)) => true,
+                    None => false,''',
+     [MADE_AGAIN, MESSAGES_PLACE]),
+    ("X2 a remake for the messages channel alone ends later passes short", DEVICE,
+     '''match self.memory {
+            true => Remade::Memory,
+            false => Remade::Messages,''',
+     '''match self.memory {
+            true => Remade::Memory,
+            false => Remade::Memory,''',
+     [MESSAGES_PLACE]),
+    ("Y1 the tries of a remade connection are forgotten by name, not by key", P2P,
+     '''tries.retain(|tried, _| tried.1 != Some(peer.0) && !reached.contains(tried));''',
+     '''tries.retain(|tried, _| !reached.contains(tried));''',
+     [FORGET_TRIES]),
     ("G1 the messages channel alone asks for no remake", DEVICE,
      '''held + memory + messages > self.most_proved,''',
      '''held + memory > self.most_proved,''',
