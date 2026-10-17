@@ -3354,6 +3354,46 @@ mod tests {
         assert_eq!(not_counted(&conn), 256);
     }
 
+    /// Of the rest, two that say one time go by key, the higher first,
+    /// and two of one key by adder (decision 2026-10-17 §2.2): whichever
+    /// a reader saw first.
+    #[test]
+    fn test_of_the_rest_two_that_say_one_time_go_by_key_and_then_adder() {
+        let [_, two, ..] = statements(&phrase());
+        // Which of `pair` a reader keeps once the bound is passed by it,
+        // where 255 records of the rest say earlier times.
+        let kept_of = |pair: [&SignedAddition; 2]| {
+            let conn = device_at(0, 2);
+            for n in 1..=255 {
+                see_addition(&conn, &added_at(&two, 0, 1, NOW + n), NOW).unwrap();
+            }
+            for record in pair {
+                assert_eq!(
+                    see_addition(&conn, record, NOW).unwrap(),
+                    AdditionSeen::NotCounted(NotCounted::CountsAlready)
+                );
+            }
+            assert_eq!(not_counted(&conn), 256);
+            (keeps(&conn, pair[0]), keeps(&conn, pair[1]))
+        };
+        let later = NOW + 1000;
+        // Two keys of the statement, by one adder: the higher key goes.
+        let (low, high) = if key(0) < key(2) { (0, 2) } else { (2, 0) };
+        let (of_low, of_high) = (
+            added_at(&two, 1, low, later),
+            added_at(&two, 1, high, later),
+        );
+        assert_eq!(kept_of([&of_low, &of_high]), (true, false));
+        assert_eq!(kept_of([&of_high, &of_low]), (false, true));
+        // One key, by two adders: the higher adder's goes.
+        let (by_low, by_high) = (
+            added_at(&two, low, 1, later),
+            added_at(&two, high, 1, later),
+        );
+        assert_eq!(kept_of([&by_low, &by_high]), (true, false));
+        assert_eq!(kept_of([&by_high, &by_low]), (false, true));
+    }
+
     /// A flood of records by one device of the statement takes from
     /// another adder none of its first three keys that the 64 kept out
     /// (decision 2026-10-17 §1, property 1), whether they were seen
