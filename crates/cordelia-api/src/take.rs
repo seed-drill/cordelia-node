@@ -732,7 +732,9 @@ mod tests {
     /// A device keeps at most 256 records that are not counted, and a
     /// device that counts can sign any number of them. The record by
     /// which a device of the statement lets a key add is not among those
-    /// that go: no flood takes from a key that it may add.
+    /// that go: no flood takes from a key that it may add. What goes goes
+    /// by the order of keeping (decision 2026-10-17 §2.2): the flood's
+    /// own last record, and not another adder's.
     ///
     /// A record that did go is as one never seen. It is judged when its
     /// entry is given again, though the store holds the entry already.
@@ -819,36 +821,42 @@ mod tests {
             assert_eq!(taken(entry), stored(MAY_NOT, 0));
         }
         assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
-        // The one that went is the oldest of the flood. The record that
-        // lets device 8 add is older, and stays.
-        assert!(keeps(&lets_8_add) && !keeps(&by_9));
-        assert!(by_10.iter().all(keeps));
+        // The two adders are dealt their keys in turn, so device 9's one
+        // record is in the first turn. Each record says the same time, so
+        // device 10's keys are in order of key, and the one that went is
+        // its last. The record that lets device 8 add stays.
+        let last = (0..255u16)
+            .max_by_key(|n| identity_of(1000 + n).public_key())
+            .unwrap() as usize;
+        assert!(keeps(&lets_8_add) && keeps(&by_9) && !keeps(&by_10[last]));
+        let others = by_10.iter().enumerate().filter(|(n, _)| *n != last);
+        assert!(others.map(|(_, entry)| entry).all(keeps));
         assert!(may_add(8));
         // What device 8 signs next counts.
         assert_eq!(taken(&adds(8, 12)), stored(COUNTED, 1));
 
-        // Device 0 adds device 9 too: it may add from now on. The device
-        // keeps nothing that device 9 signed, so no key comes to count:
-        // that a key came to may add is all that says the caller is to
-        // give everything again. This record stays as the other does, and
-        // the oldest of the others goes.
-        assert_eq!(taken(&adds(0, 9)), lets_add);
-        assert!(may_add(9) && !keeps(&by_10[0]));
-        assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
-
-        // The record by device 9 that went is given again. The store
-        // holds its entry already, and it is judged as a record never
-        // seen: the key it adds counts.
-        assert_eq!(taken(&by_9), again(COUNTED, 1));
+        // Device 0 adds device 9 too: it may add from now on. The record
+        // by device 9 that is kept comes to count, which makes room for
+        // this one, and nothing goes. That a key came to count, or to may
+        // add, is what says the caller is to give everything again.
+        assert_eq!(
+            taken(&adds(0, 9)),
+            (Outcome::Stored, Some(Record::Seen(ALREADY)), (1, 1))
+        );
+        assert!(may_add(9));
         assert!(
             who_counts(&on.conn)
                 .unwrap()
                 .counts(&identity_of(11).public_key())
         );
-        // So is the one by device 10 that went: it does not count, is
-        // kept again, and the oldest of the others goes in its turn.
-        assert_eq!(taken(&by_10[0]), again(MAY_NOT, 0));
-        assert!(keeps(&by_10[0]) && !keeps(&by_10[1]));
+        assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
+
+        // The record by device 10 that went is given again. The store
+        // holds its entry already, and it is judged as a record never
+        // seen: it does not count, and is the last in the order again, so
+        // it goes again, and the others stay.
+        assert_eq!(taken(&by_10[last]), again(MAY_NOT, 0));
+        assert!(!keeps(&by_10[last]) && keeps(&by_10[0]));
         assert_eq!(not_counted(), MAX_NOT_COUNTED_RECORDS);
         // A record that the device keeps says no more when its entry is
         // given again: one that counts, and two that do not.

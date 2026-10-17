@@ -51,6 +51,8 @@
 //! to a relay by a rule of its own (§7.3). What it kept of each relay for
 //! a channel that it left goes with the channel.
 
+use std::collections::BTreeMap;
+
 use rusqlite::Connection;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -308,7 +310,8 @@ impl Counting {
     /// Whether a record that adds `key`, signed by `adder`, is one that
     /// lets the key add: the key counts by a record, and a device of the
     /// statement signed this one ([`Counting::may_add`]). A key that the
-    /// statement lists needs none.
+    /// statement lists needs none. Of several such records for one key, the
+    /// order of keeping keeps one first (decision 2026-10-17 §2.2).
     fn lets_add(&self, key: &[u8; 32], adder: &[u8; 32]) -> bool {
         self.listed.contains(adder) && !self.listed.contains(key) && self.counts(key)
     }
@@ -473,15 +476,17 @@ pub enum NotCounted {
 ///
 /// The records that are kept as not counted have a bound, 256: every
 /// time a device asks who counts it loads what it keeps, and a device that
-/// counts can sign any number of records. Beyond the bound the oldest that
-/// is not counted goes when a new one is kept. It is then as a record
-/// that was never seen: given again, it is judged as any record is.
+/// counts can sign any number of records. Beyond the bound they go from
+/// the end of the order of keeping (decision 2026-10-17 §2.2), which goes
+/// by what the records say and who counts, and not by when they were
+/// seen. One that went is then as a record that was never seen: given
+/// again, it is judged as any record is.
 ///
 /// One record that is not counted never goes so: for each key that counts
-/// by a record, the oldest that a device of the statement signed. It is
-/// what lets that key add, where the record the key counts by was signed
-/// by a device added since, and no number of records by another device
-/// takes that from the key.
+/// by a record, the oldest by its time that a device of the statement
+/// signed. It is what lets that key add, where the record the key counts
+/// by was signed by a device added since, and no number of records by
+/// another device takes that from the key.
 ///
 /// What is returned is what the record was when it was seen. A caller that
 /// asks how many keys came to count with it reads [`who_counts`] before
@@ -529,32 +534,166 @@ pub fn see_addition(
 }
 
 /// Keep the records that are not counted, under `statement`, to their
-/// bound of 256 (decision 2026-10-04 §6): beyond it the oldest of them
-/// go, in the order the device saw them.
-///
-/// A record that lets a key add does not go ([`Counting::lets_add`]): for
-/// each key that counts by a record, the oldest that is not counted and
-/// that a device of the statement signed. One for a key is enough, and a
-/// later one for the same key goes as any other does. At most 64 keys
-/// count, so they are few, and they are inside the bound: where there
-/// are some, fewer of the others stay.
+/// bound of 256 (decision 2026-10-04 §6): beyond it they go from the end
+/// of the order of keeping ([`in_the_order_of_keeping`]). The order is
+/// worked out from the records and from who counts, so which records stay
+/// does not turn on the order in which the device saw them (decision
+/// 2026-10-17 §1, property 2).
 fn keep_to_the_bound(conn: &Connection, statement: &Statement) -> Result<(), PersonError> {
     let kept = held_rows::additions(conn)?;
     let counting = Counting::of(statement, &kept);
-    let mut let_add: Vec<[u8; 32]> = Vec::new();
-    let mut may_go: Vec<i64> = Vec::new();
-    for record in kept.iter().filter(|record| !record.counted) {
-        if counting.lets_add(&record.key, &record.adder) && !let_add.contains(&record.key) {
-            let_add.push(record.key);
-        } else {
-            may_go.push(record.seen);
-        }
-    }
-    let over = (let_add.len() + may_go.len()).saturating_sub(MAX_NOT_COUNTED_RECORDS);
-    for seen in may_go.iter().take(over) {
-        held_rows::drop_not_counted(conn, *seen)?;
+    let order = in_the_order_of_keeping(statement, &counting, &kept);
+    for record in order.iter().skip(MAX_NOT_COUNTED_RECORDS) {
+        held_rows::drop_not_counted(conn, record.seen)?;
     }
     Ok(())
+}
+
+/// A record that is not counted, with the time it says it was made
+/// (`Addition::at`). A row whose bytes are no record says no time, and
+/// is put after every time.
+struct Placed<'a> {
+    row: &'a KeptAddition,
+    at: u64,
+}
+
+impl Placed<'_> {
+    /// Its place among records of one key: by the time it says, and then
+    /// by its bytes, so that two readers choose the same one.
+    fn by_time(&self) -> (u64, &[u8]) {
+        (self.at, &self.row.record)
+    }
+}
+
+/// The records that are not counted, in the order a reader keeps them
+/// (decision 2026-10-17 §2.2). The first are the last to go.
+///
+/// 1. Those that let a key add ([`Counting::lets_add`]): for each such
+///    key, the oldest by its time, and then by its bytes. There are at
+///    most 63, one for each key that counts by a record.
+/// 2. Those whose key the 64 kept out (`NotCounted::NoRoom`), dealt to
+///    their adders in turn ([`dealt`]).
+/// 3. Those whose adder counts and may not add yet
+///    (`NotCounted::MayNotAdd`), dealt in the same way: such a record
+///    comes to count once a record by a device of the statement is kept
+///    for its adder.
+/// 4. Every other, by its time, and then by key, adder and bytes.
+///
+/// At most 63 records are of the first kind and at most 64 keys may add,
+/// so each adder that may add keeps its first `KEPT_OUT_PER_ADDER` keys
+/// that the 64 kept out, whatever another key signs (§1, property 1).
+fn in_the_order_of_keeping<'a>(
+    statement: &Statement,
+    counting: &Counting,
+    kept: &'a [KeptAddition],
+) -> Vec<&'a KeptAddition> {
+    let mut let_add: Vec<Placed<'a>> = Vec::new();
+    let (mut kept_out, mut may_not_add, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    for row in kept.iter().filter(|row| !row.counted) {
+        let at =
+            SignedAddition::from_bytes(&row.record).map_or(u64::MAX, |record| record.addition.at);
+        let record = Placed { row, at };
+        if counting.lets_add(&row.key, &row.adder) {
+            let_add.push(record);
+        } else {
+            match counting.why_not(&row.key, &row.adder) {
+                Some(NotCounted::NoRoom) => kept_out.push(record),
+                Some(NotCounted::MayNotAdd) if counting.counts(&row.adder) => {
+                    may_not_add.push(record)
+                }
+                _ => rest.push(record),
+            }
+        }
+    }
+
+    let first = one_for_each_key(let_add, &mut rest);
+
+    let kept_out = dealt(statement, kept_out, &mut rest);
+    let may_not_add = dealt(statement, may_not_add, &mut rest);
+    rest.sort_by(|one, other| {
+        let order = |record: &Placed<'a>| {
+            let row = record.row;
+            (record.at, row.key, row.adder, &row.record)
+        };
+        order(one).cmp(&order(other))
+    });
+    first
+        .into_iter()
+        .map(|record| record.row)
+        .chain(kept_out)
+        .chain(may_not_add)
+        .chain(rest.into_iter().map(|record| record.row))
+        .collect()
+}
+
+/// Of `records`, the oldest for each key by its time, and then by its
+/// bytes, in order of key. The others go to `rest`.
+fn one_for_each_key<'a>(
+    mut records: Vec<Placed<'a>>,
+    rest: &mut Vec<Placed<'a>>,
+) -> Vec<Placed<'a>> {
+    records
+        .sort_by(|one, other| (one.row.key, one.by_time()).cmp(&(other.row.key, other.by_time())));
+    let mut one_each: Vec<Placed<'a>> = Vec::new();
+    for record in records {
+        if one_each
+            .last()
+            .is_some_and(|kept| kept.row.key == record.row.key)
+        {
+            rest.push(record);
+        } else {
+            one_each.push(record);
+        }
+    }
+    one_each
+}
+
+/// `records` dealt by key to their adders in turn (decision 2026-10-17
+/// §2.2): each adder's first key before any adder's second, each adder's
+/// second before any adder's third, and so on.
+///
+/// An adder has one place for each key, which the oldest of its records
+/// for that key takes, by its time and then by its bytes; any other goes
+/// to `rest`. An adder's keys are in the order of the time its record for
+/// each says, the oldest first, and then by key: that orders only that
+/// adder's own keys. Within a turn the devices of the statement come
+/// first, in its order, and then the other adders by key, so no adder
+/// takes another's turn by what it signs.
+fn dealt<'a>(
+    statement: &Statement,
+    records: Vec<Placed<'a>>,
+    rest: &mut Vec<Placed<'a>>,
+) -> Vec<&'a KeptAddition> {
+    let mut by_adder: BTreeMap<[u8; 32], Vec<Placed<'a>>> = BTreeMap::new();
+    for record in records {
+        by_adder.entry(record.row.adder).or_default().push(record);
+    }
+    let mut adders: Vec<(usize, [u8; 32], Vec<Placed<'a>>)> = Vec::new();
+    for (adder, records) in by_adder {
+        let mut places = one_for_each_key(records, rest);
+        places.sort_by_key(|place| (place.at, place.row.key));
+        let listed = statement
+            .devices
+            .iter()
+            .position(|device| device.key == adder);
+        adders.push((listed.unwrap_or(usize::MAX), adder, places));
+    }
+    adders.sort_by_key(|(listed, adder, _)| (*listed, *adder));
+
+    let turns = adders
+        .iter()
+        .map(|(.., places)| places.len())
+        .max()
+        .unwrap_or(0);
+    let mut order = Vec::new();
+    for turn in 0..turns {
+        for (.., places) in &adders {
+            if let Some(place) = places.get(turn) {
+                order.push(place.row);
+            }
+        }
+    }
+    order
 }
 
 /// Judge again the records that are kept as not counted, under
@@ -1868,9 +2007,9 @@ mod tests {
 
     use cordelia_core::protocol::{
         CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
-        ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES, LABEL_CHANGE_SECRET, LABEL_ENTRY_AUTHOR,
-        LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT, LABEL_STATEMENT, MIN_ENTRY_CONTENT_BYTES,
-        REV_BAND_HALF, REV_COUNT_BITS,
+        ITEM_SEAL_OVERHEAD_BYTES, KEPT_OUT_PER_ADDER, LABEL_CHANGE_DEVICES, LABEL_CHANGE_SECRET,
+        LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT, LABEL_STATEMENT,
+        MIN_ENTRY_CONTENT_BYTES, REV_BAND_HALF, REV_COUNT_BITS,
     };
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::aes_gcm::item_encrypt;
@@ -2933,10 +3072,41 @@ mod tests {
         }
     }
 
+    /// The record that device `adder` adds device `new` under `statement`,
+    /// saying that it was made at `at`.
+    fn added_at(statement: &Statement, adder: u16, new: u16, at: i64) -> SignedAddition {
+        let new = listed(&[new]).remove(0);
+        Addition::under(statement, new, key(adder), at as u64)
+            .unwrap()
+            .sign(&device(adder))
+            .unwrap()
+    }
+
+    /// Whether the device keeps `record`.
+    fn keeps(conn: &Connection, record: &SignedAddition) -> bool {
+        let bytes = record.to_bytes().unwrap();
+        let kept = held_rows::additions(conn).unwrap();
+        kept.iter().any(|one| one.record == bytes)
+    }
+
+    /// How many records the device keeps as not counted.
+    fn not_counted(conn: &Connection) -> usize {
+        let kept = held_rows::additions(conn).unwrap();
+        kept.iter().filter(|one| !one.counted).count()
+    }
+
+    /// The records that the device keeps as not counted, as a set.
+    fn kept_not_counted(conn: &Connection) -> BTreeSet<Vec<u8>> {
+        let kept = held_rows::additions(conn).unwrap();
+        let rows = kept.into_iter().filter(|one| !one.counted);
+        rows.map(|one| one.record).collect()
+    }
+
     /// A device keeps at most 256 records that are not counted. Beyond
-    /// that the oldest of them goes when a new one is kept, and no record
-    /// that counts goes with it. One that went is as one never seen: it
-    /// is judged when it is given again.
+    /// that the last in the order of keeping goes when a new one is kept
+    /// (decision 2026-10-17 §2.2), and no record that counts goes with
+    /// it. One that went is as one never seen: it is judged when it is
+    /// given again.
     #[test]
     fn test_the_records_kept_as_not_counted_have_a_bound() {
         let [_, two, ..] = statements(&phrase());
@@ -2949,139 +3119,591 @@ mod tests {
             see_addition(&conn, &oldest, NOW).unwrap(),
             AdditionSeen::NotCounted(NotCounted::MayNotAdd)
         );
-        // And 255 more, as a device that counts could sign them: the
-        // device keeps 256 that are not counted, which is the bound.
-        for n in 0..255u16 {
-            let record = format!("a record that does not count: {n}");
-            let key = [(n % 250) as u8 + 1; 32];
-            held_rows::keep_addition(&conn, record.as_bytes(), &key, &[0xee; 32], false, NOW)
-                .unwrap();
+        // And 254 more, as a device that counts could sign them: records
+        // for a key that the statement lists, each saying a later time.
+        let again: Vec<SignedAddition> = (1..=254).map(|n| added_at(&two, 0, 1, NOW + n)).collect();
+        for record in &again {
+            assert_eq!(
+                see_addition(&conn, record, NOW).unwrap(),
+                AdditionSeen::NotCounted(NotCounted::CountsAlready)
+            );
         }
-        let not_counted = |conn: &Connection| {
-            let kept = held_rows::additions(conn).unwrap();
-            kept.iter().filter(|one| !one.counted).count()
-        };
-        let keeps = |conn: &Connection, record: &SignedAddition| {
-            let bytes = record.to_bytes().unwrap();
-            let kept = held_rows::additions(conn).unwrap();
-            kept.iter().any(|one| one.record == bytes)
+        // And a row whose bytes are no record, written past the rule: it
+        // says no time, and is the last of all. The device keeps 256 that
+        // are not counted, which is the bound.
+        held_rows::keep_addition(&conn, b"no record", &key(1), &key(0), false, NOW).unwrap();
+        let no_record = || {
+            let kept = held_rows::additions(&conn).unwrap();
+            kept.iter().any(|one| one.record == b"no record")
         };
         assert_eq!(not_counted(&conn), 256);
-        assert!(keeps(&conn, &oldest));
+        assert!(keeps(&conn, &oldest) && no_record());
 
-        // One more that does not count: the oldest goes, and the new one
-        // is kept. The two that count stay.
+        // One more that does not count: the row that is no record goes,
+        // and the new one is kept. The two that count stay.
         let newest = added(&two, 8, 11);
         assert_eq!(
             see_addition(&conn, &newest, NOW).unwrap(),
             AdditionSeen::NotCounted(NotCounted::MayNotAdd)
         );
         assert_eq!(not_counted(&conn), 256);
-        assert!(!keeps(&conn, &oldest) && keeps(&conn, &newest));
+        assert!(!no_record() && keeps(&conn, &oldest) && keeps(&conn, &newest));
         assert_eq!(counting_of(&conn), (vec![0, 1, 2, 7, 8], vec![0, 1, 2, 7]));
+        // And one more: the record that says the latest time goes.
+        let one_more = added_at(&two, 0, 1, NOW + 255);
+        see_addition(&conn, &one_more, NOW).unwrap();
+        assert!(!keeps(&conn, &one_more) && again.iter().all(|one| keeps(&conn, one)));
+        assert_eq!(not_counted(&conn), 256);
 
-        // "0 adds 8" lets device 8 add. The record that is still kept
-        // comes to count, which makes room for the one that was seen, and
-        // nothing goes. The record that went is not there to be judged.
+        // "0 adds 8" lets device 8 add. The two records that device 8
+        // signed come to count, which makes room for the one that was
+        // seen, and nothing goes. The record that went is not there to be
+        // judged.
         assert_eq!(
             see_addition(&conn, &added(&two, 0, 8), NOW).unwrap(),
             AdditionSeen::NotCounted(NotCounted::CountsAlready)
         );
-        assert_eq!(not_counted(&conn), 256);
-        assert_eq!(
-            counting_of(&conn),
-            (vec![0, 1, 2, 7, 8, 11], vec![0, 1, 2, 7, 8])
-        );
-        // Given again, it is seen as a record that was never seen.
-        assert_eq!(
-            see_addition(&conn, &oldest, NOW).unwrap(),
-            AdditionSeen::Counted
-        );
-        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(not_counted(&conn), 255);
         assert_eq!(
             counting_of(&conn),
             (vec![0, 1, 2, 7, 8, 9, 11], vec![0, 1, 2, 7, 8])
         );
+        // Given again, it is seen as a record that was never seen.
+        assert_eq!(
+            see_addition(&conn, &one_more, NOW).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        assert!(keeps(&conn, &one_more));
+        assert_eq!(not_counted(&conn), 256);
     }
 
-    /// Of the records that are not counted, one never goes at the bound:
-    /// for each key that counts by a record, the oldest that a device of
-    /// the statement signed, which is what lets that key add. Every other
-    /// goes in its turn: one for a key that does not count, one for a key
-    /// the statement lists, one that a device added since signed, and a
-    /// second for the same key.
+    /// The order of keeping (decision 2026-10-17 §2.2), seen from what
+    /// goes: every other record first, the latest by its time; then a
+    /// record whose adder may not add yet; then one whose key the 64 kept
+    /// out, the last of an adder's keys before another adder's first; and
+    /// never the one that lets a key add, which is the oldest by its time
+    /// of those that a device of the statement signed for the key.
     #[test]
-    fn test_of_the_records_not_counted_only_the_oldest_that_lets_a_key_add_never_goes() {
+    fn test_the_records_that_do_not_count_go_from_the_end_of_the_order_of_keeping() {
         let [_, _, three, _] = statements(&phrase());
         // Statement 3 lists devices 0 and 1, and removes device 2.
         let conn = device_at(0, 3);
-        let seen = |adder: u16, new: u16| {
-            let record = added(&three, adder, new);
-            (see_addition(&conn, &record, NOW).unwrap(), record)
-        };
-        let already = AdditionSeen::NotCounted(NotCounted::CountsAlready);
-        let may_not = AdditionSeen::NotCounted(NotCounted::MayNotAdd);
-
-        // Device 0 adds 7, which adds 8 and 9: 8 and 9 may not add.
-        for (adder, new) in [(0, 7), (7, 8), (7, 9)] {
-            assert_eq!(seen(adder, new).0, AdditionSeen::Counted);
+        let seen = |record: &SignedAddition| see_addition(&conn, record, NOW).unwrap();
+        let why = |not: NotCounted| AdditionSeen::NotCounted(not);
+        // Device 0 adds 7, which adds 8, and 60 more: 64 count, and 8 may
+        // not add.
+        for record in [added(&three, 0, 7), added(&three, 7, 8)] {
+            assert_eq!(seen(&record), AdditionSeen::Counted);
         }
-        // Five that are not counted, the oldest first. A device of the
-        // statement signed one for a key that does not count,
-        let (why, for_a_removed_key) = seen(0, 2);
-        assert_eq!(why, AdditionSeen::NotCounted(NotCounted::Removed));
-        // and one for a key that the statement lists.
-        let (why, for_a_listed_key) = seen(0, 1);
-        assert_eq!(why, already);
-        // A device added since signed one for a key that counts.
-        let (why, by_one_added_since) = seen(8, 9);
-        assert_eq!(why, already);
-        // Each device of the statement signed one for device 8: the
-        // first of them lets it add.
-        let (why, lets_8_add) = seen(0, 8);
-        assert_eq!(why, already);
-        let (why, a_second_for_8) = seen(1, 8);
-        assert_eq!(why, already);
-        // And 251 more, as a device that counts could sign them: 256.
-        for n in 0..251u16 {
-            let record = format!("a record that does not count: {n}");
-            let key = [(n % 250) as u8 + 1; 32];
-            held_rows::keep_addition(&conn, record.as_bytes(), &key, &[0xee; 32], false, NOW)
-                .unwrap();
+        for n in 100..160 {
+            assert_eq!(seen(&added(&three, 0, n)), AdditionSeen::Counted, "{n}");
         }
-        let first_of_the_rest = b"a record that does not count: 0".to_vec();
-        let keeps_bytes = |bytes: &[u8]| {
-            let kept = held_rows::additions(&conn).unwrap();
-            kept.iter().any(|one| one.record == bytes)
-        };
-        let keeps = |record: &SignedAddition| keeps_bytes(&record.to_bytes().unwrap());
-        let not_counted = || {
-            let kept = held_rows::additions(&conn).unwrap();
-            kept.iter().filter(|one| !one.counted).count()
-        };
-        assert_eq!(not_counted(), 256);
+        assert_eq!(who_counts(&conn).unwrap().devices(), 64);
 
-        // Each record that device 9 signs is one more that is not
-        // counted, and the oldest that may go goes: each of the others in
-        // its turn, and never the one that lets device 8 add.
-        let goes: [&dyn Fn() -> bool; 5] = [
-            &|| keeps(&for_a_removed_key),
-            &|| keeps(&for_a_listed_key),
-            &|| keeps(&by_one_added_since),
-            &|| keeps(&a_second_for_8),
-            &|| keeps_bytes(&first_of_the_rest),
+        // Device 1 signs a record for 7 first, and device 0 one that
+        // says an older time: device 0's is the one that lets 7 add.
+        let by_1_for_7 = added_at(&three, 1, 7, NOW + 10);
+        let lets_7_add = added_at(&three, 0, 7, NOW + 4);
+        assert_eq!(seen(&by_1_for_7), why(NotCounted::CountsAlready));
+        assert_eq!(seen(&lets_7_add), why(NotCounted::CountsAlready));
+        // Two whose key the 64 kept out, one by a device of the statement
+        // and one by a key that it added.
+        let by_1 = added_at(&three, 1, 500, NOW + 5);
+        let by_100 = added_at(&three, 100, 501, NOW);
+        assert_eq!(seen(&by_1), why(NotCounted::NoRoom));
+        assert_eq!(seen(&by_100), why(NotCounted::NoRoom));
+        // One whose adder may not add yet: it says a later time than any
+        // of the rest, and goes after all of them.
+        let by_8 = added_at(&three, 8, 502, NOW + 30);
+        assert_eq!(seen(&by_8), why(NotCounted::MayNotAdd));
+        // And the rest: a second record of device 1's for 500, one for
+        // the removed key, one for a key that the statement lists, and
+        // one for 8 by a key that was added since.
+        let by_1_again = added_at(&three, 1, 500, NOW + 6);
+        let for_the_removed = added_at(&three, 0, 2, NOW + 3);
+        let for_a_listed = added_at(&three, 0, 1, NOW + 1);
+        let by_100_for_8 = added_at(&three, 100, 8, NOW + 2);
+        assert_eq!(seen(&by_1_again), why(NotCounted::NoRoom));
+        assert_eq!(seen(&for_the_removed), why(NotCounted::Removed));
+        assert_eq!(seen(&for_a_listed), why(NotCounted::CountsAlready));
+        assert_eq!(seen(&by_100_for_8), why(NotCounted::CountsAlready));
+        // And a row of a record whose adder does not count, written past
+        // the rule: it is among the rest, and says the latest time.
+        let by_a_stranger = added_at(&three, 300, 503, NOW + 20);
+        let bytes = by_a_stranger.to_bytes().unwrap();
+        held_rows::keep_addition(&conn, &bytes, &key(503), &key(300), false, NOW).unwrap();
+
+        // Device 1 fills the bound with records whose keys the 64 kept
+        // out, each saying an older time than its record for 500: they
+        // are its first keys.
+        let fill = 256 - not_counted(&conn);
+        assert_eq!(fill, 246);
+        for n in 0..fill {
+            let record = added_at(&three, 1, 1000 + n as u16, NOW - 2000 + n as i64);
+            assert_eq!(seen(&record), why(NotCounted::NoRoom), "{n}");
+        }
+        assert_eq!(not_counted(&conn), 256);
+
+        // Each record that device 1 signs next is one more than the
+        // device keeps, and the last in the order goes, in this order.
+        let goes = [
+            &by_a_stranger,
+            &by_1_for_7,
+            &by_1_again,
+            &for_the_removed,
+            &by_100_for_8,
+            &for_a_listed,
+            &by_8,
+            &by_1,
         ];
-        for (turn, is_kept) in goes.iter().enumerate() {
-            assert!(is_kept(), "{turn}");
-            assert_eq!(seen(9, 20 + turn as u16).0, may_not, "{turn}");
-            assert!(!is_kept(), "{turn}");
+        for (turn, record) in goes.iter().enumerate() {
+            assert!(keeps(&conn, record), "{turn}");
+            let pushes = added_at(&three, 1, 3000 + turn as u16, NOW - 3000);
+            assert_eq!(seen(&pushes), why(NotCounted::NoRoom), "{turn}");
+            assert!(!keeps(&conn, record), "{turn}");
             // Those whose turn has not come are there still.
-            assert!(goes[turn + 1..].iter().all(|later| later()), "{turn}");
-            assert!(keeps(&lets_8_add), "{turn}");
-            assert_eq!(not_counted(), 256, "{turn}");
+            assert!(
+                goes[turn + 1..].iter().all(|later| keeps(&conn, later)),
+                "{turn}"
+            );
+            assert!(keeps(&conn, &lets_7_add) && keeps(&conn, &by_100), "{turn}");
+            assert_eq!(not_counted(&conn), 256, "{turn}");
         }
+        let counting = who_counts(&conn).unwrap();
+        assert!(counting.may_add(&key(7)) && !counting.may_add(&key(8)));
+    }
+
+    /// Records whose adder counts and may not add yet are dealt to their
+    /// adders in turn, as those whose key the 64 kept out are (decision
+    /// 2026-10-17 §2.2): a flood by one such adder takes from another none
+    /// of its first keys, whether they were seen before it or after it.
+    #[test]
+    fn test_records_whose_adder_may_not_add_yet_are_dealt_to_their_adders_in_turn() {
+        let [_, two, ..] = statements(&phrase());
+        // Device 0 adds 7, which adds 8 and 9: neither may add.
+        let of_8: Vec<SignedAddition> = (500..503).map(|n| added(&two, 8, n)).collect();
+        let flood: Vec<SignedAddition> = (0..300)
+            .map(|n| added_at(&two, 9, 1000 + n as u16, NOW + n))
+            .collect();
+        for of_8_first in [true, false] {
+            let conn = device_at(0, 2);
+            for record in [added(&two, 0, 7), added(&two, 7, 8), added(&two, 7, 9)] {
+                see_addition(&conn, &record, NOW).unwrap();
+            }
+            let mut order: Vec<&SignedAddition> = flood.iter().collect();
+            if of_8_first {
+                order.splice(0..0, of_8.iter());
+            } else {
+                order.extend(of_8.iter());
+            }
+            for record in order {
+                assert_eq!(
+                    see_addition(&conn, record, NOW).unwrap(),
+                    AdditionSeen::NotCounted(NotCounted::MayNotAdd)
+                );
+            }
+            assert_eq!(not_counted(&conn), 256);
+            assert!(of_8.iter().all(|one| keeps(&conn, one)), "{of_8_first}");
+            for (n, record) in flood.iter().enumerate() {
+                assert_eq!(keeps(&conn, record), n < 253, "{of_8_first} {n}");
+            }
+        }
+    }
+
+    /// Within a turn the devices of the statement come first, in its
+    /// order, and then the other adders by key (decision 2026-10-17
+    /// §2.2): where the last turn is cut, those are the ones that have it.
+    #[test]
+    fn test_within_a_turn_the_devices_of_the_statement_come_first_in_its_order() {
+        let [_, two, ..] = statements(&phrase());
+        // Statement 2 lists 0, 1 and 2. Device 0 adds 100 to 160: 64
+        // count.
+        let conn = device_at(0, 2);
+        for n in 100..161 {
+            see_addition(&conn, &added(&two, 0, n), NOW).unwrap();
+        }
+        // Two devices of the statement, and two keys that device 0 added
+        // in order of key, each sign 100 records whose keys the 64 keep
+        // out.
+        let mut others = [100u16, 101];
+        others.sort_by_key(|n| key(*n));
+        let adders = [1u16, 2, others[0], others[1]];
+        let of = |i: usize, j: usize| added_at(&two, adders[i], 1000 + (100 * i + j) as u16, NOW);
+        for i in 0..4 {
+            for j in 0..100 {
+                see_addition(&conn, &of(i, j), NOW).unwrap();
+            }
+        }
+        // How many of each adder's records are kept.
+        let kept = || -> Vec<usize> {
+            (0..4)
+                .map(|i| (0..100).filter(|j| keeps(&conn, &of(i, *j))).count())
+                .collect()
+        };
+        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(kept(), [64, 64, 64, 64]);
+        // A record that lets a key add takes one place: the last turn is
+        // cut, and the key that sorts last loses it.
+        let lets_add = |n: u16| added_at(&two, 1, n, NOW + 1);
+        see_addition(&conn, &lets_add(100), NOW).unwrap();
+        assert_eq!(kept(), [64, 64, 64, 63]);
+        // Two more: only the first device of the statement keeps it.
+        see_addition(&conn, &lets_add(101), NOW).unwrap();
+        see_addition(&conn, &lets_add(102), NOW).unwrap();
+        assert_eq!(kept(), [64, 63, 63, 63]);
+        assert_eq!(not_counted(&conn), 256);
+    }
+
+    /// A flood of records by one device of the statement takes from
+    /// another adder none of its first three keys that the 64 kept out
+    /// (decision 2026-10-17 §1, property 1), whether they were seen
+    /// before the flood or after it.
+    #[test]
+    fn test_a_flood_of_records_keeps_each_adders_first_three_kept_out() {
+        let [_, two, ..] = statements(&phrase());
+        // Device 0 adds keys until 64 count.
+        let filled = || {
+            let conn = device_at(0, 2);
+            for n in 100..161 {
+                see_addition(&conn, &added(&two, 0, n), NOW).unwrap();
+            }
+            assert_eq!(who_counts(&conn).unwrap().devices(), 64);
+            conn
+        };
+        // Device 1 adds three keys, which the 64 keep out, and device 0
+        // signs 300 more records, of 300 keys.
+        let of_device_1: Vec<SignedAddition> = (500..500 + KEPT_OUT_PER_ADDER as u16)
+            .map(|n| added(&two, 1, n))
+            .collect();
+        let flood: Vec<SignedAddition> = (0..300)
+            .map(|n| added_at(&two, 0, 1000 + n as u16, NOW + n))
+            .collect();
+        let mut kept = Vec::new();
+        for of_device_1_first in [true, false] {
+            let conn = filled();
+            let mut order: Vec<&SignedAddition> = flood.iter().collect();
+            if of_device_1_first {
+                order.splice(0..0, of_device_1.iter());
+            } else {
+                order.extend(of_device_1.iter());
+            }
+            for record in order {
+                assert_eq!(
+                    see_addition(&conn, record, NOW).unwrap(),
+                    AdditionSeen::NotCounted(NotCounted::NoRoom)
+                );
+            }
+            assert_eq!(not_counted(&conn), 256);
+            // All three of device 1's are kept, and device 0 keeps its
+            // first 253 by the time each says.
+            assert!(of_device_1.iter().all(|one| keeps(&conn, one)));
+            for (n, record) in flood.iter().enumerate() {
+                assert_eq!(keeps(&conn, record), n < 253, "{n}");
+            }
+            kept.push(kept_not_counted(&conn));
+        }
+        assert_eq!(kept[0], kept[1]);
+    }
+
+    /// Statement 1, which lists device 0 alone, and the 64 adders that
+    /// may add there: device 0, and 63 keys that it added, 100 to 162.
+    /// Device 0 signs a second record for each of the 63, which is the
+    /// one that lets it add: 63 records that the device never drops. So
+    /// 193 places are left for keys that the 64 kept out.
+    fn at_the_floor() -> (Connection, Statement, Vec<u16>) {
+        let [one, ..] = statements(&phrase());
+        let conn = device_at(0, 1);
+        for n in 100..163 {
+            see_addition(&conn, &added(&one, 0, n), NOW).unwrap();
+            assert_eq!(
+                see_addition(&conn, &added_at(&one, 0, n, NOW + 1), NOW).unwrap(),
+                AdditionSeen::NotCounted(NotCounted::CountsAlready)
+            );
+        }
+        let counting = who_counts(&conn).unwrap();
+        assert_eq!(counting.devices(), 64);
+        let adders: Vec<u16> = std::iter::once(0).chain(100..163).collect();
+        assert!(adders.iter().all(|n| counting.may_add(&key(*n))));
+        assert_eq!(adders.len(), MAX_COUNTED_DEVICES);
+        (conn, one, adders)
+    }
+
+    /// At every bound together: 63 records that let a key add, and 64
+    /// adders that may add, each of which signs five records that the 64
+    /// keep out. Each adder keeps its first three by the time each says
+    /// (`KEPT_OUT_PER_ADDER`), and device 0, the first of the statement,
+    /// the one place left over. In two orders of seeing, the same.
+    #[test]
+    fn test_at_every_bound_each_adder_that_may_add_keeps_its_first_three_kept_out() {
+        assert_eq!(MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1), 193);
+        let mut kept = Vec::new();
+        for backwards in [false, true] {
+            let (conn, one, adders) = at_the_floor();
+            // Adder `i`'s record `j` says the time NOW + 10 + 4 - j: its
+            // records are signed newest first.
+            let record = |i: usize, j: usize| {
+                let new = 1000 + (5 * i + j) as u16;
+                added_at(&one, adders[i], new, NOW + 14 - j as i64)
+            };
+            let mut all: Vec<(usize, usize)> = (0..adders.len())
+                .flat_map(|i| (0..5).map(move |j| (i, j)))
+                .collect();
+            if backwards {
+                all.reverse();
+            }
+            for (i, j) in all {
+                assert_eq!(
+                    see_addition(&conn, &record(i, j), NOW).unwrap(),
+                    AdditionSeen::NotCounted(NotCounted::NoRoom)
+                );
+            }
+            assert_eq!(not_counted(&conn), 256);
+            for i in 0..adders.len() {
+                // Its oldest are its last two: j of 4, 3 and 2.
+                for j in 0..5 {
+                    let first = 4 - j < KEPT_OUT_PER_ADDER;
+                    let left_over = i == 0 && j == 1;
+                    assert_eq!(keeps(&conn, &record(i, j)), first || left_over, "{i} {j}");
+                }
+            }
+            // The records that let a key add are all kept.
+            assert!((100..163).all(|n| keeps(&conn, &added_at(&one, 0, n, NOW + 1))));
+            kept.push(kept_not_counted(&conn));
+        }
+        assert_eq!(kept[0], kept[1]);
+    }
+
+    /// An adder has one place for each key (decision 2026-10-17 §2.2):
+    /// where it signs two records for one key, the second is among the
+    /// rest, and does not take the place of its third key.
+    #[test]
+    fn test_an_adder_has_one_place_for_each_key() {
+        let (conn, one, adders) = at_the_floor();
+        // Key 101 signs two records for one key, and one each for two
+        // more, in that order of time.
+        let of_101 = [
+            added_at(&one, 101, 500, NOW + 10),
+            added_at(&one, 101, 500, NOW + 11),
+            added_at(&one, 101, 501, NOW + 12),
+            added_at(&one, 101, 502, NOW + 13),
+        ];
+        for record in &of_101 {
+            see_addition(&conn, record, NOW).unwrap();
+        }
+        // Every other adder floods, with records saying older times.
+        for (i, adder) in adders.iter().enumerate().filter(|(_, n)| **n != 101) {
+            for j in 0..5 {
+                let record = added_at(&one, *adder, 2000 + (5 * i + j) as u16, NOW);
+                see_addition(&conn, &record, NOW).unwrap();
+            }
+        }
+        assert_eq!(not_counted(&conn), 256);
+        // Key 101 keeps a record for each of its three keys, and not the
+        // second for the first.
+        let [first, second, third, fourth] = &of_101;
+        assert!(keeps(&conn, first) && keeps(&conn, third) && keeps(&conn, fourth));
+        assert!(!keeps(&conn, second));
+    }
+
+    /// The records that a reader keeps do not turn on the order in which
+    /// it saw them (decision 2026-10-17 §1, property 2). Two readers are
+    /// given, in one order, the records that make 64 count, and then 300
+    /// more of four adders, in two orders: both keep the same 256.
+    #[test]
+    fn test_the_records_kept_do_not_turn_on_the_order_they_were_seen() {
+        let [_, two, ..] = statements(&phrase());
+        // Statement 2 lists 0, 1 and 2. Device 0 adds 100 to 159, and 100
+        // adds 200: 64 count, and 200 may not add.
+        let filled = || {
+            let conn = device_at(0, 2);
+            for n in 100..160 {
+                see_addition(&conn, &added(&two, 0, n), NOW).unwrap();
+            }
+            see_addition(&conn, &added(&two, 100, 200), NOW).unwrap();
+            assert_eq!(who_counts(&conn).unwrap().devices(), 64);
+            conn
+        };
+        // Four adders: two of the statement, one that it added, and one
+        // that may not add. Each signs 75 records, for keys that the 64
+        // keep out, for keys that count already, and twice for one key,
+        // each saying a time that is not the order of signing, and three
+        // of them each time.
+        let adders = [0u16, 1, 100, 200];
+        let records: Vec<SignedAddition> = (0..300i64)
+            .map(|n| {
+                let adder = adders[n as usize % 4];
+                let at = NOW + (n * 7919) % 300 / 3;
+                let new = match n % 5 {
+                    0 => 1 + (n % 2) as u16,
+                    1 => 600 + (n % 3) as u16,
+                    _ => 1000 + n as u16,
+                };
+                added_at(&two, adder, new, at)
+            })
+            .collect();
+        let mut kept = Vec::new();
+        for backwards in [false, true] {
+            let conn = filled();
+            let mut order = records.clone();
+            if backwards {
+                order.reverse();
+            }
+            for record in &order {
+                see_addition(&conn, record, NOW).unwrap();
+            }
+            assert_eq!(not_counted(&conn), 256);
+            kept.push(kept_not_counted(&conn));
+        }
+        assert_eq!(kept[0], kept[1]);
+    }
+
+    /// The record that lets a key add does not turn on the order in which
+    /// a reader saw the records for that key (decision 2026-10-17 §2.2):
+    /// of those that devices of the statement signed, the oldest by the
+    /// time it says, and then by its bytes, is kept first, and the others
+    /// are among the rest.
+    #[test]
+    fn test_the_record_that_lets_a_key_add_does_not_turn_on_the_order_seen() {
+        let [_, two, ..] = statements(&phrase());
+        // Key 8 counts by a record of device 7, which was added since:
+        // devices 0 and 1 of the statement each sign a record for it.
+        let readers = |of_8: [&SignedAddition; 2]| {
+            let mut kept = Vec::new();
+            for order in [[of_8[0], of_8[1]], [of_8[1], of_8[0]]] {
+                let conn = device_at(0, 2);
+                see_addition(&conn, &added(&two, 0, 7), NOW).unwrap();
+                see_addition(&conn, &added(&two, 7, 8), NOW).unwrap();
+                for n in 100..159 {
+                    see_addition(&conn, &added(&two, 0, n), NOW).unwrap();
+                }
+                for record in order {
+                    assert_eq!(
+                        see_addition(&conn, record, NOW).unwrap(),
+                        AdditionSeen::NotCounted(NotCounted::CountsAlready)
+                    );
+                }
+                // A flood of records whose keys the 64 keep out: one of
+                // the two goes.
+                for n in 0..300 {
+                    let record = added_at(&two, 2, 1000 + n, NOW);
+                    see_addition(&conn, &record, NOW).unwrap();
+                }
+                assert_eq!(not_counted(&conn), 256);
+                assert!(who_counts(&conn).unwrap().may_add(&key(8)));
+                kept.push((keeps(&conn, of_8[0]), keeps(&conn, of_8[1])));
+            }
+            kept
+        };
+        // The older by its time is kept, whichever was seen first.
+        let older = added_at(&two, 1, 8, NOW + 2);
+        let newer = added_at(&two, 0, 8, NOW + 5);
+        assert_eq!(readers([&older, &newer]), [(true, false), (true, false)]);
+        // Of two that say one time, the one whose bytes are the lower.
+        let (one, other) = (added_at(&two, 0, 8, NOW), added_at(&two, 1, 8, NOW));
+        let (lower, higher) = if one.to_bytes().unwrap() < other.to_bytes().unwrap() {
+            (one, other)
+        } else {
+            (other, one)
+        };
+        assert_eq!(readers([&lower, &higher]), [(true, false), (true, false)]);
+    }
+
+    /// Who counts does not turn on which records beyond the bound a
+    /// reader kept (decision 2026-10-17 §2.7). One reader keeps by the
+    /// order of keeping, and one as a reader of the version before did,
+    /// the oldest it saw going first. A record by a device of the
+    /// statement then lets a key add, and each reads its channels again:
+    /// both count the same keys.
+    #[test]
+    fn test_who_counts_does_not_turn_on_which_records_beyond_the_bound_were_kept() {
+        let [_, two, ..] = statements(&phrase());
+        // Device 0 adds 7, which adds 8: 8 may not add. "8 adds 9" is the
+        // oldest record that does not count, and 256 records for a key
+        // that the statement lists come after it: one more than a reader
+        // keeps.
+        let before = [added(&two, 0, 7), added(&two, 7, 8)];
+        let of_8 = added(&two, 8, 9);
+        let flood: Vec<SignedAddition> = (1..=256).map(|n| added_at(&two, 0, 1, NOW + n)).collect();
+        let mut all: Vec<SignedAddition> = before.to_vec();
+        all.push(of_8.clone());
+        all.extend(flood.iter().cloned());
+
+        let by_the_order = device_at(0, 2);
+        let oldest_first = device_at(0, 2);
+        for record in &all {
+            see_addition(&by_the_order, record, NOW).unwrap();
+            see_addition(&oldest_first, record, NOW).unwrap();
+        }
+        // The order of keeping keeps "8 adds 9", and lets the latest of
+        // the flood go.
+        let latest = flood.last().unwrap();
+        assert!(keeps(&by_the_order, &of_8) && !keeps(&by_the_order, latest));
+        // The other reader kept the flood, and let "8 adds 9" go.
+        let rows = held_rows::additions(&oldest_first).unwrap();
+        let row = rows
+            .iter()
+            .find(|one| one.record == of_8.to_bytes().unwrap());
+        held_rows::drop_not_counted(&oldest_first, row.unwrap().seen).unwrap();
+        let bytes = latest.to_bytes().unwrap();
+        held_rows::keep_addition(&oldest_first, &bytes, &key(1), &key(0), false, NOW).unwrap();
+        assert!(!keeps(&oldest_first, &of_8) && keeps(&oldest_first, latest));
+        assert_eq!(not_counted(&oldest_first), 256);
+
+        // Device 1 adds 8: 8 may add. Each reads its channels again.
+        let lets_8_add = added(&two, 1, 8);
+        for conn in [&by_the_order, &oldest_first] {
+            assert_eq!(
+                see_addition(conn, &lets_8_add, NOW).unwrap(),
+                AdditionSeen::NotCounted(NotCounted::CountsAlready)
+            );
+            see_until_none_is_kept(conn, &all);
+        }
+        let counted = counting_of(&by_the_order);
+        assert_eq!(counted, (vec![0, 1, 2, 7, 8, 9], vec![0, 1, 2, 7, 8]));
+        assert_eq!(counting_of(&oldest_first), counted);
+    }
+
+    /// A key that comes to add after a flood (decision 2026-10-17 §12):
+    /// while it may not add, its records are kept after those whose key
+    /// the 64 kept out, and a flood of those lets them go. Once a record
+    /// by a device of the statement lets it add, and the reader reads its
+    /// channels again, they are among those the 64 kept out, and its
+    /// first three are kept.
+    #[test]
+    fn test_a_key_whose_adder_comes_to_add_after_a_flood_keeps_its_first_three() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        // Device 0 adds 7, which adds 8, and 59 more: 64 count, and 8 may
+        // not add.
+        let mut all = vec![added(&two, 0, 7), added(&two, 7, 8)];
+        all.extend((100..159).map(|n| added(&two, 0, n)));
+        // Key 8 adds three keys, and device 1 floods.
+        let of_8: Vec<SignedAddition> = (500..503).map(|n| added(&two, 8, n)).collect();
+        all.extend(of_8.iter().cloned());
+        all.extend((0..300).map(|n| added_at(&two, 1, 1000 + n, NOW)));
+        for record in &all {
+            see_addition(&conn, record, NOW).unwrap();
+        }
+        assert_eq!(who_counts(&conn).unwrap().devices(), 64);
+        assert!(of_8.iter().all(|one| !keeps(&conn, one)));
+
+        // Device 0 adds 8 too: it may add. The reader reads its channels
+        // again, and keeps each of the three.
+        let lets_8_add = added(&two, 0, 8);
+        see_addition(&conn, &lets_8_add, NOW).unwrap();
         assert!(who_counts(&conn).unwrap().may_add(&key(8)));
-        assert_eq!(counting_of(&conn).0, vec![0, 1, 7, 8, 9]);
+        see_until_none_is_kept(&conn, &all);
+        assert!(of_8.iter().all(|one| keeps(&conn, one)));
+        assert!(keeps(&conn, &lets_8_add));
+        assert_eq!(not_counted(&conn), 256);
+        for record in &of_8 {
+            assert_eq!(
+                who_counts(&conn)
+                    .unwrap()
+                    .why_not(&record.addition.device.key, &key(8)),
+                Some(NotCounted::NoRoom)
+            );
+        }
     }
 
     /// The bound of 64 stands where a record is judged again: one that
