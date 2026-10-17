@@ -32,8 +32,8 @@ def e2e(file, test): return (("cordelia-node", ["--test", file]), test)
 # Two edits in one part: give two lists of the same length.
 MUTATIONS = [
     ("F1a a command takes the lock for nobody's, and opens the database beside its node", MAIN,
-     '''        Ok(file) => lock_tried(file.try_lock()) == Lock::AnotherNode,''',
-     '''        Ok(file) => lock_tried(file.try_lock()) == Lock::AnotherNode && file.metadata().is_err(),''',
+     '''        Lock::AnotherNode => DirLock::Held,''',
+     '''        Lock::AnotherNode => DirLock::Free,''',
      [main("test_a_command_asks_the_lock_on_the_data_directory"),
       e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock"),
       e2e("first_start_e2e", "swarm_init_writes_nothing_beside_a_node_that_runs_on_its_data_directory")]),
@@ -42,26 +42,50 @@ MUTATIONS = [
      '''    if found != own && own == 0 {''',
      [main("test_a_command_asks_the_lock_on_the_data_directory"),
       e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
-    ("F1c a command asks the port again, and refuses beside a node on another directory", MAIN,
-     '''    let data_dir = config.data_dir();
-    let db_path = data_dir.join("cordelia.db");
-    if !a_node_holds(&data_dir) {''',
-     '''    let data_dir = config.data_dir();
-    let db_path = data_dir.join("cordelia.db");
-    if let Ok(node) = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR)
-        && let Some(note) = version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
-    {
-        anyhow::bail!("{note}");
-    }
-    if !a_node_holds(&data_dir) {''',
+    ("F1c where the lock tells nothing, the port is not asked, and a node of another version is not refused", MAIN,
+     '''    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {''',
+     '''    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) || lock == DirLock::NoFile {''',
      [e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
+    ("F1d the port is asked though the lock file is there and free, and a node on another directory refuses", MAIN,
+     '''    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {''',
+     '''    if lock == DirLock::Held {''',
+     [e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
+    ("F1e a node that finds the lock held refuses at once, and a command's moment stops it", MAIN,
+     '''            Lock::AnotherNode if std::time::Instant::now() < until => {''',
+     '''            Lock::AnotherNode if std::time::Instant::now() > until => {''',
+     [main("test_only_another_nodes_lock_keeps_a_node_from_starting")]),
     ("F2 swarm-init makes its data directory at the default mode", MAIN,
-     '''    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+     '''    // (mode 0700), as `cordelia init` and the install script make it.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
+    }''',
+     '''    // (mode 0700), as `cordelia init` and the install script make it.
+    std::fs::create_dir_all(&data_dir)?;''',
+     [e2e("first_start_e2e", "swarm_init_makes_its_data_directory_its_owners_alone")]),
+    ("F2b swarm-init changes the mode before it refuses a directory that holds a key", MAIN,
+     ['''    // A directory that holds a key already is refused before anything is
+    // changed, its mode included.
+    let identity_path = data_dir.join("identity.key");
+    if identity_path.exists() {
+        anyhow::bail!(
+            "Identity already exists at {}. Use --force with `cordelia init` to overwrite.",
+            identity_path.display()
+        );
+    }
+''',
+      '''    // (mode 0700), as `cordelia init` and the install script make it.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
+    }'''],
+     ['''    let identity_path = data_dir.join("identity.key");
+''',
+      '''    // (mode 0700), as `cordelia init` and the install script make it.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
         eprintln!("{says}");
     }
-    let identity_path''',
-     '''    std::fs::create_dir_all(&data_dir)?;
-    let identity_path''',
+    if identity_path.exists() {
+        anyhow::bail!("Identity already exists at {}.", identity_path.display());
+    }'''],
      [e2e("first_start_e2e", "swarm_init_makes_its_data_directory_its_owners_alone")]),
     ("F3a a directory shared with its group is taken for one open to others", MAIN,
      '''found.permissions().mode() & 0o007 != 0)''',
@@ -87,6 +111,14 @@ MUTATIONS = [
      '''    let found_at: Vec<Vec<String>> = match waiting.iter().any(unnamed) && relays.is_empty() {''',
      [person_cmd("devices_lists_a_relay_with_no_key_once"),
       e2e("memory_e2e", "a_relay_set_up_with_no_key_is_one_line_in_devices")]),
+    ("F5b a row named for another relay is claimed by an address", PERSON_CMD,
+     '''        by_name(waits, relays[n]) || (waits["name"].is_null() && found_at[n].iter().any(found))''',
+     '''        by_name(waits, relays[n]) || found_at[n].iter().any(found)''',
+     [person_cmd("devices_lists_a_relay_with_no_key_once")]),
+    ("F5c the lookups of the relays' names wait far beyond their bound", PERSON_CMD,
+     '''        .recv_timeout(wait)''',
+     '''        .recv_timeout(wait * 100)''',
+     [person_cmd("the_lookups_of_the_relays_names_end_within_their_wait")]),
     ("F6a a version under any higher revision is brought back", CARRYING,
      '''            carry::Brought::Higher if carry::later_by_its_author(conn, name, version)? => held += 1,''',
      '''            carry::Brought::Higher => held += 1,''',
@@ -96,6 +128,14 @@ MUTATIONS = [
      '''                authors.contains(&entry.author) || authors.iter().any(carried_from)''',
      '''                authors.contains(&entry.author) || (authors.iter().any(carried_from) && authors.is_empty())''',
      [api("carrying", "test_a_version_under_another_keys_later_revision_is_not_brought_back")]),
+    ("F6c a later revision by the same author that lost its tie is not its own", CARRY,
+     '''    Ok(slot.current.iter().chain(&slot.lost).any(by_them))''',
+     '''    Ok(slot.current.iter().any(by_them))''',
+     [api("carrying", "test_a_later_revision_of_the_same_authors_work_is_its_own_wherever_it_stands")]),
+    ("F6d only the first link of a chain names the author", CARRY,
+     '''                    entry.chain.iter().flatten().any(|held| *held == link)''',
+     '''                    entry.chain.iter().flatten().next() == Some(&link)''',
+     [api("carrying", "test_a_later_revision_of_the_same_authors_work_is_its_own_wherever_it_stands")]),
     ("F7 the first start's line names two ways on", FIRST_START,
      '''        "first start on this version: the database was copied and moved on; this device is {}",
         look::NOT_ADDED.replace("\\n  - ", " ")''',
