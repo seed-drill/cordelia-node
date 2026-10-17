@@ -17,12 +17,14 @@ ORIG = {f: open(f).read() for f in (ENTRIES, CARRYING, STATE)}
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 NODE_E2E = ("cordelia-node", ["--test", "device_entries_e2e"])
 API = ("cordelia-api", ["--lib"])
+COMMANDS = ("cordelia-api", ["--test", "commands_api"])
 def e2e(test): return (NODE_E2E, test)
 def api(test): return (API, "carrying::tests::" + test)
 
 GOES_ON = e2e("a_read_of_a_left_channel_goes_on_from_a_place")
 FROM_THE_START = e2e("the_door_for_a_carry_proves_and_pulls_and_does_nothing_else")
 SAYS = api("test_a_read_with_proofs_says_the_place_it_reached_at_each_relay")
+ROUTE = (COMMANDS, "test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_was_left")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -128,8 +130,8 @@ MUTATIONS = [
             _ => Some(json!({ "relay": at.relay, "mark": "", "place": 0 })),''',
      [SAYS]),
     ("RP17 the route drops the places it is handed", CARRYING,
-     '''        from.insert(place.relay.clone(), at);''',
-     '''        let _ = (&place.relay, at);''',
+     '''from.insert(place.relay.clone(), at).is_some()''',
+     '''false && from.insert(place.relay.clone(), at).is_some()''',
      [SAYS]),
     ("RP18 the route takes the place under no mark", CARRYING,
      '''        let at = LeftPlace {
@@ -141,6 +143,26 @@ MUTATIONS = [
             next: place.place,
         };''',
      [SAYS]),
+    ("RP19 a read whose time goes by after some pages says the place it began at", ENTRIES,
+     '''                    whole: false,
+                    reached: reached(place),
+                };
+            }
+            if !self.room_to_take(link) {''',
+     '''                    whole: false,
+                    reached: from,
+                };
+            }
+            if !self.room_to_take(link) {''',
+     [GOES_ON]),
+    ("RP20 the door gives a relay the place given for another", ENTRIES,
+     '''let place = from.get(&name).copied().unwrap_or(LeftPlace::START);''',
+     '''let place = from.values().next().copied().unwrap_or(LeftPlace::START);''',
+     [GOES_ON]),
+    ("RP21 the route takes one relay given two places", CARRYING,
+     '''        if from.insert(place.relay.clone(), at).is_some() {''',
+     '''        if from.insert(place.relay.clone(), at).is_some() && false {''',
+     [ROUTE]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
