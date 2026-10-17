@@ -5335,7 +5335,9 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
 /// the page: the connection is still open, and that is no end of what it
 /// will hand. The read waits, asks for the same page again, and hands
 /// the channel to its end, with nothing handed twice and the proof sent
-/// once. A pull reset for another reason ends the read there, in part.
+/// once, whether the pull refused was the first after the proof or a
+/// later one. A pull reset for another reason ends the read there, in
+/// part.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     let relay = StandIn::started().await;
@@ -5385,13 +5387,14 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     };
     relay.requests();
 
-    // The second pull is refused for now.
-    for reset in [Say::NotNow, Say::Reset] {
+    // A pull refused for now: the first, just after the proof, and then
+    // a later one. And a pull reset for another reason.
+    for (reset, at) in [(Say::NotNow, 0), (Say::NotNow, 1), (Say::Reset, 1)] {
         let pulls = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&pulls);
         let how = reset.clone();
         relay.hook(move |request| match request {
-            WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == 1 => {
+            WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == at => {
                 Some(how.clone())
             }
             _ => None,
@@ -5412,7 +5415,10 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
                 assert_eq!(entries.len(), 3);
                 assert_eq!(ids(entries), ids(&held));
                 assert_eq!(*reached, LeftPlace { mark, next: 3 });
-                assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2, 3]));
+                // The same page asked again, and the proof sent once.
+                let mut pulled = vec![0, 1, 2, 3];
+                pulled.insert(at as usize, at);
+                assert_eq!(asked(&relay), (1, pulled), "{at}");
                 // It waited before it asked again.
                 assert!(began.elapsed() >= Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS));
             }
