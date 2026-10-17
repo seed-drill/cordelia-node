@@ -4,8 +4,8 @@ relay a node is set up with is kept, churn closes no personal node's
 relay, the requests of the minute of a day's proofs are counted against
 the device's own pace, a connection whose proofs are held by a left
 generation is made again, a role this version does not know is refused
-at load, and hot churn spares trusted peers (decision 2026-10-17 §1 to
-§6). A part for each rule of
+at load, and churn and demotion spare trusted peers (decision
+2026-10-17 §1 to §6). A part for each rule of
 the slice: put each fault in, and confirm the test named for it fails on
 an assertion. Run from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
@@ -49,6 +49,10 @@ ONE_RELAY_E2E = devices_e2e("one_relay_under_two_names_is_counted_and_paced_once
 GOVERNOR_FOR = p2p("a_nodes_governor_keeps_its_relays_through_churn_only_on_a_personal_node")
 HELD = device_e2e("a_pass_held_by_its_pace_stops_and_moves_no_place")
 TRUSTED = governor("test_churn_hot_demotes_no_trusted_peer")
+TRUSTED_WARM = governor("test_churn_warm_closes_no_trusted_peer")
+TRUSTED_EXCESS = governor("test_excess_hot_demotes_no_trusted_peer")
+NO_LINK = device_e2e("a_relay_given_with_no_connection_keeps_what_the_device_says_and_forgets")
+BY_KEY = p2p("a_connection_to_make_again_is_found_by_its_key")
 MESSAGES_PLACE = device_e2e("a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none")
 REPOSITORY = config("test_the_configurations_in_this_repository_load")
 
@@ -100,9 +104,23 @@ MUTATIONS = [
      '''|| (peers[i] == peers[j])''',
      [ONE_RELAY]),
     ("S4 a pass is given the same relay under each name", P2P,
-     '''.filter(|(_, one)| *one == OneRelay::Itself)''',
+     '''.filter(|(_, one)| !matches!(one, OneRelay::SameAs(_)))''',
      '''.filter(|_| true)''',
      [LINKS, ONE_RELAY_E2E]),
+    ("W1 a relay another key answers for is left out of the count", P2P,
+     '''.filter(|(_, one)| !matches!(one, OneRelay::SameAs(_)))''',
+     '''.filter(|(_, one)| *one == OneRelay::Itself)''',
+     [LINKS]),
+    ("N1 a relay with no connection is not counted among every relay", DEVICE,
+     '''    set_up.filter(|keys| Some(keys.len()) == configured)''',
+     '''    let _ = (set_up, configured);
+    Some(
+        relays
+            .iter()
+            .filter_map(|relay| relay.link.as_ref().map(|link| link.relay().0))
+            .collect(),
+    )''',
+     [NO_LINK, LINKS]),
     ("S5 the device is counted every name of its configuration", P2P,
      '''    own.set_up_with(relays.len());''',
      '''    own.set_up_with(set_up.len());''',
@@ -117,12 +135,12 @@ MUTATIONS = [
      [TWO_KEYS]),
     # §2 Churn on a personal node.
     ("C1 churn closes a personal node's relays", GOVERNOR,
-     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay);''',
-     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay && false);''',
+     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay) && !self.is_trusted(p);''',
+     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay && false) && !self.is_trusted(p);''',
      [CHURN]),
     ("C2 too wide: churn closes no relay's warm relays either", GOVERNOR,
-     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay);''',
-     '''let churned = |p: &PeerInfo| !p.is_relay;''',
+     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay) && !self.is_trusted(p);''',
+     '''let churned = |p: &PeerInfo| !p.is_relay && !self.is_trusted(p);''',
      [CHURN]),
     ("C3 a personal node's governor does not keep its relays", P2P,
      '''        true => governor.keeping_its_relays(),''',
@@ -154,48 +172,59 @@ MUTATIONS = [
      [HELD]),
     # §4 The channels proved on a connection.
     ("P1 a full connection is never made again", DEVICE,
-     '''        if whole && self.make_again_where_full(link, &own) {
+     '''        if whole && self.make_again_where_full(link, &own) == Remade::Memory {
             return false;
         }''',
      '''        let _ = Self::make_again_where_full;''',
      [MADE_AGAIN]),
     ("P5 the pass goes on on a connection it asked to make again", DEVICE,
-     '''        if whole && self.make_again_where_full(link, &own) {
+     '''        if whole && self.make_again_where_full(link, &own) == Remade::Memory {
             return false;
         }''',
      '''        if whole {
             self.make_again_where_full(link, &own);
         }''',
      [MADE_AGAIN]),
-    ("P7 too wide: the messages channel alone has a connection made again", DEVICE,
-     '''own.is_pulled() && own.kind != Kind::Messages && !of.proved.contains_key(&own.id)''',
-     '''own.is_pulled() && !of.proved.contains_key(&own.id)''',
-     [MESSAGES_PLACE]),
-    ("P6 a later pass goes on on a connection being made again", DEVICE,
-     '''            if of.made_again {
-                return true;
-            }''',
-     '''            if of.made_again {
-                return false;
-            }''',
-     [MADE_AGAIN]),
     ("P2 the device forgets a left generation's proofs, which the relay keeps", DEVICE,
-     '''            of.made_again = left > 0;
-            left
-        };''',
-     '''            of.proved.retain(|channel, _| proves(channel));
-            let _ = left;
-            0
-        };''',
+     '''let left = of.proved.keys().filter(|channel| !proves(channel)).count();''',
+     '''of.proved.retain(|channel, _| proves(channel));
+            let left = 0;''',
      [MADE_AGAIN]),
     ("P3 too wide: a connection is made again with room left", DEVICE,
-     '''of.proved.len() + not_proved.count() > self.most_proved''',
-     '''not_proved.count() > 0''',
+     '''held + memory + messages > self.most_proved,''',
+     '''memory + messages > 0,''',
      [MADE_AGAIN]),
-    ("P4 the device asks again at every pass", DEVICE,
-     '''            of.made_again = left > 0;''',
-     '''            let _ = of.made_again;''',
+    ("M2 a remake the node did not carry out is never asked again", DEVICE,
+     '''Some(Ok(false) | Err(TryRecvError::Closed)) => true,''',
+     '''Some(Ok(false) | Err(TryRecvError::Closed)) => false,''',
      [MADE_AGAIN]),
+    ("M3 a remake carried out is asked again", DEVICE,
+     '''Some(Ok(true)) => {
+                        made.answer = None;
+                        false
+                    }''',
+     '''Some(Ok(true)) => true,''',
+     [MADE_AGAIN]),
+    ("M4 a remake is asked by the relay's name alone", DEVICE,
+     '''peer: Some(link.relay().0),''',
+     '''peer: None,''',
+     [MADE_AGAIN]),
+    ("M5 the node finds a remake's connection by name alone", P2P,
+     '''Some(key) => Some(NodeId(key)).filter(|peer| connected(peer)),''',
+     '''Some(_) => relays
+            .iter()
+            .find(|set_up| set_up.name == relay)
+            .and_then(|set_up| set_up.link.as_ref())
+            .map(|link| link.relay().clone()),''',
+     [BY_KEY]),
+    ("G1 the messages channel alone asks for no remake", DEVICE,
+     '''held + memory + messages > self.most_proved,''',
+     '''held + memory > self.most_proved,''',
+     [MESSAGES_PLACE]),
+    ("G2 a remake for the messages channel alone ends the pass short", DEVICE,
+     '''if whole && self.make_again_where_full(link, &own) == Remade::Memory {''',
+     '''if whole && self.make_again_where_full(link, &own) != Remade::No {''',
+     [MESSAGES_PLACE]),
     # §5 A node's role.
     ("F1 the role is not checked at load", CONFIG,
      '''        config.network.check()?;
@@ -214,10 +243,18 @@ MUTATIONS = [
      '''if ROLES.contains(&self.role.as_str()) {''',
      '''if ROLES.contains(&self.role.as_str()) || self.role == "keeper" {''',
      [ROLE]),
-    # §6 Hot churn and trusted peers.
+    # §6 Churn, demotion and trusted peers.
     ("K1 hot churn demotes a trusted peer", GOVERNOR,
-     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
-     '''.filter(|p| p.state == PeerState::Hot)''',
+     '''// a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        let hot_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
+     '''// a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        let hot_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot)''',
      [TRUSTED]),
     ("K2 a swarm member is not trusted", GOVERNOR,
      '''        peer.is_swarm
@@ -226,9 +263,33 @@ MUTATIONS = [
             || matches!''',
      [TRUSTED]),
     ("K3 too wide: hot churn demotes no peer", GOVERNOR,
-     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
-     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p) && false)''',
+     '''// a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        let hot_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
+     '''// a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        let hot_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p) && false)''',
      [TRUSTED]),
+    ("K4 warm churn closes a trusted peer", GOVERNOR,
+     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay) && !self.is_trusted(p);''',
+     '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay);''',
+     [TRUSTED_WARM]),
+    ("K5 the demotion of excess hot peers demotes a trusted peer", GOVERNOR,
+     '''// a swarm peer are never demoted (network-protocol.md §5.4, step 5).
+        let mut hot_peers: Vec<(NodeId, f64, bool)> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
+     '''// a swarm peer are never demoted (network-protocol.md §5.4, step 5).
+        let mut hot_peers: Vec<(NodeId, f64, bool)> = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && !p.is_swarm)''',
+     [TRUSTED_EXCESS]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
