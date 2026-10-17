@@ -32,7 +32,7 @@ use cordelia_api::state::{
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
     OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
@@ -639,13 +639,16 @@ fn channels_at(relay: &Node) -> i64 {
 
 // ── A stand-in for a relay, which answers as the test says ───────────
 
-/// What a stand-in does with a show.
+/// What a stand-in does with a show, or with a pull a test hooks.
 #[derive(Debug, Clone)]
 enum Say {
     /// It answers with this.
     Answer(ShowAnswer),
     /// It resets the stream.
     Reset,
+    /// It resets the stream with ERR_RATE_LIMIT, as a relay refuses a
+    /// pull for more than it may hand the connection for now.
+    NotNow,
     /// It answers nothing, and keeps the stream open.
     Nothing,
 }
@@ -657,7 +660,8 @@ enum Say {
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
 /// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
 /// has it answer with that answer of a show, which is no answer to a
-/// proof.
+/// proof. For a pull, `Some(Say::NotNow)` has it refuse the pull for now,
+/// and `Some(Say::Reset)` has it reset the stream.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -762,7 +766,9 @@ impl StandIn {
         };
         // What it does with the request: `Ok` with the answer, or with
         // none where the stream is reset, and `Err` where nothing is
-        // answered and the stream is kept open.
+        // answered and the stream is kept open. A reset for now is with
+        // the code a relay resets with for its allowance.
+        let mut not_now = false;
         let does = {
             let mut script = script.lock().unwrap();
             let hooked = script.hook.as_mut().and_then(|hook| hook(&request));
@@ -775,6 +781,10 @@ impl StandIn {
                             Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
                         }
                         Say::Reset => Ok(None),
+                        Say::NotNow => {
+                            not_now = true;
+                            Ok(None)
+                        }
                         Say::Nothing => Err(()),
                     }
                 }
@@ -791,6 +801,11 @@ impl StandIn {
                         proved: script.proves,
                     })))
                 }
+                WireMessage::EntryPull(_) if matches!(hooked, Some(Say::NotNow)) => {
+                    not_now = true;
+                    Ok(None)
+                }
+                WireMessage::EntryPull(_) if matches!(hooked, Some(Say::Reset)) => Ok(None),
                 WireMessage::EntryPull(pull) => {
                     let page = match script.pulled.as_mut() {
                         Some(pulled) => pulled(pull),
@@ -829,7 +844,11 @@ impl StandIn {
                 let _ = send.finish();
             }
             Ok(None) => {
-                let _ = send.reset(0u32.into());
+                let code = match not_now {
+                    true => cordelia_core::protocol::ERR_RATE_LIMIT,
+                    false => 0,
+                };
+                let _ = send.reset(code.into());
             }
             Err(()) => tokio::time::sleep(Duration::from_secs(120)).await,
         }
@@ -5306,6 +5325,105 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
     };
     assert_eq!(read[0].read, expected);
     assert_eq!(pulls(&relay), [(mark, 3)]);
+}
+
+/// **A read of a left channel waits out a pull that the relay refuses
+/// for now, and goes on to the channel's end** (decision 2026-10-17
+/// §3.2), against a stand-in that hands a page of one entry. The relay
+/// refuses one pull for now, as a relay does where what it handed the
+/// connection in a minute, with the answers to shows, leaves no room for
+/// the page: the connection is still open, and that is no end of what it
+/// will hand. The read waits, asks for the same page again, and hands
+/// the channel to its end, with nothing handed twice and the proof sent
+/// once. A pull reset for another reason ends the read there, in part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
+    let relay = StandIn::started().await;
+    let mut a = Device::new("laptop");
+    a.makes_the_phrase(&phrase());
+    a.holds("lab");
+    let (old_secret, old) = (a.name_secret("lab"), a.channel("lab"));
+    let held: Vec<Vec<u8>> = ["a.md", "b.md", "c.md"]
+        .iter()
+        .map(|file| {
+            let text = Value::Text(format!("{file} of the old"));
+            sealed(&a.state.identity, &old_secret, 1, file, text).to_wire()
+        })
+        .collect();
+    let id = |bytes: &Vec<u8>| Entry::from_wire(bytes).unwrap().id();
+    let ids = |of: &[Vec<u8>]| of.iter().map(id).collect::<BTreeSet<_>>();
+    a.changes(&phrase(), &[&a], &[]);
+    a.connects_to("relay", relay.port, relay.key).await;
+    relay.holds_what_is_proved(true);
+    let mark = [7u8; 8];
+    let hands = held.clone();
+    relay.pulls(move |pull| {
+        let after = if pull.mark == mark { pull.after } else { 0 };
+        let page: Vec<Vec<u8>> = hands.iter().skip(after as usize).take(1).cloned().collect();
+        EntryPulled {
+            next: after + page.len() as u64,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let by_secret = || ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let soon = || std::time::Instant::now() + Duration::from_secs(30);
+    let asked = |relay: &StandIn| -> (usize, Vec<u64>) {
+        let requests = relay.requests();
+        let proofs = requests
+            .iter()
+            .filter(|one| matches!(one, WireMessage::ChannelProve(_)))
+            .count();
+        let pulls = requests
+            .iter()
+            .filter_map(|one| match one {
+                WireMessage::EntryPull(pull) => Some(pull.after),
+                _ => None,
+            })
+            .collect();
+        (proofs, pulls)
+    };
+    relay.requests();
+
+    // The second pull is refused for now.
+    for reset in [Say::NotNow, Say::Reset] {
+        let pulls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&pulls);
+        let how = reset.clone();
+        relay.hook(move |request| match request {
+            WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == 1 => {
+                Some(how.clone())
+            }
+            _ => None,
+        });
+        let began = std::time::Instant::now();
+        let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+        let LeftRead::Read {
+            entries,
+            whole,
+            reached,
+        } = &read[0].read
+        else {
+            panic!("{read:?}");
+        };
+        match reset {
+            Say::NotNow => {
+                assert!(*whole, "{read:?}");
+                assert_eq!(entries.len(), 3);
+                assert_eq!(ids(entries), ids(&held));
+                assert_eq!(*reached, LeftPlace { mark, next: 3 });
+                assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2, 3]));
+                // It waited before it asked again.
+                assert!(began.elapsed() >= Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS));
+            }
+            _ => {
+                assert!(!*whole, "{read:?}");
+                assert_eq!(ids(entries), ids(&held[..1]));
+                assert_eq!(*reached, LeftPlace { mark, next: 1 });
+                assert_eq!(asked(&relay), (1, vec![0, 1]));
+            }
+        }
+    }
 }
 
 /// **A read of a generation that was left counts each proof it sends,
