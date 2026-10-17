@@ -2141,9 +2141,9 @@ impl DeviceEntries {
     /// one entry of the largest size, within what a relay may hand a
     /// connection in a minute, **less the room that the relay keeps for
     /// the answer to a show** (SHOW_ANSWER_ROOM_BYTES). A relay hands no
-    /// page from that room, and refuses a pull that would need it: a read
-    /// that asked would end there, where it can wait and go on
-    /// (decision 2026-10-17 §3.1, §3.2).
+    /// page from that room, and refuses for now a pull that would need
+    /// it: the device does not ask for such a page, and waits for the
+    /// minute instead (decision 2026-10-17 §3.1, §3.2).
     fn room_to_take(&self, link: &Link) -> bool {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
