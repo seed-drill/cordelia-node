@@ -1425,12 +1425,17 @@ fn adding_a_relay_that_a_node_names_replaces_its_entry_in_its_place() {
     assert_eq!(configured_relays(&n), [(at.clone(), Some(first.clone()))]);
 
     n.add_relay(NOWHERE, None);
-    let both = [(at.clone(), Some(first)), (NOWHERE.to_string(), None)];
+    let both = [
+        (at.clone(), Some(first.clone())),
+        (NOWHERE.to_string(), None),
+    ];
     assert_eq!(configured_relays(&n), both);
 
     // A key in place of a key, and then none: the old key's line goes
     // with its entry.
     n.add_relay(&at, Some(&second));
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    assert!(!config.contains(&first), "{config}");
     let both = [(at.clone(), Some(second)), (NOWHERE.to_string(), None)];
     assert_eq!(configured_relays(&n), both);
     n.add_relay(&at, None);
