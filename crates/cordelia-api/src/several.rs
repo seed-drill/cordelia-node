@@ -41,7 +41,7 @@ use crate::person::{
     kept_entry, latest_entry, shown, who_counts,
 };
 use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
-use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProvedBy};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftPlace, LeftRead, ProvedBy};
 use crate::take::{Taken, take};
 
 pub(crate) const WORDS: &str =
@@ -488,6 +488,11 @@ pub(crate) struct Node {
     pub(crate) did: Arc<Mutex<Vec<&'static str>>>,
     /// Whether the relay hands a channel in part, and not to its end.
     pub(crate) in_part: Arc<std::sync::atomic::AtomicBool>,
+    /// How many entries the relay hands in one read, where a test says:
+    /// all that follow the place asked from, where it is 0. Each entry
+    /// it holds of a channel is a place, counted from 1, under
+    /// [`RELAY_MARK`].
+    pub(crate) per_read: Arc<std::sync::atomic::AtomicUsize>,
     /// How many of the next whole passes end before they have read every
     /// channel to its end.
     pub(crate) short_passes: Arc<std::sync::atomic::AtomicUsize>,
@@ -513,6 +518,9 @@ pub(crate) struct Node {
 
 /// The session of the connection to the relay of a test.
 pub(crate) const SESSION: [u8; 32] = [5; 32];
+
+/// The mark of the relay's holding of each channel, in a test.
+pub(crate) const RELAY_MARK: [u8; 8] = [6; 8];
 
 /// The session of the connection to the relay of a test once it was
 /// made again so often: [`SESSION`], while it was not.
@@ -554,6 +562,8 @@ impl Node {
         let order = Arc::clone(&did);
         let in_part: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let part = Arc::clone(&in_part);
+        let per_read: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let at_most = Arc::clone(&per_read);
         let not_connected: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let away = Arc::clone(&not_connected);
         let no_room: Arc<std::sync::atomic::AtomicUsize> = Default::default();
@@ -623,6 +633,7 @@ impl Node {
                     DoorAsk::Read {
                         channel,
                         by,
+                        from,
                         answer,
                         ..
                     } => {
@@ -635,12 +646,30 @@ impl Node {
                         let then = std::time::Instant::now() + nearly;
                         let waits = node.own_channels.carried_into(then);
                         held_back.lock().unwrap().push(waits);
+                        // From the place asked, where it is under the
+                        // holding's mark, and from the start where not.
+                        let place = from.get("relay").copied().unwrap_or(LeftPlace::START);
+                        let start = match place.mark == RELAY_MARK {
+                            true => place.next as usize,
+                            false => 0,
+                        };
                         let read = match holds.lock().unwrap().get(&channel) {
                             None => LeftRead::NotHeld,
-                            Some(entries) => LeftRead::Read {
-                                entries: entries.clone(),
-                                whole: !part.load(std::sync::atomic::Ordering::SeqCst),
-                            },
+                            Some(entries) => {
+                                let start = start.min(entries.len());
+                                let end = match at_most.load(SeqCst) {
+                                    0 => entries.len(),
+                                    most => (start + most).min(entries.len()),
+                                };
+                                LeftRead::Read {
+                                    entries: entries[start..end].to_vec(),
+                                    whole: end == entries.len() && !part.load(SeqCst),
+                                    reached: LeftPlace {
+                                        mark: RELAY_MARK,
+                                        next: end as u64,
+                                    },
+                                }
+                            }
                         };
                         let _ = answer.send(vec![LeftAt {
                             relay: "relay".into(),
@@ -656,6 +685,7 @@ impl Node {
             asked,
             did,
             in_part,
+            per_read,
             short_passes,
             not_connected,
             no_room,

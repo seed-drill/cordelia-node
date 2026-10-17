@@ -3578,6 +3578,7 @@ mod tests {
             asked: Default::default(),
             did: Default::default(),
             in_part: Default::default(),
+            per_read: Default::default(),
             short_passes: Default::default(),
             not_connected: Default::default(),
             no_room: Default::default(),
