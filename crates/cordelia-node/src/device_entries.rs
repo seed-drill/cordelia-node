@@ -116,7 +116,7 @@ use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
+    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -2124,11 +2124,15 @@ impl DeviceEntries {
     /// Whether the device takes a page more from the relay at `link`
     /// now: what that relay handed it in the last minute leaves room for
     /// one entry of the largest size, within what a relay may hand a
-    /// connection in a minute.
+    /// connection in a minute, **less the room that the relay keeps for
+    /// the answer to a show** (SHOW_ANSWER_ROOM_BYTES). A relay hands no
+    /// page from that room, and refuses a pull that would need it: a read
+    /// that asked would end there, where it can wait and go on
+    /// (decision 2026-10-17 §3.1, §3.2).
     fn room_to_take(&self, link: &Link) -> bool {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
-        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES)
+        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
