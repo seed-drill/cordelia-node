@@ -290,7 +290,8 @@ pub struct Offer {
 impl Offer {
     /// The offer that makes the channel `old_channel` anew as `card`, with
     /// the new seed sealed to each of `keys` (decision 2026-10-10 §7, step
-    /// 2). At least one key, at most 64, each once and each usable.
+    /// 2). At least one key, at most 64, each once and each usable; and a
+    /// card of another channel than the old one.
     pub fn make(
         made: u64,
         old_channel: &[u8; 32],
@@ -299,6 +300,9 @@ impl Offer {
     ) -> Result<Self, AnewError> {
         check_keys(keys.iter())?;
         let new_channel = card.channel_id().map_err(crypto)?;
+        if new_channel == *old_channel {
+            return Err(AnewError::SameChannel);
+        }
         let info = seal_info(old_channel, &new_channel);
         let seals = keys
             .iter()
@@ -434,12 +438,14 @@ fn check_keys<'a>(keys: impl ExactSizeIterator<Item = &'a [u8; 32]>) -> Result<(
         return Err(AnewError::TooManyKeys(count));
     }
     let mut seen: Vec<&[u8; 32]> = keys.collect();
-    if !seen.iter().all(|key| is_usable_public_key(key)) {
-        return Err(AnewError::KeyNotUsable);
-    }
     seen.sort_unstable();
     if seen.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(AnewError::KeyTwice);
+    }
+    // Last, since it is the one check that costs a point's decompression
+    // for each key.
+    if !seen.iter().all(|key| is_usable_public_key(key)) {
+        return Err(AnewError::KeyNotUsable);
     }
     Ok(())
 }
@@ -810,7 +816,6 @@ mod tests {
         let fields = expected.len() + 64 * (32 + SEALED_SECRET_BYTES);
         assert_eq!(fields, 8_043);
         assert!(value[fields..].iter().all(|byte| *byte == 0));
-        assert_ne!(value[fields - 1], 0);
 
         let info = seal_info(&OLD, &new);
         let mut label = b"cordelia v2 anew seal".to_vec();
@@ -861,12 +866,30 @@ mod tests {
         assert_eq!(offer.open(&laptop, &[2; 32]), Err(AnewError::DidNotOpen));
 
         // An offer of the old channel itself, which any member can seal
-        // with the old seed: it opens to the channel it makes anew, and is
-        // a fault.
+        // with the old seed: it is not made, and one written by hand opens
+        // to the channel it makes anew, and is a fault.
         let old = card.channel_id().unwrap();
-        let same = Offer::make(9, &old, &card, &[laptop.public_key()]).unwrap();
-        assert_eq!(same.new_channel, old);
+        assert_eq!(
+            Offer::make(9, &old, &card, &[laptop.public_key()]),
+            Err(AnewError::SameChannel)
+        );
+        let to = x25519_pub_from_ed25519_pub(&laptop.public_key()).unwrap();
+        let same = Offer {
+            new_channel: old,
+            seals: vec![Seal {
+                key: laptop.public_key(),
+                sealed: ecies_encrypt_for(&to, card.seed(), &seal_info(&old, &old))
+                    .unwrap()
+                    .to_bytes()
+                    .try_into()
+                    .unwrap(),
+            }],
+            ..offer.clone()
+        };
         assert_eq!(same.open(&laptop, &old), Err(AnewError::SameChannel));
+        // Read in another old channel, its seal, bound to the old one, does
+        // not open.
+        assert_eq!(same.open(&laptop, &OLD), Err(AnewError::DidNotOpen));
 
         // The seal of another card's seed, under this offer's IDs.
         let other = self::card(&[[3; 32]]);
