@@ -282,8 +282,9 @@ fn not_shown_says(not_shown: usize) -> Option<String> {
 
 /// What is said where a recovery did not keep every record of an
 /// addition that it read (decision 2026-10-04 §9, step 3): a reader
-/// keeps 256 records that do not count, the oldest it saw going first,
-/// so where more were written, one that was read is not among them.
+/// keeps 256 records that do not count, in the order of keeping
+/// (decision 2026-10-17 §2.2), so where more were written, one that was
+/// read is not among them.
 /// `number` is the number of the change recovered from. It gives two
 /// numbers, and is said where either is not 0:
 ///

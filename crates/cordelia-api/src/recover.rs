@@ -233,11 +233,11 @@ pub struct Row {
     /// Whether a record of an addition that was read for this key, under
     /// some adder, is not among the records that the reader kept
     /// (decision 2026-10-04 §9, step 3): a reader keeps 256 records that
-    /// do not count, the oldest it saw going first. The row is then by
-    /// another record of the key, and may say less of it than was
-    /// written: the record that went may be the one that fails only for
-    /// the bound of 64, under an adder that may add, by which the key
-    /// would have been asked about. Never so for a key that the statement
+    /// do not count, in the order of keeping (decision 2026-10-17 §2.2).
+    /// The row is then by another record of the key, and may say less of
+    /// it than was written: the record that went may be one that fails
+    /// only for the bound of 64, under an adder that may add, by which the
+    /// key would have been asked about. Never so for a key that the statement
     /// removes: it stays removed whatever a record says of it.
     pub record_let_go: bool,
 }
@@ -257,9 +257,9 @@ pub struct Generation {
     pub not_shown: Vec<Row>,
     /// How many keys a record of an addition was read for that have no
     /// row at all, shown or not (decision 2026-10-04 §9, step 3). A
-    /// reader keeps 256 records that do not count, the oldest it saw
-    /// going first: where more were written, one that was read is not
-    /// among those it kept. A device that was added since the change,
+    /// reader keeps 256 records that do not count, in the order of
+    /// keeping (decision 2026-10-17 §2.2): where more were written, one
+    /// that was read is not among those it kept. A device that was added since the change,
     /// and that the bound of 64 kept out, may be among them. Nothing is
     /// asked of such a key, nothing is taken from it, and the reader
     /// does not hold it: the command says how many there are. Keys are
@@ -488,9 +488,9 @@ pub fn read_generation(
     let not_shown = rows.split_off(RECOVERY_MAX_DEVICES_SHOWN.min(rows.len()));
     // The keys that a record was read for and that have no row, shown
     // or not: the reader kept 256 records that do not count, and let go
-    // of the oldest beyond that. A key that the statement removes stays
-    // removed whatever a record says of it, and is not counted. (A
-    // device of the statement always has a row.)
+    // of those beyond them in the order of keeping. A key that the
+    // statement removes stays removed whatever a record says of it, and
+    // is not counted. (A device of the statement always has a row.)
     let has_a_row = |key: &[u8; 32]| rows.iter().chain(&not_shown).any(|row| row.key == *key);
     let read_keys: BTreeSet<[u8; 32]> = read_for.iter().map(|(key, _)| *key).collect();
     let no_row = read_keys
