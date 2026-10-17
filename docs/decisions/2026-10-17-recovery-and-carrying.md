@@ -23,7 +23,7 @@ Reviews of alpha.11 found four places where recovery and carrying keep a rule th
 
 1. **Fairness between adders in the two bounds of 256** (section 2). Which records a reader keeps, and which rows a recovery shows, go by who signed them and not by when they were seen. Among the records the relays hold, each adder that may add keeps its first three keys that the 64 kept out, whatever another device signs.
 2. **A recovery reads the personal channel on to its end** (section 3). The personal channel of the change recovered from is read on from the place reached, for up to 615 seconds, which is what a channel at its cap takes. The command says that it is reading. The phrase's own channel holds one entry, and a relay that handed none of it is said before the yes.
-3. **What "sent to no relay" means where a carried name is let go** (section 4). A version counts as held at a relay only where a relay that the device is set up with handed it, in a read made after the person asked, which reads on until each version is found or the channel's end is reached.
+3. **What "sent to no relay" means where a carried name is let go** (section 4). Each entry of the name that this device signed counts as held only where a relay that the device is set up with handed it, or what moved its slot on, in a read made after the person asked, which reads on until each is found or the channel's end is reached.
 4. **A way out for a carried name that no relay takes** (section 5). A typed `discard`, at a terminal, lets the name go with what no relay holds.
 
 Nothing on the wire changes, and no relay needs a change (section 6). Two of the changes alter what every device runs: the order of keeping records (section 2), which every reader applies, and the check before a carried name is let go (section 4), which is local to each device. A person whose devices run alpha.11 and this version at once is safe with both (section 6).
@@ -36,13 +36,13 @@ Each is one sentence that a test can hold. Section 9 names the tests. Security p
 2. **The records that a reader keeps do not turn on the order in which it saw them,** given who counts.
 3. **A row of a key that the 64 kept out shows the label that each adder that may add gave it,** each beside that adder, and no one adder's label stands for the key.
 4. Not used.
-5. **A carried name is let go with a version that no relay holds only after the word `discard` is typed at a terminal,** once the command has said how many such versions there are, and where they may still be.
-6. **For that check, a version counts as held only where a relay that the device is set up with handed, in a read that began after the person asked, the same version signed by a key that counts, or an entry at a higher revision in its slot signed by a key that counts.**
+5. **On a device that reads the relays, a carried name is let go with an entry of its own that no relay holds only after the word `discard` is typed at a terminal,** once the command has said how many such entries there are, and where they may still be.
+6. **For that check, an entry that this device signed counts as held only where a relay that the device is set up with handed, in a read that began after the person asked, the same version signed by a key that counts, or entries that, read as a slot is read, give its slot a current version at a higher revision.**
 7. **A folder's unmapping never lets go of a name that a carry on this version brought versions into,** whether the folder was mapped before the carry or after it.
 8. **On a device that has stopped, a carried name of which its own notes say it sent a version that it signed to no relay is let go only after the same typed word,** and the command says that the device could not read the relays.
-9. **No let-go lets go of a version that the read did not ask about:** where the store has taken anything of the name's channel since the read ended, or a `discard` comes with a read that is more than ten minutes old or a number that is not the one found, the node refuses.
+9. **No let-go lets go of an entry that the read did not ask about:** where the store has taken anything of the name's channel since the read ended, or a `discard` comes with a read that is more than ten minutes old or a number that is not the one found, the node refuses.
 10. **A recovery reads the personal channel of the change it recovers from on from the place each relay reached,** until each relay has handed it to its end or holds none of it, or until 615 seconds have passed (`RECOVERY_READ_ON_MAX_SECS`).
-11. **A recovery says before its yes each relay at which it read that channel in part, and each that handed none of the phrase's own channel.**
+11. **A recovery says before its yes each relay at which it read that channel in part, and each at which it could not read the phrase's own channel to its end.**
 12. **The count of versions sent to no relay that a command says before its yes counts only entries that this device signed.**
 13. **Nothing on the wire changes:** a relay of alpha.11 serves a device of this version as it serves one of alpha.11.
 
@@ -50,7 +50,7 @@ Each is one sentence that a test can hold. Section 9 names the tests. Security p
 
 ### 2.1 What the code does today
 
-- **A reader keeps 256 records that do not count, the oldest it saw going first.** `keep_to_the_bound` (`crates/cordelia-api/src/person.rs`) splits the records that do not count into those that let a key add (`Counting::lets_add`: for each key that counts by a record, the oldest record that a device of the statement signed) and the rest. The rest are dropped in the order the device saw them (`held_rows::additions` reads them `ORDER BY seen`), until 256 are left. Every device runs it, after each record it takes (`see_addition`).
+- **A reader keeps 256 records that do not count, the oldest it saw going first.** `keep_to_the_bound` (`crates/cordelia-api/src/person.rs`) splits the records that do not count into those that let a key add (`Counting::lets_add`: for each key that counts by a record, one record that a device of the statement signed, the first of them it saw) and the rest. The rest are dropped in the order the device saw them (`held_rows::additions` reads them `ORDER BY seen`), until 256 are left. Every device runs it, after each record it takes (`see_addition`).
 - **A reader takes no record whose adder does not count.** The one door refuses every entry whose signer does not count (`take::taken_as_its_own`, `NotTaken::SignerDoesNotCount`), and `see_addition` refuses such a record besides. A recovery reads through the same door (`recover::read_generation` calls `take::take`).
 - **A recovery reads the records in the order of the statement.** `read_generation` (`crates/cordelia-api/src/recover.rs`) sorts what the relays handed by the place of the signer in the statement, then by key, slot and revision, and gives it to the same functions over a database in memory. So the bound of 256 drops first the records of the device listed first.
 - **A recovery shows 256 rows.** `read_generation` puts every device of the statement first, then the keys added since that count, then the records that do not count: those that fail only for the 64 (`only_for_room`) before the others, each group in order of key. `rows.split_off(RECOVERY_MAX_DEVICES_SHOWN)` cuts the rest.
@@ -61,13 +61,13 @@ Each is one sentence that a test can hold. Section 9 names the tests. Security p
 
 A reader keeps the records that do not count in one order, and drops from its end until 256 are left. The order is a function of the records it holds and of who counts. It does not use the order in which they were seen.
 
-1. **Records that let a key add** (`Counting::lets_add`), as today. They are never dropped. There are at most 63: one for each key that counts by a record.
+1. **Records that let a key add** (`Counting::lets_add`). They are never dropped. There are at most 63: one for each key that counts by a record. Where several devices of the statement signed a record for that key, the one kept here is the oldest by the time it says (`Addition::at`), and then by the record's bytes; the others are in the fourth group. So which one is kept does not turn on when a reader saw them.
 2. **Records whose key the 64 kept out and whose adder may add.** They are dealt by key to their adders in turn: each adder's first key before any adder's second, each adder's second before any adder's third, and so on.
    - An adder's keys are in the order of the time its first record for each says it was made (`Addition::at`), the oldest first, and then by key. That is the adder's word, and it orders only that adder's keys.
    - An adder has one place for each key. Where it signed two records for one key (`cordelia add` run twice), the oldest by its time, and then by the record's bytes, takes the place, and the other is in the fourth group.
    - Among the keys of one turn, the devices of the statement come first, in its order, and then the other adders by key.
 3. **Records whose adder counts and may not add yet** (`NotCounted::MayNotAdd`): the adder was added by a key added since, not by a device of the statement. Dealt to their adders in turn, in the same way. Such a record comes to count where a record by a device of the statement is kept for its adder, so it is kept before the rest.
-4. **Every other record that does not count:** a record of a removed key (`NotCounted::Removed`), a record of a key that counts already that lets nothing add (`NotCounted::CountsAlready`), and an adder's second record for a key it has a place for. By the time each says, and then by key, adder and the record's bytes.
+4. **Every other record that does not count:** a record of a removed key (`NotCounted::Removed`), a record of a key that counts already that is not the one of the first group (`NotCounted::CountsAlready`), and an adder's second record for a key it has a place for. By the time each says, and then by key, adder and the record's bytes.
 
 **What it gives.** At most 63 records are of the first kind, and at most 64 adders may add. So at least 193 places are left for the second kind, and each adder that may add keeps at least its first three keys that the 64 kept out: `KEPT_OUT_PER_ADDER`, 3. That holds whatever any other key signs, and however many adders sign, **among the records that the relays hold.** A record that no relay holds reaches no reader (section 7).
 
@@ -83,7 +83,7 @@ A tablet that the 64 kept out does not count. A phone added from that tablet is 
 
 **It is not the case of `NotCounted::MayNotAdd`.** That is a record whose adder counts, but was itself added by a key added since. Such a record is kept, in the third group of 2.2, and has a row where room is left.
 
-**The row of a key that the 64 kept out says it:** a device that it added is not shown, since a key that does not count adds nothing. So a person whose tablet is asked about learns that a phone added from it, if any, is in no row. What the phone wrote is not brought back. If the person still has the phone, they add it again by hand.
+**The row of a key that the 64 kept out says it, where that key signed a record:** a device that it added is not shown, since a key that does not count adds nothing. The door takes nothing that key signed, so `read_generation` looks for it in what the relays handed, outside the door, as `names_before` reads names there: an entry of the personal channel under an `added/` name, signed by that key, that opens with the channel's secret. So a person whose tablet is asked about learns that a phone added from it is in no row. What the phone wrote is not brought back. If the person still has the phone, they add it again by hand.
 
 **It is not asked about.** What lets a key that does not count be asked about is that an adder that counts vouched for it. An adder that never counted vouches for nothing. Were such keys read, any chain of records would be read, and each answer of "gone" would take one of the phrase's 256 removals.
 
@@ -108,6 +108,8 @@ entries in the personal channel of that change.
   tells two apart.
   A device that it added is not shown here: a device that does not count adds nothing.
 ```
+
+The last line is said only where the key signed a record of an addition (2.3).
 
 What `no_row_says` says before the first question gains one sentence after its first:
 
@@ -149,7 +151,7 @@ The other lines of a recovery, of `cordelia devices` and of the prompt of the ne
 - **`read_left` says where a channel ends.** A page that holds nothing, or that leaves the place where it was, is the channel's end: the read is whole. A page of which nothing is an entry of the channel, though the relay handed something, is not: the read is in part. So is a read that reaches its time.
 - **A device takes from one relay about 2 MiB a minute.** `room_to_take` holds a read to `PUSH_BYTES_PER_PEER_PER_MINUTE`, counted with `ENTRY_OVERHEAD_BYTES` for each entry, and a relay sizes a page to leave `SHOW_ANSWER_ROOM_BYTES` for the answer to a show. A channel may hold `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 16 MiB, counted the same way. So one read reaches about 4 MiB, and a channel at its cap takes about 8¼ minutes.
 - **The personal channel read in part.** The command goes on with what it read, and `WasRead::lines` says so before its yes. It refuses only where nothing is known at any relay (`personal_not_read_says`).
-- **Step 1, the phrase's own channel.** It holds one entry, the change entry of 32 KB, which only the phrase writes (the record of 2026-10-04, section 2.2). So one read takes it whole at a relay that hands anything. It is read by the same `read_channel`. Where a change is found, the command goes on from the one with the highest number (`recover::found`), and a relay that handed none of it is said only where none was found (`none_found_says`).
+- **Step 1, the phrase's own channel.** It holds one entry, the change entry of 32 KB, which only the phrase writes (the record of 2026-10-04, section 2.2). So one read takes it whole at a relay that hands anything. It is read by the same `read_channel`. As it reads, the command says each relay that it could not read to its end, but not one that holds none of it (`recover_cmd::read_channel`, `not_read_to_its_end`). Where a change is found, the command goes on from the one with the highest number (`recover::found`). It says nothing of those relays again before its yes, and `none_found_says` names them only where no change was found.
 - **The tests.** A recovery that read its personal channel in part and went on to its yes is tested in process only (`recover_cmd`, `test_a_recovery_goes_on_with_what_it_could_read_of_the_personal_channel`). The real-process test (`recover_e2e.rs`, `a_recovery_says_at_which_relay_the_personal_channel_was_not_read`) has a second relay that was not reached, and a first that handed the channel whole.
 
 ### 3.2 The rule: read on
@@ -159,11 +161,11 @@ The other lines of a recovery, of `cordelia devices` and of the prompt of the ne
 1. The first round is the read of today: from the start, for `CARRY_READ_MAX_SECS` at most.
 2. The node says, of each relay that it read in part, the place it reached there: the mark of the relay's holding and the next place, as a pull keeps them (`at_relays.mark`, `at_relays.place`).
 3. The command asks again, of those relays only, from those places. It makes its proofs again where a connection changed, as today. A relay that answers under another mark than the place was asked under has dropped and taken the channel again since: it is read from the start there, and what was read before is kept.
-4. It stops at a relay that has handed the channel to its end or holds none of it, and everywhere at `RECOVERY_READ_ON_MAX_SECS` (615 seconds) from the first round. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. A relay that is not reached in a round stays as it was.
+4. It stops at a relay that has handed the channel to its end or holds none of it, and everywhere at `RECOVERY_READ_ON_MAX_SECS` (615 seconds) from the first round. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. **A relay that is not reached in a round is not asked again:** it stays as it was, and a relay that is down does not hold the read for 615 seconds. A relay that handed part of the channel and then answers that it holds none of it is read in part.
 
 The personal channels of the generations before, which are read for names, are read once each, as today (section 11).
 
-**The phrase's own channel (step 1) is read in one round, as today.** It holds one entry, so a relay that hands anything of it hands it whole. A relay that handed none of it in that round is said before the yes, by relay, whether or not a change was found elsewhere: the change recovered from is the latest that the relays which answered held.
+**The phrase's own channel (step 1) is read in one round, as today.** It holds one entry, so a relay that hands anything of it hands it whole. A relay that holds none of it says so, and is not said. A relay that could not be read to its end (it was reached, and its read ended before the entry was handed) is said as today while the command reads, and again before the yes, whether or not a change was found elsewhere: it may hold a later change than the one recovered from.
 
 Through the door the node still stores nothing of what it pulls and pushes nothing (the record of 2026-10-04, section 4.6). It keeps no place of its own either: the command is handed the place, and asks from it.
 
@@ -184,6 +186,8 @@ nothing is made.
   relay-one: read to its end, 9.3 MiB.
 ```
 
+The lines are on standard output, as the other lines of a recovery are. A size is counted as a relay counts it against its cap: each entry's content and `ENTRY_OVERHEAD_BYTES`. So 9.3 MiB is of the 16 MiB a relay may hold.
+
 Where a relay is still read in part at the end, the line of `WasRead::lines` for a channel read to its end at no relay ends so, in place of what it says of a device that filled the channel:
 
 ```
@@ -191,11 +195,11 @@ It was read for 10 minutes, which is what a channel at its largest takes: a rela
 it more slowly than that, or stops, leaves it in part.
 ```
 
-Step 1, after the change to recover from is chosen, and again before the yes, where a relay that was reached handed none of the phrase's own channel:
+Step 1, before the yes, where the phrase's own channel could not be read to its end at a relay:
 
 ```
-The recovery phrase's own channel was not handed by relay-two: it may hold a later change.
-This recovery is made from change 3, the latest that the relays which answered held. Only the
+The recovery phrase's own channel could not be read to its end at relay-two: it may hold a
+later change. This recovery is made from change 3, the latest in what was read. Only the
 recovery phrase writes in that channel.
 ```
 
@@ -237,15 +241,23 @@ Only the command of a recovery and the node it talks to. The door's read gains a
 
 The check protects one thing: **a version of a carried name that is nowhere else in the generation applied.** On a machine that has just recovered, that is the only copy outside the generation that was left. So the check asks the relays, and not the device's notes of what it sent.
 
-1. **Before a carried name is let go, the device reads the name's channel at each relay it is set up with.** It is a pull of the device's own channel, under leave, as a pass makes it (the record of 2026-10-04, section 4.6), from the start and then on from the place reached, round after round as a recovery reads (3.2). It stops at a relay that has handed the channel to its end or holds none of it; everywhere once each slot's current version in the store is held at one relay; and everywhere at `RECOVERY_READ_ON_MAX_SECS` from the first round. It takes what it is handed as any pull does, and notes besides what each relay handed in each slot.
-2. **The read runs outside the database's lock.** The node keeps the read in memory under an ID, with the place reached at each relay, and the command asks it to read on, round by round, under that ID. The let-go itself takes the lock.
-3. **The versions asked about are each slot's current version in the name's channel when the read ends,** as the device reads it with who counts: every version that the device would show a folder.
-4. **A version is held where one relay handed, in that slot, in that read:**
+1. **Before a carried name is let go, the device reads the name's channel at each relay it is set up with.** It is a pull of the device's own channel, under leave, as a pass makes it (the record of 2026-10-04, section 4.6), from the start and then on from the place reached, round after round as a recovery reads (3.2). It stops at a relay that has handed the channel to its end or holds none of it; everywhere once each entry asked about is held at one relay; and everywhere at `RECOVERY_READ_ON_MAX_SECS` from the first round.
+2. **What it pulls through, and what it keeps.** The carry door refuses a device's own channel (`LeftRefused::OwnChannel`), so the read is a pull of pages under leave, taken through `at_relays::take_page` and the one door, as a pass takes them. It differs from a pass in three things:
+   - **Its places are its own,** in memory, under the read's ID: it starts at `(NO_MARK, 0)` and never writes the stored place (`keep_place`). The pass's place at each relay is left as it was.
+   - **It marks nothing as sent.** What it is handed is stored as any entry is, but `at_relays.sent_to` does not move for it.
+   - **It notes what each relay handed in each slot,** for the check.
+
+   It asks and takes within the same budget as the pass at that relay, and not beside it: what the device takes from one relay in a minute (`room_to_take`, `PUSH_BYTES_PER_PEER_PER_MINUTE`), and the requests it makes there on its own channels (`OWN_ENTRY_REQUESTS_PER_MINUTE`). Where the minute is used, it waits, as a pass does.
+3. **The read runs outside the database's lock.** The node keeps the read in memory under an ID, with its places, and the command asks it to read on, round by round, under that ID. The let-go itself takes the lock.
+4. **The entries asked about are every entry of the name's channel that this device signed, as the store holds them when the read ends.** A slot keeps one entry for each author, so this is at most one for each slot: the device's current version there, one that lost a tie (`version::Slot::lost`), or one that another device wrote over. What a carry or a recovery brought is among them: a carried entry is this device's own (`person::carried_entry`). An entry that another key signed came here from a relay (4.5).
+5. **An entry is held where one relay handed, in its slot, in that read:**
    - an entry that is the same version (the same text or delete at the same revision: the record of 2026-10-04, section 2.3) signed by a key that counts; or
-   - an entry at a higher revision signed by a key that counts: what the slot shows has moved on, and the version would not be the current one anywhere.
-5. **One relay is enough.** Relays that work together pass entries on, and a recovery is set up with relays of the person's choosing.
-6. **Anything else is held by no relay:** a relay that was not reached; one that was read in part, for what it did not hand; one that refused the entry as not checking, holds another, dropped the channel, or had no room; and an entry signed by a key that does not count, which no reader takes.
-7. **Every let-go is bound to its read.** The node lets go only where its store has taken nothing of the name's channel since the read ended (`at_relays::last_taken` of the channel is what it was then). Otherwise it refuses, and the command says to run it again. So a version that a pass or a `sync carry` brought in after the read is never let go unasked.
+   - entries that, read as a slot is read (`version::read`, with who counts and under the statement applied), give the slot a current version at a higher revision. An entry that does not open, is over its bound, or is in a band above the statement is no version there, and moves nothing on.
+
+   So an entry of this device's that lost a tie is held only where a relay handed it, or the same version, or a higher one: the winner of the tie does not hold it.
+6. **One relay is enough.** Relays that work together pass entries on, and a recovery is set up with relays of the person's choosing.
+7. **Anything else is held by no relay:** a relay that was not reached; one that was read in part, for what it did not hand; one that refused the entry as not checking, holds another, dropped the channel, or had no room; and an entry signed by a key that does not count, which no reader takes.
+8. **Every let-go is bound to its read.** The node lets go only where its store has taken nothing of the name's channel since the read ended (`at_relays::last_taken` of the channel is what it was then). Otherwise it refuses, and the command says to run it again. So an entry that a pass or a `sync carry` brought in after the read is never let go unasked.
 
 So each of the gaps of 4.1 closes by the same rule. A relay that the device is no longer set up with is not read. What was refused, held in another form that is not the same version, dropped, or refused for room, is not handed.
 
@@ -258,9 +270,11 @@ So each of the gaps of 4.1 closes by the same rule. A relay that the device is n
 - Where no folder is mapped, it is in `person.names_carried`, as today.
 - Where a folder is mapped, it is in a new key of `node_meta`, `person.names_brought_in`, a list of names as the first is.
 
-**The rule is where a name is held for a carry:** wherever a carry by command or a recovery's look holds a name under which it brings versions, and a folder is mapped to it, the name is added to `person.names_brought_in` in the same transaction. Today every such holding goes through `names::hold_for_a_carry`, so that is where it is done.
+**The mark is set where a version is brought in.** Where `carry::bring` returns `Brought::Carried` under a name that a folder is mapped to, the caller adds the name to `person.names_brought_in`, in the transaction of the bring. Every carry brings through `carry::bring`: a carry by command (`carrying::carry_name` for `cordelia sync carry`, `carrying::take_from` for the carry `--from`, and `carrying::take_handed` for what a command hands under the phrase's word) and the look of a recovery (`recover::the_look`). Holding a name sets no mark: `names::hold_for_a_carry` is called before anything is brought, and not at all for a name that a folder already holds (`carrying::holds`).
 
-**A folder's unmapping never lets go of a carried name.** Where the folder was the name's last, the name moves to `person.names_carried`, and is held as it is held today when a carry brought it with no folder. `cordelia sync unmap <name>` then lets it go by the check of 4.2. A name leaves `person.names_brought_in` when the device stops it, and both lists go when the device leaves its phrase, as the first does today.
+**The carry that `cordelia sync map` makes is not a carry by command.** It brings, before the folder's first cycle, versions of the folder's own name into the slots that hold nothing (`carry_name` with `only_where_empty`, from `sync::map`). The name is the folder's from the start, and the folder publishes over what it brought. It sets no mark, and the folder's unmapping stops the name as it stops any folder's name.
+
+**A folder's unmapping never lets go of a carried name.** Where the folder was the name's last, the name is added to `person.names_carried`, and is held as it is held today when a carry brought it with no folder. It stays in `person.names_brought_in`, which then says that a folder was mapped to it. `cordelia sync unmap <name>` then lets it go by the check of 4.2. A name leaves `person.names_brought_in` when the device stops it, and both lists go when the device leaves its phrase, as the first does today.
 
 **A name brought in under a folder on alpha.11 is not in the list.** Nothing fills `person.names_brought_in` for it at the upgrade. Unmapping that folder still stops the name, as on alpha.11. The relays still hold what was carried, in the channels it was carried from.
 
@@ -270,6 +284,7 @@ A device that has stopped (it was removed, is in no list, could not open a chang
 
 - **`cordelia sync unmap <name>` there lets a carried name go only after the typed word of section 5,** where the device's own notes say that it holds a version of the name that it signed and sent to no relay. Where they say none, it lets the name go at once, as today.
 - **The node keeps the count it took from its notes under an ID,** as it keeps a read (4.2), for `LET_GO_READ_STANDS_SECS`. A `discard` there is bound to that ID and that number, and to a store that has taken nothing of the channel since, as anywhere.
+- **Property 5 is of a device that reads the relays.** On a device that has stopped, the notes decide: where they are wrong (a relay dropped the channel, or the entry went to a relay the device is no longer set up with), the name is let go at once, with no word. Property 8 is what holds there.
 - What it loses matters for one case: a device in no list, or one that could not open a change, can be added again, and then carries what it holds.
 - **The notes count only what the device signed** (4.5). They are a device's own word, and the command says that it could not check them.
 
@@ -289,7 +304,7 @@ held each of its 12 versions when it was read just now, so nothing is lost by it
 devices keep what they hold of it.
 ```
 
-Where the read takes more than one round, a line is said after each, as in 3.3: "Reading lab at relay-one: 4.0 MiB so far."
+Where the read takes more than one round, a line is said after each on standard output, as in 3.3: "Reading lab at relay-one: 4.0 MiB so far."
 
 `cordelia sync unmap lab`, where a version is held by no relay, with no terminal. The node's refusal, in place of `not_let_go_says`, on standard error, with status 1:
 
@@ -303,6 +318,8 @@ now, with them, run `cordelia sync unmap lab` at a terminal.
 ```
 
 Where the store took something of the channel since the read, on standard error, with status 1: "lab is not let go: this device took something of it while it was read. Run `cordelia sync unmap lab` again."
+
+Where the node no longer knows the read's ID (it was started again during the read, or before the word), on standard error, with status 1: "lab is still held: the node was started again since lab was read. Run `cordelia sync unmap lab` again."
 
 At a terminal, the same lines, and then the prompt of section 5.
 
@@ -349,10 +366,11 @@ Short of beginning again (`cordelia init --new-key`, or `cordelia phrase`), a ca
 
 - **Who may give it.** The rules of a yes in the record of 2026-10-04 (section 5): it is asked by the command, at a terminal, and refused where the command's input is not a terminal. It stops a command run by mistake, or by a script that has no terminal. It does not stop a program that runs as the person (section 7).
 - **It asks for no phrase.** Nothing comes in by it, and nothing is signed. It lets go of what this device holds, which a program that runs as the person could delete from the database anyway.
-- **What is let go is what was shown.** The node keeps the result of the read in memory, by an ID, for `LET_GO_READ_STANDS_SECS` (600 seconds) from the end of the read. The command sends that ID with the word and the number of versions it showed. The node lets go only where the read stands, the number is the one it found, and its store has taken nothing of the name's channel since the read ended (4.2, item 7). Otherwise it refuses, and the command says to run it again.
+- **What is let go is what was shown.** The node keeps the result of the read in memory, by an ID, for `LET_GO_READ_STANDS_SECS` (600 seconds) from the end of the read, measured on the node's monotonic clock (an `Instant`), so that a step of the wall clock neither widens nor shortens it. The command sends that ID with the word and the number of versions it showed. The node lets go only where the read stands, the number is the one it found, and its store has taken nothing of the name's channel since the read ended (4.2, item 8). Otherwise it refuses, and the command says to run it again.
 - **Where the versions may still be.** The prompt says it, from what the device knows, and promises nothing it does not know:
   - **What a carry brought** is still in the channels it was carried from, at the relays, for as long as the device holds the secret of each generation that it left (section 3 of the record of 2026-10-04), and the command that carried it brings it in again: `cordelia sync carry <name>` for what keys that count signed, and `--from <device>`, with the phrase, for what a removed key signed. The prompt says how many more days the device holds the latest of those secrets.
-  - **What was written on this device since,** by a folder mapped to the name, or over what was carried, is on this device alone, and goes for good. The store keeps no mark of which entry a carry made, so the prompt does not say how many of the versions are of each kind. It says that any written here go for good.
+  - **What was written on this device since,** by a folder mapped to the name, or over what was carried, is on this device alone in the channel, and goes from the channel for good. The store keeps no mark of which entry a carry made, so the prompt does not say how many of the versions are of each kind. It says that any written here go from the channel for good.
+  - **A folder that was mapped to the name keeps its files.** Unmapping a folder forgets only what the folder had agreed with the channel (`sync::forget_what_is_not_mapped`); it deletes no file. So the words a folder wrote may still be in it, as files, and the prompt says so where a folder was mapped to the name (it is in `person.names_brought_in`, or was when its last folder was unmapped).
   - Where the device holds no secret of a generation it left, the prompt says that the versions are on this device alone.
 
 On a device that has stopped (4.4) the same word is asked, and the prompt says that the device could not read the relays.
@@ -375,6 +393,8 @@ wrote. A version written on this device since it was carried is on this device a
 goes for good: this device does not keep which of the 3 those are.
   Type `discard` to let lab go with them. Anything else keeps it:
 ```
+
+Where a folder was mapped to lab, a sentence follows the second: "A folder that was mapped to lab keeps its files: what it wrote may still be there."
 
 On `discard`, on standard output, with status 0:
 
@@ -416,7 +436,7 @@ Each device, for itself. `POST /api/v1/sync/unmap` gains the ID of a read, the w
 
 **Constants,** in `crates/cordelia-core/src/protocol.rs`:
 
-- `LET_GO_READ_STANDS_SECS: i64 = CARRY_WORD_SECS` (600). It is an `i64`, as `CARRY_WORD_SECS` is: both are compared with a time in seconds. For `parameter-rationale.md` §12.9: "How long the read that `cordelia sync unmap` shows, or the count that a device that has stopped took from its notes, stands for the `discard` that follows it (decision 2026-10-17 §5). The person reads the lines and types the word in that time. A word typed later lets go of nothing, and the command is run again. Derived: as long as a word of the phrase for a carry stands, the other act at a prompt that follows what the node read."
+- `LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64` (600), with `CARRY_WORD_SECS > 0` checked at compile time. It is a `u64`: it bounds a `Duration` on a monotonic clock, where `CARRY_WORD_SECS`, an `i64`, is compared with a time in seconds of the wall clock. For `parameter-rationale.md` §12.9: "How long the read that `cordelia sync unmap` shows, or the count that a device that has stopped took from its notes, stands for the `discard` that follows it (decision 2026-10-17 §5). The person reads the lines and types the word in that time. A word typed later lets go of nothing, and the command is run again. Derived: as long as a word of the phrase for a carry stands, the other act at a prompt that follows what the node read."
 
 ## 6. Alpha.11 and this version together, and what a relay sees
 
@@ -442,7 +462,7 @@ Each device, for itself. `POST /api/v1/sync/unmap` gains the ID of a read, the w
 - It can sign any number of records. Under the order of 2.2 those records take places only from its own share and from the shares of keys it added. Among the records the relays hold, each other adder that may add keeps its first three keys that the 64 kept out, among what a reader keeps and among a recovery's rows (property 1).
 - It can add keys that count until 64 do, and each key it adds so may add in its turn. That makes at most 64 adders, and the floor of three holds with 64 adders.
 - It can give a key a label. Its label is shown beside it, among every other adder's label for that key (property 3). It cannot change the words of a key's fingerprint.
-- **It can fill the personal channel at a relay to its cap,** `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 16 MiB. A record is counted at 1,280 bytes at least (`MIN_ENTRY_CONTENT_BYTES` and `ENTRY_OVERHEAD_BYTES`), so some 13,000 records do it. The relay then refuses every later entry of that channel, whoever signs it (`relay::taken`, `Refused::ChannelFull`): a record, a word that a device syncs a name, a word that it has applied a statement.
+- **It can fill the personal channel at a relay to its cap,** `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 16 MiB. A record and its name (`added/` and a key of 70 characters) take more than `MIN_ENTRY_CONTENT_BYTES`, so each is a content of 512 bytes at least, counted at 1,536 with `ENTRY_OVERHEAD_BYTES`: some 11,000 records at most do it. The relay then refuses every later entry of that channel, whoever signs it (`relay::taken`, `Refused::ChannelFull`): a record, a word that a device syncs a name, a word that it has applied a statement.
   - **What does not hold then.** A record that comes after the channel is full reaches no reader at that relay, and no recovery that reads there. The floor of three holds only among the records the relays hold. An honest record that the 64 keep out is always late: a device does not sign one where it has seen the 64 count (`adding::add_device` refuses `NoRoom`), so it signs one only where it had not yet seen them. Nothing in this record keeps a place for it at the relay.
   - **What the person sees.** Each device whose entry the relay refused, and that syncs a folder, shows the status line "memory: a relay has no room" for as long as the refusal stands (`indicator`, `NO_ROOM_STANDS_SECS`). On each such device `cordelia devices` names the relay and says that it is full (`look::relays`). It also shows the records that do not count, by the device that signed them: hundreds from one device. A name that a device maps after that is not listed there, and a device's word that it applied a statement is not seen.
   - **What the person can do:** remove that device (`cordelia remove-device`, with the phrase). The next statement makes a new personal channel, which the removed device cannot write in. Records are not carried to it (the record of 2026-10-04, section 6): a device that was refused is added again by hand after the statement.
@@ -458,11 +478,13 @@ Each device, for itself. `POST /api/v1/sync/unmap` gains the ID of a read, the w
 - It can say that it holds a version that it does not, only by handing that version, which it cannot forge: an entry is signed by the channel's key and its author's, and only an author that counts makes it held. A relay that handed a version can drop it a moment later. Nothing defends against that, as nothing defends against a relay dropping anything.
 - It cannot change which records a reader keeps: the order goes by what the records say and who counts, and not by when they arrived. It can keep a record from every reader that reads only there, by not handing it.
 
-**A key that holds the secret and does not count** (one that the 64 kept out, that was handed the secret): it can write entries in the name's channel at a relay. It cannot make a version held for the check of 4.2: only an entry signed by a key that counts does (property 6).
+**A key that holds the secret and does not count** (one that the 64 kept out, that was handed the secret): it can write entries in the name's channel at a relay. It cannot make an entry held for the check of 4.2: only an entry signed by a key that counts does (property 6).
+
+**A device that counts, in someone else's hands, and the check of 4.2:** it can push an entry into a slot of a carried name at a relay. It makes an entry of this device's held only where that entry is a version, read as a slot is read: one that does not open, is over its bound, or is in a band above the statement moves nothing on. A real version above it is shown on every device, as any write over another's is.
 
 **A person who types yes at the wrong prompt:**
 
-- At the prompt of section 5, a typed `discard` drops the versions that no relay holds. A `y`, a `yes` or Enter keeps the name. The prompt says how many versions go, where what a carry brought may still be, and that what was written here goes for good.
+- At the prompt of section 5, a typed `discard` drops the entries that no relay holds. A `y`, a `yes` or Enter keeps the name. The prompt says how many go, where what a carry brought may still be, that what was written here goes from the channel for good, and that a folder that was mapped keeps its files.
 - At a recovery, an answer typed to a row whose labels differ is an answer about the key that the words name, under every label shown.
 - A program that runs as the person can type `discard` (the threat model's T17). What is left is that the carried versions are still in the channels they were carried from, for as long as the device holds those secrets, and the command that carried them brings them in again. What was written here since is lost.
 
@@ -490,6 +512,7 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 **Property 2 (the order of keeping is not the order of seeing):**
 
 - `person.rs`, `test_the_records_kept_do_not_turn_on_the_order_they_were_seen`. Two readers are first given, in one order, the records that make 64 count. Three hundred more records of four adders are then given to them in two orders. Both keep the same 256. With the oldest-first rule they keep two sets.
+- `person.rs`, `test_the_record_that_lets_a_key_add_does_not_turn_on_the_order_seen`. A key counts by a record of a device added since; two devices of the statement each sign a record for it. Two readers see the two in two orders, and then a flood. Both keep the same one in the first group, the older by its time.
 - `person.rs`, `test_who_counts_does_not_turn_on_which_records_beyond_the_bound_were_kept`. One reader keeps by the order of 2.2 and one by the oldest first; a record by a device of the statement then lets a key add, and each reads its channels again. Both count the same keys.
 
 **Property 3 (each label beside its adder):**
@@ -499,22 +522,26 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 
 **A key that a key the 64 kept out added (2.3):**
 
-- `recover.rs`, `test_a_key_added_by_a_key_the_64_kept_out_has_no_row`. A tablet that the 64 kept out adds a phone. The phone has no row, `no_row` does not count it, and `gone` never lists it. The tablet's row is asked about.
-- `recover_cmd.rs`, `test_a_row_kept_out_by_the_64_says_that_what_it_added_is_not_shown`: the last line of the row of 2.5.
+- `recover.rs`, `test_a_key_added_by_a_key_the_64_kept_out_has_no_row`. A tablet that the 64 kept out adds a phone. The phone has no row, `no_row` does not count it, and `gone` never lists it. The tablet's row is asked about, and says that it signed a record.
+- `recover_cmd.rs`, `test_a_row_kept_out_by_the_64_says_that_what_it_added_is_not_shown`: the last line of the row of 2.5, said where the key signed a record, and not where it signed none.
 
 **Properties 5, 6 and 9 (held, and the discard):**
 
 - `crates/cordelia-api/src/sync.rs`, `test_a_version_is_held_only_where_a_relay_read_after_the_ask_handed_it`, on the harness of several devices (`several.rs`). Each of these leaves the name held: a relay that the device is no longer set up with; a relay that refused the entry as not checking; one that holds another entry of the device's at that revision with another text; one that dropped the channel after the push; one that had no room; one read in part; the same version signed by a key that holds the secret and does not count. Each of these lets it go: the same version signed by another key that counts; an entry at a higher revision by a key that counts. Taking the read out, and counting by the notes, lets the first four go.
+- `sync.rs`, `test_an_entry_that_lost_a_tie_is_held_only_where_it_was_handed`. The device's own entry loses a tie to another device's at the same revision; the read hands only the winner. The name stays held. Asking only of each slot's current version lets it go.
+- `sync.rs`, `test_an_entry_that_is_no_version_moves_nothing_on`. A relay hands, above the device's entry, an entry by a key that counts in a band above the statement, and one that does not open. The name stays held.
+- `sync.rs`, `test_the_read_before_a_let_go_keeps_its_own_places`: after the read, the stored place at each relay and `at_relays.sent_to` are as they were.
 - `sync.rs`, `test_a_let_go_reads_on_until_each_version_is_found`. A read that hands a third of the channel at each round finds a version in the third round, and lets the name go. Taking the reading on out leaves it held.
-- `sync.rs`, `test_a_let_go_lets_go_only_of_what_was_read`. A read is made, and then the store takes an entry of the name: an ordinary let-go is refused, and so is a discard. A read older than `LET_GO_READ_STANDS_SECS` is refused. A number that is not the one found is refused.
+- `sync.rs`, `test_a_let_go_lets_go_only_of_what_was_read`. A read is made, and then the store takes an entry of the name: an ordinary let-go is refused, and so is a discard. A read older than `LET_GO_READ_STANDS_SECS` on the monotonic clock is refused, and a step of the wall clock changes nothing. A number that is not the one found is refused. An ID the node does not know is refused.
 - `sync.rs`, `test_the_read_before_a_let_go_does_not_hold_the_lock`: another request is answered while the read runs.
 - Real processes, `crates/cordelia-node/tests/carry_e2e.rs`, `a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought`. A device carries a name through a relay whose cap leaves no room for it. `cordelia sync unmap <name>` with no terminal is refused with the lines of 4.6, naming the relay, on standard error, with status 1. The relay is given room: the device sends what waits, and the name is let go.
 - Real processes, `carry_e2e.rs`, `a_relay_that_dropped_a_carried_channel_keeps_the_name_held`. The relay is sent everything, and is then started again with the channel gone from its store. Until the device has sent it again, the name is not let go.
-- Real processes, `carry_e2e.rs`, `a_carried_name_that_no_relay_takes_is_let_go_on_a_typed_discard`. Under a pseudo-terminal: `yes` keeps the name, Enter keeps it, `discard` lets it go; the prompt says the number of versions, the days left, and that what was written here goes for good. With no terminal the word is never asked.
+- Real processes, `carry_e2e.rs`, `a_carried_name_that_no_relay_takes_is_let_go_on_a_typed_discard`. Under a pseudo-terminal: `yes` keeps the name, Enter keeps it, `discard` lets it go; the prompt says the number of entries, the days left, and that what was written here goes from the channel for good. With no terminal the word is never asked.
 
 **Property 7 (a folder's unmapping keeps a carried name):**
 
-- `sync.rs`, `test_a_name_a_carry_brought_versions_into_under_a_folder_is_held_after_the_folders_unmapping`. A folder is mapped to a name, a carry brings a version in, and the folder is unmapped: the name is held, and is in `person.names_carried`. The same where the look of a recovery brings it. Without the list of 4.3, the name is stopped.
+- `sync.rs`, `test_a_name_a_carry_brought_versions_into_under_a_folder_is_held_after_the_folders_unmapping`. A folder is mapped to a name, `cordelia sync carry` brings a version in through `carrying::carry_name`, and the folder is unmapped: the name is held, and is in `person.names_carried`. The same where the look of a recovery brings it. Without the list of 4.3, the name is stopped.
+- `sync.rs`, `test_only_a_version_brought_in_marks_a_name`: a look that brings nothing into a mapped name, and the carry that `cordelia sync map` makes, set no mark, and the folder's unmapping stops the name.
 
 **Property 8 (a device that has stopped):**
 
@@ -528,9 +555,10 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 - `crates/cordelia-api/src/carrying.rs`, `test_a_read_with_proofs_says_the_place_it_reached_at_each_relay`.
 - `recover_cmd.rs`, `test_a_recovery_reads_its_personal_channel_on_until_its_end`, with a read that hands a third of the channel at each round: the command reads three rounds and says "read to its end". Taking the rule out leaves it in part after one.
 - `recover_cmd.rs`, `test_a_recovery_stops_reading_on_at_the_bound`, and `test_a_page_that_leaves_the_place_ends_the_reading_as_read_to_its_end`.
-- `recover_cmd.rs`, `test_a_relay_that_handed_none_of_the_phrases_channel_is_said_before_the_yes`: the lines of 3.3 for step 1, after the choice and before the yes, where another relay held a change. Today nothing is said.
+- `recover_cmd.rs`, `test_a_phrase_channel_not_read_to_its_end_is_said_again_before_the_yes`: the lines of 3.3 for step 1 before the yes, where another relay held a change. A relay that holds none of it is not said. Today the relay is said only while the command reads.
+- `recover_cmd.rs`, `test_a_relay_not_reached_in_a_round_is_not_asked_again`, and that a relay that handed part and then holds none is read in part.
 - Real processes, `recover_e2e.rs`, `a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end`. Devices that count fill the personal channel with about 6 MiB of words, and the desktop's record of a phone is among the last of them. The recovery says that it is reading on, says "read to its end", and asks about the phone. Taking the rule out, the phone has no row. It takes about four minutes.
-- Real processes, `recover_e2e.rs`, `a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look`. One relay, which is stopped during the second round and started again before the yes. The command says what 3.3 says of a read in part, takes the yes, and the look ends and carries what was read. This is the real-process test that today's rule lacks.
+- Real processes, `recover_e2e.rs`, `a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look`. One relay, which is stopped during the second round, and is then not asked again: the reading ends within that round. The relay is started again before the yes. The command says what 3.3 says of a read in part, takes the yes, and the look ends and carries what was read. It takes about four minutes. This is the real-process test that today's rule lacks.
 - `protocol.rs`: `RECOVERY_READ_ON_MAX_SECS` is 615, from the values it is made of.
 
 **Property 12 (the count before a yes):**
@@ -556,13 +584,14 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 
 Each slice can be reviewed and merged alone. The smallest come first.
 
-1. **The count before a yes counts only this device's entries** (4.5). Storage. Property 12. It needs nothing before it.
-2. **The order of keeping** (2.2), in `keep_to_the_bound`, dealing keys and not records, with `KEPT_OUT_PER_ADDER` and its check at compile time. Properties 1 and 2, for a reader, in `person.rs` and `take.rs`. It needs nothing before it.
-3. **The rows of a recovery** (2.2 to 2.5): their order, each adder's label, and the line of a row that what it added is not shown (2.3). `read_generation`, `asked_for_room` and the command's lines. Properties 1 and 3, for a recovery. It needs slice 2 for its reader.
-4. **A read from a place** (3.2): the door, `read_left`, `read_with_proofs` and `POST /api/v1/carry/read`, taking and giving a place for each relay. Unit tests only. It needs nothing before it.
-5. **A recovery reads the personal channel on** (3.2, 3.3), with `RECOVERY_READ_ON_MAX_SECS`, and says before its yes a relay that handed none of the phrase's channel. Properties 10 and 11, with their real-process tests. It needs slice 4.
-6. **The read before a carried name is let go** (4.2): outside the lock, reading on, signed by a key that counts, and every let-go bound to its read; the list of 4.3; and the line after a folder's unmapping on a device that sends. Properties 6, 7 and 9 for an ordinary let-go. It needs slices 1 and 4.
-7. **The `discard`** (section 5), with `LET_GO_READ_STANDS_SECS`; a device that has stopped (4.4), with its own ID; the prompt; and the line after a folder's unmapping on a device that has stopped (4.6). Properties 5, 8 and 9, with the `carry_e2e` tests. It needs slice 6. **Slices 6 and 7 ship in one release:** slice 6 alone refuses more than today and gives no way out.
+1. **The count before a yes counts only this device's entries** (4.5), in `at_relays::sent_to_no_relay` and its callers. Property 12. It needs nothing before it.
+2. **The order of keeping** (2.2), in `keep_to_the_bound`: the first group chosen by the time a record says and then its bytes, keys dealt to their adders, and `KEPT_OUT_PER_ADDER` with its check at compile time. Properties 1 and 2, for a reader. It needs nothing before it.
+3. **The rows of a recovery** (2.2 to 2.5): their order, each adder's label, an adder that may be in someone else's hands among several, and the lines, with the line of a row that what it added is not shown where it signed a record (2.3). Properties 1 and 3, at a recovery. It needs slice 2.
+4. **A read from a place through the carry door** (3.2): `read_left`, `read_with_proofs` and `POST /api/v1/carry/read`, taking and giving a place for each relay. Unit tests only. It needs nothing before it.
+5. **A recovery reads the personal channel on** (3.2, 3.3), with `RECOVERY_READ_ON_MAX_SECS`, a relay not reached in a round not asked again, and the line of step 1 before the yes. Properties 10 and 11. It needs slice 4.
+6. **A pull of a device's own channel with places of its own** (4.2, item 2): through `take_page`, without `keep_place` and without moving what was sent, kept in memory under an ID, within the pass's budget at each relay, and outside the lock. Unit tests, among them that it does not hold the lock and leaves the stored places as they were. It needs nothing before it.
+7. **The read before a carried name is let go** (4.2: the entries this device signed, and held as a slot is read), every let-go bound to its read, **the list of 4.3** (set where a version is brought in), and the line after a folder's unmapping on a device that sends. Properties 6, 7 and 9, for an ordinary let-go. It needs slices 1 and 6.
+8. **The `discard`** (section 5), with `LET_GO_READ_STANDS_SECS` on the monotonic clock; a device that has stopped, with the count from its notes under an ID (4.4); the prompts; and the line after a folder's unmapping on a device that has stopped (4.6). Properties 5, 8 and 9, with the `carry_e2e` tests. It needs slice 7. **Slices 7 and 8 ship in one release:** slice 7 alone refuses more than today, and holds more names after their folder goes, with no way out.
 
 ## 11. What is put off, and why
 
@@ -583,19 +612,20 @@ Where I am least sure, said plainly.
 - **The floor holds only among what the relays hold.** A device that counts can fill the personal channel at a relay, and then no later record reaches a reader there (section 7). The person sees that the relay is full, and removes the device. Until then, a device added since may be unseen by every reader that reads at that relay.
 - **A key that a key the 64 kept out added (2.3)** has no row and is counted nowhere. A person whose real tablet was kept out learns only from the tablet's row that what it added is not shown. I think that is right: no device vouched for it.
 - **A read from a place (3.2).** A place means something only with its mark, and a sweep frees places that are not given again (the record of 2026-10-04, section 16). I rely on that for a read that resumes. A relay that drops the channel between two rounds and takes it again under the same mark would hand the start again as what follows; I believe a new holding has a new mark, and did not prove it.
-- **The read before a let-go (4.2) is under leave, and runs outside the lock.** It is a pull that a pass would make. I have not checked how it shares a relay's minute with the pass that is running. A name that another device writes to often can move while it is read, and the let-go is then refused and run again.
+- **The read before a let-go (4.2) is under leave, with places of its own, and runs outside the lock.** It shares the pass's budget at each relay, so a large read slows the pass there while it lasts. It stores what it is handed and marks none of it sent: the next push then offers it to the relay, which answers that it holds it. A name that another device writes to often can move while it is read, and the let-go is then refused and run again.
 - **A relay that holds the version for a moment.** "Held" is what a relay handed in that read. A relay that drops it afterwards loses it, and the device has let go. Nothing in this record defends against that, and nothing can short of keeping the version.
 - **What was written here (5.2).** The prompt cannot say how many of the versions held by no relay were written on this device since the carry. It says that any such go for good. A person may still read "still at the relays" as covering all of them.
-- **The ID of a read for a discard (5.2).** It is in memory. A node that restarts between the read and the word refuses the word, and the person runs the command again. I think that is right, and it is untested in this design.
+- **The ID of a read for a discard (5.2).** It is in memory, on the monotonic clock. A node that restarts between the read and the word refuses the word, says why, and the person runs the command again.
+- **Held as a slot is read (4.2, item 5).** The check reads each slot with what one relay handed, under the statement applied and with who counts. A relay that hands an entry of another device at a higher revision, which this device's own store would not take for a reason the read does not see, would count as moving the slot on. I believe `version::read` with who counts sees every such reason, and did not prove it.
 - **The bound of 615 seconds.** It assumes that a relay hands what it may in a minute. A relay that hands less leaves a channel near its cap in part, and the command goes on, as today.
 
 ## 13. Questions for the person
 
 1. **Is three enough?** `KEPT_OUT_PER_ADDER` follows from the bounds. Raising it means raising `MAX_NOT_COUNTED_RECORDS` and `RECOVERY_MAX_DEVICES_SHOWN`. **Recommendation:** keep three, and the bounds as they are. It counts keys, not records, and it holds only among the records the relays hold: it does nothing against a personal channel at its cap (section 7).
-2. **Should a key that a key the 64 kept out added be shown at a recovery (2.3)?** **Recommendation:** no, as this record has it: it has no row and is counted nowhere, an adder that never counted vouches for nothing, and asking would let any chain of records spend the phrase's removals. The row of the key that added it says that what it added is not shown.
-3. **Should the `discard` need the phrase (5.4)?** **Recommendation:** no. Nothing comes in by it. What a carry brought is still in the channels it was carried from, and the prompt says plainly that what was written here goes for good.
-4. **Should the check before a let-go need every relay, or one (4.2, item 5)?** **Recommendation:** one, where the entry is signed by a key that counts, and the read reads on to the channel's end.
-5. **Should slices 6 and 7 ship in one release (section 10)?** **Recommendation:** yes. Slice 6 alone refuses on a device that has stopped where today it lets go, with no way out but beginning again. The line for a device that has stopped goes with them.
+2. **Should a key that a key the 64 kept out added be shown at a recovery (2.3)?** **Recommendation:** no, as this record has it: it has no row and is counted nowhere, an adder that never counted vouches for nothing, and asking would let any chain of records spend the phrase's removals. The row of the key that added it says that what it added is not shown, where it signed a record.
+3. **Should the `discard` need the phrase (5.4)?** **Recommendation:** no. Nothing comes in by it. The check asks about every entry this device signed, one that lost a tie included. What a carry brought is still in the channels it was carried from; the prompt says plainly that what was written here goes from the channel for good, and that a folder that was mapped keeps its files.
+4. **Should the check before a let-go need every relay, or one (4.2, item 6)?** **Recommendation:** one, where what was handed is a version as a slot is read, signed by a key that counts, and the read reads on to the channel's end.
+5. **Should slices 7 and 8 ship in one release (section 10)?** **Recommendation:** yes. Slice 7 alone refuses more than today, and its list of 4.3 holds more names after their folder goes, with no way out but beginning again. The line for a device that has stopped goes with them.
 
 **Where the code differs from the brief this record was written from.** The code is right about today.
 
