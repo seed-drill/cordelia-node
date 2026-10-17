@@ -35,6 +35,8 @@ NOT_SHOWN = cmd("test_a_row_kept_out_by_the_64_says_that_what_it_added_is_not_sh
 BOUND_64 = cmd("test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out")
 NO_ROW_SAYS = cmd("test_what_is_said_of_the_keys_whose_record_was_read_and_that_have_no_row")
 PHONE = e2e("a_device_that_signs_hundreds_of_records_leaves_a_phone_its_row")
+AT_A_ROW = cmd("test_what_is_said_at_a_row_turns_on_the_answers_so_far")
+SHOWN_LABEL = cmd("test_a_key_kept_out_by_the_64_is_named_by_the_label_its_row_showed")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -48,7 +50,7 @@ MUTATIONS = [
     let mut by_key: Vec<&KeptAddition> = kept.iter().filter(|one| !one.counted).collect();
     by_key.sort_by_key(|one| one.key);
     for record in by_key {''',
-     [FIRST_THREE]),
+     [FIRST_THREE, PHONE]),
     ("O2 the rows of records that do not count from the end of the order of keeping", RECOVER,
      '''    for record in person::in_the_order_of_keeping(statement, &counting, &kept) {''',
      '''    for record in person::in_the_order_of_keeping(statement, &counting, &kept)
@@ -106,13 +108,27 @@ MUTATIONS = [
      [LABELS]),
 
     # The record of a key that the 64 kept out (§2.3).
-    ("S1 a delete under an added/ name counts as a record", RECOVER,
-     '''        .filter(|entry| no_room.contains_key(&entry.author) && !entry.delete)''',
-     '''        .filter(|entry| no_room.contains_key(&entry.author))''',
+    ("S1 any added/ entry that opens counts as a record, as before", RECOVER,
+     '''        let Value::Other(bytes) = &inside.value else {''',
+     '''        if inside.name.starts_with(PERSONAL_ADDED_PREFIX) {
+            return true;
+        }
+        let Value::Other(bytes) = &inside.value else {''',
      [NO_ROW]),
-    ("S2 any entry that opens counts as a record, whatever its name", RECOVER,
-     '''            opened.is_ok_and(|inside| inside.name.starts_with(PERSONAL_ADDED_PREFIX))''',
-     '''            opened.is_ok_and(|inside| !inside.name.is_empty())''',
+    ("S2 a record under any name counts, not only under an added/ name", RECOVER,
+     '''        inside.name.starts_with(PERSONAL_ADDED_PREFIX)
+            && record.addition.adder == entry.author''',
+     '''        !inside.name.is_empty()
+            && record.addition.adder == entry.author''',
+     [NO_ROW]),
+    ("S5 a record that another key signed counts for the key that put it there", RECOVER,
+     '''            && record.addition.adder == entry.author
+''',
+     '''''',
+     [NO_ROW]),
+    ("S6 a record whose signature does not hold counts", RECOVER,
+     '''            && record.verify().is_ok()''',
+     '''            && record.verify().is_ok() || record.addition.adder == entry.author''',
      [NO_ROW]),
     ("S3 every row of a key the 64 kept out says that it signed a record", RECOVER,
      '''        row.signed_a_record = signed_records.contains(&row.key);''',
@@ -125,21 +141,68 @@ MUTATIONS = [
 
     # What a person reads (§2.5).
     ("C1 the line of several adders for a key that one adder added", CMD,
-     '''        Some(_) if row.no_room.len() > 1 => {''',
-     '''        Some(_) if !row.no_room.is_empty() => {''',
+     '''        Some(_) if row.no_room.len() > 1 || hidden > 0 => {''',
+     '''        Some(_) if !row.no_room.is_empty() || hidden > 0 => {''',
      [BOUND_64]),
     ("C2 the line of one adder for a key that two added", CMD,
-     '''        Some(_) if row.no_room.len() > 1 => {''',
-     '''        Some(_) if row.no_room.len() > 2 => {''',
+     '''        Some(_) if row.no_room.len() > 1 || hidden > 0 => {''',
+     '''        Some(_) if row.no_room.len() > 2 || hidden > 0 => {''',
      [TWO_LABELS, BOUND_64]),
-    ("C3 an adder that may be in someone else's hands is shown", CMD,
-     '''                .partition(|(adder, ..)| in_other_hands(adder));''',
-     '''                .partition(|(adder, ..)| in_other_hands(adder) && false);''',
+    ("C3 an adder that may be in someone else's hands is shown", RECOVER,
+     '''        place.is_some_and(|place| in_other_hands(rows, answers, place))
+    };
+    let (hidden, shown)''',
+     '''        place.is_some_and(|place| in_other_hands(rows, answers, place) && false)
+    };
+    let (hidden, shown)''',
+     [TWO_LABELS, AT_A_ROW, SHOWN_LABEL]),
+    ("C13 an adder is hidden only by its own answer, not by its adder's (the chain)", RECOVER,
+     '''        place.is_some_and(|place| in_other_hands(rows, answers, place))
+    };
+    let (hidden, shown)''',
+     '''        place.is_some_and(|place| answers.get(place) == Some(&Answer::OtherHands))
+    };
+    let (hidden, shown)''',
      [TWO_LABELS]),
-    ("C4 the label that the row holds stands first, not the first adder's shown", CMD,
-     '''            label = shown.first().map_or("", |(_, _, label)| label.as_str());''',
-     '''            let _ = shown.first();''',
+    ("C14 one adder alone that may be in someone else's hands is shown with its label", CMD,
+     '''        Some(_) if row.no_room.len() > 1 || hidden > 0 => {''',
+     '''        Some(_) if row.no_room.len() > 1 => {''',
      [TWO_LABELS]),
+    ("C4 the label that the row holds stands first, not the first adder's shown", RECOVER,
+     '''    shown.first().map_or("", |(_, _, label)| label.as_str())''',
+     '''    let _ = shown;
+    &row.label''',
+     [TWO_LABELS, SHOWN_LABEL]),
+    ("C15 where every adder is hidden, the first adder's label stands", RECOVER,
+     '''    shown.first().map_or("", |(_, _, label)| label.as_str())''',
+     '''    shown.first().map_or(row.no_room[0].2.as_str(), |(_, _, label)| label.as_str())''',
+     [TWO_LABELS, SHOWN_LABEL]),
+    ("C16 the row shows the label that its record holds, not the label shown", CMD,
+     '''    let label = recover::label_shown(rows, answers, row);
+    let (shown, hidden)''',
+     '''    let label = row.label.as_str();
+    let (shown, hidden)''',
+     [TWO_LABELS]),
+    ("C17 before the yes, a key is named by the label its record holds", CMD,
+     '''            .map(|row| named(recover::label_shown(rows, answers, row), &row.key))''',
+     '''            .map(|row| named(&row.label, &row.key))''',
+     [SHOWN_LABEL]),
+    ("C18 the node is handed the label that a key's record holds", CMD,
+     '''        let label = recover::label_shown(rows, answers, row);
+        json!''',
+     '''        let label = &row.label;
+        json!''',
+     [SHOWN_LABEL]),
+    ("C19 a row is said with no answers, whatever was answered before it", CMD,
+     '''    let says = row_says(rows, answers, at, number);
+    if rows[at].key == *own {''',
+     '''    let says = row_says(rows, &[], at, number);
+    if rows[at].key == *own {''',
+     [AT_A_ROW]),
+    ("C20 a row asked about for the 64 alone is said with no answers", CMD,
+     '''        return AtARow::Asks(for_room_says(rows, answers, at, number, left));''',
+     '''        return AtARow::Asks(for_room_says(rows, &[], at, number, left));''',
+     [AT_A_ROW]),
     ("C5 no label beside its adder", CMD,
      '''                    format!("from {adder} at {} as {label:?}", time_of(*at))''',
      '''                    format!("from {adder} at {}", time_of(*at) + &label[..0])''',
