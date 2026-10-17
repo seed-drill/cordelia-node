@@ -2408,6 +2408,49 @@ mod tests {
         assert!(entries.is_empty());
         assert_eq!(read["relays"][0]["read"], "not held", "{read}");
         assert_eq!(read["reached"], json!([]));
+
+        // At the route, the places are handed as the node said them.
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer t"))
+            .to_http_request();
+        let proof = &made_for(&old)[0];
+        let body = web::Json(ReadRequest {
+            channel: hex::encode(channel),
+            proofs: vec![ProofFor {
+                relay: proof.relay.clone(),
+                session: hex::encode(proof.session),
+                proof: hex::encode(proof.proof),
+            }],
+            from: vec![PlaceFor {
+                relay: "relay".into(),
+                mark: hex::encode(RELAY_MARK),
+                place: 1,
+            }],
+        });
+        let state = web::Data::from(std::sync::Arc::clone(&node.state));
+        let answered = read_proved(req, state, body).await.unwrap();
+        let body = actix_web::body::to_bytes(answered.into_body()).await;
+        let read: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        said(&read, "part", 2);
+
+        // Where the connection is made again for room, the read there
+        // goes on from the same place.
+        node.did.lock().unwrap().clear();
+        node.no_room.store(1, SeqCst);
+        let by = ProvedBy::Secret(Zeroizing::new(old));
+        let within = Instant::now() + Duration::from_secs(30);
+        let on = from("relay", RELAY_MARK, 2);
+        let at = read_at_relays_from(&node.state, channel, by, &on, within).await;
+        assert_eq!(*node.did.lock().unwrap(), ["no room", "remake", "read"]);
+        let expected = LeftRead::Read {
+            entries: wire(2),
+            whole: true,
+            reached: LeftPlace {
+                mark: RELAY_MARK,
+                next: 3,
+            },
+        };
+        assert_eq!(at[0].read, expected);
     }
 
     /// The new channel was fetched whole where a whole pass that began

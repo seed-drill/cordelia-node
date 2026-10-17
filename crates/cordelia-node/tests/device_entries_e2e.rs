@@ -5171,6 +5171,24 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
         assert!(again.is_none_or(|(ids, _)| ids.is_empty()), "{read:?}");
         assert_eq!(pulls(&relay), [([0; 8], 0), (mark, 1), (mark, 1)]);
     }
+
+    // The relay dropped the channel and took it again, under a new mark,
+    // and holds nothing of it yet: the read is whole, and the place
+    // reached is under the new mark, at its start.
+    let new_mark = [8u8; 8];
+    relay.pulls(move |_| EntryPulled {
+        entries: Vec::new(),
+        next: 0,
+        mark: new_mark,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, from(place(mark, 3)), soon()).await;
+    let expected = LeftRead::Read {
+        entries: Vec::new(),
+        whole: true,
+        reached: place(new_mark, 0),
+    };
+    assert_eq!(read[0].read, expected);
+    assert_eq!(pulls(&relay), [(mark, 3)]);
 }
 
 /// **A read of a generation that was left counts each proof it sends,
