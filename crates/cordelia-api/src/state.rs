@@ -181,7 +181,8 @@ impl HeldUp {
 /// And it carries how many relays the node is configured with
 /// ([`OwnChannels::set_up_with`]). The node says it from the list that
 /// each pass is given, which is every relay of its configuration, whether
-/// or not its name resolves. What a device keeps of a relay is forgotten
+/// or not its name resolves, and each relay once: a name that reaches the
+/// same relay as one before it is not another (decision 2026-10-17 §1). What a device keeps of a relay is forgotten
 /// as of one that it is set up with no longer only while every relay it
 /// is configured with is connected.
 ///
@@ -341,8 +342,12 @@ pub enum DoorAsk {
     /// relay anew. A relay remembers the channels that were proved on a
     /// connection for that connection alone: a new one starts with none.
     /// Answered with whether there was a connection to close.
+    ///
+    /// With `peer`, the connection is the one to the node of that key,
+    /// whatever name it is listed under now (decision 2026-10-17 §4).
     Remake {
         relay: String,
+        peer: Option<[u8; 32]>,
         answer: tokio::sync::oneshot::Sender<bool>,
     },
 }

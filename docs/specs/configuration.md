@@ -15,8 +15,10 @@
 > The sync adapter's settings are not in this file: `cordelia sync claude`
 > and `cordelia sync map` store them in the node's database. The `[memory]`
 > and `[search]` sections (§2.7, §2.8) belong to archived specs
-> ([`docs/archive/`](../archive/README.md)), and the `keeper` role is deferred
-> ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)).
+> ([`docs/archive/`](../archive/README.md)). The `keeper` role was dropped
+> ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)),
+> and a configuration that names it is refused
+> ([decision record of 2026-10-17](../decisions/2026-10-17-a-devices-relays-and-connections.md) §5).
 >
 > Per the [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md):
 >
@@ -87,7 +89,7 @@ P2P networking: listen address, node role, push policy, bootnode addresses, DNS 
 |-----------|------|---------|--------------|-------------|--------|
 | `listen_addr` | string | `"0.0.0.0:9474"` | `<ip>:<port>` | P2P listen address (UDP, QUIC). | operations.md SS5.1, network-protocol.md SS12.2 |
 | `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket (it still listens if it has `trusted_peers`). Set `true` on a personal node that others dial directly, such as a swarm lead. | decision 2026-09-30 §4.6 |
-| `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"`, `"keeper"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. | network-protocol.md SS8, SS12.2 |
+| `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. **Any other value is refused when the configuration is loaded**, with a line that names the roles this version takes. | network-protocol.md SS8, SS12.2; decision 2026-10-17 §5 |
 | `push_policy` | string | `"subscribers_only"` | `"subscribers_only"`, `"pull_only"` | Push behaviour for personal nodes. `subscribers_only`: push items to hot peers subscribed to the channel. `pull_only`: never push; peers must pull via Item-Sync. Trade-off: `pull_only` increases latency (bounded by `replication.sync_interval_realtime_secs`). | network-protocol.md SS8.1.1, SS12.2 |
 | `dns_discovery` | string | `""` | any | **No longer used (2026-10-02).** A node learns of no relay from DNS: its relays are the ones it is configured with. The setting is still read, so that older configurations load. | decision 2026-09-30 §4.6 |
 
@@ -109,13 +111,15 @@ key = "cordelia_pk1..."
 | `addr` | string | (required) | The relay's address as `<hostname>:<port>`. With none configured, a personal node uses the two default relays. | decision 2026-09-30 §4.6 |
 | `key` | string | unset | The relay's public key (`cordelia_pk1...`, as `cordelia id` prints on the relay). When set, any other key answering at `addr` is refused. The default relays' keys are compiled in and need not be given. Without a key, whichever node answers is accepted, and the node warns at start. A key that does not parse stops the node from starting. **On a relay, a relay listed with its key is one it works together with:** the two pass the entries of channels from their secrets between them without the proof, tell each other which channels they hold, and are not counted against each other's limits. A relay listed by address alone is not one for that: whoever came from that address would be handed every channel. | decision 2026-09-30 §4.6; decision 2026-10-04 §2.4, item 6 |
 
+**Two relays at one address.** Every relay listed is kept, also where two names resolve to one address. Only one key answers at an address: a relay there that was given another key fails its own handshake, and `cordelia peers` and `cordelia status` list it with the wrong key. Once one relay is connected at the address, the node does not dial it again for the other. The node says in its log which relays share an address. Two names that reach one relay (one given its key and one given none at its address, or two given the same key) are one relay: the second is listed as "same relay", and the device counts, paces and passes the relay once. A relay that another key answers for at its address stays counted, as one out of reach (decision 2026-10-17 §1).
+
 **Contradiction resolved:** operations.md SS5.1 uses a flat string array (`bootnodes = ["host:port", ...]`) and places governor parameters under `[network]`. network-protocol.md SS12.2 uses `[[network.bootnodes]]` array-of-tables and places governor parameters under `[governor]`. This document follows network-protocol.md SS12.2 as canonical: bootnodes use array-of-tables (extensible for future fields like `role`, `priority`), and governor parameters live under `[governor]` (SS2.4 below).
 
 ### 2.4 `[governor]`
 
 Peer governor targets and timing. Controls how the node manages its peer set across Hot, Warm, and Cold states.
 
-Defaults match the Personal Node profile (network-protocol.md SS8.6). Override for Relay, Bootnode, or Secret Keeper roles.
+Defaults match the Personal Node profile (network-protocol.md SS8.6). Override for Relay or Bootnode roles.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
@@ -127,7 +131,7 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 | `cold_max` | integer | `50` | >= `warm_max` (exempt for `trusted_only`) | Maximum cold (known, not connected) peers. | SS5.3, SS8.6 |
 | `dial_policy` | string | `"all"` | `"all"`, `"relays_only"`, `"trusted_only"` | Controls which peers the governor connects to. `trusted_only` for secret keepers. | SS5.3, SS8.5, SS8.6 |
 | `tick_interval_secs` | integer | `10` | >= 1 | Governor tick interval. Each tick evaluates promotions, demotions, and churn. | SS5.4, SS12.2 |
-| `churn_interval_secs` | integer | `3600` | > 0 | Base churn interval. Warm peers swapped with cold to prevent topology ossification. | SS5.4, SS12.2 |
+| `churn_interval_secs` | integer | `3600` | > 0 | Base churn interval. Warm peers swapped with cold to prevent topology ossification. A personal node never closes, by churn, its connection to a relay it is set up with. | SS5.4, SS12.2; decision 2026-10-17 §2 |
 | `churn_jitter_secs` | integer | `300` | >= 0 | Random jitter added to churn interval (0 to this value). Prevents correlated churn across nodes. | SS5.4, SS12.2 |
 | `churn_fraction` | float | `0.2` | (0.0, 1.0] | Fraction of warm peers swapped per churn cycle. | SS5.4, SS12.2 |
 | `min_warm_tenure_secs` | integer | `300` | >= 60 | Minimum warm time before Hot promotion. Anti-Sybil guard. Bypassed when `hot < hot_min`. | SS5.4, SS12.2 |
@@ -278,7 +282,7 @@ max_storage_bytes = 1073741824             # 1 GB local storage limit
 # --- Network ---
 [network]
 listen_addr = "0.0.0.0:9474"              # P2P listen address (UDP, QUIC)
-role = "personal"                          # "personal" | "bootnode" | "relay" | "keeper"
+role = "personal"                          # "personal" | "bootnode" | "relay"
 push_policy = "subscribers_only"           # "subscribers_only" | "pull_only"
 
 # Relays: where to dial, and the key that must answer there. The default
@@ -292,7 +296,7 @@ addr = "relay2.cordelia.seeddrill.ai:9474"
 # --- Governor ---
 # Peer management targets and timing. Controls Hot/Warm/Cold peer lifecycle.
 # Defaults match Personal Node profile (network-protocol.md SS8.6).
-# See SS8.6 for Relay, Bootnode, and Secret Keeper profiles.
+# See SS8.6 for Relay and Bootnode profiles.
 [governor]
 hot_min = 2                                # Below this, promote aggressively
 hot_max = 2                                # Above this, demote worst-scoring

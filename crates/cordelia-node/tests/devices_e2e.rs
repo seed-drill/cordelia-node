@@ -4268,3 +4268,219 @@ async fn a_relay_warns_of_what_a_peer_announced_in_a_few_safe_characters() {
     assert!(!log.lines().any(|line| line.starts_with(FORGED)), "{log}");
     assert!(!log.contains(&"x".repeat(100)));
 }
+
+// ── A device's relays and its connections (decision 2026-10-17) ─────
+
+/// How long each relay a device lists in `cordelia peers --json` has been
+/// connected, by its key: those it is connected to now.
+fn connected_secs(n: &Node) -> std::collections::HashMap<String, u64> {
+    let out = n.command(&["peers", "--json"]);
+    let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let peers = said["peers"].as_array().cloned().unwrap_or_default();
+    peers
+        .iter()
+        .filter_map(|peer| {
+            Some((
+                peer["key"].as_str()?.to_string(),
+                peer["connected_secs"].as_u64()?,
+            ))
+        })
+        .collect()
+}
+
+/// A device keeps every relay it is set up with through churn (decision
+/// 2026-10-17 §2). It is set up with four relays of the test's own, is
+/// connected to all four, and churns every two seconds. The fourth stops,
+/// so a peer of the device's is cold, which is when churn closes a warm
+/// peer. Through six churn intervals the device stays connected to the
+/// other three, on the connections it had: each has been connected for
+/// about as long as the test waited, or longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_keeps_every_relay_it_is_set_up_with_through_churn() {
+    const CHURN_SECS: u64 = 2;
+    const WAITED_SECS: u64 = 6 * CHURN_SECS;
+    let mut relays = [
+        node("relay-one", "relay", None),
+        node("relay-two", "relay", None),
+        node("relay-three", "relay", None),
+        node("relay-four", "relay", None),
+    ];
+    for relay in relays.iter_mut() {
+        relay.start();
+    }
+    for relay in &relays {
+        wait_for("relay healthy", &[relay], 30, || healthy(relay));
+    }
+    let set_up: Vec<(String, Option<String>)> = relays
+        .iter()
+        .map(|relay| (format!("127.0.0.1:{}", relay.p2p), Some(key_of(relay))))
+        .collect();
+    let mut laptop = node_with_relays("laptop", "personal", &set_up);
+    laptop.churn_every_secs(CHURN_SECS);
+    laptop.start();
+    let connected = |n: &Node| -> Vec<bool> {
+        relays_of(n)
+            .iter()
+            .map(|relay| relay["state"] == "connected")
+            .collect()
+    };
+    wait_for("node healthy", &[&laptop], 30, || healthy(&laptop));
+    wait_for(
+        "the device is connected to its four relays",
+        &[&laptop],
+        60,
+        || (connected(&laptop) == [true; 4]).then_some(()),
+    );
+
+    let four = key_of(&relays[3]);
+    relays[3].stop();
+    wait_for(
+        "the fourth relay is gone from the device's peers",
+        &[&laptop],
+        60,
+        || (!connected_secs(&laptop).contains_key(&four)).then_some(()),
+    );
+    let since = Instant::now();
+    while since.elapsed() < Duration::from_secs(WAITED_SECS) {
+        assert_eq!(
+            connected(&laptop)[..3],
+            [true; 3],
+            "a relay the device is set up with is not connected\n{}",
+            laptop.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let secs = connected_secs(&laptop);
+    for relay in &relays[..3] {
+        let for_secs = secs.get(&key_of(relay)).copied().unwrap_or(0);
+        assert!(
+            for_secs >= WAITED_SECS - CHURN_SECS,
+            "{} has been connected for {for_secs}s only: churn closed it\n{}",
+            relay.name,
+            laptop.log_tail()
+        );
+    }
+}
+
+/// Two relays a device is set up with resolve to one address, each given
+/// a key of its own (decision 2026-10-17 §1). Only the relay's own key
+/// answers there. The one that was given the other key is kept, and is
+/// listed with the wrong key; the other is connected, and stays so on
+/// one connection: the device does not dial the address again for the
+/// relay whose key is wrong. The relay counts the connections it took
+/// from the device: one, where each dial again would have been another,
+/// in place of the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_relays_at_one_address_are_each_kept_and_the_wrong_key_is_its_own() {
+    const WAITED_SECS: u64 = 12;
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let identity = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let another = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
+    // The one with the wrong key first: it is the one dialled first.
+    let wrong = format!("localhost:{}", relay.p2p);
+    let right = format!("127.0.0.1:{}", relay.p2p);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (wrong.clone(), Some(another)),
+            (right.clone(), Some(key_of(&relay))),
+        ],
+    );
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("node healthy", &all, 30, || healthy(&laptop));
+    let stands = |n: &Node| -> Vec<(String, String)> {
+        relays_of(n)
+            .iter()
+            .map(|r| {
+                let host = r["host"].as_str().unwrap_or_default().to_string();
+                (host, r["state"].as_str().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    let expected = vec![
+        (wrong.clone(), "wrong key".to_string()),
+        (right.clone(), "connected".to_string()),
+    ];
+    wait_for("each relay is listed as it stands", &all, 60, || {
+        (stands(&laptop) == expected).then_some(())
+    });
+    tokio::time::sleep(Duration::from_secs(WAITED_SECS)).await;
+    assert_eq!(stands(&laptop), expected);
+    assert_eq!(
+        inbound_connections(&relay),
+        1,
+        "the device dialled the relay again\n{}",
+        laptop.log_tail()
+    );
+}
+
+/// How many connections a relay has taken from its peers, as its log
+/// says.
+fn inbound_connections(relay: &Node) -> usize {
+    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
+    log.lines()
+        .filter(|line| line.contains("accepted inbound connection"))
+        .count()
+}
+
+/// One relay set up under two names is one relay (decision 2026-10-17
+/// §1). A device is set up with one relay of the test's own, under one
+/// name with its key and under another with none. It is listed under the
+/// first as connected, and under the second as the same relay. The
+/// device counts one relay, and paces and passes it once: the relays
+/// that its person's view lists are one, and that one holds the latest
+/// change. The relay took one connection from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_relay_under_two_names_is_counted_and_paced_once() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let keyed = format!("127.0.0.1:{}", relay.p2p);
+    let keyless = format!("localhost:{}", relay.p2p);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (keyed.clone(), Some(key_of(&relay))),
+            (keyless.clone(), None),
+        ],
+    );
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("node healthy", &all, 30, || healthy(&laptop));
+    makes_a_phrase(&laptop, "laptop");
+    let listed = |n: &Node| -> Vec<(String, String)> {
+        relays_of(n)
+            .iter()
+            .map(|r| {
+                let host = r["host"].as_str().unwrap_or_default().to_string();
+                (host, r["state"].as_str().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    let expected = vec![
+        (keyed.clone(), "connected".to_string()),
+        (keyless.clone(), "same relay".to_string()),
+    ];
+    wait_for("each name is listed as it stands", &all, 60, || {
+        (listed(&laptop) == expected).then_some(())
+    });
+    // The device's own list of its relays: what it counts, paces and
+    // passes, and says holds the latest change.
+    let counted = wait_for("the relay holds the latest change", &all, 60, || {
+        let seen = person_of(&laptop);
+        let relays = seen["relays"].as_array()?.clone();
+        relays
+            .iter()
+            .all(|relay| relay["holds_latest"] == true)
+            .then_some(relays)
+    });
+    let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();
+    assert_eq!(names, [keyed.as_str()], "{counted:?}");
+    assert_eq!(listed(&laptop), expected);
+    assert_eq!(inbound_connections(&relay), 1);
+}

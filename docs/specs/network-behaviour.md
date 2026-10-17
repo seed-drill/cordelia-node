@@ -229,6 +229,18 @@ If a Hot peer is detected as dead (last_activity > keepalive_timeout):
 9. Log INFO "gov: warm -> cold (dead)"
 ```
 
+### 3.5a Warm -> Cold (churn)
+
+Every `churn_interval_secs`, while a peer is cold, the governor closes a
+share of its warm peers (`churn_fraction`), as in §3.5 steps 2 to 8, so
+that cold peers may take their place.
+
+**A personal node never closes, by churn, its connection to a relay it is
+set up with** (decision 2026-10-17 §2). Every peer it dials is a relay the
+person chose: churn would only close one and dial it again. Its relays
+still move between Hot and Warm (§3.4), on connections that stay open. A
+relay and a bootnode churn their warm peers as before.
+
 ### 3.6 Any -> Banned
 
 ```
