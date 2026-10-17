@@ -573,8 +573,12 @@ impl DeviceEntries {
     /// **What the device takes from one relay in a minute is bounded
     /// here as in a pass** ([`Self::room_to_take`]): where the minute is
     /// used up it waits for room, and a relay is never asked for more
-    /// than it may hand a connection. A channel that is not read to its
-    /// end by `until` is handed back as that.
+    /// than it may hand a connection. **A pull that the relay refuses for
+    /// now, on a connection that is still open, is waited out the same
+    /// way** (decision 2026-10-17 §3.2): the relay counts the answers to
+    /// shows in its minute, which the device does not see, and a refusal
+    /// for room is not the end of what it will hand. A channel that is
+    /// not read to its end by `until` is handed back as that.
     ///
     /// **The proof is counted from the moment it is sent, whatever the
     /// relay answers** (decision 2026-10-04 §16): a relay remembers every
@@ -667,6 +671,16 @@ impl DeviceEntries {
                 }
                 // Asked enough for this minute: it waits, and asks again.
                 Err(LeftRefused::AskedEnough) => tokio::time::sleep(LEFT_ROOM_WAIT).await,
+                // Refused for now, on a connection that is still open:
+                // the relay counts what it handed in this minute with the
+                // answers to shows, which the device does not see. That
+                // is no end of what it will hand: it waits, and asks
+                // again (decision 2026-10-17 §3.2). The proof was
+                // answered.
+                Err(LeftRefused::NotNow) => {
+                    proved = true;
+                    tokio::time::sleep(LEFT_ROOM_WAIT).await
+                }
                 Err(refused) if read.is_empty() => {
                     return LeftRead::NotRead(match refused {
                         LeftRefused::OwnChannel => {
@@ -675,6 +689,7 @@ impl DeviceEntries {
                         }
                         LeftRefused::NotAnswered(why) => why,
                         LeftRefused::AskedEnough => "asked enough".into(),
+                        LeftRefused::NotNow => "refused for now".into(),
                     });
                 }
                 Err(_) => {
