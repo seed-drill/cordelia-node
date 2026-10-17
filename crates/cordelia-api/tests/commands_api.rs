@@ -628,6 +628,18 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         (&said["relays"], &said["reached"]),
         (&json!([]), &json!([]))
     );
+    // One relay given two places is refused: which it is read from would
+    // not be known.
+    let mut twice = read_from(hex::encode([6u8; 8]));
+    let place = twice["from"][0].clone();
+    twice["from"] = json!([place.clone(), place]);
+    let (status, said) = asks!(app, "/api/v1/carry/read", twice);
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string()
+            .contains("relay is given two places to read from"),
+        "{said}"
+    );
 
     // The name is held by the carry, with no folder mapped to it. While
     // a version that was brought in there has been sent to no relay, the
