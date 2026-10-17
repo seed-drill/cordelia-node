@@ -5672,6 +5672,20 @@ async fn a_connection_whose_places_are_held_by_a_left_generation_is_made_again()
             panic!("the device asked for something else");
         };
         assert_eq!((name.as_str(), peer), ("relay", Some(relay.key)));
+        // While the node has not answered, a pass asks no more, and asks
+        // nothing on that connection: it ends there, and is short.
+        a.passes().await;
+        assert!(
+            door(&a, 200).await.is_none(),
+            "asked again before an answer"
+        );
+        let own = &a.state.own_channels;
+        assert_eq!(
+            own.last_short_pass(),
+            own.whole_passes().1,
+            "the pass is short"
+        );
+        assert!(proved(&relay).is_empty());
         // The node did not make it again: it found no such connection.
         // The next pass asks again, and nothing more on that connection.
         let _ = answer.send(false);
@@ -6360,6 +6374,18 @@ async fn a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_non
             no_place,
             "{most_proved}"
         );
+        // While the node has not answered, a later pass goes on as before:
+        // it is not short, and asks no more.
+        device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
+        device.passes().await;
+        let own = &device.state.own_channels;
+        assert_eq!(own.whole_passes().1, 3, "{most_proved}");
+        assert_eq!(own.last_short_pass(), 0, "{most_proved}");
+        assert!(
+            door(&device, 200).await.is_none(),
+            "{most_proved}: asked again"
+        );
+        drop(asked);
     }
 }
 

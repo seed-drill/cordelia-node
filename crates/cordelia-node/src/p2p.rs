@@ -2883,8 +2883,10 @@ pub async fn p2p_loop(
                         let peer = to_make_again(peer, &relay, &relays, &|peer| conn_mgr.is_connected(peer));
                         if let Some(peer) = &peer {
                             tracing::info!(%relay, "the connection to a relay is made again: it has no room left for a proof");
+                            let addr = conn_mgr.get_connection(peer).map(|conn| conn.remote_address());
                             conn_mgr.disconnect(peer);
-                            relay_tries.retain(|(host, _), _| *host != relay);
+                            let resolved = relay_addrs.read().map(|r| r.clone()).unwrap_or_default();
+                            forget_tries(&mut relay_tries, &resolved, peer, addr);
                         }
                         let _ = answer.send(peer.is_some());
                     }
@@ -3676,6 +3678,25 @@ fn to_make_again(
             .and_then(|set_up| set_up.link.as_ref())
             .map(|link| link.relay().clone()),
     }
+}
+
+/// Forget the tries of each configured relay that the connection to
+/// `peer`, at `addr`, reached, when it is made again (decision 2026-10-17
+/// §4): by the key that found the connection, or for a relay given no
+/// key, by its address. The tries of any other relay are kept, whatever
+/// it is called.
+fn forget_tries(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    peer: &NodeId,
+    addr: Option<std::net::SocketAddr>,
+) {
+    let reached: Vec<TriedRelay> = resolved
+        .iter()
+        .filter(|relay| relay.key.is_none() && Some(relay.addr) == addr)
+        .map(tried_relay)
+        .collect();
+    tries.retain(|tried, _| tried.1 != Some(peer.0) && !reached.contains(tried));
 }
 
 /// The governor of a node of `role`, with its targets and timeouts from
@@ -5269,6 +5290,44 @@ mod tests {
             to_make_again(None, "keyless.example:9474", &listed, &connected),
             None,
             "listed with no connection"
+        );
+    }
+
+    /// When a connection is made again, the tries forgotten are those of
+    /// each relay it reached (decision 2026-10-17 §4): by the key that
+    /// found it, and for a relay given no key, by its address. A relay of
+    /// the same name with another key, and a relay elsewhere, keep theirs.
+    #[test]
+    fn the_tries_forgotten_are_those_of_the_relays_the_connection_reached() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let here = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let elsewhere = std::net::SocketAddr::from(([127, 0, 0, 2], 9474));
+        let at = |host: &str, addr, key| RelayAddr {
+            host: host.into(),
+            addr,
+            key,
+        };
+        let resolved = [
+            at("keyed.example:9474", here, Some([7; 32])),
+            at("keyless.example:9474", here, None),
+            at("keyed.example:9474", here, Some([8; 32])),
+            at("other.example:9474", elsewhere, Some([9; 32])),
+            at("far.example:9474", elsewhere, None),
+        ];
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = resolved
+            .iter()
+            .map(|relay| (tried_relay(relay), RelayTry::default()))
+            .collect();
+        forget_tries(&mut tries, &resolved, &NodeId([7; 32]), Some(here));
+        let mut kept: Vec<TriedRelay> = tries.into_keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                ("far.example:9474".to_string(), None),
+                ("keyed.example:9474".to_string(), Some([8; 32])),
+                ("other.example:9474".to_string(), Some([9; 32])),
+            ]
         );
     }
 
