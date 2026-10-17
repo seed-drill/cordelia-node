@@ -1149,6 +1149,18 @@ fn swarm_init_makes_its_data_directory_its_owners_alone() {
         .mode();
     assert_eq!(mode & 0o777, 0o700, "{mode:o}");
     assert!(child.data_dir().join("identity.key").exists());
+
+    // Over a directory that holds a key already, and is open to others,
+    // it refuses, and changes nothing: not the directory's mode either.
+    std::fs::set_permissions(child.data_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let refused = child.refused(&args);
+    assert!(refused.contains("Identity already exists"), "{refused}");
+    assert!(!refused.contains("could be read"), "{refused}");
+    let mode = std::fs::metadata(child.data_dir())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
 }
 
 /// `cordelia swarm-init` opens no database, and writes nothing, where a

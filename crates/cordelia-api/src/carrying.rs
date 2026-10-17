@@ -2125,6 +2125,86 @@ mod tests {
         assert_eq!(said_of(&node, removed).await, json!(false));
     }
 
+    /// A later revision of a removed key's own work counts as its work
+    /// brought back wherever it stands in its slot, and however it came
+    /// (decision 2026-10-04 §7.3): where it lost the tie at its revision to
+    /// another key's entry, and where it was carried from a carry of it, so
+    /// that the removed key's link is not the first of its chain.
+    #[actix_web::test]
+    async fn test_a_later_revision_of_the_same_authors_work_is_its_own_wherever_it_stands() {
+        use crate::publish::read;
+        use crate::several::text;
+        use cordelia_crypto::entry::Link;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 2], LAB);
+        s.write(0, LAB, "kept.md", "of device 0");
+        s.meet(&[0, 2]);
+        let old = s[2].own(LAB);
+        let first = s.write(2, LAB, "only.md", "first");
+        let second = s.write(2, LAB, "only.md", "second");
+        s.change(0, &[0, 1], &[2]);
+        let new = s[0].own(LAB);
+        let one =
+            cordelia_crypto::identity::NodeIdentity::from_seed(*s[1].identity.seed()).unwrap();
+        let (removed, phrase) = (s.key(2), Phrase::parse(crate::several::WORDS).unwrap());
+        let node = Node::of(s.machines.remove(0));
+        async fn said_of(node: &Node, removed: [u8; 32]) -> serde_json::Value {
+            let listed = look_from(&node.state, LAB, &[]).await.unwrap();
+            assert_eq!(listed["signed"][0]["key"], hex::encode(removed), "{listed}");
+            listed["signed"][0]["brought_back"].clone()
+        }
+        let stored = |entry: &CheckedEntry| {
+            cordelia_storage::entries::store(&db(&node.state), entry, now()).unwrap();
+        };
+
+        // The removed key's later version is carried; the relay then hands
+        // only its earlier one.
+        node.relay_holds(&old, &[first.clone(), second.clone()]);
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(done["carried"], 1, "{done}");
+        let rev = {
+            let conn = db(&node.state);
+            read(&conn, LAB, "only.md")
+                .unwrap()
+                .slot
+                .current
+                .unwrap()
+                .rev
+        };
+        node.relay_holds(&old, std::slice::from_ref(&first));
+        assert_eq!(said_of(&node, removed).await, json!(true));
+
+        // Device 1 writes at that revision a text that wins the tie: the
+        // carried version lost it, and is held all the same.
+        let wins = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .into_iter()
+            .find(|said| text(said).hash() > text("second").hash())
+            .unwrap();
+        stored(&entry_by(&one, &new, rev, "only.md", text(wins), &[]));
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some(wins));
+        assert_eq!(said_of(&node, removed).await, json!(true));
+
+        // Device 1 writes above it the removed key's text, carried from a
+        // carry of it by another key: the removed key's link is the second
+        // of its chain. It is the removed key's work.
+        let other = [7u8; 32];
+        let chain = [
+            Link::of(&text("second"), other),
+            Link::of(&text("second"), removed),
+        ];
+        stored(&entry_by(
+            &one,
+            &new,
+            rev + 1,
+            "only.md",
+            text("second"),
+            &chain,
+        ));
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("second"));
+        assert_eq!(said_of(&node, removed).await, json!(true));
+    }
+
     /// **Which slots of the new channel hold nothing is judged only
     /// where the new channel was fetched whole just before** (decision
     /// 2026-10-04 §7.3). Where no relay answers, a plain carry, a

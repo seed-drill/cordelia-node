@@ -131,11 +131,14 @@ download_binary() {
 # ── Install ─────────────────────────────────────────────────────────
 
 # Whether others than its owner and its group may read, write or enter
-# what is at $1: a bit of its mode that is everyone else's.
+# what is at $1: everyone else's r, w or x. Where $1 is a symbolic link,
+# what it leads to is read, as the node reads it. The sticky bit alone
+# (T in the last place) lets nobody in.
 open_to_others() {
-    case "$(ls -ld "$1" | cut -c8-10)" in
-        ---) return 1 ;;
-        *) return 0 ;;
+    others=$(ls -ldL "$1" | cut -c8-10)
+    case "$others" in
+        r??|?w?|??x|??t) return 0 ;;
+        *) return 1 ;;
     esac
 }
 

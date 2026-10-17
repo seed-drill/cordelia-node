@@ -397,9 +397,11 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   what is stored read the database for reading only, with no step run,
 >   and only where it is at their own schema version: at another the node
 >   is of another version, and they open nothing, and name `cordelia status`
->   and the restart instead. Where no node holds it, each goes on. A node on
->   another data directory never refuses them, whatever answers at the
->   port.
+>   and the restart instead. Where the directory has no lock file, or its
+>   lock cannot be asked, a node that takes no lock may run there: the port
+>   is asked as well, and a node of another version there refuses them.
+>   Where the lock file is there and no node holds it, each goes on, and a
+>   node on another data directory never refuses them.
 > - **A command that cannot reach the node says how it is started:** the
 >   command that starts the service on the system (`systemctl --user start
 >   cordelia` on Linux, `launchctl load
@@ -1099,7 +1101,9 @@ before makes a copy and then one step, when it starts (data-formats.md §12):
 - **A data directory is one node's.** A node takes a lock on the directory
   (a file in it, `node.lock`) before it opens the database. A second node
   that is started on the same directory, whatever ports it was given, says
-  that another is running there, changes nothing, and stops.
+  that another is running there, changes nothing, and stops, once it has
+  found the lock held for half a second (`NODE_LOCK_WAIT_MS`): a command
+  that asks the lock holds it for a moment only.
 - **The copy** is a folder beside the database, `before-<version>`: the
   database as its opening left it (the schema's steps have added tables, and
   have changed no row that was there), and the key files of the older

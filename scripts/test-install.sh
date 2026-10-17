@@ -499,6 +499,31 @@ check "the configuration file's mode" \
     "$(mode_of "$HOME_DIR/.cordelia/config.toml")" "-rw-r-----"
 has_not "could be read, written or entered by others"
 
+# A data directory that is a symbolic link to one shared with its group
+# is read where the link leads, as the node reads it: it is left as it is,
+# and nothing is said. So is one whose others have only the sticky bit.
+setup() {
+    mkdir -p "$HOME/shared/bin"; echo "the one before" > "$HOME/shared/bin/cordelia"
+    touch "$HOME/shared/identity.key" "$HOME/shared/config.toml"
+    chmod 750 "$HOME/shared"; chmod 640 "$HOME/shared/config.toml"
+    ln -s "$HOME/shared" "$HOME/.cordelia"
+}
+run "a-data-directory-that-is-a-link-to-one-shared-with-its-group"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the mode of the directory the link leads to" "$(mode_of "$HOME_DIR/shared")" "drwxr-x---"
+check "the configuration file's mode" "$(mode_of "$HOME_DIR/shared/config.toml")" "-rw-r-----"
+has_not "could be read, written or entered by others"
+
+setup() {
+    mkdir -p "$HOME/.cordelia/bin"; echo "the one before" > "$HOME/.cordelia/bin/cordelia"
+    touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 1750 "$HOME/.cordelia"; chmod 640 "$HOME/.cordelia/config.toml"
+}
+run "a-data-directory-whose-others-have-only-the-sticky-bit"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwxr-x--T"
+has_not "could be read, written or entered by others"
+
 # A configuration file that is a link is kept elsewhere: no mode is set
 # through the link, and the data directory is set as it always is.
 setup() {

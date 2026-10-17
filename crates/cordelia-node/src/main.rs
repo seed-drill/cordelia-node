@@ -944,7 +944,7 @@ fn cmd_init(
     // it opens none where a node holds the data directory's lock, and
     // writes nothing there either (decision 2026-10-04 §10.1, rule 6).
     if force || !config.data_dir().join("cordelia.db").exists() {
-        refuse_beside_its_node(&config.data_dir())?;
+        refuse_beside_its_node(&config)?;
     }
     init_with(
         &config_file,
@@ -1760,6 +1760,23 @@ fn lock_tried(tried: Result<(), std::fs::TryLockError>) -> Lock {
     }
 }
 
+/// Try the lock on `file`, and where another holds it, try again every
+/// few milliseconds until `wait` has passed (decision 2026-10-04 §10.1):
+/// a command that asks the lock holds it for a moment only
+/// ([`lock_of`]), and a node started in that moment is not stopped by it.
+/// Whatever else the system answers is answered at once.
+fn lock_tried_within(file: &std::fs::File, wait: std::time::Duration) -> Lock {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match lock_tried(file.try_lock()) {
+            Lock::AnotherNode if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            tried => return tried,
+        }
+    }
+}
+
 /// The node goes on with no lock on its data directory: it says so in
 /// its log, once, with why the lock could not be taken.
 fn goes_on_with_no_lock(data_dir: &std::path::Path, why: &str) -> Option<std::fs::File> {
@@ -1777,9 +1794,11 @@ fn goes_on_with_no_lock(data_dir: &std::path::Path, why: &str) -> Option<std::fs
 /// ends. The file that is returned holds it, and is kept for the life of
 /// the process.
 ///
-/// Where another process holds it, a node is running on that directory:
-/// this one says so, and has changed nothing. The file holds nothing, and
-/// is left where it is when the node stops.
+/// Where another process holds it for longer than
+/// [`cordelia_core::protocol::NODE_LOCK_WAIT_MS`], a node is running on
+/// that directory: this one says so, and has changed nothing. (A command
+/// that asks the lock holds it for a moment only, and is waited out.) The
+/// file holds nothing, and is left where it is when the node stops.
 ///
 /// **Nothing else keeps the node from starting** ([`lock_tried`]). Where
 /// the lock cannot be taken for any other reason (the volume knows no
@@ -1798,7 +1817,8 @@ fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<Option<std::fs::F
         Ok(file) => file,
         Err(e) => return Ok(goes_on_with_no_lock(data_dir, &e.to_string())),
     };
-    match lock_tried(file.try_lock()) {
+    let wait = std::time::Duration::from_millis(cordelia_core::protocol::NODE_LOCK_WAIT_MS);
+    match lock_tried_within(&file, wait) {
         Lock::Held => Ok(Some(file)),
         Lock::AnotherNode => anyhow::bail!(
             "another node is running on the data directory {}: a data directory is one node's. \
@@ -2969,19 +2989,21 @@ fn cmd_swarm_init(
     // The database is opened below: none is opened, and nothing is made,
     // where a node holds the data directory's lock (decision 2026-10-04
     // §10.1, rule 6).
-    refuse_beside_its_node(&data_dir)?;
+    refuse_beside_its_node(&config)?;
 
-    // Write child identity. The data directory is made its owner's alone
-    // (mode 0700), as `cordelia init` and the install script make it.
-    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
-        eprintln!("{says}");
-    }
+    // A directory that holds a key already is refused before anything is
+    // changed, its mode included.
     let identity_path = data_dir.join("identity.key");
     if identity_path.exists() {
         anyhow::bail!(
             "Identity already exists at {}. Use --force with `cordelia init` to overwrite.",
             identity_path.display()
         );
+    }
+    // Write child identity. The data directory is made its owner's alone
+    // (mode 0700), as `cordelia init` and the install script make it.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
     }
     // The database is opened before anything is written: one from a
     // later version is refused, and nothing is changed (decision
@@ -3716,19 +3738,67 @@ fn refuse_by_how_it_stands(status: &anyhow::Result<serde_json::Value>) -> anyhow
     }
 }
 
-/// Whether a node holds the lock on the data directory `data_dir` now
+/// What a command finds of the lock on a data directory
+/// ([`lock_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirLock {
+    /// A node holds it: one runs on the directory.
+    Held,
+    /// The file is there, and no node holds it: no node of a version that
+    /// takes the lock runs there.
+    Free,
+    /// There is no file of the lock: no node of a version that takes the
+    /// lock has run there, and one from before it may run there now.
+    NoFile,
+    /// It could not be asked (the volume knows no such lock, or the file
+    /// cannot be opened): a node there runs without it, as it says in its
+    /// log ([`lock_tried`]).
+    NotAsked,
+}
+
+/// What a command finds of the lock on the data directory `data_dir` now
 /// (decision 2026-10-04 §10.1): the lock that a node takes on the file
 /// [`NODE_LOCK`] there before it opens its database, and holds for as
 /// long as it runs. It is asked, and let go of at once: this process
-/// keeps no lock. Where the file is not there, no node holds it, and
-/// none is made: the command writes nothing in the directory. A lock
-/// that cannot be asked for any other reason (the volume knows no such
-/// lock) is taken for none, as a node takes it ([`lock_tried`]).
-fn a_node_holds(data_dir: &std::path::Path) -> bool {
-    match std::fs::File::open(data_dir.join(NODE_LOCK)) {
-        Ok(file) => lock_tried(file.try_lock()) == Lock::AnotherNode,
-        Err(_) => false,
+/// keeps no lock, and a node that tries it in that moment tries again
+/// ([`NODE_LOCK_WAIT_MS`]). Where the file is not there, none is made:
+/// the command writes nothing in the directory.
+fn lock_of(data_dir: &std::path::Path) -> DirLock {
+    let file = match std::fs::File::open(data_dir.join(NODE_LOCK)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirLock::NoFile,
+        Err(_) => return DirLock::NotAsked,
+    };
+    match lock_tried(file.try_lock()) {
+        Lock::AnotherNode => DirLock::Held,
+        Lock::Held => DirLock::Free,
+        Lock::NotTaken(_) => DirLock::NotAsked,
     }
+}
+
+/// What a command that opens the node's database itself says of a node of
+/// another version that answers at its configuration's port, where the
+/// data directory's lock tells nothing, after the note that says how to
+/// restart it.
+const NOT_OPENED_BESIDE_ANOTHER_VERSION: &str = "This command opens the node's database itself, \
+                                                 and does not open it beside a node of another \
+                                                 version: nothing was opened.";
+
+/// Where the lock on the data directory of `config` tells nothing (there
+/// is no file of it, or it could not be asked, [`DirLock`]), a node that
+/// takes no lock may run there: one from before the lock, or one on a
+/// volume that knows no locks. So the port of the configuration is asked,
+/// as it was before there was a lock, for as long as a command waits for
+/// a node. The note on a node of another version that answers there is
+/// returned ([`version_note`]); `None` where none answers, or one of this
+/// command's version does. Where the lock is held, or is there and free,
+/// nothing is asked: the lock says it all.
+fn another_version_with_no_lock(config: &Config, lock: DirLock) -> Option<String> {
+    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {
+        return None;
+    }
+    let node = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR).ok()?;
+    version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
 /// What a command that opens the node's database itself and writes says
@@ -3776,18 +3846,25 @@ fn not_read_beside_another_version(
 /// Nothing is opened or written, and the refusal names the command that
 /// stops the node ([`not_opened_beside_its_node`]).
 ///
-/// **The lock is what is asked, and no port:** a node that answers late,
+/// **The lock is what is asked first:** a node that answers late,
 /// answers with an error, or listens at another port than this command's
-/// configuration names holds it all the same. And a node that runs on
-/// another data directory does not hold this one's lock: it never
-/// refuses the command.
-fn refuse_beside_its_node(data_dir: &std::path::Path) -> anyhow::Result<()> {
-    match a_node_holds(data_dir) {
-        true => anyhow::bail!(
+/// configuration names holds it all the same. Only where the lock tells
+/// nothing is the port asked, and a node of another version there refuses
+/// the command too ([`another_version_with_no_lock`]). Where the lock is
+/// there and free, a node that runs on another data directory never
+/// refuses it.
+fn refuse_beside_its_node(config: &Config) -> anyhow::Result<()> {
+    let data_dir = config.data_dir();
+    let lock = lock_of(&data_dir);
+    if lock == DirLock::Held {
+        anyhow::bail!(
             "{}",
-            not_opened_beside_its_node(data_dir, std::env::consts::OS)
-        ),
-        false => Ok(()),
+            not_opened_beside_its_node(&data_dir, std::env::consts::OS)
+        );
+    }
+    match another_version_with_no_lock(config, lock) {
+        Some(note) => anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}"),
+        None => Ok(()),
     }
 }
 
@@ -3797,7 +3874,9 @@ fn refuse_beside_its_node(data_dir: &std::path::Path) -> anyhow::Result<()> {
 /// rule 6).
 ///
 /// - **Where no node holds the lock,** it is opened as any command opens
-///   it ([`open_database`]): its schema's steps are run.
+///   it ([`open_database`]): its schema's steps are run. But where the
+///   lock tells nothing and a node of another version answers at the port,
+///   nothing is opened ([`another_version_with_no_lock`]).
 /// - **Where a node holds it,** it is opened for reading only, and none of
 ///   the schema's steps is run: nothing is written beside the node. It is
 ///   read only where it stands at this command's schema version, which
@@ -3808,7 +3887,11 @@ fn refuse_beside_its_node(data_dir: &std::path::Path) -> anyhow::Result<()> {
 fn open_to_read(config: &Config) -> anyhow::Result<rusqlite::Connection> {
     let data_dir = config.data_dir();
     let db_path = data_dir.join("cordelia.db");
-    if !a_node_holds(&data_dir) {
+    let lock = lock_of(&data_dir);
+    if lock != DirLock::Held {
+        if let Some(note) = another_version_with_no_lock(config, lock) {
+            anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}");
+        }
         return open_database(&db_path, config);
     }
     let conn = rusqlite::Connection::open_with_flags(
@@ -7067,6 +7150,26 @@ mod tests {
         drop(held);
         assert!(lock_data_dir(dir.path()).unwrap().is_some());
 
+        // A lock held for a moment, as a command holds it when it asks,
+        // is waited out: the node that tries it then takes it. One held
+        // for longer than the wait is another node's.
+        let briefly = std::fs::File::open(dir.path().join(NODE_LOCK)).unwrap();
+        briefly.try_lock().unwrap();
+        let let_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(briefly);
+        });
+        let began = std::time::Instant::now();
+        assert!(lock_data_dir(dir.path()).unwrap().is_some());
+        assert!(began.elapsed() >= std::time::Duration::from_millis(90));
+        let_go.join().unwrap();
+        let held = lock_data_dir(dir.path()).unwrap();
+        let began = std::time::Instant::now();
+        assert!(lock_data_dir(dir.path()).is_err());
+        let wait = std::time::Duration::from_millis(cordelia_core::protocol::NODE_LOCK_WAIT_MS);
+        assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
+        drop(held);
+
         // The file of the lock cannot be opened: here a folder is in its
         // place. The node goes on, with no lock.
         let dir = tempfile::tempdir().unwrap();
@@ -7089,6 +7192,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.node.data_dir = dir.path().display().to_string();
+        // A port where nothing answers: where the lock tells nothing, the
+        // port is asked.
+        config.node.http_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let database = dir.path().join("cordelia.db");
         let version = || -> u32 {
             rusqlite::Connection::open(&database)
@@ -7098,18 +7208,19 @@ mod tests {
         };
 
         // No node: nothing refuses, and nothing is made.
-        assert!(!a_node_holds(dir.path()));
+        assert_eq!(lock_of(dir.path()), DirLock::NoFile);
+        assert_ne!(lock_of(dir.path()), DirLock::Held);
         assert!(!dir.path().join(NODE_LOCK).exists());
-        assert!(refuse_beside_its_node(dir.path()).is_ok());
+        assert!(refuse_beside_its_node(&config).is_ok());
 
         // A node holds the lock, over a database in the released form.
         drop(cordelia_storage::first_start::released::database(&database).unwrap());
         let held = lock_data_dir(dir.path())
             .unwrap()
             .expect("the lock is taken");
-        assert!(a_node_holds(dir.path()));
+        assert_eq!(lock_of(dir.path()), DirLock::Held);
         assert_eq!(
-            refuse_beside_its_node(dir.path()).unwrap_err().to_string(),
+            refuse_beside_its_node(&config).unwrap_err().to_string(),
             not_opened_beside_its_node(dir.path(), std::env::consts::OS)
         );
         let refused = open_to_read(&config).unwrap_err().to_string();
@@ -7124,11 +7235,11 @@ mod tests {
         );
         assert_eq!(version(), RELEASED_SCHEMA_VERSION, "nothing was stepped");
         // Asking took nothing: the node still holds it.
-        assert!(a_node_holds(dir.path()));
+        assert_eq!(lock_of(dir.path()), DirLock::Held);
 
         // Let go of: the command opens it as any does, and steps it.
         drop(held);
-        assert!(!a_node_holds(dir.path()));
+        assert_eq!(lock_of(dir.path()), DirLock::Free);
         drop(open_to_read(&config).unwrap());
         assert_eq!(version(), SCHEMA_VERSION);
 

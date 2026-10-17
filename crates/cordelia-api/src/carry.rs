@@ -256,10 +256,12 @@ pub fn would_bring(
 /// Whether the name's channel in the generation applied holds, in the
 /// slot of `version`, a later revision written by the same author as
 /// `version` (decision 2026-10-04 §7.3): an entry of one of its authors,
-/// or one that carried what such an author signed, whose chain begins
-/// with that author's link to its own value ([`chain::carried_from`]). A
-/// later revision that another key wrote is not that author's work, and
-/// what lies under it was not brought back.
+/// or one that carried what such an author signed, whose chain holds that
+/// author's link to its own value ([`chain::carried_from`]): first, where
+/// it was carried from that author, and further on, where it was carried
+/// from a carry of it. A later revision that another key wrote is not
+/// that author's work, and what lies under it was not brought back. One
+/// that lost the tie at its revision is held all the same.
 ///
 /// [`chain::carried_from`]: cordelia_crypto::chain::carried_from
 pub fn later_by_its_author(
@@ -276,8 +278,8 @@ pub fn later_by_its_author(
         held.rev > rev
             && held.entries.iter().any(|entry| {
                 let carried_from = |author: &[u8; 32]| {
-                    let first = entry.chain.as_deref().and_then(<[Link]>::first);
-                    first == Some(&Link::of(&held.value, *author))
+                    let link = Link::of(&held.value, *author);
+                    entry.chain.iter().flatten().any(|held| *held == link)
                 };
                 authors.contains(&entry.author) || authors.iter().any(carried_from)
             })

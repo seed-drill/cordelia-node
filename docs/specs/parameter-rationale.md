@@ -1795,6 +1795,20 @@ run, and the first wait is a cycle long: without this, the timer's own
 jitter would put every try off by a whole cycle. `protocol.rs` asserts that
 it is less than the first wait.
 
+#### NODE_LOCK_WAIT_MS = 500
+
+**Rationale:** How long a node that finds the lock on its data directory
+held tries it again, every few milliseconds, before it says that another
+node is running there and stops (decision §10.1). A command that opens the
+database itself (`stats`, `channels`, `status`, `init`, `swarm-init`) asks
+the lock by taking it, and lets go of it at once: it holds it for a few
+microseconds. Without a wait, a node started by hand in that moment would
+stop, and one under its service would be started again only after the
+service's own pause. Half a second covers a command's hold many times over,
+and is less than a person notices at a start; a node that does hold the
+lock holds it for as long as it runs, so a second node still refuses, half a
+second later.
+
 ### 12.12 Messages Between Your Own Agents
 
 The constants of the [decision record of 2026-10-09](../decisions/2026-10-09-messages-between-your-own-agents.md),

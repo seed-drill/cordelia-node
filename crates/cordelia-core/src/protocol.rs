@@ -1668,6 +1668,15 @@ pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
 /// this, the timer's own jitter would put every try off by a whole cycle.
 pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
 
+/// How long a node that finds the lock on its data directory held tries
+/// it again before it says that another node is running there (decision
+/// 2026-10-04 §10.1): half a second. A command that opens the database
+/// itself asks the lock by taking it, and lets go of it at once: a node
+/// started in that moment is not stopped by it. A node that holds the
+/// lock holds it for as long as it runs, and a second node still refuses
+/// within this.
+pub const NODE_LOCK_WAIT_MS: u64 = 500;
+
 // ── A carry that a person asks for, and a recovery ──────────────────
 
 /// How long a carry by command reads one name at the relays, at most
@@ -2762,6 +2771,7 @@ mod tests {
         assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
         assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
         const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
+        assert_eq!(NODE_LOCK_WAIT_MS, 500);
     }
 
     /// The value that a proof is made over is exported from a TLS session

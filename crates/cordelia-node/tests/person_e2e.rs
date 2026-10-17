@@ -4978,11 +4978,16 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 /// it opens the database, and asks no port (decision 2026-10-04 §10.1,
 /// rule 6).
 ///
-/// - **A node on another data directory never refuses it,** whatever it
-///   answers at the port of the command's configuration: here a stand-in
-///   that says it is of another version. `cordelia stats`, `cordelia
-///   channels` and `cordelia init --force` go on, and the opening steps
-///   the database; none of them asks the node anything.
+/// - **Where the directory has no lock file,** as one where a node from
+///   before the lock runs, the lock tells nothing, and the port of the
+///   command's configuration is asked: a node of another version there
+///   (here a stand-in that says it is) refuses `cordelia stats`, `cordelia
+///   channels` and `cordelia init --force`, and the database stays at the
+///   released version's schema, byte for byte.
+/// - **Where the lock file is there and no node holds it,** a node on
+///   another data directory never refuses them, whatever it answers at
+///   the port: each goes on, and the opening steps the database; none of
+///   them asks the node anything.
 /// - **Where the lock is held** (here by the test, in the place of a node
 ///   of another version, over a database in the released version's
 ///   form), `cordelia init --force` opens nothing and names the command
@@ -5035,15 +5040,45 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         ("CORDELIA_HTTP_PORT", port.as_str()),
     ];
 
-    // The node at the port runs on another data directory: each command
-    // goes on, asks it nothing, and the opening steps the database.
-    for args in [
-        &["stats"][..],
+    let opens: [&[&str]; 4] = [
+        &["stats"],
         &["stats", "--json"],
         &["channels"],
         &["init", "--force"],
-    ] {
+    ];
+    let note = "The running node is version 0.0.0-another and this command is version";
+    // The directory has no lock file, as one where a node from before the
+    // lock runs: the lock tells nothing, so the port is asked, and the
+    // node of another version that answers there refuses each command.
+    // Nothing is opened, and nothing is stepped.
+    released();
+    let as_it_was = std::fs::read(&database).unwrap();
+    for args in opens {
+        let before = another.asked().len();
+        let out = laptop.command_given(&through, args);
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?}: {said}");
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert!(
+            said.contains("does not open it beside a node of another version: nothing was opened."),
+            "{args:?}: {said}"
+        );
+        assert!(
+            another.asked().len() > before,
+            "{args:?} did not ask the node"
+        );
+        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
+    }
+    assert!(!beside.join("node.lock").exists());
+
+    // The directory has its lock file, and no node holds it: the node at
+    // the port runs on another data directory, and refuses nothing. Each
+    // command goes on, asks it nothing, and the opening steps the
+    // database.
+    for args in opens {
         released();
+        std::fs::File::create(beside.join("node.lock")).unwrap();
         assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
         let before = another.asked().len();
         let out = laptop.command_given(&through, args);

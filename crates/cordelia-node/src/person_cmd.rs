@@ -869,6 +869,27 @@ fn addresses_of(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The addresses of each of `names` ([`addresses_of`]), looked up by
+/// `lookup` within `wait` for all of them together, as the node bounds
+/// its own lookups of its relays (`STREAM_TIMEOUT_SECS`). Where the
+/// lookups do not end in time, none is found for any name: each relay is
+/// then listed by its name, and what waits at its address after it, and
+/// the command is not held up.
+fn addresses_within(
+    names: Vec<String>,
+    wait: std::time::Duration,
+    lookup: fn(&str) -> Vec<String>,
+) -> Vec<Vec<String>> {
+    let count = names.len();
+    let (found, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = found.send(names.iter().map(|name| lookup(name)).collect());
+    });
+    answer
+        .recv_timeout(wait)
+        .unwrap_or_else(|_| vec![Vec::new(); count])
+}
+
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
 fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
@@ -1066,10 +1087,14 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
         waits["name"].is_null() && !relays.iter().any(|relay| by_name(waits, relay))
     };
     let found_at: Vec<Vec<String>> = match waiting.iter().any(unnamed) {
-        true => relays
-            .iter()
-            .map(|relay| addresses_of(text(relay, "relay")))
-            .collect(),
+        true => addresses_within(
+            relays
+                .iter()
+                .map(|relay| text(relay, "relay").to_string())
+                .collect(),
+            std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
+            addresses_of,
+        ),
         false => vec![Vec::new(); relays.len()],
     };
     // Whether a row of what waits is that of the relay that is `n`th.
@@ -3877,6 +3902,59 @@ mod tests {
             ]
         );
         assert!(!lines.join("\n").contains("127.0.0.1"), "{lines:?}");
+
+        // A row that the node gives another relay's name is that relay's,
+        // and is not claimed by an address that this relay's name is
+        // found at.
+        let mut two = seen.clone();
+        two["relays"].as_array_mut().unwrap().push(
+            json!({ "relay": "other.example:9474", "heard_since_woke": true,
+                          "holds_latest": true }),
+        );
+        two["waiting"] = json!([
+            { "relay": "127.0.0.1:9474", "name": "other.example:9474", "waits": 3 },
+            { "relay": "192.0.2.9:9474", "name": null, "waits": 5 },
+        ]);
+        let lines = devices_lines(&two, &key(1));
+        let from = lines.iter().position(|line| line == "Relays:").unwrap();
+        assert_eq!(
+            lines[from..],
+            [
+                "Relays:",
+                "  localhost:9474: holds the latest change",
+                "  other.example:9474: holds the latest change; 3 of this device's channels \
+                 still to send there",
+                "  192.0.2.9:9474: 5 of this device's channels still to send there",
+            ]
+        );
+    }
+
+    /// The lookups of the relays' names that `cordelia devices` makes are
+    /// bounded: where they do not end within the wait, none is found, and
+    /// the command goes on; where they do, each name's addresses are
+    /// given, in the order of the names.
+    #[test]
+    fn the_lookups_of_the_relays_names_end_within_their_wait() {
+        let names = || vec!["one:1".to_string(), "two:2".to_string()];
+        let never = |_: &str| -> Vec<String> {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            Vec::new()
+        };
+        let began = std::time::Instant::now();
+        let wait = std::time::Duration::from_millis(200);
+        assert_eq!(
+            addresses_within(names(), wait, never),
+            vec![Vec::<String>::new(); 2]
+        );
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        let at = |name: &str| vec![format!("found {name}")];
+        assert_eq!(
+            addresses_within(names(), wait, at),
+            [
+                vec!["found one:1".to_string()],
+                vec!["found two:2".to_string()]
+            ]
+        );
     }
 
     /// What the node says in the middle of a line begins a line of its
