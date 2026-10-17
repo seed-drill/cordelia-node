@@ -10,11 +10,15 @@ import re, subprocess, sys
 # One name for each file a part edits.
 PROTOCOL = 'crates/cordelia-core/src/protocol.rs'
 PERSON = 'crates/cordelia-api/src/person.rs'
-ORIG = {f: open(f).read() for f in (PROTOCOL, PERSON)}
+ADDITION = 'crates/cordelia-crypto/src/addition.rs'
+TAKE = 'crates/cordelia-api/src/take.rs'
+ORIG = {f: open(f).read() for f in (PROTOCOL, PERSON, ADDITION, TAKE)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 CORE = ("cordelia-core", ["--lib"])
 API = ("cordelia-api", ["--lib"])
+CRYPTO = ("cordelia-crypto", ["--lib"])
+def crypto(test): return (CRYPTO, "addition::tests::" + test)
 def core(test): return (CORE, "protocol::tests::" + test)
 def person(test): return (API, "person::tests::" + test)
 def take(test): return (API, "take::tests::" + test)
@@ -32,6 +36,10 @@ LETS_ADD = person("test_the_record_that_lets_a_key_add_does_not_turn_on_the_orde
 WHO_COUNTS = person("test_who_counts_does_not_turn_on_which_records_beyond_the_bound_were_kept")
 THE_REST_IN_ONE_TIME = person("test_of_the_rest_two_that_say_one_time_go_by_key_and_then_adder")
 COMES_TO_ADD = person("test_a_key_whose_adder_comes_to_add_after_a_flood_keeps_its_first_three")
+NOT_WORKED_OUT = person("test_within_the_bound_the_order_of_keeping_is_not_worked_out")
+NOT_CHECKED_AGAIN = person("test_a_row_is_ordered_by_its_time_without_its_record_checked_again")
+TIME_OF = crypto("the_time_of_a_signed_record_is_read_without_checking_the_record")
+GIVEN_AGAIN = take("test_a_record_that_went_at_the_bound_counts_when_its_entry_is_given_again")
 TAKE_FLOOD = take("test_a_flood_of_records_drops_none_that_lets_a_key_add")
 
 # Each part: (a short id and what the fault is, the file, the exact text
@@ -87,10 +95,48 @@ MUTATIONS = [
     order.extend(may_go.into_iter().rev());''',
      [FLOOD, NOT_THE_ORDER_SEEN, LETS_ADD, MAY_NOT_ADD]),
 
+    # The order is worked out only beyond the bound, and reads a row's
+    # time without checking its record again.
+    ("E1 the order is worked out within the bound too", PERSON,
+     '''    if kept.iter().filter(|row| !row.counted).count() <= MAX_NOT_COUNTED_RECORDS {
+        return Ok(());
+    }''',
+     '''''',
+     [NOT_WORKED_OUT]),
+    ("E2 the order is not worked out at one record past the bound", PERSON,
+     '''    if kept.iter().filter(|row| !row.counted).count() <= MAX_NOT_COUNTED_RECORDS {''',
+     '''    if kept.iter().filter(|row| !row.counted).count() <= MAX_NOT_COUNTED_RECORDS + 1 {''',
+     [BOUND, NOT_WORKED_OUT]),
+    ("E3 the order is worked out at the bound itself", PERSON,
+     '''    if kept.iter().filter(|row| !row.counted).count() <= MAX_NOT_COUNTED_RECORDS {''',
+     '''    if kept.iter().filter(|row| !row.counted).count() < MAX_NOT_COUNTED_RECORDS {''',
+     [NOT_WORKED_OUT]),
+    ("E4 a row's record is checked again to read its time", PERSON,
+     '''        let at = SignedAddition::time_of(&row.record).unwrap_or(u64::MAX);''',
+     '''        let at = SignedAddition::from_bytes(&row.record)
+            .map_or(u64::MAX, |record| record.addition.at);''',
+     [NOT_CHECKED_AGAIN]),
+    ("E5 the time is read without passing over the label", ADDITION,
+     '''        reader.take(length)?;
+        reader.u64()''',
+     '''        let _ = length;
+        reader.u64()''',
+     [TIME_OF]),
+    ("E6 the time is read from bytes that end before it", ADDITION,
+     '''        reader.take(length)?;
+        reader.u64()''',
+     '''        reader.take(length)?;
+        Some(reader.u64().unwrap_or(0))''',
+     [TIME_OF]),
+    ("E7 an entry given again is never read again, though its record went", TAKE,
+     '''    if again && (is_kept(conn, &record)? || !is_the_entry_held(conn, entry)?) {''',
+     '''    if again {''',
+     [GIVEN_AGAIN]),
+
     # A record's time.
     ("T1 a row whose bytes are no record says the earliest time", PERSON,
-     '''map_or(u64::MAX, |record| record.addition.at);''',
-     '''map_or(0, |record| record.addition.at);''',
+     '''        let at = SignedAddition::time_of(&row.record).unwrap_or(u64::MAX);''',
+     '''        let at = SignedAddition::time_of(&row.record).unwrap_or(0);''',
      [BOUND]),
     ("T2 among records of one key, the first seen and not the oldest by its time", PERSON,
      '''        (self.at, &self.row.record)''',
