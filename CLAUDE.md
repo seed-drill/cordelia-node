@@ -233,6 +233,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
+| `LET_GO_READ_STANDS_SECS` | 600s (derived: a read before a let-go stands for its `discard`, on the monotonic clock) | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
 | `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |
 | `DEVICE_DELETE_SWEEP_INTERVAL_SECS` | 86400s (a device's sweep of old deletes) | parameter-rationale.md §12.9 |
