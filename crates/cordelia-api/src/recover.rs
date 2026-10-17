@@ -508,14 +508,25 @@ pub fn read_generation(
     // addition (§2.3). The door takes nothing that a key which does not
     // count signed, so it is looked for in what the relays handed, as
     // `names_before` reads names there: an entry under an `added/` name
-    // that opens with the channel's secret and is no delete.
+    // that opens with the channel's secret and holds a record whose
+    // signature holds by that very key (a delete holds none).
+    let a_record_by_its_signer = |entry: &CheckedEntry| {
+        let Ok(inside) = entry.open(&personal) else {
+            return false;
+        };
+        let Value::Other(bytes) = &inside.value else {
+            return false;
+        };
+        let Ok(record) = SignedAddition::from_bytes(bytes) else {
+            return false;
+        };
+        inside.name.starts_with(PERSONAL_ADDED_PREFIX)
+            && record.addition.adder == entry.author
+            && record.verify().is_ok()
+    };
     let signed_records: BTreeSet<[u8; 32]> = of_it
         .iter()
-        .filter(|entry| no_room.contains_key(&entry.author) && !entry.delete)
-        .filter(|entry| {
-            let opened = entry.open(&personal);
-            opened.is_ok_and(|inside| inside.name.starts_with(PERSONAL_ADDED_PREFIX))
-        })
+        .filter(|entry| no_room.contains_key(&entry.author) && a_record_by_its_signer(entry))
         .map(|entry| entry.author)
         .collect();
     for row in &mut not_counted {
@@ -614,6 +625,41 @@ pub fn in_other_hands(rows: &[Row], answers: &[Answer], at: usize) -> bool {
         }
     }
     false
+}
+
+/// The adders of `row` that are shown, in the order of their rows, and
+/// how many are not (decision 2026-10-17 §2.4): an adder that may be in
+/// someone else's hands by `answers` ([`in_other_hands`] of its own
+/// row) is counted, and neither it nor its label is shown. `rows` are the
+/// rows that are shown, and hold every adder; `row` may be one of them or
+/// one that could not be shown. None for a row that no key added for
+/// the bound of 64 alone ([`Row::no_room`]).
+pub fn adders_shown<'a>(
+    rows: &[Row],
+    answers: &[Answer],
+    row: &'a Row,
+) -> (Vec<&'a AddedAs>, usize) {
+    let hidden = |(adder, ..): &&AddedAs| {
+        let place = rows.iter().position(|row| row.key == *adder);
+        place.is_some_and(|place| in_other_hands(rows, answers, place))
+    };
+    let (hidden, shown): (Vec<_>, Vec<_>) = row.no_room.iter().partition(hidden);
+    (shown, hidden.len())
+}
+
+/// The label that `row` is shown by, at its row, before the yes, and in
+/// what the machine keeps of it (decision 2026-10-17 §2.4, §1 property
+/// 3): the statement's, or its adder's. For a key that the 64 kept out,
+/// that of the first adder shown ([`adders_shown`]), so that no adder
+/// that may be in someone else's hands chooses it; and none where every
+/// adder may be: the key is then shown by its words alone, as an empty
+/// label is everywhere.
+pub fn label_shown<'a>(rows: &[Row], answers: &[Answer], row: &'a Row) -> &'a str {
+    if row.no_room.is_empty() {
+        return &row.label;
+    }
+    let (shown, _) = adders_shown(rows, answers, row);
+    shown.first().map_or("", |(_, _, label)| label.as_str())
 }
 
 /// The keys that the look of a recovery takes from (decision 2026-10-04
@@ -3576,13 +3622,15 @@ mod tests {
     /// by a key that does not count, so no reader takes it. The row of the
     /// key that added it says that it signed a record, which is looked for
     /// in what the relays handed: an entry under an `added/` name, signed
-    /// by that key, that opens and is no delete.
+    /// by that key, that opens and holds a record whose signature holds by
+    /// that key.
     ///
     /// A statement lists device 0 and device 1. Device 0 adds 62 keys, and
     /// 64 count. Device 1 adds a tablet and a watch, which the 64 keep out.
     /// The tablet adds a phone. The watch signs a delete under an `added/`
-    /// name, a word under a name's place, and an entry that does not open;
-    /// device 0 signs records, and is no key of a row that the 64 kept out.
+    /// name, a word under a name's place, an entry that does not open, and
+    /// entries that hold no record that it signed; device 0 signs records,
+    /// and is no key of a row that the 64 kept out.
     #[test]
     fn test_a_key_added_by_a_key_the_64_kept_out_has_no_row() {
         use Answer::{Lost, NotAsked};
@@ -3614,6 +3662,42 @@ mod tests {
         handed.push(delete);
         let word = names::word_name("theirs");
         handed.push(entry_by(&watch, &personal, band + 1, &word, text("x"), &[]));
+        // Under `added/` names: plain text; bytes that are no record; a
+        // record that another key signed; and one of the watch's own whose
+        // signature does not hold. And a record of the watch's own, whole,
+        // under a name's place. None is a record that the watch signed.
+        let watch_as = |key: [u8; 32], value: Value| {
+            entry_by(
+                &watch,
+                &personal,
+                band + 1,
+                &added_name(&key).unwrap(),
+                value,
+                &[],
+            )
+        };
+        let [some, other, third] = [703, 704, 705].map(|n| identity_of(n).public_key());
+        handed.push(watch_as(phone, text("a device of mine")));
+        handed.push(watch_as(some, Value::Other(vec![1; 300])));
+        let device = |key: [u8; 32]| Device::new(key, "a device").unwrap();
+        let by = |adder: &NodeIdentity, key: [u8; 32]| {
+            let record = Addition::under(&statement, device(key), adder.public_key(), AT);
+            record.unwrap().sign(adder).unwrap().to_bytes().unwrap()
+        };
+        handed.push(watch_as(other, Value::Other(by(&s[0].identity, other))));
+        let mut forged = by(&watch, third);
+        *forged.last_mut().unwrap() ^= 1;
+        handed.push(watch_as(third, Value::Other(forged)));
+        let elsewhere = names::word_name("a record");
+        let whole = Value::Other(by(&watch, third));
+        handed.push(entry_by(
+            &watch,
+            &personal,
+            band + 1,
+            &elsewhere,
+            whole,
+            &[],
+        ));
         let no_content = vec![7; cordelia_core::protocol::MIN_ENTRY_CONTENT_BYTES];
         let not_opened =
             crate::several::signed_in(&personal, &watch, [3; 32], band + 3, no_content);
