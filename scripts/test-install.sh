@@ -296,6 +296,7 @@ run "a-first-install"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 first_install_says "systemctl --user enable --now cordelia"
 private
+has_not "could be read, written or entered by others"
 
 service() { echo "${1:-active}" > "$HOME/.fake/service"; }
 
@@ -470,6 +471,7 @@ setup() {
 run "a-data-directory-that-was-open-to-others"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 private
+has "/.cordelia could be read, written or entered by others than its owner and its group: setting it to its owner's alone (mode 700)."
 check "the key's mode is left as it was" \
     "$(mode_of "$HOME_DIR/.cordelia/identity.key")" "$(mode_of "$HOME_DIR/.fake/calls")"
 
@@ -481,6 +483,21 @@ setup() {
 run "an-upgrade-of-a-data-directory-that-was-open-to-others"
 expect "installed=$NEW running=$NEW restart=done" 0 1
 private
+
+# A data directory shared with its group on purpose, and open to nobody
+# else, is left as it is, and so is the configuration file in it: nothing
+# is set, and nothing is said. A first install's own is made private.
+setup() {
+    mkdir -p "$HOME/.cordelia/bin"; echo "the one before" > "$HOME/.cordelia/bin/cordelia"
+    touch "$HOME/.cordelia/identity.key" "$HOME/.cordelia/config.toml"
+    chmod 750 "$HOME/.cordelia"; chmod 640 "$HOME/.cordelia/config.toml"
+}
+run "a-data-directory-shared-with-its-group"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+check "the data directory's mode" "$(mode_of "$HOME_DIR/.cordelia")" "drwxr-x---"
+check "the configuration file's mode" \
+    "$(mode_of "$HOME_DIR/.cordelia/config.toml")" "-rw-r-----"
+has_not "could be read, written or entered by others"
 
 # A configuration file that is a link is kept elsewhere: no mode is set
 # through the link, and the data directory is set as it always is.

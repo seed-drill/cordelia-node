@@ -253,6 +253,38 @@ pub fn would_bring(
     Ok(left.unwrap_or(Brought::Carried))
 }
 
+/// Whether the name's channel in the generation applied holds, in the
+/// slot of `version`, a later revision written by the same author as
+/// `version` (decision 2026-10-04 §7.3): an entry of one of its authors,
+/// or one that carried what such an author signed, whose chain begins
+/// with that author's link to its own value ([`chain::carried_from`]). A
+/// later revision that another key wrote is not that author's work, and
+/// what lies under it was not brought back.
+///
+/// [`chain::carried_from`]: cordelia_crypto::chain::carried_from
+pub fn later_by_its_author(
+    conn: &Connection,
+    name: &str,
+    version: &Version,
+) -> Result<bool, PersonError> {
+    let standing = Standing::to_write(conn)?;
+    let secret = standing.name_secret(conn, name)?;
+    let slot = standing.slot(conn, &secret, &version.name)?;
+    let rev = lifted(version.rev);
+    let authors: Vec<[u8; 32]> = version.entries.iter().map(|entry| entry.author).collect();
+    let by_them = |held: &Version| {
+        held.rev > rev
+            && held.entries.iter().any(|entry| {
+                let carried_from = |author: &[u8; 32]| {
+                    let first = entry.chain.as_deref().and_then(<[Link]>::first);
+                    first == Some(&Link::of(&held.value, *author))
+                };
+                authors.contains(&entry.author) || authors.iter().any(carried_from)
+            })
+    };
+    Ok(slot.current.iter().chain(&slot.lost).any(by_them))
+}
+
 /// The one judgement of a version for a carry: why it is left, or `None`
 /// where it may be carried into the channel whose secret is `secret`,
 /// which is the name's in the generation applied.

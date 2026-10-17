@@ -194,10 +194,12 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > §10.5. A relay keeps `channel-keys/` for the older kind.
 >
 > **The data directory itself is mode 0700, and `config.toml` in it 0600.**
-> `cordelia init` and the install script make them so. A node that starts on
-> a data directory that others can read, write or enter sets it to 0700, and
-> the configuration file in it to 0600, and says so once in its log
-> (configuration.md §5.4).
+> `cordelia init`, `cordelia swarm-init` and the install script make them
+> so. One that is there already is set to 0700, with the configuration file
+> in it to 0600, only where others than its owner and its group can read,
+> write or enter it: by `init`, the install script and a node that starts,
+> and each says so, the node once in its log. A directory shared with its
+> group on purpose is left as it is (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
@@ -385,13 +387,25 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   the exception. `cordelia status`, `cordelia sync status`, `cordelia
 >   devices` and `cordelia history` still answer beside such a node, with the
 >   note (decision 2026-10-04 §10.1, rule 6).
-> - **A command that opens the database itself opens none beside a running
->   node of another version:** opening runs the schema's steps, and a later
->   command would step the database under an earlier node. `cordelia stats`,
->   `cordelia channels`, `cordelia swarm-init`, and `cordelia init` where it
->   makes the database or is given `--force`, say the note that names the
->   restart, and open nothing. `cordelia status` says the note, and reads
->   nothing of the database. Where no node answers, each goes on.
+> - **A command that opens the database itself asks the data directory's
+>   lock first,** the one a node holds for as long as it runs (§10.5), and
+>   asks no port: opening runs the schema's steps, and would step the
+>   database under the node. Where a node holds the lock, `cordelia
+>   swarm-init`, and `cordelia init` where it makes the database or is given
+>   `--force`, open nothing and name the command that stops the node;
+>   `cordelia stats`, `cordelia channels` and what `cordelia status` says of
+>   what is stored read the database for reading only, with no step run,
+>   and only where it is at their own schema version: at another the node
+>   is of another version, and they open nothing, and name `cordelia status`
+>   and the restart instead. Where no node holds it, each goes on. A node on
+>   another data directory never refuses them, whatever answers at the
+>   port.
+> - **A command that cannot reach the node says how it is started:** the
+>   command that starts the service on the system (`systemctl --user start
+>   cordelia` on Linux, `launchctl load
+>   ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist` on macOS), and
+>   `cordelia start` where the node does not run as that service. `cordelia
+>   status` says the same where the node is not running.
 > - `cordelia sync exclude`, `cordelia sync include`, `cordelia sync claude
 >   --exclude` and `cordelia sync claude --all` are refused, before anything
 >   is sent to the node, with what to do instead: only what is mapped syncs,

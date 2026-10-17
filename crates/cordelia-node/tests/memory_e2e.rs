@@ -1009,3 +1009,64 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
         "{said}"
     );
 }
+
+/// A relay that is set up with no key, by a name, is one line in
+/// `cordelia devices`, whatever waits to be sent there (decision
+/// 2026-10-04 §8). The node gives the row of what waits there no name,
+/// only the address it reached the relay at: the command finds that
+/// address under the relay's name, and says it on the relay's line. Here
+/// the relay has too little room for the folder, so something of it
+/// waits there for as long as the test looks.
+#[test]
+fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
+    let mut relay = node("relay", "relay", None);
+    relay.max_storage_bytes(200_000);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let name = format!("localhost:{}", relay.p2p);
+    let mut device = node_with_relays("laptop", "personal", &[(name.clone(), None)]);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("device reaches its relay", &[&device, &relay], 60, || {
+        has_hot_peer(&device)
+    });
+    makes_a_phrase(&device, "laptop");
+
+    let (notes, memory) = notes_of(&device);
+    std::fs::create_dir_all(&memory).unwrap();
+    let text = "a memory that does not fit. ".repeat(1400);
+    for n in 0..6 {
+        std::fs::write(memory.join(format!("note-{n}.md")), format!("{n}\n{text}")).unwrap();
+    }
+    syncs_notes_as_lab(&device, &notes);
+    wait_for(
+        "something waits at the relay",
+        &[&device, &relay],
+        120,
+        || {
+            let seen = person_of(&device);
+            let waiting = seen["waiting"].as_array()?.clone();
+            waiting
+                .iter()
+                .any(|row| row["name"].is_null() && row["waits"].as_u64().is_some_and(|n| n > 0))
+                .then_some(())
+        },
+    );
+
+    let said = device.cli(&["devices"]);
+    let block: Vec<&str> = said
+        .lines()
+        .skip_while(|line| *line != "Relays:")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("      "))
+        .collect();
+    let port = format!(":{}", relay.p2p);
+    let of_it: Vec<&&str> = block.iter().filter(|line| line.contains(&port)).collect();
+    assert_eq!(of_it.len(), 1, "{said}");
+    assert!(of_it[0].starts_with(&format!("  {name}: ")), "{said}");
+    assert!(of_it[0].contains("still to send there"), "{said}");
+    for address in [format!("127.0.0.1{port}"), format!("[::1]{port}")] {
+        assert!(!said.contains(&address), "{address}: {said}");
+    }
+}

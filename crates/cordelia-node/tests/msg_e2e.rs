@@ -2514,8 +2514,24 @@ fn log_outside_a_terminal_shows_only_the_folders_agent() {
         &two.desktop,
         &work,
         &[],
-        "The node is not running, so nothing was done. Start it with: cordelia start",
+        &format!(
+            "The node is not running, so nothing was done. {}",
+            cordelia_api::commands::start_says(std::env::consts::OS)
+        ),
     );
+    // It names the service of this system, and not `cordelia start`
+    // alone, as it did.
+    let said = msg_in(&two.desktop, &work, &[], &["log"], b"");
+    let said = err(&said);
+    let service = match std::env::consts::OS {
+        "macos" => "launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+        _ => "systemctl --user start cordelia",
+    };
+    assert!(
+        said.contains(&format!("Start it with `{service}`")),
+        "{said}"
+    );
+    assert!(!said.contains("Start it with: cordelia start"), "{said}");
 }
 
 /// Two agents answer each other in new threads on one device: the

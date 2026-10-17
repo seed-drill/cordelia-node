@@ -789,13 +789,30 @@ fn node_is_ready(by_a_script: bool) -> &'static str {
     }
 }
 
-/// Whether anyone but its owner may read, write or enter what is at
-/// `path`: any bit of its mode that is the group's or everyone else's.
-/// What is not there is open to nobody.
+/// Whether anyone but its owner and its group may read, write or enter
+/// what is at `path`: any bit of its mode that is everyone else's. A
+/// directory that is shared with its group on purpose is not open to
+/// others. What is not there is open to nobody.
 #[cfg(unix)]
 fn open_to_others(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|found| found.permissions().mode() & 0o077 != 0)
+    std::fs::metadata(path).is_ok_and(|found| found.permissions().mode() & 0o007 != 0)
+}
+
+/// Where a system has no such modes, nothing is open to others.
+#[cfg(not(unix))]
+fn open_to_others(_: &std::path::Path) -> bool {
+    false
+}
+
+/// What is said where the data directory at `dir` was open to others
+/// ([`open_to_others`]), before what was done of it.
+fn was_open_says(dir: &std::path::Path) -> String {
+    format!(
+        "the data directory {} could be read, written or entered by others than its owner \
+         and its group",
+        dir.display()
+    )
 }
 
 /// Let only its owner read and write the file, or read, write and enter
@@ -836,18 +853,25 @@ fn not_private_says(dir: &std::path::Path, why: &std::io::Error) -> String {
 /// Make the data directory at `dir`, with every directory above it that
 /// is missing, and let only its owner read, write or enter it (mode
 /// 0700): it holds the device's key, the node's token and the database.
-/// One that is there already is set so. Nothing in it is touched.
+/// **One that is there already is set so only where it is open to others
+/// than its owner and its group** ([`open_to_others`]), as a node that
+/// starts sets it ([`keep_private`]), and what is given back says so: a
+/// directory shared with its group on purpose is left as it is. Nothing
+/// in it is touched.
 ///
 /// **Only a directory that cannot be made is an error.** Where its mode
 /// cannot be set (the directory is another's, or its volume refuses the
 /// change), the directory is used as it is, and this gives back what to
-/// say of it ([`not_private_says`]): a node that starts there does the
-/// same ([`keep_private`]). `set` sets the mode: [`owners_alone`], but in
-/// the test of this.
+/// say of it ([`not_private_says`]). `set` sets the mode:
+/// [`owners_alone`], but in the test of this.
 fn private_data_dir(
     dir: &std::path::Path,
     set: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<Option<String>> {
+    let there = dir.is_dir();
+    if there && !open_to_others(dir) {
+        return Ok(None);
+    }
     let mut made = std::fs::DirBuilder::new();
     made.recursive(true);
     #[cfg(unix)]
@@ -857,13 +881,18 @@ fn private_data_dir(
     }
     made.create(dir)?;
     match set(dir) {
-        Ok(()) => Ok(None),
+        Ok(()) if !there => Ok(None),
+        Ok(()) => Ok(Some(format!(
+            "{}: it is now its owner's alone (mode 0700).",
+            was_open_says(dir)
+        ))),
         Err(why) => Ok(Some(not_private_says(dir, &why))),
     }
 }
 
-/// What a node that starts does about a data directory that others can
-/// read, write or enter: **it sets the directory to its owner's alone
+/// What a node that starts does about a data directory that others than
+/// its owner and its group can read, write or enter ([`open_to_others`]):
+/// **it sets the directory to its owner's alone
 /// (mode 0700), and with it the configuration file, where that file is
 /// in the directory (mode 0600).** Nothing else's mode changes: not a
 /// file in the directory that has its own mode already, and not a
@@ -873,18 +902,16 @@ fn private_data_dir(
 /// to is touched ([`is_a_link`]).
 ///
 /// Returns what the node's log says of it, once: what was set, or what
-/// could not be. `None` where the directory is its owner's alone
-/// already: nothing is looked at further, and nothing is said. A mode
+/// could not be. `None` where the directory is open to no one but its
+/// owner and its group (one shared with its group on purpose is left as
+/// it is): nothing is looked at further, and nothing is said. A mode
 /// that cannot be set keeps no node from starting.
 #[cfg(unix)]
 fn keep_private(data_dir: &std::path::Path, config_file: &std::path::Path) -> Option<String> {
     if !open_to_others(data_dir) {
         return None;
     }
-    let mut says = format!(
-        "the data directory {} could be read, written or entered by others",
-        data_dir.display()
-    );
+    let mut says = was_open_says(data_dir);
     match owners_alone(data_dir) {
         Ok(()) => says.push_str(": it is now its owner's alone (mode 0700)"),
         Err(e) => says.push_str(&format!(
@@ -914,10 +941,10 @@ fn cmd_init(
     let mut config = Config::load(&config_file).unwrap_or_default();
     config.apply_env_overrides();
     // `init` opens the database where it makes one, and with `--force`:
-    // it opens none beside a node of another version, and writes nothing
-    // there either (decision 2026-10-04 §10.1, rule 6).
+    // it opens none where a node holds the data directory's lock, and
+    // writes nothing there either (decision 2026-10-04 §10.1, rule 6).
     if force || !config.data_dir().join("cordelia.db").exists() {
-        refuse_to_open_beside_another_version(config_path)?;
+        refuse_beside_its_node(&config.data_dir())?;
     }
     init_with(
         &config_file,
@@ -934,9 +961,11 @@ fn cmd_init(
 /// the database and the configuration, each made where it is not there
 /// (or made again with `force`).
 ///
-/// **The data directory is its owner's alone (mode 0700), and so is the
-/// configuration file that this writes (mode 0600),** but one that it
-/// writes through a symbolic link. The key, the token and the database
+/// **The data directory that this makes is its owner's alone (mode
+/// 0700), and one that is there already is set so where it is open to
+/// others than its owner and its group ([`private_data_dir`]). The
+/// configuration file that this writes is its owner's alone (mode
+/// 0600),** but one that it writes through a symbolic link. The key, the token and the database
 /// are each 0600.
 fn init_with(
     config_file: &std::path::Path,
@@ -1353,23 +1382,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     let db_path = data_dir.join("cordelia.db");
     // A database from a later version is not opened: the status says so,
     // and goes on to what the node says of itself (decision 2026-10-04
-    // §10.1).
-    // Nor is it opened beside a running node of another version: the
-    // schema's steps would be run under that node (rule 6). Where the
-    // node said nothing in the moment that a status gives it, it is
-    // asked once more, for as long as a command waits for a node.
-    let beside = match &status.live {
-        Some(live) => version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION"))
-            .map(|_| NOT_READ_BESIDE_ANOTHER_VERSION.to_string()),
-        None if status.not_asked.is_some() => None,
-        None => another_version_answered(&node_status(config_path, VERSION_ASKED_FOR))
-            .map(|note| format!("{note} So {NOT_READ_BESIDE_ANOTHER_VERSION}")),
-    };
-    let opened = match (db_path.exists(), beside) {
-        (false, _) => None,
-        (true, Some(why)) => Some(Err(anyhow::anyhow!(why))),
-        (true, None) => Some(open_database(&db_path, &config)),
-    };
+    // §10.1). Where a node holds the data directory's lock, it is read
+    // without the schema's steps, and not at all beside a node of
+    // another version (rule 6, [`open_to_read`]).
+    let opened = db_path.exists().then(|| open_to_read(&config));
     if let Some(Err(why)) = &opened {
         println!();
         println!("Storage:");
@@ -1471,12 +1487,22 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
         // A node whose address is refused is not asked, and is not known
         // to be stopped.
         None => match &status.not_asked {
-            None => println!("  Running:   no (start it with `cordelia start`)"),
+            None => println!("{}", not_running_line(std::env::consts::OS)),
             Some(why) => println!("  Running:   not asked: {why}"),
         },
     }
 
     Ok(())
+}
+
+/// The line of `cordelia status` where the node is not running, on the
+/// system named: how it is started there
+/// ([`cordelia_api::commands::start_says`]).
+fn not_running_line(os: &str) -> String {
+    format!(
+        "  Running:   no. {}",
+        cordelia_api::commands::start_says(os)
+    )
 }
 
 /// What the folders of a sync report say, for the level: how many sync,
@@ -2677,9 +2703,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
 
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
-    let db_path = data_dir.join("cordelia.db");
-    refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path, &config)?;
+    let conn = open_to_read(&config)?;
 
     // A personal node carries no channel of the older kind (decision
     // 2026-10-04 §10): what it has is the names that it holds, each with
@@ -2756,8 +2780,7 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     let identity = NodeIdentity::from_file(&identity_path)?;
     let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
-    refuse_to_open_beside_another_version(config_path)?;
-    let conn = open_database(&db_path, &config)?;
+    let conn = open_to_read(&config)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     // A personal node carries no channel of the older kind (decision
@@ -2944,12 +2967,15 @@ fn cmd_swarm_init(
     let entity_id = format!("swarm{index}_{child_suffix}");
 
     // The database is opened below: none is opened, and nothing is made,
-    // beside a node of another version (decision 2026-10-04 §10.1, rule
-    // 6).
-    refuse_to_open_beside_another_version(config_path)?;
+    // where a node holds the data directory's lock (decision 2026-10-04
+    // §10.1, rule 6).
+    refuse_beside_its_node(&data_dir)?;
 
-    // Write child identity
-    std::fs::create_dir_all(&data_dir)?;
+    // Write child identity. The data directory is made its owner's alone
+    // (mode 0700), as `cordelia init` and the install script make it.
+    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
+        eprintln!("{says}");
+    }
     let identity_path = data_dir.join("identity.key");
     if identity_path.exists() {
         anyhow::bail!(
@@ -3321,6 +3347,16 @@ fn to_this_machine(
     Ok((client, url))
 }
 
+/// What a command says where the node's local API at `url` cannot be
+/// reached, on the system named: why, and how the node is started there
+/// ([`cordelia_api::commands::start_says`]).
+fn cannot_reach_says(url: &str, why: &dyn std::fmt::Display, os: &str) -> String {
+    format!(
+        "cannot reach the local node at {url} ({why}). {}",
+        cordelia_api::commands::start_says(os)
+    )
+}
+
 /// Call the running node's local API (GET, or POST with an empty body)
 /// with the node token, failing after `timeout`.
 fn local_api(
@@ -3341,11 +3377,8 @@ fn local_api(
     } else {
         agent.get(&url).header("Authorization", &auth).call()
     };
-    let mut resp = resp.map_err(|e| {
-        anyhow::anyhow!(
-            "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-        )
-    })?;
+    let mut resp =
+        resp.map_err(|e| anyhow::anyhow!(cannot_reach_says(&url, &e, std::env::consts::OS)))?;
     // A failure is an error already. What is left that is no success is
     // an answer the node's API never gives (a redirect, say).
     if !resp.status().is_success() {
@@ -3459,11 +3492,8 @@ pub(crate) fn api_post_within(
             .header("Authorization", &format!("Bearer {}", token.trim()))
             .send_json(&body)
     });
-    let mut resp = sent.map_err(|e| {
-        anyhow::anyhow!(
-            "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-        )
-    })?;
+    let mut resp =
+        sent.map_err(|e| anyhow::anyhow!(cannot_reach_says(&url, &e, std::env::consts::OS)))?;
 
     let status = resp.status();
     // A redirect did not come from the node: nothing of it is read.
@@ -3555,11 +3585,7 @@ pub(crate) fn api_post_told_of(
         .post(&url)
         .header("Authorization", &format!("Bearer {}", token.trim()))
         .send_json(body)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot reach the local node at {url} ({e}). Start it with `cordelia start`."
-            )
-        })?;
+        .map_err(|e| anyhow::anyhow!(cannot_reach_says(&url, &e, std::env::consts::OS)))?;
     let status = resp.status();
     if status.is_redirection() {
         anyhow::bail!("what answered at {url} is not the node (HTTP {status})");
@@ -3690,49 +3716,120 @@ fn refuse_by_how_it_stands(status: &anyhow::Result<serde_json::Value>) -> anyhow
     }
 }
 
-/// What a command that opens the node's database itself says of a running
-/// node of another version, after the note that says how to restart it.
-const NOT_OPENED_BESIDE_ANOTHER_VERSION: &str = "This command opens the node's database itself, \
-                                                 and does not open it beside a node of another \
-                                                 version: nothing was opened.";
-
-/// What `cordelia status` says in the place of what the database stores,
-/// beside a running node of another version.
-const NOT_READ_BESIDE_ANOTHER_VERSION: &str = "a node of another version is running, and its \
-                                               database is not opened beside it.";
-
-/// The note on a running node of another version than this command
-/// ([`version_note`]), given what answered when the node was asked its
-/// status. `None` where the node is of this command's version, and where
-/// no node answered: there is then none to say it of.
-fn another_version_answered(status: &anyhow::Result<serde_json::Value>) -> Option<String> {
-    let node = status.as_ref().ok()?;
-    version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+/// Whether a node holds the lock on the data directory `data_dir` now
+/// (decision 2026-10-04 §10.1): the lock that a node takes on the file
+/// [`NODE_LOCK`] there before it opens its database, and holds for as
+/// long as it runs. It is asked, and let go of at once: this process
+/// keeps no lock. Where the file is not there, no node holds it, and
+/// none is made: the command writes nothing in the directory. A lock
+/// that cannot be asked for any other reason (the volume knows no such
+/// lock) is taken for none, as a node takes it ([`lock_tried`]).
+fn a_node_holds(data_dir: &std::path::Path) -> bool {
+    match std::fs::File::open(data_dir.join(NODE_LOCK)) {
+        Ok(file) => lock_tried(file.try_lock()) == Lock::AnotherNode,
+        Err(_) => false,
+    }
 }
 
-/// Refuse to open the node's database beside a running node of another
-/// version than this command (decision 2026-10-04 §10.1, rule 6). A
-/// command that opens the database runs the schema's steps on it, and a
-/// node goes on running the version it was started as until it is
-/// restarted: a later command would step the database under an earlier
-/// node. The refusal is the note that says how to restart the node, and
-/// nothing is opened.
+/// What a command that opens the node's database itself and writes says
+/// where a node holds the lock on the data directory at `data_dir`, on
+/// the system named: that nothing was opened, and the command that stops
+/// the node first.
+fn not_opened_beside_its_node(data_dir: &std::path::Path, os: &str) -> String {
+    format!(
+        "a node is running on the data directory {}, and this command opens the node's \
+         database itself: nothing was opened, and nothing was changed. Stop the node first \
+         (`{}`, where it runs as the service that the install script set up), and run this \
+         command again.",
+        data_dir.display(),
+        cordelia_api::commands::stop_command(os)
+    )
+}
+
+/// What a command that reads the node's database itself says where a
+/// node holds the lock on the data directory at `data_dir` and the
+/// database is at schema version `found`, and not this command's `own`,
+/// on the system named: the node is of another version, nothing was
+/// opened, and the commands to run instead.
+fn not_read_beside_another_version(
+    data_dir: &std::path::Path,
+    found: u32,
+    own: u32,
+    os: &str,
+) -> String {
+    format!(
+        "a node of another version is running on the data directory {}: its database is at \
+         schema version {found}, and this command knows schema version {own}. This command \
+         opens the node's database itself, and does not open it beside a node of another \
+         version: nothing was opened. `cordelia status` asks the node itself; or restart the \
+         node, so that it runs this command's version (`{}`).",
+        data_dir.display(),
+        cordelia_api::commands::restart_command(os)
+    )
+}
+
+/// Refuse a command that opens the node's database itself and writes
+/// (`init` where it opens the database, `swarm-init`) where a node holds
+/// the lock on the data directory `data_dir` (decision 2026-10-04 §10.1,
+/// rule 6): opening runs the schema's steps, and would step the database
+/// under the node; and what the command writes would be written under it.
+/// Nothing is opened or written, and the refusal names the command that
+/// stops the node ([`not_opened_beside_its_node`]).
 ///
-/// The commands that open the database themselves are `stats`,
-/// `channels`, `swarm-init`, and `init` where it makes the database or
-/// is given `--force`. `cordelia status` opens it too, to say what it
-/// stores: beside such a node it says the note, and reads nothing of the
-/// database.
-///
-/// **Where no node answers, the command goes on as it did:** there is
-/// no node to open the database beside. (A command that is sent to the
-/// node is refused there, [`refuse_another_version`]: these are sent to
-/// no node.)
-fn refuse_to_open_beside_another_version(config_path: &str) -> anyhow::Result<()> {
-    match another_version_answered(&node_status(config_path, VERSION_ASKED_FOR)) {
-        None => Ok(()),
-        Some(note) => anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}"),
+/// **The lock is what is asked, and no port:** a node that answers late,
+/// answers with an error, or listens at another port than this command's
+/// configuration names holds it all the same. And a node that runs on
+/// another data directory does not hold this one's lock: it never
+/// refuses the command.
+fn refuse_beside_its_node(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    match a_node_holds(data_dir) {
+        true => anyhow::bail!(
+            "{}",
+            not_opened_beside_its_node(data_dir, std::env::consts::OS)
+        ),
+        false => Ok(()),
     }
+}
+
+/// Open the node's database for a command that only reads it (`stats`,
+/// `channels`, and what `cordelia status` says of what it stores),
+/// asking the data directory's lock first (decision 2026-10-04 §10.1,
+/// rule 6).
+///
+/// - **Where no node holds the lock,** it is opened as any command opens
+///   it ([`open_database`]): its schema's steps are run.
+/// - **Where a node holds it,** it is opened for reading only, and none of
+///   the schema's steps is run: nothing is written beside the node. It is
+///   read only where it stands at this command's schema version, which
+///   the running node has stepped it to. One from a later version is
+///   refused, as any command refuses it ([`from_a_later_version`]); at an
+///   earlier one the node is of another version, and nothing is opened
+///   ([`not_read_beside_another_version`]).
+fn open_to_read(config: &Config) -> anyhow::Result<rusqlite::Connection> {
+    let data_dir = config.data_dir();
+    let db_path = data_dir.join("cordelia.db");
+    if !a_node_holds(&data_dir) {
+        return open_database(&db_path, config);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(
+        cordelia_core::protocol::STREAM_TIMEOUT_SECS,
+    ))?;
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let own = cordelia_storage::schema::SCHEMA_VERSION;
+    if found > own {
+        anyhow::bail!("{}", from_a_later_version(&db_path, found, own));
+    }
+    if found != own {
+        anyhow::bail!(
+            "{}",
+            not_read_beside_another_version(&data_dir, found, own, std::env::consts::OS)
+        );
+    }
+    Ok(conn)
 }
 
 /// Say, where the running node is another version than this command, that
@@ -6977,6 +7074,133 @@ mod tests {
         assert!(lock_data_dir(dir.path()).unwrap().is_none());
     }
 
+    /// A command that opens the node's database itself asks the lock that
+    /// a node holds on its data directory, and nothing else (decision
+    /// 2026-10-04 §10.1, rule 6). With no lock file, and with one that no
+    /// node holds, it goes on, and opens the database as any command
+    /// does: its steps are run. Where a node holds the lock, a command
+    /// that writes refuses, and names the command that stops the node; a
+    /// command that reads opens the database for reading only, with no
+    /// step run, and only at its own schema version. Asking makes no file,
+    /// and keeps no lock.
+    #[test]
+    fn test_a_command_asks_the_lock_on_the_data_directory() {
+        use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.node.data_dir = dir.path().display().to_string();
+        let database = dir.path().join("cordelia.db");
+        let version = || -> u32 {
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+
+        // No node: nothing refuses, and nothing is made.
+        assert!(!a_node_holds(dir.path()));
+        assert!(!dir.path().join(NODE_LOCK).exists());
+        assert!(refuse_beside_its_node(dir.path()).is_ok());
+
+        // A node holds the lock, over a database in the released form.
+        drop(cordelia_storage::first_start::released::database(&database).unwrap());
+        let held = lock_data_dir(dir.path())
+            .unwrap()
+            .expect("the lock is taken");
+        assert!(a_node_holds(dir.path()));
+        assert_eq!(
+            refuse_beside_its_node(dir.path()).unwrap_err().to_string(),
+            not_opened_beside_its_node(dir.path(), std::env::consts::OS)
+        );
+        let refused = open_to_read(&config).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            not_read_beside_another_version(
+                dir.path(),
+                RELEASED_SCHEMA_VERSION,
+                SCHEMA_VERSION,
+                std::env::consts::OS
+            )
+        );
+        assert_eq!(version(), RELEASED_SCHEMA_VERSION, "nothing was stepped");
+        // Asking took nothing: the node still holds it.
+        assert!(a_node_holds(dir.path()));
+
+        // Let go of: the command opens it as any does, and steps it.
+        drop(held);
+        assert!(!a_node_holds(dir.path()));
+        drop(open_to_read(&config).unwrap());
+        assert_eq!(version(), SCHEMA_VERSION);
+
+        // A node of this version holds it: the database is read, and
+        // only read.
+        let held = lock_data_dir(dir.path())
+            .unwrap()
+            .expect("the lock is taken");
+        let read = open_to_read(&config).unwrap();
+        let wrote = read.execute("INSERT INTO node_meta (key, value) VALUES ('a', 'b')", []);
+        assert!(wrote.is_err(), "{wrote:?}");
+        drop(read);
+        // One from a later version is refused as any command refuses it.
+        let later = SCHEMA_VERSION + 1;
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", later)
+            .unwrap();
+        assert_eq!(
+            open_to_read(&config).unwrap_err().to_string(),
+            from_a_later_version(&database, later, SCHEMA_VERSION)
+        );
+        drop(held);
+
+        // What is said names the commands to run instead, on each system.
+        for os in ["linux", "macos"] {
+            let stop = cordelia_api::commands::stop_command(os);
+            let restart = cordelia_api::commands::restart_command(os);
+            assert!(not_opened_beside_its_node(dir.path(), os).contains(&format!("(`{stop}`")));
+            let said = not_read_beside_another_version(dir.path(), 10, 19, os);
+            assert!(
+                said.contains("`cordelia status` asks the node itself"),
+                "{said}"
+            );
+            assert!(said.contains(&format!("(`{restart}`)")), "{said}");
+        }
+    }
+
+    /// Every sentence that says how the node is started names the command
+    /// that starts the service on the system, as `cordelia status` says it
+    /// ([`cordelia_api::commands::start_says`]), and never `cordelia
+    /// start` alone: where the node cannot be reached, and the status's
+    /// line of a node that is not running.
+    #[test]
+    fn test_every_sentence_that_starts_the_node_names_the_service() {
+        let systems = [
+            ("linux", "systemctl --user start cordelia"),
+            (
+                "macos",
+                "launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+            ),
+        ];
+        for (os, service) in systems {
+            let start = cordelia_api::commands::start_says(os);
+            assert_eq!(not_running_line(os), format!("  Running:   no. {start}"));
+            for said in [not_running_line(os), cannot_reach_says("u", &"e", os)] {
+                assert!(
+                    said.contains(&format!("Start it with `{service}`")),
+                    "{said}"
+                );
+                assert!(!said.contains("Start it with `cordelia start`"), "{said}");
+            }
+            assert_eq!(
+                cannot_reach_says("http://127.0.0.1:1/api/v1/status", &"refused", os),
+                format!(
+                    "cannot reach the local node at http://127.0.0.1:1/api/v1/status (refused). \
+                     {start}"
+                )
+            );
+        }
+    }
+
     /// `cordelia sync unmap <word>` asks the node to let go of a name
     /// only where the word has nothing to do with a mapping (decision
     /// 2026-10-04 §7.3): no folder is unmapped by the asking. Not for a
@@ -7495,6 +7719,7 @@ mod tests {
     /// mode cannot be set (it is another's, or its volume refuses the
     /// change): it says so in one line, with why, and uses the directory
     /// as it is. Only a directory that cannot be made is an error.
+    #[cfg(unix)]
     #[test]
     fn test_init_goes_on_where_the_data_directory_cannot_be_made_private() {
         use std::io::{Error, ErrorKind};
@@ -7514,6 +7739,38 @@ mod tests {
         );
         // Where the mode is set, nothing is said.
         assert_eq!(private_data_dir(&data, |_| Ok(())).unwrap(), None);
+        // A directory that is there, and open to others than its owner
+        // and its group, is set, and that is said; where its mode cannot
+        // be set, that is said.
+        set_mode(&data, 0o755);
+        assert_eq!(
+            private_data_dir(&data, owners_alone).unwrap(),
+            Some(format!(
+                "the data directory {} could be read, written or entered by others than its \
+                 owner and its group: it is now its owner's alone (mode 0700).",
+                data.display()
+            ))
+        );
+        assert_eq!(mode(&data), 0o700);
+        set_mode(&data, 0o755);
+        assert!(
+            private_data_dir(&data, refused)
+                .unwrap()
+                .unwrap()
+                .starts_with("Could not make")
+        );
+        // One shared with its group, and with nobody else, is left as it
+        // is: nothing is set, and nothing is said.
+        for shared in [0o750, 0o770] {
+            set_mode(&data, shared);
+            let set = |_: &std::path::Path| -> std::io::Result<()> { panic!("{shared:o} was set") };
+            assert_eq!(private_data_dir(&data, set).unwrap(), None);
+            assert_eq!(mode(&data), shared);
+        }
+        // One that is made is made its owner's alone.
+        let new = dir.path().join("new").join("data");
+        assert_eq!(private_data_dir(&new, owners_alone).unwrap(), None);
+        assert_eq!(mode(&new), 0o700);
         // A directory that cannot be made is an error: here a file is in
         // the way.
         let in_the_way = dir.path().join("file");
@@ -7547,9 +7804,9 @@ mod tests {
         assert_eq!(
             said,
             format!(
-                "the data directory {} could be read, written or entered by others: it is now \
-                 its owner's alone (mode 0700), and so is the configuration file in it (mode \
-                 0600)",
+                "the data directory {} could be read, written or entered by others than its \
+                 owner and its group: it is now its owner's alone (mode 0700), and so is the \
+                 configuration file in it (mode 0600)",
                 data.display()
             )
         );
@@ -7561,8 +7818,17 @@ mod tests {
         assert_eq!(keep_private(&data, &config_file), None);
         assert_eq!((mode(&data), mode(&config_file)), (0o700, 0o664));
 
+        // A directory shared with its group, and open to nobody else, is
+        // left as it is, and nothing is said: it was shared on purpose.
+        set_mode(&config_file, 0o640);
+        for shared in [0o750, 0o770, 0o710, 0o720] {
+            set_mode(&data, shared);
+            assert_eq!(keep_private(&data, &config_file), None, "{shared:o}");
+            assert_eq!((mode(&data), mode(&config_file)), (shared, 0o640));
+        }
+
         // A configuration file that is kept elsewhere is left as it is.
-        for open in [0o750, 0o705, 0o701, 0o720] {
+        for open in [0o755, 0o705, 0o701, 0o702, 0o777] {
             set_mode(&data, open);
             let said = keep_private(&data, &elsewhere).expect("it says what it set");
             assert!(

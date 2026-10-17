@@ -4973,23 +4973,28 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
     }
 }
 
-/// A command that opens the node's database itself does not open it
-/// beside a running node of another version than its own (decision
-/// 2026-10-04 §10.1, rule 6): opening runs the schema's steps, and a
-/// later command would step the database under an earlier node. `cordelia
-/// stats`, `cordelia channels` and `cordelia init --force` say the note
-/// that names the restart, end in failure, and open nothing: the
-/// database stays at its schema version, byte for byte. `cordelia
-/// status` still answers: it says the note, and that the database was
-/// not read. **Where no node answers, each goes on as it did,** and the
-/// database is stepped as any opening steps it.
+/// A command that opens the node's database itself asks the data
+/// directory's lock, the one a node holds for as long as it runs, before
+/// it opens the database, and asks no port (decision 2026-10-04 §10.1,
+/// rule 6).
 ///
-/// The node here is of this version, behind a stand-in that says it is
-/// of another. The database is one of the test's own, in the released
-/// version's form, in a directory beside the node's with a key and a
-/// token: no command here opens the database that the node runs on.
+/// - **A node on another data directory never refuses it,** whatever it
+///   answers at the port of the command's configuration: here a stand-in
+///   that says it is of another version. `cordelia stats`, `cordelia
+///   channels` and `cordelia init --force` go on, and the opening steps
+///   the database; none of them asks the node anything.
+/// - **Where the lock is held** (here by the test, in the place of a node
+///   of another version, over a database in the released version's
+///   form), `cordelia init --force` opens nothing and names the command
+///   that stops the node; `stats` and `channels` open nothing at a
+///   schema that is not theirs, and name what to run instead; `cordelia
+///   status` says that the database was not read. Nothing is stepped:
+///   the database is as it was, byte for byte.
+/// - **Beside a node that runs on the data directory,** `cordelia init
+///   --force` and `cordelia swarm-init` refuse, and write nothing; `stats`
+///   and `channels` read the node's database, for reading only.
 #[test]
-fn a_command_that_opens_the_database_opens_none_beside_a_node_of_another_version() {
+fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
     use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
@@ -5002,12 +5007,17 @@ fn a_command_that_opens_the_database_opens_none_beside_a_node_of_another_version
 
     // A data directory as the released version left one.
     let beside = laptop.dir.path().join("beside");
-    std::fs::create_dir(&beside).unwrap();
-    for file in ["identity.key", "node-token"] {
-        std::fs::copy(laptop.data_dir().join(file), beside.join(file)).unwrap();
-    }
+    let released = || {
+        let _ = std::fs::remove_dir_all(&beside);
+        std::fs::create_dir(&beside).unwrap();
+        for file in ["identity.key", "node-token"] {
+            std::fs::copy(laptop.data_dir().join(file), beside.join(file)).unwrap();
+        }
+        drop(
+            cordelia_storage::first_start::released::database(&beside.join("cordelia.db")).unwrap(),
+        );
+    };
     let database = beside.join("cordelia.db");
-    drop(cordelia_storage::first_start::released::database(&database).unwrap());
     let schema_version = || -> u32 {
         let db = rusqlite::Connection::open_with_flags(
             &database,
@@ -5017,84 +5027,118 @@ fn a_command_that_opens_the_database_opens_none_beside_a_node_of_another_version
         db.pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap()
     };
-    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
     const { assert!(RELEASED_SCHEMA_VERSION < SCHEMA_VERSION) };
-    let as_it_was = std::fs::read(&database).unwrap();
-    let key = std::fs::read(beside.join("identity.key")).unwrap();
-
-    // Beside the node that says it is of another version.
     let port = another.port.to_string();
     let directory = beside.to_str().unwrap();
     let through = [
         ("CORDELIA_DATA_DIR", directory),
         ("CORDELIA_HTTP_PORT", port.as_str()),
     ];
-    let note = "The running node is version 0.0.0-another and this command is version";
-    let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
-    let opens: [&[&str]; 4] = [
-        &["stats"],
+
+    // The node at the port runs on another data directory: each command
+    // goes on, asks it nothing, and the opening steps the database.
+    for args in [
+        &["stats"][..],
         &["stats", "--json"],
         &["channels"],
         &["init", "--force"],
-    ];
-    for args in opens {
+    ] {
+        released();
+        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
         let before = another.asked().len();
         let out = laptop.command_given(&through, args);
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{args:?}: {said}");
+        assert!(!said.contains("0.0.0-another"), "{args:?}: {said}");
+        assert_eq!(another.asked().len(), before, "{args:?} asked the node");
+        assert_eq!(schema_version(), SCHEMA_VERSION, "{args:?}");
+    }
+
+    // The lock on the data directory is held, as a node holds it.
+    released();
+    let as_it_was = std::fs::read(&database).unwrap();
+    let key = std::fs::read(beside.join("identity.key")).unwrap();
+    let lock = std::fs::File::create(beside.join("node.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let os = std::env::consts::OS;
+    let stop = cordelia_api::commands::stop_command(os);
+    let restart = cordelia_api::commands::restart_command(os);
+    let refusals: [(&[&str], String); 4] = [
+        (
+            &["init", "--force"],
+            format!(
+                "a node is running on the data directory {directory}, and this command opens \
+                 the node's database itself: nothing was opened, and nothing was changed. Stop \
+                 the node first (`{stop}`"
+            ),
+        ),
+        (
+            &["stats"],
+            format!("a node of another version is running on the data directory {directory}"),
+        ),
+        (
+            &["stats", "--json"],
+            "does not open it beside a node of another version: nothing was opened.".into(),
+        ),
+        (
+            &["channels"],
+            format!("or restart the node, so that it runs this command's version (`{restart}`)"),
+        ),
+    ];
+    for (args, says) in &refusals {
+        let out = laptop.command_given(&through, args);
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(!out.status.success(), "{args:?}: {said}");
-        assert!(said.contains(note), "{args:?}: {said}");
-        assert!(said.contains(restart), "{args:?}: {said}");
-        assert!(
-            said.contains("does not open it beside a node of another version: nothing was opened."),
-            "{args:?}: {said}"
-        );
+        assert!(said.contains(says.as_str()), "{args:?}: {said}");
         assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
-        // The node was asked its version, and nothing else.
-        let asked = another.asked();
-        assert!(asked.len() > before, "{args:?} did not ask the node");
-        for (path, _) in &asked[before..] {
-            assert_eq!(path, "/api/v1/status", "{args:?} asked the node for more");
-        }
     }
-    // `init --force` wrote no new key either.
     assert_eq!(std::fs::read(beside.join("identity.key")).unwrap(), key);
-
     // `cordelia status` still answers, and reads nothing of the database.
     let out = laptop.command_given(&through, &["status"]);
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{said}");
     assert!(
-        said.contains(
-            "Storage:\n  Not read:  a node of another version is running, and its database \
-             is not opened beside it."
-        ),
+        said.contains(&format!(
+            "Storage:\n  Not read:  a node of another version is running on the data directory \
+             {directory}"
+        )),
         "{said}"
     );
-    assert!(said.contains(note), "{said}");
     assert!(!said.contains("DB size:"), "{said}");
-    assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
     assert_eq!(std::fs::read(&database).unwrap(), as_it_was);
-
-    // The control: where no node answers, each goes on as it did, and
-    // the opening steps the database.
-    let nobody = {
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        free.local_addr().unwrap().port().to_string()
-    };
-    let alone = [
-        ("CORDELIA_DATA_DIR", directory),
-        ("CORDELIA_HTTP_PORT", nobody.as_str()),
-    ];
-    let out = laptop.command_given(&alone, &["stats"]);
+    // Let go of, the lock holds nothing back.
+    drop(lock);
+    let out = laptop.command_given(&through, &["stats"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let said = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(said.contains("Database:"), "{said}");
     assert_eq!(schema_version(), SCHEMA_VERSION);
+
+    // Beside the laptop's own node, on its own data directory.
+    let key = std::fs::read(laptop.data_dir().join("identity.key")).unwrap();
+    let refused = laptop.refused(&["init", "--force"]);
+    assert!(
+        refused.contains(&format!(
+            "a node is running on the data directory {}",
+            laptop.data_dir().display()
+        )),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("nothing was opened, and nothing was changed."),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read(laptop.data_dir().join("identity.key")).unwrap(),
+        key
+    );
+    let stats = laptop.cli(&["stats"]);
+    assert!(stats.contains("Names:            0 held"), "{stats}");
+    let channels = laptop.cli(&["channels"]);
+    assert!(channels.starts_with("No names."), "{channels}");
 }
 
 // ── A change made while a pass is in flight ──────────────────────────
@@ -5299,4 +5343,58 @@ fn a_word_that_is_no_name_is_printed_by_no_command() {
     let said = at.done();
     assert!(!said.to_uppercase().contains("NOT-A-NAME"), "{said}");
     let _ = words;
+}
+
+// ── What is said of a device that has not been heard from ────────────
+
+/// "Not heard from yet" is said only for five minutes from a time that
+/// this device's own clock gave (decision 2026-10-04 §8): when it took a
+/// typed key, or when it added the device. Here the laptop made the
+/// phrase, and took no key; the desktop was added from it, and then added
+/// a tablet, which never accepts. On the laptop the tablet's record holds
+/// the desktop's time, written by the desktop's clock: it holds nothing
+/// back, and the tablet's line gives the advice at once. On the desktop,
+/// which added the tablet a moment ago, it is "not heard from yet".
+#[test]
+fn not_heard_from_yet_runs_only_from_a_time_of_this_devices_own() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let tablet = node("tablet", "personal", None);
+    let all = [&relay, &laptop, &desktop];
+    pair(&laptop, &desktop, "desktop", &all);
+
+    let mut at = desktop.at_terminal(&["add-device", &key_of(&tablet), "--name", "tablet"]);
+    at.says("Type yes to go on").types("yes");
+    at.done();
+    wait_for("the laptop holds the tablet's record", &all, 90, || {
+        let added = person_of(&laptop)["added"].as_array()?.clone();
+        added
+            .iter()
+            .any(|device| device["label"] == "tablet")
+            .then_some(())
+    });
+
+    let line_of = |device: &Node| -> String {
+        let said = device.cli(&["devices"]);
+        let line = said
+            .lines()
+            .find(|line| line.contains("\"tablet\", added from"));
+        line.unwrap_or_else(|| panic!("no line for the tablet:\n{said}"))
+            .to_string()
+    };
+    let on_the_laptop = line_of(&laptop);
+    assert!(
+        on_the_laptop.contains("yet, as far as this device has heard: adding it again"),
+        "{on_the_laptop}"
+    );
+    assert!(
+        !on_the_laptop.contains("not heard from yet"),
+        "{on_the_laptop}"
+    );
+    let on_the_desktop = line_of(&desktop);
+    assert!(
+        on_the_desktop.ends_with(": not heard from yet"),
+        "{on_the_desktop}"
+    );
 }

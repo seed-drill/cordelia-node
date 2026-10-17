@@ -596,10 +596,13 @@ fn removed_says(removed: &Removed, all: &[Removed]) -> serde_json::Value {
 
 /// Whether the channel of `name` in the generation applied holds already
 /// all of `versions`, which one key signed in generations that were left
-/// (decision 2026-10-04 §7.3): each is there as it is, or an entry at a
-/// higher revision is in its slot. Such a key's work is not missing, and
-/// a command says so of it. A delete that a removed key signed is never
-/// taken, and is not counted. `false` where no version is held so.
+/// (decision 2026-10-04 §7.3): each is there as it is, or its slot holds
+/// a later revision written by the same author
+/// ([`carry::later_by_its_author`]). Such a key's work is not missing,
+/// and a command says so of it. **A version that lies under a later
+/// revision that another key wrote is not held:** it was not brought
+/// back. A delete that a removed key signed is never taken, and is not
+/// counted. `false` where no version is held so.
 ///
 /// It is judged in the device's own store, with nothing written.
 fn held_in_full(
@@ -611,7 +614,8 @@ fn held_in_full(
     let mut held = 0;
     for version in versions {
         match carry::would_bring(conn, identity, name, version, Rule::EmptySlots)? {
-            carry::Brought::Held | carry::Brought::Higher => held += 1,
+            carry::Brought::Held => held += 1,
+            carry::Brought::Higher if carry::later_by_its_author(conn, name, version)? => held += 1,
             carry::Brought::Delete => {}
             _ => return Ok(false),
         }
@@ -2062,6 +2066,63 @@ mod tests {
         let listed = look_from(&node.state, LAB, &[]).await.unwrap();
         assert_eq!(listed["signed"][0]["key"], hex::encode(removed));
         assert_eq!(listed["signed"][0]["brought_back"], true, "{listed}");
+    }
+
+    /// "Already brought back" is said of a removed key only where the new
+    /// channel holds what it signed, or holds in that slot a later
+    /// revision written by the same author (decision 2026-10-04 §7.3). A
+    /// version of that key that lies under a later revision which another
+    /// key wrote was not brought back, and is not said to be.
+    #[actix_web::test]
+    async fn test_a_version_under_another_keys_later_revision_is_not_brought_back() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 2], LAB);
+        s.write(0, LAB, "kept.md", "of device 0");
+        s.meet(&[0, 2]);
+        let old = s[2].own(LAB);
+        let first = s.write(2, LAB, "only.md", "first");
+        let second = s.write(2, LAB, "only.md", "second");
+        s.change(0, &[0, 1], &[2]);
+        let (removed, phrase) = (s.key(2), Phrase::parse(crate::several::WORDS).unwrap());
+        let node = Node::of(s.machines.remove(0));
+        async fn said_of(node: &Node, removed: [u8; 32]) -> serde_json::Value {
+            let listed = look_from(&node.state, LAB, &[]).await.unwrap();
+            assert_eq!(listed["signed"][0]["key"], hex::encode(removed), "{listed}");
+            listed["signed"][0]["brought_back"].clone()
+        }
+
+        // What the removed key signed is carried: it is held.
+        node.relay_holds(&old, &[first.clone(), second.clone()]);
+        assert_eq!(said_of(&node, removed).await, json!(false));
+        let word = node.word(&phrase, &from(&[removed], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(done["carried"], 1, "{done}");
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("second"));
+        assert_eq!(said_of(&node, removed).await, json!(true));
+
+        // Where the relay hands only its earlier version, the later
+        // revision in the new channel is that key's own, carried: it is
+        // brought back.
+        node.relay_holds(&old, std::slice::from_ref(&first));
+        assert_eq!(said_of(&node, removed).await, json!(true));
+
+        // This device writes over it: the removed key's version lies under
+        // a later revision that another key wrote, and is not brought back.
+        {
+            use crate::publish::{PlannedAgainst, Published, Write, publish, read};
+            let conn = db(&node.state);
+            let write = Write {
+                name: LAB,
+                file: "only.md",
+                value: crate::several::text("of device 0, later"),
+                planned: PlannedAgainst::what_is_in(&read(&conn, LAB, "only.md").unwrap().slot),
+                merge: None,
+            };
+            let made = publish(&conn, &node.state.identity, &write, now()).unwrap();
+            assert!(matches!(made, Published::Made(_)), "{made:?}");
+        }
+        node.relay_holds(&old, &[first, second]);
+        assert_eq!(said_of(&node, removed).await, json!(false));
     }
 
     /// **Which slots of the new channel hold nothing is judged only

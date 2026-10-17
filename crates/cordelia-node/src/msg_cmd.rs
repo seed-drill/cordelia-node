@@ -145,8 +145,15 @@ Put the rest in the issue or pull request that --re names.";
 write it on standard input and close it.";
     pub const EMPTY: &str = "The message is empty: write it on standard input.";
     pub const NOT_TEXT: &str = "The message is not UTF-8 text.";
-    pub const NOT_RUNNING: &str =
-        "The node is not running, so nothing was done. Start it with: cordelia start";
+    /// Where the node cannot be reached: that nothing was done, and how
+    /// the node is started on this system, as every command says it
+    /// ([`cordelia_api::commands::start_says`]).
+    pub fn not_running() -> String {
+        format!(
+            "The node is not running, so nothing was done. {}",
+            cordelia_api::commands::start_says(std::env::consts::OS)
+        )
+    }
     pub const FOLDER_NOT_KNOWN: &str =
         "git did not answer in time, so this folder's agent is not known, and nothing was done.";
     pub const SEND_NOT_ANSWERED: &str = "The node did not answer, or its answer could not be \
@@ -428,7 +435,7 @@ impl Node {
                 .is_ok()
         });
         if !reached {
-            return Err(says::NOT_RUNNING.into());
+            return Err(says::not_running());
         }
         let node = match self.status() {
             Ok(node) if node["version"].is_string() => node,
@@ -822,7 +829,7 @@ pub fn read(config_path: &str, id: &str) -> anyhow::Result<()> {
     let posted = node.post("/api/v1/messages/read", &request, node.answer_wait());
     let (status, answer) = match of_the_route(posted) {
         Posted::Answered(status, answer) => (status, answer),
-        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotReached => refuse(&says::not_running()),
         Posted::NotKnown => refuse(says::READ_NOT_ANSWERED),
     };
     if status != 200 {
@@ -1051,7 +1058,7 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
     let posted = node.post("/api/v1/messages/send", &request, node.answer_wait());
     let (status, answer) = match of_the_route(posted) {
         Posted::Answered(status, answer) => (status, answer),
-        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotReached => refuse(&says::not_running()),
         Posted::NotKnown => refuse(says::SEND_NOT_ANSWERED),
     };
     if status != 200 {
@@ -1125,7 +1132,7 @@ pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
     let posted = node.post("/api/v1/messages/log", &request, node.answer_wait());
     let (status, answer) = match of_the_log(posted) {
         Posted::Answered(status, answer) => (status, answer),
-        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotReached => refuse(&says::not_running()),
         Posted::NotKnown => refuse(says::READ_NOT_ANSWERED),
     };
     if status != 200 {
@@ -1154,7 +1161,7 @@ pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
     let posted = node.post("/api/v1/messages/log", &request, node.answer_wait());
     let (status, answer) = match of_the_log(posted) {
         Posted::Answered(status, answer) => (status, answer),
-        Posted::NotReached => refuse(says::NOT_RUNNING),
+        Posted::NotReached => refuse(&says::not_running()),
         Posted::NotKnown => refuse(says::MARK_NOT_ANSWERED),
     };
     if status != 200 {
@@ -1724,8 +1731,13 @@ mod tests {
         );
         assert_eq!(says::NOT_TEXT, "The message is not UTF-8 text.");
         assert_eq!(
-            says::NOT_RUNNING,
-            "The node is not running, so nothing was done. Start it with: cordelia start"
+            says::not_running(),
+            format!(
+                "The node is not running, so nothing was done. Start it with `{}`, or with \
+                 `cordelia start` where it does not run as the service that the install script \
+                 set up.",
+                cordelia_api::commands::start_command(std::env::consts::OS)
+            )
         );
         assert_eq!(
             says::FOLDER_NOT_KNOWN,
@@ -2643,7 +2655,7 @@ mod tests {
             }
             .asked_first()
         };
-        assert_eq!(asked(None), Err(says::NOT_RUNNING.into()));
+        assert_eq!(asked(None), Err(says::not_running()));
         let not_learned = asked(Some("not json")).unwrap_err();
         assert!(not_learned.ends_with(VERSION_NOT_LEARNED), "{not_learned}");
         let not_learned = asked(Some(r#"{"held": null}"#)).unwrap_err();
