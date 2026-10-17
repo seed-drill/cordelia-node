@@ -13,10 +13,13 @@ import re, subprocess, sys
 AT_RELAYS = 'crates/cordelia-api/src/at_relays.rs'
 OWN_READ = 'crates/cordelia-api/src/own_read.rs'
 NODE_READ = 'crates/cordelia-node/src/device_entries/own_read.rs'
-ORIG = {f: open(f).read() for f in (AT_RELAYS, OWN_READ, NODE_READ)}
+DEVICE = 'crates/cordelia-node/src/device_entries.rs'
+PROTOCOL = 'crates/cordelia-core/src/protocol.rs'
+ORIG = {f: open(f).read() for f in (AT_RELAYS, OWN_READ, NODE_READ, DEVICE, PROTOCOL)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 API = ("cordelia-api", ["--lib"])
+CORE = ("cordelia-core", ["--lib"])
 E2E = ("cordelia-node", ["--test", "device_entries_e2e"])
 def at_relays(test): return (API, "at_relays::tests::" + test)
 def own_read(test): return (API, "own_read::tests::" + test)
@@ -37,6 +40,16 @@ E2E_LOCK = e2e("a_read_with_places_of_its_own_does_not_hold_the_lock_while_it_re
 E2E_READS_ON = e2e("a_read_with_places_of_its_own_reads_on_under_its_id_from_the_place_it_reached")
 E2E_TAKES = e2e("a_read_with_places_of_its_own_takes_within_what_the_pass_takes_from_a_relay")
 E2E_ASKS = e2e("a_read_with_places_of_its_own_asks_within_what_the_device_asks_of_a_relay")
+STANDS = own_read("test_a_read_stands_for_so_long_from_the_end_of_its_last_round")
+CONSTANTS = (CORE, "protocol::tests::test_a_carry_by_command_and_a_recovery_decision_2026_10_04_7_3_and_9")
+E2E_RESET = e2e("a_read_with_places_of_its_own_asks_again_where_a_relay_resets_a_pull")
+E2E_PROOF = e2e("a_relay_that_answered_a_reads_proof_with_no_is_sent_the_channel_again")
+E2E_ROUND_MOST = e2e("a_round_of_a_read_lasts_no_longer_than_a_carry_may_read")
+E2E_REPLACED = e2e("a_read_that_another_read_of_its_channel_replaced_stops")
+E2E_ONE_ROUND = e2e("one_round_of_a_read_runs_at_a_time_on_the_node")
+E2E_FAILED = e2e("a_page_that_a_read_could_not_take_leaves_the_relay_not_reached")
+E2E_CHANGE = e2e("a_round_after_a_change_asks_a_relay_nothing")
+E2E_RACE = e2e("a_pull_in_flight_when_every_place_is_forgotten_keeps_no_place")
 
 OWN_BRANCH = '''            let (each, read_again) = through_the_door(conn, identity, page, now)?;
             if read_again {'''
@@ -188,19 +201,19 @@ MUTATIONS = [
      [E2E_ASKS]),
     ("NR7 the read holds the database's lock", NODE_READ,
      '''        let relay = link.relay().0;
-        loop {''',
+        let reads = self.state.own_channels.reads();''',
      '''        let relay = link.relay().0;
         std::mem::forget(lock(&self.state.db));
-        loop {''',
+        let reads = self.state.own_channels.reads();''',
      [E2E_LOCK]),
     ("NR8 a channel that a pass does not pull begins a read", NODE_READ,
      '''            if !own.iter().any(|own| own.id == *channel && own.is_pulled()) {''',
      '''            if !own.iter().any(|own| own.id == *channel && own.is_pulled()) && false {''',
      [E2E_READS_ON]),
     ("NR9 a read that the node does not know is answered as known", NODE_READ,
-     '''        let Some((channel, under, at)) = reads.to_read(read) else {
+     '''        let Some((channel, under, at)) = reads.to_read(read, self.clock.now()) else {
             return false;''',
-     '''        let Some((channel, under, at)) = reads.to_read(read) else {
+     '''        let Some((channel, under, at)) = reads.to_read(read, self.clock.now()) else {
             return true;''',
      [E2E_READS_ON]),
     ("NR10 a relay not connected stays read on", NODE_READ,
@@ -217,6 +230,66 @@ MUTATIONS = [
      '''(self.state.held.why().is_none())''',
      '''(true)''',
      [E2E_READS_ON]),
+    ("NR13 a pull that a relay reset ends the relay's read", NODE_READ,
+     '''                Err(Refused::NotAnswered(_)) if link.is_open() => {''',
+     '''                Err(Refused::NotAnswered(_)) if false => {''',
+     [E2E_RESET]),
+    ("NR14 a round lasts as long as its asker said", NODE_READ,
+     '''                let until = until.min(self.clock.now() + ROUND_MOST);
+                let begun = self.begin_own(relays, &channel);''',
+     '''                let begun = self.begin_own(relays, &channel);''',
+     [E2E_ROUND_MOST]),
+    ("NR15 a read that another took the place of reads on", NODE_READ,
+     '''            if self.clock.now() >= until || !reads.stands(read) {''',
+     '''            if self.clock.now() >= until {''',
+     [E2E_REPLACED]),
+    ("NR16 rounds of two reads run at once", NODE_READ,
+     '''        let Ok(_one_round) = tokio::time::timeout(wait, self.own_rounds.lock()).await else {''',
+     '''        let Ok(_one_round) = tokio::time::timeout(wait, async { Ok::<(), ()>(()) }).await else {''',
+     [E2E_ONE_ROUND]),
+    ("NR17 a page the store could not take is read as handed", NODE_READ,
+     '''                Pulled::Failed => {
+                    at.not_reached();
+                    return at;
+                }''',
+     '''                Pulled::Failed => Handed::NotThePage { counted },''',
+     [E2E_FAILED]),
+    ("NR18 a round reads under the change entry kept now", NODE_READ,
+     ['''                    .find(|own| own.id == channel && own.is_pulled())''',
+      '''            under: *under,
+        };'''],
+     ['''                    .find(|own| own.is_pulled() && matches!(own.kind, at_relays::Kind::Name(_)))''',
+      '''            under: at_relays::kept_id(&lock(&self.state.db)).ok().flatten().unwrap_or(*under),
+        };'''],
+     [E2E_CHANGE]),
+    ("DE1 a read's no fills the pass's proof", DEVICE,
+     '''            if lately && !(held && unheeded) {''',
+     '''            if lately {''',
+     [E2E_PROOF]),
+    ("DE2 a device takes a page into the room kept for a show", DEVICE,
+     '''        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES''',
+     '''        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + 0 * SHOW_ANSWER_ROOM_BYTES''',
+     [E2E_TAKES]),
+    ("DE3 a pull in flight keeps its place when every place was forgotten", DEVICE,
+     '''                            Ok(kept) if kept == (mark, after) => Places::Kept,''',
+     '''                            Ok(_) => Places::Kept,''',
+     [E2E_RACE]),
+    ("OR18 a read stands for ever", OWN_READ,
+     '''        reads.retain(|_, kept| kept.reading || now.saturating_duration_since(kept.ended) < STANDS);''',
+     '''        reads.retain(|_, _| true);''',
+     [STANDS]),
+    ("OR19 a read is forgotten while a round of it runs", OWN_READ,
+     '''        reads.retain(|_, kept| kept.reading || now.saturating_duration_since(kept.ended) < STANDS);''',
+     '''        reads.retain(|_, kept| now.saturating_duration_since(kept.ended) < STANDS);''',
+     [STANDS]),
+    ("OR20 a read stands from when it began, not its last round", OWN_READ,
+     '''        kept.ended = now;''',
+     '''        let _ = now;''',
+     [STANDS]),
+    ("PR1 a read stands a second longer", PROTOCOL,
+     '''pub const LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64;''',
+     '''pub const LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64 + 1;''',
+     [CONSTANTS]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
