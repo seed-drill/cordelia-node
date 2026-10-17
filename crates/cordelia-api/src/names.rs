@@ -482,27 +482,37 @@ pub fn hold_for_a_carry(
 }
 
 /// How many versions this device holds of `name` that wait to be sent:
-/// those in the name's channel that it has sent to no relay
+/// those in the name's channel that it signed and has sent to no relay
 /// ([`kept_rows::sent_to_no_relay`]). Were it to hold the name no more
 /// ([`stop`]), they would go with what its store holds of the channel,
 /// and be nowhere in the generation applied (decision 2026-10-04 §7.3).
 ///
 /// None on a device that follows no phrase, or has stopped: it sends
 /// nothing in a channel of its own, so nothing waits there to be sent.
-pub fn waits_to_be_sent(conn: &Connection, name: &str) -> Result<usize, PersonError> {
+pub fn waits_to_be_sent(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+) -> Result<usize, PersonError> {
     if crate::at_relays::stands(conn)? != crate::at_relays::Stands::Applied {
         return Ok(0);
     }
     let Some(channel) = held_rows::channel_of_name(conn, name)? else {
         return Ok(0);
     };
-    Ok(kept_rows::sent_to_no_relay(conn, &channel)?)
+    Ok(kept_rows::sent_to_no_relay(
+        conn,
+        &channel,
+        &identity.public_key(),
+    )?)
 }
 
 /// How many versions this device holds that it has sent to no relay,
 /// and of how many names (decision 2026-10-04 §16): for each name that
-/// the device holds, what its store holds of the name's channel that no
-/// relay was sent ([`kept_rows::sent_to_no_relay`]). A device that
+/// the device holds, what its store holds of the name's channel that it
+/// signed and that no relay was sent ([`kept_rows::sent_to_no_relay`]).
+/// What another key signed came here from a relay, and is not counted
+/// (decision 2026-10-17 §4.5). A device that
 /// begins again, with a new phrase or a new key, lets go of everything
 /// that its store holds, a name that a carry or a recovery holds among
 /// it: the command says this count before its yes.
@@ -512,10 +522,14 @@ pub fn waits_to_be_sent(conn: &Connection, name: &str) -> Result<usize, PersonEr
 /// and is the one that is told to begin again: what its store holds
 /// that no relay was sent goes then all the same. ([`waits_to_be_sent`],
 /// which the unmapping of a name asks, counts none on such a device.)
-pub fn waits_in_every_name(conn: &Connection) -> Result<(usize, usize), PersonError> {
+pub fn waits_in_every_name(
+    conn: &Connection,
+    identity: &NodeIdentity,
+) -> Result<(usize, usize), PersonError> {
+    let own = identity.public_key();
     let (mut versions, mut names) = (0, 0);
     for held in held_rows::names(conn)? {
-        let waits = kept_rows::sent_to_no_relay(conn, &held.channel)?;
+        let waits = kept_rows::sent_to_no_relay(conn, &held.channel, &own)?;
         versions += waits;
         names += usize::from(waits > 0);
     }
@@ -1487,6 +1501,8 @@ mod tests {
     /// What a device has sent to no relay is counted over every name
     /// that it holds (decision 2026-10-04 §16): how many versions, and of
     /// how many names. A name of which nothing waits is not among them.
+    /// Only what this device signed is counted (decision 2026-10-17
+    /// §4.5): what another device wrote came here from a relay.
     ///
     /// **It is counted however the device stands.** A device that was
     /// removed, or that holds two changes made apart, is told to begin
@@ -1496,23 +1512,32 @@ mod tests {
     /// it did.
     #[test]
     fn test_what_was_sent_to_no_relay_is_counted_over_every_name_held() {
-        let mut s = Several::of_one_person(1);
-        assert_eq!(waits_in_every_name(&s[0].conn).unwrap(), (0, 0));
+        let mut s = Several::of_one_person(2);
+        let every = |s: &Several| waits_in_every_name(&s[0].conn, &s[0].identity).unwrap();
+        assert_eq!(every(&s), (0, 0));
         let now = s.tick();
         hold_for_a_carry(&s[0].conn, &s[0].identity, "brought", now).unwrap();
-        s.hold(&[0], "lab");
-        s.hold(&[0], "empty");
-        assert_eq!(waits_in_every_name(&s[0].conn).unwrap(), (0, 0));
+        s.hold(&[0, 1], "lab");
+        s.hold(&[0, 1], "empty");
+        assert_eq!(every(&s), (0, 0));
         s.write(0, "brought", "a.md", "brought in by a carry");
         s.write(0, "brought", "b.md", "and this");
         s.write(0, "lab", "c.md", "of a folder");
-        let conn = &s[0].conn;
-        assert_eq!(waits_in_every_name(conn).unwrap(), (3, 2));
-        // A relay was sent what the one name holds: the other waits.
+        // The other device writes in two names, and this one takes what
+        // it wrote, as from a relay, and marks none of it as sent: it is
+        // not counted, here or in a name that held nothing.
+        s.write(1, "lab", "d.md", "the other device's");
+        s.write(1, "empty", "e.md", "and this");
+        s.pass(1, 0);
+        let other = s.key(1);
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
         let lab = held_rows::channel_of_name(conn, "lab").unwrap().unwrap();
+        assert!(kept_rows::holds_by(conn, &lab, &other).unwrap());
+        assert_eq!(waits_in_every_name(conn, identity).unwrap(), (3, 2));
+        // A relay was sent what the one name holds: the other waits.
         let last = kept_rows::last_taken(conn, &lab).unwrap();
         kept_rows::sent(conn, &[0xa1; 32], &lab, last).unwrap();
-        assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1));
+        assert_eq!(waits_in_every_name(conn, identity).unwrap(), (2, 1));
         // A device that has stopped holds what it held: what no relay
         // was sent is counted there all the same.
         for stopped in [
@@ -1522,12 +1547,21 @@ mod tests {
             State::NotOpened,
         ] {
             held_rows::set_state(conn, stopped).unwrap();
-            assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1), "{stopped:?}");
-            assert_eq!(waits_to_be_sent(conn, "brought").unwrap(), 0, "{stopped:?}");
+            assert_eq!(
+                waits_in_every_name(conn, identity).unwrap(),
+                (2, 1),
+                "{stopped:?}"
+            );
+            assert_eq!(
+                waits_to_be_sent(conn, identity, "brought").unwrap(),
+                0,
+                "{stopped:?}"
+            );
         }
         held_rows::set_state(conn, State::Applied).unwrap();
-        assert_eq!(waits_to_be_sent(conn, "brought").unwrap(), 2);
-        assert_eq!(waits_in_every_name(conn).unwrap(), (2, 1));
+        assert_eq!(waits_to_be_sent(conn, identity, "brought").unwrap(), 2);
+        assert_eq!(waits_to_be_sent(conn, identity, "empty").unwrap(), 0);
+        assert_eq!(waits_in_every_name(conn, identity).unwrap(), (2, 1));
     }
 
     /// Where a device comes to sync a name it holds it, so that its
