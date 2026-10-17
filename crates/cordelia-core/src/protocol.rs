@@ -1975,9 +1975,11 @@ const _: () = assert!(
         .next_power_of_two()
         == AGENT_MESSAGE_CONTENT_BYTES
 );
-// Every counted device's ring and list are within one channel at a relay.
+// Every counted device's ring and its two lists, `read/` and the `sread/`
+// of a shared channel (decision 2026-10-10 §6.1), are within one channel
+// at a relay.
 const _: () = assert!(
-    (MAX_COUNTED_DEVICES * (AGENT_MESSAGE_RING + 1)) as u64
+    (MAX_COUNTED_DEVICES * (AGENT_MESSAGE_RING + 2)) as u64
         * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
         <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
 );
@@ -1986,8 +1988,262 @@ const _: () = assert!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR < AGENT_MESSAGE_RING);
 // The clearing of the highest number is in the bottom half of band 0.
 const _: () = assert!(2 * AGENT_MESSAGE_NUMBER_MAX + 1 < REV_BAND_HALF);
 
+// ── A shared channel, for messages between people (decision 2026-10-10) ─
+
+/// The label a shared channel's secret is derived under, from its seed
+/// (decision 2026-10-10 §2.1): the `info` is this label and the hash of the
+/// card's relays ([`LABEL_SHARED_RELAYS`]). No seed gives the secret of a
+/// channel of anyone's own, and no person secret a shared channel's.
+pub const LABEL_SHARED: &[u8] = b"cordelia v2 shared";
+
+/// The label a card's list of relays is hashed under (decision 2026-10-10
+/// §2.1): SHA-256 of this label and the list in its one form. A card with
+/// other relays is another channel.
+pub const LABEL_SHARED_RELAYS: &[u8] = b"cordelia v2 relays";
+
+/// The label of a share pair channel's secret (decision 2026-10-10 §3.1).
+/// The two devices' public keys follow it, the lower first, as they follow
+/// [`LABEL_PAIR`]: a channel of its own kind, so that a share is never read
+/// where a hand-over is looked for, nor a hand-over where a share is.
+pub const LABEL_SHARE_PAIR: &[u8] = b"cordelia v2 share pair";
+
+/// The label a new seed is sealed to each key that stays under, when a
+/// channel is made anew (decision 2026-10-10 §7): the old channel's ID and
+/// the new one's follow it. What is sealed to a key for any other use does
+/// not open as a new seed, nor a seed for one channel as another's.
+pub const LABEL_ANEW_SEAL: &[u8] = b"cordelia v2 anew seal";
+
+/// The label that a mark of a shared message sent by an agent of the
+/// person's is hashed under (decision 2026-10-10 §6.1): the first 16 bytes
+/// of SHA-256 of this label, the channel's ID, the message's ID and the
+/// sending agent's name.
+pub const LABEL_SHARED_SENT: &[u8] = b"cordelia v2 message sent";
+
+/// The label under which a device signs an act in its list in the personal
+/// channel (decision 2026-10-10 §3.4): its device key signs this label, the
+/// item's kind and every other field of the item.
+pub const LABEL_SHARED_ACT: &[u8] = b"cordelia v2 act";
+
+/// A shared channel's seed, in bytes (decision 2026-10-10 §2.1): as every
+/// secret of a channel. It comes from the operating system's random source,
+/// and nothing derives one.
+pub const SHARED_SEED_BYTES: usize = 32;
+
+/// The most relays a shared channel lives at (decision 2026-10-10 §2.1,
+/// §8.5): the person's own channels are carried by two relays by default,
+/// so that losing one stops nothing.
+pub const SHARED_MAX_RELAYS: usize = 2;
+
+/// The most shared channels a person holds (decision 2026-10-10 §3.4,
+/// §8.5). It sets a device's store, the bytes of reading again and the
+/// requests of a pass; thirty-two waits on the rules of places.
+pub const SHARED_MAX_CHANNELS: usize = 16;
+
+/// The most drops a device's list keeps, apart from the places of its
+/// channels (decision 2026-10-10 §3.4): four times the places.
+pub const SHARED_MAX_DROPPED: usize = 64;
+
+/// The most subscriptions a person's agents hold (decision 2026-10-10
+/// §3.4, §4.1).
+pub const SHARED_MAX_SUBSCRIPTIONS: usize = 32;
+
+/// The most labels of keys a person keeps (decision 2026-10-10 §3.4): as
+/// many as the keys a channel shows.
+pub const SHARED_MAX_LABELS: usize = 64;
+
+/// The most bytes of a label that a person gives a key (decision 2026-10-10
+/// §5.2).
+/// Derived: a device's label in a statement, MAX_DEVICE_LABEL_BYTES.
+pub const SHARED_LABEL_MAX_BYTES: usize = MAX_DEVICE_LABEL_BYTES;
+
+/// What every act in a device's list carries beside its item (decision
+/// 2026-10-10 §3.4): its time, its count, its maker's key and its maker's
+/// signature.
+const SHARED_ACT_BYTES: usize = 8 + 8 + 32 + 64;
+
+/// The most a device's list in the personal channel takes, at every bound
+/// (decision 2026-10-10 §3.4).
+/// Derived from the bounds above and the widths of the form: the form and
+/// the fetched time; then each part, a count of one byte and its items. A
+/// filing is the channel's ID, the card (the seed, and the relays behind
+/// their count), the name behind a length of one byte, and how it came (a
+/// byte, and a key or a channel's ID); a drop is a channel's ID; a
+/// subscription is the channel's ID, the agent's name behind a length of
+/// one byte, and its state; a label is a key, and the label behind a
+/// length of two bytes, as a statement writes one. Each carries its act.
+pub const SHARED_LIST_MAX_VALUE_BYTES: usize = 1
+    + 8
+    + 1
+    + SHARED_MAX_CHANNELS
+        * (32
+            + (SHARED_SEED_BYTES + 1 + SHARED_MAX_RELAYS * 32)
+            + (1 + AGENT_MESSAGE_NAME_MAX_BYTES)
+            + (1 + 32)
+            + SHARED_ACT_BYTES)
+    + 1
+    + SHARED_MAX_DROPPED * (32 + SHARED_ACT_BYTES)
+    + 1
+    + SHARED_MAX_SUBSCRIPTIONS * (32 + (1 + AGENT_MESSAGE_NAME_MAX_BYTES) + 1 + SHARED_ACT_BYTES)
+    + 1
+    + SHARED_MAX_LABELS * (32 + (2 + SHARED_LABEL_MAX_BYTES) + SHARED_ACT_BYTES);
+
+/// How often a device writes its list again when nothing in it changed,
+/// after a whole fetch of the personal channel (decision 2026-10-10 §3.4):
+/// every 30 days, so that a list is fresh within each 90 days with two
+/// writings to spare.
+/// Derived: a third of KEYED_TOMBSTONE_RETENTION_DAYS.
+pub const SHARED_WORDS_WRITTEN_AGAIN_DAYS: u32 = KEYED_TOMBSTONE_RETENTION_DAYS / 3;
+
+/// The latest time, in seconds since 1970, that an act or a list's fetched
+/// time may say, and the highest count an item may say (decision
+/// 2026-10-10 §3.4): 2^40, some 34,000 years from 1970. A new act is never
+/// dated above it, and at this time alone the count orders acts.
+pub const SHARED_ACT_TIME_MAX: u64 = 1 << 40;
+
+/// The most keys a device shows in one shared channel, and the most that
+/// stay when it is made anew (decision 2026-10-10 §2.4, §6.3, §7): as many
+/// as a person's devices that count, and what fits in a channel's 16 MiB
+/// at a relay.
+pub const SHARED_MAX_KEYS: usize = 64;
+
+/// The most rows a device keeps, in a shared channel's table of keys, of
+/// keys that store nothing (decision 2026-10-10 §6.3). A key that stores an
+/// entry always keeps its row: at most 5,461 that the person does not know,
+/// and 128 that the person does.
+pub const SHARED_KEYS_KEPT: usize = 1_024;
+
+/// The most bytes a relay hands the shared pass of a device in a minute
+/// (decision 2026-10-10 §8.4), so that the device's own channels always
+/// have three quarters of what a relay hands it.
+/// Derived: a quarter of PUSH_BYTES_PER_PEER_PER_MINUTE.
+pub const SHARED_BYTES_PER_MINUTE: u64 = PUSH_BYTES_PER_PEER_PER_MINUTE / 4;
+
+/// How often a device reads a shared channel again from its start, at most
+/// (decision 2026-10-10 §6.3, §8.4): once a day. One asked for within the
+/// day begins when the day is up.
+pub const SHARED_READ_AGAIN_SECS: u64 = 24 * 60 * 60;
+
+/// How many requests the shared pass makes of one relay in a minute, at
+/// most, on a counter of its own (decision 2026-10-10 §8.4). With the
+/// device's own, OWN_ENTRY_REQUESTS_PER_MINUTE, and its shows of a minute,
+/// it is within what a relay allows a connection: 2,250 + 72 + 600 = 2,922
+/// of 3,000.
+pub const SHARED_REQUESTS_PER_MINUTE: u32 = 600;
+
+/// The most bytes the shared pass pushes to one relay in a minute (decision
+/// 2026-10-10 §8.4), so that the device's own channels always have three
+/// quarters of what the device pushes.
+/// Derived: a quarter of OUTBOX_BYTES_PER_MINUTE.
+pub const SHARED_PUSH_BYTES_PER_MINUTE: u64 = OUTBOX_BYTES_PER_MINUTE / 4;
+
+/// How many words of a key's fingerprint show another person's device
+/// (decision 2026-10-10 §3.2, §5.3): six, which is 66 bits. A search over
+/// keys made to match them costs some 2^26 times more than one to match
+/// the 40 bits of eight characters of a key: costly, not impossible.
+pub const SHARED_KEY_WORDS_SHOWN: usize = 6;
+
+/// The content of a device's anew record in a shared channel, an offer or
+/// empty (decision 2026-10-10 §2.3, §7): one size class, so that an offer
+/// written over the empty record is never larger.
+pub const SHARED_ANEW_CONTENT_BYTES: usize = 16_384;
+
+/// The first part of the name of a device's anew record in a shared
+/// channel (decision 2026-10-10 §2.3): the device's key follows it, as a
+/// device's key is written.
+pub const SHARED_ANEW_PREFIX: &str = "anew/";
+
+/// The value of an anew record (decision 2026-10-10 §2.3).
+/// Derived: SHARED_ANEW_CONTENT_BYTES, less the seal
+/// (ITEM_SEAL_OVERHEAD_BYTES), less the 7 bytes of an entry's form around
+/// its name and value, less its name: `anew/` and a key as it is written
+/// (70 bytes). So it seals at its one size through `Entry::seal` as it is.
+pub const SHARED_ANEW_VALUE_BYTES: usize =
+    SHARED_ANEW_CONTENT_BYTES - ITEM_SEAL_OVERHEAD_BYTES - 7 - (SHARED_ANEW_PREFIX.len() + 70);
+
+/// The first part of the name of a share in a share pair channel (decision
+/// 2026-10-10 §3.1): the channel's ID follows it, in hex.
+pub const SHARE_PREFIX: &str = "share/";
+
+/// The value of a share (decision 2026-10-10 §3.1).
+/// Derived: a content of 512 bytes, less the seal, less the 7 bytes of an
+/// entry's form, less its name: `share/` and a channel's ID in hex (64
+/// bytes).
+pub const SHARE_VALUE_BYTES: usize =
+    512 - ITEM_SEAL_OVERHEAD_BYTES - 7 - (SHARE_PREFIX.len() + 2 * 32);
+
+/// The first part of the name, in the messages channel, of a device's list
+/// of the shared messages its agents read and sent (decision 2026-10-10
+/// §6.1): the device's key follows it.
+pub const SHARED_READ_PREFIX: &str = "sread/";
+
+/// The first part of the name, in the personal channel, of a device's list
+/// of shared channels, subscriptions and labels (decision 2026-10-10 §3.4):
+/// the device's key follows it, and only its own entry there is its list.
+pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
+
+// Checked at compile time (decision 2026-10-10 §14). The largest card is
+// the seed and two relays behind their count: with the form, the time and
+// the key it is for, it fits a share; and it fits an anew record, whose
+// largest offer, the form, the time, the new ID, the relays, a count and
+// a seal for each key that stays, fits too.
+const _: () =
+    assert!(1 + 8 + 32 + (SHARED_SEED_BYTES + 1 + SHARED_MAX_RELAYS * 32) <= SHARE_VALUE_BYTES);
+const _: () = assert!(SHARED_SEED_BYTES + 1 + SHARED_MAX_RELAYS * 32 <= SHARED_ANEW_VALUE_BYTES);
+const _: () = assert!(
+    1 + 8 + 32 + (1 + SHARED_MAX_RELAYS * 32) + 1 + SHARED_MAX_KEYS * (32 + SEALED_SECRET_BYTES)
+        <= SHARED_ANEW_VALUE_BYTES
+);
+// A share and an anew record each seal at their size with their name.
+const _: () =
+    assert!(7 + SHARE_PREFIX.len() + 2 * 32 + SHARE_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES == 512);
+const _: () = assert!(
+    7 + SHARED_ANEW_PREFIX.len() + 70 + SHARED_ANEW_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES
+        == SHARED_ANEW_CONTENT_BYTES
+);
+const _: () = assert!(SHARED_ANEW_CONTENT_BYTES.is_power_of_two());
+// A list at its bounds, with its name, is one entry.
+const _: () = assert!(
+    PERSONAL_SHARED_PREFIX.len() + 70 + SHARED_LIST_MAX_VALUE_BYTES
+        <= MAX_ENTRY_NAME_AND_VALUE_BYTES
+);
+// What 64 devices write in a shared channel, a ring and an anew record
+// each; the 66 slots of each of 64 devices in the messages channel (above);
+// and 64 lists, each counted as the largest entry: each within one channel
+// at a relay.
+const _: () = assert!(
+    SHARED_MAX_KEYS as u64
+        * (AGENT_MESSAGE_RING as u64 * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
+            + entry_cost(SHARED_ANEW_CONTENT_BYTES))
+        <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+);
+const _: () = assert!(
+    MAX_COUNTED_DEVICES as u64 * entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+);
+// The shared pass's share of what a relay hands has room for one entry of
+// the largest size, as counted; and 16 channels, each read again from its
+// start once a day, are within what the share hands in a day.
+const _: () = assert!(entry_cost(MAX_ITEM_BYTES) <= SHARED_BYTES_PER_MINUTE);
+const _: () = assert!(
+    SHARED_MAX_CHANNELS as u64 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+        <= SHARED_BYTES_PER_MINUTE * (SHARED_READ_AGAIN_SECS / 60)
+);
+// The shared pass's requests, the device's own and its shows of a minute,
+// one for each whole pass and each pass that sends and as many again, are
+// within what a relay allows a connection (decision 2026-10-10 §8.4).
+const _: () = assert!(
+    SHARED_REQUESTS_PER_MINUTE as u64
+        + OWN_ENTRY_REQUESTS_PER_MINUTE as u64
+        + 2 * (60 / REALTIME_SYNC_INTERVAL_SECS + 60 / OUTBOX_FLUSH_INTERVAL_SECS)
+        <= ENTRY_REQUESTS_PER_PEER_PER_MINUTE as u64
+);
+// An anew record, as counted, fits the shared pass's share of a push.
+const _: () = assert!(entry_cost(SHARED_ANEW_CONTENT_BYTES) <= SHARED_PUSH_BYTES_PER_MINUTE);
+// The time bound is above every time the node reads: the last second that
+// a time in RFC 3339 can be, 9999-12-31T23:59:59Z.
+const _: () = assert!(SHARED_ACT_TIME_MAX > 253_402_300_799);
+
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 28] = [
+pub const LABELS: [&[u8]; 34] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -2016,6 +2272,12 @@ pub const LABELS: [&[u8]; 28] = [
     LABEL_AGENT_MESSAGES,
     LABEL_AGENT_MESSAGE_ID,
     LABEL_AGENT_MESSAGE_READ,
+    LABEL_SHARED,
+    LABEL_SHARED_RELAYS,
+    LABEL_SHARE_PAIR,
+    LABEL_ANEW_SEAL,
+    LABEL_SHARED_SENT,
+    LABEL_SHARED_ACT,
 ];
 
 // ── Assertion tests ──────────────────────────────────────────────────
@@ -2548,6 +2810,13 @@ mod tests {
         assert_eq!(LABEL_PAIR, b"cordelia v2 pair");
         assert_eq!(LABEL_RECOVERY, b"cordelia v2 recovery");
         assert_eq!(LABEL_LOCKED, b"cordelia v2 locked");
+        // The six of a shared channel (decision 2026-10-10 §14).
+        assert_eq!(LABEL_SHARED, b"cordelia v2 shared");
+        assert_eq!(LABEL_SHARED_RELAYS, b"cordelia v2 relays");
+        assert_eq!(LABEL_SHARE_PAIR, b"cordelia v2 share pair");
+        assert_eq!(LABEL_ANEW_SEAL, b"cordelia v2 anew seal");
+        assert_eq!(LABEL_SHARED_SENT, b"cordelia v2 message sent");
+        assert_eq!(LABEL_SHARED_ACT, b"cordelia v2 act");
         for (i, one) in LABELS.iter().enumerate() {
             for (j, other) in LABELS.iter().enumerate() {
                 assert!(
@@ -2621,7 +2890,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 28);
+        assert_eq!(LABELS.len(), 34);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -2867,6 +3136,11 @@ mod tests {
     /// of its personal channel and of its messages channel (decision
     /// 2026-10-09 §12), every ten seconds; its day's proofs in one burst;
     /// and a show and a push every two seconds besides.
+    ///
+    /// And for the shared pass beside a device's own (decision 2026-10-10
+    /// §8.4): its first pages, proofs and share pair channels of a minute
+    /// are within its own counter of 600, and that counter, the device's
+    /// own 2,250 and its shows of a minute together are within the 3,000.
     #[test]
     fn test_requests_on_the_streams_of_entries_decision_2026_10_04_16() {
         assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
@@ -2877,6 +3151,32 @@ mod tests {
         let sends = 2 * (60 / OUTBOX_FLUSH_INTERVAL_SECS);
         assert_eq!(pulls + proofs + sends, 2_632);
         assert!(pulls + proofs + sends <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
+
+        // A first page of each shared channel at each whole pass, a proof
+        // of each, and a proof and a pull of a share pair channel for each
+        // key typed for a channel at each whole pass: 208.
+        let channels = SHARED_MAX_CHANNELS as u64;
+        let typed = MAX_TYPED_KEYS as u64;
+        let shared = passes * channels + channels + passes * 2 * typed;
+        assert_eq!(shared, 208);
+        assert!(shared <= u64::from(SHARED_REQUESTS_PER_MINUTE));
+        // The shows of a minute, as a device's side of a relay counts
+        // them: one for each whole pass and each pass that sends, and as
+        // many again.
+        let shows = 2 * (passes + 60 / OUTBOX_FLUSH_INTERVAL_SECS);
+        assert_eq!(shows, 72);
+        let asked = u64::from(SHARED_REQUESTS_PER_MINUTE)
+            + u64::from(OWN_ENTRY_REQUESTS_PER_MINUTE)
+            + shows;
+        assert_eq!(asked, 2_922);
+        assert!(asked <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
+        // 678 would fit, and 600 leaves room.
+        assert_eq!(
+            u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE)
+                - u64::from(OWN_ENTRY_REQUESTS_PER_MINUTE)
+                - shows,
+            678
+        );
     }
 
     /// A device's side of a relay: the leave that an answer to a show
@@ -3084,5 +3384,249 @@ mod tests {
             AGENT_MESSAGE_CLEAR_INTERVAL_SECS,
             ENTRY_CHANNEL_SWEEP_INTERVAL_SECS
         );
+    }
+
+    // ── A shared channel, for messages between people (decision 2026-10-10)
+
+    /// The six labels of a shared channel are each in `LABELS` once, which
+    /// then has 34; none begins another, which
+    /// `test_no_label_begins_another_decision_2026_10_04_2_2` holds.
+    #[test]
+    fn test_the_labels_of_a_shared_channel_decision_2026_10_10_14() {
+        for label in [
+            LABEL_SHARED,
+            LABEL_SHARED_RELAYS,
+            LABEL_SHARE_PAIR,
+            LABEL_ANEW_SEAL,
+            LABEL_SHARED_SENT,
+            LABEL_SHARED_ACT,
+        ] {
+            assert_eq!(
+                LABELS.iter().filter(|one| **one == label).count(),
+                1,
+                "{:?}",
+                String::from_utf8_lossy(label)
+            );
+        }
+        assert_eq!(LABELS.len(), 34);
+    }
+
+    /// A card and a share (decision 2026-10-10 §2.1, §3.1): a seed of 32
+    /// bytes and one or two relays by key, 65 or 97 bytes; a share of 407
+    /// bytes, which seals at 512, and whose fields at the largest card are
+    /// 138.
+    #[test]
+    fn test_a_card_and_a_share_decision_2026_10_10_2_1_and_3_1() {
+        assert_eq!(SHARED_SEED_BYTES, 32);
+        assert_eq!(SHARED_MAX_RELAYS, 2);
+        let card = |relays: usize| SHARED_SEED_BYTES + 1 + relays * 32;
+        assert_eq!(card(1), 65);
+        assert_eq!(card(SHARED_MAX_RELAYS), 97);
+        assert_eq!(SHARE_PREFIX, "share/");
+        assert_eq!(SHARE_PREFIX.len() + 64, 70);
+        assert_eq!(SHARE_VALUE_BYTES, 407);
+        assert_eq!(SHARE_VALUE_BYTES, 512 - 28 - 7 - 70);
+        let fields = 1 + 8 + 32 + card(SHARED_MAX_RELAYS);
+        assert_eq!(fields, 138);
+        assert!(fields <= SHARE_VALUE_BYTES);
+        assert_eq!(
+            (7 + 70 + SHARE_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES).next_power_of_two(),
+            512
+        );
+        // The words of another person's key: six, 66 bits, within the
+        // hash, and as many as name a removed key at a carry.
+        assert_eq!(SHARED_KEY_WORDS_SHOWN, 6);
+        assert_eq!(SHARED_KEY_WORDS_SHOWN, CARRY_FROM_WORDS);
+        const { assert!(SHARED_KEY_WORDS_SHOWN > FINGERPRINT_WORDS_SHOWN) };
+        assert_eq!(SHARED_KEY_WORDS_SHOWN * 11, 66);
+        const { assert!(SHARED_KEY_WORDS_SHOWN * 11 <= 256) };
+        // 66 bits against the 40 of eight characters of a key: 2^26.
+        assert_eq!(SHARED_KEY_WORDS_SHOWN * 11 - 8 * 5, 26);
+    }
+
+    /// The two sizes of an entry of a shared channel (decision 2026-10-10
+    /// §2.3, §6.3): a message or a clearing of 2,048 bytes, whose value is
+    /// 1,936, and an anew record of 16,384, whose value is 16,274. A
+    /// device's room is 214,016 bytes as counted, 64 devices take
+    /// 13,697,024, and 14 more fit; a full offer's fields are 8,043 bytes.
+    #[test]
+    fn test_the_entries_of_a_shared_channel_decision_2026_10_10_2_3() {
+        assert_eq!(AGENT_MESSAGE_CONTENT_BYTES, 2_048);
+        assert_eq!(AGENT_MESSAGE_VALUE_BYTES, 1_936);
+        assert_eq!(SHARED_ANEW_CONTENT_BYTES, 16_384);
+        assert_eq!(SHARED_ANEW_PREFIX, "anew/");
+        assert_eq!(SHARED_ANEW_PREFIX.len() + 70, 75);
+        assert_eq!(SHARED_ANEW_VALUE_BYTES, 16_274);
+        assert_eq!(SHARED_ANEW_VALUE_BYTES, 16_384 - 28 - 7 - 75);
+        assert_eq!(
+            7 + 75 + SHARED_ANEW_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES,
+            SHARED_ANEW_CONTENT_BYTES
+        );
+        assert!(!AGENT_MESSAGE_PREFIX.starts_with(SHARED_ANEW_PREFIX));
+        assert!(!SHARED_ANEW_PREFIX.starts_with(AGENT_MESSAGE_PREFIX));
+
+        let offer = 1 + 8 + 32 + (1 + SHARED_MAX_RELAYS * 32) + 1;
+        let seals = SHARED_MAX_KEYS * (32 + SEALED_SECRET_BYTES);
+        assert_eq!(seals, 7_936);
+        assert_eq!(offer + seals, 8_043);
+        assert!(offer + seals <= SHARED_ANEW_VALUE_BYTES);
+
+        let device = AGENT_MESSAGE_RING as u64 * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
+            + entry_cost(SHARED_ANEW_CONTENT_BYTES);
+        assert_eq!(entry_cost(SHARED_ANEW_CONTENT_BYTES), 17_408);
+        assert_eq!(device, 214_016);
+        assert_eq!(device * SHARED_MAX_KEYS as u64, 13_697_024);
+        assert!(device * SHARED_MAX_KEYS as u64 <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        let more = (MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - device * SHARED_MAX_KEYS as u64) / device;
+        assert_eq!(more, 14);
+    }
+
+    /// A device's list in the personal channel (decision 2026-10-10 §3.4):
+    /// a filing of 475 bytes, a drop of 144, a subscription of 346 and a
+    /// label of 210, each with its act of 112; at every bound 41,341
+    /// bytes, which seal at 65,536 and are counted at 66,560; 64 lists are
+    /// 4,259,840 bytes as counted.
+    #[test]
+    fn test_the_persons_list_decision_2026_10_10_3_4() {
+        assert_eq!(SHARED_MAX_CHANNELS, 16);
+        assert_eq!(SHARED_MAX_DROPPED, 64);
+        assert_eq!(SHARED_MAX_DROPPED, 4 * SHARED_MAX_CHANNELS);
+        assert_eq!(SHARED_MAX_SUBSCRIPTIONS, 32);
+        assert_eq!(SHARED_MAX_LABELS, 64);
+        assert_eq!(SHARED_MAX_LABELS, SHARED_MAX_KEYS);
+        assert_eq!(SHARED_LABEL_MAX_BYTES, 64);
+        assert_eq!(SHARED_LABEL_MAX_BYTES, MAX_DEVICE_LABEL_BYTES);
+        // Every part's count is one byte.
+        for most in [
+            SHARED_MAX_CHANNELS,
+            SHARED_MAX_DROPPED,
+            SHARED_MAX_SUBSCRIPTIONS,
+            SHARED_MAX_LABELS,
+        ] {
+            assert!(most <= u8::MAX as usize, "{most}");
+        }
+        assert_eq!(SHARED_ACT_BYTES, 112);
+        let filing = 32 + 97 + (1 + AGENT_MESSAGE_NAME_MAX_BYTES) + (1 + 32) + SHARED_ACT_BYTES;
+        let drop = 32 + SHARED_ACT_BYTES;
+        let subscription = 32 + (1 + AGENT_MESSAGE_NAME_MAX_BYTES) + 1 + SHARED_ACT_BYTES;
+        let label = 32 + (2 + SHARED_LABEL_MAX_BYTES) + SHARED_ACT_BYTES;
+        assert_eq!((filing, drop, subscription, label), (475, 144, 346, 210));
+        let parts = [
+            1 + 8,
+            1 + SHARED_MAX_CHANNELS * filing,
+            1 + SHARED_MAX_DROPPED * drop,
+            1 + SHARED_MAX_SUBSCRIPTIONS * subscription,
+            1 + SHARED_MAX_LABELS * label,
+        ];
+        assert_eq!(parts, [9, 7_601, 9_217, 11_073, 13_441]);
+        assert_eq!(parts.iter().sum::<usize>(), SHARED_LIST_MAX_VALUE_BYTES);
+        assert_eq!(SHARED_LIST_MAX_VALUE_BYTES, 41_341);
+
+        assert_eq!(PERSONAL_SHARED_PREFIX, "shared/");
+        let name = PERSONAL_SHARED_PREFIX.len() + 70;
+        assert_eq!(name, 77);
+        assert!(name + SHARED_LIST_MAX_VALUE_BYTES <= MAX_ENTRY_NAME_AND_VALUE_BYTES);
+        let content =
+            (7 + name + SHARED_LIST_MAX_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES).next_power_of_two();
+        assert_eq!(content, 65_536);
+        assert_eq!(content, MAX_ITEM_BYTES);
+        assert_eq!(entry_cost(content), 66_560);
+        let lists = MAX_COUNTED_DEVICES as u64 * entry_cost(content);
+        assert_eq!(lists, 4_259_840);
+        assert!(lists <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        // Its prefix begins no other of the personal channel, and none
+        // begins it.
+        for other in [
+            PERSONAL_NAME_PREFIX,
+            PERSONAL_ADDED_PREFIX,
+            PERSONAL_APPLIED_PREFIX,
+            PERSONAL_LEFT_PREFIX,
+        ] {
+            assert!(!PERSONAL_SHARED_PREFIX.starts_with(other), "{other}");
+            assert!(!other.starts_with(PERSONAL_SHARED_PREFIX), "{other}");
+        }
+
+        // Written again within each 90 days, with two writings to spare.
+        assert_eq!(SHARED_WORDS_WRITTEN_AGAIN_DAYS, 30);
+        assert_eq!(
+            3 * SHARED_WORDS_WRITTEN_AGAIN_DAYS,
+            KEYED_TOMBSTONE_RETENTION_DAYS
+        );
+        // The time bound: 2^40 seconds, some 34,000 years from 1970, and
+        // above the last second that RFC 3339 writes.
+        assert_eq!(SHARED_ACT_TIME_MAX, 1_099_511_627_776);
+        assert_eq!(SHARED_ACT_TIME_MAX / (36_525 * 864), 34_841);
+        let last_rfc_3339_second: u64 = 253_402_300_799;
+        assert!(SHARED_ACT_TIME_MAX > last_rfc_3339_second);
+        // A time or a count at the bound is eight bytes as an act writes it.
+        const { assert!(SHARED_ACT_TIME_MAX < u64::MAX) };
+    }
+
+    /// The messages channel with a `sread/` list for each device (decision
+    /// 2026-10-10 §6.1): 66 slots of 3,072 bytes, 202,752 a device and
+    /// 12,976,128 at 64 devices, under a channel's 16 MiB.
+    #[test]
+    fn test_the_messages_channel_with_its_sread_lists_decision_2026_10_10_6_1() {
+        assert_eq!(SHARED_READ_PREFIX, "sread/");
+        assert_eq!(SHARED_READ_PREFIX.len() + 70, 76);
+        for (one, other) in [
+            (SHARED_READ_PREFIX, AGENT_MESSAGE_READ_PREFIX),
+            (SHARED_READ_PREFIX, AGENT_MESSAGE_PREFIX),
+            (AGENT_MESSAGE_READ_PREFIX, AGENT_MESSAGE_PREFIX),
+        ] {
+            assert!(!one.starts_with(other), "{one} {other}");
+            assert!(!other.starts_with(one), "{one} {other}");
+        }
+        // Its name is in the class of the channel's one size.
+        assert_eq!(
+            (7 + 76 + AGENT_MESSAGE_VALUE_BYTES + ITEM_SEAL_OVERHEAD_BYTES).next_power_of_two(),
+            AGENT_MESSAGE_CONTENT_BYTES
+        );
+        let device = (AGENT_MESSAGE_RING as u64 + 2) * entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        assert_eq!(device, 202_752);
+        assert_eq!(device * MAX_COUNTED_DEVICES as u64, 12_976_128);
+        assert!(device * MAX_COUNTED_DEVICES as u64 <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+    }
+
+    /// A device's store of one shared channel (decision 2026-10-10 §6.3):
+    /// 64 keys shown, 1,024 rows kept of keys that store nothing, 5,461
+    /// keys of one message each in the room for keys the person does not
+    /// know, and 44,171,264 bytes of one channel at worst, 706,740,224 of
+    /// a person's 16.
+    #[test]
+    fn test_a_devices_store_of_a_shared_channel_decision_2026_10_10_6_3() {
+        assert_eq!(SHARED_MAX_KEYS, 64);
+        assert_eq!(SHARED_MAX_KEYS, MAX_COUNTED_DEVICES);
+        assert_eq!(SHARED_KEYS_KEPT, 1_024);
+        let message = entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        let keys = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / message;
+        assert_eq!(keys, 5_461);
+        assert_eq!(keys * message, 16_776_192);
+        let device = AGENT_MESSAGE_RING as u64 * message + entry_cost(SHARED_ANEW_CONTENT_BYTES);
+        let one = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY + 2 * SHARED_MAX_KEYS as u64 * device;
+        assert_eq!(one, 44_171_264);
+        assert_eq!(SHARED_MAX_CHANNELS as u64 * one, 706_740_224);
+    }
+
+    /// The shared pass's own counters at each relay (decision 2026-10-10
+    /// §8.4): 512 KiB handed and 384 KiB pushed in a minute, a quarter of
+    /// each; room in each for its largest entry; 16 channels of 16 MiB read
+    /// again once a day are 256 MiB, within the 720 MiB the share hands in
+    /// a day.
+    #[test]
+    fn test_the_shared_pass_decision_2026_10_10_8_4() {
+        assert_eq!(SHARED_BYTES_PER_MINUTE, 524_288);
+        assert_eq!(4 * SHARED_BYTES_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE);
+        assert_eq!(SHARED_PUSH_BYTES_PER_MINUTE, 393_216);
+        assert_eq!(4 * SHARED_PUSH_BYTES_PER_MINUTE, OUTBOX_BYTES_PER_MINUTE);
+        assert_eq!(SHARED_REQUESTS_PER_MINUTE, 600);
+        assert!(entry_cost(MAX_ITEM_BYTES) <= SHARED_BYTES_PER_MINUTE);
+        assert!(entry_cost(SHARED_ANEW_CONTENT_BYTES) <= SHARED_PUSH_BYTES_PER_MINUTE);
+        assert_eq!(SHARED_READ_AGAIN_SECS, 86_400);
+        let read_again = SHARED_MAX_CHANNELS as u64 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY;
+        assert_eq!(read_again, 256 * 1024 * 1024);
+        let a_day = SHARED_BYTES_PER_MINUTE * (SHARED_READ_AGAIN_SECS / 60);
+        assert_eq!(a_day, 720 * 1024 * 1024);
+        assert!(read_again <= a_day);
     }
 }

@@ -3,9 +3,10 @@
 //! code to them.
 //!
 //! [`vectors`] makes the file's content from fixed inputs: each derivation
-//! from a channel's secret, the secret of each kind of channel, what a
-//! recovery phrase gives, a commitment, and two statements with their
-//! bytes, hashes and signatures. Another implementation checks itself
+//! from a channel's secret, the secret of each kind of channel (a shared
+//! channel's and a share pair channel's among them, decision 2026-10-10),
+//! what a recovery phrase gives, a commitment, and two statements with
+//! their bytes, hashes and signatures. Another implementation checks itself
 //! against the file, and a change here that changes a value fails the test
 //! until the file is written again, on purpose:
 //!
@@ -22,6 +23,7 @@ use crate::bech32::{encode_channel_id, encode_public_key};
 use crate::derive;
 use crate::identity::{NodeIdentity, x25519_from_ed25519_seed};
 use crate::phrase::Phrase;
+use crate::share::{Card, Relays};
 use crate::statement::{Device, SignedStatement, Statement, commitment};
 
 /// Where the vectors are published, from this crate.
@@ -109,6 +111,33 @@ fn vectors() -> Value {
         pair,
         derive::pair_secret(&laptop, &desktop.public_key()).unwrap()
     );
+
+    // A shared channel (decision 2026-10-10 §2.1): a seed, and two relays
+    // given out of their order; and the channel of the same seed at the
+    // first of them alone.
+    let seed = counting(0x10);
+    let mut relays = [
+        NodeIdentity::from_seed(counting(0x30))
+            .unwrap()
+            .public_key(),
+        NodeIdentity::from_seed(counting(0x70))
+            .unwrap()
+            .public_key(),
+    ];
+    relays.sort_unstable_by(|one, other| other.cmp(one));
+    let card = Card::of(seed, Relays::new(&relays).unwrap());
+    let shared_id = card.channel_id().unwrap();
+    let one_relay = Card::of(seed, Relays::new(&relays[..1]).unwrap());
+    let shared_channel = json!({
+        "seed": hex::encode(seed),
+        "relays": relays.iter().map(hex::encode).collect::<Vec<_>>(),
+        "relays_list": hex::encode(card.relays().to_bytes()),
+        "relays_hash": hex::encode(card.relays().hash()),
+        "secret": hex::encode(card.secret().unwrap()),
+        "id": hex::encode(shared_id),
+        "id_text": encode_channel_id(&shared_id).unwrap(),
+        "one_relay_id": hex::encode(one_relay.channel_id().unwrap()),
+    });
     let kinds = json!({
         "person_secret": hex::encode(person_secret),
         "personal": hex::encode(derive::personal_secret(&person_secret).unwrap()),
@@ -127,6 +156,12 @@ fn vectors() -> Value {
             "name": "notes",
             "secret": hex::encode(
                 derive::locked_secret(&person_secret, &lock_key, "notes").unwrap()
+            ),
+        },
+        "shared": shared_channel,
+        "share_pair": {
+            "secret": hex::encode(
+                derive::share_pair_secret(&desktop, &laptop.public_key()).unwrap()
             ),
         },
     });
@@ -175,7 +210,8 @@ fn vectors() -> Value {
 
     json!({
         "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret \
-                  of each kind of channel (with the messages channel of decision 2026-10-09), \
+                  of each kind of channel (with the messages channel of decision 2026-10-09, \
+                  and the shared channel and share pair channel of decision 2026-10-10), \
                   the recovery phrase, and the statement. Bytes are in \
                   hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that \
                   crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. \
@@ -223,7 +259,7 @@ fn as_written(vectors: &Value) -> String {
 
 /// The published file, read once for the tests here. It is written first
 /// where that was asked for.
-fn published() -> &'static str {
+pub(crate) fn published() -> &'static str {
     static READ: OnceLock<String> = OnceLock::new();
     READ.get_or_init(|| {
         if std::env::var_os("CORDELIA_WRITE_VECTORS").is_some() {
@@ -319,6 +355,48 @@ fn the_published_vectors_follow_from_their_own_inputs() {
         let device = NodeIdentity::from_seed(key(&pair[seed])).unwrap();
         assert_eq!(device.public_key(), key(&pair[public]));
     }
+    let mut info = b"cordelia v2 share pair".to_vec();
+    info.extend_from_slice(&keys[0]);
+    info.extend_from_slice(&keys[1]);
+    assert_eq!(
+        key(&kinds["share_pair"]["secret"]),
+        hkdf_sha256(&key(&pair["x25519"]), &[], &info).unwrap()
+    );
+    assert_ne!(key(&kinds["share_pair"]["secret"]), key(&pair["secret"]));
+
+    // A shared channel: the list in its one form, a count and the keys
+    // sorted; its hash; the secret from the seed under the label and the
+    // hash; the ID from the secret.
+    let shared = &kinds["shared"];
+    let mut relays: Vec<[u8; 32]> = shared["relays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(key)
+        .collect();
+    relays.sort_unstable();
+    let mut list = vec![relays.len() as u8];
+    for relay in &relays {
+        list.extend_from_slice(relay);
+    }
+    assert_eq!(bytes(&shared["relays_list"]), list);
+    let mut hashed = b"cordelia v2 relays".to_vec();
+    hashed.extend_from_slice(&list);
+    assert_eq!(key(&shared["relays_hash"]), crate::sha256(&hashed));
+    let mut info = b"cordelia v2 shared".to_vec();
+    info.extend_from_slice(&key(&shared["relays_hash"]));
+    let secret = key(&shared["secret"]);
+    assert_eq!(
+        secret,
+        hkdf_sha256(&key(&shared["seed"]), &[], &info).unwrap()
+    );
+    assert_eq!(key(&shared["id"]), derive::channel_id(&secret).unwrap());
+    assert_eq!(
+        crate::bech32::decode_channel_id(shared["id_text"].as_str().unwrap()).unwrap(),
+        key(&shared["id"])
+    );
+    assert_ne!(key(&shared["one_relay_id"]), key(&shared["id"]));
+
     let locked = &kinds["locked"];
     let name = locked["name"].as_str().unwrap();
     let mut info = b"cordelia v2 locked".to_vec();
