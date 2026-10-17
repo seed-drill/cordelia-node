@@ -85,6 +85,16 @@
 //! relay made again and reads on: a new connection starts with none
 //! remembered.
 //!
+//! ## A read of a channel of its own, with places of its own
+//!
+//! Before a carried name is let go, the device reads the name's channel
+//! at each relay (decision 2026-10-17 §4.2): [`DeviceEntries::own`] takes
+//! such an asking up. It is a pull under leave, as a pass makes it,
+//! within the pass's budget at each relay, each page through the one
+//! door; but its places are its own, kept in memory under the read's ID,
+//! and it marks nothing as sent. It reads round by round, as it is
+//! asked, outside the database's lock.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -95,6 +105,7 @@
 //! at a relay is left before it is sent there again.
 
 pub mod leave;
+mod own_read;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -102,7 +113,7 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
 use cordelia_api::at_relays::{
-    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
+    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands, Which,
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
@@ -1862,7 +1873,13 @@ impl DeviceEntries {
                             mark: page_mark,
                             next,
                         };
-                        match at_relays::take_page(db, &self.state.identity, &page, now) {
+                        match at_relays::take_page(
+                            db,
+                            &self.state.identity,
+                            &page,
+                            Places::Kept,
+                            now,
+                        ) {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
