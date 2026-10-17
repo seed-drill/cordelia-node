@@ -551,7 +551,7 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 
 **Properties 10 and 11 (reading on):**
 
-- `crates/cordelia-node/src/device_entries.rs`, `test_a_read_of_a_left_channel_goes_on_from_a_place`. A read asked from a place hands what follows it, and says the place it reached. Asked under a mark that the relay no longer has, it reads from the start.
+- `crates/cordelia-node/tests/device_entries_e2e.rs`, `a_read_of_a_left_channel_goes_on_from_a_place`, against a stand-in for a relay in the test's own process (no relay process). A read asked from a place hands what follows it, and says the place it reached. Asked under a mark that the relay no longer has, it reads from the start.
 - `crates/cordelia-api/src/carrying.rs`, `test_a_read_with_proofs_says_the_place_it_reached_at_each_relay`.
 - `recover_cmd.rs`, `test_a_recovery_reads_its_personal_channel_on_until_its_end`, with a read that hands a third of the channel at each round: the command reads three rounds and says "read to its end". Taking the rule out leaves it in part after one.
 - `recover_cmd.rs`, `test_a_recovery_stops_reading_on_at_the_bound`, and `test_a_page_that_leaves_the_place_ends_the_reading_as_read_to_its_end`.
