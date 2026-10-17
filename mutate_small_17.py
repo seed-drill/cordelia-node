@@ -50,6 +50,24 @@ MUTATIONS = [
      '''    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {''',
      '''    if lock == DirLock::Held {''',
      [e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
+    ("F1f where the lock could not be asked, the port is not asked", MAIN,
+     '''    if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {''',
+     '''    if !matches!(lock, DirLock::NoFile) {''',
+     [main("test_a_command_asks_the_lock_on_the_data_directory"),
+      e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
+    ("F1g the lock's file is asked as anything, and a folder in its place is taken for a free lock", MAIN,
+     ['''        Ok(found) if found.is_file() => {}''',
+      '''    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path);'''],
+     ['''        Ok(_) => {}''',
+      '''    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&path);'''],
+     [main("test_a_command_asks_the_lock_on_the_data_directory"),
+      e2e("person_e2e", "a_command_that_opens_the_database_asks_the_data_directorys_lock")]),
     ("F1e a node that finds the lock held refuses at once, and a command's moment stops it", MAIN,
      '''            Lock::AnotherNode if std::time::Instant::now() < until => {''',
      '''            Lock::AnotherNode if std::time::Instant::now() > until => {''',
@@ -119,6 +137,20 @@ MUTATIONS = [
      '''        .recv_timeout(wait)''',
      '''        .recv_timeout(wait * 100)''',
      [person_cmd("the_lookups_of_the_relays_names_end_within_their_wait")]),
+    ("F5d cordelia devices looks the relays up with no bound again", PERSON_CMD,
+     '''        true => addresses_within(
+            relays
+                .iter()
+                .map(|relay| text(relay, "relay").to_string())
+                .collect(),
+            lookup.wait,
+            lookup.by,
+        ),''',
+     '''        true => relays
+            .iter()
+            .map(|relay| addresses_of(text(relay, "relay")))
+            .collect(),''',
+     [person_cmd("devices_looks_the_relays_up_only_as_its_lookup_says_and_within_its_wait")]),
     ("F6a a version under any higher revision is brought back", CARRYING,
      '''            carry::Brought::Higher if carry::later_by_its_author(conn, name, version)? => held += 1,''',
      '''            carry::Brought::Higher => held += 1,''',
@@ -133,9 +165,13 @@ MUTATIONS = [
      '''    Ok(slot.current.iter().any(by_them))''',
      [api("carrying", "test_a_later_revision_of_the_same_authors_work_is_its_own_wherever_it_stands")]),
     ("F6d only the first link of a chain names the author", CARRY,
-     '''                    entry.chain.iter().flatten().any(|held| *held == link)''',
-     '''                    entry.chain.iter().flatten().next() == Some(&link)''',
+     '''                        .take_while(|link| link.hash == hash)''',
+     '''                        .take(1)''',
      [api("carrying", "test_a_later_revision_of_the_same_authors_work_is_its_own_wherever_it_stands")]),
+    ("F6e any link of a chain names the author, and another key's revert is brought back", CARRY,
+     '''                        .take_while(|link| link.hash == hash)''',
+     '''                        .take_while(|link| link.hash == link.hash)''',
+     [api("carrying", "test_another_keys_revert_to_an_earlier_text_is_not_brought_back")]),
     ("F7 the first start's line names two ways on", FIRST_START,
      '''        "first start on this version: the database was copied and moved on; this device is {}",
         look::NOT_ADDED.replace("\\n  - ", " ")''',
