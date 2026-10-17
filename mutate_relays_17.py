@@ -3,8 +3,9 @@
 relay a node is set up with is kept, churn closes no personal node's
 relay, the requests of the minute of a day's proofs are counted against
 the device's own pace, a connection whose proofs are held by a left
-generation is made again, and a role this version does not know is
-refused at load (decision 2026-10-17 §1 to §5). A part for each rule of
+generation is made again, a role this version does not know is refused
+at load, and hot churn spares trusted peers (decision 2026-10-17 §1 to
+§6). A part for each rule of
 the slice: put each fault in, and confirm the test named for it fails on
 an assertion. Run from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
@@ -14,9 +15,10 @@ BOOTSTRAP = 'crates/cordelia-network/src/bootstrap.rs'
 GOVERNOR = 'crates/cordelia-network/src/governor.rs'
 P2P = 'crates/cordelia-node/src/p2p.rs'
 DEVICE = 'crates/cordelia-node/src/device_entries.rs'
+LEAVE = 'crates/cordelia-node/src/device_entries/leave.rs'
 PROTOCOL = 'crates/cordelia-core/src/protocol.rs'
 CONFIG = 'crates/cordelia-core/src/config.rs'
-ORIG = {f: open(f).read() for f in (BOOTSTRAP, GOVERNOR, P2P, DEVICE, PROTOCOL, CONFIG)}
+ORIG = {f: open(f).read() for f in (BOOTSTRAP, GOVERNOR, P2P, DEVICE, LEAVE, PROTOCOL, CONFIG)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 NETWORK = ("cordelia-network", ["--lib"])
@@ -40,6 +42,13 @@ CHURN_E2E = devices_e2e("a_device_keeps_every_relay_it_is_set_up_with_through_ch
 REQUESTS = core("test_requests_on_the_streams_of_entries_decision_2026_10_04_16")
 MADE_AGAIN = device_e2e("a_connection_whose_places_are_held_by_a_left_generation_is_made_again")
 ROLE = config("test_a_role_that_this_version_does_not_know_is_refused")
+ONE_RELAY = p2p("one_relay_under_two_names_is_one_relay")
+TWO_KEYS = p2p("one_name_given_twice_with_two_keys_is_listed_by_its_key")
+LINKS = p2p("a_relay_whose_name_does_not_resolve_is_still_one_the_node_is_set_up_with")
+ONE_RELAY_E2E = devices_e2e("one_relay_under_two_names_is_counted_and_paced_once")
+GOVERNOR_FOR = p2p("a_nodes_governor_keeps_its_relays_through_churn_only_on_a_personal_node")
+HELD = device_e2e("a_pass_held_by_its_pace_stops_and_moves_no_place")
+TRUSTED = governor("test_churn_hot_demotes_no_trusted_peer")
 REPOSITORY = config("test_the_configurations_in_this_repository_load")
 
 # Each part: (a short id and what the fault is, the file, the exact text
@@ -77,6 +86,34 @@ MUTATIONS = [
      '''if relays.iter().any(|other| other.addr == relay.addr && relay_connected(&conn_mgr, other)) {''',
      '''if relays.iter().any(|other| other.addr == relay.addr && relay_connected(&conn_mgr, other) && false) {''',
      [AT_ONE_ADDRESS]),
+    ("S1 one relay under two names is counted twice", P2P,
+     '''            one[i] = OneRelay::SameAs(j);''',
+     '''            let _ = j;''',
+     [ONE_RELAY, LINKS, ONE_RELAY_E2E]),
+    ("S2 a relay another key answers for at its address is counted", P2P,
+     '''            one[i] = OneRelay::WrongKeyAt(j);''',
+     '''            let _ = j;''',
+     [ONE_RELAY]),
+    ("S3 too wide: two relays no connection reaches are one relay", P2P,
+     '''|| (peers[i].is_some() && peers[i] == peers[j])''',
+     '''|| (peers[i] == peers[j])''',
+     [ONE_RELAY]),
+    ("S4 a pass is given the same relay under each name", P2P,
+     '''.filter(|(_, one)| *one == OneRelay::Itself)''',
+     '''.filter(|_| true)''',
+     [LINKS, ONE_RELAY_E2E]),
+    ("S5 the device is counted every name of its configuration", P2P,
+     '''    own.set_up_with(relays.len());''',
+     '''    own.set_up_with(set_up.len());''',
+     [LINKS]),
+    ("T1 tries are kept by name alone", P2P,
+     '''    (relay.host.clone(), relay.key)''',
+     '''    (relay.host.clone(), None)''',
+     [TWO_KEYS]),
+    ("T2 the status finds a relay by its name alone", P2P,
+     '''.find(|relay| relay.host == named.host && relay.key == named.key);''',
+     '''.find(|relay| relay.host == named.host);''',
+     [TWO_KEYS]),
     # §2 Churn on a personal node.
     ("C1 churn closes a personal node's relays", GOVERNOR,
      '''let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay);''',
@@ -87,9 +124,13 @@ MUTATIONS = [
      '''let churned = |p: &PeerInfo| !p.is_relay;''',
      [CHURN]),
     ("C3 a personal node's governor does not keep its relays", P2P,
-     '''        governor = governor.keeping_its_relays();''',
-     '''        let _ = &governor;''',
-     [CHURN_E2E]),
+     '''        true => governor.keeping_its_relays(),''',
+     '''        true => governor,''',
+     [GOVERNOR_FOR, CHURN_E2E]),
+    ("C4 too wide: every node's governor keeps its relays", P2P,
+     '''        false => governor,''',
+     '''        false => governor.keeping_its_relays(),''',
+     [GOVERNOR_FOR]),
     # §3 The requests of the minute of a day's proofs.
     ("Q1 the device paces itself at the relay's limit", PROTOCOL,
      '''pub const OWN_ENTRY_REQUESTS_PER_MINUTE: u32 = ENTRY_REQUESTS_PER_PEER_PER_MINUTE / 4 * 3;''',
@@ -99,12 +140,39 @@ MUTATIONS = [
      '''pub const OWN_ENTRY_REQUESTS_PER_MINUTE: u32 = ENTRY_REQUESTS_PER_PEER_PER_MINUTE / 4 * 3;''',
      '''pub const OWN_ENTRY_REQUESTS_PER_MINUTE: u32 = ENTRY_REQUESTS_PER_PEER_PER_MINUTE / 5 * 3;''',
      [REQUESTS]),
+    ("H1 the device does not pace itself", LEAVE,
+     '''            .check_and_record()''',
+     '''            .check_and_record()
+            || true''',
+     [HELD]),
+    ("H2 a pass held by its pace is not said to be short", DEVICE,
+     '''            if !read_all {
+                self.state.own_channels.whole_pass_was_short(number);
+            }''',
+     '''            let _ = read_all;''',
+     [HELD]),
     # §4 The channels proved on a connection.
     ("P1 a full connection is never made again", DEVICE,
+     '''        if whole && self.make_again_where_full(link, &own) {
+            return false;
+        }''',
+     '''        let _ = Self::make_again_where_full;''',
+     [MADE_AGAIN]),
+    ("P5 the pass goes on on a connection it asked to make again", DEVICE,
+     '''        if whole && self.make_again_where_full(link, &own) {
+            return false;
+        }''',
      '''        if whole {
             self.make_again_where_full(link, &own);
         }''',
-     '''        let _ = Self::make_again_where_full;''',
+     [MADE_AGAIN]),
+    ("P6 a later pass goes on on a connection being made again", DEVICE,
+     '''            if of.made_again {
+                return true;
+            }''',
+     '''            if of.made_again {
+                return false;
+            }''',
      [MADE_AGAIN]),
     ("P2 the device forgets a left generation's proofs, which the relay keeps", DEVICE,
      '''            of.made_again = left > 0;
@@ -116,8 +184,8 @@ MUTATIONS = [
         };''',
      [MADE_AGAIN]),
     ("P3 too wide: a connection is made again with room left", DEVICE,
-     '''!of.made_again && of.proved.len() + not_proved.count() > self.most_proved''',
-     '''!of.made_again && not_proved.count() > 0''',
+     '''of.proved.len() + not_proved.count() > self.most_proved''',
+     '''not_proved.count() > 0''',
      [MADE_AGAIN]),
     ("P4 the device asks again at every pass", DEVICE,
      '''            of.made_again = left > 0;''',
@@ -141,6 +209,21 @@ MUTATIONS = [
      '''if ROLES.contains(&self.role.as_str()) {''',
      '''if ROLES.contains(&self.role.as_str()) || self.role == "keeper" {''',
      [ROLE]),
+    # §6 Hot churn and trusted peers.
+    ("K1 hot churn demotes a trusted peer", GOVERNOR,
+     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
+     '''.filter(|p| p.state == PeerState::Hot)''',
+     [TRUSTED]),
+    ("K2 a swarm member is not trusted", GOVERNOR,
+     '''        peer.is_swarm
+            || matches!''',
+     '''        false
+            || matches!''',
+     [TRUSTED]),
+    ("K3 too wide: hot churn demotes no peer", GOVERNOR,
+     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))''',
+     '''.filter(|p| p.state == PeerState::Hot && !self.is_trusted(p) && false)''',
+     [TRUSTED]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
