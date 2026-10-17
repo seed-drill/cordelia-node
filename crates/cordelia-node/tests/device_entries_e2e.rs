@@ -5137,6 +5137,57 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
     assert_eq!(read[0].read, expected);
     assert!(pulls(&relay).is_empty());
 
+    // The time goes by after some pages: the read is in part, and the
+    // place reached is the one after the last page handed. A read asked
+    // from it hands the rest, and nothing twice. Each page is handed a
+    // while after it is asked for, so that the time goes by between two.
+    let slow = held.clone();
+    relay.pulls(move |pull| {
+        std::thread::sleep(Duration::from_millis(400));
+        let after = if pull.mark == mark { pull.after } else { 0 };
+        let page: Vec<Vec<u8>> = slow.iter().skip(after as usize).take(1).cloned().collect();
+        EntryPulled {
+            next: after + page.len() as u64,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let until = std::time::Instant::now() + Duration::from_millis(1000);
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), until).await;
+    let LeftRead::Read {
+        entries: first,
+        whole,
+        reached,
+    } = read[0].read.clone()
+    else {
+        panic!("{read:?}");
+    };
+    let handed = first.len();
+    assert!(!whole, "{read:?}");
+    assert!((2..held.len()).contains(&handed), "{read:?}");
+    assert_eq!(ids(&first), ids(&held[..handed]));
+    assert_eq!(reached, place(mark, handed as u64));
+    let read = reads_left_from(&a, old, by_secret(), None, from(reached), soon()).await;
+    let LeftRead::Read {
+        entries: rest,
+        whole,
+        ..
+    } = &read[0].read
+    else {
+        panic!("{read:?}");
+    };
+    assert!(*whole);
+    assert!(ids(&first).is_disjoint(&ids(rest)));
+    assert_eq!(ids(rest), ids(&held[handed..]));
+    relay.requests();
+
+    // A place given only for a relay of another name: this relay is read
+    // from the start, under no mark.
+    let only_far = HashMap::from([("far".to_string(), place(mark, 2))]);
+    let read = reads_left_from(&a, old, by_secret(), None, only_far, soon()).await;
+    assert_eq!(handed_ids(&read[0].read), Some((ids(&held), true)));
+    assert_eq!(pulls(&relay)[0], ([0; 8], 0));
+
     // A page of which nothing is an entry of the channel, and a page
     // that holds more than a page may, which is no answer: the read stops
     // with what it had, in part, at the place before that page. Asked

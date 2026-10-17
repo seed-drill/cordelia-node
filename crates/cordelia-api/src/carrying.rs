@@ -1240,7 +1240,9 @@ pub struct ReadRequest {
 
 /// The place that the read reached at each relay where it read the
 /// channel, to its end or in part: its name, the mark of its holding in
-/// hex, and the place (decision 2026-10-17 §3.2). A command
+/// hex, and the place (decision 2026-10-17 §3.2). **A relay that is not
+/// among them read nothing** (it was not reached, holds none, or did not
+/// answer): whoever asked keeps the place it had there. A command
 /// asks from it to read on where the read stopped.
 fn places_reached(read: &[LeftAt]) -> Vec<serde_json::Value> {
     read.iter()
@@ -1339,7 +1341,10 @@ pub async fn read_proved(
             mark,
             next: place.place,
         };
-        from.insert(place.relay.clone(), at);
+        if from.insert(place.relay.clone(), at).is_some() {
+            let twice = format!("{} is given two places to read from", place.relay);
+            return Err(ApiError::BadRequest(twice));
+        }
     }
     let read = read_with_proofs(&state, channel, proofs, from).await;
     Ok(HttpResponse::Ok().json(read))
