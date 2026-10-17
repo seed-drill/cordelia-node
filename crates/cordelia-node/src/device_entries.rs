@@ -1549,8 +1549,10 @@ impl DeviceEntries {
         };
         let at = At { link, under };
         let whole = kind == Pass::Whole;
-        if whole {
-            self.make_again_where_full(link, &own);
+        // A connection that is to be made again is used no more: the
+        // pass at this relay ends, and is short (decision 2026-10-17 §4).
+        if whole && self.make_again_where_full(link, &own) {
+            return false;
         }
         let mut read_all = true;
         for channel in &own {
@@ -1776,26 +1778,33 @@ impl DeviceEntries {
     /// ([`DoorAsk::Remake`]), and is asked once for a connection. Where
     /// every place is held by a channel the device still proves, nothing
     /// is asked: a new connection would have no more room.
-    fn make_again_where_full(&self, link: &Link, own: &[Own]) {
+    ///
+    /// Says whether it asked, now or before: the pass then ends at this
+    /// relay, since the connection is being closed.
+    fn make_again_where_full(&self, link: &Link, own: &[Own]) -> bool {
         let short = {
             let kept = lock(&self.kept);
             let Some(of) = kept.links.get(&link.id()) else {
-                return;
+                return false;
             };
+            // Asked already: it is being made again.
+            if of.made_again {
+                return true;
+            }
             let proved = |own: &&Own| own.is_pulled() && !of.proved.contains_key(&own.id);
             let not_proved = own.iter().filter(proved);
-            !of.made_again && of.proved.len() + not_proved.count() > self.most_proved
+            of.proved.len() + not_proved.count() > self.most_proved
         };
         if !short {
-            return;
+            return false;
         }
         let Ok(listed) = at_relays::listed(&lock(&self.state.db), self.most_proved) else {
-            return;
+            return false;
         };
         let left = {
             let mut kept = lock(&self.kept);
             let Some(of) = kept.links.get_mut(&link.id()) else {
-                return;
+                return false;
             };
             let proves = |channel: &[u8; 32]| own.iter().chain(&listed).any(|o| o.id == *channel);
             let left = of.proved.keys().filter(|channel| !proves(channel)).count();
@@ -1803,7 +1812,7 @@ impl DeviceEntries {
             left
         };
         if left == 0 {
-            return;
+            return false;
         }
         tracing::info!(
             relay = link.name(),
@@ -1815,6 +1824,7 @@ impl DeviceEntries {
             relay: link.name().to_string(),
             answer,
         });
+        true
     }
 
     /// Whether the connection at `link` has room for the proof of

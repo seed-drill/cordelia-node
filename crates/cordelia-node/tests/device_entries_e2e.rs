@@ -1819,6 +1819,99 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
     assert_eq!(device.at("relay").refuses, None);
 }
 
+/// A pass held by the device's pace stops, and moves no place (decision
+/// 2026-10-17 §3). The relay moves the device's place in each channel at
+/// every pull. Once the device has asked what it asks of a relay in a
+/// minute, a whole pass asks nothing on a stream of a channel: no place
+/// moves, what waits to be sent is not sent, and the pass says it is
+/// short. In the next minute a pass goes on from the places it kept, and
+/// sends what waited: nothing was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_held_by_its_pace_stops_and_moves_no_place() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    let notes = device.channel("notes");
+    let personal = device.personal();
+    // Each pull moves the place by one, and hands nothing: the place is
+    // where the pass leaves the channel.
+    relay.pulls(|pull| EntryPulled {
+        entries: Vec::new(),
+        next: pull.after + 1,
+        mark: [5; 8],
+    });
+    let of_a_channel = |seen: &[Seen]| {
+        let asked = |one: &&Seen| matches!(one, Seen::Prove | Seen::Pull | Seen::Push);
+        seen.iter().filter(asked).count()
+    };
+    let places = |device: &Device| {
+        (
+            device.place("relay", &notes),
+            device.place("relay", &personal),
+        )
+    };
+    device.passes().await;
+    let kept = places(&device);
+    assert_ne!(kept.0, ([0; 8], 0), "the pull moved the place");
+
+    // The device asks what it asks of a relay in a minute.
+    let link = device.link("relay");
+    let proof = proof_on(&device, "relay", "notes");
+    let entry = device.latest();
+    let under = entry.id();
+    let mut refused = None;
+    for n in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+        if n % 200 == 0 {
+            device
+                .engine
+                .leave()
+                .show(&link, &entry, true)
+                .await
+                .unwrap();
+        }
+        let asked = Asked {
+            under: &under,
+            request: &proof,
+        };
+        let opened =
+            device
+                .engine
+                .leave()
+                .open(&device.state.db, &link, asked, |_| (), |_| (), |_, _| ());
+        if let Err(why) = opened.await {
+            refused = Some(why);
+            break;
+        }
+    }
+    assert_eq!(refused, Some(Refused::AskedEnough));
+    let _ = relay.seen();
+
+    // Held: the pass asks nothing of a channel, moves no place, sends
+    // nothing, and is short.
+    device.writes("notes", "a.md", "waiting to be sent");
+    let pushes = device.counts("relay").pushes;
+    device.passes().await;
+    let own = &device.state.own_channels;
+    let held = own.whole_passes().1;
+    assert_eq!(own.last_short_pass(), held, "the held pass is short");
+    assert_eq!(of_a_channel(&relay.seen()), 0);
+    assert_eq!(places(&device), kept);
+    assert_eq!(device.counts("relay").pushes, pushes);
+
+    // A minute on, it goes on from where it was, and sends what waited.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    device.passes().await;
+    let moved = places(&device);
+    assert_eq!(moved.0.0, kept.0.0);
+    assert!(moved.0.1 > kept.0.1, "{moved:?} after {kept:?}");
+    assert!(
+        device.counts("relay").pushes > pushes,
+        "what waited was sent"
+    );
+}
+
 /// With leave, a device still asks only so much of a relay in a minute on
 /// the streams of a channel. At that it opens no more, and its passes
 /// stop there: what they did not ask, they ask later. Its shows go on.
@@ -5427,11 +5520,12 @@ async fn a_pass_that_passed_a_channel_by_for_its_proof_has_not_read_everything()
 /// channels a new one, and the relay still remembers the old five.
 ///
 /// Where a relay remembers the proofs of eight channels for one
-/// connection, three of the new find a place and two do not: the device
-/// sends no proof beyond the eight, and asks the node, once, to make the
-/// connection again. On the new connection it proves every channel of
-/// the new generation. Where a relay remembers sixteen, every new
-/// channel finds a place on the same connection, and nothing is asked.
+/// connection, the new five do not all find a place: the device asks
+/// the node, once, to make the connection again, and asks nothing more
+/// on the one that is to be closed. On the new connection it proves
+/// every channel of the new generation. Where a relay remembers sixteen,
+/// every new channel finds a place on the same connection, and nothing
+/// is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_whose_places_are_held_by_a_left_generation_is_made_again() {
     // The channels whose keys the relay was asked to prove since it was
@@ -5494,7 +5588,11 @@ async fn a_connection_whose_places_are_held_by_a_left_generation_is_made_again()
             );
             continue;
         }
-        assert_eq!(on_the_first.len(), most, "as many as the relay remembers");
+        assert_eq!(
+            on_the_first.len(),
+            before.len(),
+            "a proof on a connection being closed"
+        );
         let asked = door(&a, 5_000).await;
         let asked = asked.expect("the device did not ask for the connection to be made again");
         let DoorAsk::Remake { relay: name, .. } = asked else {

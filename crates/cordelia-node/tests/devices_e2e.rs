@@ -4321,7 +4321,9 @@ async fn a_device_keeps_every_relay_it_is_set_up_with_through_churn() {
 /// answers there. The one that was given the other key is kept, and is
 /// listed with the wrong key; the other is connected, and stays so on
 /// one connection: the device does not dial the address again for the
-/// relay whose key is wrong.
+/// relay whose key is wrong. The relay counts the connections it took
+/// from the device: one, where each dial again would have been another,
+/// in place of the first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_relays_at_one_address_are_each_kept_and_the_wrong_key_is_its_own() {
     const WAITED_SECS: u64 = 12;
@@ -4362,10 +4364,77 @@ async fn two_relays_at_one_address_are_each_kept_and_the_wrong_key_is_its_own() 
     });
     tokio::time::sleep(Duration::from_secs(WAITED_SECS)).await;
     assert_eq!(stands(&laptop), expected);
-    let for_secs = connected_secs(&laptop).get(&key_of(&relay)).copied();
-    assert!(
-        for_secs.is_some_and(|secs| secs >= WAITED_SECS - 2),
-        "the relay's connection was made again: connected for {for_secs:?}s\n{}",
+    assert_eq!(
+        inbound_connections(&relay),
+        1,
+        "the device dialled the relay again\n{}",
         laptop.log_tail()
     );
+}
+
+/// How many connections a relay has taken from its peers, as its log
+/// says.
+fn inbound_connections(relay: &Node) -> usize {
+    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
+    log.lines()
+        .filter(|line| line.contains("accepted inbound connection"))
+        .count()
+}
+
+/// One relay set up under two names is one relay (decision 2026-10-17
+/// §1). A device is set up with one relay of the test's own, under one
+/// name with its key and under another with none. It is listed under the
+/// first as connected, and under the second as the same relay. The
+/// device counts one relay, and paces and passes it once: the relays
+/// that its person's view lists are one, and that one holds the latest
+/// change. The relay took one connection from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_relay_under_two_names_is_counted_and_paced_once() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let keyed = format!("127.0.0.1:{}", relay.p2p);
+    let keyless = format!("localhost:{}", relay.p2p);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (keyed.clone(), Some(key_of(&relay))),
+            (keyless.clone(), None),
+        ],
+    );
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("node healthy", &all, 30, || healthy(&laptop));
+    makes_a_phrase(&laptop, "laptop");
+    let listed = |n: &Node| -> Vec<(String, String)> {
+        relays_of(n)
+            .iter()
+            .map(|r| {
+                let host = r["host"].as_str().unwrap_or_default().to_string();
+                (host, r["state"].as_str().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    let expected = vec![
+        (keyed.clone(), "connected".to_string()),
+        (keyless.clone(), "same relay".to_string()),
+    ];
+    wait_for("each name is listed as it stands", &all, 60, || {
+        (listed(&laptop) == expected).then_some(())
+    });
+    // The device's own list of its relays: what it counts, paces and
+    // passes, and says holds the latest change.
+    let counted = wait_for("the relay holds the latest change", &all, 60, || {
+        let seen = person_of(&laptop);
+        let relays = seen["relays"].as_array()?.clone();
+        relays
+            .iter()
+            .all(|relay| relay["holds_latest"] == true)
+            .then_some(relays)
+    });
+    let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();
+    assert_eq!(names, [keyed.as_str()], "{counted:?}");
+    assert_eq!(listed(&laptop), expected);
+    assert_eq!(inbound_connections(&relay), 1);
 }

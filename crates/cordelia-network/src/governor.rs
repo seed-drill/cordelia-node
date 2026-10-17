@@ -535,6 +535,15 @@ impl Governor {
             .count()
     }
 
+    /// Whether a peer is trusted, and so exempt from churn
+    /// (network-protocol.md §5.4, step 6): one of the trusted peers that a
+    /// swarm node dials alone, or an HKDF-verified swarm member, which is
+    /// always hot.
+    fn is_trusted(&self, peer: &PeerInfo) -> bool {
+        peer.is_swarm
+            || matches!(&self.dial_policy, DialPolicy::TrustedOnly(trusted) if trusted.contains(&peer.node_id))
+    }
+
     /// Check if a peer is dialable under the current policy.
     fn is_dialable(&self, peer: &PeerInfo) -> bool {
         match &self.dial_policy {
@@ -981,11 +990,12 @@ impl Governor {
             return;
         }
 
-        // Pick a random non-trusted hot peer to demote
+        // Pick a random non-trusted hot peer to demote: a trusted peer and
+        // a swarm peer are exempt (network-protocol.md §5.4, step 6).
         let hot_peers: Vec<NodeId> = self
             .peers
             .values()
-            .filter(|p| p.state == PeerState::Hot)
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
             .map(|p| p.node_id.clone())
             .collect();
 
@@ -2101,6 +2111,48 @@ mod tests {
         assert_eq!(actions.disconnect.len(), 1, "{:?}", actions.disconnect);
         assert!(three.contains(&actions.disconnect[0]));
         assert_eq!(relay.counts().2, 2, "the warm relay that churned is cold");
+    }
+
+    /// Hot churn demotes no trusted peer (network-protocol.md §5.4, step
+    /// 6): neither one of the trusted peers that a swarm node dials alone,
+    /// nor a swarm member. With one of each hot beside a peer that is
+    /// neither, churn after churn demotes only that one.
+    #[test]
+    fn test_churn_hot_demotes_no_trusted_peer() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            hot_max: 3,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max: 10,
+            cold_max: 50,
+            churn_interval_secs: 0, // churn every tick
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+        };
+        let (trusted, swarm, other) = (make_node_id(1), make_node_id(2), make_node_id(3));
+        let policy = DialPolicy::TrustedOnly(vec![trusted.clone()]);
+        let mut gov = Governor::with_dial_policy(targets, vec![], policy);
+        for id in [&trusted, &swarm, &other] {
+            gov.add_peer(id.clone(), vec![], vec![]);
+            gov.peers.get_mut(id).unwrap().state = PeerState::Hot;
+        }
+        gov.set_peer_swarm(&swarm);
+        let mut demoted = Vec::new();
+        for _ in 0..10 {
+            gov.last_churn = Instant::now() - Duration::from_secs(1);
+            let actions = gov.tick();
+            demoted.extend(
+                actions
+                    .transitions
+                    .into_iter()
+                    .filter(|(_, from, to)| from == "hot" && to == "warm")
+                    .map(|(id, _, _)| id),
+            );
+        }
+        assert_eq!(demoted, std::slice::from_ref(&other));
+        assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Hot));
+        assert_eq!(gov.peer_state(&swarm), Some(&PeerState::Hot));
     }
 
     #[test]
