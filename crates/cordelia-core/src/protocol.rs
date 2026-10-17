@@ -1220,10 +1220,30 @@ pub const MAX_COUNTED_DEVICES: usize = MAX_STATEMENT_DEVICES;
 /// The most records of additions a reader keeps as not counted (decision
 /// 2026-10-04 §6). A device that counts can sign any number of records,
 /// and every reader loads what it keeps each time it asks who counts. Over
-/// this bound the oldest record that is not counted goes when a new one is
-/// kept: it is seen again as any record is, where it is given again. A
-/// record that counts is never dropped for room.
+/// this bound records go from the end of the order of keeping (decision
+/// 2026-10-17 §2.2), which goes by who signed them and not by when they
+/// were seen: one that went is seen again as any record is, where it is
+/// given again. A record that counts is never dropped for room.
 pub const MAX_NOT_COUNTED_RECORDS: usize = 256;
+
+/// How many keys that the 64 kept out each adder that may add keeps among
+/// the records a reader keeps, and among the rows a recovery shows,
+/// whatever another key signs, of the records the relays hold (decision
+/// 2026-10-17 §2.2). It is what is left of each bound once the records
+/// that let a key add, or the rows of the devices that count, have their
+/// places, shared among the 64 adders there can be.
+/// Derived: the lesser of (MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES -
+/// 1)) / MAX_COUNTED_DEVICES and (RECOVERY_MAX_DEVICES_SHOWN -
+/// MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES.
+pub const KEPT_OUT_PER_ADDER: usize = {
+    let kept = (MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1)) / MAX_COUNTED_DEVICES;
+    let shown = (RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES;
+    if kept < shown { kept } else { shown }
+};
+
+// Checked at compile time: each adder that may add keeps at least one key
+// that the 64 kept out, in both bounds.
+const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
 
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
@@ -2590,6 +2610,33 @@ mod tests {
         assert_eq!(MAX_NOT_COUNTED_RECORDS, 256);
         assert_eq!(MAX_COUNTED_DEVICES, 64);
         assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
+    }
+
+    /// Each adder that may add keeps its first three keys that the 64
+    /// kept out (decision 2026-10-17 §2.2): the lesser of what is left of
+    /// each bound of 256, shared among 64 adders.
+    #[test]
+    fn test_each_adder_keeps_its_first_three_kept_out_decision_2026_10_17_2_2() {
+        assert_eq!(KEPT_OUT_PER_ADDER, 3);
+        // What a reader keeps: 256, less the 63 that let a key add.
+        assert_eq!(MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1), 193);
+        assert_eq!(193 / MAX_COUNTED_DEVICES, 3);
+        // What a recovery shows: 256 rows, less the 64 that count.
+        assert_eq!(RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES, 192);
+        assert_eq!(192 / MAX_COUNTED_DEVICES, 3);
+        // At the floor, every adder's share fits each bound.
+        const {
+            assert!(
+                (MAX_COUNTED_DEVICES - 1) + MAX_COUNTED_DEVICES * KEPT_OUT_PER_ADDER
+                    <= MAX_NOT_COUNTED_RECORDS
+            )
+        };
+        const {
+            assert!(
+                MAX_COUNTED_DEVICES + MAX_COUNTED_DEVICES * KEPT_OUT_PER_ADDER
+                    <= RECOVERY_MAX_DEVICES_SHOWN
+            )
+        };
     }
 
     #[test]
