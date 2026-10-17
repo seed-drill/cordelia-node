@@ -5,9 +5,15 @@
 // Each test file uses a different part of this.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use cordelia_crypto::entry::Entry;
+use cordelia_crypto::identity::NodeIdentity;
+use cordelia_network::messages::{Protocol, WireMessage};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_cordelia");
 
@@ -51,13 +57,19 @@ impl Node {
 
     /// Add a relay to this node's configuration: where to dial and, if
     /// given, the key that must answer there. For before the node starts.
+    ///
+    /// Where the configuration names the address already, its entry is
+    /// replaced, in its place: a device that is to know its relay by its
+    /// key (decision 2026-10-10 §13) is given the key in the entry it was
+    /// made with, and the address is never named twice.
     pub fn add_relay(&self, addr: &str, key: Option<&str>) {
         assert_on_this_machine(self.name, addr);
-        let key = key.map(|k| format!("key = \"{k}\"\n")).unwrap_or_default();
+        let entry = bootnode_entry(addr, key);
         let mut config = std::fs::read_to_string(self.config()).unwrap();
-        config.push_str(&format!(
-            "\n[[network.bootnodes]]\naddr = \"{addr}\"\n{key}"
-        ));
+        match entry_naming(&config, addr) {
+            Some(at) => config.replace_range(at, &entry),
+            None => config.push_str(&format!("\n{entry}")),
+        }
         std::fs::write(self.config(), config).unwrap();
     }
 
@@ -769,13 +781,7 @@ fn node_made(
     }
     let bootnodes: String = relays
         .iter()
-        .map(|(addr, key)| {
-            let key = key
-                .as_ref()
-                .map(|k| format!("key = \"{k}\"\n"))
-                .unwrap_or_default();
-            format!("[[network.bootnodes]]\naddr = \"{addr}\"\n{key}")
-        })
+        .map(|(addr, key)| bootnode_entry(addr, key.as_deref()))
         .collect();
     let (hot_min, hot_max) = if role == "relay" { (1, 10) } else { (1, 2) };
     let config = format!(
@@ -824,6 +830,33 @@ level = "debug"
     };
     n.cli(&["init", "--non-interactive", "--name", name]);
     n
+}
+
+/// A relay's entry in a configuration, as the harness writes each one:
+/// its address, and its key on the next line where it has one.
+fn bootnode_entry(addr: &str, key: Option<&str>) -> String {
+    let key = key.map(|k| format!("key = \"{k}\"\n")).unwrap_or_default();
+    format!("[[network.bootnodes]]\naddr = \"{addr}\"\n{key}")
+}
+
+/// Where in `config` the entry that names `addr` is, with its key's line
+/// where it has one: the text that [`bootnode_entry`] wrote for it.
+fn entry_naming(config: &str, addr: &str) -> Option<std::ops::Range<usize>> {
+    let head = bootnode_entry(addr, None);
+    let mut found = config.match_indices(&head).map(|(at, _)| at);
+    let start = found.next()?;
+    assert!(
+        found.next().is_none(),
+        "the configuration names {addr} twice:\n{config}"
+    );
+    let after = start + head.len();
+    let rest = &config[after..];
+    let key_line = if rest.starts_with("key = \"") {
+        rest.find('\n').map_or(rest.len(), |end| end + 1)
+    } else {
+        0
+    };
+    Some(start..after + key_line)
 }
 
 /// A command that runs at a terminal of its own: a pseudo-terminal,
@@ -1286,7 +1319,21 @@ pub fn relay_started() -> Node {
 
 /// A device whose one relay is `relay`, started, and connected to it.
 pub fn device_started(name: &'static str, relay: &Node) -> Node {
-    let mut device = node(name, "personal", Some(relay.p2p));
+    started(node(name, "personal", Some(relay.p2p)), relay)
+}
+
+/// [`device_started`], with its relay's key in its configuration: a relay
+/// that it knows by its key, as a shared channel's relays are known
+/// (decision 2026-10-10 §8.2). The key is put in the entry the device was
+/// made with, which then names the relay with its key, and only once.
+pub fn device_started_with_its_relays_key(name: &'static str, relay: &Node) -> Node {
+    let device = node(name, "personal", Some(relay.p2p));
+    device.add_relay(&format!("127.0.0.1:{}", relay.p2p), Some(&key_of(relay)));
+    started(device, relay)
+}
+
+/// `device`, started, and connected to `relay`.
+fn started(mut device: Node, relay: &Node) -> Node {
     device.start();
     wait_for("device healthy", &[&device], 30, || healthy(&device));
     wait_for("device reaches its relay", &[&device, relay], 60, || {
@@ -1716,4 +1763,291 @@ pub fn two_words_in_a_row(bytes: &[u8], phrase: &[&str]) -> Option<(String, Stri
                 .any(|two| two[0] == pair[0] && two[1] == pair[1])
         })
         .map(|pair| (pair[0].clone(), pair[1].clone()))
+}
+
+/// Every file under `dir` that contains `needle`, as raw bytes: SQLite
+/// keeps text and bytes as they were written, so this finds it in a
+/// database, in the write-ahead log beside it, and in a log file alike.
+pub fn files_containing(dir: &std::path::Path, needle: impl AsRef<[u8]>) -> Vec<PathBuf> {
+    let needle = needle.as_ref();
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path)
+                && bytes.windows(needle.len()).any(|w| w == needle)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+// ── A stand-in for a relay ──────────────────────────────────────────
+
+/// What a stand-in for a relay was sent on a stream of entries: the
+/// stream it came on, its bytes as they travelled, and the request that
+/// they are, where they are one.
+#[derive(Clone)]
+pub struct HeardOnAStream {
+    pub protocol: Protocol,
+    pub bytes: Vec<u8>,
+    pub request: Option<WireMessage>,
+}
+
+/// What a stand-in for a relay holds, and how it answers.
+pub struct Script {
+    /// Whether it has room. Without room it takes no entry: one that is
+    /// shown or pushed is refused for room, as a relay that is full
+    /// refuses it.
+    pub has_room: bool,
+    /// How many pushes it still answers with an answer that says nothing
+    /// of any entry: fewer things than the push held entries.
+    pub says_nothing_of: usize,
+    /// The entries it took, each by what it is named by.
+    pub holds: BTreeSet<[u8; 32]>,
+    /// A channel it has no room for, whatever `has_room` says: an entry
+    /// of it that is shown or pushed is refused for room.
+    pub no_room_in: Option<[u8; 32]>,
+}
+
+/// A stand-in for a relay. It completes the handshake as a relay does,
+/// and records what each node that connects does: the protocol of every
+/// stream it opens, and every request it makes on a stream of entries
+/// (decision 2026-10-04 §2.4).
+///
+/// It answers those requests as a relay with room does, until a test
+/// says otherwise: an entry that is shown, it takes; a proof it answers
+/// with no, as a relay that holds nothing of the channel yet; a pull,
+/// with a page of nothing; and a push, with "stored" for each entry.
+pub struct StandIn {
+    pub port: u16,
+    /// The stand-in's own key, as a device would be configured with it.
+    pub key: String,
+    pub streams: Arc<Mutex<Vec<Protocol>>>,
+    pub heard: Arc<Mutex<Vec<HeardOnAStream>>>,
+    pub script: Arc<Mutex<Script>>,
+    /// Each connection that a node made to it, on which it can ask that
+    /// node what a relay may ask.
+    pub connections: Arc<Mutex<Vec<quinn::Connection>>>,
+}
+
+/// A stand-in relay that has room.
+pub fn stand_in_relay() -> StandIn {
+    use cordelia_network::{connection, transport};
+
+    let identity = Arc::new(NodeIdentity::generate().unwrap());
+    let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
+    let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = endpoint.local_addr().unwrap().port();
+    let manager = connection::ConnectionManager::new(
+        identity,
+        endpoint.clone(),
+        vec![],
+        vec!["relay".into()],
+        port,
+    );
+    let ctx = manager.connect_context();
+    let relay = StandIn {
+        port,
+        key,
+        streams: Arc::default(),
+        heard: Arc::default(),
+        script: Arc::new(Mutex::new(Script {
+            has_room: true,
+            says_nothing_of: 0,
+            holds: BTreeSet::new(),
+            no_room_in: None,
+        })),
+        connections: Arc::default(),
+    };
+
+    let (streams, heard, script, connections) = (
+        relay.streams.clone(),
+        relay.heard.clone(),
+        relay.script.clone(),
+        relay.connections.clone(),
+    );
+    tokio::spawn(async move {
+        let _manager = manager; // keeps the endpoint's context alive
+        while let Some(incoming) = endpoint.accept().await {
+            let ctx = ctx.clone();
+            let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
+                    return;
+                };
+                connections.lock().unwrap().push(outcome.conn.clone());
+                while let Ok((send, recv)) = outcome.conn.accept_bi().await {
+                    let (streams, heard, script) = (streams.clone(), heard.clone(), script.clone());
+                    tokio::spawn(StandIn::answers(streams, heard, script, send, recv));
+                }
+            });
+        }
+    });
+    relay
+}
+
+impl StandIn {
+    /// Answer one stream.
+    async fn answers(
+        streams: Arc<Mutex<Vec<Protocol>>>,
+        heard: Arc<Mutex<Vec<HeardOnAStream>>>,
+        script: Arc<Mutex<Script>>,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
+        use cordelia_network::codec;
+        use cordelia_network::messages::{
+            ChannelProved, EntryPulled, EntryPushed, EntryRefused, EntryShown, PushAnswer,
+            ShowAnswer,
+        };
+
+        let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
+            return;
+        };
+        streams.lock().unwrap().push(protocol);
+        let of_entries = [
+            Protocol::EntryShow,
+            Protocol::ChannelProve,
+            Protocol::EntryPull,
+            Protocol::EntryPush,
+        ];
+        if !of_entries.contains(&protocol) {
+            return;
+        }
+        let Ok(bytes) = codec::read_raw_frame(&mut recv).await else {
+            return;
+        };
+        let request = codec::decode_message(&bytes).ok();
+        // What an entry that is shown or pushed is answered with, where
+        // its bytes are an entry's: it is held, or taken, or refused for
+        // room.
+        let taken = |script: &mut Script, bytes: &[u8]| -> Option<PushAnswer> {
+            let entry = Entry::from_wire(bytes).ok()?;
+            let id = entry.id();
+            let room = script.has_room && script.no_room_in != Some(entry.channel);
+            Some(if script.holds.contains(&id) {
+                PushAnswer::Held
+            } else if room {
+                script.holds.insert(id);
+                PushAnswer::Stored
+            } else {
+                PushAnswer::Refused(EntryRefused::NoRoom)
+            })
+        };
+        let answer = {
+            let mut script = script.lock().unwrap();
+            match &request {
+                Some(WireMessage::EntryShow(show)) => {
+                    taken(&mut script, &show.entry).map(|became| {
+                        let answer = match became {
+                            PushAnswer::Stored => ShowAnswer::Taken,
+                            PushAnswer::Refused(why) => ShowAnswer::Refused(why),
+                            _ => ShowAnswer::Held,
+                        };
+                        WireMessage::EntryShown(EntryShown { answer })
+                    })
+                }
+                // It holds the entry, or holds none: "show it whole".
+                Some(WireMessage::EntryShowShort(short)) => {
+                    let answer = match script.holds.contains(&short.id) {
+                        true => ShowAnswer::Held,
+                        false => ShowAnswer::Whole,
+                    };
+                    Some(WireMessage::EntryShown(EntryShown { answer }))
+                }
+                Some(WireMessage::ChannelProve(_)) => {
+                    Some(WireMessage::ChannelProved(ChannelProved { proved: false }))
+                }
+                Some(WireMessage::EntryPull(pull)) => Some(WireMessage::EntryPulled(EntryPulled {
+                    entries: Vec::new(),
+                    next: pull.after,
+                    mark: pull.mark,
+                })),
+                Some(WireMessage::EntryPush(push)) if script.says_nothing_of > 0 => {
+                    script.says_nothing_of -= 1;
+                    let answers = vec![PushAnswer::Stored; push.entries.len().saturating_sub(1)];
+                    Some(WireMessage::EntryPushed(EntryPushed { answers }))
+                }
+                Some(WireMessage::EntryPush(push)) => {
+                    let answers: Option<Vec<PushAnswer>> = push
+                        .entries
+                        .iter()
+                        .map(|bytes| taken(&mut script, bytes))
+                        .collect();
+                    answers.map(|answers| WireMessage::EntryPushed(EntryPushed { answers }))
+                }
+                _ => None,
+            }
+        };
+        heard.lock().unwrap().push(HeardOnAStream {
+            protocol,
+            bytes,
+            request,
+        });
+        // What is no request for a stream of entries is answered nothing.
+        if let Some(answer) = answer {
+            let _ = codec::write_frame(&mut send, &answer).await;
+            let _ = send.finish();
+        }
+    }
+
+    /// From now on it has room, or has none, as `has_room` says.
+    pub fn has_room(&self, has_room: bool) {
+        self.script.lock().unwrap().has_room = has_room;
+    }
+
+    /// From now on it has no room for the channel `channel`, and room for
+    /// the others as [`Self::has_room`] says.
+    pub fn has_no_room_in(&self, channel: [u8; 32]) {
+        self.script.lock().unwrap().no_room_in = Some(channel);
+    }
+
+    /// Every request it was sent on a stream of entries, in the order
+    /// they arrived.
+    pub fn heard(&self) -> Vec<HeardOnAStream> {
+        self.heard.lock().unwrap().clone()
+    }
+
+    /// The entries that it was shown whole, in the order they were
+    /// shown, each by what it is named by.
+    pub fn shown_whole(&self) -> Vec<[u8; 32]> {
+        self.heard()
+            .iter()
+            .filter_map(|heard| match &heard.request {
+                Some(WireMessage::EntryShow(show)) => {
+                    Some(Entry::from_wire(&show.entry).ok()?.id())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The entries of each push, in the order the pushes arrived.
+    pub fn pushes(&self) -> Vec<Vec<Entry>> {
+        self.heard()
+            .iter()
+            .filter_map(|heard| match &heard.request {
+                Some(WireMessage::EntryPush(push)) => Some(
+                    push.entries
+                        .iter()
+                        .filter_map(|bytes| Entry::from_wire(bytes).ok())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many pushes held the entry that is named by `id`, in hex.
+    pub fn pushes_of(&self, id: &str) -> usize {
+        let holds = |push: &Vec<Entry>| push.iter().any(|entry| hex::encode(entry.id()) == id);
+        self.pushes().iter().filter(|push| holds(push)).count()
+    }
 }
