@@ -49,6 +49,7 @@ ONE_RELAY_E2E = devices_e2e("one_relay_under_two_names_is_counted_and_paced_once
 GOVERNOR_FOR = p2p("a_nodes_governor_keeps_its_relays_through_churn_only_on_a_personal_node")
 HELD = device_e2e("a_pass_held_by_its_pace_stops_and_moves_no_place")
 TRUSTED = governor("test_churn_hot_demotes_no_trusted_peer")
+MESSAGES_PLACE = device_e2e("a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none")
 REPOSITORY = config("test_the_configurations_in_this_repository_load")
 
 # Each part: (a short id and what the fault is, the file, the exact text
@@ -166,6 +167,10 @@ MUTATIONS = [
             self.make_again_where_full(link, &own);
         }''',
      [MADE_AGAIN]),
+    ("P7 too wide: the messages channel alone has a connection made again", DEVICE,
+     '''own.is_pulled() && own.kind != Kind::Messages && !of.proved.contains_key(&own.id)''',
+     '''own.is_pulled() && !of.proved.contains_key(&own.id)''',
+     [MESSAGES_PLACE]),
     ("P6 a later pass goes on on a connection being made again", DEVICE,
      '''            if of.made_again {
                 return true;
