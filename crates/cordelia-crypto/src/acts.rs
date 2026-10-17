@@ -113,6 +113,9 @@ pub enum ListError {
 
     #[error("a list is at most 41341 bytes, and this is {0}")]
     TooLong(usize),
+
+    #[error("a list's fetched time is at most 2^40, and this is {0}")]
+    FetchedPastTheBound(u64),
 }
 
 /// How a channel came to be filed (decision 2026-10-10 §3.4).
@@ -516,9 +519,13 @@ impl SharedList {
         Ok(list)
     }
 
-    /// Each part within its bound, and one act on each item: a filing and
-    /// a drop of one channel are one item.
+    /// The fetched time within its bound, each part within its bound, and
+    /// one act on each item: a filing and a drop of one channel are one
+    /// item.
     fn check(&self) -> Result<(), ListError> {
+        if self.fetched > SHARED_ACT_TIME_MAX {
+            return Err(ListError::FetchedPastTheBound(self.fetched));
+        }
         for (part, most, count) in [
             ("filings", SHARED_MAX_CHANNELS, self.filings.len()),
             ("drops", SHARED_MAX_DROPPED, self.drops.len()),
@@ -666,7 +673,7 @@ mod tests {
         let (laptop, desktop) = (device(1), device(2));
         let long = |n: usize, at: usize| format!("{n:0>at$}");
         SharedList {
-            fetched: u64::MAX,
+            fetched: SHARED_ACT_TIME_MAX,
             filings: (0..16)
                 .map(|n| act(filing(n as u8, &long(n, 200)), &laptop))
                 .collect(),
@@ -781,14 +788,14 @@ mod tests {
             &laptop,
         );
         let list = SharedList {
-            fetched: 0x0102_0304_0506_0708,
+            fetched: 0x00ff_0102_0304,
             filings: vec![filing.clone()],
             labels: vec![label.clone()],
             ..SharedList::default()
         };
         let value = list.to_value(names).unwrap();
 
-        let mut expected = vec![1, 1, 2, 3, 4, 5, 6, 7, 8, 1];
+        let mut expected = vec![1, 0, 0, 0, 0xff, 1, 2, 3, 4, 1];
         expected.extend_from_slice(&filing.item.channel);
         expected.extend_from_slice(&card(9).to_bytes());
         expected.push(6);
@@ -1037,6 +1044,25 @@ mod tests {
         let mut longer = empty.clone();
         longer.push(0);
         assert_eq!(read(longer), Err(ListError::TrailingBytes));
+
+        // A fetched time past 2^40, written and read; at it, a list.
+        let past = SharedList {
+            fetched: SHARED_ACT_TIME_MAX + 1,
+            ..SharedList::default()
+        };
+        assert_eq!(
+            past.to_value(names),
+            Err(ListError::FetchedPastTheBound(SHARED_ACT_TIME_MAX + 1))
+        );
+        let mut changed = empty.clone();
+        changed[1..9].copy_from_slice(&(SHARED_ACT_TIME_MAX + 1).to_be_bytes());
+        assert_eq!(
+            read(changed),
+            Err(ListError::FetchedPastTheBound(SHARED_ACT_TIME_MAX + 1))
+        );
+        let mut changed = empty.clone();
+        changed[1..9].copy_from_slice(&SHARED_ACT_TIME_MAX.to_be_bytes());
+        assert_eq!(read(changed).unwrap().fetched, SHARED_ACT_TIME_MAX);
 
         // Each part's count past its bound, read and written.
         for (at, part, most) in [

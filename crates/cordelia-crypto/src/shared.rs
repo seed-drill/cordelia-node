@@ -66,7 +66,7 @@ use crate::CryptoError;
 use crate::bech32::encode_public_key;
 use crate::ecies::{EciesEnvelope, ecies_decrypt_for, ecies_encrypt_for};
 use crate::entry::Value;
-use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
+use crate::identity::{NodeIdentity, is_usable_public_key, x25519_pub_from_ed25519_pub};
 use crate::message::{
     FLAG_ASKS, NotAMessage, Place, byte, filled, is_a_link, is_clearing, place_of, whole,
 };
@@ -244,6 +244,9 @@ pub enum AnewError {
     #[error("the seed sealed to this device gives another channel than the offer's")]
     AnotherChannel,
 
+    #[error("the offer's new channel is the channel it makes anew")]
+    SameChannel,
+
     #[error("sealing failed: {0}")]
     Crypto(String),
 }
@@ -325,8 +328,13 @@ impl Offer {
     /// Open the seal for `device`, in the offer that makes `old_channel`
     /// anew: the new channel's card, where the seal opens to a seed whose
     /// card gives the offer's new ID (decision 2026-10-10 §7). Anything
-    /// else is a fault, and says which.
+    /// else is a fault, and says which. An offer whose new channel is the
+    /// old one is a fault: any member holds the old seed and can seal it,
+    /// and a move to it would file the channel beside its own drop.
     pub fn open(&self, device: &NodeIdentity, old_channel: &[u8; 32]) -> Result<Card, AnewError> {
+        if self.new_channel == *old_channel {
+            return Err(AnewError::SameChannel);
+        }
         let key = device.public_key();
         let seal = self
             .seals
@@ -415,7 +423,8 @@ impl Anew {
     }
 }
 
-/// The keys an offer seals to: 1 to 64, each once.
+/// The keys an offer seals to: 1 to 64, each once, and each a usable
+/// public key, made or read: a key of no device is no one who stays.
 fn check_keys<'a>(keys: impl ExactSizeIterator<Item = &'a [u8; 32]>) -> Result<(), AnewError> {
     let count = keys.len();
     if count == 0 {
@@ -425,6 +434,9 @@ fn check_keys<'a>(keys: impl ExactSizeIterator<Item = &'a [u8; 32]>) -> Result<(
         return Err(AnewError::TooManyKeys(count));
     }
     let mut seen: Vec<&[u8; 32]> = keys.collect();
+    if !seen.iter().all(|key| is_usable_public_key(key)) {
+        return Err(AnewError::KeyNotUsable);
+    }
     seen.sort_unstable();
     if seen.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(AnewError::KeyTwice);
@@ -848,6 +860,14 @@ mod tests {
         assert_eq!(offer.open(&phone, &OLD), Err(AnewError::NotSealedToThisKey));
         assert_eq!(offer.open(&laptop, &[2; 32]), Err(AnewError::DidNotOpen));
 
+        // An offer of the old channel itself, which any member can seal
+        // with the old seed: it opens to the channel it makes anew, and is
+        // a fault.
+        let old = card.channel_id().unwrap();
+        let same = Offer::make(9, &old, &card, &[laptop.public_key()]).unwrap();
+        assert_eq!(same.new_channel, old);
+        assert_eq!(same.open(&laptop, &old), Err(AnewError::SameChannel));
+
         // The seal of another card's seed, under this offer's IDs.
         let other = self::card(&[[3; 32]]);
         let mut forged = offer.clone();
@@ -942,6 +962,13 @@ mod tests {
             let mut changed = value.clone();
             changed[at] = 1;
             assert_eq!(read(changed), Err(AnewError::Fill), "{at}");
+        }
+        // The second seal's key one of small order, and bytes that are no
+        // point.
+        for key in [[0; 32], [0xff; 32]] {
+            let mut changed = value.clone();
+            changed[231..263].copy_from_slice(&key);
+            assert_eq!(read(changed), Err(AnewError::KeyNotUsable), "{key:?}");
         }
         // An empty record whose fill is not all zeros is read as an offer,
         // and refused as one.
