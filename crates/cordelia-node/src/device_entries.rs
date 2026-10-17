@@ -1764,8 +1764,9 @@ impl DeviceEntries {
 
     /// Have the connection at `link` made again where a channel of the
     /// device's own, of `own`, that a pass proves finds no place among
-    /// its proofs, and some of those places are held by channels that the
-    /// device no longer proves (decision 2026-10-17 §4): those of a
+    /// its proofs (but the messages channel, which is passed over where
+    /// it has none), and some of those places are held by channels that
+    /// the device no longer proves (decision 2026-10-17 §4): those of a
     /// generation that it left when it applied a statement, or that a
     /// carry read.
     ///
@@ -1791,7 +1792,12 @@ impl DeviceEntries {
             if of.made_again {
                 return true;
             }
-            let proved = |own: &&Own| own.is_pulled() && !of.proved.contains_key(&own.id);
+            // The messages channel is not one of them: it is passed over
+            // where it has no place, and never makes a pass short
+            // (decision 2026-10-09 §2.1).
+            let proved = |own: &&Own| {
+                own.is_pulled() && own.kind != Kind::Messages && !of.proved.contains_key(&own.id)
+            };
             let not_proved = own.iter().filter(proved);
             of.proved.len() + not_proved.count() > self.most_proved
         };
