@@ -277,17 +277,28 @@ pub fn sent_everywhere(
 }
 
 /// How many entries the store holds of `channel`, the channel of a name,
-/// that no relay was sent: what would be nowhere but here were the store
-/// to drop the channel. An entry was sent to a relay where what the
-/// device keeps of that relay for the channel reaches it (what it carried
-/// when it applied a statement has a turn of its own there,
-/// [`carried_up_to`]) and the relay did not refuse it for room
-/// ([`waiting_refused`]). Nothing is written.
-pub fn sent_to_no_relay(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
+/// that `own`, this device's key, signed and that no relay was sent: what
+/// would be nowhere but here were the store to drop the channel. An entry
+/// was sent to a relay where what the device keeps of that relay for the
+/// channel reaches it (what it carried when it applied a statement has a
+/// turn of its own there, [`carried_up_to`]) and the relay did not refuse
+/// it for room ([`waiting_refused`]). Nothing is written.
+///
+/// **Only the device's own entries are counted** (decision 2026-10-17
+/// §4.5): an entry that another key signed came here from a relay, and a
+/// page taken from a relay while something else waited there is not
+/// marked as sent. Its own entries that come back from a relay, as on a
+/// device restored from a backup, are still counted until a push clears
+/// them: the count errs toward asking.
+pub fn sent_to_no_relay(
+    conn: &Connection,
+    channel: &[u8; 32],
+    own: &[u8; 32],
+) -> Result<usize, CordeliaError> {
     let carried_up_to = carried_up_to(conn)?;
     conn.query_row(
         "SELECT COUNT(*) FROM entries AS held
-         WHERE held.channel_id = ?1
+         WHERE held.channel_id = ?1 AND held.author = ?3
            AND NOT EXISTS (
                SELECT 1 FROM at_relays AS there
                WHERE there.channel = ?1
@@ -297,7 +308,7 @@ pub fn sent_to_no_relay(conn: &Connection, channel: &[u8; 32]) -> Result<usize, 
                      SELECT 1 FROM at_relays_refused AS refused
                      WHERE refused.relay = there.relay AND refused.channel = ?1
                        AND refused.seq = held.seq))",
-        params![channel.as_slice(), carried_up_to],
+        params![channel.as_slice(), carried_up_to, own.as_slice()],
         |row| row.get::<_, i64>(0),
     )
     .map(|waits| waits.max(0) as usize)
@@ -751,7 +762,8 @@ mod tests {
     #[test]
     fn test_what_no_relay_was_sent_of_a_channel_is_counted() {
         let conn = db::open_in_memory().unwrap();
-        let waits = |c: u8| sent_to_no_relay(&conn, &channel(c)).unwrap();
+        let own = device(1).public_key();
+        let waits = |c: u8| sent_to_no_relay(&conn, &channel(c), &own).unwrap();
         assert_eq!(waits(1), 0);
         // Two that the device carried when it applied, and three since:
         // at the places 1 to 5 of the store's order. Another channel
@@ -788,6 +800,50 @@ mod tests {
         // A relay that holds the channel anew was sent nothing of it.
         start_again(&conn, &OTHER_RELAY, &channel(1)).unwrap();
         assert_eq!(waits(1), 2);
+    }
+
+    /// Only the entries that this device signed are counted as sent to
+    /// no relay (decision 2026-10-17 §4.5, property 12). On a device that
+    /// has stopped nothing is pushed, so a page that it took from a relay
+    /// while something else waited there is never marked as sent: what
+    /// another key signed in it came from a relay, and is not counted.
+    /// The device's own entries that come back from a relay, as on a
+    /// device restored from a backup, are counted: the count errs toward
+    /// asking.
+    #[test]
+    fn test_what_was_sent_to_no_relay_counts_only_this_devices_own_entries() {
+        let conn = db::open_in_memory().unwrap();
+        let own = device(1).public_key();
+        let waits = |author: &[u8; 32]| sent_to_no_relay(&conn, &channel(1), author).unwrap();
+        // The device wrote two, and sent them to a relay: the places 1
+        // and 2. Then it wrote one more, which no relay was sent.
+        for name in ["a.md", "b.md"] {
+            entries::store(&conn, &made(1, 1, 5, name), 100).unwrap();
+        }
+        sent(&conn, &RELAY, &channel(1), 2).unwrap();
+        entries::store(&conn, &made(1, 1, 5, "c.md"), 100).unwrap();
+        assert_eq!(waits(&own), 1);
+        // It took a page from the relay while that one waited: three
+        // entries that another device signed, at the places 4 to 6, and
+        // nothing of it marked as sent. None of them is counted.
+        for name in ["a.md", "d.md", "e.md"] {
+            entries::store(&conn, &made(1, 2, 7, name), 100).unwrap();
+        }
+        assert_eq!(kept(&conn, &RELAY, &channel(1)).unwrap().sent_to, 2);
+        assert_eq!(waits(&own), 1);
+        // Counted for the key that signed them, they are three: it is the
+        // author that leaves them out, and nothing else.
+        assert_eq!(waits(&device(2).public_key()), 3);
+        assert_eq!(waits(&device(3).public_key()), 0);
+        // An entry of its own, written after the backup it was restored
+        // from, comes back from the relay while something else waited:
+        // it is counted as sent to no relay.
+        entries::store(&conn, &made(1, 1, 6, "f.md"), 100).unwrap();
+        assert_eq!(waits(&own), 2);
+        // The relay was sent everything: none waits, of any author.
+        sent(&conn, &RELAY, &channel(1), 7).unwrap();
+        assert_eq!(waits(&own), 0);
+        assert_eq!(waits(&device(2).public_key()), 0);
     }
 
     /// What a relay had no room for is kept by its place in the store's

@@ -607,6 +607,39 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     let (status, said) = asks!(app, "/api/v1/carry/read", read(hex::encode([1u8; 32])));
     assert_eq!(status, 200, "{said}");
     assert_eq!((&said["relays"], &said["entries"]), (&json!([]), &json!(0)));
+    // A place to read on from at a relay (decision 2026-10-17 §3.2) is
+    // handed with the mark it is under: one that says what is no mark
+    // is refused. With no network, no place is reached.
+    let read_from = |mark: String| {
+        let mut asked = read(hex::encode([1u8; 32]));
+        asked["from"] = json!([{ "relay": "relay", "mark": mark, "place": 4 }]);
+        asked
+    };
+    let (status, said) = asks!(app, "/api/v1/carry/read", read_from("0102".into()));
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string()
+            .contains("a mark is not as many bytes in hex"),
+        "{said}"
+    );
+    let (status, said) = asks!(app, "/api/v1/carry/read", read_from(hex::encode([6u8; 8])));
+    assert_eq!(status, 200, "{said}");
+    assert_eq!(
+        (&said["relays"], &said["reached"]),
+        (&json!([]), &json!([]))
+    );
+    // One relay given two places is refused: which it is read from would
+    // not be known.
+    let mut twice = read_from(hex::encode([6u8; 8]));
+    let place = twice["from"][0].clone();
+    twice["from"] = json!([place.clone(), place]);
+    let (status, said) = asks!(app, "/api/v1/carry/read", twice);
+    assert_eq!(status, 400, "{said}");
+    assert!(
+        said.to_string()
+            .contains("relay is given two places to read from"),
+        "{said}"
+    );
 
     // The name is held by the carry, with no folder mapped to it. While
     // a version that was brought in there has been sent to no relay, the

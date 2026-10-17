@@ -1141,7 +1141,7 @@ pub fn let_go_of_a_carried_name(
     if !crate::names::carried(db).map_err(refused)?.contains(name) {
         return Ok(false);
     }
-    let waits = crate::names::waits_to_be_sent(db, name).map_err(refused)?;
+    let waits = crate::names::waits_to_be_sent(db, &state.identity, name).map_err(refused)?;
     if waits > 0 {
         return Err(ApiError::Conflict(not_let_go_says(name, waits)));
     }
@@ -2551,7 +2551,7 @@ mod tests {
             let held = cordelia_storage::entries::channel_entries_after(&db, &lab, 0, 10).unwrap();
             held.iter().map(|held| held.entry.id()).collect()
         };
-        let waits = || crate::names::waits_to_be_sent(&db, "lab").unwrap();
+        let waits = || crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap();
         // The name as the carry holds it, before any folder: with two
         // versions, which no relay was sent.
         let as_before_the_folder = || {
@@ -2726,13 +2726,22 @@ mod tests {
         // A device that has stopped sends nothing: nothing waits to be
         // sent there, and what it holds of a name is its person's to
         // let go.
-        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 1);
+        assert_eq!(
+            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
+            1
+        );
         held_rows::set_state(&db, held_rows::State::NotListed).unwrap();
-        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 0);
+        assert_eq!(
+            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
+            0
+        );
         held_rows::set_state(&db, held_rows::State::Applied).unwrap();
         // The relay holds it: the name is let go.
         cordelia_storage::at_relays::not_refused(&db, &relay, &lab, last).unwrap();
-        assert_eq!(crate::names::waits_to_be_sent(&db, "lab").unwrap(), 0);
+        assert_eq!(
+            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
+            0
+        );
         assert!(listed_alone(&state, &db));
         assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
         assert_eq!(held(&db), ["team"]);

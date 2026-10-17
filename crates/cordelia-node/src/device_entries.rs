@@ -106,7 +106,8 @@ use cordelia_api::at_relays::{
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftRead, NoRoom, ProvedBy,
+    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, NoRoom,
+    ProvedBy,
 };
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
@@ -444,7 +445,8 @@ impl DeviceEntries {
     ///   another, each through the one door ([`Self::read_left`]), and
     ///   each relay is answered for by its name: one that is not
     ///   connected as that. Where the asking names relays, it is read at
-    ///   those alone.
+    ///   those alone. At a relay that it gives a place for, the read goes
+    ///   on from that place (decision 2026-10-17 §3.2).
     /// - **A connection to be made again** is the node's own to make: it
     ///   holds the connections. Asked here, it is answered with no.
     ///
@@ -467,6 +469,7 @@ impl DeviceEntries {
                 channel,
                 by,
                 only,
+                from,
                 until,
                 answer,
             } => {
@@ -527,8 +530,11 @@ impl DeviceEntries {
                         continue;
                     };
                     let engine = Arc::clone(self);
+                    let place = from.get(&name).copied().unwrap_or(LeftPlace::START);
                     reads.spawn(async move {
-                        let read = engine.read_left(&link, &channel, &proof, until).await;
+                        let read = engine
+                            .read_left(&link, &channel, &proof, place, until)
+                            .await;
                         LeftAt { relay: name, read }
                     });
                 }
@@ -547,10 +553,17 @@ impl DeviceEntries {
     }
 
     /// Read the channel whose ID is `channel` at the relay at `link`,
-    /// from its start, through the one door for a carry
+    /// from the place `from`, through the one door for a carry
     /// ([`Leave::left`]): the proof once, and then page after page until
     /// a page holds nothing, until a page does not move the place, or
     /// until `until`.
+    ///
+    /// **A read says the place it reached** (decision 2026-10-17 §3.2):
+    /// the place it would ask from next, which a later read is asked
+    /// from to go on where this one stopped. From [`LeftPlace::START`] it
+    /// reads from the channel's start. A relay that holds the channel
+    /// under another mark than `from`'s reads it from the start, and the
+    /// place it hands is under the mark it has now.
     ///
     /// **A page of which nothing is an entry of the channel, though the
     /// relay handed something, is not the channel's end:** what the
@@ -575,9 +588,11 @@ impl DeviceEntries {
         link: &Link,
         channel: &[u8; 32],
         proof: &[u8; 64],
+        from: LeftPlace,
         until: Instant,
     ) -> LeftRead {
-        let mut place = (NO_MARK, 0u64);
+        let mut place = (from.mark, from.next);
+        let reached = |(mark, next): (Mark, u64)| LeftPlace { mark, next };
         let mut read: Vec<Vec<u8>> = Vec::new();
         let mut proved = false;
         loop {
@@ -585,6 +600,7 @@ impl DeviceEntries {
                 return LeftRead::Read {
                     entries: read,
                     whole: false,
+                    reached: reached(place),
                 };
             }
             if !self.room_to_take(link) {
@@ -630,10 +646,12 @@ impl DeviceEntries {
                     read.extend(entries.iter().map(|entry| entry.to_wire()));
                     // The relay handed something, and nothing of it is an
                     // entry of the channel: that is no end of a channel.
+                    // The place reached is the one before that page.
                     if nothing && !handed.is_empty() {
                         return LeftRead::Read {
                             entries: read,
                             whole: false,
+                            reached: reached(place),
                         };
                     }
                     // A page that holds nothing, or that leaves the place
@@ -642,6 +660,7 @@ impl DeviceEntries {
                         return LeftRead::Read {
                             entries: read,
                             whole: true,
+                            reached: reached((mark, next)),
                         };
                     }
                     place = (mark, next);
@@ -662,6 +681,7 @@ impl DeviceEntries {
                     return LeftRead::Read {
                         entries: read,
                         whole: false,
+                        reached: reached(place),
                     };
                 }
             }

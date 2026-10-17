@@ -541,6 +541,11 @@ pub fn see_addition(
 /// 2026-10-17 §1, property 2).
 fn keep_to_the_bound(conn: &Connection, statement: &Statement) -> Result<(), PersonError> {
     let kept = held_rows::additions(conn)?;
+    // Within the bound nothing goes, and the order is not worked out: it
+    // is worked out after each record a reader takes beyond it.
+    if kept.iter().filter(|row| !row.counted).count() <= MAX_NOT_COUNTED_RECORDS {
+        return Ok(());
+    }
     let counting = Counting::of(statement, &kept);
     let order = in_the_order_of_keeping(statement, &counting, &kept);
     for record in order.iter().skip(MAX_NOT_COUNTED_RECORDS) {
@@ -550,7 +555,7 @@ fn keep_to_the_bound(conn: &Connection, statement: &Statement) -> Result<(), Per
 }
 
 /// A record that is not counted, with the time it says it was made
-/// (`Addition::at`). A row whose bytes are no record says no time, and
+/// (`Addition::at`). A row whose bytes end before a time says none, and
 /// is put after every time.
 struct Placed<'a> {
     row: &'a KeptAddition,
@@ -589,11 +594,14 @@ pub(crate) fn in_the_order_of_keeping<'a>(
     counting: &Counting,
     kept: &'a [KeptAddition],
 ) -> Vec<&'a KeptAddition> {
+    #[cfg(test)]
+    tests::ORDERS_WORKED_OUT.with(|orders| orders.set(orders.get() + 1));
     let mut let_add: Vec<Placed<'a>> = Vec::new();
     let (mut kept_out, mut may_not_add, mut rest) = (Vec::new(), Vec::new(), Vec::new());
     for row in kept.iter().filter(|row| !row.counted) {
-        let at =
-            SignedAddition::from_bytes(&row.record).map_or(u64::MAX, |record| record.addition.at);
+        // The row is of a record that was verified when it was kept: its
+        // time is read, and the record is not checked again.
+        let at = SignedAddition::time_of(&row.record).unwrap_or(u64::MAX);
         let record = Placed { row, at };
         if counting.lets_add(&row.key, &row.adder) {
             let_add.push(record);
@@ -1972,6 +1980,12 @@ impl Drop for Begun<'_> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// How many times this thread has worked out the order of keeping.
+        pub(super) static ORDERS_WORKED_OUT: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
     /// A device's word that it has applied a statement holds the
     /// statement's number, and, once it has sent what it carried, says so
     /// after it (decision 2026-10-04 §8). A text that is neither is no
@@ -3177,6 +3191,57 @@ mod tests {
         );
         assert!(keeps(&conn, &one_more));
         assert_eq!(not_counted(&conn), 256);
+    }
+
+    /// Within the bound of 256, a reader does not work out the order of
+    /// keeping: nothing goes. It is worked out after each record taken
+    /// beyond the bound, once.
+    #[test]
+    fn test_within_the_bound_the_order_of_keeping_is_not_worked_out() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        let orders = || ORDERS_WORKED_OUT.with(|orders| orders.get());
+        let before = orders();
+        for n in 1..=256 {
+            see_addition(&conn, &added_at(&two, 0, 1, NOW + n), NOW).unwrap();
+        }
+        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(orders(), before);
+        for n in 257..=260 {
+            see_addition(&conn, &added_at(&two, 0, 1, NOW + n), NOW).unwrap();
+        }
+        assert_eq!(not_counted(&conn), 256);
+        assert_eq!(orders(), before + 4);
+    }
+
+    /// A row is ordered by the time its bytes say, and its record is not
+    /// checked again: it was verified when it was kept. A row written past
+    /// the rule, whose bytes the record would be refused for, is ordered
+    /// by its time all the same.
+    #[test]
+    fn test_a_row_is_ordered_by_its_time_without_its_record_checked_again() {
+        let [_, two, ..] = statements(&phrase());
+        let conn = device_at(0, 2);
+        // A record of the rest whose form adds its own adder: no record
+        // reads so, and its time is an early one.
+        let mut bytes = added_at(&two, 0, 1, NOW).to_bytes().unwrap();
+        bytes[..32].copy_from_slice(&key(0));
+        assert!(SignedAddition::from_bytes(&bytes).is_err());
+        assert_eq!(SignedAddition::time_of(&bytes), Some(NOW as u64));
+        held_rows::keep_addition(&conn, &bytes, &key(0), &key(0), false, NOW).unwrap();
+        let early = || {
+            let kept = held_rows::additions(&conn).unwrap();
+            kept.iter().any(|one| one.record == bytes)
+        };
+        // 256 records of the rest that say later times: the latest goes,
+        // and the early row stays.
+        let later: Vec<SignedAddition> = (1..=256).map(|n| added_at(&two, 0, 1, NOW + n)).collect();
+        for record in &later {
+            see_addition(&conn, record, NOW).unwrap();
+        }
+        assert_eq!(not_counted(&conn), 256);
+        assert!(early());
+        assert!(!keeps(&conn, &later[255]) && keeps(&conn, &later[254]));
     }
 
     /// The order of keeping (decision 2026-10-17 §2.2), seen from what
