@@ -68,7 +68,7 @@ const FORM_MESSAGE: u8 = 1;
 const FORM_LIST: u8 = 2;
 
 /// The one flag: the message asks for an answer.
-const FLAG_ASKS: u8 = 0b0000_0001;
+pub(crate) const FLAG_ASKS: u8 = 0b0000_0001;
 
 /// The kinds of `to`.
 const TO_ONE: u8 = 1;
@@ -560,7 +560,7 @@ fn is_a_number(number: u64) -> bool {
 
 /// The bytes of a value of the messages channel: of kind 2, and of its
 /// one length.
-fn whole(value: &Value) -> Result<&[u8], NotAMessage> {
+pub(crate) fn whole(value: &Value) -> Result<&[u8], NotAMessage> {
     let Value::Other(bytes) = value else {
         return Err(NotAMessage::Kind);
     };
@@ -578,7 +578,7 @@ fn form_refused(form: u8) -> NotAMessage {
     }
 }
 
-fn byte(reader: &mut Reader) -> Result<u8, NotAMessage> {
+pub(crate) fn byte(reader: &mut Reader) -> Result<u8, NotAMessage> {
     Ok(reader.array::<1>().ok_or(NotAMessage::Field)?[0])
 }
 
@@ -600,7 +600,7 @@ fn name_in(bytes: &[u8], is_a_name: impl Fn(&str) -> bool) -> Result<String, Not
 }
 
 /// What is left after the fields is the fill: zeros, all of it.
-fn filled(reader: &Reader) -> Result<(), NotAMessage> {
+pub(crate) fn filled(reader: &Reader) -> Result<(), NotAMessage> {
     if reader.rest().iter().any(|byte| *byte != 0) {
         return Err(NotAMessage::Fill);
     }

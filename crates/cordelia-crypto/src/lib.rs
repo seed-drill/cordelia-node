@@ -20,7 +20,15 @@
 //! to a person beside the first words of its fingerprint ([`fingerprint`]).
 //! The value of a message between a person's own agents, and its place in
 //! the messages channel, are in [`message`] (decision 2026-10-09).
+//!
+//! A shared channel, for messages between people (decision 2026-10-10), is
+//! not yet used by the node either: its card and the share that hands it on
+//! ([`share`]), the entries it holds and the seal of a new seed when it is
+//! made anew ([`shared`]), and a device's list of the person's shared
+//! channels in the personal channel, each act signed by its maker
+//! ([`acts`]).
 
+pub mod acts;
 pub mod addition;
 pub mod aes_gcm;
 pub mod bech32;
@@ -37,6 +45,8 @@ pub mod message;
 pub mod phrase;
 pub mod proof;
 pub mod psk_envelope;
+pub mod share;
+pub mod shared;
 pub mod signing;
 pub mod slots;
 pub mod statement;

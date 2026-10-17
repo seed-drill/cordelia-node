@@ -1,5 +1,5 @@
 {
-  "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret of each kind of channel (with the messages channel of decision 2026-10-09), the recovery phrase, and the statement. Bytes are in hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. This file is written by crates/cordelia-crypto/src/vectors.rs, and a test there checks the code against it.",
+  "about": "Test vectors for decision 2026-10-04: a channel from its secret, the secret of each kind of channel (with the messages channel of decision 2026-10-09, and the shared channel and share pair channel of decision 2026-10-10), the recovery phrase, and the statement. Bytes are in hex. Every derivation is HKDF-SHA256 with an empty salt, under the label that crates/cordelia-core/src/protocol.rs gives it. A seed is an Ed25519 seed. This file is written by crates/cordelia-crypto/src/vectors.rs, and a test there checks the code against it.",
   "channel": {
     "entry_key": "58e1ccacc2fdae6fec33cf8af19b484e052c963ff95ac682270a79e55ba9e4da",
     "id": "6c889e0c623433aa409db1bdaea7502809124f0170181a1dca682bf1ff28eab1",
@@ -38,7 +38,23 @@
       "x25519": "0d90b633b5693f7105aa5af568168de7134f1d02506aa6f64635ba3f5892670d"
     },
     "person_secret": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
-    "personal": "f33a27dda2fbd6ef8316ffc2b5bc3dc62c7143aec25fcd8032671e03c18f1183"
+    "personal": "f33a27dda2fbd6ef8316ffc2b5bc3dc62c7143aec25fcd8032671e03c18f1183",
+    "share_pair": {
+      "secret": "7c9125ee3225729bb049d6d524ef199d4f5c05ac3f04e35731ccbb3d3f3287a8"
+    },
+    "shared": {
+      "id": "f63605c6bfdbefccf1f3d51ad47c0849fba071c1f5ee0eb79ccc0873fcc86398",
+      "id_text": "cordelia_ch17cmqt34lm0hueu0n65ddglqgf8a6quwp7hhqaduuesy88lxgvwvqrvpd7a",
+      "one_relay_id": "eecd9be02a3a393ac752d2a6db252c8329254fe2071736b78ba8037032c71cf2",
+      "relays": [
+        "8bb04e1c1b83dddf311f5bcddf7c50ede3c0802f47ec796e2a131cf41298d9f3",
+        "1ce56a48c82ff99162a14bc544612674e5d61fb9317e65d4055780fdbcb4dc35"
+      ],
+      "relays_hash": "ade772b85cb810328d1638bbb812566f07f86bc009d72ba804f620b72a2aba46",
+      "relays_list": "021ce56a48c82ff99162a14bc544612674e5d61fb9317e65d4055780fdbcb4dc358bb04e1c1b83dddf311f5bcddf7c50ede3c0802f47ec796e2a131cf41298d9f3",
+      "secret": "adc439b3b35d9f436086f35832e7c0e83ada14ee9b95023c702eac3be2c40f59",
+      "seed": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+    }
   },
   "phrase": {
     "bytes": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
