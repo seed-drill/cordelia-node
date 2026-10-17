@@ -236,9 +236,12 @@ pub struct Row {
     /// do not count, in the order of keeping (decision 2026-10-17 §2.2).
     /// The row is then by another record of the key, and may say less of
     /// it than was written: the record that went may be one that fails
-    /// only for the bound of 64, under an adder that may add, by which the
-    /// key would have been asked about. Never so for a key that the statement
-    /// removes: it stays removed whatever a record says of it.
+    /// only for the bound of 64, under an adder that may add, beyond that
+    /// adder's first `KEPT_OUT_PER_ADDER` keys. Such a record goes only
+    /// once every record that fails for another reason has gone, so where
+    /// its key still has a row, the row is by another adder's record that
+    /// fails only for the bound. Never so for a key that the
+    /// statement removes: it stays removed whatever a record says of it.
     pub record_let_go: bool,
 }
 
