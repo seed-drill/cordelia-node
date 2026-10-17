@@ -1,7 +1,7 @@
 # Decision: messages between your own agents
 
 **Date**: 2026-10-09
-**Status**: Proposed. Not built. Revised after its fourth review and its narrow check. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it.
+**Status**: Built. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it.
 **Cited as**: code comments cite the sections of this record ("decision 2026-10-09 §2.2"), and the numbered properties ("§1, property 4"). The numbers do not change.
 
 Words used throughout:
