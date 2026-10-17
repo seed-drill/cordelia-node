@@ -13,6 +13,17 @@
 //! Where the minute is used, it waits, as a read through the door for a
 //! carry does.
 //!
+//! **A refusal on a connection that is still open is waited out:** a
+//! relay that has handed a connection what it may in a minute resets the
+//! next pull, and the read asks again once a little time has gone by, as
+//! where the device has asked what it asks in a minute.
+//!
+//! **One round runs at a time on the node, and none for longer than a
+//! carry may read** (CARRY_READ_MAX_SECS, the round of decision
+//! 2026-10-17 §3.5): a round that is asked for waits for the one that
+//! runs, until its own time is gone. A read that another of the same
+//! channel took the place of stops at its next page.
+//!
 //! **It runs outside the database's lock.** The lock is taken to read
 //! which channels are the device's own, and to take each page, as a pass
 //! takes it, and is never held while a relay is asked. Its places and
@@ -22,12 +33,12 @@
 //! [`Leave`]: super::Leave
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cordelia_api::at_relays::{self, Own, Page, PageTaken, Places};
 use cordelia_api::own_read::{Handed, OwnAt, ReadId};
 use cordelia_api::state::OwnAsk;
-use cordelia_core::protocol::ENTRY_PAGE_MAX_ENTRIES;
+use cordelia_core::protocol::{CARRY_READ_MAX_SECS, ENTRY_PAGE_MAX_ENTRIES};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{EntryPull, WireMessage};
 use cordelia_storage::relay::Mark;
@@ -35,6 +46,9 @@ use cordelia_storage::relay::Mark;
 use super::{
     At, DeviceEntries, LEFT_ROOM_WAIT, Link, Refused, Relay, Step, counted_as_handed, lock,
 };
+
+/// The longest that one round of a read lasts.
+const ROUND_MOST: Duration = Duration::from_secs(CARRY_READ_MAX_SECS);
 
 /// What came of one pull of the read.
 enum Pulled {
@@ -60,6 +74,9 @@ impl DeviceEntries {
     ///   held up: nothing is asked of a relay then.
     /// - **Read on:** one round more, at each relay where the read is in
     ///   part, from its place there.
+    ///
+    /// A round lasts until `until`, and no longer than CARRY_READ_MAX_SECS
+    /// from now, whatever was asked.
     pub async fn own(self: &Arc<Self>, relays: &[Relay], ask: OwnAsk) {
         match ask {
             OwnAsk::Begin {
@@ -67,6 +84,7 @@ impl DeviceEntries {
                 until,
                 answer,
             } => {
+                let until = until.min(self.clock.now() + ROUND_MOST);
                 let begun = self.begin_own(relays, &channel);
                 if let Some(read) = &begun {
                     self.read_own(relays, read, until).await;
@@ -78,6 +96,7 @@ impl DeviceEntries {
                 until,
                 answer,
             } => {
+                let until = until.min(self.clock.now() + ROUND_MOST);
                 let known = self.read_own(relays, &read, until).await;
                 let _ = answer.send(known);
             }
@@ -100,17 +119,19 @@ impl DeviceEntries {
             at_relays::kept_id(&db).ok()??
         };
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
-        let begun = self
-            .state
-            .own_channels
-            .reads()
-            .begin(channel, &under, &names);
+        let begun =
+            self.state
+                .own_channels
+                .reads()
+                .begin(channel, &under, &names, self.clock.now());
         begun.ok()
     }
 
     /// Read one round of the read named `read`: at each relay where it is
     /// in part, beside one another, until `until`. Says whether the node
-    /// keeps that read, with no round of it running.
+    /// keeps that read, with no round of it running. A round waits for
+    /// the one that runs on the node, and reads nothing where `until` goes
+    /// by first.
     ///
     /// A relay that is not connected now is not reached, and is not asked
     /// again. So is every relay where the channel is no longer one of the
@@ -120,7 +141,11 @@ impl DeviceEntries {
     /// relay for a channel that the device has left.
     async fn read_own(self: &Arc<Self>, relays: &[Relay], read: &ReadId, until: Instant) -> bool {
         let reads = self.state.own_channels.reads();
-        let Some((channel, under, at)) = reads.to_read(read) else {
+        let wait = until.saturating_duration_since(self.clock.now());
+        let Ok(_one_round) = tokio::time::timeout(wait, self.own_rounds.lock()).await else {
+            return reads.stands(read);
+        };
+        let Some((channel, under, at)) = reads.to_read(read, self.clock.now()) else {
             return false;
         };
         let own: Option<Own> = (self.state.held.why().is_none())
@@ -141,10 +166,10 @@ impl DeviceEntries {
                 .filter(|link| link.is_open());
             match (&own, link) {
                 (Some(channel), Some(link)) => {
-                    let (engine, channel) = (Arc::clone(self), channel.clone());
+                    let (engine, channel, read) = (Arc::clone(self), channel.clone(), *read);
                     reading.spawn(async move {
                         engine
-                            .read_own_at(&link, &under, &channel, one, until)
+                            .read_own_at(&link, &read, &under, &channel, one, until)
                             .await
                     });
                 }
@@ -159,7 +184,7 @@ impl DeviceEntries {
                 done.push(one);
             }
         }
-        reads.read(read, done);
+        reads.read(read, done, self.clock.now());
         true
     }
 
@@ -170,9 +195,13 @@ impl DeviceEntries {
     /// nothing that the device keeps: a relay that does not hold the
     /// channel says so to the pull, with the mark of no holding. Where it
     /// was not made, or not answered, the relay is not reached.
+    ///
+    /// It stops where the read named `read` stands no more: another read
+    /// of the channel took its place.
     async fn read_own_at(
         &self,
         link: &Link,
+        read: &ReadId,
         under: &[u8; 32],
         channel: &Own,
         mut at: OwnAt,
@@ -187,8 +216,9 @@ impl DeviceEntries {
             return at;
         }
         let relay = link.relay().0;
+        let reads = self.state.own_channels.reads();
         loop {
-            if Instant::now() >= until {
+            if self.clock.now() >= until || !reads.stands(read) {
                 return at;
             }
             // Within what the device takes from this relay in a minute,
@@ -211,12 +241,11 @@ impl DeviceEntries {
                     &request,
                     |_| (),
                     |answer| {
+                        // A page of more entries than a page may hold is
+                        // refused where it is read off the wire.
                         let WireMessage::EntryPulled(page) = answer else {
                             return (0, None);
                         };
-                        if page.entries.len() > ENTRY_PAGE_MAX_ENTRIES as usize {
-                            return (0, None);
-                        }
                         // What the relay handed counts as taken from it,
                         // whatever is then done with it.
                         let handed: u64 = page
@@ -265,6 +294,14 @@ impl DeviceEntries {
                 // Asked enough of this relay for this minute, with the
                 // pass: it waits, and asks again.
                 Err(Refused::AskedEnough) => {
+                    tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                    continue;
+                }
+                // A relay that has handed what it may in a minute resets
+                // the pull, though the device counted room for it: the
+                // device does not count the answers to its shows. On a
+                // connection that is still open it waits, and asks again.
+                Err(Refused::NotAnswered(_)) if link.is_open() => {
                     tokio::time::sleep(LEFT_ROOM_WAIT).await;
                     continue;
                 }

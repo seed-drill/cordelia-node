@@ -36,11 +36,17 @@
 //! place where it was.
 //!
 //! **One read of a channel is kept at a time.** A read that begins
-//! forgets any other of the same channel, so the reads that a node keeps
-//! are at most as many as the channels of its own.
+//! forgets any other of the same channel, and a round of the one it
+//! replaced stops. So the reads that a node keeps are at most as many as
+//! the channels of its own, and **each stands for
+//! LET_GO_READ_STANDS_SECS** from the end of its last round, on the
+//! node's monotonic clock (decision 2026-10-17 §5.2).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use cordelia_core::protocol::LET_GO_READ_STANDS_SECS;
 
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_storage::relay::{Mark, NO_MARK};
@@ -210,6 +216,9 @@ pub struct OwnRead {
     pub at: Vec<OwnAt>,
     /// Whether a round of it is running.
     reading: bool,
+    /// When its last round ended, or it began where none has: it stands
+    /// for LET_GO_READ_STANDS_SECS from then.
+    ended: Instant,
 }
 
 impl OwnRead {
@@ -219,28 +228,42 @@ impl OwnRead {
     }
 }
 
+/// How long a read stands from the end of its last round.
+const STANDS: Duration = Duration::from_secs(LET_GO_READ_STANDS_SECS);
+
 /// The reads that the node keeps, each under its ID (see the module's
 /// documentation).
+///
+/// **A read stands for LET_GO_READ_STANDS_SECS from the end of its last
+/// round** (decision 2026-10-17 §5.2), measured on the node's monotonic
+/// clock: each function is given the time from it, and a read older than
+/// that is kept no more, whoever asks. A read while a round of it runs is
+/// kept.
 #[derive(Debug, Default)]
 pub struct OwnReads {
     reads: Mutex<HashMap<ReadId, OwnRead>>,
 }
 
 impl OwnReads {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ReadId, OwnRead>> {
-        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+    /// The reads that stand at `now`: each that is older is forgotten.
+    fn standing(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<ReadId, OwnRead>> {
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        reads.retain(|_, kept| kept.reading || now.saturating_duration_since(kept.ended) < STANDS);
+        reads
     }
 
     /// Begin a read of `channel`, which is of the statement of the change
-    /// entry named `under`, at `relays`: each from the start, under the
-    /// mark of no holding. A read of the same channel that is kept is
-    /// forgotten. Returns the new read's ID: nothing is read until a
-    /// round of it is taken ([`Self::to_read`]).
+    /// entry named `under`, at `relays`, at `now`: each from the start,
+    /// under the mark of no holding. A read of the same channel that is
+    /// kept is forgotten, and a round of it that runs stops at its next
+    /// page ([`Self::stands`]). Returns the new read's ID: nothing is read
+    /// until a round of it is taken ([`Self::to_read`]).
     pub fn begin(
         &self,
         channel: &[u8; 32],
         under: &[u8; 32],
         relays: &[String],
+        now: Instant,
     ) -> Result<ReadId, PersonError> {
         let random = cordelia_crypto::generate_psk()?;
         let mut id = [0u8; 16];
@@ -250,20 +273,21 @@ impl OwnReads {
             under: *under,
             at: relays.iter().map(|relay| OwnAt::new(relay)).collect(),
             reading: false,
+            ended: now,
         };
-        let mut reads = self.lock();
+        let mut reads = self.standing(now);
         reads.retain(|_, kept| kept.channel != *channel);
         reads.insert(id, read);
         Ok(id)
     }
 
-    /// Take a round of the read named `read`: the channel, the change
-    /// entry it is read under, and what it has of each relay that is read
-    /// on ([`ReadAt::reads_on`]). Each other relay stays as it was.
-    /// `None` where the node keeps no such read, or a round of it is
+    /// Take a round of the read named `read` at `now`: the channel, the
+    /// change entry it is read under, and what it has of each relay that
+    /// is read on ([`ReadAt::reads_on`]). Each other relay stays as it
+    /// was. `None` where the node keeps no such read, or a round of it is
     /// running.
-    pub fn to_read(&self, read: &ReadId) -> Option<([u8; 32], [u8; 32], Vec<OwnAt>)> {
-        let mut reads = self.lock();
+    pub fn to_read(&self, read: &ReadId, now: Instant) -> Option<([u8; 32], [u8; 32], Vec<OwnAt>)> {
+        let mut reads = self.standing(now);
         let kept = reads.get_mut(read).filter(|kept| !kept.reading)?;
         kept.reading = true;
         let on = kept
@@ -275,11 +299,19 @@ impl OwnReads {
         Some((kept.channel, kept.under, on))
     }
 
-    /// A round of the read named `read` has ended, and `at` is what it
-    /// read at each relay it asked. Where the read was forgotten in the
-    /// meantime, nothing is kept of it.
-    pub fn read(&self, read: &ReadId, at: Vec<OwnAt>) {
-        let mut reads = self.lock();
+    /// Whether the read named `read` is still kept: one that a read of the
+    /// same channel took the place of, or that was forgotten, is not, and
+    /// a round of it that runs stops.
+    pub fn stands(&self, read: &ReadId) -> bool {
+        let reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        reads.contains_key(read)
+    }
+
+    /// A round of the read named `read` has ended at `now`, and `at` is
+    /// what it read at each relay it asked. The read stands from now.
+    /// Where it was forgotten in the meantime, nothing is kept of it.
+    pub fn read(&self, read: &ReadId, at: Vec<OwnAt>, now: Instant) {
+        let mut reads = self.standing(now);
         let Some(kept) = reads.get_mut(read) else {
             return;
         };
@@ -289,16 +321,20 @@ impl OwnReads {
             }
         }
         kept.reading = false;
+        kept.ended = now;
     }
 
-    /// The read named `read`, as it stands, where the node keeps it.
-    pub fn get(&self, read: &ReadId) -> Option<OwnRead> {
-        self.lock().get(read).cloned()
+    /// The read named `read`, as it stands at `now`, where the node keeps
+    /// it.
+    pub fn get(&self, read: &ReadId, now: Instant) -> Option<OwnRead> {
+        self.standing(now).get(read).cloned()
     }
 
-    /// The read named `read` is kept no more.
+    /// The read named `read` is kept no more: what lets a name go ends the
+    /// read it was bound to.
     pub fn forget(&self, read: &ReadId) {
-        self.lock().remove(read);
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        reads.remove(read);
     }
 }
 
@@ -484,51 +520,84 @@ mod tests {
     #[test]
     fn test_a_read_is_kept_under_its_id_and_a_new_read_of_its_channel_takes_its_place() {
         let reads = OwnReads::default();
+        let now = Instant::now();
         let relays = ["relay-one".to_string(), "relay-two".to_string()];
         let (channel, other, under) = ([1; 32], [2; 32], [3; 32]);
-        let id = reads.begin(&channel, &under, &relays).unwrap();
-        let kept = reads.get(&id).unwrap();
+        let id = reads.begin(&channel, &under, &relays, now).unwrap();
+        let kept = reads.get(&id, now).unwrap();
         assert_eq!((kept.channel, kept.under), (channel, under));
         assert!(kept.at.iter().all(|at| *at == OwnAt::new(&at.relay)));
 
-        let (read_channel, read_under, mut at) = reads.to_read(&id).unwrap();
+        let (read_channel, read_under, mut at) = reads.to_read(&id, now).unwrap();
         assert_eq!((read_channel, read_under), (channel, under));
         assert_eq!(at.len(), 2);
-        assert_eq!(reads.to_read(&id), None);
+        assert_eq!(reads.to_read(&id, now), None);
         let written = entries(2);
         assert!(at[0].handed(page(&written, MARK, 2)));
         at[1].not_reached();
-        reads.read(&id, at);
+        reads.read(&id, at, now);
 
         // The next round reads on at the first relay alone, from its
         // place.
-        let (_, _, at) = reads.to_read(&id).unwrap();
+        let (_, _, at) = reads.to_read(&id, now).unwrap();
         assert_eq!(at.len(), 1);
         assert_eq!(at[0].relay, "relay-one");
         assert_eq!(at[0].place, (MARK, 2));
-        reads.read(&id, at);
-        let kept = reads.get(&id).unwrap();
+        reads.read(&id, at, now);
+        let kept = reads.get(&id, now).unwrap();
         assert_eq!(kept.at("relay-two").unwrap().read, ReadAt::NotReached);
         assert_eq!(kept.at("relay-one").unwrap().place, (MARK, 2));
 
         // Another channel's read stays; a new read of this channel takes
         // the place of the first.
-        let of_other = reads.begin(&other, &under, &relays).unwrap();
-        let again = reads.begin(&channel, &under, &relays).unwrap();
+        let of_other = reads.begin(&other, &under, &relays, now).unwrap();
+        let again = reads.begin(&channel, &under, &relays, now).unwrap();
         assert_ne!(again, id);
-        assert_eq!(reads.get(&id), None);
-        assert_eq!(reads.to_read(&id), None);
-        assert!(reads.get(&of_other).is_some());
+        assert!(!reads.stands(&id));
+        assert!(reads.stands(&again));
+        assert_eq!(reads.get(&id, now), None);
+        assert_eq!(reads.to_read(&id, now), None);
+        assert!(reads.get(&of_other, now).is_some());
         assert_eq!(
-            reads.get(&again).unwrap().at("relay-one").unwrap().place,
+            reads
+                .get(&again, now)
+                .unwrap()
+                .at("relay-one")
+                .unwrap()
+                .place,
             (NO_MARK, 0)
         );
 
         // What a round of a read that was forgotten read is not kept.
-        let (_, _, at) = reads.to_read(&again).unwrap();
+        let (_, _, at) = reads.to_read(&again, now).unwrap();
         reads.forget(&again);
-        reads.read(&again, at);
-        assert_eq!(reads.get(&again), None);
-        assert_eq!(reads.get(&[9; 16]), None);
+        assert!(!reads.stands(&again));
+        reads.read(&again, at, now);
+        assert_eq!(reads.get(&again, now), None);
+        assert_eq!(reads.get(&[9; 16], now), None);
+    }
+
+    /// A read stands for LET_GO_READ_STANDS_SECS from the end of its last
+    /// round, on the monotonic clock, and is then kept no more, whoever
+    /// asks. While a round of it runs it is kept, however long that takes.
+    #[test]
+    fn test_a_read_stands_for_so_long_from_the_end_of_its_last_round() {
+        let reads = OwnReads::default();
+        let relays = ["relay-one".to_string()];
+        let begun = Instant::now();
+        let stands = Duration::from_secs(LET_GO_READ_STANDS_SECS);
+        let just = Duration::from_millis(1);
+        let id = reads.begin(&[1; 32], &[3; 32], &relays, begun).unwrap();
+        assert!(reads.get(&id, begun + stands - just).is_some());
+
+        // A round that runs past the time is kept, and stands from its end.
+        let (_, _, at) = reads.to_read(&id, begun).unwrap();
+        assert!(reads.get(&id, begun + 2 * stands).is_some());
+        let ended = begun + 2 * stands;
+        reads.read(&id, at, ended);
+        assert!(reads.get(&id, ended + stands - just).is_some());
+        assert_eq!(reads.get(&id, ended + stands), None);
+        assert!(!reads.stands(&id));
+        assert_eq!(reads.to_read(&id, ended), None);
     }
 }
