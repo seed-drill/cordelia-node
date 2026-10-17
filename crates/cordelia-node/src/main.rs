@@ -1384,8 +1384,17 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
     // and goes on to what the node says of itself (decision 2026-10-04
     // §10.1). Where a node holds the data directory's lock, it is read
     // without the schema's steps, and not at all beside a node of
-    // another version (rule 6, [`open_to_read`]).
-    let opened = db_path.exists().then(|| open_to_read(&config));
+    // another version (rule 6, [`open_to_read`]). What the node answered
+    // the status is used again, where the lock tells nothing: it is not
+    // asked twice.
+    let known = match (&status.live, &status.not_asked) {
+        (Some(live), _) => Known::Answered(live),
+        (None, Some(_)) => Known::NotAsked,
+        (None, None) => Known::Ask,
+    };
+    let opened = db_path
+        .exists()
+        .then(|| open_to_read_knowing(&config, known));
     if let Some(Err(why)) = &opened {
         println!();
         println!("Storage:");
@@ -3763,11 +3772,25 @@ enum DirLock {
 /// keeps no lock, and a node that tries it in that moment tries again
 /// ([`NODE_LOCK_WAIT_MS`]). Where the file is not there, none is made:
 /// the command writes nothing in the directory.
+///
+/// **It is asked as the node takes it:** the file is opened for reading
+/// and writing, and is nothing but a regular file. Where it is anything
+/// else (a folder in its place), or cannot be opened so, a node there
+/// could not take it either, and runs without it ([`lock_data_dir`]): the
+/// lock could not be asked.
 fn lock_of(data_dir: &std::path::Path) -> DirLock {
-    let file = match std::fs::File::open(data_dir.join(NODE_LOCK)) {
-        Ok(file) => file,
+    let path = data_dir.join(NODE_LOCK);
+    match std::fs::metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirLock::NoFile,
-        Err(_) => return DirLock::NotAsked,
+        Ok(found) if found.is_file() => {}
+        _ => return DirLock::NotAsked,
+    }
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path);
+    let Ok(file) = opened else {
+        return DirLock::NotAsked;
     };
     match lock_tried(file.try_lock()) {
         Lock::AnotherNode => DirLock::Held,
@@ -3793,12 +3816,33 @@ const NOT_OPENED_BESIDE_ANOTHER_VERSION: &str = "This command opens the node's d
 /// returned ([`version_note`]); `None` where none answers, or one of this
 /// command's version does. Where the lock is held, or is there and free,
 /// nothing is asked: the lock says it all.
-fn another_version_with_no_lock(config: &Config, lock: DirLock) -> Option<String> {
+fn another_version_with_no_lock(config: &Config, lock: DirLock, known: Known) -> Option<String> {
     if !matches!(lock, DirLock::NoFile | DirLock::NotAsked) {
         return None;
     }
-    let node = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR).ok()?;
+    let asked;
+    let node = match known {
+        Known::Ask => {
+            asked = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR).ok()?;
+            &asked
+        }
+        Known::Answered(node) => node,
+        Known::NotAsked => return None,
+    };
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
+}
+
+/// What a command knows already of the node at its configuration's port,
+/// where the lock tells nothing ([`another_version_with_no_lock`]).
+#[derive(Debug, Clone, Copy)]
+enum Known<'a> {
+    /// Nothing: the port is asked.
+    Ask,
+    /// What it answered when it was asked its status: `cordelia status`
+    /// asked it already, and it is not asked again.
+    Answered(&'a serde_json::Value),
+    /// The address is one that is not asked ([`not_the_nodes_own`]).
+    NotAsked,
 }
 
 /// What a command that opens the node's database itself and writes says
@@ -3862,7 +3906,7 @@ fn refuse_beside_its_node(config: &Config) -> anyhow::Result<()> {
             not_opened_beside_its_node(&data_dir, std::env::consts::OS)
         );
     }
-    match another_version_with_no_lock(config, lock) {
+    match another_version_with_no_lock(config, lock, Known::Ask) {
         Some(note) => anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}"),
         None => Ok(()),
     }
@@ -3885,11 +3929,17 @@ fn refuse_beside_its_node(config: &Config) -> anyhow::Result<()> {
 ///   earlier one the node is of another version, and nothing is opened
 ///   ([`not_read_beside_another_version`]).
 fn open_to_read(config: &Config) -> anyhow::Result<rusqlite::Connection> {
+    open_to_read_knowing(config, Known::Ask)
+}
+
+/// [`open_to_read`], where what the node at the port answered is known
+/// already (`cordelia status` asked it): it is not asked again.
+fn open_to_read_knowing(config: &Config, known: Known) -> anyhow::Result<rusqlite::Connection> {
     let data_dir = config.data_dir();
     let db_path = data_dir.join("cordelia.db");
     let lock = lock_of(&data_dir);
     if lock != DirLock::Held {
-        if let Some(note) = another_version_with_no_lock(config, lock) {
+        if let Some(note) = another_version_with_no_lock(config, lock, known) {
             anyhow::bail!("{note}\n{NOT_OPENED_BESIDE_ANOTHER_VERSION}");
         }
         return open_database(&db_path, config);
@@ -7207,8 +7257,43 @@ mod tests {
                 .unwrap()
         };
 
+        // A folder in the place of the lock's file: a node there runs
+        // without the lock, and the lock could not be asked.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join(NODE_LOCK)).unwrap();
+        assert!(lock_data_dir(other.path()).unwrap().is_none());
+        assert_eq!(lock_of(other.path()), DirLock::NotAsked);
+
         // No node: nothing refuses, and nothing is made.
         assert_eq!(lock_of(dir.path()), DirLock::NoFile);
+        // Where the lock tells nothing, what the node at the port answered
+        // already is used, and not asked again; where the lock file is
+        // there and free, it is not looked at.
+        let another = serde_json::json!({ "version": "0.0.0-another" });
+        let ours = serde_json::json!({ "version": env!("CARGO_PKG_VERSION") });
+        for lock in [DirLock::NoFile, DirLock::NotAsked] {
+            let note = another_version_with_no_lock(&config, lock, Known::Answered(&another));
+            assert!(
+                note.is_some_and(|note| note.contains("0.0.0-another")),
+                "{lock:?}"
+            );
+            assert_eq!(
+                another_version_with_no_lock(&config, lock, Known::Answered(&ours)),
+                None
+            );
+            assert_eq!(
+                another_version_with_no_lock(&config, lock, Known::NotAsked),
+                None
+            );
+            assert_eq!(
+                another_version_with_no_lock(&config, lock, Known::Ask),
+                None
+            );
+        }
+        for lock in [DirLock::Free, DirLock::Held] {
+            let note = another_version_with_no_lock(&config, lock, Known::Answered(&another));
+            assert_eq!(note, None, "{lock:?}");
+        }
         assert_ne!(lock_of(dir.path()), DirLock::Held);
         assert!(!dir.path().join(NODE_LOCK).exists());
         assert!(refuse_beside_its_node(&config).is_ok());

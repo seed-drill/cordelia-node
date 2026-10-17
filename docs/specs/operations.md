@@ -389,8 +389,8 @@ Phase 4: device management UI, selective revocation via key rotation.
 >   note (decision 2026-10-04 §10.1, rule 6).
 > - **A command that opens the database itself asks the data directory's
 >   lock first,** the one a node holds for as long as it runs (§10.5), and
->   asks no port: opening runs the schema's steps, and would step the
->   database under the node. Where a node holds the lock, `cordelia
+>   asks the port only where the lock tells nothing (below): opening runs
+>   the schema's steps, and would step the database under the node. Where a node holds the lock, `cordelia
 >   swarm-init`, and `cordelia init` where it makes the database or is given
 >   `--force`, open nothing and name the command that stops the node;
 >   `cordelia stats`, `cordelia channels` and what `cordelia status` says of

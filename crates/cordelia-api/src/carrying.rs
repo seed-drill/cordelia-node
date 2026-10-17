@@ -2205,6 +2205,48 @@ mod tests {
         assert_eq!(said_of(&node, removed).await, json!(true));
     }
 
+    /// A later revision that another key wrote is not the removed key's
+    /// work, even where it holds a text that the removed key wrote before
+    /// (decision 2026-10-04 §7.3): a device that reverts a file to the
+    /// removed key's earlier text writes over the removed key's later
+    /// version, and its chain names both of the removed key's versions as
+    /// what it was written over, not as what it carries. The removed key's
+    /// later version lies under it, and is not brought back.
+    #[actix_web::test]
+    async fn test_another_keys_revert_to_an_earlier_text_is_not_brought_back() {
+        use crate::several::text;
+        use cordelia_crypto::entry::Link;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 2], LAB);
+        s.write(0, LAB, "kept.md", "of device 0");
+        s.meet(&[0, 2]);
+        let old = s[2].own(LAB);
+        let first = s.write(2, LAB, "only.md", "first");
+        let second = s.write(2, LAB, "only.md", "second");
+        s.change(0, &[0, 1], &[2]);
+        let new = s[0].own(LAB);
+        let one =
+            cordelia_crypto::identity::NodeIdentity::from_seed(*s[1].identity.seed()).unwrap();
+        let removed = s.key(2);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &[first.clone(), second.clone()]);
+
+        // Device 1 puts the file back to the removed key's first text,
+        // above the removed key's second: an ordinary write over both.
+        let rev = cordelia_core::revision::lifted(second.rev) + 1;
+        let chain = [
+            Link::of(&text("second"), removed),
+            Link::of(&text("first"), removed),
+        ];
+        let revert = entry_by(&one, &new, rev, "only.md", text("first"), &chain);
+        cordelia_storage::entries::store(&db(&node.state), &revert, now()).unwrap();
+        assert_eq!(node.text(LAB, "only.md").as_deref(), Some("first"));
+
+        let listed = look_from(&node.state, LAB, &[]).await.unwrap();
+        assert_eq!(listed["signed"][0]["key"], hex::encode(removed), "{listed}");
+        assert_eq!(listed["signed"][0]["brought_back"], false, "{listed}");
+    }
+
     /// **Which slots of the new channel hold nothing is judged only
     /// where the new channel was fetched whole just before** (decision
     /// 2026-10-04 §7.3). Where no relay answers, a plain carry, a

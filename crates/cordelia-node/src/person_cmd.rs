@@ -893,8 +893,22 @@ fn addresses_within(
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
 fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
-    devices_lines_at(seen, own, chrono::Utc::now().timestamp())
+    devices_lines_at(seen, own, chrono::Utc::now().timestamp(), &LOOKED_UP)
 }
+
+/// How `cordelia devices` looks up the relays' names
+/// ([`addresses_within`]): by what, and within how long.
+struct Lookup {
+    wait: std::time::Duration,
+    by: fn(&str) -> Vec<String>,
+}
+
+/// The lookup that `cordelia devices` makes: the system's, within the
+/// stream timeout, as the node bounds its own lookups of its relays.
+const LOOKED_UP: Lookup = Lookup {
+    wait: std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
+    by: addresses_of,
+};
 
 /// Whether it is too soon, at `now`, to say anything against `device`,
 /// which this device has not heard to have applied the change (decision
@@ -927,7 +941,7 @@ fn too_soon_to_say(seen: &Value, device: &Value, own: &[u8; 32], now: i64) -> bo
 /// [`devices_lines`], at `now`, in seconds: what is said of a device
 /// that has not been heard from goes by how long ago this device joined,
 /// or that one was added ([`too_soon_to_say`]).
-fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
+fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
     out.push(format!(
@@ -1092,8 +1106,8 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64) -> Vec<String> {
                 .iter()
                 .map(|relay| text(relay, "relay").to_string())
                 .collect(),
-            std::time::Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
-            addresses_of,
+            lookup.wait,
+            lookup.by,
         ),
         false => vec![Vec::new(); relays.len()],
     };
@@ -3725,7 +3739,7 @@ mod tests {
         let advice = "has not applied change 1 yet, as far as this device has heard: adding it \
                       again from a device that has (`cordelia add-device`)";
         let says_of = |seen: &Value, own: u8, label: &str, at: i64| -> String {
-            let lines = devices_lines_at(seen, &key(own), at);
+            let lines = devices_lines_at(seen, &key(own), at, &LOOKED_UP);
             let of_it = format!("\"{label}\"");
             let line = lines.iter().find(|line| line.contains(&of_it));
             line.unwrap_or_else(|| panic!("no line for {label}: {lines:?}"))
@@ -3926,6 +3940,66 @@ mod tests {
                  still to send there",
                 "  192.0.2.9:9474: 5 of this device's channels still to send there",
             ]
+        );
+    }
+
+    /// `cordelia devices` looks the relays' names up as its lookup says,
+    /// and within its wait: a row at the address that the lookup gives a
+    /// relay's name is said on that relay's line, and a lookup that does
+    /// not end does not hold the command up past the wait. (Here the
+    /// relay's name is an address, which the system's own lookup would
+    /// give as it is.)
+    #[test]
+    fn devices_looks_the_relays_up_only_as_its_lookup_says_and_within_its_wait() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let seen = json!({
+            "this_device": encode_public_key(&key(1)).unwrap(),
+            "change": 1,
+            "devices": [],
+            "relays": [
+                { "relay": "203.0.113.7:9474", "heard_since_woke": true, "holds_latest": true },
+            ],
+            "waiting": [{ "relay": "203.0.113.5:9474", "name": null, "waits": 2 }],
+        });
+        fn found(name: &str) -> Vec<String> {
+            match name {
+                "203.0.113.7:9474" => vec!["203.0.113.5:9474".to_string()],
+                _ => Vec::new(),
+            }
+        }
+        fn never(name: &str) -> Vec<String> {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            found(name)
+        }
+        let relays_of = |lookup: &Lookup| -> Vec<String> {
+            let lines = devices_lines_at(&seen, &key(1), 0, lookup);
+            let from = lines.iter().position(|line| line == "Relays:").unwrap();
+            lines[from + 1..].to_vec()
+        };
+        let wait = std::time::Duration::from_secs(5);
+        assert_eq!(
+            relays_of(&Lookup { wait, by: found }),
+            [
+                "  203.0.113.7:9474: holds the latest change; 2 of this device's channels still \
+              to send there"
+            ]
+        );
+        let began = std::time::Instant::now();
+        let short = std::time::Duration::from_millis(200);
+        assert_eq!(
+            relays_of(&Lookup {
+                wait: short,
+                by: never
+            }),
+            [
+                "  203.0.113.7:9474: holds the latest change",
+                "  203.0.113.5:9474: 2 of this device's channels still to send there",
+            ]
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
         );
     }
 

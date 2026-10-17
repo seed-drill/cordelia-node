@@ -4975,12 +4975,13 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 
 /// A command that opens the node's database itself asks the data
 /// directory's lock, the one a node holds for as long as it runs, before
-/// it opens the database, and asks no port (decision 2026-10-04 §10.1,
-/// rule 6).
+/// it opens the database, and asks the port only where the lock tells
+/// nothing (decision 2026-10-04 §10.1, rule 6).
 ///
 /// - **Where the directory has no lock file,** as one where a node from
-///   before the lock runs, the lock tells nothing, and the port of the
-///   command's configuration is asked: a node of another version there
+///   before the lock runs, or its lock could not be asked (a folder in its
+///   place), the lock tells nothing, and the port of the command's
+///   configuration is asked: a node of another version there
 ///   (here a stand-in that says it is) refuses `cordelia stats`, `cordelia
 ///   channels` and `cordelia init --force`, and the database stays at the
 ///   released version's schema, byte for byte.
@@ -5071,6 +5072,28 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
     assert!(!beside.join("node.lock").exists());
+    // `cordelia status` says the note, and reads nothing of the database.
+    let out = laptop.command_given(&through, &["status"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("Storage:\n  Not read:  "), "{said}");
+    assert!(said.contains(note), "{said}");
+    assert!(!said.contains("DB size:"), "{said}");
+    assert_eq!(std::fs::read(&database).unwrap(), as_it_was);
+
+    // A folder stands in the place of the lock's file, as on a volume
+    // where a node runs without the lock: the lock could not be asked, so
+    // the port is asked too, and the node of another version refuses
+    // each command. Nothing is stepped.
+    std::fs::create_dir(beside.join("node.lock")).unwrap();
+    for args in opens {
+        let out = laptop.command_given(&through, args);
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?}: {said}");
+        assert!(said.contains(note), "{args:?}: {said}");
+        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
+    }
 
     // The directory has its lock file, and no node holds it: the node at
     // the port runs on another data directory, and refuses nothing. Each
