@@ -3556,7 +3556,8 @@ mod tests {
         // above the last second that RFC 3339 writes.
         assert_eq!(SHARED_ACT_TIME_MAX, 1_099_511_627_776);
         assert_eq!(SHARED_ACT_TIME_MAX / (36_525 * 864), 34_841);
-        const { assert!(SHARED_ACT_TIME_MAX > 253_402_300_799) };
+        let last_rfc_3339_second: u64 = 253_402_300_799;
+        assert!(SHARED_ACT_TIME_MAX > last_rfc_3339_second);
         // A time or a count at the bound is eight bytes as an act writes it.
         const { assert!(SHARED_ACT_TIME_MAX < u64::MAX) };
     }
