@@ -3516,9 +3516,20 @@ mod tests {
         let by_1 = &s[1].identity;
         handed.push(record(by_1, watch, "watch", AT));
         handed.push(record(by_1, phone, "phone", AT + 60));
-        // A second record of device 1's for the phone, later by its time:
-        // the older takes device 1's place, and is the one shown.
-        handed.push(record(by_1, phone, "phone again", AT + 120));
+        // A second record of device 1's for the phone, later by its time,
+        // as `cordelia add` run again writes it, over the first: the older
+        // takes device 1's place, and is the one shown.
+        let mut again = record(by_1, phone, "phone again", AT + 120);
+        let inside = again.open(&personal).unwrap();
+        again = entry_by(
+            by_1,
+            &personal,
+            again.rev + 1,
+            &inside.name,
+            inside.value,
+            &[],
+        );
+        handed.push(again);
         handed.push(record(x, phone, "kitchen tablet", AT));
         handed.push(record(y, tablet, "tablet", AT));
         let statement_key = *phrase().statement_key().unwrap();
