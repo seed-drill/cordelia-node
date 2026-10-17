@@ -102,22 +102,24 @@ fn relays_from(
 /// Resolve the relays' names now, with the system resolver, one address
 /// per name. Names that do not resolve are skipped with a warning. Blocks;
 /// for startup.
+///
+/// **Every relay whose name resolves is kept** (decision 2026-10-17 §1),
+/// also one whose address is another's: only one key can answer at an
+/// address, so a relay there that was given another key fails its own
+/// handshake, and its status says so.
 pub fn resolve_relays_now(relays: &[Relay]) -> Vec<RelayAddr> {
     let mut resolved: Vec<RelayAddr> = Vec::new();
     for relay in relays {
         match relay.host.to_socket_addrs() {
             Ok(addrs) => {
                 let addrs: Vec<SocketAddr> = addrs.collect();
-                match pick(&addrs) {
-                    Some(addr) if !resolved.iter().any(|r| r.addr == addr) => {
-                        debug!(host = %relay.host, %addr, "resolved relay");
-                        resolved.push(RelayAddr {
-                            host: relay.host.clone(),
-                            addr,
-                            key: relay.key,
-                        });
-                    }
-                    _ => {}
+                if let Some(addr) = pick(&addrs) {
+                    debug!(host = %relay.host, %addr, "resolved relay");
+                    resolved.push(RelayAddr {
+                        host: relay.host.clone(),
+                        addr,
+                        key: relay.key,
+                    });
                 }
             }
             Err(e) => warn!(host = %relay.host, error = %e, "relay name did not resolve"),
@@ -128,7 +130,8 @@ pub fn resolve_relays_now(relays: &[Relay]) -> Vec<RelayAddr> {
 
 /// Resolve the relays' names with the system resolver (so `/etc/hosts`
 /// applies), one address per name. Names that do not resolve are skipped;
-/// that is expected while offline.
+/// that is expected while offline. Every relay whose name resolves is
+/// kept, as [`resolve_relays_now`] keeps it.
 pub async fn resolve_relays(relays: &[Relay]) -> Vec<RelayAddr> {
     let timeout = std::time::Duration::from_secs(protocol::STREAM_TIMEOUT_SECS);
     let mut resolved: Vec<RelayAddr> = Vec::new();
@@ -136,9 +139,7 @@ pub async fn resolve_relays(relays: &[Relay]) -> Vec<RelayAddr> {
         match tokio::time::timeout(timeout, tokio::net::lookup_host(relay.host.as_str())).await {
             Ok(Ok(addrs)) => {
                 let addrs: Vec<SocketAddr> = addrs.collect();
-                if let Some(addr) = pick(&addrs)
-                    && !resolved.iter().any(|r| r.addr == addr)
-                {
+                if let Some(addr) = pick(&addrs) {
                     resolved.push(RelayAddr {
                         host: relay.host.clone(),
                         addr,
@@ -160,6 +161,20 @@ fn pick(addrs: &[SocketAddr]) -> Option<SocketAddr> {
         .find(|a| a.is_ipv4())
         .or_else(|| addrs.first())
         .copied()
+}
+
+/// The relays among `resolved` whose address is another's before them,
+/// each with the name of the first relay at that address: what the node
+/// says in its log when the addresses change (decision 2026-10-17 §1).
+pub fn sharing_an_address(resolved: &[RelayAddr]) -> Vec<(&str, &str)> {
+    resolved
+        .iter()
+        .enumerate()
+        .filter_map(|(at, relay)| {
+            let first = resolved[..at].iter().find(|r| r.addr == relay.addr)?;
+            Some((relay.host.as_str(), first.host.as_str()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -281,10 +296,6 @@ mod tests {
                 key: Some(pk),
             },
             Relay {
-                host: "127.0.0.1:9474".into(),
-                key: None,
-            }, // same address again
-            Relay {
                 host: "not-a-valid-address".into(),
                 key: None,
             },
@@ -299,6 +310,41 @@ mod tests {
         assert_eq!(resolved[0].key, Some(pk));
         assert_eq!(resolved[1].addr, "127.0.0.2:9475".parse().unwrap());
         assert_eq!(resolved[1].key, None);
+    }
+
+    /// Two configured relays whose names resolve to one address, each
+    /// with a key of its own, are both kept, each with its own name and
+    /// key: whichever key answers there, the other relay fails its own
+    /// handshake (decision 2026-10-17 §1). So is a third there with no
+    /// key. Each way of resolving keeps them alike, and the second and
+    /// the third are named as sharing the first one's address.
+    #[tokio::test]
+    async fn two_relays_that_resolve_to_one_address_are_both_kept() {
+        let ((one, _), (two, _)) = (key(1), key(2));
+        let at = |host: &str, key| Relay {
+            host: host.into(),
+            key,
+        };
+        let relays = vec![
+            at("127.0.0.1:9474", Some(one)),
+            at("127.0.0.1:9475", None),
+            at("127.0.0.1:9474", Some(two)),
+            at("127.0.0.1:9474", None),
+        ];
+        for resolved in [resolve_relays_now(&relays), resolve_relays(&relays).await] {
+            assert_eq!(resolved.len(), 4, "{resolved:?}");
+            let keys: Vec<Option<[u8; 32]>> = resolved.iter().map(|r| r.key).collect();
+            assert_eq!(keys, [Some(one), None, Some(two), None]);
+            let shared: SocketAddr = "127.0.0.1:9474".parse().unwrap();
+            for at in [0, 2, 3] {
+                assert_eq!(resolved[at].addr, shared);
+            }
+            assert_eq!(
+                sharing_an_address(&resolved),
+                [("127.0.0.1:9474", "127.0.0.1:9474"); 2]
+            );
+        }
+        assert!(sharing_an_address(&resolve_relays_now(&relays[..2])).is_empty());
     }
 
     #[tokio::test]

@@ -90,7 +90,11 @@
 //! In its database, for each relay and channel: its place there, and how
 //! far it has sent (`cordelia_storage::at_relays`). In memory, and gone
 //! with the connection: which entry it showed whole there, and which
-//! channels it proved there and when. In memory, for as long as the node
+//! channels it proved there and when, as the relay remembers them. Where
+//! channels that it no longer proves hold places there that a channel of
+//! its own needs, it has the connection made again
+//! ([`DeviceEntries::make_again_where_full`], decision 2026-10-17 §4). In
+//! memory, for as long as the node
 //! runs: what a status reads, and how long a channel that found no room
 //! at a relay is left before it is sent there again.
 
@@ -221,6 +225,10 @@ struct OfLink {
     /// When the channels of the names that the personal channel lists
     /// were last proved on it, all of them.
     listed_proved: Option<Instant>,
+    /// Whether the node was asked to make it again, because channels that
+    /// the device no longer proves hold places there that its own need
+    /// ([`DeviceEntries::make_again_where_full`]): it is asked once.
+    made_again: bool,
 }
 
 /// What is kept of one relay, by its name, for as long as the node runs.
@@ -1541,6 +1549,9 @@ impl DeviceEntries {
         };
         let at = At { link, under };
         let whole = kind == Pass::Whole;
+        if whole {
+            self.make_again_where_full(link, &own);
+        }
         let mut read_all = true;
         for channel in &own {
             let messages = channel.kind == Kind::Messages;
@@ -1747,6 +1758,63 @@ impl DeviceEntries {
             Ok(None) => Step::Done(false),
             Err(_) => Step::Stop,
         }
+    }
+
+    /// Have the connection at `link` made again where a channel of the
+    /// device's own, of `own`, that a pass proves finds no place among
+    /// its proofs, and some of those places are held by channels that the
+    /// device no longer proves (decision 2026-10-17 §4): those of a
+    /// generation that it left when it applied a statement, or that a
+    /// carry read.
+    ///
+    /// A relay remembers every proof made on a connection for as long as
+    /// the connection lives, and the device keeps what the relay
+    /// remembers: a channel it no longer proves still holds its place
+    /// there, and is not forgotten while the connection lives. A new
+    /// connection starts with none, and its places are the current
+    /// channels'. The node makes it again, as it does for a carry
+    /// ([`DoorAsk::Remake`]), and is asked once for a connection. Where
+    /// every place is held by a channel the device still proves, nothing
+    /// is asked: a new connection would have no more room.
+    fn make_again_where_full(&self, link: &Link, own: &[Own]) {
+        let short = {
+            let kept = lock(&self.kept);
+            let Some(of) = kept.links.get(&link.id()) else {
+                return;
+            };
+            let proved = |own: &&Own| own.is_pulled() && !of.proved.contains_key(&own.id);
+            let not_proved = own.iter().filter(proved);
+            !of.made_again && of.proved.len() + not_proved.count() > self.most_proved
+        };
+        if !short {
+            return;
+        }
+        let Ok(listed) = at_relays::listed(&lock(&self.state.db), self.most_proved) else {
+            return;
+        };
+        let left = {
+            let mut kept = lock(&self.kept);
+            let Some(of) = kept.links.get_mut(&link.id()) else {
+                return;
+            };
+            let proves = |channel: &[u8; 32]| own.iter().chain(&listed).any(|o| o.id == *channel);
+            let left = of.proved.keys().filter(|channel| !proves(channel)).count();
+            of.made_again = left > 0;
+            left
+        };
+        if left == 0 {
+            return;
+        }
+        tracing::info!(
+            relay = link.name(),
+            left,
+            "channels this device no longer proves hold places among a connection's proofs that its own need: the connection is made again"
+        );
+        let (answer, _) = tokio::sync::oneshot::channel();
+        self.state.own_channels.ask_door(DoorAsk::Remake {
+            relay: link.name().to_string(),
+            answer,
+        });
     }
 
     /// Whether the connection at `link` has room for the proof of

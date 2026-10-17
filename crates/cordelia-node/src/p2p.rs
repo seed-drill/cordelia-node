@@ -2141,6 +2141,11 @@ pub async fn p2p_loop(
     let mut governor =
         cordelia_network::governor::Governor::with_dial_policy(gov_targets, vec![], dial_policy)
             .with_timeouts(gov_timeouts);
+    // Every relay of a personal node is one the person set it up with:
+    // churn closes none of them (decision 2026-10-17 §2).
+    if node_role == "personal" {
+        governor = governor.keeping_its_relays();
+    }
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
@@ -2484,36 +2489,40 @@ pub async fn p2p_loop(
 
                         if direction == Direction::Outbound {
                             in_flight.remove(&addr);
-                            // A configured relay must answer with its key.
+                            // A configured relay must answer with its key:
+                            // each one at this address is judged by the key
+                            // that answered (decision 2026-10-17 §1).
                             let dialled = relay_addrs
                                 .read()
-                                .ok()
-                                .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
-                            if let Some(relay) = dialled {
+                                .map(|relays| relays.clone())
+                                .unwrap_or_default();
+                            let (answers, refused) = answered_at(&dialled, addr, &outcome.node_id.0);
+                            if !answers.is_empty() || !refused.is_empty() {
                                 let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                                let tried = relay_tries.entry(relay.host.clone()).or_default();
-                                match relay.key {
-                                    Some(key) if key != outcome.node_id.0 => {
-                                        tracing::warn!(
-                                            relay = %relay.host,
-                                            answered = %outcome.node_id,
-                                            "another key answered at a relay's address; refusing it"
-                                        );
-                                        outcome.conn.close(0u32.into(), b"not the relay");
-                                        tried.failed(
-                                            "another key answered at this address".into(),
-                                            true,
-                                            p2p_gov_tick_secs,
-                                            any_connected,
-                                        );
-                                        continue;
-                                    }
-                                    // Keep the count of failures until the
-                                    // connection has lasted (see the relay
-                                    // tick), so a relay that accepts and
-                                    // drops at once is not redialled every
-                                    // second.
-                                    _ => tried.connected_at = Some(std::time::Instant::now()),
+                                for relay in &refused {
+                                    tracing::warn!(
+                                        relay = %relay.host,
+                                        answered = %outcome.node_id,
+                                        "another key answered at a relay's address; refusing it for that relay"
+                                    );
+                                    relay_tries.entry(relay.host.clone()).or_default().failed(
+                                        "another key answered at this address".into(),
+                                        true,
+                                        p2p_gov_tick_secs,
+                                        any_connected,
+                                    );
+                                }
+                                if answers.is_empty() {
+                                    outcome.conn.close(0u32.into(), b"not the relay");
+                                    continue;
+                                }
+                                // Keep the count of failures until the
+                                // connection has lasted (see the relay
+                                // tick), so a relay that accepts and drops
+                                // at once is not redialled every second.
+                                for relay in &answers {
+                                    relay_tries.entry(relay.host.clone()).or_default().connected_at =
+                                        Some(std::time::Instant::now());
                                 }
                             }
                         }
@@ -2635,14 +2644,17 @@ pub async fn p2p_loop(
                             governor.mark_dial_failed(&nid);
                         }
                         tracing::debug!(addr = %addr, error = %error, "outbound connect failed");
-                        let dialled = relay_addrs
+                        // Every configured relay at this address failed.
+                        let dialled: Vec<String> = relay_addrs
                             .read()
-                            .ok()
-                            .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
-                        if let Some(relay) = dialled {
-                            let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                            relay_tries.entry(relay.host).or_default().failed(
-                                error,
+                            .map(|relays| {
+                                relays.iter().filter(|r| r.addr == addr).map(|r| r.host.clone()).collect()
+                            })
+                            .unwrap_or_default();
+                        let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
+                        for host in dialled {
+                            relay_tries.entry(host).or_default().failed(
+                                error.clone(),
                                 false,
                                 p2p_gov_tick_secs,
                                 any_connected,
@@ -2679,6 +2691,14 @@ pub async fn p2p_loop(
                         {
                             relay_tries.remove(&relay.host);
                         }
+                        continue;
+                    }
+                    // Another relay is connected at this address: only one
+                    // key answers at one, and it is not this relay's. It
+                    // stands as its last dial left it, and is not dialled:
+                    // a second connection to that relay would only replace
+                    // the first (decision 2026-10-17 §1).
+                    if relays.iter().any(|other| other.addr == relay.addr && relay_connected(&conn_mgr, other)) {
                         continue;
                     }
                     if in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT {
@@ -3570,6 +3590,15 @@ pub async fn keep_relays_resolved(
                     .map(|r| format!("{}={}", r.host, r.addr))
                     .collect();
                 tracing::info!(addrs = ?list, "relay addresses updated");
+                // Each is kept and dialled; one key answers at an address
+                // (decision 2026-10-17 §1).
+                for (relay, first) in cordelia_network::bootstrap::sharing_an_address(&resolved) {
+                    tracing::warn!(
+                        relay,
+                        first,
+                        "two relays this node is set up with resolve to one address: only one key can answer there, and a relay given another key is shown with the wrong key"
+                    );
+                }
                 *current = resolved;
             }
             true
@@ -3632,6 +3661,27 @@ fn relay_backoff(failures: u32, tick_secs: u64, another_connected: bool) -> std:
         .max(1)
         .saturating_mul(1u64 << failures.saturating_sub(1).min(16));
     std::time::Duration::from_secs(doubled.min(cap).max(1))
+}
+
+/// What the key that answered a dial at `addr` says of each configured
+/// relay there (decision 2026-10-17 §1): the relays of `relays` at that
+/// address whose key answered, or that were given none, are reached by
+/// the connection; each that was given another key failed its own
+/// handshake, and is shown with the wrong key. Two relays may share an
+/// address, and only one key answers at one.
+fn answered_at(
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    addr: std::net::SocketAddr,
+    answered: &[u8; 32],
+) -> (
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+) {
+    relays
+        .iter()
+        .filter(|relay| relay.addr == addr)
+        .cloned()
+        .partition(|relay| relay.key.is_none_or(|key| key == *answered))
 }
 
 /// Whether a configured relay is connected: by its key if one is
@@ -4891,6 +4941,86 @@ mod tests {
         let none = relay_snapshots(&set_up, &[], &tries, &|_| true);
         assert_eq!(none.len(), 3);
         assert!(none.iter().all(|relay| relay.state == "unreachable"));
+    }
+
+    /// Two relays that a node is set up with resolve to one address, each
+    /// given a key of its own, beside a third there that was given none
+    /// (decision 2026-10-17 §1). The key that answers a dial there
+    /// reaches the relay that was given it, and the one given none; the
+    /// other fails its own handshake. Each is listed by its name: the one
+    /// whose key did not answer with the wrong key, while the others are
+    /// connected. None of them is dropped.
+    #[test]
+    fn two_relays_at_one_address_are_each_listed_and_a_wrong_key_is_their_own() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let shared = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let at = |host: &str, addr, key| RelayAddr {
+            host: host.into(),
+            addr,
+            key,
+        };
+        let other = std::net::SocketAddr::from(([127, 0, 0, 2], 9474));
+        let resolved = [
+            at("one.example:9474", shared, Some([7; 32])),
+            at("two.example:9474", shared, Some([8; 32])),
+            at("three.example:9474", shared, None),
+            at("other.example:9474", other, Some([9; 32])),
+        ];
+        let hosts = |relays: &[RelayAddr]| -> Vec<String> {
+            relays.iter().map(|relay| relay.host.clone()).collect()
+        };
+        let (answers, refused) = answered_at(&resolved, shared, &[8; 32]);
+        assert_eq!(hosts(&answers), ["two.example:9474", "three.example:9474"]);
+        assert_eq!(hosts(&refused), ["one.example:9474"]);
+        // A key that none was given reaches only the relay given none.
+        let (stranger, both) = answered_at(&resolved, shared, &[5; 32]);
+        assert_eq!(hosts(&stranger), ["three.example:9474"]);
+        assert_eq!(hosts(&both), ["one.example:9474", "two.example:9474"]);
+        let (none, nothing) = answered_at(&resolved, "127.0.0.3:9474".parse().unwrap(), &[8; 32]);
+        assert!(none.is_empty() && nothing.is_empty());
+
+        // As the loop does with that answer: the relay whose key did not
+        // answer failed, with the wrong key.
+        let mut tries: std::collections::HashMap<String, RelayTry> = Default::default();
+        for relay in &refused {
+            let tried = tries.entry(relay.host.clone()).or_default();
+            tried.failed(
+                "another key answered at this address".into(),
+                true,
+                10,
+                true,
+            );
+        }
+        let set_up: Vec<Relay> = resolved
+            .iter()
+            .map(|relay| Relay {
+                host: relay.host.clone(),
+                key: relay.key,
+            })
+            .collect();
+        let connected =
+            |relay: &RelayAddr| relay.addr == shared && relay.key.is_none_or(|key| key == [8; 32]);
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &connected);
+        let stands: Vec<(&str, &str, Option<&str>)> = listed
+            .iter()
+            .map(|relay| {
+                let error = relay.error.as_deref();
+                (relay.host.as_str(), relay.state.as_str(), error)
+            })
+            .collect();
+        assert_eq!(
+            stands,
+            [
+                (
+                    "one.example:9474",
+                    "wrong key",
+                    Some("another key answered at this address")
+                ),
+                ("two.example:9474", "connected", None),
+                ("three.example:9474", "connected", None),
+                ("other.example:9474", "connecting", None),
+            ]
+        );
     }
 
     /// A device answers a request of the older kind with nothing, as a
