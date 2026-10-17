@@ -587,7 +587,9 @@ impl Placed<'_> {
 /// At most 63 records are of the first kind and at most 64 keys may add,
 /// so each adder that may add keeps its first `KEPT_OUT_PER_ADDER` keys
 /// that the 64 kept out, whatever another key signs (§1, property 1).
-fn in_the_order_of_keeping<'a>(
+/// A recovery shows its rows of records that do not count in this order
+/// too (`recover::read_generation`, §2.2).
+pub(crate) fn in_the_order_of_keeping<'a>(
     statement: &Statement,
     counting: &Counting,
     kept: &'a [KeptAddition],
