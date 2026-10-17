@@ -2218,7 +2218,10 @@ pub async fn p2p_loop(
         let none: Vec<Option<NodeId>> = vec![None; relays_set_up.len()];
         let addrs: Vec<Option<std::net::SocketAddr>> = vec![None; relays_set_up.len()];
         let one = one_relay_each(&relays_set_up, &none, &addrs, &|_| None);
-        let counted = one.iter().filter(|one| **one == OneRelay::Itself).count();
+        let counted = one
+            .iter()
+            .filter(|one| !matches!(one, OneRelay::SameAs(_)))
+            .count();
         state.own_channels.set_up_with(counted);
     }
     // A device's side of its relays, for the channels of its own
@@ -2876,9 +2879,8 @@ pub async fn p2p_loop(
                     // that connection alone. It is closed here, and the
                     // relay is dialled anew as any relay that is not
                     // connected is: nothing is kept of the tries before.
-                    (cordelia_api::state::DoorAsk::Remake { relay, answer }, _) => {
-                        let link = relays.into_iter().find(|set_up| set_up.name == relay);
-                        let peer = link.and_then(|set_up| set_up.link).map(|link| link.relay().clone());
+                    (cordelia_api::state::DoorAsk::Remake { relay, peer, answer }, _) => {
+                        let peer = to_make_again(peer, &relay, &relays, &|peer| conn_mgr.is_connected(peer));
                         if let Some(peer) = &peer {
                             tracing::info!(%relay, "the connection to a relay is made again: it has no room left for a proof");
                             conn_mgr.disconnect(peer);
@@ -3654,6 +3656,28 @@ fn relay_backoff(failures: u32, tick_secs: u64, another_connected: bool) -> std:
     std::time::Duration::from_secs(doubled.min(cap).max(1))
 }
 
+/// The connection that an asking to make one again names (decision
+/// 2026-10-17 §4): by the relay's key where it gives one, which holds
+/// whatever name the relay is listed under now; otherwise by the name it
+/// gives, among `relays`, the relays a pass is given. `None` where there
+/// is no such connection: the asking is then answered that none was
+/// closed.
+fn to_make_again(
+    peer: Option<[u8; 32]>,
+    relay: &str,
+    relays: &[cordelia_node::device_entries::Relay],
+    connected: &dyn Fn(&NodeId) -> bool,
+) -> Option<NodeId> {
+    match peer {
+        Some(key) => Some(NodeId(key)).filter(|peer| connected(peer)),
+        None => relays
+            .iter()
+            .find(|set_up| set_up.name == relay)
+            .and_then(|set_up| set_up.link.as_ref())
+            .map(|link| link.relay().clone()),
+    }
+}
+
 /// The governor of a node of `role`, with its targets and timeouts from
 /// `gov_config`: the one place where a node's role decides it.
 ///
@@ -3737,10 +3761,12 @@ fn relay_connected(
 /// says does not hold a change.
 ///
 /// **One relay is here once** (decision 2026-10-17 §1): a relay that is
-/// the same relay as one before it, or that another key answers for at
-/// its address ([`one_relay_each`]), is left out. So one relay is counted
-/// once, paced once and passed once, and the node says how many relays
-/// the device is set up with from this list (`own`).
+/// the same relay as one before it ([`one_relay_each`]) is left out. So
+/// one relay is counted once, paced once and passed once, and the node
+/// says how many relays the device is set up with from this list
+/// (`own`). A relay that another key answers for at its address is here,
+/// with no connection, as a relay that is out of reach is: so the device
+/// never takes every relay for connected while it fails.
 fn relays_with_links(
     set_up: &[cordelia_network::bootstrap::Relay],
     relay_addrs: &RelayAddrs,
@@ -3759,7 +3785,7 @@ fn relays_with_links(
         .iter()
         .zip(peers)
         .zip(one)
-        .filter(|(_, one)| *one == OneRelay::Itself)
+        .filter(|(_, one)| !matches!(one, OneRelay::SameAs(_)))
         .map(|((relay, peer), _)| {
             let link = peer.and_then(|peer| {
                 let conn = conn_mgr.get_connection(&peer)?.clone();
@@ -3786,7 +3812,8 @@ enum OneRelay {
     /// is listed as that, and nothing else.
     SameAs(usize),
     /// Another key answers at its address, on the connection of the relay
-    /// at this place: it is listed with the wrong key, and nothing else.
+    /// at this place: it is listed with the wrong key, and counted as a
+    /// relay that is out of reach, with no connection.
     WrongKeyAt(usize),
 }
 
@@ -5210,6 +5237,41 @@ mod tests {
             .collect()
     }
 
+    /// The connection that an asking to make one again names is found by
+    /// the relay's key where the asking gives one (decision 2026-10-17
+    /// §4): whatever name the relay is listed under now, or none. Where
+    /// that key is not connected, there is none to close. An asking with
+    /// no key, a carry's, is found by its name among the relays a pass is
+    /// given.
+    #[test]
+    fn a_connection_to_make_again_is_found_by_its_key() {
+        use cordelia_node::device_entries::Relay;
+        let key = [7; 32];
+        let connected = |peer: &NodeId| peer.0 == key;
+        // Listed under another name now, or under none.
+        let listed = [Relay {
+            name: "keyless.example:9474".into(),
+            link: None,
+        }];
+        for relays in [&listed[..], &[]] {
+            let found = to_make_again(Some(key), "keyed.example:9474", relays, &connected);
+            assert_eq!(found, Some(NodeId(key)));
+        }
+        assert_eq!(
+            to_make_again(Some([8; 32]), "keyed.example:9474", &listed, &connected),
+            None
+        );
+        assert_eq!(
+            to_make_again(None, "keyed.example:9474", &listed, &connected),
+            None
+        );
+        assert_eq!(
+            to_make_again(None, "keyless.example:9474", &listed, &connected),
+            None,
+            "listed with no connection"
+        );
+    }
+
     /// A node's governor goes by its role (decision 2026-10-17 §2): built
     /// as the node builds it, a personal node's keeps the three relays it
     /// is connected to through several churn intervals, while a fourth
@@ -5544,6 +5606,39 @@ mod tests {
         assert_eq!(names, ["keyed.test:9474"]);
         assert!(relays[0].link.is_some());
         assert_eq!(own.relays_set_up(), Some(1));
+        let by_key = cordelia_node::device_entries::every_relay_by_key;
+        assert_eq!(
+            by_key(&relays, own.relays_set_up()),
+            Some(vec![relay.public_key()])
+        );
+
+        // Two relays at that one address, each given a key of its own,
+        // and the relay's answers there (decision 2026-10-17 §1). The one
+        // whose key did not answer is given to a pass with no connection,
+        // as one out of reach is, and counted: so the device is not set
+        // up by key, and forgets nothing of it and says no "sent".
+        let wrong_key = [9; 32];
+        let two_keys = [
+            named("keyed.test:9474", Some(relay.public_key())),
+            named("wrong.test:9474", Some(wrong_key)),
+        ];
+        let at_one_address: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(
+            two_keys
+                .iter()
+                .map(|named| RelayAddr {
+                    host: named.host.clone(),
+                    addr: relay_addr,
+                    key: named.key,
+                })
+                .collect(),
+        ));
+        let relays = relays_with_links(&two_keys, &at_one_address, &conn_mgr, &own);
+        let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
+        assert_eq!(names, ["keyed.test:9474", "wrong.test:9474"]);
+        let linked: Vec<bool> = relays.iter().map(|relay| relay.link.is_some()).collect();
+        assert_eq!(linked, [true, false]);
+        assert_eq!(own.relays_set_up(), Some(2));
+        assert_eq!(by_key(&relays, own.relays_set_up()), None);
         conn_mgr.shutdown();
     }
 

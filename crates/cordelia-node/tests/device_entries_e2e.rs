@@ -1819,6 +1819,72 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
     assert_eq!(device.at("relay").refuses, None);
 }
 
+/// Whether the device has said, in its personal channel, that it has sent
+/// what it carried under the statement it applied (decision 2026-10-04
+/// §8).
+fn says_sent(device: &Device) -> bool {
+    let secret = device.personal_secret();
+    let name = cordelia_api::person::applied_name(&device.key()).unwrap();
+    let slot = slot_id(&derive::slot_key(&secret).unwrap(), &name);
+    let (personal, key) = (device.personal(), device.key());
+    let held = entries::author_entry(&device.db(), &personal, &slot, &key);
+    held.unwrap().is_some_and(|held| {
+        let opened = held.entry.check().unwrap().open(&secret).unwrap();
+        let sent = cordelia_core::protocol::PERSONAL_APPLIED_SENT;
+        matches!(opened.value, Value::Text(word) if word.ends_with(sent))
+    })
+}
+
+/// A relay that another key answers for at its address is given to a
+/// pass with no connection, and counted, as one out of reach is (decision
+/// 2026-10-17 §1): the device is not set up by key while it fails. Two
+/// relays: the device has sent to the second, which then fails. While it
+/// does, the device forgets nothing of it, and does not say that it has
+/// sent what it carried. Reached again, it says so, and forgets nothing
+/// of either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_given_with_no_connection_keeps_what_the_device_says_and_forgets() {
+    let (reached, fails) = (StandIn::started().await, StandIn::started().await);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes("notes", "a.md", "one");
+    let personal = device.personal();
+    let keeps = |device: &Device, relay: &[u8; 32]| {
+        kept_rows::keeps_any(&device.db(), relay, &personal).unwrap()
+    };
+    device.set_up_with("reached");
+    device.connects_to("fails", fails.port, fails.key).await;
+    // It wakes, and waits for the relay it does not reach.
+    device.passes().await;
+    device.clock.run_ahead(Duration::from_secs(WAKE_WAIT_SECS));
+    device.passes().await;
+    assert!(keeps(&device, &fails.key));
+    assert!(!says_sent(&device), "one relay is out of reach");
+
+    // The second fails, as one that another key answers for: it is given
+    // with no connection, and the device is still set up with two.
+    device.disconnects("fails");
+    device
+        .connects_to("reached", reached.port, reached.key)
+        .await;
+    assert_eq!(device.state.own_channels.relays_set_up(), Some(2));
+    for _ in 0..2 {
+        device.passes().await;
+    }
+    assert!(
+        keeps(&device, &fails.key),
+        "what was kept of it is forgotten"
+    );
+    assert!(!says_sent(&device), "it says it has sent to every relay");
+
+    // Reached again: it says so.
+    device.connects_to("fails", fails.port, fails.key).await;
+    device.passes().await;
+    assert!(says_sent(&device));
+    assert!(keeps(&device, &fails.key) && keeps(&device, &reached.key));
+}
+
 /// A pass held by the device's pace stops, and moves no place (decision
 /// 2026-10-17 §3). The relay moves the device's place in each channel at
 /// every pull. Once the device has asked what it asks of a relay in a
@@ -5521,8 +5587,10 @@ async fn a_pass_that_passed_a_channel_by_for_its_proof_has_not_read_everything()
 ///
 /// Where a relay remembers the proofs of eight channels for one
 /// connection, the new five do not all find a place: the device asks
-/// the node, once, to make the connection again, and asks nothing more
-/// on the one that is to be closed. On the new connection it proves
+/// the node to make the connection again, by the relay's key, and asks
+/// nothing more on the one that is to be closed. Where the node answers
+/// that it did not make it again, the next pass asks again; where it
+/// did, no pass asks again. On the new connection it proves
 /// every channel of the new generation. Where a relay remembers sixteen,
 /// every new channel finds a place on the same connection, and nothing
 /// is asked.
@@ -5595,11 +5663,27 @@ async fn a_connection_whose_places_are_held_by_a_left_generation_is_made_again()
         );
         let asked = door(&a, 5_000).await;
         let asked = asked.expect("the device did not ask for the connection to be made again");
-        let DoorAsk::Remake { relay: name, .. } = asked else {
+        let DoorAsk::Remake {
+            relay: name,
+            peer,
+            answer,
+        } = asked
+        else {
             panic!("the device asked for something else");
         };
-        assert_eq!(name, "relay");
-        // Once for a connection.
+        assert_eq!((name.as_str(), peer), ("relay", Some(relay.key)));
+        // The node did not make it again: it found no such connection.
+        // The next pass asks again, and nothing more on that connection.
+        let _ = answer.send(false);
+        a.passes().await;
+        assert!(proved(&relay).is_empty());
+        let asked = door(&a, 5_000).await;
+        let Some(DoorAsk::Remake { answer, .. }) = asked else {
+            panic!("a refused remake was not asked again");
+        };
+        // This time the node makes it again: while it does, the device
+        // asks no more, and nothing more on that connection.
+        let _ = answer.send(true);
         a.passes().await;
         assert!(door(&a, 200).await.is_none(), "asked again");
         assert!(proved(&relay).is_empty());
@@ -6240,8 +6324,10 @@ async fn a_pass_that_stops_at_the_messages_channel_after_a_statement_is_short() 
 /// three names. It holds one of those names no more, and sync is on: its
 /// own channels, with the messages channel, are four, but the place of
 /// the name it dropped is still taken on the connection. The messages
-/// channel is not proved, and `no_place` is said. With room for five it
-/// is proved, and nothing is said.
+/// channel is not proved, and `no_place` is said. The device asks the
+/// node to make the connection again, for the messages channel alone
+/// (decision 2026-10-17 §4): the pass goes on, and is not short. With
+/// room for five it is proved, nothing is said, and nothing is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none() {
     for (most_proved, no_place) in [(4, true), (5, false)] {
@@ -6268,6 +6354,12 @@ async fn a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_non
         let own = &device.state.own_channels;
         assert_eq!(own.no_place(), no_place, "{most_proved}");
         assert_eq!(own.last_short_pass(), 0, "{most_proved}");
+        let asked = door(&device, 200).await;
+        assert_eq!(
+            matches!(asked, Some(DoorAsk::Remake { .. })),
+            no_place,
+            "{most_proved}"
+        );
     }
 }
 

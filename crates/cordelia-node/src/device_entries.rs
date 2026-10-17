@@ -201,6 +201,24 @@ struct At<'a> {
     under: [u8; 32],
 }
 
+/// The relays of `relays` by their keys, where every one is connected
+/// and they are as many as the node said it is configured with
+/// (`configured`): what [`DeviceEntries`] forgets by, drops what every
+/// relay took by, and says it has sent what it carried by. `None`
+/// otherwise: then nothing is forgotten, dropped or said. A relay that
+/// another key answers for at its address is given with no connection
+/// (decision 2026-10-17 §1), so while it fails this is `None`.
+pub fn every_relay_by_key(relays: &[Relay], configured: Option<usize>) -> Option<Vec<[u8; 32]>> {
+    let set_up: Option<Vec<[u8; 32]>> = relays
+        .iter()
+        .map(|relay| {
+            let link = relay.link.as_ref().filter(|link| link.is_open())?;
+            Some(link.relay().0)
+        })
+        .collect();
+    set_up.filter(|keys| Some(keys.len()) == configured)
+}
+
 /// What became of one step of a relay's pass.
 enum Step {
     /// It was done, and this is whether nothing is left of it to do:
@@ -227,8 +245,43 @@ struct OfLink {
     listed_proved: Option<Instant>,
     /// Whether the node was asked to make it again, because channels that
     /// the device no longer proves hold places there that its own need
-    /// ([`DeviceEntries::make_again_where_full`]): it is asked once.
-    made_again: bool,
+    /// ([`DeviceEntries::make_again_where_full`]), and what it answered.
+    made_again: Option<MadeAgain>,
+}
+
+/// A connection that the device asked the node to make again (decision
+/// 2026-10-17 §4).
+struct MadeAgain {
+    /// Whether a channel of the device's memory had no place there: else
+    /// the messages channel alone.
+    memory: bool,
+    /// The node's answer, until it is read.
+    answer: Option<tokio::sync::oneshot::Receiver<bool>>,
+}
+
+impl MadeAgain {
+    /// What a pass makes of the connection while it is being made again.
+    fn remade(&self) -> Remade {
+        match self.memory {
+            true => Remade::Memory,
+            false => Remade::Messages,
+        }
+    }
+}
+
+/// Whether a connection is being made again, and for what (decision
+/// 2026-10-17 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remade {
+    /// It is not.
+    No,
+    /// It is, for a channel of the device's memory that has no place
+    /// there: the pass at this relay ends, and is short.
+    Memory,
+    /// It is, for the messages channel alone: the pass goes on, and
+    /// passes the messages channel over, which makes no pass short
+    /// (decision 2026-10-09 §2.1).
+    Messages,
 }
 
 /// What is kept of one relay, by its name, for as long as the node runs.
@@ -1085,15 +1138,7 @@ impl DeviceEntries {
     /// connected only where each of `relays` is, and they are as many as
     /// the node said it is configured with.
     fn set_up_by_key(&self, relays: &[Relay]) -> Option<Vec<[u8; 32]>> {
-        let configured = self.state.own_channels.relays_set_up();
-        let set_up: Option<Vec<[u8; 32]>> = relays
-            .iter()
-            .map(|relay| {
-                let link = relay.link.as_ref().filter(|link| link.is_open())?;
-                Some(link.relay().0)
-            })
-            .collect();
-        set_up.filter(|keys| Some(keys.len()) == configured)
+        every_relay_by_key(relays, self.state.own_channels.relays_set_up())
     }
 
     /// Forget what is kept of the relays and has no more use, in the
@@ -1549,9 +1594,11 @@ impl DeviceEntries {
         };
         let at = At { link, under };
         let whole = kind == Pass::Whole;
-        // A connection that is to be made again is used no more: the
-        // pass at this relay ends, and is short (decision 2026-10-17 §4).
-        if whole && self.make_again_where_full(link, &own) {
+        // A connection that is to be made again for the device's memory
+        // is used no more: the pass at this relay ends, and is short. One
+        // made again for the messages channel alone is used as before
+        // (decision 2026-10-17 §4).
+        if whole && self.make_again_where_full(link, &own) == Remade::Memory {
             return false;
         }
         let mut read_all = true;
@@ -1764,9 +1811,8 @@ impl DeviceEntries {
 
     /// Have the connection at `link` made again where a channel of the
     /// device's own, of `own`, that a pass proves finds no place among
-    /// its proofs (but the messages channel, which is passed over where
-    /// it has none), and some of those places are held by channels that
-    /// the device no longer proves (decision 2026-10-17 §4): those of a
+    /// its proofs, and some of those places are held by channels that the
+    /// device no longer proves (decision 2026-10-17 §4): those of a
     /// generation that it left when it applied a statement, or that a
     /// carry read.
     ///
@@ -1776,61 +1822,99 @@ impl DeviceEntries {
     /// there, and is not forgotten while the connection lives. A new
     /// connection starts with none, and its places are the current
     /// channels'. The node makes it again, as it does for a carry
-    /// ([`DoorAsk::Remake`]), and is asked once for a connection. Where
-    /// every place is held by a channel the device still proves, nothing
-    /// is asked: a new connection would have no more room.
+    /// ([`DoorAsk::Remake`]), found by the relay's key. Where every place
+    /// is held by a channel the device still proves, nothing is asked: a
+    /// new connection would have no more room.
     ///
-    /// Says whether it asked, now or before: the pass then ends at this
-    /// relay, since the connection is being closed.
-    fn make_again_where_full(&self, link: &Link, own: &[Own]) -> bool {
-        let short = {
-            let kept = lock(&self.kept);
-            let Some(of) = kept.links.get(&link.id()) else {
-                return false;
+    /// **It is asked once, while the node carries it out.** Where the node
+    /// answers that it did not (it found no such connection), the next
+    /// whole pass may ask again: at most one asking a pass.
+    ///
+    /// Says what the pass makes of the connection ([`Remade`]): where a
+    /// channel of the device's memory has no place, the pass ends; where
+    /// the messages channel alone has none, it goes on.
+    fn make_again_where_full(&self, link: &Link, own: &[Own]) -> Remade {
+        let (memory, any) = {
+            let mut kept = lock(&self.kept);
+            let Some(of) = kept.links.get_mut(&link.id()) else {
+                return Remade::No;
             };
-            // Asked already: it is being made again.
-            if of.made_again {
-                return true;
+            if let Some(made) = &mut of.made_again {
+                use tokio::sync::oneshot::error::TryRecvError;
+                let answered = made.answer.as_mut().map(|answer| answer.try_recv());
+                let refused = match answered {
+                    Some(Ok(true)) => {
+                        made.answer = None;
+                        false
+                    }
+                    Some(Ok(false) | Err(TryRecvError::Closed)) => true,
+                    Some(Err(TryRecvError::Empty)) | None => false,
+                };
+                if !refused {
+                    return made.remade();
+                }
+                tracing::info!(
+                    relay = link.name(),
+                    "the connection was not made again: a later pass may ask again"
+                );
+                of.made_again = None;
             }
-            // The messages channel is not one of them: it is passed over
-            // where it has no place, and never makes a pass short
-            // (decision 2026-10-09 §2.1).
-            let proved = |own: &&Own| {
-                own.is_pulled() && own.kind != Kind::Messages && !of.proved.contains_key(&own.id)
-            };
-            let not_proved = own.iter().filter(proved);
-            of.proved.len() + not_proved.count() > self.most_proved
+            let not_proved = |own: &&Own| own.is_pulled() && !of.proved.contains_key(&own.id);
+            let memory = own
+                .iter()
+                .filter(not_proved)
+                .filter(|own| own.kind != Kind::Messages)
+                .count();
+            let messages = own
+                .iter()
+                .filter(not_proved)
+                .filter(|own| own.kind == Kind::Messages)
+                .count();
+            let held = of.proved.len();
+            (
+                held + memory > self.most_proved,
+                held + memory + messages > self.most_proved,
+            )
         };
-        if !short {
-            return false;
+        if !any {
+            return Remade::No;
         }
         let Ok(listed) = at_relays::listed(&lock(&self.state.db), self.most_proved) else {
-            return false;
+            return Remade::No;
         };
+        let (answer, answered) = tokio::sync::oneshot::channel();
         let left = {
             let mut kept = lock(&self.kept);
             let Some(of) = kept.links.get_mut(&link.id()) else {
-                return false;
+                return Remade::No;
             };
             let proves = |channel: &[u8; 32]| own.iter().chain(&listed).any(|o| o.id == *channel);
             let left = of.proved.keys().filter(|channel| !proves(channel)).count();
-            of.made_again = left > 0;
+            if left > 0 {
+                of.made_again = Some(MadeAgain {
+                    memory,
+                    answer: Some(answered),
+                });
+            }
             left
         };
         if left == 0 {
-            return false;
+            return Remade::No;
         }
         tracing::info!(
             relay = link.name(),
             left,
             "channels this device no longer proves hold places among a connection's proofs that its own need: the connection is made again"
         );
-        let (answer, _) = tokio::sync::oneshot::channel();
         self.state.own_channels.ask_door(DoorAsk::Remake {
             relay: link.name().to_string(),
+            peer: Some(link.relay().0),
             answer,
         });
-        true
+        match memory {
+            true => Remade::Memory,
+            false => Remade::Messages,
+        }
     }
 
     /// Whether the connection at `link` has room for the proof of

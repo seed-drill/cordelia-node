@@ -882,11 +882,12 @@ impl Governor {
         }
 
         let excess = hot - self.targets.hot_max;
-        // Only consider non-swarm hot peers for demotion
+        // Only consider hot peers that are not trusted: a trusted peer and
+        // a swarm peer are never demoted (network-protocol.md §5.4, step 5).
         let mut hot_peers: Vec<(NodeId, f64, bool)> = self
             .peers
             .values()
-            .filter(|p| p.state == PeerState::Hot && !p.is_swarm)
+            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
             .map(|p| {
                 let is_stale = p.last_activity.elapsed() > self.timeouts.stale_timeout;
                 (p.node_id.clone(), p.score(), is_stale)
@@ -931,9 +932,13 @@ impl Governor {
     /// Warm-tier churn: demote random warm peers to cold, promote cold replacements.
     ///
     /// On a node that keeps its relays, a relay it is set up with is never
-    /// among the warm peers that churn closes (decision 2026-10-17 §2).
+    /// among the warm peers that churn closes (decision 2026-10-17 §2),
+    /// and on any node a trusted peer never is (network-protocol.md
+    /// §5.3.1).
     fn churn_warm(&mut self, actions: &mut GovernorActions) {
-        let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay);
+        // A trusted peer is never evicted by churn (network-protocol.md
+        // §5.3.1).
+        let churned = |p: &PeerInfo| !(self.keeps_its_relays && p.is_relay) && !self.is_trusted(p);
         let (_, _, cold, _) = self.counts();
         let warm = self
             .peers
@@ -2153,6 +2158,73 @@ mod tests {
         assert_eq!(demoted, std::slice::from_ref(&other));
         assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Hot));
         assert_eq!(gov.peer_state(&swarm), Some(&PeerState::Hot));
+    }
+
+    /// Warm churn closes no trusted peer (network-protocol.md §5.3.1): a
+    /// swarm node's trusted peer, warm, is never closed while a peer is
+    /// cold, and a warm peer that is not trusted is.
+    #[test]
+    fn test_churn_warm_closes_no_trusted_peer() {
+        let targets = GovernorTargets {
+            hot_min: 0,
+            hot_max: 0,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max: 10,
+            cold_max: 50,
+            churn_interval_secs: 0, // churn every tick
+            churn_jitter_secs: 0,
+            churn_fraction: 1.0,
+        };
+        let (trusted, other, cold) = (make_node_id(1), make_node_id(2), make_node_id(3));
+        let policy = DialPolicy::TrustedOnly(vec![trusted.clone()]);
+        let mut gov = Governor::with_dial_policy(targets, vec![], policy);
+        for id in [&trusted, &other, &cold] {
+            gov.add_peer(id.clone(), vec![], vec![]);
+        }
+        for id in [&trusted, &other] {
+            gov.peers.get_mut(id).unwrap().state = PeerState::Warm;
+        }
+        let mut closed = Vec::new();
+        for _ in 0..5 {
+            gov.last_churn = Instant::now() - Duration::from_secs(1);
+            closed.extend(gov.tick().disconnect);
+        }
+        assert!(!closed.contains(&trusted), "{closed:?}");
+        assert!(closed.contains(&other), "{closed:?}");
+        assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Warm));
+    }
+
+    /// The demotion of excess hot peers demotes no trusted peer
+    /// (network-protocol.md §5.4, step 5): with three hot peers and room
+    /// for none, the two that are not trusted go to warm, and the trusted
+    /// one stays hot.
+    #[test]
+    fn test_excess_hot_demotes_no_trusted_peer() {
+        let targets = GovernorTargets {
+            hot_min: 0,
+            hot_max: 0,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max: 10,
+            cold_max: 50,
+            churn_interval_secs: 3600,
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+        };
+        let trusted = make_node_id(1);
+        let others = [make_node_id(2), make_node_id(3)];
+        let policy = DialPolicy::TrustedOnly(vec![trusted.clone()]);
+        let mut gov = Governor::with_dial_policy(targets, vec![], policy);
+        for id in std::iter::once(&trusted).chain(&others) {
+            gov.add_peer(id.clone(), vec![], vec![]);
+            gov.peers.get_mut(id).unwrap().state = PeerState::Hot;
+        }
+        gov.tick();
+        assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Hot));
+        for id in &others {
+            assert_eq!(gov.peer_state(id), Some(&PeerState::Warm), "{id}");
+        }
     }
 
     #[test]

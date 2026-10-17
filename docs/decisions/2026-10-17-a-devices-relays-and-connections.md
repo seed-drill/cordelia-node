@@ -22,7 +22,9 @@ Once a relay is connected at an address, the node does not dial that address aga
 
 The node also says in its log which relays share an address.
 
-**One relay is counted once.** Two names may reach one relay: one given its key and one given none at its address, or two given the same key. The first in the configuration is the relay. Each other is listed as "same relay", and is left out of the relays that the device counts, paces, passes, and says hold the latest change. A relay that another key answers for at its address is listed with the wrong key, and is left out of them too while that connection lasts.
+**One relay is counted once.** Two names may reach one relay: one given its key and one given none at its address, or two given the same key. The first in the configuration is the relay. Each other is listed as "same relay", and is left out of the relays that the device counts, paces, passes, and says hold the latest change. A relay that another key answers for at its address is listed with the wrong key, and stays among the relays the device counts, with no connection, as a relay out of reach does. So while it fails the device never takes every relay for connected: it forgets nothing of that relay, and does not say that it has sent what it carried.
+
+Until a key answers at an address, the node cannot tell that a name given a key and a name given none there are one relay: the keyed one may be a relay with the wrong key. So they are counted as one only once a connection reaches both. The count is set from the connections at the start of every pass, so a pass is never given a wrong count; while it reads two, nothing is connected at that address, and nothing is fetched there.
 
 A relay is found by its name and its key together, in its status and in its tries: one name may be given twice, with two keys.
 
@@ -35,6 +37,8 @@ A relay is found by its name and its key together, in its status and in its trie
 - `crates/cordelia-network/src/bootstrap.rs`: `two_relays_that_resolve_to_one_address_are_both_kept`.
 - `crates/cordelia-node/src/p2p.rs`: `two_relays_at_one_address_are_each_listed_and_a_wrong_key_is_their_own`, `one_relay_under_two_names_is_one_relay`, `one_name_given_twice_with_two_keys_is_listed_by_its_key`, and `a_relay_whose_name_does_not_resolve_is_still_one_the_node_is_set_up_with` (a pass is given one relay under two names once).
 - `crates/cordelia-node/tests/devices_e2e.rs`: `two_relays_at_one_address_are_each_kept_and_the_wrong_key_is_its_own`. A device runs as a real process, set up with one relay of the test's own under two names, one with the wrong key. One is listed with the wrong key, and the other stays connected; the relay took one connection from the device.
+- `crates/cordelia-node/src/p2p.rs`: in `a_relay_whose_name_does_not_resolve_is_still_one_the_node_is_set_up_with`, two relays given keys of their own at one address, one reached: both are given to a pass, the second with no connection, and the device is not set up by key.
+- `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_relay_given_with_no_connection_keeps_what_the_device_says_and_forgets`. While a relay is given with no connection, the device forgets nothing of it and says no "sent"; reached again, it says so.
 - `crates/cordelia-node/tests/devices_e2e.rs`: `one_relay_under_two_names_is_counted_and_paced_once`. A device is set up with one relay of the test's own, under one name with its key and under another with none. The second is listed as the same relay; the device's own list of its relays holds the first alone, and it holds the latest change.
 
 ## 2. Churn on a personal node
@@ -78,13 +82,19 @@ Once a day on a connection, and when the connection is made, it also proves the 
 
 A relay remembers the channels proved on a connection for as long as the connection lives, up to 1,024 (`MAX_CHANNELS_PROVED_ON_A_CONNECTION`). The device keeps what the relay remembers.
 
-After a statement every channel of the device's own is new. The old ones still hold their places at the relay. So where a channel the device proves finds no place on a connection, and channels it no longer proves hold places there, the device has the node make the connection again. The messages channel is not counted for this: it is passed over where it has no place, and never makes a pass short ([`2026-10-09-messages-between-your-own-agents.md`](2026-10-09-messages-between-your-own-agents.md) §2.1). The node closes it and dials the relay anew, as it does for a carry. A new connection starts with none remembered, and its places are the current channels'. The device asks this once for a connection, and asks nothing more on it: the pass at that relay ends there, and so does every pass until the connection is closed. The old connection's record goes from the device at its next pass.
+After a statement every channel of the device's own is new. The old ones still hold their places at the relay. So where a channel the device proves finds no place on a connection, and channels it no longer proves hold places there, the device has the node make the connection again. The node finds the connection by the relay's key, closes it and dials the relay anew, as it does for a carry. A new connection starts with none remembered, and its places are the current channels'. The old connection's record goes from the device at its next pass.
+
+Where a channel of the device's memory has no place, the device asks nothing more on that connection: the pass at that relay ends there, and is short, and so does every pass until the connection is closed. Where the messages channel alone has none, the pass goes on and passes the messages channel over, which makes no pass short ([`2026-10-09-messages-between-your-own-agents.md`](2026-10-09-messages-between-your-own-agents.md) §2.1).
+
+The device asks once while the node carries it out. Where the node answers that it did not (it found no such connection), the next whole pass may ask again: at most one asking a pass.
 
 **Why.** A connection to a relay can live for weeks. A person with many names, or a connection that lives across several statements, would find channels of the new generation never proved there, and so never synced through that relay. The device cannot drop a channel from its own record while the relay still remembers it. It would then believe it has room the relay does not give, and the relay would answer each proof beyond its bound as one that fails.
 
 **What does not change.** Where every place is held by a channel the device still proves, nothing is asked: a new connection would have no more room. A carry still keeps places back for the device's own channels, and asks for its own new connection where it has none.
 
-**The test that holds it.** `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_connection_whose_places_are_held_by_a_left_generation_is_made_again`. The device proves its five channels on a connection, and a removal makes all five new. Where a relay remembers eight proofs for a connection, the device asks once for the connection to be made again, and proves nothing more on it; on the new connection it proves every channel of the new generation. Where a relay remembers sixteen, the new five are proved on the same connection, and nothing is asked.
+**The test that holds it.** `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_connection_whose_places_are_held_by_a_left_generation_is_made_again`. The device proves its five channels on a connection, and a removal makes all five new. Where a relay remembers eight proofs for a connection, the device asks for the connection to be made again, by the relay's key, and proves nothing more on it. Refused, the next pass asks again; carried out, no pass asks again. On the new connection it proves every channel of the new generation. Where a relay remembers sixteen, the new five are proved on the same connection, and nothing is asked.
+
+Also: `a_place_taken_by_a_channel_held_no_more_leaves_the_messages_channel_none` (the messages channel alone asks, and the pass is not short), and in `crates/cordelia-node/src/p2p.rs`, `a_connection_to_make_again_is_found_by_its_key`.
 
 ## 5. A node's role
 
@@ -96,12 +106,16 @@ A configuration whose `network.role` is not `personal`, `relay` or `bootnode` is
 
 **The tests that hold it.** `crates/cordelia-core/src/config.rs`: `test_a_role_that_this_version_does_not_know_is_refused` (a typing slip, a role in other case, `keeper` and an empty role are refused, each known role loads), and `test_the_configurations_in_this_repository_load`.
 
-## 6. Hot churn and trusted peers
+## 6. Churn, demotion and trusted peers
 
-Hot churn moves a hot peer to warm once an interval. It now picks only among the peers that are not trusted, as `network-protocol.md` §5.4 step 6 says: a trusted peer that a swarm node dials alone, and a swarm member, are exempt.
+A trusted peer is never demoted and never evicted by churn, as `network-protocol.md` §5.3.1 and §5.4 say. A trusted peer is one that a swarm node dials alone, or a swarm member. The governor tells one in a single place, and three steps go by it:
 
-**Why.** The governor picked from every hot peer, against the spec and its own comment. A swarm member is meant to be always hot.
+- hot churn picks a peer to move to warm only among those that are not trusted (§5.4 step 6);
+- warm churn closes no trusted peer (§5.3.1);
+- the demotion of excess hot peers demotes no trusted peer (§5.4 step 5).
 
-**What does not change.** Warm churn is as §2 says. A node with no trusted peer churns its hot peers as before.
+**Why.** The governor picked from every hot peer in hot churn, and from every warm peer in warm churn, against the spec. Its demotion spared swarm members alone. A swarm member is meant to be always hot.
 
-**The test that holds it.** `crates/cordelia-network/src/governor.rs`: `test_churn_hot_demotes_no_trusted_peer`. A trusted peer, a swarm member and a third peer are hot. Churn after churn demotes only the third.
+**What does not change.** A personal node's relays are kept through churn as §2 says. A node with no trusted peer churns and demotes as before. Hot churn still promotes no warm peer in the place of the one it demotes, though §5.4 step 6 says it should: that is not changed here.
+
+**The tests that hold it.** `crates/cordelia-network/src/governor.rs`: `test_churn_hot_demotes_no_trusted_peer` (a trusted peer, a swarm member and a third are hot; churn after churn demotes only the third), `test_churn_warm_closes_no_trusted_peer`, and `test_excess_hot_demotes_no_trusted_peer`.

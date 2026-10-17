@@ -342,8 +342,12 @@ pub enum DoorAsk {
     /// relay anew. A relay remembers the channels that were proved on a
     /// connection for that connection alone: a new one starts with none.
     /// Answered with whether there was a connection to close.
+    ///
+    /// With `peer`, the connection is the one to the node of that key,
+    /// whatever name it is listed under now (decision 2026-10-17 §4).
     Remake {
         relay: String,
+        peer: Option<[u8; 32]>,
         answer: tokio::sync::oneshot::Sender<bool>,
     },
 }

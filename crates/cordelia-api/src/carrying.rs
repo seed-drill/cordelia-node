@@ -179,6 +179,7 @@ async fn made_again(state: &AppState, relays: &[String], until: Instant) -> Vec<
         let (answer, answered) = tokio::sync::oneshot::channel();
         state.own_channels.ask_door(DoorAsk::Remake {
             relay: relay.clone(),
+            peer: None,
             answer,
         });
         let _ = tokio::time::timeout(Duration::from_secs(30), answered).await;
