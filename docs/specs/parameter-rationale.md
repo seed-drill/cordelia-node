@@ -1475,10 +1475,13 @@ the bytes that a key and its address may be handed in a minute. A relay
 sizes a page of a channel so that this much is left in both allowances, and
 only the entry that answers a show may use it: a device that pulls at its
 full rate, or shares its address with one that does, is still told of a
-removal. A whole page can still be handed beside it: `protocol.rs` asserts
-that the room is less than half of a minute's allowance and that a full
-page is within the allowance, and the two together are 1,086,464 bytes of
-the 2,097,152.
+removal. A device keeps the same room back when it paces what it takes from
+a relay: it asks for no page that the relay would refuse for it, and a read
+that would have ended there waits for the minute instead (decision
+2026-10-17 §3.2). A whole page can still be handed beside it: `protocol.rs`
+asserts that the room is less than half of a minute's allowance and that a
+full page is within the allowance, and the two together are 1,086,464 bytes
+of the 2,097,152.
 
 **What is not defended:** whoever shows entries of its own from the same
 address can still use that room up (decision §2.5).
