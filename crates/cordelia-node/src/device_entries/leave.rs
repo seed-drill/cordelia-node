@@ -98,7 +98,7 @@
 //! outside this file there is no way to open a stream on one but
 //! [`Leave::show`], [`Leave::open`], [`Leave::pair`] and [`Leave::left`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -108,8 +108,8 @@ use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
-    ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES,
-    SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, OWN_ENTRY_REQUESTS_PER_MINUTE,
+    SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -126,6 +126,10 @@ use rusqlite::Connection;
 
 /// How long a leave lasts.
 const LEAVE: Duration = Duration::from_secs(SHOW_LEAVE_SECS);
+
+/// The window in which a relay counts breaches of its rates, and the
+/// device what a relay refused for now.
+const BAN_WINDOW: Duration = Duration::from_secs(BAN_WINDOW_SECS);
 
 /// How long a device that wakes waits for its relays.
 const WAKE_WAIT: Duration = Duration::from_secs(WAKE_WAIT_SECS);
@@ -444,6 +448,9 @@ struct Inner {
     /// What was asked of each relay in the last minute, on the streams of
     /// a channel, by the relay's name: on whatever connection.
     asked: HashMap<String, RateCounter>,
+    /// The requests that each relay refused for now, by its node key,
+    /// each by when ([`Leave::refused_for_now`]).
+    refused_for_now: HashMap<[u8; 32], VecDeque<Instant>>,
 }
 
 impl Inner {
@@ -624,7 +631,10 @@ impl Leave {
             })
         };
         let bytes = codec::encode_message(&request).map_or(0, |bytes| bytes.len());
-        let answer = match ask(&link.conn, Protocol::EntryShow, &request).await? {
+        let answer = match self
+            .ask_counted(link, Protocol::EntryShow, &request)
+            .await?
+        {
             WireMessage::EntryShown(shown) => shown.answer,
             _ => return Err("a show was not answered as one".into()),
         };
@@ -712,12 +722,14 @@ impl Leave {
             let _ = recv.stop(0u32.into());
             return Err(refused);
         }
-        // A request that the relay refused for now is said so; any other
-        // failure is said as it was. (The doors beside this one ask with
-        // `ask`, and say what failed as it was.)
+        // A request that the relay refused for now is said so, and
+        // counted for the relay; any other failure is said as it was.
         let answer = exchange(send, recv, protocol, request).await.map_err(|e| {
             match refused_for_now(&e) {
-                true => Refused::NotNow,
+                true => {
+                    self.refused_at(link);
+                    Refused::NotNow
+                }
                 false => Refused::NotAnswered(e.to_string()),
             }
         })?;
@@ -953,9 +965,51 @@ impl Leave {
         if !lock(&self.inner).may_ask(link.name()) {
             return Err(Refused::AskedEnough);
         }
-        ask(&link.conn, protocol, request)
+        self.ask_counted(link, protocol, request)
             .await
             .map_err(Refused::NotAnswered)
+    }
+
+    /// Ask `request` of the relay at `link` on a new stream of
+    /// `protocol`, and read its answer: every step has the codec's one
+    /// timeout. Where the relay refuses it for now, that is counted for
+    /// the relay ([`Self::refused_for_now`]). What failed is said as it
+    /// was.
+    async fn ask_counted(
+        &self,
+        link: &Link,
+        protocol: Protocol,
+        request: &WireMessage,
+    ) -> Result<WireMessage, String> {
+        let (send, recv) = open_stream(&link.conn).await?;
+        exchange(send, recv, protocol, request).await.map_err(|e| {
+            if refused_for_now(&e) {
+                self.refused_at(link);
+            }
+            e.to_string()
+        })
+    }
+
+    /// The relay at `link` refused a request for now: it is counted, with
+    /// its time, for the relay's node key.
+    fn refused_at(&self, link: &Link) {
+        let now = self.clock.now();
+        let mut inner = lock(&self.inner);
+        let refused = inner.refused_for_now.entry(link.relay().0).or_default();
+        refused.push_back(now);
+    }
+
+    /// How many requests the relay whose node key is `relay` refused for
+    /// now within BAN_WINDOW_SECS, on any connection: a show, a proof, a
+    /// pull or a push, of a pass, of a read of a channel of the device's
+    /// own, through the door for a carry, or for a typed key (decision
+    /// 2026-10-17 §4.2). A relay refuses so a breach of its rates, and
+    /// cuts off an address at BAN_THRESHOLD breaches within that window.
+    /// A refusal counts until the window has gone by since it was given,
+    /// as the relay counts it; a relay with none left is forgotten.
+    pub fn refused_for_now(&self, relay: &[u8; 32]) -> usize {
+        let now = self.clock.now();
+        refusals_within(&mut lock(&self.inner).refused_for_now, relay, now)
     }
 
     /// Whether a request that was built under the change entry named
@@ -987,19 +1041,6 @@ fn gives_leave(answer: &ShowAnswer) -> bool {
             | ShowAnswer::Taken
             | ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit)
     )
-}
-
-/// Ask `conn` one thing on a new stream of `protocol`, and read its
-/// answer. Every step has the codec's one timeout.
-async fn ask(
-    conn: &quinn::Connection,
-    protocol: Protocol,
-    request: &WireMessage,
-) -> Result<WireMessage, String> {
-    let (send, recv) = open_stream(conn).await?;
-    exchange(send, recv, protocol, request)
-        .await
-        .map_err(|e| e.to_string())
 }
 
 /// Open a new stream on `conn`, within the codec's one timeout. The peer
@@ -1044,9 +1085,50 @@ fn refused_for_now(e: &codec::CodecError) -> bool {
         || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)
 }
 
+/// How many requests the relay whose node key is `relay` refused for
+/// now within BAN_WINDOW_SECS of `now`, of those kept in `refused`: each
+/// older is forgotten, and so is a relay that has none left. A refusal
+/// counts at the window's very end, as a relay counts a breach.
+fn refusals_within(
+    refused: &mut HashMap<[u8; 32], VecDeque<Instant>>,
+    relay: &[u8; 32],
+    now: Instant,
+) -> usize {
+    let Some(at) = refused.get_mut(relay) else {
+        return 0;
+    };
+    at.retain(|at| now.saturating_duration_since(*at) <= BAN_WINDOW);
+    let within = at.len();
+    if within == 0 {
+        refused.remove(relay);
+    }
+    within
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal for now counts for its relay within BAN_WINDOW_SECS of
+    /// when it was given, and no longer: one 600 seconds old counts, as
+    /// a relay counts a breach that old, and one 601 seconds old does not;
+    /// a relay with none left is forgotten. Another relay's are its own.
+    #[test]
+    fn a_refusal_for_now_counts_for_its_relay_within_the_window_and_no_longer() {
+        assert_eq!(BAN_WINDOW, Duration::from_secs(600));
+        let (one, other) = ([1; 32], [2; 32]);
+        let given = Instant::now();
+        let secs = Duration::from_secs;
+        let mut refused = HashMap::new();
+        refused.insert(one, VecDeque::from([given]));
+        refused.insert(other, VecDeque::from([given + secs(300)]));
+        assert_eq!(refusals_within(&mut refused, &one, given + secs(599)), 1);
+        assert_eq!(refusals_within(&mut refused, &one, given + secs(600)), 1);
+        assert_eq!(refusals_within(&mut refused, &one, given + secs(601)), 0);
+        assert!(!refused.contains_key(&one));
+        assert_eq!(refusals_within(&mut refused, &other, given + secs(601)), 1);
+        assert_eq!(refusals_within(&mut refused, &[3; 32], given), 0);
+    }
 
     /// A request is refused for now where its answer was reset, or its
     /// request stopped, with ERR_RATE_LIMIT, and by nothing else: not by

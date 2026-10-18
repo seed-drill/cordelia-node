@@ -24,12 +24,15 @@
 //! BAN_WINDOW_SECS** ([`DeviceEntries::asks_again_after_a_refusal`]): a
 //! relay refuses a breach of its rates with the same reset, and cuts off
 //! an address at BAN_THRESHOLD breaches in that window. The count is the
-//! relay's, kept by the device across rounds and reads, and not reset by
-//! a page. It cannot count what the pass is refused, which asks again at
-//! its next pass, nor what other devices behind one address are refused.
-//! **A relay at that count is not asked at all,** in any round of any
-//! read, until a refusal has left the window
-//! ([`DeviceEntries::asks_after_refusals`]).
+//! relay's, kept where each request is answered ([`Leave`]): every
+//! request that the relay refused so, a show, a proof, a pull or a push,
+//! of a pass or of a read, across rounds and reads and connections, and
+//! not reset by a page. It cannot count what other devices behind one
+//! address are refused, nor what was refused before the node started.
+//! **A relay at that count is not asked at all,** not even for a proof,
+//! in any round of any read, until a refusal has left the window
+//! ([`DeviceEntries::asks_after_refusals`]). A pass is not held back by
+//! it.
 //!
 //! **What that costs a relay that is honest:** one near what it may hand
 //! a connection in a minute refuses pulls for room, which are no breach.

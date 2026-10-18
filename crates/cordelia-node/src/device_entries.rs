@@ -122,7 +122,7 @@ use cordelia_api::state::{
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
-    BAN_THRESHOLD, BAN_WINDOW_SECS, CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS,
+    BAN_THRESHOLD, CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS,
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
@@ -142,10 +142,6 @@ use rusqlite::Connection;
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
 };
-
-/// The window in which a relay counts breaches of its rates, and the
-/// device counts what a relay refused for now.
-const BAN_WINDOW: Duration = Duration::from_secs(BAN_WINDOW_SECS);
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -328,10 +324,6 @@ struct Kept {
     /// When the device last swept its old deletes, by the time of day in
     /// seconds: none since the node started.
     swept_at: Option<i64>,
-    /// The requests that each relay refused for now, by its node key,
-    /// each by when: those within BAN_WINDOW_SECS
-    /// ([`DeviceEntries::asks_again_after_a_refusal`]).
-    refused_for_now: HashMap<[u8; 32], std::collections::VecDeque<Instant>>,
 }
 
 /// A device's side of its relays, for the channels of its own (see the
@@ -2166,37 +2158,24 @@ impl DeviceEntries {
 
     /// Whether a read asks the relay at `link` at all, in a round: only
     /// while the relay has refused fewer than BAN_THRESHOLD - 1 requests
-    /// for now within BAN_WINDOW_SECS ([`Self::asks_again_after_a_refusal`]).
-    /// A relay at that count is not asked, by a read of any channel, until
-    /// a refusal has left the window: the device knows that one more
-    /// refusal may be the breach that has the relay cut off its address.
-    pub fn asks_after_refusals(&self, link: &Link) -> bool {
-        let now = self.clock.now();
-        let mut kept = lock(&self.kept);
-        refusals_within(&mut kept.refused_for_now, &link.relay().0, now)
-            < (BAN_THRESHOLD - 1) as usize
-    }
-
-    /// The relay at `link` refused a request for now: it reset the stream
-    /// with ERR_RATE_LIMIT ([`Refused::NotNow`]). The refusal is kept,
-    /// with its time, and the answer is whether a read asks the relay
-    /// again: only while the relay has refused fewer than BAN_THRESHOLD -
-    /// 1 requests so within BAN_WINDOW_SECS, this one with them.
+    /// for now within BAN_WINDOW_SECS ([`Leave::refused_for_now`]). A
+    /// relay at that count is not asked, by a read of any channel, until a
+    /// refusal has left the window: the device knows that one more refusal
+    /// may be the breach that has the relay cut off its address.
     ///
-    /// **Why:** a relay refuses with that reset a pull it has no room for
-    /// now, which is no breach, and also a breach of its rates, and cuts
-    /// off an address at BAN_THRESHOLD breaches within that window. The
-    /// device cannot tell the two apart, so it asks again only short of
-    /// that count, and asks nothing more while the relay is at it
-    /// ([`Self::asks_after_refusals`]). The count is the relay's, kept by
-    /// its node key: across rounds and across reads, of any channel, on
-    /// any connection. A page does not reset it; each refusal leaves it
-    /// once the window has gone by.
+    /// **Why:** a relay refuses with ERR_RATE_LIMIT a pull it has no room
+    /// for now, which is no breach, and also a breach of its rates, and
+    /// cuts off an address at BAN_THRESHOLD breaches within that window.
+    /// The device cannot tell the two apart. Every request that a relay
+    /// refuses so is counted for it, by its node key, where it was given
+    /// ([`Leave`]): a show, a proof, a pull or a push, of a pass or of a
+    /// read, on any connection. A page does not reset the count; each
+    /// refusal leaves it once the window has gone by.
     ///
-    /// **What it cannot count:** a pass that is refused does not ask
-    /// again, and is not counted here; the relay counts it, and so it
-    /// counts what other devices behind the same address do. Nor does the
-    /// count outlive the node.
+    /// **What it cannot count:** what other devices behind the same
+    /// address are refused, which the relay counts against the address;
+    /// and anything from before the node started. A pass is not held back
+    /// by the count: it asks at its next pass.
     ///
     /// **What it costs a relay that is honest:** a relay near what it may
     /// hand a connection in a minute refuses pulls for room, which are no
@@ -2205,21 +2184,21 @@ impl DeviceEntries {
     /// again within its minute; after two, it is not asked at all. A read
     /// there then ends in part where it could have read on (decision
     /// 2026-10-17 §11).
+    pub fn asks_after_refusals(&self, link: &Link) -> bool {
+        self.leave.refused_for_now(&link.relay().0) < (BAN_THRESHOLD - 1) as usize
+    }
+
+    /// The relay at `link` refused a request for now ([`Refused::NotNow`]),
+    /// which was counted for it where it was given: whether a read asks
+    /// the relay again ([`Self::asks_after_refusals`]).
     pub fn asks_again_after_a_refusal(&self, link: &Link) -> bool {
-        let (now, relay) = (self.clock.now(), link.relay().0);
-        let mut kept = lock(&self.kept);
-        kept.refused_for_now
-            .entry(relay)
-            .or_default()
-            .push_back(now);
-        refusals_within(&mut kept.refused_for_now, &relay, now) < (BAN_THRESHOLD - 1) as usize
+        self.asks_after_refusals(link)
     }
 
     /// How many requests the relay whose node key is `relay` refused for
     /// now within BAN_WINDOW_SECS, as the device counts them.
     pub fn refused_for_now(&self, relay: &[u8; 32]) -> usize {
-        let now = self.clock.now();
-        refusals_within(&mut lock(&self.kept).refused_for_now, relay, now)
+        self.leave.refused_for_now(relay)
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
@@ -2389,25 +2368,6 @@ fn got_somewhere(asked: (Mark, u64), told: (Mark, u64), each: &[Taken], read_aga
         });
     }
     told.0 != asked.0 || told.1 > asked.1
-}
-
-/// How many requests the relay whose node key is `relay` refused for
-/// now within BAN_WINDOW_SECS of `now`, of those kept in `refused`: each
-/// older is forgotten, and so is a relay that has none left.
-fn refusals_within(
-    refused: &mut HashMap<[u8; 32], std::collections::VecDeque<Instant>>,
-    relay: &[u8; 32],
-    now: Instant,
-) -> usize {
-    let Some(at) = refused.get_mut(relay) else {
-        return 0;
-    };
-    at.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);
-    let within = at.len();
-    if within == 0 {
-        refused.remove(relay);
-    }
-    within
 }
 
 /// What the bytes of an entry that a relay handed are counted at, as the
@@ -2586,37 +2546,6 @@ mod tests {
     /// the channel is the device's own and the relay is one it is set up
     /// with: and, where the relays it is set up with are not all known,
     /// whatever the relay.
-    /// A refusal for now counts for its relay within BAN_WINDOW_SECS of
-    /// when it was given, and no longer: one 599 seconds old counts, one
-    /// 601 seconds old does not, and a relay with none left is forgotten.
-    /// Another relay's are its own.
-    #[test]
-    fn a_refusal_for_now_counts_for_its_relay_within_the_window_and_no_longer() {
-        assert_eq!(BAN_WINDOW, Duration::from_secs(600));
-        let (one, other) = ([1; 32], [2; 32]);
-        let given = Instant::now();
-        let mut refused = HashMap::new();
-        refused.insert(one, std::collections::VecDeque::from([given]));
-        refused.insert(
-            other,
-            std::collections::VecDeque::from([given + Duration::from_secs(300)]),
-        );
-        assert_eq!(
-            refusals_within(&mut refused, &one, given + Duration::from_secs(599)),
-            1
-        );
-        assert_eq!(
-            refusals_within(&mut refused, &one, given + Duration::from_secs(601)),
-            0
-        );
-        assert!(!refused.contains_key(&one));
-        assert_eq!(
-            refusals_within(&mut refused, &other, given + Duration::from_secs(601)),
-            1
-        );
-        assert_eq!(refusals_within(&mut refused, &[3; 32], given), 0);
-    }
-
     #[test]
     fn what_is_kept_of_a_part_is_of_use_while_its_channel_and_its_relay_are_the_devices() {
         let (relay, other_relay) = ([1u8; 32], [2u8; 32]);

@@ -661,8 +661,9 @@ enum Say {
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
 /// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
 /// has it answer with that answer of a show, which is no answer to a
-/// proof. For a pull, `Some(Say::NotNow)` has it refuse the pull for now,
-/// and `Some(Say::Reset)` has it reset the stream.
+/// proof, and `Some(Say::NotNow)` has it refuse the proof for now. For a
+/// pull, `Some(Say::NotNow)` has it refuse the pull for now, and
+/// `Some(Say::Reset)` has it reset the stream.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -790,6 +791,10 @@ impl StandIn {
                     }
                 }
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
+                WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::NotNow)) => {
+                    not_now = true;
+                    Ok(None)
+                }
                 // An answer of a show, which is no answer to a proof.
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Answer(_))) => {
                     let Some(Say::Answer(answer)) = hooked else {
@@ -5673,7 +5678,7 @@ async fn a_read_with_places_of_its_own_waits_out_a_pull_refused_for_now() {
     for reset in [Say::NotNow, Say::Reset] {
         // Each from no refusal for now that the relay is counted to have
         // given.
-        device.clock.run_ahead(BAN_WINDOW);
+        device.clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
         let (once, how) = (Arc::new(AtomicBool::new(true)), reset.clone());
         relay.hook(move |request| {
             let second = matches!(request, WireMessage::EntryPull(pull) if pull.channel == notes && pull.after == 1);
@@ -5794,7 +5799,7 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
     // Refused for now as a minute has gone by since the round began:
     // asked once, and not reached. (The refusals before have left the
     // window by then.)
-    device.clock.run_ahead(BAN_WINDOW);
+    device.clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
     assert_eq!(device.engine.refused_for_now(&relay.key), 0);
     let (once, clock) = (Arc::new(AtomicBool::new(true)), device.clock.clone());
     relay.hook(move |request| {
@@ -5811,6 +5816,59 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
     assert_eq!(at.read, ReadAt::NotReached);
     assert_eq!(device.engine.refused_for_now(&relay.key), 1);
     assert_eq!(pulled_from(&relay.requests(), &notes).len(), 1);
+}
+
+/// A proof, or a show, that a relay refuses for now counts for the relay
+/// as a pull's refusal does: a proof refused on two connections leaves the
+/// relay at its count, and the third read there sends no proof at all. A
+/// show that it refuses for now counts the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_or_a_show_that_a_relay_refuses_for_now_counts_for_it() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.holds("lab");
+    let (notes, lab) = (device.channel("notes"), device.channel("lab"));
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    let proofs_of = |relay: &StandIn, channel: [u8; 32]| {
+        let of = |one: &WireMessage| matches!(one, WireMessage::ChannelProve(prove) if prove.channel == channel);
+        relay.requests().iter().filter(|one| of(one)).count()
+    };
+    let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
+    let lasts = Duration::from_secs(10);
+
+    // Proofs refused for now, each read on a new connection.
+    relay.hook(move |request| {
+        let of_lab = matches!(request, WireMessage::ChannelProve(prove) if prove.channel == lab);
+        of_lab.then_some(Say::NotNow)
+    });
+    relay.requests();
+    for (n, asked) in [(1, 1), (2, 1), (2, 0)] {
+        device.connects_to("relay", relay.port, relay.key).await;
+        let read = begins_a_read(&device, lab, lasts).await.unwrap();
+        let at = read_at(&device, &read, "relay");
+        assert_eq!((at.read, at.place), (ReadAt::NotReached, ([0; 8], 0)));
+        assert_eq!(refused(&device), n);
+        assert_eq!(proofs_of(&relay, lab), asked, "the read at {n}");
+    }
+
+    // A show refused for now: the read's leave has run out, and its show
+    // is refused.
+    device.clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
+    assert_eq!(refused(&device), 0);
+    relay.hook(move |request| {
+        let shows = matches!(
+            request,
+            WireMessage::EntryShow(_) | WireMessage::EntryShowShort(_)
+        );
+        shows.then_some(Say::NotNow)
+    });
+    let read = begins_a_read(&device, notes, lasts).await.unwrap();
+    assert_eq!(read_at(&device, &read, "relay").read, ReadAt::NotReached);
+    assert_eq!(refused(&device), 1);
 }
 
 /// The window in which a relay counts breaches, and a device what a
@@ -5900,6 +5958,8 @@ async fn what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window()
     for ahead in [Duration::ZERO, BAN_WINDOW - Duration::from_secs(5)] {
         device.clock.run_ahead(ahead);
         assert_eq!(refused(&device), 2);
+        // On a new connection: not even a proof is sent.
+        device.connects_to("relay", relay.port, relay.key).await;
         relay.requests();
         let gated = begins_a_read(&device, lab, lasts).await.unwrap();
         let at = read_at(&device, &gated, "relay");
@@ -5928,7 +5988,7 @@ async fn what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window()
 
     // A second read at the relay, of another channel, starts from the
     // count that the first left: one refusal there, and one here.
-    device.clock.run_ahead(BAN_WINDOW);
+    device.clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
     *refuse.lock().unwrap() = vec![(notes, 0)];
     let first = begins_a_read(&device, notes, lasts).await.unwrap();
     let at = read_at(&device, &first, "relay");
@@ -5943,7 +6003,7 @@ async fn what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window()
     assert_eq!(pulled_from(&relay.requests(), &lab).len(), 1);
 
     // Once the window has gone by, a refusal is waited out again.
-    device.clock.run_ahead(BAN_WINDOW);
+    device.clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
     assert_eq!(refused(&device), 0);
     *refuse.lock().unwrap() = vec![(lab, 0)];
     let third = begins_a_read(&device, lab, lasts).await.unwrap();
