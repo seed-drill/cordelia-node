@@ -1722,6 +1722,16 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
 
+/// How long a read of a channel of the device's own stands, from the end
+/// of its last round, on the node's monotonic clock (decision 2026-10-17
+/// §4.2, §5.2): the read that `cordelia sync unmap` shows, for the
+/// `discard` that follows it. A read older than this is kept no more.
+/// Derived: as long as a word of the phrase for a carry stands. It is a
+/// `u64`: it bounds a `Duration`, where CARRY_WORD_SECS is compared with a
+/// time in seconds of the wall clock.
+pub const LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64;
+const _: () = assert!(CARRY_WORD_SECS > 0);
+
 /// How often a command that was typed the phrase makes its proofs again
 /// for one channel, at most (decision 2026-10-04 §16): a proof holds on
 /// the connection whose session it was made over, and where the node
@@ -2733,6 +2743,7 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(LET_GO_READ_STANDS_SECS, 600);
         assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
         assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
         assert!(LABELS.contains(&LABEL_CARRY_BATCH));

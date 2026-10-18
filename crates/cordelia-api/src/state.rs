@@ -208,6 +208,11 @@ impl HeldUp {
 /// read at each relay. The node takes each asking up and answers it.
 /// And which channels a carry is being made into, before a folder's
 /// first cycle there ([`OwnChannels::carrying`]).
+///
+/// And it carries what a command's work asks for a read of a channel of
+/// the device's own with places of its own ([`OwnChannels::ask_own`],
+/// decision 2026-10-17 §4.2), and keeps each such read under its ID
+/// between rounds ([`OwnChannels::reads`]).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -242,6 +247,12 @@ pub struct OwnChannels {
     /// yet.
     door: Mutex<std::collections::VecDeque<DoorAsk>>,
     door_asked: tokio::sync::Notify,
+    /// What was asked for a read of a channel of the device's own, and is
+    /// not taken up yet.
+    own: Mutex<std::collections::VecDeque<OwnAsk>>,
+    own_asked: tokio::sync::Notify,
+    /// The reads of channels of the device's own, each under its ID.
+    reads: crate::own_read::OwnReads,
     /// The channels that a carry is being made into, each with when that
     /// began.
     carrying: Mutex<std::collections::HashMap<[u8; 32], Instant>>,
@@ -377,6 +388,33 @@ pub enum DoorAsk {
     },
 }
 
+/// What a command's work asks of the node for a read of a channel of the
+/// device's own with places of its own (decision 2026-10-17 §4.2): a pull
+/// of the channel, under leave, as a pass makes it, that keeps its places
+/// in memory under the read's ID ([`crate::own_read`]). What it read is
+/// in [`OwnChannels::reads`].
+pub enum OwnAsk {
+    /// Begin a read of the channel whose ID is `channel`, one that a pass
+    /// pulls, at every relay that the device is set up with, and read its
+    /// first round, until `until`. Answered with the read's ID: `None`
+    /// where the channel is not one that a pass pulls now, or the node is
+    /// held up, and nothing is read.
+    Begin {
+        channel: [u8; 32],
+        until: Instant,
+        answer: tokio::sync::oneshot::Sender<Option<crate::own_read::ReadId>>,
+    },
+    /// Read one round more of the read named `read`, at each relay where
+    /// it is read in part, from its place there, until `until`. Answered
+    /// with whether the node keeps that read, with no round of it
+    /// running: one that it does not is read nowhere.
+    ReadOn {
+        read: crate::own_read::ReadId,
+        until: Instant,
+        answer: tokio::sync::oneshot::Sender<bool>,
+    },
+}
+
 /// How long a channel that a carry is being made into holds back a
 /// folder's first cycle there, at most: a carry that never says it has
 /// ended holds nothing up for longer.
@@ -481,6 +519,38 @@ impl OwnChannels {
             }
             self.door_asked.notified().await;
         }
+    }
+
+    /// A command's work asks for a read of a channel of the device's own:
+    /// the node takes it up, and answers on the asking's own channel.
+    pub fn ask_own(&self, ask: OwnAsk) {
+        self.own
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ask);
+        self.own_asked.notify_one();
+    }
+
+    /// Wait for a read of a channel of the device's own to be asked for,
+    /// and take it up: each asking is taken up once.
+    pub async fn wait_own(&self) -> OwnAsk {
+        loop {
+            let asked = self
+                .own
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            if let Some(asked) = asked {
+                return asked;
+            }
+            self.own_asked.notified().await;
+        }
+    }
+
+    /// The reads of channels of the device's own that the node keeps,
+    /// each under its ID, with its places and what each relay handed.
+    pub fn reads(&self) -> &crate::own_read::OwnReads {
+        &self.reads
     }
 
     /// A carry is being made into the channel whose ID is `channel`, from

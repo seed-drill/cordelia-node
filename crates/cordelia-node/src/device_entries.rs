@@ -85,6 +85,16 @@
 //! relay made again and reads on: a new connection starts with none
 //! remembered.
 //!
+//! ## A read of a channel of its own, with places of its own
+//!
+//! Before a carried name is let go, the device reads the name's channel
+//! at each relay (decision 2026-10-17 §4.2): [`DeviceEntries::own`] takes
+//! such an asking up. It is a pull under leave, as a pass makes it,
+//! within the pass's budget at each relay, each page through the one
+//! door; but its places are its own, kept in memory under the read's ID,
+//! and it marks nothing as sent. It reads round by round, as it is
+//! asked, outside the database's lock.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -95,6 +105,7 @@
 //! at a relay is left before it is sent there again.
 
 pub mod leave;
+mod own_read;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -102,7 +113,7 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
 use cordelia_api::at_relays::{
-    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
+    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands, Which,
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
@@ -116,7 +127,7 @@ use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
+    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -196,6 +207,10 @@ pub struct Counts {
 struct At<'a> {
     link: &'a Link,
     under: [u8; 32],
+    /// Whether each request is held to the relay's count of refusals for
+    /// now ([`DeviceEntries::asks_after_refusals`]): a read's are, and a
+    /// pass's are not.
+    gated: bool,
 }
 
 /// What became of one step of a relay's pass.
@@ -219,6 +234,12 @@ struct OfLink {
     /// that was left, each from the moment its proof is sent. It is what
     /// the relay remembers for the connection, or more.
     proved: HashMap<[u8; 32], Instant>,
+    /// Of those, the channels whose proof was answered no, by a relay
+    /// that does not hold the channel, where whoever proved it did not act
+    /// on that: a read with places of its own (decision 2026-10-17 §4.2).
+    /// A pass proves such a channel again, and acts on the answer: the
+    /// relay is sent the channel from the start.
+    no_unheeded: HashSet<[u8; 32]>,
     /// When the channels of the names that the personal channel lists
     /// were last proved on it, all of them.
     listed_proved: Option<Instant>,
@@ -327,6 +348,9 @@ pub struct DeviceEntries {
     /// One asking at a time at each relay for what the device of a typed
     /// key hands over, by the relay's name.
     asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One round at a time of a read of a channel of the device's own
+    /// (decision 2026-10-17 §4.2).
+    own_rounds: tokio::sync::Mutex<()>,
 }
 
 impl DeviceEntries {
@@ -348,6 +372,7 @@ impl DeviceEntries {
             waking: tokio::sync::Mutex::new(()),
             turns: Mutex::default(),
             asking: Mutex::default(),
+            own_rounds: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -801,7 +826,7 @@ impl DeviceEntries {
             for link in links {
                 if whole || !self.leave.has_heard(link.name()) {
                     let (engine, link) = (Arc::clone(self), (*link).clone());
-                    shows.spawn(async move { (link.id(), engine.show_at(&link).await) });
+                    shows.spawn(async move { (link.id(), engine.show_at(&link, false).await) });
                 }
             }
             while let Some(done) = shows.join_next().await {
@@ -888,7 +913,7 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         let gave_leave = match shown {
             Some(gave_leave) => Some(gave_leave),
-            None if whole => Some(self.show_at(link).await),
+            None if whole => Some(self.show_at(link, false).await),
             None => None,
         };
         // (A device that has stopped, or is in a fork, has no channel
@@ -1215,9 +1240,9 @@ impl DeviceEntries {
     /// whole show whose stream is reset, which is how a relay says "not
     /// now" to an asker that is over its bytes for the minute, is made
     /// again at the next pass.
-    async fn show_at(&self, link: &Link) -> bool {
+    async fn show_at(&self, link: &Link, gated: bool) -> bool {
         let mut round = Round::default();
-        let gave_leave = self.show_round(link, &mut round).await;
+        let gave_leave = self.show_round(link, &mut round, gated).await;
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -1249,7 +1274,7 @@ impl DeviceEntries {
 
     /// [`Self::show_at`], for one round of shows, with what became of
     /// them said in `round`.
-    async fn show_round(&self, link: &Link, round: &mut Round) -> bool {
+    async fn show_round(&self, link: &Link, round: &mut Round, gated: bool) -> bool {
         // The entry is shown whole where it was not yet on this
         // connection, where the relay asks for it, and where the relay
         // tells of another that the device does not keep.
@@ -1279,6 +1304,12 @@ impl DeviceEntries {
                 .get(&link.id())
                 .and_then(|of| of.shown_whole);
             let short = !whole && shown_whole == Some(entry.id());
+            // A show of a read is held to the relay's count of refusals
+            // for now, as each of its requests is: a short show refused
+            // for now is followed by a whole one only below the count.
+            if gated && !self.asks_after_refusals(link) {
+                return false;
+            }
             let answered = match self.leave.show(link, entry, short).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
@@ -1559,7 +1590,11 @@ impl DeviceEntries {
                 return false;
             }
         };
-        let at = At { link, under };
+        let at = At {
+            link,
+            under,
+            gated: false,
+        };
         let whole = kind == Pass::Whole;
         let mut read_all = true;
         for channel in &own {
@@ -1675,6 +1710,11 @@ impl DeviceEntries {
     ///
     /// `opened` is called under the database's lock once a stream is
     /// about to be opened, and not for one that is refused.
+    ///
+    /// **A read's request is held to the relay's count of refusals for
+    /// now** ([`At::gated`]): each show, and the request as it is sent and
+    /// as it is sent again after a show, is sent only below that count
+    /// ([`Leave::at_its_count`]); at it, nothing is ([`Refused::RefusedEnough`]).
     async fn through<R, T>(
         &self,
         at: &At<'_>,
@@ -1687,12 +1727,13 @@ impl DeviceEntries {
         let asked = Asked {
             under: &at.under,
             request,
+            gated: at.gated,
         };
         let link = at.link;
         let open = || self.leave.open(db, link, asked, &opened, &read, &take);
         match open().await {
             Err(Refused::NoLeave(NoLeave::NotGiven)) => {
-                self.show_at(link).await;
+                self.show_at(link, at.gated).await;
                 open().await
             }
             done => done,
@@ -1706,17 +1747,20 @@ impl DeviceEntries {
     ///
     /// What is remembered is that the proof was made and answered, and
     /// not what was answered: a relay remembers a proof that held for a
-    /// channel it does not hold yet.
+    /// channel it does not hold yet. **But a "no" that was not acted on is
+    /// remembered too:** where the device holds the channel, it proves it
+    /// again, so that the relay is sent it from the start.
     async fn prove(&self, at: &At<'_>, channel: &Own, held: bool) -> Step {
         let link = at.link;
         let now = self.clock.now();
         {
             let kept = lock(&self.kept);
-            let proved = kept.links.get(&link.id()).map(|of| &of.proved);
-            let lately = proved
-                .and_then(|proved| proved.get(&channel.id))
+            let of = kept.links.get(&link.id());
+            let lately = of
+                .and_then(|of| of.proved.get(&channel.id))
                 .is_some_and(|at| now.saturating_duration_since(*at) < PROOF_AGAIN);
-            if lately {
+            let unheeded = of.is_some_and(|of| of.no_unheeded.contains(&channel.id));
+            if lately && !(held && unheeded) {
                 return Step::Done(true);
             }
         }
@@ -1753,10 +1797,14 @@ impl DeviceEntries {
             )
             .await;
         match answered {
-            Ok(Some(_)) => {
+            Ok(Some(proved)) => {
                 let mut kept = lock(&self.kept);
                 let of = kept.links.entry(link.id()).or_default();
                 of.proved.insert(channel.id, now);
+                match !proved && !held {
+                    true => of.no_unheeded.insert(channel.id),
+                    false => of.no_unheeded.remove(&channel.id),
+                };
                 kept.relays
                     .entry(link.name().to_string())
                     .or_default()
@@ -1882,16 +1930,31 @@ impl DeviceEntries {
                             mark: page_mark,
                             next,
                         };
-                        match at_relays::take_page(db, &self.state.identity, &page, now) {
+                        // Where every place was forgotten while the page
+                        // was asked for, the place it was asked from is
+                        // not the one kept: its entries are taken, and it
+                        // moves no place, so that the channel is read
+                        // again from the start (§16).
+                        let asked_from = at_relays::place(db, &relay, &channel.id);
+                        let places = match asked_from {
+                            Ok(kept) if kept == (mark, after) => Places::Kept,
+                            _ => Places::Own,
+                        };
+                        match at_relays::take_page(db, &self.state.identity, &page, places, now) {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
-                                got_somewhere: got_somewhere(
-                                    (mark, after),
-                                    (page_mark, next),
-                                    &each,
-                                    read_again,
-                                ),
+                                // A page asked from a place forgotten
+                                // since is no end of the channel: the pull
+                                // goes on, from the start.
+                                stale: places == Places::Own,
+                                got_somewhere: places == Places::Own
+                                    || got_somewhere(
+                                        (mark, after),
+                                        (page_mark, next),
+                                        &each,
+                                        read_again,
+                                    ),
                             }),
                             Ok(PageTaken::NotThePage) => None,
                             Err(e) => {
@@ -1903,7 +1966,7 @@ impl DeviceEntries {
                 )
                 .await;
             match taken {
-                Ok(Some(page)) if page.entries == 0 => return Step::Done(true),
+                Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -2124,11 +2187,58 @@ impl DeviceEntries {
     /// Whether the device takes a page more from the relay at `link`
     /// now: what that relay handed it in the last minute leaves room for
     /// one entry of the largest size, within what a relay may hand a
-    /// connection in a minute.
+    /// connection in a minute, beside the room that a relay keeps for the
+    /// answer to a show (SHOW_ANSWER_ROOM_BYTES), which it hands no page
+    /// into.
     fn room_to_take(&self, link: &Link) -> bool {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
-        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES)
+        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES
+    }
+
+    /// Whether a read asks the relay at `link` at all, in a round: only
+    /// while the relay has refused fewer than BAN_THRESHOLD - 1 requests
+    /// for now within BAN_WINDOW_SECS ([`Leave::refused_for_now`]). A
+    /// relay at that count is not asked, by a read of any channel, until a
+    /// refusal has left the window: the device knows that one more refusal
+    /// may be the breach that has the relay cut off its address.
+    ///
+    /// **Why:** a relay refuses with ERR_RATE_LIMIT a pull it has no room
+    /// for now, which is no breach, and also a breach of its rates, and
+    /// cuts off an address at BAN_THRESHOLD breaches within that window.
+    /// The device cannot tell the two apart. Every request that a relay
+    /// refuses so is counted for it, by its node key, where it was given
+    /// ([`Leave`]): a show, a proof, a pull or a push, of a pass or of a
+    /// read, on any connection. A page does not reset the count; each
+    /// refusal leaves it once the window has gone by.
+    ///
+    /// **What it cannot count:** what other devices behind the same
+    /// address are refused, which the relay counts against the address;
+    /// and anything from before the node started. A pass is not held back
+    /// by the count: it asks at its next pass.
+    ///
+    /// **What it costs a relay that is honest:** a relay near what it may
+    /// hand a connection in a minute refuses pulls for room, which are no
+    /// breach. For BAN_WINDOW_SECS after one such refusal, the next leaves
+    /// the relay not reached in that round, where it would have had room
+    /// again within its minute; after two, it is not asked at all. A read
+    /// there then ends in part where it could have read on (decision
+    /// 2026-10-17 §11).
+    pub fn asks_after_refusals(&self, link: &Link) -> bool {
+        !self.leave.at_its_count(&link.relay().0)
+    }
+
+    /// The relay at `link` refused a request for now ([`Refused::NotNow`]),
+    /// which was counted for it where it was given: whether a read asks
+    /// the relay again ([`Self::asks_after_refusals`]).
+    pub fn asks_again_after_a_refusal(&self, link: &Link) -> bool {
+        self.asks_after_refusals(link)
+    }
+
+    /// How many requests the relay whose node key is `relay` refused for
+    /// now within BAN_WINDOW_SECS, as the device counts them.
+    pub fn refused_for_now(&self, relay: &[u8; 32]) -> usize {
+        self.leave.refused_for_now(relay)
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
@@ -2268,6 +2378,9 @@ struct PageSeen {
     read_again: bool,
     /// Whether the pull got somewhere by it ([`got_somewhere`]).
     got_somewhere: bool,
+    /// Whether it was asked from a place that is no longer the one kept:
+    /// every place was forgotten while it was asked for.
+    stale: bool,
 }
 
 /// Whether a pull got somewhere by a page: it was `asked` from a mark and
