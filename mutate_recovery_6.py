@@ -51,6 +51,8 @@ E2E_LAST_PAGE = e2e("a_refusal_for_now_is_waited_out_for_a_minute_from_the_last_
 E2E_DEADLINE = e2e("a_round_ends_at_its_time_while_a_relay_is_waited_for_or_asked")
 E2E_GONE = e2e("a_round_whose_asker_has_gone_stops")
 E2E_PROVES_ONCE = e2e("a_pass_proves_again_only_after_a_no_given_to_a_read_and_once")
+E2E_PROOF_TIME = e2e("a_round_ends_at_its_time_while_its_proof_is_not_answered")
+UNIT_NOT_NOW = (("cordelia-node", ["--lib"]), "device_entries::leave::tests::a_request_is_refused_for_now_only_by_the_rate_limits_code")
 E2E_LEFT_ROOM = e2e("a_read_of_a_left_channel_takes_no_page_from_the_room_kept_for_a_show")
 E2E_PROOF = e2e("a_relay_that_answered_a_reads_proof_with_no_is_sent_the_channel_again")
 E2E_ROUND_MOST = e2e("a_round_of_a_read_lasts_no_longer_than_a_carry_may_read")
@@ -240,29 +242,73 @@ MUTATIONS = [
      '''(true)''',
      [E2E_READS_ON]),
     ("NR13 a refusal for now ends the relay's read", NODE_READ,
-     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
-     '''                    if false && why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
+     '''                Err(Refused::NotNow) => {''',
+     '''                Err(Refused::NotARequest) => {''',
      [E2E_RESET]),
-    ("NR19 a refusal for now is waited out for ever", NODE_READ,
-     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
-     '''                    if why == NOT_NOW && self.clock.now() < paged + 100 * A_MINUTE =>''',
+    ("NR19 a refusal for now is waited out after the minute", NODE_READ,
+     '''                    let within = self.clock.now() < paged + A_MINUTE;''',
+     '''                    let within = self.clock.now() < paged + 100 * A_MINUTE;''',
      [E2E_EVERY]),
-    ("NR20 every failure on a connection is waited out", NODE_READ,
-     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
-     '''                    if !why.is_empty() && self.clock.now() < paged + A_MINUTE =>''',
-     [E2E_CLOSED, E2E_OVERSIZE, E2E_RESET]),
+    ("NR20 every failure on a request is a refusal for now", LEAVE,
+     '''            match refused_for_now(&e) {''',
+     '''            match !refused_for_now(&e) || refused_for_now(&e) {''',
+     [E2E_OVERSIZE, E2E_RESET]),
+    ("NR22 a wait for a refusal runs past the round's time", NODE_READ,
+     '''                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
+                    continue;
+                }
+                Err(_) => {''',
+     '''                    tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                    continue;
+                }
+                Err(_) => {''',
+     [E2E_DEADLINE]),
+    ("NR26 refusals for now are asked again without bound", NODE_READ,
+     '''                    if !within || at.refused_for_now >= BAN_THRESHOLD - 1 {''',
+     '''                    if !within {''',
+     [E2E_EVERY]),
+    ("NR27 refusals for now are asked again up to the relay's count", NODE_READ,
+     '''                    if !within || at.refused_for_now >= BAN_THRESHOLD - 1 {''',
+     '''                    if !within || at.refused_for_now >= BAN_THRESHOLD {''',
+     [E2E_EVERY]),
+    ("NR28 the proof runs past the round's time", NODE_READ,
+     '''tokio::time::timeout(left, self.prove(&asks, channel, false))''',
+     '''tokio::time::timeout(left + ROUND_MOST, self.prove(&asks, channel, false))''',
+     [E2E_PROOF_TIME]),
+    ("NR29 a wait for room runs past the round's time", NODE_READ,
+     '''            if !self.room_to_take(link) {
+                tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;''',
+     '''            if !self.room_to_take(link) {
+                tokio::time::sleep(LEFT_ROOM_WAIT).await;''',
+     [E2E_TAKES]),
+    ("NR30 a wait for asking runs past the round's time", NODE_READ,
+     '''                Err(Refused::AskedEnough) => {
+                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;''',
+     '''                Err(Refused::AskedEnough) => {
+                    tokio::time::sleep(LEFT_ROOM_WAIT).await;''',
+     [E2E_ASKS]),
+    ("NR31 a first round goes on after its asker has gone", NODE_READ,
+     '''                        _ = answer.closed() => return self.asker_gone(read),''',
+     '''                        _ = std::future::pending::<()>() => return self.asker_gone(read),''',
+     [E2E_GONE]),
+    ("LV1 a reset for now is not told from any other", LEAVE,
+     '''    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(at)) if *at == code)
+        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
+     '''    let _ = (inner, code);
+    false''',
+     [UNIT_NOT_NOW, E2E_RESET]),
+    ("LV2 a request stopped for now is not told", LEAVE,
+     '''        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
+     '''        || false''',
+     [UNIT_NOT_NOW]),
+    ("LV3 a reset with any code is a refusal for now", LEAVE,
+     '''    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(at)) if *at == code)''',
+     '''    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(_)))''',
+     [UNIT_NOT_NOW, E2E_RESET]),
     ("NR21 the minute is counted from the round's start", NODE_READ,
      '''                    paged = self.clock.now();''',
      '''                    let _ = &mut paged;''',
      [E2E_LAST_PAGE]),
-    ("NR22 a wait for a refusal runs past the round's time", NODE_READ,
-     ['''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
-                {
-                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;'''],
-     ['''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
-                {
-                    tokio::time::sleep(LEFT_ROOM_WAIT).await;'''],
-     [E2E_DEADLINE]),
     ("NR23 a request runs past the round's time", NODE_READ,
      '''            let Ok(taken) = tokio::time::timeout(left, taken).await else {''',
      '''            let Ok(taken) = tokio::time::timeout(left + ROUND_MOST, taken).await else {''',
@@ -275,12 +321,6 @@ MUTATIONS = [
      '''        self.state.own_channels.reads().forget(read);''',
      '''        let _ = read;''',
      [E2E_GONE]),
-    ("LV1 a reset for now is not told from any other", LEAVE,
-     '''    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(at)) if *at == code)
-        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
-     '''    let _ = (inner, code);
-    false''',
-     [E2E_RESET]),
     ("DE4 an unheeded no is never cleared", DEVICE,
      '''                    false => of.no_unheeded.remove(&channel.id),''',
      '''                    false => false,''',
