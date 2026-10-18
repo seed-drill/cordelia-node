@@ -2127,20 +2127,7 @@ pub async fn p2p_loop(
 
     let our_node_id = NodeId(state.identity.public_key());
 
-    // Governor -- with dial policy based on trusted_peers config (§8.2.2)
-    let gov_targets = cordelia_network::governor::GovernorTargets::from_config(&gov_config);
-    let gov_timeouts = cordelia_network::governor::GovernorTimeouts::from_config(&gov_config);
-    let dial_policy = if !trusted_peer_ids.is_empty() && node_role == "personal" {
-        // Swarm node: only dial trusted peers (lead node)
-        cordelia_network::governor::DialPolicy::TrustedOnly(trusted_peer_ids.clone())
-    } else if node_role == "personal" {
-        cordelia_network::governor::DialPolicy::RelaysOnly
-    } else {
-        cordelia_network::governor::DialPolicy::All
-    };
-    let mut governor =
-        cordelia_network::governor::Governor::with_dial_policy(gov_targets, vec![], dial_policy)
-            .with_timeouts(gov_timeouts);
+    let mut governor = governor_for(&node_role, &gov_config, &trusted_peer_ids);
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
@@ -2224,7 +2211,19 @@ pub async fn p2p_loop(
     }
     // How many relays the node is set up with is said here, from the list
     // that every pass is made of: the two cannot come to differ.
-    state.own_channels.set_up_with(relays_set_up.len());
+    // Each relay once: a name given the same key as one before it is that
+    // relay (decision 2026-10-17 §1). Each pass says it again, from the
+    // connections there are then.
+    {
+        let none: Vec<Option<NodeId>> = vec![None; relays_set_up.len()];
+        let addrs: Vec<Option<std::net::SocketAddr>> = vec![None; relays_set_up.len()];
+        let one = one_relay_each(&relays_set_up, &none, &addrs, &|_| None);
+        let counted = one
+            .iter()
+            .filter(|one| !matches!(one, OneRelay::SameAs(_)))
+            .count();
+        state.own_channels.set_up_with(counted);
+    }
     // A device's side of its relays, for the channels of its own
     // (decision 2026-10-04 §4.6): the show, the leave it gives, and the
     // passes that prove, pull and push. Only a personal node has one, and
@@ -2370,7 +2369,7 @@ pub async fn p2p_loop(
     // again, at a slowing pace (see `relay_backoff`).
     let mut relay_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut relay_tries: std::collections::HashMap<String, RelayTry> =
+    let mut relay_tries: std::collections::HashMap<TriedRelay, RelayTry> =
         std::collections::HashMap::new();
 
     // Peer-share has two independent concerns:
@@ -2484,36 +2483,40 @@ pub async fn p2p_loop(
 
                         if direction == Direction::Outbound {
                             in_flight.remove(&addr);
-                            // A configured relay must answer with its key.
+                            // A configured relay must answer with its key:
+                            // each one at this address is judged by the key
+                            // that answered (decision 2026-10-17 §1).
                             let dialled = relay_addrs
                                 .read()
-                                .ok()
-                                .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
-                            if let Some(relay) = dialled {
+                                .map(|relays| relays.clone())
+                                .unwrap_or_default();
+                            let (answers, refused) = answered_at(&dialled, addr, &outcome.node_id.0);
+                            if !answers.is_empty() || !refused.is_empty() {
                                 let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                                let tried = relay_tries.entry(relay.host.clone()).or_default();
-                                match relay.key {
-                                    Some(key) if key != outcome.node_id.0 => {
-                                        tracing::warn!(
-                                            relay = %relay.host,
-                                            answered = %outcome.node_id,
-                                            "another key answered at a relay's address; refusing it"
-                                        );
-                                        outcome.conn.close(0u32.into(), b"not the relay");
-                                        tried.failed(
-                                            "another key answered at this address".into(),
-                                            true,
-                                            p2p_gov_tick_secs,
-                                            any_connected,
-                                        );
-                                        continue;
-                                    }
-                                    // Keep the count of failures until the
-                                    // connection has lasted (see the relay
-                                    // tick), so a relay that accepts and
-                                    // drops at once is not redialled every
-                                    // second.
-                                    _ => tried.connected_at = Some(std::time::Instant::now()),
+                                for relay in &refused {
+                                    tracing::warn!(
+                                        relay = %relay.host,
+                                        answered = %outcome.node_id,
+                                        "another key answered at a relay's address; refusing it for that relay"
+                                    );
+                                    relay_tries.entry(tried_relay(relay)).or_default().failed(
+                                        ANOTHER_KEY_ANSWERED.into(),
+                                        true,
+                                        p2p_gov_tick_secs,
+                                        any_connected,
+                                    );
+                                }
+                                if answers.is_empty() {
+                                    outcome.conn.close(0u32.into(), b"not the relay");
+                                    continue;
+                                }
+                                // Keep the count of failures until the
+                                // connection has lasted (see the relay
+                                // tick), so a relay that accepts and drops
+                                // at once is not redialled every second.
+                                for relay in &answers {
+                                    relay_tries.entry(tried_relay(relay)).or_default().connected_at =
+                                        Some(std::time::Instant::now());
                                 }
                             }
                         }
@@ -2635,14 +2638,17 @@ pub async fn p2p_loop(
                             governor.mark_dial_failed(&nid);
                         }
                         tracing::debug!(addr = %addr, error = %error, "outbound connect failed");
-                        let dialled = relay_addrs
+                        // Every configured relay at this address failed.
+                        let dialled: Vec<TriedRelay> = relay_addrs
                             .read()
-                            .ok()
-                            .and_then(|relays| relays.iter().find(|r| r.addr == addr).cloned());
-                        if let Some(relay) = dialled {
-                            let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                            relay_tries.entry(relay.host).or_default().failed(
-                                error,
+                            .map(|relays| {
+                                relays.iter().filter(|r| r.addr == addr).map(tried_relay).collect()
+                            })
+                            .unwrap_or_default();
+                        let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
+                        for tried in dialled {
+                            relay_tries.entry(tried).or_default().failed(
+                                error.clone(),
                                 false,
                                 p2p_gov_tick_secs,
                                 any_connected,
@@ -2674,17 +2680,25 @@ pub async fn p2p_loop(
                     if relay_connected(&conn_mgr, relay) {
                         // Forget earlier failures once the connection has lasted.
                         if relay_tries
-                            .get(&relay.host)
+                            .get(&tried_relay(relay))
                             .is_some_and(|t| t.connected_at.is_none_or(|at| at.elapsed() >= settled))
                         {
-                            relay_tries.remove(&relay.host);
+                            relay_tries.remove(&tried_relay(relay));
                         }
+                        continue;
+                    }
+                    // Another relay is connected at this address: only one
+                    // key answers at one, and it is not this relay's. It
+                    // stands as its last dial left it, and is not dialled:
+                    // a second connection to that relay would only replace
+                    // the first (decision 2026-10-17 §1).
+                    if relays.iter().any(|other| other.addr == relay.addr && relay_connected(&conn_mgr, other)) {
                         continue;
                     }
                     if in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT {
                         continue;
                     }
-                    let tried = relay_tries.entry(relay.host.clone()).or_default();
+                    let tried = relay_tries.entry(tried_relay(relay)).or_default();
                     if let Some(at) = tried.connected_at.take()
                         && at.elapsed() < settled
                     {
@@ -2834,13 +2848,13 @@ pub async fn p2p_loop(
             // What waits in a channel of the device's own is sent on this
             // timer, through the leave that a show gives.
             _ = outbox_interval.tick(), if device_entries.is_some() => {
-                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels, cordelia_node::device_entries::Pass::Send);
             }
 
             // Something was written in a channel of the device's own: it
             // is sent without waiting for the timer, through that leave.
             _ = state.own_channels.wait_written(), if device_entries.is_some() => {
-                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Send);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels, cordelia_node::device_entries::Pass::Send);
             }
 
             // A command asked for a whole pass: the show to each relay,
@@ -2848,7 +2862,7 @@ pub async fn p2p_loop(
             // of a new phrase; the asking for what a typed key's device
             // hands over (decision 2026-10-04 §5.1, §5.2, §7.1).
             _ = state.own_channels.wait_asked(), if device_entries.is_some() => {
-                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels, cordelia_node::device_entries::Pass::Whole);
             }
 
             // A command's work asked something through the door for a
@@ -2856,7 +2870,7 @@ pub async fn p2p_loop(
             // or never followed, read at each relay (decision 2026-10-04
             // §7.3, §9). Off the select loop: it waits on the relays.
             ask = state.own_channels.wait_door(), if device_entries.is_some() => {
-                let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr);
+                let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels);
                 match (ask, device_entries.clone()) {
                     // The connection to a relay is made again (decision
                     // 2026-10-04 §16): a read of a generation that was
@@ -2865,13 +2879,14 @@ pub async fn p2p_loop(
                     // that connection alone. It is closed here, and the
                     // relay is dialled anew as any relay that is not
                     // connected is: nothing is kept of the tries before.
-                    (cordelia_api::state::DoorAsk::Remake { relay, answer }, _) => {
-                        let link = relays.into_iter().find(|set_up| set_up.name == relay);
-                        let peer = link.and_then(|set_up| set_up.link).map(|link| link.relay().clone());
+                    (cordelia_api::state::DoorAsk::Remake { relay, peer, answer }, _) => {
+                        let peer = to_make_again(peer, &relay, &relays, &|peer| conn_mgr.is_connected(peer));
                         if let Some(peer) = &peer {
                             tracing::info!(%relay, "the connection to a relay is made again: it has no room left for a proof");
+                            let addr = conn_mgr.get_connection(peer).map(|conn| conn.remote_address());
                             conn_mgr.disconnect(peer);
-                            relay_tries.remove(&relay);
+                            let resolved = relay_addrs.read().map(|r| r.clone()).unwrap_or_default();
+                            forget_tries(&mut relay_tries, &resolved, peer, addr);
                         }
                         let _ = answer.send(peer.is_some());
                     }
@@ -3152,7 +3167,7 @@ pub async fn p2p_loop(
                 // A device's own channels, at each relay it is set up
                 // with: it shows its change entry, and then proves, pulls
                 // and pushes where the answer gives it leave.
-                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, cordelia_node::device_entries::Pass::Whole);
+                device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels, cordelia_node::device_entries::Pass::Whole);
 
                 // That is all a personal node fetches: it holds no channel
                 // of the older kind, and asks no peer for one.
@@ -3570,6 +3585,15 @@ pub async fn keep_relays_resolved(
                     .map(|r| format!("{}={}", r.host, r.addr))
                     .collect();
                 tracing::info!(addrs = ?list, "relay addresses updated");
+                // Each is kept and dialled; one key answers at an address
+                // (decision 2026-10-17 §1).
+                for (relay, first) in cordelia_network::bootstrap::sharing_an_address(&resolved) {
+                    tracing::warn!(
+                        relay,
+                        first,
+                        "two relays this node is set up with resolve to one address: only one key can answer there, and a relay given another key is shown with the wrong key"
+                    );
+                }
                 *current = resolved;
             }
             true
@@ -3634,6 +3658,100 @@ fn relay_backoff(failures: u32, tick_secs: u64, another_connected: bool) -> std:
     std::time::Duration::from_secs(doubled.min(cap).max(1))
 }
 
+/// The connection that an asking to make one again names (decision
+/// 2026-10-17 §4): by the relay's key where it gives one, which holds
+/// whatever name the relay is listed under now; otherwise by the name it
+/// gives, among `relays`, the relays a pass is given. `None` where there
+/// is no such connection: the asking is then answered that none was
+/// closed.
+fn to_make_again(
+    peer: Option<[u8; 32]>,
+    relay: &str,
+    relays: &[cordelia_node::device_entries::Relay],
+    connected: &dyn Fn(&NodeId) -> bool,
+) -> Option<NodeId> {
+    match peer {
+        Some(key) => Some(NodeId(key)).filter(|peer| connected(peer)),
+        None => relays
+            .iter()
+            .find(|set_up| set_up.name == relay)
+            .and_then(|set_up| set_up.link.as_ref())
+            .map(|link| link.relay().clone()),
+    }
+}
+
+/// Forget the tries of each configured relay that the connection to
+/// `peer`, at `addr`, reached, when it is made again (decision 2026-10-17
+/// §4): by the key that found the connection, or for a relay given no
+/// key, by its address. The tries of any other relay are kept, whatever
+/// it is called.
+fn forget_tries(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    peer: &NodeId,
+    addr: Option<std::net::SocketAddr>,
+) {
+    let reached: Vec<TriedRelay> = resolved
+        .iter()
+        .filter(|relay| relay.key.is_none() && Some(relay.addr) == addr)
+        .map(tried_relay)
+        .collect();
+    tries.retain(|tried, _| tried.1 != Some(peer.0) && !reached.contains(tried));
+}
+
+/// The governor of a node of `role`, with its targets and timeouts from
+/// `gov_config`: the one place where a node's role decides it.
+///
+/// - Its dial policy (§8.2.2): a personal node with trusted peers dials
+///   only those (a swarm node), any other personal node only relays, and
+///   a relay or a bootnode any peer.
+/// - **A personal node keeps its relays** (decision 2026-10-17 §2):
+///   every relay it is set up with is one the person chose, and churn
+///   closes none of them. A relay and a bootnode churn as before.
+fn governor_for(
+    role: &str,
+    gov_config: &cordelia_core::config::GovernorConfig,
+    trusted_peer_ids: &[NodeId],
+) -> cordelia_network::governor::Governor {
+    use cordelia_network::governor::{DialPolicy, Governor, GovernorTargets, GovernorTimeouts};
+    let personal = role == "personal";
+    let dial_policy = if personal && !trusted_peer_ids.is_empty() {
+        DialPolicy::TrustedOnly(trusted_peer_ids.to_vec())
+    } else if personal {
+        DialPolicy::RelaysOnly
+    } else {
+        DialPolicy::All
+    };
+    let targets = GovernorTargets::from_config(gov_config);
+    let governor = Governor::with_dial_policy(targets, vec![], dial_policy)
+        .with_timeouts(GovernorTimeouts::from_config(gov_config));
+    match personal {
+        true => governor.keeping_its_relays(),
+        false => governor,
+    }
+}
+
+/// What the key that answered a dial at `addr` says of each configured
+/// relay there (decision 2026-10-17 §1): the relays of `relays` at that
+/// address whose key answered, or that were given none, are reached by
+/// the connection; each that was given another key failed its own
+/// handshake, and is shown with the wrong key. Two relays may share an
+/// address, and only one key answers at one.
+fn answered_at(
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    addr: std::net::SocketAddr,
+    answered: &[u8; 32],
+) -> (
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+) {
+    relays
+        .iter()
+        .filter(|relay| relay.addr == addr)
+        .cloned()
+        .partition(|relay| relay.key.is_none_or(|key| key == *answered))
+}
+
 /// Whether a configured relay is connected: by its key if one is
 /// configured, otherwise by the address it was dialled at.
 fn relay_connected(
@@ -3662,10 +3780,19 @@ fn relay_connected(
 /// set up with all the same. It is waited for when the device wakes, it is
 /// named as not heard from, and it is one of the relays that a command
 /// says does not hold a change.
+///
+/// **One relay is here once** (decision 2026-10-17 §1): a relay that is
+/// the same relay as one before it ([`one_relay_each`]) is left out. So
+/// one relay is counted once, paced once and passed once, and the node
+/// says how many relays the device is set up with from this list
+/// (`own`). A relay that another key answers for at its address is here,
+/// with no connection, as a relay that is out of reach is: so the device
+/// never takes every relay for connected while it fails.
 fn relays_with_links(
     set_up: &[cordelia_network::bootstrap::Relay],
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
+    own: &cordelia_api::state::OwnChannels,
 ) -> Vec<cordelia_node::device_entries::Relay> {
     use cordelia_node::device_entries::{Link, Relay};
     // Where the addresses cannot be read, a relay is still known by its
@@ -3674,22 +3801,13 @@ fn relays_with_links(
         .read()
         .map(|resolved| resolved.clone())
         .unwrap_or_default();
-    set_up
+    let (peers, one) = one_relay_each_now(set_up, &resolved, conn_mgr);
+    let relays: Vec<Relay> = set_up
         .iter()
-        .map(|relay| {
-            let peer = match relay.key {
-                Some(key) => Some(NodeId(key)),
-                None => resolved
-                    .iter()
-                    .find(|resolved| resolved.host == relay.host)
-                    .and_then(|resolved| {
-                        conn_mgr.connected_peers().into_iter().find(|peer| {
-                            conn_mgr
-                                .get_connection(peer)
-                                .is_some_and(|conn| conn.remote_address() == resolved.addr)
-                        })
-                    }),
-            };
+        .zip(peers)
+        .zip(one)
+        .filter(|(_, one)| !matches!(one, OneRelay::SameAs(_)))
+        .map(|((relay, peer), _)| {
             let link = peer.and_then(|peer| {
                 let conn = conn_mgr.get_connection(&peer)?.clone();
                 Some(Link::new(relay.host.clone(), peer, conn))
@@ -3699,7 +3817,112 @@ fn relays_with_links(
                 link,
             }
         })
-        .collect()
+        .collect();
+    own.set_up_with(relays.len());
+    relays
+}
+
+/// What one relay that a node is set up with is among the others
+/// (decision 2026-10-17 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneRelay {
+    /// A relay of its own: listed, counted, paced and passed.
+    Itself,
+    /// The same relay as the one at this place in the configuration: it
+    /// was given the same key, or the same connection answers for it. It
+    /// is listed as that, and nothing else.
+    SameAs(usize),
+    /// Another key answers at its address, on the connection of the relay
+    /// at this place: it is listed with the wrong key, and counted as a
+    /// relay that is out of reach, with no connection.
+    WrongKeyAt(usize),
+}
+
+/// Which of the relays in `set_up` are one relay (decision 2026-10-17
+/// §1). `peers` is, for each, the peer whose connection reaches it, where
+/// one does: by its key, or for a relay given none by its address.
+/// `addrs` is the address its name resolves to, where it does, and
+/// `at` the address of a peer's connection.
+///
+/// - A relay given the same key as one before it, or reached by the
+///   same connection, is the same relay as that one: the first in the
+///   configuration is the one counted.
+/// - A relay that no connection reaches, at the address of a connection
+///   that reaches another relay, is one that another key answers for
+///   there: only one key answers at an address.
+/// - Every other relay is a relay of its own, reached or not.
+fn one_relay_each(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    peers: &[Option<NodeId>],
+    addrs: &[Option<std::net::SocketAddr>],
+    at: &dyn Fn(&NodeId) -> Option<std::net::SocketAddr>,
+) -> Vec<OneRelay> {
+    let mut one = vec![OneRelay::Itself; set_up.len()];
+    for i in 0..set_up.len() {
+        let same = (0..i).find(|&j| {
+            let key = set_up[i].key;
+            one[j] == OneRelay::Itself
+                && ((key.is_some() && key == set_up[j].key)
+                    || (peers[i].is_some() && peers[i] == peers[j])
+                    || key.is_some_and(|key| peers[j] == Some(NodeId(key))))
+        });
+        if let Some(j) = same {
+            one[i] = OneRelay::SameAs(j);
+        }
+    }
+    for i in 0..set_up.len() {
+        if one[i] != OneRelay::Itself || peers[i].is_some() {
+            continue;
+        }
+        let Some(addr) = addrs[i] else {
+            continue;
+        };
+        let answered = (0..set_up.len()).find(|&j| {
+            j != i
+                && one[j] == OneRelay::Itself
+                && peers[j].as_ref().is_some_and(|peer| at(peer) == Some(addr))
+        });
+        if let Some(j) = answered {
+            one[i] = OneRelay::WrongKeyAt(j);
+        }
+    }
+    one
+}
+
+/// [`one_relay_each`] now: for each relay in `set_up`, the peer whose
+/// connection reaches it, and what it is among the others. A relay is
+/// found among `resolved` by its name and its key.
+fn one_relay_each_now(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> (Vec<Option<NodeId>>, Vec<OneRelay>) {
+    let addrs: Vec<Option<std::net::SocketAddr>> = set_up
+        .iter()
+        .map(|relay| {
+            let found = resolved
+                .iter()
+                .find(|resolved| resolved.host == relay.host && resolved.key == relay.key);
+            found.map(|resolved| resolved.addr)
+        })
+        .collect();
+    let peers: Vec<Option<NodeId>> = set_up
+        .iter()
+        .zip(&addrs)
+        .map(|(relay, addr)| match relay.key {
+            Some(key) => conn_mgr.get_connection(&NodeId(key)).map(|_| NodeId(key)),
+            None => addr.and_then(|addr| {
+                conn_mgr.connected_peers().into_iter().find(|peer| {
+                    conn_mgr
+                        .get_connection(peer)
+                        .is_some_and(|conn| conn.remote_address() == addr)
+                })
+            }),
+        })
+        .collect();
+    let at = |peer: &NodeId| conn_mgr.get_connection(peer).map(|c| c.remote_address());
+    let one = one_relay_each(set_up, &peers, &addrs, &at);
+    (peers, one)
 }
 
 /// Start a pass of a device's side of its relays, where this node has
@@ -3713,12 +3936,13 @@ fn device_pass(
     set_up: &[cordelia_network::bootstrap::Relay],
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
+    own: &cordelia_api::state::OwnChannels,
     kind: cordelia_node::device_entries::Pass,
 ) {
     let Some(device) = device.clone() else {
         return;
     };
-    let relays = relays_with_links(set_up, relay_addrs, conn_mgr);
+    let relays = relays_with_links(set_up, relay_addrs, conn_mgr, own);
     tokio::spawn(async move { device.pass(&relays, kind).await });
 }
 
@@ -3790,6 +4014,23 @@ fn is_configured_relay(
 /// standing is listed.
 const NAME_DOES_NOT_RESOLVE: &str = "its name does not resolve";
 
+/// The state of a relay that is the same relay as one before it in the
+/// configuration (decision 2026-10-17 §1): never "connected", so that one
+/// relay is counted once wherever relays are counted.
+const SAME_RELAY: &str = "same relay";
+
+/// What is said of a relay that another key answered for at its address.
+const ANOTHER_KEY_ANSWERED: &str = "another key answered at this address";
+
+/// A relay that the node is set up with, as its tries are kept: by its
+/// name and its key, since one name may be given twice, with two keys.
+type TriedRelay = (String, Option<[u8; 32]>);
+
+/// How the tries of `relay` are kept.
+fn tried_relay(relay: &cordelia_network::bootstrap::RelayAddr) -> TriedRelay {
+    (relay.host.clone(), relay.key)
+}
+
 /// Where each relay that the node is set up with stands, for `cordelia
 /// peers` and `cordelia status`.
 ///
@@ -3799,10 +4040,18 @@ const NAME_DOES_NOT_RESOLVE: &str = "its name does not resolve";
 /// names resolve to now, and `connected` whether a relay at one of those
 /// is connected. A relay whose name has not resolved cannot be dialled:
 /// it is unreachable, and its line says why.
+///
+/// A relay is found among `resolved` and `tries` by its name and its key:
+/// one name may be given twice, with two keys. `one` says what each is
+/// among the others ([`one_relay_each`], decision 2026-10-17 §1): one
+/// that is the same relay as another says so, and is not connected in
+/// its own right; one that another key answers for at its address has
+/// the wrong key.
 fn relay_snapshots(
     set_up: &[cordelia_network::bootstrap::Relay],
     resolved: &[cordelia_network::bootstrap::RelayAddr],
-    tries: &std::collections::HashMap<String, RelayTry>,
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
+    one: &[OneRelay],
     connected: &dyn Fn(&cordelia_network::bootstrap::RelayAddr) -> bool,
 ) -> Vec<cordelia_api::state::RelaySnapshot> {
     let key_of = |key: Option<[u8; 32]>| {
@@ -3810,8 +4059,23 @@ fn relay_snapshots(
     };
     set_up
         .iter()
-        .map(|named| {
-            let Some(relay) = resolved.iter().find(|relay| relay.host == named.host) else {
+        .enumerate()
+        .map(|(at, named)| {
+            let one = one.get(at).copied().unwrap_or(OneRelay::Itself);
+            if let OneRelay::SameAs(first) = one {
+                return cordelia_api::state::RelaySnapshot {
+                    host: named.host.clone(),
+                    key: key_of(named.key),
+                    state: SAME_RELAY.into(),
+                    unreachable_secs: None,
+                    last_tried_secs: None,
+                    error: Some(format!("the same relay as {}", set_up[first].host)),
+                };
+            }
+            let found = resolved
+                .iter()
+                .find(|relay| relay.host == named.host && relay.key == named.key);
+            let Some(relay) = found else {
                 return cordelia_api::state::RelaySnapshot {
                     host: named.host.clone(),
                     key: key_of(named.key),
@@ -3821,11 +4085,14 @@ fn relay_snapshots(
                     error: Some(NAME_DOES_NOT_RESOLVE.into()),
                 };
             };
-            let tried = tries.get(&relay.host);
-            let connected = connected(relay);
+            let tried = tries.get(&tried_relay(relay));
+            let wrong_key_at = matches!(one, OneRelay::WrongKeyAt(_));
+            let connected = !wrong_key_at && connected(relay);
             let failing = tried.filter(|t| t.failures > 0 && !connected);
             let state = if connected {
                 "connected"
+            } else if wrong_key_at {
+                "wrong key"
             } else {
                 match failing {
                     Some(t) if t.wrong_key => "wrong key",
@@ -3842,7 +4109,9 @@ fn relay_snapshots(
                     .filter(|_| !connected)
                     .and_then(|t| t.last_tried)
                     .map(|t| t.elapsed().as_secs()),
-                error: failing.and_then(|t| t.error.clone()),
+                error: failing
+                    .and_then(|t| t.error.clone())
+                    .or_else(|| wrong_key_at.then(|| ANOTHER_KEY_ANSWERED.to_string())),
             }
         })
         .collect()
@@ -3854,10 +4123,11 @@ fn publish_relays(
     state: &cordelia_api::state::AppState,
     set_up: &[cordelia_network::bootstrap::Relay],
     resolved: &[cordelia_network::bootstrap::RelayAddr],
-    tries: &std::collections::HashMap<String, RelayTry>,
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
 ) {
-    let list = relay_snapshots(set_up, resolved, tries, &|relay| {
+    let (_, one) = one_relay_each_now(set_up, resolved, conn_mgr);
+    let list = relay_snapshots(set_up, resolved, tries, &one, &|relay| {
         relay_connected(conn_mgr, relay)
     });
     // Which of them are connected now: the node keeps since when each
@@ -4859,7 +5129,7 @@ mod tests {
             at("relay3.example:9474", 3, None),
         ];
         let tries = std::collections::HashMap::new();
-        let listed = relay_snapshots(&set_up, &resolved, &tries, &|relay| {
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &[], &|relay| {
             relay.host == "relay1.example:9474"
         });
         let stands: Vec<(&str, &str, Option<&str>)> = listed
@@ -4888,9 +5158,343 @@ mod tests {
         let key = cordelia_crypto::bech32::encode_public_key(&[8; 32]).unwrap();
         assert_eq!(listed[1].key.as_deref(), Some(key.as_str()));
         // With no name resolved, every relay is still listed.
-        let none = relay_snapshots(&set_up, &[], &tries, &|_| true);
+        let none = relay_snapshots(&set_up, &[], &tries, &[], &|_| true);
         assert_eq!(none.len(), 3);
         assert!(none.iter().all(|relay| relay.state == "unreachable"));
+    }
+
+    /// Two relays that a node is set up with resolve to one address, each
+    /// given a key of its own, beside a third there that was given none
+    /// (decision 2026-10-17 §1). The key that answers a dial there
+    /// reaches the relay that was given it, and the one given none; the
+    /// other fails its own handshake. Each is listed by its name: the one
+    /// whose key did not answer with the wrong key, the one given that
+    /// key as connected, and the one given none as the same relay as it.
+    /// None of them is dropped, and one relay is connected once.
+    #[test]
+    fn two_relays_at_one_address_are_each_listed_and_a_wrong_key_is_their_own() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let shared = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let at = |host: &str, addr, key| RelayAddr {
+            host: host.into(),
+            addr,
+            key,
+        };
+        let other = std::net::SocketAddr::from(([127, 0, 0, 2], 9474));
+        let resolved = [
+            at("one.example:9474", shared, Some([7; 32])),
+            at("two.example:9474", shared, Some([8; 32])),
+            at("three.example:9474", shared, None),
+            at("other.example:9474", other, Some([9; 32])),
+        ];
+        let hosts = |relays: &[RelayAddr]| -> Vec<String> {
+            relays.iter().map(|relay| relay.host.clone()).collect()
+        };
+        let (answers, refused) = answered_at(&resolved, shared, &[8; 32]);
+        assert_eq!(hosts(&answers), ["two.example:9474", "three.example:9474"]);
+        assert_eq!(hosts(&refused), ["one.example:9474"]);
+        // A key that none was given reaches only the relay given none.
+        let (stranger, both) = answered_at(&resolved, shared, &[5; 32]);
+        assert_eq!(hosts(&stranger), ["three.example:9474"]);
+        assert_eq!(hosts(&both), ["one.example:9474", "two.example:9474"]);
+        let (none, nothing) = answered_at(&resolved, "127.0.0.3:9474".parse().unwrap(), &[8; 32]);
+        assert!(none.is_empty() && nothing.is_empty());
+
+        // As the loop does with that answer: the relay whose key did not
+        // answer failed, with the wrong key.
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        for relay in &refused {
+            let tried = tries.entry(tried_relay(relay)).or_default();
+            tried.failed(
+                "another key answered at this address".into(),
+                true,
+                10,
+                true,
+            );
+        }
+        let set_up: Vec<Relay> = resolved
+            .iter()
+            .map(|relay| Relay {
+                host: relay.host.clone(),
+                key: relay.key,
+            })
+            .collect();
+        let connected =
+            |relay: &RelayAddr| relay.addr == shared && relay.key.is_none_or(|key| key == [8; 32]);
+        // The connection is the second relay's, by its key; the third is
+        // reached by it at its address.
+        let peers = [None, Some(NodeId([8; 32])), Some(NodeId([8; 32])), None];
+        let addrs: Vec<_> = resolved.iter().map(|relay| Some(relay.addr)).collect();
+        let at = |peer: &NodeId| (peer.0 == [8; 32]).then_some(shared);
+        let one = one_relay_each(&set_up, &peers, &addrs, &at);
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &one, &connected);
+        assert_eq!(
+            stands_of(&listed),
+            [
+                (
+                    "one.example:9474",
+                    "wrong key",
+                    Some("another key answered at this address")
+                ),
+                ("two.example:9474", "connected", None),
+                (
+                    "three.example:9474",
+                    "same relay",
+                    Some("the same relay as two.example:9474")
+                ),
+                ("other.example:9474", "connecting", None),
+            ]
+        );
+    }
+
+    /// Each relay's name, state and what is said of it.
+    fn stands_of(listed: &[cordelia_api::state::RelaySnapshot]) -> Vec<(&str, &str, Option<&str>)> {
+        listed
+            .iter()
+            .map(|relay| {
+                let error = relay.error.as_deref();
+                (relay.host.as_str(), relay.state.as_str(), error)
+            })
+            .collect()
+    }
+
+    /// The connection that an asking to make one again names is found by
+    /// the relay's key where the asking gives one (decision 2026-10-17
+    /// §4): whatever name the relay is listed under now, or none. Where
+    /// that key is not connected, there is none to close. An asking with
+    /// no key, a carry's, is found by its name among the relays a pass is
+    /// given.
+    #[test]
+    fn a_connection_to_make_again_is_found_by_its_key() {
+        use cordelia_node::device_entries::Relay;
+        let key = [7; 32];
+        let connected = |peer: &NodeId| peer.0 == key;
+        // Listed under another name now, or under none.
+        let listed = [Relay {
+            name: "keyless.example:9474".into(),
+            link: None,
+        }];
+        for relays in [&listed[..], &[]] {
+            let found = to_make_again(Some(key), "keyed.example:9474", relays, &connected);
+            assert_eq!(found, Some(NodeId(key)));
+        }
+        assert_eq!(
+            to_make_again(Some([8; 32]), "keyed.example:9474", &listed, &connected),
+            None
+        );
+        assert_eq!(
+            to_make_again(None, "keyed.example:9474", &listed, &connected),
+            None
+        );
+        assert_eq!(
+            to_make_again(None, "keyless.example:9474", &listed, &connected),
+            None,
+            "listed with no connection"
+        );
+    }
+
+    /// When a connection is made again, the tries forgotten are those of
+    /// each relay it reached (decision 2026-10-17 §4): by the key that
+    /// found it, and for a relay given no key, by its address. A relay of
+    /// the same name with another key, and a relay elsewhere, keep theirs.
+    #[test]
+    fn the_tries_forgotten_are_those_of_the_relays_the_connection_reached() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let here = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let elsewhere = std::net::SocketAddr::from(([127, 0, 0, 2], 9474));
+        let at = |host: &str, addr, key| RelayAddr {
+            host: host.into(),
+            addr,
+            key,
+        };
+        let resolved = [
+            at("keyed.example:9474", here, Some([7; 32])),
+            at("keyless.example:9474", here, None),
+            at("keyed.example:9474", here, Some([8; 32])),
+            at("other.example:9474", elsewhere, Some([9; 32])),
+            at("far.example:9474", elsewhere, None),
+        ];
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = resolved
+            .iter()
+            .map(|relay| (tried_relay(relay), RelayTry::default()))
+            .collect();
+        forget_tries(&mut tries, &resolved, &NodeId([7; 32]), Some(here));
+        let mut kept: Vec<TriedRelay> = tries.into_keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                ("far.example:9474".to_string(), None),
+                ("keyed.example:9474".to_string(), Some([8; 32])),
+                ("other.example:9474".to_string(), Some([9; 32])),
+            ]
+        );
+    }
+
+    /// A node's governor goes by its role (decision 2026-10-17 §2): built
+    /// as the node builds it, a personal node's keeps the three relays it
+    /// is connected to through several churn intervals, while a fourth
+    /// has gone and is cold. A relay's and a bootnode's, with the same
+    /// peers, close a warm one at the first.
+    #[test]
+    fn a_nodes_governor_keeps_its_relays_through_churn_only_on_a_personal_node() {
+        let config = cordelia_core::config::GovernorConfig {
+            hot_min: 1,
+            hot_max: 2,
+            hot_min_relays: 1,
+            warm_min: 1,
+            churn_interval_secs: 0,
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+            ..Default::default()
+        };
+        let three: Vec<NodeId> = (1..=3u8).map(|n| NodeId([n; 32])).collect();
+        // What a governor closes over `intervals` churn intervals, with
+        // three relays connected and a fourth gone.
+        let closes = |role: &str, intervals: usize| -> Vec<NodeId> {
+            let mut governor = governor_for(role, &config, &[]);
+            for n in 1..=4u8 {
+                let id = NodeId([n; 32]);
+                governor.add_peer(id.clone(), vec![], vec![]);
+                governor.set_peer_relay(&id, true);
+                governor.mark_connected(&id);
+            }
+            governor.mark_disconnected(&NodeId([4; 32]));
+            assert_eq!(governor.counts(), (1, 2, 1, 0), "{role}");
+            (0..intervals)
+                .flat_map(|_| governor.tick().disconnect)
+                .collect()
+        };
+        assert!(closes("personal", 5).is_empty());
+        for role in ["relay", "bootnode"] {
+            let closed = closes(role, 1);
+            assert_eq!(closed.len(), 1, "{role}: {closed:?}");
+            assert!(three.contains(&closed[0]), "{role}");
+        }
+    }
+
+    /// One relay is one relay, under however many names (decision
+    /// 2026-10-17 §1). A name given a relay's key and another given no
+    /// key, at the address of one connection, are one relay: the first is
+    /// counted, and the second is the same relay as it. So are two names
+    /// given the same key, whether or not the relay is reached. A relay
+    /// that no connection reaches at the address of one that another key
+    /// answers is one with the wrong key; one at an address of its own is
+    /// a relay of its own, reached or not.
+    #[test]
+    fn one_relay_under_two_names_is_one_relay() {
+        use cordelia_network::bootstrap::Relay;
+        let named = |host: &str, key: Option<[u8; 32]>| Relay {
+            host: host.into(),
+            key,
+        };
+        let shared = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let elsewhere = std::net::SocketAddr::from(([127, 0, 0, 2], 9474));
+        let set_up = [
+            named("keyed.example:9474", Some([7; 32])),
+            named("keyless.example:9474", None),
+            named("again.example:9474", Some([7; 32])),
+            named("wrong.example:9474", Some([8; 32])),
+            named("own.example:9474", Some([9; 32])),
+        ];
+        let addrs = [
+            Some(shared),
+            Some(shared),
+            Some(elsewhere),
+            Some(shared),
+            Some(elsewhere),
+        ];
+        let at = |peer: &NodeId| (peer.0 == [7; 32]).then_some(shared);
+        let reached = Some(NodeId([7; 32]));
+        let peers = [reached.clone(), reached.clone(), reached, None, None];
+        let one = one_relay_each(&set_up, &peers, &addrs, &at);
+        assert_eq!(
+            one,
+            [
+                OneRelay::Itself,
+                OneRelay::SameAs(0),
+                OneRelay::SameAs(0),
+                OneRelay::WrongKeyAt(0),
+                OneRelay::Itself,
+            ]
+        );
+        // Unreached: the names given one key are still one relay, and
+        // the others are relays of their own.
+        let none = [None, None, None, None, None];
+        let one = one_relay_each(&set_up, &none, &addrs, &|_| None);
+        assert_eq!(
+            one,
+            [
+                OneRelay::Itself,
+                OneRelay::Itself,
+                OneRelay::SameAs(0),
+                OneRelay::Itself,
+                OneRelay::Itself,
+            ]
+        );
+        // The name given no key, first: it is the one counted.
+        let first = [set_up[1].clone(), set_up[0].clone()];
+        let peers = [Some(NodeId([7; 32])), Some(NodeId([7; 32]))];
+        let one = one_relay_each(&first, &peers, &[Some(shared); 2], &at);
+        assert_eq!(one, [OneRelay::Itself, OneRelay::SameAs(0)]);
+    }
+
+    /// One name given twice, with two keys (decision 2026-10-17 §1): each
+    /// entry is found by its name and its key, where it resolved and in
+    /// its tries. The key of the first answers: the first is connected,
+    /// with its own key, and the second has the wrong key, with its own.
+    #[test]
+    fn one_name_given_twice_with_two_keys_is_listed_by_its_key() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let shared = std::net::SocketAddr::from(([127, 0, 0, 1], 9474));
+        let resolved: Vec<RelayAddr> = [[7; 32], [8; 32]]
+            .into_iter()
+            .map(|key| RelayAddr {
+                host: "h.example:9474".into(),
+                addr: shared,
+                key: Some(key),
+            })
+            .collect();
+        let set_up: Vec<Relay> = resolved
+            .iter()
+            .map(|relay| Relay {
+                host: relay.host.clone(),
+                key: relay.key,
+            })
+            .collect();
+        let (answers, refused) = answered_at(&resolved, shared, &[7; 32]);
+        assert_eq!((answers.len(), refused.len()), (1, 1));
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        for relay in &answers {
+            tries.entry(tried_relay(relay)).or_default().connected_at =
+                Some(std::time::Instant::now());
+        }
+        for relay in &refused {
+            let tried = tries.entry(tried_relay(relay)).or_default();
+            tried.failed(ANOTHER_KEY_ANSWERED.into(), true, 10, true);
+        }
+        assert_eq!(tries.len(), 2, "one try for each name and key");
+        let peers = [Some(NodeId([7; 32])), None];
+        let addrs = [Some(shared), Some(shared)];
+        let at = |peer: &NodeId| (peer.0 == [7; 32]).then_some(shared);
+        let one = one_relay_each(&set_up, &peers, &addrs, &at);
+        // As the node tells: by the key that is connected.
+        let connected = |relay: &RelayAddr| relay.key == Some([7; 32]);
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &one, &connected);
+        assert_eq!(
+            stands_of(&listed),
+            [
+                ("h.example:9474", "connected", None),
+                ("h.example:9474", "wrong key", Some(ANOTHER_KEY_ANSWERED)),
+            ]
+        );
+        let key = |k: [u8; 32]| cordelia_crypto::bech32::encode_public_key(&k).ok();
+        assert_eq!(listed[0].key, key([7; 32]));
+        assert_eq!(listed[1].key, key([8; 32]));
+        // And without what the connections say, by its tries alone.
+        let itself = [OneRelay::Itself; 2];
+        let listed = relay_snapshots(&set_up, &resolved, &tries, &itself, &connected);
+        assert_eq!(listed[1].state, "wrong key");
     }
 
     /// A device answers a request of the older kind with nothing, as a
@@ -5009,7 +5613,8 @@ mod tests {
             resolved("down.test:9474", down),
         ]));
 
-        let relays = relays_with_links(&set_up, &addrs, &conn_mgr);
+        let own = cordelia_api::state::OwnChannels::default();
+        let relays = relays_with_links(&set_up, &addrs, &conn_mgr, &own);
         let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5032,8 +5637,9 @@ mod tests {
         // none has a connection: a relay with no key is known only by
         // the address its name resolves to.
         let none: RelayAddrs = Default::default();
-        let relays = relays_with_links(&set_up, &none, &conn_mgr);
+        let relays = relays_with_links(&set_up, &none, &conn_mgr, &own);
         assert_eq!(relays.len(), set_up.len());
+        assert_eq!(own.relays_set_up(), Some(set_up.len()));
         assert!(relays.iter().all(|relay| relay.link.is_none()));
 
         // A relay with a key is found by its key, whatever its name
@@ -5042,9 +5648,56 @@ mod tests {
             "no-such-name-with-a-key.test:9474",
             Some(relay.public_key()),
         )];
-        let relays = relays_with_links(&keyed, &none, &conn_mgr);
+        let relays = relays_with_links(&keyed, &none, &conn_mgr, &own);
         assert_eq!(relays.len(), 1);
         assert!(relays[0].link.is_some());
+
+        // One relay under two names, one given its key and one given
+        // none at its address (decision 2026-10-17 §1): a pass is given
+        // it once, under the first name, and the device is set up with
+        // one relay.
+        let twice = [
+            named("keyed.test:9474", Some(relay.public_key())),
+            named("reached.test:9474", None),
+        ];
+        let relays = relays_with_links(&twice, &addrs, &conn_mgr, &own);
+        let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
+        assert_eq!(names, ["keyed.test:9474"]);
+        assert!(relays[0].link.is_some());
+        assert_eq!(own.relays_set_up(), Some(1));
+        let by_key = cordelia_node::device_entries::every_relay_by_key;
+        assert_eq!(
+            by_key(&relays, own.relays_set_up()),
+            Some(vec![relay.public_key()])
+        );
+
+        // Two relays at that one address, each given a key of its own,
+        // and the relay's answers there (decision 2026-10-17 §1). The one
+        // whose key did not answer is given to a pass with no connection,
+        // as one out of reach is, and counted: so the device is not set
+        // up by key, and forgets nothing of it and says no "sent".
+        let wrong_key = [9; 32];
+        let two_keys = [
+            named("keyed.test:9474", Some(relay.public_key())),
+            named("wrong.test:9474", Some(wrong_key)),
+        ];
+        let at_one_address: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(
+            two_keys
+                .iter()
+                .map(|named| RelayAddr {
+                    host: named.host.clone(),
+                    addr: relay_addr,
+                    key: named.key,
+                })
+                .collect(),
+        ));
+        let relays = relays_with_links(&two_keys, &at_one_address, &conn_mgr, &own);
+        let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
+        assert_eq!(names, ["keyed.test:9474", "wrong.test:9474"]);
+        let linked: Vec<bool> = relays.iter().map(|relay| relay.link.is_some()).collect();
+        assert_eq!(linked, [true, false]);
+        assert_eq!(own.relays_set_up(), Some(2));
+        assert_eq!(by_key(&relays, own.relays_set_up()), None);
         conn_mgr.shutdown();
     }
 

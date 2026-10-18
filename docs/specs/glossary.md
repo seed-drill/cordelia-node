@@ -50,7 +50,7 @@
 - **Personal node**: Node with `role="personal"`, storing only subscribed channels.
 - **Bootnode**: Node with `role="bootnode"`, discovery-only (Handshake + Peer-Sharing), never stores or relays items.
 - **Relay**: Node with `role="relay"`, store-and-forward with LRU-evicted cache (max 10GB), re-pushes items to peers.
-- **Keeper**: Node with `role="keeper"`, anchors channels, holds PSKs for open/gated channels (Phase 2+).
+- **Keeper**: A node of an earlier design that would anchor channels and hold PSKs for open/gated channels. It was dropped (decision 2026-09-30 §4.2), and `role="keeper"` is refused when a configuration is loaded (decision 2026-10-17 §5).
 - **Anchor keeper**: A specific keeper designated as PSK authority for a channel (Phase 2+, stored in ChannelDescriptor).
 - **Push policy**: Personal node config: `subscribers_only` (default, push to channel peers + relays) or `pull_only` (never push, serve only via Item-Sync).
 - **Subscriber**: An entity subscribed to a channel (holds the PSK, receives items).

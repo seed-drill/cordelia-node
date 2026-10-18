@@ -153,17 +153,12 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
             // Keep-Alive: allowed on Warm + Hot
             (KeepAlive,    Warm | Hot) => handle_keepalive(stream)
 
-            // Peer-Sharing: Warm (after min_warm_tenure) + Hot.
-            // A relay and a bootnode answer with shared_peers; a personal
-            // node answers with an empty list, whatever it is connected to
-            // (decision 2026-10-14).
-            (PeerSharing,  Hot) => handle_peer_sharing(stream)
-            (PeerSharing,  Warm) =>
-                if peer.state_tenure() >= min_warm_tenure:
-                    handle_peer_sharing(stream)
-                else:
-                    log DEBUG "peer-sharing rejected: warm tenure not met"
-                    stream.reset(APP_ERROR_TENURE_REQUIRED)
+            // Peer-Sharing: Warm + Hot, with no tenure. A relay and a
+            // bootnode answer with shared_peers; a personal node answers
+            // with an empty list, whatever it is connected to (decision
+            // 2026-10-14). min_warm_tenure is what a warm peer waits
+            // before it may be made hot, and gates nothing here.
+            (PeerSharing,  Warm | Hot) => handle_peer_sharing(stream)
 
             // Data protocols: Hot only
             (ItemPush,        Hot) => handle_push(stream)
@@ -276,6 +271,8 @@ fn handle_push(stream, peer_id, rate_limiter):
 | Trigger | Sequence |
 |---------|----------|
 | Governor demotes Warm->Cold | `conn_mgr.disconnect(node_id)` -> `governor.mark_disconnected(node_id)` -> `connection_tracker.release(remote_ip)` |
+| Churn (Warm->Cold) | As above. A relay and a bootnode churn their warm peers; a personal node never closes, by churn, its connection to a relay it is set up with (decision 2026-10-17 §2) |
+| A device's proofs are held by channels it no longer proves | The device asks the node to make the connection again (`DoorAsk::Remake`): `conn_mgr.disconnect(node_id)`, and the relay is dialled anew (decision 2026-10-17 §4) |
 | Governor bans peer | Same as above + `governor.ban_peer(node_id, reason, tier)` |
 | Node shutdown (SIGTERM) | `conn_mgr.shutdown_and_wait()` -> all connections close -> `endpoint.wait_idle()` |
 

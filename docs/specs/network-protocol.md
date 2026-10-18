@@ -1470,7 +1470,7 @@ Executed in order:
 4a. **Ensure relay connectivity**: If fewer than `hot_min_relays` relay peers are Hot, promote a random warm relay to Hot. This bypasses the regular random selection and the tenure guard (same urgency as `hot < hot_min`). Evaluated after step 4, independent of `hot_count`.
 5. **Demote Hot→Warm**: If `hot_count > hot_max`, demote worst-scoring hot peer. Stale peers (no items for `stale_threshold_secs`, default: 1800s) demoted first. Trusted peers are never demoted.
 6. **Churn (hot)**: Every `churn_interval_secs` (default: 3600s) +/- `churn_jitter_secs` (default: 0-300s random), demote 1 random hot peer to Warm and promote 1 random warm peer to Hot. Trusted peers are exempt. This forces hot-tier exploration and prevents topology ossification.
-7. **Churn (warm)**: Same interval, swap `churn_fraction` (default: 0.2) of warm peers with random cold peers.
+7. **Churn (warm)**: Same interval, swap `churn_fraction` (default: 0.2) of warm peers with random cold peers. A personal node never closes, by churn, its connection to a relay it is set up with: each is one the person chose (decision 2026-10-17 §2).
 8. **Evict excess cold**: If `cold_count > cold_max`, remove peers with most connection failures first, then oldest-seen.
 
 ### 5.4.1 Immediate Promotion on Connect

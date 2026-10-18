@@ -68,7 +68,26 @@ pub struct NetworkConfig {
     pub listen: Option<bool>,
 }
 
+/// The roles this version takes for `network.role` (decision 2026-10-17
+/// §5): a person's device, a relay, and a bootnode. A configuration with
+/// any other role is refused when it is loaded.
+pub const ROLES: &[&str] = &["personal", "relay", "bootnode"];
+
 impl NetworkConfig {
+    /// Refuse a role that this version does not know (decision 2026-10-17
+    /// §5): a node of no known role would load, and be none of them.
+    fn check(&self) -> Result<(), CordeliaError> {
+        if ROLES.contains(&self.role.as_str()) {
+            return Ok(());
+        }
+        let taken: Vec<String> = ROLES.iter().map(|role| format!("\"{role}\"")).collect();
+        Err(CordeliaError::Config(format!(
+            "[network] role is {:?}: this version takes {}",
+            self.role,
+            taken.join(", ")
+        )))
+    }
+
     /// Whether this node listens for inbound connections. A personal node
     /// only dials out, unless it is told to listen or has trusted peers
     /// (§8.2.2), which may dial it.
@@ -407,6 +426,7 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)
             .map_err(|e| CordeliaError::Config(format!("parse config: {e}")))?;
+        config.network.check()?;
         config.messages.check()?;
         Ok(config)
     }
@@ -657,7 +677,7 @@ http_port = 8080
         // The default role is personal: it dials out and does not listen.
         assert!(!with(""));
         assert!(!with("[network]\nrole = \"personal\"\n"));
-        for role in ["relay", "bootnode", "keeper"] {
+        for role in ["relay", "bootnode"] {
             assert!(with(&format!("[network]\nrole = \"{role}\"\n")), "{role}");
         }
         // A personal node listens when told to, or when it has trusted
@@ -675,6 +695,68 @@ http_port = 8080
         // The option is not written to a config that does not set it.
         let written = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!written.contains("listen ="), "{written}");
+    }
+
+    /// A configuration whose role this version does not know is refused
+    /// when it is loaded, with a line that names the roles it takes: a
+    /// typing slip, a role of an earlier design, and none (decision
+    /// 2026-10-17 §5). Each role it knows loads, and so does a file that
+    /// sets none: it is a personal node.
+    #[test]
+    fn test_a_role_that_this_version_does_not_know_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let loaded = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|config| config.network.role)
+        };
+        assert_eq!(ROLES, ["personal", "relay", "bootnode"]);
+        for role in ROLES {
+            assert_eq!(
+                loaded(&format!("[network]\nrole = \"{role}\"\n")).unwrap(),
+                *role
+            );
+        }
+        assert_eq!(loaded("").unwrap(), "personal");
+        assert_eq!(loaded("[network]\n").unwrap(), "personal");
+        for slip in ["realy", "Relay", "personal ", "keeper", ""] {
+            let refused = loaded(&format!("[network]\nrole = \"{slip}\"\n")).unwrap_err();
+            let said = refused.to_string();
+            assert!(said.contains(&format!("role is {slip:?}")), "{said}");
+            assert!(
+                said.contains("takes \"personal\", \"relay\", \"bootnode\""),
+                "{said}"
+            );
+        }
+    }
+
+    /// Every configuration that this repository writes for a node loads:
+    /// the relays' own (`deploy/relay`), and those of the topology tests
+    /// (`tests/e2e/configs`). Each names a role this version knows.
+    #[test]
+    fn test_the_configurations_in_this_repository_load() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = vec![
+            root.join("deploy/relay/relay1.toml"),
+            root.join("deploy/relay/relay2.toml"),
+        ];
+        for topology in std::fs::read_dir(root.join("tests/e2e/configs")).unwrap() {
+            for file in std::fs::read_dir(topology.unwrap().path()).unwrap() {
+                let file = file.unwrap().path();
+                if file.extension().is_some_and(|ext| ext == "toml") {
+                    files.push(file);
+                }
+            }
+        }
+        assert!(files.len() > 2, "{files:?}");
+        for file in files {
+            let config = Config::load(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            assert!(
+                ROLES.contains(&config.network.role.as_str()),
+                "{}",
+                file.display()
+            );
+        }
     }
 
     #[test]
