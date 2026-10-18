@@ -6,7 +6,9 @@ sync map`): taking an act, the order with its last tie-break by the act's
 bytes, the dating with its count at the time bound and with removed keys'
 times left out, copies, items not in force, drops and moves that take no
 place, the bounds with makers that count first, fresh lists, freeing,
-coming back, the recovery's read, and what a device keeps of it. A part
+coming back, the recovery's read, and what a device keeps of it. Since the
+second review: an act of a key the device does not know, which hides
+the older acts on its item, and undoes that need no place. A part
 for each rule of the slice: put each fault in, and confirm the test named
 for it fails on an assertion. Run from the root of a checkout that
 nothing else edits."""
@@ -60,7 +62,10 @@ OWN_FRESH = lists("a_device_whose_own_list_is_fresh_takes_nothing_out")
 OWN_ENTRY = lists("a_list_is_read_only_from_its_writers_own_entry_under_the_statement")
 RECOVERY = lists("a_recovery_reads_the_lists_by_the_newest_fetch_of_devices_not_in_other_hands")
 LISTS_IN = lists("the_lists_a_recovery_reads_are_each_shown_devices_own")
-NEVER_HAD = lists("an_act_of_a_key_the_person_never_had_undoes_nothing_and_takes_no_place")
+NEVER_HAD = lists("an_act_of_a_key_the_person_never_had_hides_and_takes_no_place")
+SETTLED = lists("a_device_added_after_a_settlement_holds_what_the_older_devices_hold")
+UNDO_NO_PLACE = lists("undoing_a_copy_not_in_force_needs_no_place")
+HIDES_AT_RECOVERY = lists("at_a_recovery_an_act_of_a_key_no_device_is_hides_its_item")
 IN_FORCE = lists("a_place_is_taken_only_by_an_item_in_force")
 UNDO_NOTHING = lists("an_undo_of_what_nobody_did_is_not_taken")
 BEFORE_UNDOES = lists("past_a_bound_the_makers_that_count_come_before_a_removed_keys_undoes")
@@ -218,9 +223,9 @@ MUTATIONS = [
      '''                Order::of_act(act, makers),''',
      [BOUND]),
     ("L33 past a bound nothing is left out", LISTS,
-     '''at < 2 * most''',
-     '''at < most''',
-     [BOUND, PLACE]),
+     '''.extend(left.into_iter().take(most).cloned());''',
+     '''.extend(left.into_iter().take(0).cloned());''',
+     [IN_FORCE]),
     ("L34 a move leaves the old channel filed", LISTS,
      '''                filing.and_then(|filing| Ok(vec![AnyAct::Filing(filing), AnyAct::Drop(drop?)]))''',
      '''                filing.and_then(|filing| Ok(vec![AnyAct::Filing(filing)]).and_then(|v| drop.map(|_| v)))''',
@@ -426,11 +431,9 @@ MUTATIONS = [
      [LISTS_IN]),
     # ── Makers, places and undoes, since the review ──
     ("M01 an act of a key the person never had is taken", LISTS,
-     '''        makers.maker(&act.maker()).is_some()
-            && *self''',
-     '''        makers.maker(&act.maker()).is_some() | true
-            && *self''',
-     [NOT_TAKEN, NEVER_HAD]),
+     '''        makers.maker(&act.maker()).is_some() && self.holds(act)''',
+     '''        makers.maker(&act.maker()).is_some() | true && self.holds(act)''',
+     [NEVER_HAD]),
     ("M02 a key a statement left out is a key never had", LISTS,
      '''        } else if self.left_out.contains(key) {''',
      '''        } else if self.left_out.contains(key) && false {''',
@@ -460,11 +463,11 @@ MUTATIONS = [
      '''            counts: makers.maker(&maker) == makers.maker(&maker),''',
      [AT_BOUND, TWO_AT_BOUND, ORDER]),
     ("M08 an act is taken whether or not it holds", LISTS,
-     '''        .find(|(_, act)| checked.takes(act, makers))''',
-     '''        .find(|_| true)''',
+     '''    let first = acts.find(|act| checked.holds(act))?;''',
+     '''    let first = acts.next()?;''',
      [NOT_TAKEN]),
     ("M09 an act is taken whatever its signature, once checked", LISTS,
-     '''                .or_insert_with(|| act.holds())''',
+     '''            .or_insert_with(|| act.holds())''',
      '''                .or_insert_with(|| true)''',
      [NOT_TAKEN]),
     ("M10 an undo of what nobody did is taken", LISTS,
@@ -495,15 +498,15 @@ MUTATIONS = [
      [AT_BOUND, DATED]),
     ("M16 an act the device would not take dates the next", LISTS,
      '''        .filter(|act| checked.takes(act, makers))
-        .collect();''',
+        .cloned()''',
      '''        .filter(|act| checked.takes(act, makers) || true)
-        .collect();''',
+        .cloned()''',
      [DATED]),
     ("M17 an act whose signature fails dates the next", LISTS,
      '''        .filter(|act| checked.takes(act, makers))
-        .collect();''',
+        .cloned()''',
      '''        .filter(|act| makers.maker(&act.maker()).is_some())
-        .collect();''',
+        .cloned()''',
      [DATED]),
     ("M18 a part is full one item later", LISTS,
      '''count() >= most && !placed(key)''',
@@ -574,6 +577,76 @@ MUTATIONS = [
      '''                Some(Maker::InNoList) => left_out.push(key),''',
      '''                Some(Maker::InNoList) => {}''',
      [RECOVERY]),
+    # ── An act of a key the device does not know, since the second review ──
+    ("H01 an act of a key the device does not know hides nothing", LISTS,
+     '''    let first = acts.find(|act| checked.holds(act))?;''',
+     '''    let first = acts.find(|act| checked.takes(act, makers))?;''',
+     [SETTLED, NEVER_HAD, HIDES_AT_RECOVERY]),
+    ("H02 the act that hides an item is taken", LISTS,
+     '''    if makers.maker(&first.maker()).is_some() {''',
+     '''    if true {''',
+     [NEVER_HAD]),
+    ("H03 the act held hidden may be one the device would not take", LISTS,
+     '''    Some(Newest::Hidden(acts.find(|act| checked.takes(act, makers))))''',
+     '''    Some(Newest::Hidden(acts.find(|act| checked.holds(act))))''',
+     [NEVER_HAD]),
+    ("H04 nothing is held hidden", LISTS,
+     '''    Some(Newest::Hidden(acts.find(|act| checked.takes(act, makers))))''',
+     '''    Some(Newest::Hidden(None))''',
+     [NEVER_HAD]),
+    ("H05 what is held hidden is in force", LISTS,
+     '''            Some(Newest::Hidden(Some(act))) => hidden.push(act),''',
+     '''            Some(Newest::Hidden(Some(act))) => chosen.push(act),''',
+     [NEVER_HAD]),
+    ("H06 what is held hidden is not kept within a bound", LISTS,
+     '''        let mut left: Vec<&AnyAct> = hidden.iter().filter(|act| of_part(act)).collect();''',
+     '''        let mut left: Vec<&AnyAct> = Vec::new();''',
+     [NEVER_HAD, HIDES_AT_RECOVERY]),
+    ("H07 an act lets go of what was held hidden", LISTS,
+     '''        let bounded = within_bounds(held, left_out, &makers);''',
+     '''        let bounded = within_bounds(held, Vec::new(), &makers);''',
+     [NEVER_HAD]),
+    ("H08 a recovery lets go of what is held hidden", LISTS,
+     '''    let bounded = within_bounds(chosen, hidden, &makers);
+    (list_of(bounded.list, 0), list_of(bounded.left_out, 0))''',
+     '''    let bounded = within_bounds(chosen, Vec::new(), &makers);
+    (list_of(bounded.list, 0), list_of(bounded.left_out, 0))''',
+     [HIDES_AT_RECOVERY]),
+    ("H09 what is held hidden is first held when it comes back", LISTS,
+     '''    for act in &hidden {
+        let at = lists.first_held_of(act).unwrap_or(now);
+        first_held.insert(act.key(), (act.signature(), at));
+    }''',
+     '''''',
+     [NEVER_HAD]),
+    ("H10 an act of a key the device does not know dates nothing", LISTS,
+     '''        .filter(|act| act.key() == *key && checked.holds(act))''',
+     '''        .filter(|act| act.key() == *key && checked.takes(act, makers))''',
+     [DATED]),
+    ("H11 an act of a key the device does not know dates every item", LISTS,
+     '''        .filter(|act| act.key() == *key && checked.holds(act))''',
+     '''        .filter(|act| checked.holds(act))''',
+     [DATED]),
+    ("H12 an act that does not hold dates its item", LISTS,
+     '''        .filter(|act| act.key() == *key && checked.holds(act))''',
+     '''        .filter(|act| act.key() == *key)''',
+     [DATED]),
+    ("U01 an unsubscription needs a place", LISTS,
+     '''if subscription.subscribed && full(''',
+     '''if full(''',
+     [UNDO_NO_PLACE]),
+    ("U02 a removed label needs a place", LISTS,
+     '''if label.label.is_some() && full(''',
+     '''if full(''',
+     [UNDO_NO_PLACE]),
+    ("U03 a subscription needs no place", LISTS,
+     '''if subscription.subscribed && full(''',
+     '''if !subscription.subscribed && full(''',
+     [UNDO_NO_PLACE]),
+    ("U04 a label needs no place", LISTS,
+     '''if label.label.is_some() && full(''',
+     '''if label.label.is_none() && full(''',
+     [UNDO_NO_PLACE]),
     # ── An act's bytes ──
     ("A01 an act's bytes leave out its time, count, maker and signature", ACTS,
      '''        self.write(&mut out, &|_| true)?;
