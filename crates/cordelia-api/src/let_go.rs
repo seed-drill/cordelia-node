@@ -347,15 +347,16 @@ pub fn started_again_says(name: &str) -> String {
     )
 }
 
-/// What is said where what was read has changed since the read ended in
-/// a way that the store's order does not show (decision 2026-10-17 §4.2
-/// item 8, §5.3): a folder was mapped to the name while it was read.
-pub fn changed_since_says(name: &str) -> String {
+/// What is said where a folder was mapped to the name while it was read
+/// (decision 2026-10-17 §4.2 item 8): the store's order does not show it,
+/// since a folder takes nothing in until its first cycle. The name is
+/// held by that folder now. Nothing tells the person to unmap the name
+/// again: that would unmap the folder.
+pub fn folder_mapped_says(name: &str) -> String {
+    let shown = shown(name);
     format!(
-        "{} is still held: what was read has changed since, or is too old. Run `cordelia sync \
-         unmap {}` again.",
-        shown(name),
-        typed(name)
+        "{shown} is still held: a folder was mapped to {shown} while the relays were read, and \
+         {shown} is held by that folder now. Nothing was let go."
     )
 }
 
