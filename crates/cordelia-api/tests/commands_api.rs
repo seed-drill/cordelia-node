@@ -641,9 +641,9 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         "{said}"
     );
 
-    // The name is held by the carry, with no folder mapped to it. While
-    // a version that was brought in there has been sent to no relay, the
-    // name is not let go: the node refuses, and says how much waits.
+    // The name is held by the carry, with no folder mapped to it. Before
+    // it is let go the node reads the relays (decision 2026-10-17 §4.2):
+    // with no network it reads none, and the name is not let go.
     let lab = held(&state).unwrap();
     {
         use cordelia_api::publish::{PlannedAgainst, Published, Write, publish};
@@ -691,18 +691,14 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     assert!(seen.get("sent_to_no_relay").is_none(), "{seen}");
     assert_eq!(seen["state"], "applied", "{seen}");
     let unmap = json!({ "folder": "lab" });
+    let not_read = "lab is not let go: this device could not read the relays just now. Run \
+                    `cordelia sync unmap lab` again.";
+    // It does not wait for a read that nothing would make.
+    let began = std::time::Instant::now();
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
+    assert!(began.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(status, 409, "{said}");
-    assert!(
-        said.to_string()
-            .contains("lab is not let go: 1 version of it waits to be sent"),
-        "{said}"
-    );
-    assert!(
-        said.to_string()
-            .contains("The name can be let go once it is sent"),
-        "{said}"
-    );
+    assert!(said.to_string().contains(not_read), "{said}");
     assert_eq!(held(&state), Some(lab));
     // A folder is mapped to the name, and unmapped again: the name is
     // still held, as it was before the folder, and the answer to the
@@ -730,10 +726,9 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     assert_eq!(status, 200, "{said}");
     assert!(said.get("still_held").is_none(), "{said}");
     assert_eq!(held(&state), Some(lab));
-    // A relay was sent it: unmapping the name lets go of it, and the
-    // answer says so, and that the statement lists this device alone.
-    // Asked again, nothing is mapped so, as for any word that names no
-    // mapping.
+    // The notes say that a relay was sent it: unmapping the name still
+    // reads the relays first, and lets nothing go where none was read.
+    // A word that names nothing held is no mapping.
     {
         let db = state.db.lock().unwrap();
         let last = kept_rows::last_taken(&db, &lab).unwrap();
@@ -745,12 +740,12 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
         json!({ "versions": 0, "names": 0 }),
         "{seen}"
     );
-    let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap.clone());
-    assert_eq!(status, 200, "{said}");
-    assert_eq!(said["let_go"], "lab");
-    assert_eq!(said["let_go_alone"], true);
-    assert_eq!(held(&state), None);
     let (status, said) = asks!(app, "/api/v1/sync/unmap", unmap);
+    assert_eq!(status, 409, "{said}");
+    assert!(said.to_string().contains(not_read), "{said}");
+    assert_eq!(held(&state), Some(lab));
+    let never = json!({ "folder": "never" });
+    let (status, said) = asks!(app, "/api/v1/sync/unmap", never);
     assert_eq!(status, 400, "{said}");
     assert!(
         said.to_string().contains("is not mapped on this device"),

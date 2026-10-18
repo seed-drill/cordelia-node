@@ -213,6 +213,10 @@ pub async fn round(state: &AppState, name: &str, read: Option<ReadId>) -> Result
     let channel = held_rows::channel_of_name(&*lock()?, name)
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::BadRequest(format!("{name} is not mapped on this device")))?;
+    // A node with no network reads no relay.
+    if state.push_tx.is_none() {
+        return Err(ApiError::Conflict(not_read_says(name)));
+    }
     let reads = state.own_channels.reads();
     let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     let read = match read {
