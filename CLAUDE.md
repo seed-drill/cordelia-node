@@ -47,7 +47,7 @@ cordelia-node/
                          #   the share), shared (forms 3 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 20). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 21). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -57,7 +57,10 @@ cordelia-node/
                          #   channel it held; H and the live numbers, the index, places
                          #   and the shown time; a row overwritten before it goes, in the
                          #   caller's write); shared_lists (step 20: what a device keeps
-                         #   beside its list of shared channels); db (secure_delete, set
+                         #   beside its list of shared channels); shared (step 21: the
+                         #   shared channels a device holds, the table of keys of each
+                         #   with its room, and the index of shared messages); db
+                         #   (secure_delete, set
                          #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
                          #   kind: channels, items, psk, search
@@ -68,7 +71,9 @@ cordelia-node/
                          #   counts, carrying), adding, change, leaving, look, names, publish,
                          #   take (the one door for an entry), lists (the person's lists
                          #   of shared channels: acts, their order and dating, fresh lists,
-                         #   freeing, coming back, a recovery's read), at_relays, local (the local
+                         #   freeing, coming back, a recovery's read), shared (the door's
+                         #   branch for a shared channel and its reader: the room, the
+                         #   keys shown, taking out, reading again), at_relays, local (the local
                          #   API for the names a device holds), commands (the routes behind
                          #   the device commands), carry and carrying (a carry that a person
                          #   asks for, and the phrase's word for it), recover, swept (old

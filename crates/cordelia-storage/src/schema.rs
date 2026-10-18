@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -961,6 +961,174 @@ CREATE TABLE shared_list_freed (
 );
 "#;
 
+/// Migration v21: what a device keeps of the shared channels it holds
+/// (decision 2026-10-10 §2.2, §2.3, §2.4, §6.3, §14). Each column takes
+/// only its type and its bound.
+///
+/// - `shared_channels`: each shared channel by its ID, with its card (a
+///   seed and one or two relays: 65 or 97 bytes), the name the person
+///   files it under (a name, at most `AGENT_MESSAGE_NAME_MAX_BYTES`), how
+///   it came (1 made, 2 taken from the share of the key in `came_from`, 3
+///   moved to from the channel in `came_from`), its state (1 held, 2
+///   dropped, 3 moved from, 4 filed by no act in force), when the device
+///   first held it and when it left it, the room taken by the keys the
+///   person does not know, how many rows of keys the table let go, and when
+///   a read again was asked and when the last began.
+/// - `shared_keys`: a row for each key that stored an entry in a channel or
+///   was refused one for room, as `cordelia_storage::shared::Key` holds it.
+///   A revision kept of a key let go is in the bottom half of band 0.
+/// - `shared_unopened`: the slots of a key beyond the 64 shown whose entries
+///   wait to be opened.
+/// - `shared_labelled`: the keys labelled when the device last kept its
+///   channels.
+/// - `shared_index`, `shared_numbers`, `shared_first_held`,
+///   `shared_signers` and `shared_places`: the index of shared messages and
+///   its rows, of the shape of step 19's, keyed by the channel's row
+///   (decision 2026-10-10 §14: `message_generations` takes only a channel
+///   of a statement). A row of first holding of a message taken out with
+///   its key's entries keeps its place, to be read again as it was.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V21: &str = r#"
+CREATE TABLE shared_channels (
+    id          INTEGER PRIMARY KEY,
+    channel     BLOB NOT NULL UNIQUE CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    card        BLOB NOT NULL CHECK(typeof(card) = 'blob' AND length(card) IN (65, 97)),
+    name        TEXT NOT NULL CHECK(typeof(name) = 'text'
+                                    AND length(CAST(name AS BLOB)) >= 1
+                                    AND length(CAST(name AS BLOB)) <= 200),
+    came        INTEGER NOT NULL CHECK(came IN (1, 2, 3)),
+    came_from   BLOB CHECK((came = 1) = (came_from IS NULL)
+                           AND (came_from IS NULL
+                                OR (typeof(came_from) = 'blob' AND length(came_from) = 32))),
+    state       INTEGER NOT NULL CHECK(state IN (1, 2, 3, 4)),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    left_at     INTEGER CHECK(left_at IS NULL OR typeof(left_at) = 'integer'),
+    room        INTEGER NOT NULL DEFAULT 0 CHECK(typeof(room) = 'integer' AND room >= 0),
+    let_go      INTEGER NOT NULL DEFAULT 0 CHECK(typeof(let_go) = 'integer' AND let_go >= 0),
+    read_asked  INTEGER CHECK(read_asked IS NULL OR typeof(read_asked) = 'integer'),
+    read_begun  INTEGER CHECK(read_begun IS NULL OR typeof(read_begun) = 'integer')
+);
+
+CREATE TABLE shared_keys (
+    channel           INTEGER NOT NULL REFERENCES shared_channels(id),
+    key               BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    known             INTEGER NOT NULL CHECK(known IN (0, 1)),
+    unknown_since     INTEGER CHECK(unknown_since IS NULL
+                                    OR (typeof(unknown_since) = 'integer' AND known = 0)),
+    held_order        INTEGER CHECK(held_order IS NULL
+                                    OR (typeof(held_order) = 'integer' AND held_order >= 1)),
+    first_held        INTEGER CHECK(first_held IS NULL OR typeof(first_held) = 'integer'),
+    last_held         INTEGER CHECK(last_held IS NULL OR typeof(last_held) = 'integer'),
+    first_refused     INTEGER CHECK(first_refused IS NULL OR typeof(first_refused) = 'integer'),
+    last_refused      INTEGER CHECK(last_refused IS NULL OR typeof(last_refused) = 'integer'),
+    last_seq          INTEGER NOT NULL CHECK(typeof(last_seq) = 'integer' AND last_seq >= 1),
+    bytes_stored      INTEGER NOT NULL DEFAULT 0
+                          CHECK(typeof(bytes_stored) = 'integer' AND bytes_stored >= 0),
+    bytes_refused     INTEGER NOT NULL DEFAULT 0
+                          CHECK(typeof(bytes_refused) = 'integer' AND bytes_refused >= 0),
+    kept_message_rev  INTEGER CHECK(kept_message_rev IS NULL
+                                    OR (typeof(kept_message_rev) = 'integer'
+                                        AND kept_message_rev >= 0
+                                        AND kept_message_rev < 8796093022208)),
+    kept_anew_rev     INTEGER CHECK(kept_anew_rev IS NULL
+                                    OR (typeof(kept_anew_rev) = 'integer'
+                                        AND kept_anew_rev >= 0
+                                        AND kept_anew_rev < 8796093022208)),
+    CHECK((held_order IS NULL) = (first_held IS NULL)),
+    CHECK((first_held IS NULL) = (last_held IS NULL)),
+    CHECK((first_refused IS NULL) = (last_refused IS NULL)),
+    CHECK(first_held IS NOT NULL OR first_refused IS NOT NULL),
+    PRIMARY KEY (channel, key)
+);
+
+CREATE INDEX idx_shared_keys_held_order ON shared_keys(channel, held_order);
+CREATE INDEX idx_shared_keys_last_seq ON shared_keys(channel, last_seq);
+
+CREATE TABLE shared_unopened (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    key      BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    slot     BLOB NOT NULL CHECK(typeof(slot) = 'blob' AND length(slot) = 32),
+    PRIMARY KEY (channel, key, slot)
+);
+
+CREATE TABLE shared_labelled (
+    key  BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32)
+);
+
+CREATE TABLE shared_index (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    id          BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    subject     TEXT NOT NULL,
+    thread      BLOB NOT NULL CHECK(typeof(thread) = 'blob' AND length(thread) = 16),
+    answers     BLOB NOT NULL CHECK(typeof(answers) = 'blob' AND length(answers) = 16),
+    asks        INTEGER NOT NULL CHECK(asks IN (0, 1)),
+    link        TEXT,
+    body        TEXT NOT NULL,
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    placed_at   INTEGER CHECK(placed_at IS NULL OR typeof(placed_at) = 'integer'),
+    PRIMARY KEY (channel, id)
+);
+
+CREATE INDEX idx_shared_index_signer ON shared_index(channel, signer);
+
+CREATE TABLE shared_numbers (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer   BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                    AND number >= 1 AND number <= 4398046511103),
+    id       BLOB NOT NULL,
+    FOREIGN KEY (channel, id) REFERENCES shared_index(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, signer, number)
+);
+
+CREATE INDEX idx_shared_numbers_id ON shared_numbers(channel, id);
+
+CREATE TABLE shared_first_held (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                       AND number >= 1 AND number <= 4398046511103),
+    id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
+    sent        INTEGER CHECK(sent IS NULL OR typeof(sent) = 'integer'),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    taken_out   INTEGER NOT NULL DEFAULT 0 CHECK(taken_out IN (0, 1)),
+    placed_at   INTEGER CHECK(placed_at IS NULL
+                              OR (typeof(placed_at) = 'integer' AND taken_out = 1)),
+    CHECK((id IS NULL) = (sent IS NULL)),
+    CHECK(id IS NOT NULL OR taken_out = 0),
+    PRIMARY KEY (channel, signer, number)
+);
+
+CREATE INDEX idx_shared_first_held_id ON shared_first_held(channel, id);
+
+CREATE TABLE shared_signers (
+    channel       INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer        BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    highest       INTEGER NOT NULL CHECK(typeof(highest) = 'integer'
+                                         AND highest >= 0 AND highest <= 4398046511103),
+    overwritten   INTEGER NOT NULL DEFAULT 0
+                      CHECK(typeof(overwritten) = 'integer' AND overwritten >= 0),
+    not_messages  INTEGER NOT NULL DEFAULT 0
+                      CHECK(typeof(not_messages) = 'integer' AND not_messages >= 0),
+    counted_from  INTEGER CHECK(counted_from IS NULL
+                                OR (typeof(counted_from) = 'integer'
+                                    AND counted_from >= 1 AND counted_from <= highest)),
+    PRIMARY KEY (channel, signer)
+);
+
+CREATE TABLE shared_places (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    placed_at   INTEGER NOT NULL CHECK(typeof(placed_at) = 'integer'),
+    unlabelled  INTEGER NOT NULL CHECK(unlabelled IN (0, 1))
+);
+
+CREATE INDEX idx_shared_places ON shared_places(channel, signer, placed_at);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1176,6 +1344,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 20 {
         tracing::info!("applying migration v20 (the person's lists of shared channels)");
         migrate_in_one(conn, MIGRATION_V20, 20)?;
+    }
+
+    if current < 21 {
+        tracing::info!("applying migration v21 (the shared channels a device holds)");
+        migrate_in_one(conn, MIGRATION_V21, 21)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1772,7 +1945,7 @@ mod tests {
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
-                   AND name NOT LIKE '%shared_list%'
+                   AND name NOT LIKE '%shared%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1996,7 +2169,7 @@ mod tests {
                AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE '%person_left%'
                AND name NOT LIKE '%message%'
-               AND name NOT LIKE '%shared_list%'
+               AND name NOT LIKE '%shared%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -2206,7 +2379,7 @@ mod tests {
                    AND name NOT LIKE '%person_names_before%'
                    AND name NOT LIKE '%person_left%'
                    AND name NOT LIKE '%message%'
-                   AND name NOT LIKE '%shared_list%'
+                   AND name NOT LIKE '%shared%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -3139,7 +3312,7 @@ mod tests {
             // What the step to version 19 adds, and what later steps add.
             if NEW_IN_V19.contains(&name.as_str())
                 || name.contains("message")
-                || name.contains("shared_list")
+                || name.contains("shared")
             {
                 continue;
             }
@@ -4235,7 +4408,41 @@ mod tests {
     fn new_in_v20(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
-             WHERE name LIKE 'shared%' AND name NOT LIKE 'sqlite_autoindex%'
+             WHERE name LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// What the step to version 21 adds: nine tables and their indexes.
+    const NEW_IN_V21: [&str; 15] = [
+        "idx_shared_first_held_id",
+        "idx_shared_index_signer",
+        "idx_shared_keys_held_order",
+        "idx_shared_keys_last_seq",
+        "idx_shared_numbers_id",
+        "idx_shared_places",
+        "shared_channels",
+        "shared_first_held",
+        "shared_index",
+        "shared_keys",
+        "shared_labelled",
+        "shared_numbers",
+        "shared_places",
+        "shared_signers",
+        "shared_unopened",
+    ];
+
+    /// What a database holds of the step to version 21, by name.
+    fn new_in_v21(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE 'shared%' OR name LIKE 'idx_shared%')
+               AND name NOT LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
         .unwrap()
@@ -4246,8 +4453,23 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row, but
-    /// what the step to version 20 adds.
+    /// what the steps of the shared channels' record add, from step 20 on.
     fn everything_but_v20(conn: &Connection) -> Vec<String> {
+        everything_but(conn, |name| name.contains("shared"))
+    }
+
+    /// Everything a database holds, each definition and each row, but
+    /// what the step to version 21 adds.
+    fn everything_but_v21(conn: &Connection) -> Vec<String> {
+        everything_but(conn, |name| {
+            NEW_IN_V21.contains(&name)
+                || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
+        })
+    }
+
+    /// Everything a database holds, each definition and each row, but what
+    /// `left_out` names.
+    fn everything_but(conn: &Connection, left_out: impl Fn(&str) -> bool) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
             .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
             .unwrap()
@@ -4257,7 +4479,7 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            if name.contains("shared_list") {
+            if left_out(&name) {
                 continue;
             }
             held.push(format!("{name}: {}", sql.unwrap_or_default()));
@@ -4309,11 +4531,12 @@ mod tests {
             "the tables go with the version"
         );
 
-        // The next start runs the step from the beginning.
+        // The next start runs the step from the beginning, and the steps
+        // after it.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 20);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v20(&conn), NEW_IN_V20);
+        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
         assert_eq!(everything_but_v20(&conn), before);
         let counted = |conn: &Connection| -> Vec<i64> {
             NEW_IN_V20
@@ -4411,6 +4634,247 @@ mod tests {
         ] {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
+
+        step_21_adds_its_tables_and_changes_no_older_row();
+    }
+
+    /// The step to version 21 (decision 2026-10-10 §2.2, §6.3, §14): from a
+    /// database at step 20 that holds rows of it, it adds the tables of the
+    /// shared channels a device holds, empty, and changes no older row or
+    /// definition; a failure leaves none of it, and the step asked for
+    /// twice is run once. Each column takes only its type and its bound: a
+    /// channel's ID, a card, a name and how a channel came; a key's row,
+    /// held or refused, with revisions kept below the half of band 0; a
+    /// message's ID, number and place.
+    fn step_21_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v19();
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
+        conn.execute_batch(
+            "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
+                 VALUES (1, zeroblob(13), zeroblob(13), NULL, 9);",
+        )
+        .unwrap();
+        let before = everything_but_v21(&conn);
+        assert!(before.iter().any(|row| row.starts_with("shared_lists: ")));
+        assert!(new_in_v21(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V21} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 21).is_err());
+        assert_eq!(version(&conn), 20);
+        assert!(
+            new_in_v21(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 21);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
+        assert_eq!(everything_but_v21(&conn), before);
+
+        let tables = [
+            "shared_channels",
+            "shared_keys",
+            "shared_unopened",
+            "shared_labelled",
+            "shared_index",
+            "shared_numbers",
+            "shared_first_held",
+            "shared_signers",
+            "shared_places",
+        ];
+        let counted = |conn: &Connection| -> Vec<i64> {
+            tables
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 9]);
+
+        // What the device keeps, at the bounds of each column.
+        let name = "n".repeat(200);
+        conn.execute_batch(&format!(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9),
+                        (2, X'{one}', zeroblob(97), '{name}', 3, zeroblob(32), 4, 9),
+                        (3, X'{two}', zeroblob(97), 'r', 2, zeroblob(32), 2, 9);
+             INSERT INTO shared_keys (channel, key, known, held_order, first_held, last_held,
+                                      last_seq, bytes_stored, kept_message_rev, kept_anew_rev)
+                 VALUES (1, zeroblob(32), 0, 1, 9, 9, 1, 214016, 8796093022207, 0);
+             INSERT INTO shared_keys (channel, key, known, unknown_since, first_refused,
+                                      last_refused, last_seq, bytes_refused)
+                 VALUES (1, X'{one}', 0, 9, 9, 9, 2, 3072);
+             INSERT INTO shared_unopened (channel, key, slot)
+                 VALUES (1, zeroblob(32), zeroblob(32));
+             INSERT INTO shared_labelled (key) VALUES (zeroblob(32));
+             INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(16), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 1,
+                         'owner/repo#1', 'b', 9, NULL);
+             INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 4398046511103, zeroblob(16));
+             INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 1, zeroblob(16), 9, 9, 1, 9),
+                        (1, zeroblob(32), 2, NULL, NULL, 9, 0, NULL);
+             INSERT INTO shared_signers (channel, signer, highest, overwritten, not_messages,
+                                         counted_from)
+                 VALUES (1, zeroblob(32), 4398046511103, 0, 0, 1);
+             INSERT INTO shared_places (channel, signer, placed_at, unlabelled)
+                 VALUES (1, zeroblob(32), 9, 1);",
+            one = "01".repeat(32),
+            two = "02".repeat(32),
+        ))
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [3, 2, 1, 1, 1, 1, 2, 1, 1]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(everything_but_v21(&conn), before);
+
+        let channel = |values: &str| {
+            format!(
+                "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                              first_held)
+                 VALUES (9, {values})"
+            )
+        };
+        let key = |columns: &str, values: &str| {
+            format!("INSERT INTO shared_keys (channel, key, last_seq, {columns}) VALUES ({values})")
+        };
+        let held = "known, held_order, first_held, last_held";
+        let three = "X'".to_string() + &"03".repeat(32) + "'";
+        let refused = [
+            channel("zeroblob(31), zeroblob(65), 'r', 1, NULL, 1, 9"),
+            channel("zeroblob(32), zeroblob(65), 'r', 1, NULL, 1, 9"),
+            channel(&format!("{three}, zeroblob(64), 'r', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(98), 'r', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(65), '', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(65), '{name}n', 1, NULL, 1, 9")),
+            channel(&format!(
+                "{three}, zeroblob(65), zeroblob(1), 1, NULL, 1, 9"
+            )),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 4, zeroblob(32), 1, 9"
+            )),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 1, zeroblob(32), 1, 9"
+            )),
+            channel(&format!("{three}, zeroblob(65), 'r', 2, NULL, 1, 9")),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 3, zeroblob(31), 1, 9"
+            )),
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 5, 9")),
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 1, 'nine'")),
+            key(held, "1, zeroblob(31), 1, 0, 2, 9, 9"),
+            key(held, &format!("9, {three}, 1, 0, 2, 9, 9")),
+            key(held, &format!("1, {three}, 1, 2, 2, 9, 9")),
+            key(held, &format!("1, {three}, 0, 0, 0, 9, 9")),
+            key(held, &format!("1, {three}, 1, 0, NULL, 9, 9")),
+            key(held, &format!("1, {three}, 1, 0, 2, 9, NULL")),
+            key(held, &format!("1, {three}, 1, 0, 2, NULL, NULL")),
+            key("known", &format!("1, {three}, 1, 0")),
+            key(
+                "known, unknown_since, first_refused, last_refused",
+                &format!("1, {three}, 1, 1, 9, 9, 9"),
+            ),
+            key("known, first_refused", &format!("1, {three}, 1, 0, 9")),
+            key(
+                &format!("{held}, bytes_stored"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, -1"),
+            ),
+            key(
+                &format!("{held}, kept_message_rev"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, 8796093022208"),
+            ),
+            key(
+                &format!("{held}, kept_anew_rev"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, -1"),
+            ),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 0, zeroblob(16))"
+                .into(),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 4398046511104, zeroblob(16))"
+                .into(),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 7, X'01010101010101010101010101010101')"
+                .into(),
+            "INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(15), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 0,
+                         NULL, 'b', 9, NULL)"
+                .into(),
+            "INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 3, zeroblob(16), 9, 9, 0, 9)"
+                .into(),
+            "INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 3, NULL, NULL, 9, 1, NULL)"
+                .into(),
+            "INSERT INTO shared_signers (channel, signer, highest, overwritten, not_messages,
+                                         counted_from)
+                 VALUES (1, X'0101010101010101010101010101010101010101010101010101010101010101',
+                         4398046511104, 0, 0, NULL)"
+                .into(),
+            "INSERT INTO shared_places (channel, signer, placed_at, unlabelled)
+                 VALUES (1, zeroblob(32), 9, 2)"
+                .into(),
+        ];
+        for refused in refused {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        // Each refused in its place is taken where it is of its type and
+        // within its bound.
+        for taken in [
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 1, 9")),
+            key(held, &format!("1, {three}, 1, 0, 2, 9, 9")),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 7, zeroblob(16))"
+                .into(),
+        ] {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// The bounds that step 21 writes as numbers in its SQL are those of
+    /// protocol.rs (decision 2026-10-10 §2.1, §2.3, §6.3): a card of one
+    /// relay and of two, a name at its longest, a revision kept below the
+    /// half of band 0, and a message's highest number.
+    #[test]
+    fn step_21s_bounds_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::{
+            AGENT_MESSAGE_NAME_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX, REV_BAND_HALF,
+            SHARED_MAX_RELAYS, SHARED_SEED_BYTES,
+        };
+        let count = |text: &str| MIGRATION_V21.matches(text).count();
+        let card = |relays: usize| SHARED_SEED_BYTES + 1 + 32 * relays;
+        assert_eq!(SHARED_MAX_RELAYS, 2);
+        assert_eq!(
+            count(&format!("length(card) IN ({}, {}))", card(1), card(2))),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "length(CAST(name AS BLOB)) <= {AGENT_MESSAGE_NAME_MAX_BYTES})"
+            )),
+            1
+        );
+        assert_eq!(count(&format!("_rev < {REV_BAND_HALF}))")), 2);
+        assert_eq!(count(&REV_BAND_HALF.to_string()), 2);
+        assert_eq!(count(&format!("number <= {AGENT_MESSAGE_NUMBER_MAX})")), 2);
+        assert_eq!(count(&format!("highest <= {AGENT_MESSAGE_NUMBER_MAX})")), 1);
     }
 
     /// The bounds that step 20 writes as numbers in its SQL are those of
@@ -4463,7 +4927,7 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 20, own: 19 })
+                Err(StorageError::LaterVersion { found: 21, own: 19 })
             ),
             "{refused:?}"
         );
@@ -4531,6 +4995,7 @@ mod tests {
             assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
             assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
             assert_eq!(new_in_v20(&conn), NEW_IN_V20, "from version {at}");
+            assert_eq!(new_in_v21(&conn), NEW_IN_V21, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }
