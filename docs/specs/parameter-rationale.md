@@ -1644,20 +1644,6 @@ first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
 never costs the fifth reading, which a channel at its cap needs: four
 readings of a relay that hands what it may come to about 15.5 MiB.
 
-#### LEFT_REFUSED_IN_A_ROW_MAX = 2
-
-**Derivation:** `BAN_THRESHOLD` − 1.
-
-**Rationale:** How many pulls in a row, with no page between them, a read
-through the door for a carry lets a relay refuse for now before it ends its
-read there in part (decision 2026-10-17 §3.2). A relay that has no room to
-hand a page resets the pull with `ERR_RATE_LIMIT`, which is no breach, and
-the read waits and asks again. But a relay resets with the same code a
-request over its rate, which it counts as a breach, and it cuts an address
-off at `BAN_THRESHOLD` breaches: so the device asks again only while it
-stays below that. A relay that counts more than the device does (devices
-behind one address) still sees no more than this from one read in a row.
-
 #### CARRY_FROM_WORDS = 6
 
 **Rationale:** How many words of a key's fingerprint name a removed key at
@@ -1678,6 +1664,21 @@ at once, and a word that is found later is no word.
 **Why ten minutes:** neither the code nor the record gives a reason for the
 number. It is longer than a carry may read a name (`CARRY_READ_MAX_SECS`);
 no measurement behind it yet.
+
+#### LET_GO_READ_STANDS_SECS = 600
+
+**Derivation:** `CARRY_WORD_SECS`, as a `u64`; `protocol.rs` asserts that
+`CARRY_WORD_SECS` is above 0.
+
+**Rationale:** How long the read that `cordelia sync unmap` shows, or the
+count that a device that has stopped took from its notes, stands for the
+`discard` that follows it (decision 2026-10-17 §5). The person reads the
+lines and types the word in that time. A word typed later lets go of
+nothing, and the command is run again. It is measured from the end of the
+read's last round, on the node's monotonic clock, so that a step of the wall
+clock neither widens nor shortens it, and a read older than it is kept no
+more. Derived: as long as a word of the phrase for a carry stands, the other
+act at a prompt that follows what the node read.
 
 #### CARRY_PART_MAX_BYTES = 512 KB
 
