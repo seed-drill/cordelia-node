@@ -23,7 +23,11 @@
 //!    the first words of its key's fingerprint and how much it signed
 //!    there: the statement's devices first, always; then
 //!    the keys added since that count; then the records that do not
-//!    count; 256 rows in all. It says first where the answers could not
+//!    count, in the order a reader keeps them, so that each device that
+//!    may add has a row for its first three keys that the 64 kept out;
+//!    256 rows in all. A key that several devices added is shown with
+//!    each label beside the device that gave it (decision 2026-10-17
+//!    §2.4). It says first where the answers could not
 //!    all be kept: a statement has room for 256 removed keys. Of each
 //!    device that counts it asks one of three things: the person still
 //!    has it, it is lost or broken, or it may be in someone else's
@@ -63,7 +67,7 @@
 //! of the generation recovered from and of those before it,** which the
 //! machine keeps as a device keeps a secret it left (§3, §9).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -76,7 +80,7 @@ use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
 use cordelia_core::protocol::{
-    CARRY_READ_MAX_SECS, MAX_COUNTED_DEVICES, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
+    CARRY_READ_MAX_SECS, KEPT_OUT_PER_ADDER, MAX_COUNTED_DEVICES, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
     MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES, RECOVERY_READ_ON_READS,
 };
 use cordelia_crypto::entry::CheckedEntry;
@@ -198,17 +202,13 @@ fn asked_for_room_says(left: usize) -> String {
 
 /// What is said of a key that is asked about for the bound of 64 alone,
 /// before its answer is asked: what is said of any row ([`row_says`]),
-/// and what the answers do for it ([`asked_for_room_says`]). `under` is
-/// the key for whose record it is asked about: where the row shows
-/// another that added it, this one is named too. `left` is how many
-/// removals the phrase has left.
-fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32], left: usize) -> String {
-    let mut says = row_says(rows, at, number);
-    if rows[at].added_by.is_some_and(|(shown, _)| shown != *under) {
-        let label = rows.iter().find(|row| row.key == *under);
-        let label = label.map(|row| row.label.as_str()).unwrap_or_default();
-        says.push_str(&format!("\n  {} added it too.", named(label, under)));
-    }
+/// and what the answers do for it ([`asked_for_room_says`]). It is asked
+/// under the first adder, in the order of the rows, that is not in
+/// someone else's hands ([`recover::asked_for_room`]), and the row shows
+/// every such adder, each with its label (decision 2026-10-17 §2.4).
+/// `left` is how many removals the phrase has left.
+fn for_room_says(rows: &[Row], answers: &[Answer], at: usize, number: u64, left: usize) -> String {
+    let says = row_says(rows, answers, at, number);
     format!("{says}\n{}", asked_for_room_says(left))
 }
 
@@ -311,7 +311,10 @@ fn not_shown_says(not_shown: usize) -> Option<String> {
 /// the bound of 64 kept out, may be among either.** Its key is removed
 /// afterwards as that of a row that was not asked about is
 /// ([`removed_afterwards`]), and one that the person still has is added
-/// again by hand.
+/// again by hand. **What is kept, and shown, leaves each adder that may
+/// add its first `KEPT_OUT_PER_ADDER` such keys** (decision 2026-10-17
+/// §2.2, §2.5): it says so, so that a person knows that only an adder
+/// that added more than that can have left one of theirs out.
 ///
 /// It is said before the first question ([`said_first`]), and again
 /// before the yes ([`will_do_lines`]).
@@ -350,7 +353,10 @@ fn no_row_says(generation: &Generation, number: u64) -> Option<String> {
         );
     }
     Some(format!(
-        "{}, because more were written than a recovery keeps. A device of yours that was added \
+        "{}, because more were written than a recovery keeps. Each device that may add keeps a \
+         row for at least the first {KEPT_OUT_PER_ADDER} devices that it added since change \
+         {number} and that {MAX_COUNTED_DEVICES} devices counted already kept out: a device that \
+         added more than that may have left one of them here. A device of yours that was added \
          since change {number} may be among them.{of_each} If it is a device of yours that is \
          gone, {}. One that you still have is added again by hand.",
         found.join(", and "),
@@ -1112,15 +1118,63 @@ fn lists_lines(statement: &Statement, own: &[u8; 32]) -> anyhow::Result<Vec<Stri
 /// statement lists it or who added it since and when, and how much it
 /// signed in the personal channel. A record that does not count is said
 /// to be one, and where it fails only for the bound of 64 counted
-/// devices, that is said.
-fn row_says(rows: &[Row], at: usize, number: u64) -> String {
+/// devices, that is said. `answers` are those given so far.
+///
+/// **A key that the 64 kept out, and that several adders added, is shown
+/// with each label beside the adder that gave it** (decision 2026-10-17
+/// §2.4, §1 property 3), in the order of the adders' rows, so that no one
+/// adder's label stands for the key: where the labels differ, the row
+/// says that the words are what tells two apart. An adder that may be in
+/// someone else's hands ([`recover::adders_shown`]) is counted, and not
+/// shown, also where it is the only one: the key is then shown by its
+/// words alone ([`recover::label_shown`]). And where the key signed a record of an addition, the row says
+/// that the device it added is not shown (§2.3).
+fn row_says(rows: &[Row], answers: &[Answer], at: usize, number: u64) -> String {
     let row = &rows[at];
     let label_of = |key: &[u8; 32]| {
         let known = rows.iter().find(|row| row.key == *key);
         known.map(|row| row.label.clone()).unwrap_or_default()
     };
+    let for_room =
+        format!(", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted already");
+    let label = recover::label_shown(rows, answers, row);
+    let (shown, hidden) = recover::adders_shown(rows, answers, row);
+    let mut more = Vec::new();
     let whose = match row.added_by {
         None => format!("a device of change {number}"),
+        // Several adders, or one that may be in someone else's hands: each
+        // that is shown with its label, and the others counted.
+        Some(_) if row.no_room.len() > 1 || hidden > 0 => {
+            let from: Vec<String> = shown
+                .iter()
+                .map(|(adder, at, label)| {
+                    let adder = named(&label_of(adder), adder);
+                    format!("from {adder} at {} as {label:?}", time_of(*at))
+                })
+                .collect();
+            let hands = match (shown.is_empty(), hidden) {
+                (_, 0) => String::new(),
+                (true, n) => format!(
+                    " by {} that may be in someone else's hands",
+                    counted(n, "device")
+                ),
+                (false, n) => {
+                    format!(", and {n} more added it, which may be in someone else's hands")
+                }
+            };
+            let labels: BTreeSet<&str> = shown.iter().map(|(_, _, label)| label.as_str()).collect();
+            if labels.len() > 1 {
+                more.push(
+                    "  The labels differ. A label is what the device that added it called it: the \
+                     words are what tells two apart.",
+                );
+            }
+            let from = match from.is_empty() {
+                true => String::new(),
+                false => format!(", {}", from.join(", and ")),
+            };
+            format!("added since change {number}{from}{hands}{for_room}")
+        }
         Some((adder, at)) => format!(
             "added since change {number}, from {} at {}{}",
             named(&label_of(&adder), &adder),
@@ -1128,18 +1182,26 @@ fn row_says(rows: &[Row], at: usize, number: u64) -> String {
             match (row.counts, row.no_room.is_empty()) {
                 (true, _) => String::new(),
                 (false, true) => ", by a record that does not count".to_string(),
-                (false, false) => format!(
-                    ", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted \
-                     already"
-                ),
+                (false, false) => for_room,
             }
         ),
     };
-    format!(
+    if row.signed_a_record {
+        more.push(
+            "  A device that it added is not shown here: a device that does not count adds \
+             nothing.",
+        );
+    }
+    let mut says = format!(
         "\n{}, {whose}. It signed {} in the personal channel of that change.",
-        named(&row.label, &row.key),
+        named(label, &row.key),
         counted(row.signed, "entry").replace("entrys", "entries")
-    )
+    );
+    for line in more {
+        says.push('\n');
+        says.push_str(line);
+    }
+    says
 }
 
 /// Ask one of the three things of a device. **No answer is suggested:**
@@ -1184,8 +1246,12 @@ fn will_do_lines(
     let rows = &generation.rows;
     let taken = recover::takes(rows, answers);
     let mut lines = Vec::new();
+    // Each by the label that its row showed (decision 2026-10-17 §2.4).
     let shown = |keys: Vec<&Row>| -> String {
-        let all: Vec<String> = keys.iter().map(|row| named(&row.label, &row.key)).collect();
+        let all: Vec<String> = keys
+            .iter()
+            .map(|row| named(recover::label_shown(rows, answers, row), &row.key))
+            .collect();
         all.join(", ")
     };
     let from: Vec<&Row> = rows
@@ -1287,6 +1353,103 @@ fn will_do_lines(
             .to_string(),
     );
     lines
+}
+
+/// What the command does at one row of a recovery (decision 2026-10-04
+/// §9, step 3): it says the row and answers it itself, or says it and
+/// asks.
+#[derive(Debug, PartialEq, Eq)]
+enum AtARow {
+    /// What is said, and the answer that stands for it: this machine
+    /// itself, or a record of which nothing is asked.
+    Said(String, Answer),
+    /// What is said before the question.
+    Asks(String),
+}
+
+/// What the command does at the row at `at`, with `answers` the answers
+/// given so far, to every row before it: **what is said of a row turns
+/// on them** (decision 2026-10-17 §2.4), since an adder that may be in
+/// someone else's hands is not shown, nor its label. `number` is the
+/// number of the change recovered from, `own` this machine's key, `room`
+/// what the change has room for, and `removed_already` whether a change
+/// has removed a key already: the one recovered from, or the one made
+/// apart from it.
+fn at_a_row(
+    rows: &[Row],
+    answers: &[Answer],
+    at: usize,
+    number: u64,
+    own: &[u8; 32],
+    room: &recover::Room,
+    removed_already: &dyn Fn(&[u8; 32]) -> bool,
+) -> AtARow {
+    let says = row_says(rows, answers, at, number);
+    if rows[at].key == *own {
+        let says = format!("{says}\n  It is this machine: it is the one device of the change.");
+        return AtARow::Said(says, Answer::Have);
+    }
+    // A record that does not count is shown as that, and nothing is
+    // asked of it: unless only the bound of 64 kept its key out, a key
+    // signed it that may add and is not in someone else's hands, and no
+    // change has removed its key already.
+    if !rows[at].counts {
+        let removed = removed_already(&rows[at].key);
+        if asked_though_it_does_not_count(rows, answers, at, removed).is_none() {
+            let says = format!("{says}\n{}", not_asked_says(&rows[at], removed));
+            return AtARow::Said(says, Answer::NotAsked);
+        }
+        let left = removals_left(room, rows, answers, removed_already);
+        return AtARow::Asks(for_room_says(rows, answers, at, number, left));
+    }
+    let mut says = says;
+    // What was said of the device that added it bears on it.
+    let adders_answer = rows[at]
+        .added_by
+        .and_then(|(adder, _)| rows.iter().position(|row| row.key == adder))
+        .is_some_and(|adder| {
+            let mut so_far = answers.to_vec();
+            so_far.push(Answer::Have);
+            recover::in_other_hands(rows, &so_far, adder)
+        });
+    if adders_answer {
+        says.push_str(
+            "\n  It was added by a device that may be in someone else's hands: nothing that it \
+             wrote is brought back, whatever is said of it.",
+        );
+    }
+    AtARow::Asks(says)
+}
+
+/// The keys that the node is handed with the label of each (decision
+/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone;
+/// `still_have`, each that they still have; and `not_shown`, each row
+/// that could not be shown. **Each label is the one that its row was
+/// shown by** ([`recover::label_shown`], decision 2026-10-17 §2.4): the
+/// node keeps it, and `cordelia devices` shows it afterwards, so an adder
+/// that may be in someone else's hands chooses none. Where every adder of
+/// a key may be, the label is empty, which the node keeps as none: the
+/// key is shown by its words alone, as its row was. `own` is this
+/// machine's key, which is no key of these.
+fn labels_for_the_node(generation: &Generation, answers: &[Answer], own: &[u8; 32]) -> Value {
+    let rows = &generation.rows;
+    let key_and_label = |row: &Row| -> Value {
+        let label = recover::label_shown(rows, answers, row);
+        json!({ "key": hex::encode(row.key), "label": label })
+    };
+    let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
+        rows.iter()
+            .zip(answers)
+            .filter(|(row, said)| answer(said) && row.key != *own)
+            .map(|(row, _)| key_and_label(row))
+            .collect()
+    };
+    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
+    json!({
+        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
+        "still_have": labelled(|said| *said == Answer::Have),
+        "not_shown": not_shown,
+    })
 }
 
 /// `cordelia recover` (see the module's documentation).
@@ -1438,46 +1601,22 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     };
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
-        let says = row_says(rows, at_row, statement.number);
-        if rows[at_row].key == own {
-            println!("{says}\n  It is this machine: it is the one device of the change.");
-            answers.push(Answer::Have);
-            continue;
+        let removed = &removed_already;
+        match at_a_row(
+            rows,
+            &answers,
+            at_row,
+            statement.number,
+            &own,
+            &room,
+            removed,
+        ) {
+            AtARow::Said(says, answer) => {
+                println!("{says}");
+                answers.push(answer);
+            }
+            AtARow::Asks(says) => answers.push(asks_of(&at, &says)?),
         }
-        // A record that does not count is shown as that, and nothing is
-        // asked of it: unless only the bound of 64 kept its key out, a
-        // key signed it that may add and is not in someone else's
-        // hands, and no change has removed its key already.
-        if !rows[at_row].counts {
-            let removed = removed_already(&rows[at_row].key);
-            let under = asked_though_it_does_not_count(rows, &answers, at_row, removed);
-            let Some((under, _)) = under else {
-                println!("{says}\n{}", not_asked_says(&rows[at_row], removed));
-                answers.push(Answer::NotAsked);
-                continue;
-            };
-            let left = removals_left(&room, rows, &answers, removed_already);
-            let says = for_room_says(rows, at_row, statement.number, &under, left);
-            answers.push(asks_of(&at, &says)?);
-            continue;
-        }
-        let mut says = says;
-        // What was said of the device that added it bears on it.
-        let adders_answer = rows[at_row]
-            .added_by
-            .and_then(|(adder, _)| rows.iter().position(|row| row.key == adder))
-            .is_some_and(|adder| {
-                let mut so_far = answers.clone();
-                so_far.push(Answer::Have);
-                recover::in_other_hands(rows, &so_far, adder)
-            });
-        if adders_answer {
-            says.push_str(
-                "\n  It was added by a device that may be in someone else's hands: nothing that \
-                 it wrote is brought back, whatever is said of it.",
-            );
-        }
-        answers.push(asks_of(&at, &says)?);
     }
     if let Some(says) = not_shown_says(generation.not_shown.len()) {
         println!("\n{says}");
@@ -1562,23 +1701,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         left.push(json!({ "number": earlier.number, "secret": hex::encode(&earlier.secret[..]) }));
     }
     drop(for_phrase);
-    let key_and_label =
-        |row: &Row| -> Value { json!({ "key": hex::encode(row.key), "label": row.label }) };
-    let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
-        rows.iter()
-            .zip(&answers)
-            .filter(|(row, said)| answer(said) && row.key != own)
-            .map(|(row, _)| key_and_label(row))
-            .collect()
-    };
-    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
+    let labels = labels_for_the_node(&generation, &answers, &own);
     let mut body = json!({
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
-        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
-        "still_have": labelled(|said| *said == Answer::Have),
-        "not_shown": not_shown,
+        "gone": labels["gone"],
+        "still_have": labels["still_have"],
+        "not_shown": labels["not_shown"],
         "word": word,
     });
     drop(statement_key);
@@ -2245,6 +2375,7 @@ mod tests {
             signed: usize::from(n),
             no_room: Vec::new(),
             record_let_go: false,
+            signed_a_record: false,
         }
     }
 
@@ -2266,7 +2397,7 @@ mod tests {
     #[test]
     fn test_what_is_said_of_a_device_before_its_answer_is_asked() {
         let rows = rows();
-        let laptop = row_says(&rows, 0, 7);
+        let laptop = row_says(&rows, &[], 0, 7);
         assert_eq!(
             laptop,
             format!(
@@ -2275,7 +2406,7 @@ mod tests {
                 fingerprint::shown(&[1; 32])
             )
         );
-        let phone = row_says(&rows, 2, 7);
+        let phone = row_says(&rows, &[], 2, 7);
         assert!(
             phone.contains(&format!(
                 "\"phone\", added since change 7, from ({}) \"desktop\" at 2027-01-15 08:00 UTC. \
@@ -2285,7 +2416,7 @@ mod tests {
             "{phone}"
         );
         // A record that does not count is said to be one.
-        let tablet = row_says(&rows, 3, 7);
+        let tablet = row_says(&rows, &[], 3, 7);
         assert!(
             tablet.contains("by a record that does not count"),
             "{tablet}"
@@ -2293,7 +2424,7 @@ mod tests {
         // A label is another device's word: quoted, it cannot pass for
         // what the command says itself.
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
-        let says = row_says(&odd, 0, 1);
+        let says = row_says(&odd, &[], 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
     }
 
@@ -2303,43 +2434,45 @@ mod tests {
     /// question: nothing that it wrote is brought back, `lost` or
     /// `hands` removes its key, and `have` leaves it to be added again;
     /// and each key that is removed takes one of the removals that the
-    /// phrase has left, with how many are left. Before the yes it is
-    /// named among those from whom the look takes nothing, where it was
-    /// said to be gone.
+    /// phrase has left, with how many are left. Where two adders added it,
+    /// each label is shown beside the adder that gave it, and no adder is
+    /// named apart (decision 2026-10-17 §2.4); where it signed a record,
+    /// its row says that what it added is not shown (§2.3). Before the
+    /// yes it is named among those from whom the look takes nothing,
+    /// where it was said to be gone.
     #[test]
     fn test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out() {
         let mut rows = rows();
-        // A watch that the desktop added, and the laptop too: its record
-        // found no room.
+        // A watch that the laptop added: its record found no room.
         let mut watch = row(5, "watch", Some(1), false);
-        watch.no_room = vec![([1; 32], 1_800_000_000), ([2; 32], 1_800_000_000)];
+        watch.no_room = vec![([1; 32], 1_800_000_000, "watch".into())];
         rows.push(watch);
-        let says = row_says(&rows, 4, 7);
-        assert!(
-            says.contains(&format!(
-                "\"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 UTC, \
-                 by a record that does not count: 64 devices counted already. It signed 5 entries",
+        let says = row_says(&rows, &[], 4, 7);
+        assert_eq!(
+            says,
+            format!(
+                "\n({}) \"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 \
+                 UTC, by a record that does not count: 64 devices counted already. It signed 5 \
+                 entries in the personal channel of that change.",
+                fingerprint::shown(&[5; 32]),
                 fingerprint::shown(&[1; 32])
-            )),
-            "{says}"
-        );
-        // Asked about for the record that the device shown signed.
-        let asked = for_room_says(&rows, 4, 7, &[1; 32], 191);
-        assert!(asked.starts_with(&says), "{asked}");
-        assert!(!asked.contains("added it too"), "{asked}");
-        assert!(
-            asked.ends_with(
-                "\n  That is the one thing its record fails for, so it is asked about all the \
-                 same. Nothing that it wrote is brought back by this recovery, whatever is said \
-                 of it: `lost` or `hands` removes its key, and what it wrote then comes in by \
-                 `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves it \
-                 to be added again by hand. Each key that is removed takes one of the removals \
-                 that the recovery phrase has left: 191 of 256."
             ),
-            "{asked}"
+        );
+        // Asked about for the record that the laptop signed.
+        let asked = for_room_says(&rows, &[], 4, 7, 191);
+        assert_eq!(
+            asked,
+            format!(
+                "{says}\n  That is the one thing its record fails for, so it is asked about all \
+                 the same. Nothing that it wrote is brought back by this recovery, whatever is \
+                 said of it: `lost` or `hands` removes its key, and what it wrote then comes in \
+                 by `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves \
+                 it to be added again by hand. Each key that is removed takes one of the \
+                 removals that the recovery phrase has left: 191 of 256."
+            ),
         );
         assert!(
-            for_room_says(&rows, 4, 7, &[1; 32], 0).ends_with("has left: 0 of 256."),
+            for_room_says(&rows, &[], 4, 7, 0).ends_with("has left: 0 of 256."),
             "the number that is left is said"
         );
         // How many are left, as the row is asked about: what the change
@@ -2357,16 +2490,35 @@ mod tests {
         assert_eq!(removals_left(&room, &rows, &so_far, was_removed), 195);
         let none = recover::Room { can_go: 1, ..room };
         assert_eq!(removals_left(&none, &rows, &so_far, |_| false), 0);
-        // Asked about for the record of another device than the one
-        // shown: that one is named too.
-        let asked = for_room_says(&rows, 4, 7, &[2; 32], 191);
+
+        // The desktop added it too, under another label, and it signed a
+        // record of its own: both labels are shown, each beside its
+        // adder, and the line of what it added follows. Neither adder is
+        // named apart from the others.
+        let mut two = rows.clone();
+        two[4]
+            .no_room
+            .push(([2; 32], 1_800_000_060, "kitchen watch".into()));
+        two[4].signed_a_record = true;
+        let asked = for_room_says(&two, &[], 4, 7, 191);
         assert!(
             asked.contains(&format!(
-                "\n  ({}) \"desktop\" added it too.\n  That is the one thing",
+                "from ({}) \"laptop\" at 2027-01-15 08:00 UTC as \"watch\", and from ({}) \
+                 \"desktop\" at 2027-01-15 08:01 UTC as \"kitchen watch\", by a record",
+                fingerprint::shown(&[1; 32]),
                 fingerprint::shown(&[2; 32])
             )),
             "{asked}"
         );
+        assert!(
+            asked.contains(
+                "\n  The labels differ. A label is what the device that added it called it: the \
+                 words are what tells two apart.\n  A device that it added is not shown here: a \
+                 device that does not count adds nothing.\n  That is the one thing"
+            ),
+            "{asked}"
+        );
+        assert!(!asked.contains("added it too"), "{asked}");
 
         // Before the yes: said to be lost, it is one of those from whom
         // the look takes nothing, with the command that brings what it
@@ -2402,6 +2554,286 @@ mod tests {
         (hands[0], hands[1]) = (Answer::OtherHands, Answer::OtherHands);
         let all = will_do_lines(&generation, &hands, &names, &[9; 32], &read_whole()).join("\n");
         assert!(!all.contains("\"watch\""), "{all}");
+    }
+
+    /// What is said of a key that the 64 kept out and that two adders
+    /// added under two labels (decision 2026-10-17 §2.5): the row shows
+    /// each label beside the adder that gave it, in the order of the
+    /// adders' rows, and says that the labels differ. An adder that may be
+    /// in someone else's hands is counted, and not shown, nor is its label
+    /// (§2.4): no one adder's label stands for the key.
+    #[test]
+    fn test_what_is_said_of_a_key_added_under_two_labels() {
+        let mut rows = rows();
+        // A key that the laptop added as a phone and the desktop as a
+        // kitchen tablet. The label that the row holds is no adder's own
+        // word here, so what is shown is the adders'.
+        let mut phone = row(6, "not shown", Some(1), false);
+        phone.no_room = vec![
+            ([1; 32], 1_800_000_000, "phone".into()),
+            ([2; 32], 1_800_123_400, "kitchen tablet".into()),
+        ];
+        phone.signed = 4;
+        phone.signed_a_record = true;
+        rows.push(phone);
+        let (w1, w2, w6) = (
+            fingerprint::shown(&[1; 32]),
+            fingerprint::shown(&[2; 32]),
+            fingerprint::shown(&[6; 32]),
+        );
+        let labels_differ = "  The labels differ. A label is what the device that added it \
+                             called it: the words are what tells two apart.";
+        let added_one = "  A device that it added is not shown here: a device that does not \
+                         count adds nothing.";
+        assert_eq!(
+            row_says(&rows, &[Answer::Have, Answer::Lost], 4, 3),
+            format!(
+                "\n({w6}) \"phone\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 \
+                 08:00 UTC as \"phone\", and from ({w2}) \"desktop\" at 2027-01-16 18:16 UTC as \
+                 \"kitchen tablet\", by a record that does not count: 64 devices counted \
+                 already. It signed 4 entries in the personal channel of that change.\
+                 \n{labels_differ}\n{added_one}"
+            )
+        );
+        // The laptop may be in someone else's hands: it is counted, and
+        // neither it nor its label is shown.
+        let hands = [Answer::OtherHands, Answer::Lost];
+        let says = row_says(&rows, &hands, 4, 3);
+        assert_eq!(
+            says,
+            format!(
+                "\n({w6}) \"kitchen tablet\", added since change 3, from ({w2}) \"desktop\" at \
+                 2027-01-16 18:16 UTC as \"kitchen tablet\", and 1 more added it, which may be in \
+                 someone else's hands, by a record that does not count: 64 devices counted \
+                 already. It signed 4 entries in the personal channel of that change.\
+                 \n{added_one}"
+            )
+        );
+        assert!(!says.contains("\"phone\"") && !says.contains(&w1), "{says}");
+        // Both may be: neither is shown.
+        let says = row_says(&rows, &[Answer::OtherHands, Answer::OtherHands], 4, 3);
+        assert_eq!(
+            says,
+            format!(
+                "\nthe device ({w6}), added since change 3 by 2 devices that may be in someone \
+                 else's hands, by a record that does not count: 64 devices counted already. It \
+                 signed 4 entries in the personal channel of that change.\n{added_one}"
+            )
+        );
+        // An adder whose own adder may be in someone else's hands may be
+        // too: a watch that the laptop added, and the phone, which the
+        // desktop added. The phone was said to be one that the person
+        // still has, and the desktop may be in someone else's hands: the
+        // phone is counted, and its label is not shown.
+        let mut watch = row(7, "not shown", Some(1), false);
+        watch.no_room = vec![
+            ([1; 32], 1_800_000_000, "watch".into()),
+            ([3; 32], 1_800_000_000, "kitchen watch".into()),
+        ];
+        rows.push(watch);
+        let chain = [Answer::Have, Answer::OtherHands, Answer::Have];
+        let says = row_says(&rows, &chain, 5, 3);
+        assert!(
+            says.starts_with(&format!(
+                "\n({}) \"watch\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 \
+                 08:00 UTC as \"watch\", and 1 more added it, which may be in someone else's \
+                 hands, by a record",
+                fingerprint::shown(&[7; 32])
+            )),
+            "{says}"
+        );
+        assert!(!says.contains("kitchen watch"), "{says}");
+        // One adder alone that may be in someone else's hands is counted
+        // and not shown, as among several: the key is shown by its words.
+        let mut pager = row(8, "pager", Some(1), false);
+        pager.no_room = vec![([1; 32], 1_800_000_000, "pager".into())];
+        rows.push(pager);
+        assert_eq!(
+            row_says(&rows, &[Answer::OtherHands], 6, 3),
+            format!(
+                "\nthe device ({}), added since change 3 by 1 device that may be in someone \
+                 else's hands, by a record that does not count: 64 devices counted already. It \
+                 signed 8 entries in the personal channel of that change.",
+                fingerprint::shown(&[8; 32])
+            )
+        );
+        let shown_alone = row_says(&rows, &[Answer::Have], 6, 3);
+        assert!(
+            shown_alone.contains(&format!(
+                "\"pager\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 08:00 \
+                 UTC, by a record that does not count: 64"
+            )),
+            "{shown_alone}"
+        );
+
+        // The same label from both: nothing is said of labels.
+        rows[4].no_room[1].2 = "phone".into();
+        let says = row_says(&rows, &[Answer::Have, Answer::Lost], 4, 3);
+        assert!(says.contains("as \"phone\", and from"), "{says}");
+        assert!(!says.contains("The labels differ"), "{says}");
+    }
+
+    /// The rows of a test, and a key that the 64 kept out, which the
+    /// laptop added as a phone and the desktop as a kitchen tablet: its
+    /// row holds the laptop's label, as a recovery reads it, the laptop's
+    /// row being the first.
+    fn rows_with_two_labels() -> Vec<Row> {
+        let mut rows = rows();
+        let mut kept_out = row(6, "phone", Some(1), false);
+        kept_out.no_room = vec![
+            ([1; 32], 1_800_000_000, "phone".into()),
+            ([2; 32], 1_800_000_000, "kitchen tablet".into()),
+        ];
+        rows.push(kept_out);
+        rows
+    }
+
+    /// What the command does at a row turns on the answers given so far
+    /// (decision 2026-10-17 §2.4): an adder that was said to be in
+    /// someone else's hands is not shown, whether the row is asked about
+    /// or is not.
+    #[test]
+    fn test_what_is_said_at_a_row_turns_on_the_answers_so_far() {
+        let rows = rows_with_two_labels();
+        let room = recover::Room {
+            removed: 0,
+            asked: 5,
+            can_go: 256,
+        };
+        let at = |answers: &[Answer], n: usize| {
+            at_a_row(&rows, answers, n, 3, &[9; 32], &room, &|_| false)
+        };
+        // The laptop may be in someone else's hands, and the desktop is
+        // kept: the key is asked about under the desktop, by its label.
+        let so_far = [
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::Have,
+            Answer::NotAsked,
+        ];
+        let AtARow::Asks(says) = at(&so_far, 4) else {
+            panic!("the key is asked about");
+        };
+        assert_eq!(says, for_room_says(&rows, &so_far, 4, 3, 255));
+        assert!(
+            says.contains("\"kitchen tablet\", added since change 3"),
+            "{says}"
+        );
+        assert!(says.contains("and 1 more added it"), "{says}");
+        assert!(!says.contains("\"phone\""), "{says}");
+        // Both may be: nothing is asked, and neither label is shown.
+        let both = [
+            Answer::OtherHands,
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::NotAsked,
+        ];
+        let AtARow::Said(says, Answer::NotAsked) = at(&both, 4) else {
+            panic!("nothing is asked of the key");
+        };
+        assert!(says.starts_with("\nthe device ("), "{says}");
+        assert!(
+            !says.contains("\"phone\"") && !says.contains("kitchen"),
+            "{says}"
+        );
+        // This machine is answered as one that the person has.
+        let own = at_a_row(&rows, &[], 0, 3, &[1; 32], &room, &|_| false);
+        assert!(matches!(own, AtARow::Said(_, Answer::Have)), "{own:?}");
+    }
+
+    /// The label by which a key that the 64 kept out is named before the
+    /// yes, and the label that the node is handed for it and keeps, is
+    /// the one that its row was shown by (decision 2026-10-17 §2.4): that
+    /// of the first adder that is not in someone else's hands. Where every
+    /// adder may be, the label is empty, which the node keeps as none.
+    #[test]
+    fn test_a_key_kept_out_by_the_64_is_named_by_the_label_its_row_showed() {
+        let mut rows = rows_with_two_labels();
+        let not_shown = |n: u8| {
+            let mut beyond = row(n, "beyond", Some(1), false);
+            beyond.no_room = vec![([1; 32], 1_800_000_000, "beyond".into())];
+            beyond
+        };
+        let generation = Generation {
+            rows: rows.clone(),
+            not_shown: vec![not_shown(20)],
+            ..Default::default()
+        };
+        let names = recover::Names::default();
+        // The laptop may be in someone else's hands; the desktop and the
+        // phone are kept, and the key is lost.
+        let answers = [
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::Have,
+            Answer::NotAsked,
+            Answer::Lost,
+        ];
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read_whole()).join("\n");
+        assert!(
+            all.contains(&format!(
+                "It takes nothing from: ({}) \"laptop\", ({}) \"kitchen tablet\".",
+                fingerprint::shown(&[1; 32]),
+                fingerprint::shown(&[6; 32])
+            )),
+            "{all}"
+        );
+        let labels = labels_for_the_node(&generation, &answers, &[9; 32]);
+        let labelled =
+            |key: u8, label: &str| json!({ "key": hex::encode([key; 32]), "label": label });
+        assert_eq!(
+            labels["gone"],
+            json!([labelled(1, "laptop"), labelled(6, "kitchen tablet")])
+        );
+        assert_eq!(
+            labels["still_have"],
+            json!([labelled(2, "desktop"), labelled(3, "phone")])
+        );
+        // The row that could not be shown was added by the laptop alone:
+        // it has no label.
+        assert_eq!(labels["not_shown"], json!([labelled(20, "")]));
+        // With the laptop kept, each is by the laptop's label.
+        let mut kept = answers;
+        kept[0] = Answer::Have;
+        let labels = labels_for_the_node(&generation, &kept, &[9; 32]);
+        assert_eq!(labels["gone"], json!([labelled(6, "phone")]));
+        assert_eq!(labels["not_shown"], json!([labelled(20, "beyond")]));
+        // This machine is handed as none of them.
+        rows[0].key = [9; 32];
+        let generation = Generation {
+            rows,
+            ..Default::default()
+        };
+        let labels = labels_for_the_node(&generation, &kept, &[9; 32]);
+        assert!(
+            !labels["still_have"]
+                .to_string()
+                .contains(&hex::encode([9u8; 32]))
+        );
+    }
+
+    /// The row of a key that the 64 kept out says that what it added is
+    /// not shown where it signed a record of an addition, and not where it
+    /// signed none (decision 2026-10-17 §2.3, §2.5).
+    #[test]
+    fn test_a_row_kept_out_by_the_64_says_that_what_it_added_is_not_shown() {
+        let mut rows = rows();
+        let mut tablet = row(5, "tablet", Some(1), false);
+        tablet.no_room = vec![([1; 32], 1_800_000_000, "tablet".into())];
+        rows.push(tablet);
+        let line = "\n  A device that it added is not shown here: a device that does not count \
+                    adds nothing.";
+        let none = row_says(&rows, &[], 4, 7);
+        assert!(!none.contains("A device that it added"), "{none}");
+        rows[4].signed_a_record = true;
+        let signed = row_says(&rows, &[], 4, 7);
+        assert_eq!(signed, format!("{none}{line}"));
+        // Asked about, the line is said before what the answers do.
+        let asked = for_room_says(&rows, &[], 4, 7, 191);
+        assert!(
+            asked.starts_with(&format!("{signed}\n  That is the one thing")),
+            "{asked}"
+        );
     }
 
     /// Of two changes made apart, the command says how many more are on
@@ -2840,7 +3272,10 @@ mod tests {
     /// machine cannot show its key; of such a row, that its line gives
     /// its key where nothing is asked of it; how a key is removed
     /// afterwards where its device is gone; and that one the person
-    /// still has is added again by hand. It is said where either number
+    /// still has is added again by hand. After its first sentence it
+    /// says that each device that may add keeps a row for at least its
+    /// first three that the 64 kept out (decision 2026-10-17 §2.5). It
+    /// is said where either number
     /// is not 0: before the first question, after what is said where the
     /// answers could not all be kept, and again before the yes.
     #[test]
@@ -2853,8 +3288,11 @@ mod tests {
                         wrote is brought back. This machine cannot show its key.";
         let of_a_row = "Where nothing is asked of such a row, nothing that its device wrote is \
                         brought back, and its line gives its key.";
-        let because = "because more were written than a recovery keeps. A device of yours that \
-                       was added since change 7 may be among them.";
+        let because = "because more were written than a recovery keeps. Each device that may add \
+                       keeps a row for at least the first 3 devices that it added since change 7 \
+                       and that 64 devices counted already kept out: a device that added more \
+                       than that may have left one of them here. A device of yours that was added \
+                       since change 7 may be among them.";
         // The rows of a test, with `let_go` more: each a row that does
         // not count, of a key one of whose records was not kept.
         let of = |no_row: usize, let_go: u8| {
@@ -2886,6 +3324,10 @@ mod tests {
         );
         assert!(
             one.contains("added since change 3 may be among them"),
+            "{one}"
+        );
+        assert!(
+            one.contains("the first 3 devices that it added since change 3 and that 64"),
             "{one}"
         );
         // Such a row, and every key has a row: the sentence is said for
@@ -3724,7 +4166,7 @@ mod tests {
 
         // A watch that only the bound kept out, which the laptop added.
         let mut watch = row(5, "watch", Some(1), false);
-        watch.no_room = vec![([1; 32], 1_800_000_000)];
+        watch.no_room = vec![([1; 32], 1_800_000_000, "watch".into())];
         let key = cordelia_crypto::bech32::encode_public_key(&[5; 32]).unwrap();
         assert_eq!(
             not_asked_says(&watch, false),

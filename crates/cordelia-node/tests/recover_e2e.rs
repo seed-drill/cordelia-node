@@ -777,11 +777,32 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
 /// relays, as it sends anything it wrote in its personal channel.
 /// Returns the device's key.
 fn signs_records(device: &Node, count: u16) -> [u8; 32] {
+    let identity =
+        cordelia_crypto::identity::NodeIdentity::from_file(&device.data_dir().join("identity.key"))
+            .unwrap();
+    signs_records_as(device, &identity, 0..count)
+}
+
+/// The key of the record numbered `n` that [`signs_records_as`] signs:
+/// a key that is nobody's.
+fn nobodys(n: u16) -> cordelia_crypto::identity::NodeIdentity {
+    let mut seed = [0x5a; 32];
+    seed[..2].copy_from_slice(&n.to_be_bytes());
+    cordelia_crypto::identity::NodeIdentity::from_seed(seed).unwrap()
+}
+
+/// [`signs_records`], with the records signed by `identity`, which may be
+/// another key than the device's, each of the key [`nobodys`] gives for
+/// a number of `numbers`. The device sends them as it sends anything in
+/// its store of its personal channel. Returns the key that signed them.
+fn signs_records_as(
+    device: &Node,
+    identity: &cordelia_crypto::identity::NodeIdentity,
+    numbers: impl IntoIterator<Item = u16>,
+) -> [u8; 32] {
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::entry::{Entry, Inside, Value};
-    use cordelia_crypto::identity::NodeIdentity;
     use cordelia_crypto::statement::{Device, SignedStatement};
-    let identity = NodeIdentity::from_file(&device.data_dir().join("identity.key")).unwrap();
     let conn = rusqlite::Connection::open(device.data_dir().join("cordelia.db")).unwrap();
     conn.busy_timeout(Duration::from_secs(10)).unwrap();
     let statement: Vec<u8> = conn
@@ -799,21 +820,19 @@ fn signs_records(device: &Node, count: u16) -> [u8; 32] {
     let personal = cordelia_crypto::derive::personal_secret(&secret).unwrap();
     let rev = (statement.number << cordelia_core::protocol::REV_COUNT_BITS) + 1;
     let now = chrono::Utc::now().timestamp();
-    for n in 0..count {
-        let mut seed = [0x5a; 32];
-        seed[..2].copy_from_slice(&n.to_be_bytes());
-        let key = NodeIdentity::from_seed(seed).unwrap().public_key();
+    for n in numbers {
+        let key = nobodys(n).public_key();
         let added = Device::new(key, &format!("added {n}")).unwrap();
         let record = Addition::under(&statement, added, identity.public_key(), now as u64)
             .unwrap()
-            .sign(&identity)
+            .sign(identity)
             .unwrap();
         let inside = Inside {
             name: cordelia_api::person::added_name(&key).unwrap(),
             value: Value::Other(record.to_bytes().unwrap()),
             chain: Some(Vec::new()),
         };
-        let entry = Entry::seal(&personal, &identity, rev, &inside)
+        let entry = Entry::seal(&personal, identity, rev, &inside)
             .unwrap()
             .check()
             .unwrap();
@@ -955,8 +974,40 @@ struct KeptOut {
 
 const ON_THE_PHONE: &str = "written on the phone\n";
 
+/// A device whose one relay is `relay`, started, and connected to it,
+/// with a key whose first byte is the highest: written before its first
+/// start, so that it is the device's key from the first. A test signs
+/// records of keys below it ([`signs_records_as`]): where rows went by
+/// key, its row would be the last of them.
+fn device_with_a_high_key(name: &'static str, relay: &Node) -> Node {
+    let mut device = node(name, "personal", Some(relay.p2p));
+    let identity = (0..=u16::MAX)
+        .map(|n| {
+            let mut seed = [0xa7; 32];
+            seed[..2].copy_from_slice(&n.to_be_bytes());
+            cordelia_crypto::identity::NodeIdentity::from_seed(seed).unwrap()
+        })
+        .find(|identity| identity.public_key()[0] == u8::MAX)
+        .unwrap();
+    std::fs::write(device.data_dir().join("identity.key"), identity.seed()).unwrap();
+    device.cli(&["init", "--non-interactive", "--name", name]);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    wait_for("device reaches its relay", &[&device, relay], 60, || {
+        has_hot_peer(&device)
+    });
+    assert_eq!(key_of(&device), key_written(&identity.public_key()));
+    device
+}
+
+/// A key as `cordelia id` writes it.
+fn key_written(key: &[u8; 32]) -> String {
+    cordelia_crypto::bech32::encode_public_key(key).unwrap()
+}
+
 /// A change lists the laptop and the desktop. The desktop then adds a
-/// phone, which syncs `lab` and writes a file there. The laptop signs 62
+/// phone, which syncs `lab` and writes a file there. The phone's key is
+/// above every key of the records that a test signs ([`device_with_a_high_key`]). The laptop signs 62
 /// records of additions, which a recovery reads first: with them 64
 /// devices count, and the phone's record finds no room. Every device is
 /// stopped, and the relay holds what each had sent.
@@ -975,7 +1026,7 @@ fn a_phone_that_the_64_keep_out() -> KeptOut {
         has_sent_everything(&two.laptop).and(has_sent_everything(&two.desktop))
     });
     // The desktop adds a phone, which syncs `lab` and writes a file.
-    let mut phone = device_started("phone", &relay);
+    let mut phone = device_with_a_high_key("phone", &relay);
     adds(&two.desktop, &phone, "phone");
     let phone_memory = syncs_lab(&phone);
     std::fs::write(phone_memory.join("p.md"), ON_THE_PHONE).unwrap();
@@ -1110,7 +1161,8 @@ fn a_device_added_since_is_asked_about_where_only_the_bound_of_64_kept_it_out() 
 /// where the 64 keep a phone out ([`a_phone_that_the_64_keep_out`]).
 ///
 /// The laptop may be in someone else's hands, and so may the desktop,
-/// which added the phone: nothing is asked of the phone. Its row says
+/// which added the phone: nothing is asked of the phone, and its row
+/// shows it by its words alone, without the desktop's label. Its row says
 /// how its key is removed afterwards, if it is a device of the person's,
 /// with the key written whole. On the machine that has recovered,
 /// `cordelia remove-device` takes that key, which is in no list of the
@@ -1128,16 +1180,18 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
     let said = at.done();
     println!("{said}");
     // The phone is shown, with why it does not count, and nothing is
-    // asked of it: the row says how its key is removed afterwards.
+    // asked of it: the row says how its key is removed afterwards. The
+    // desktop, its one adder, may be in someone else's hands: it is
+    // counted and not shown, nor is its label, and the phone is shown by
+    // its words alone (decision 2026-10-17 §2.4).
     let of_the_phone = said
-        .split("\"phone\", added since change 2, from (")
+        .split(
+            "), added since change 2 by 1 device that may be in someone else's hands, by a \
+             record that does not count: 64 devices counted already. It signed ",
+        )
         .nth(1)
         .unwrap_or_else(|| panic!("{said}"));
-    assert!(
-        of_the_phone
-            .contains(", by a record that does not count: 64 devices counted already. It signed "),
-        "{said}"
-    );
+    assert!(!said.contains("\"phone\", added since change 2"), "{said}");
     let afterwards = format!(
         "It is no device: nothing is asked of it, nothing that it wrote is brought back, and its \
          key is not removed. If it is a device of yours that is gone, its key is removed \
@@ -1200,6 +1254,123 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
     let said = at.done();
     assert!(said.contains("lab: 1 version brought in"), "{said}");
     assert_eq!(text_of(&new, "p.md").as_deref(), Some(ON_THE_PHONE));
+}
+
+/// **A device that signs hundreds of records leaves a phone its row**
+/// (decision 2026-10-17 §1, property 1, §2.2), where the 64 keep a phone
+/// out ([`a_phone_that_the_64_keep_out`]). The laptop has signed records
+/// of 62 keys, which count; with the key of one of those, which is in no
+/// list, the test signs 300 more records of 300 keys, and the laptop
+/// hands them to the relay: `cordelia add` signs no record once 64
+/// count. A recovery reads the laptop's records first, so the 64 count
+/// without the phone, and the phone's record fails only for the 64. The
+/// flood is read last, its signer being in no list. Each key of the flood
+/// is below the phone's, so that rows in order of key would leave the
+/// phone out every time.
+///
+/// A recovery keeps the records that do not count, and shows their rows,
+/// in the order of keeping: the desktop's first key, the phone, is in the
+/// first turn, and keeps its row however many records another key signs.
+/// The phone is shown and asked about. What is left out is said: the
+/// rows beyond the 256, and the keys of the flood whose record was not
+/// kept, with the floor of three that each device that may add keeps.
+#[test]
+fn a_device_that_signs_hundreds_of_records_leaves_a_phone_its_row() {
+    let KeptOut {
+        relay,
+        mut two,
+        phone,
+    } = a_phone_that_the_64_keep_out();
+    // One of the laptop's 62 signs 300 records, and the relay is sent
+    // each. Each is of a key below the phone's: where rows went by key,
+    // the phone's would be the last of the 256 kept, and not shown.
+    let phone_key = cordelia_crypto::bech32::decode_public_key(&key_of(&phone)).unwrap();
+    let below: Vec<u16> = (1_000..)
+        .filter(|n| nobodys(*n).public_key() < phone_key)
+        .take(300)
+        .collect();
+    assert_eq!(below.len(), 300);
+    let flooder = nobodys(0);
+    assert_eq!(
+        signs_records_as(&two.laptop, &flooder, below),
+        flooder.public_key()
+    );
+    two.laptop.start();
+    wait_for("the laptop is up again", &[&relay, &two.laptop], 30, || {
+        healthy(&two.laptop)
+    });
+    wait_for(
+        "the relay holds the flood",
+        &[&relay, &two.laptop],
+        180,
+        || {
+            let held: i64 = store_of(&relay)
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE author = ?1",
+                    rusqlite::params![flooder.public_key().as_slice()],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            (held >= 300)
+                .then_some(())
+                .and(has_sent_everything(&two.laptop))
+        },
+    );
+    two.laptop.stop();
+
+    // The laptop may be in someone else's hands, and so may each of the
+    // 62 keys that it added, the one that flooded among them. The
+    // desktop is lost, and so is the phone, which is asked about.
+    let new = device_started("new", &relay);
+    let mut answers = vec!["hands", "lost"];
+    answers.extend(std::iter::repeat_n("hands", 62));
+    answers.push("lost");
+    let mut at = recovers(&new, None, &two.words, &answers);
+    at.says("The change is made (change 3)")
+        .says("The look is made");
+    let said = at.done();
+    println!("{said}");
+    // The phone, under the desktop, with the reason that it does not
+    // count: and asked about.
+    let of_the_phone = said
+        .split("\"phone\", added since change 2, from (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{said}"));
+    let by = of_the_phone.split(" at ").next().unwrap();
+    assert!(by.ends_with(") \"desktop\""), "{by}: {said}");
+    let asked = of_the_phone.split("Type `have`").next().unwrap();
+    assert!(
+        asked.contains(
+            "That is the one thing its record fails for, so it is asked about all the same."
+        ),
+        "{said}"
+    );
+    // It is removed, with the 64 that count; no key of the flood is
+    // asked about, its signer being in someone else's hands.
+    assert!(said.contains("removed keys (65):"), "{said}");
+    assert_eq!(person_of(&new)["removed"].as_array().unwrap().len(), 65);
+    // The phone and 191 of the flood's keys are shown; the other 64 kept
+    // are beyond the 256 rows, and the 45 of the flood that went have no
+    // row.
+    assert_eq!(
+        said.matches("by a record that does not count").count(),
+        192,
+        "{said}"
+    );
+    assert!(
+        said.contains("64 more records beyond the 256 that are shown: nothing is asked of those."),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "Records of additions were read for 45 keys that are not shown here at all, because \
+             more were written than a recovery keeps. Each device that may add keeps a row for \
+             at least the first 3 devices that it added since change 2 and that 64 devices \
+             counted already kept out: a device that added more than that may have left one of \
+             them here."
+        ),
+        "{said}"
+    );
 }
 
 /// What `n` holds under the name `name`, by key, with its text.

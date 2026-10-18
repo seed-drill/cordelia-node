@@ -1735,14 +1735,6 @@ const _: () = assert!(RECOVERY_READ_ON_MAX_SECS > CARRY_READ_MAX_SECS);
 /// RECOVERY_READ_ON_MAX_SECS.
 pub const RECOVERY_READ_ON_READS: u64 = RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS;
 
-/// How many pulls in a row, with no page between them, a read through the
-/// door for a carry lets a relay refuse for now before it ends its read
-/// there in part (decision 2026-10-17 §3.2). A relay resets with one code
-/// both a pull it has no room for, which is no breach, and a request over
-/// its rate, which is: so the device stays below the breaches that cut an
-/// address off. Derived: one fewer than BAN_THRESHOLD.
-pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 1;
-
 /// How many words of a key's fingerprint name a removed key at `cordelia
 /// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
 /// 66 bits. A statement lists removed keys bare, so a machine that never
@@ -1759,6 +1751,16 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// §7.3): ten minutes from when the phrase signed it. The command hands
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
+
+/// How long a read of a channel of the device's own stands, from the end
+/// of its last round, on the node's monotonic clock (decision 2026-10-17
+/// §4.2, §5.2): the read that `cordelia sync unmap` shows, for the
+/// `discard` that follows it. A read older than this is kept no more.
+/// Derived: as long as a word of the phrase for a carry stands. It is a
+/// `u64`: it bounds a `Duration`, where CARRY_WORD_SECS is compared with a
+/// time in seconds of the wall clock.
+pub const LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64;
+const _: () = assert!(CARRY_WORD_SECS > 0);
 
 /// How often a command that was typed the phrase makes its proofs again
 /// for one channel, at most (decision 2026-10-04 §16): a proof holds on
@@ -2771,6 +2773,7 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(LET_GO_READ_STANDS_SECS, 600);
         assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
         assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
         assert!(LABELS.contains(&LABEL_CARRY_BATCH));
@@ -2820,9 +2823,6 @@ mod tests {
         // Five whole readings fit in it, and a sixth does not: five reach
         // a channel at its cap.
         assert_eq!(RECOVERY_READ_ON_READS, 5);
-        assert_eq!(LEFT_REFUSED_IN_A_ROW_MAX, 2);
-        const { assert!(LEFT_REFUSED_IN_A_ROW_MAX >= 1) };
-        const { assert!(LEFT_REFUSED_IN_A_ROW_MAX < BAN_THRESHOLD) };
         const { assert!(RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS <= RECOVERY_READ_ON_MAX_SECS) };
         const { assert!((RECOVERY_READ_ON_READS + 1) * CARRY_READ_MAX_SECS > RECOVERY_READ_ON_MAX_SECS) };
         let per_round =
