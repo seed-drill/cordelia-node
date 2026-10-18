@@ -282,6 +282,9 @@ pub fn forget(
         held_rows::clear_additions(conn)?;
         held_rows::forget_person(conn)?;
         acts::forget_all(conn)?;
+        // What it held of the person's lists of shared channels is the
+        // person's (decision 2026-10-10 §3.4).
+        cordelia_storage::shared_lists::forget_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }
@@ -734,11 +737,37 @@ mod tests {
         entries::store(&on.conn, &entry.check().unwrap(), now).unwrap();
         kept_rows::keep_place(&on.conn, &[0x77; 32], &messages_id, &[1; 8], 1).unwrap();
         assert!(!on.stored().is_empty());
+        // Its list of shared channels (decision 2026-10-10 §3.4).
+        let label = cordelia_crypto::acts::Label {
+            key: [6; 32],
+            label: Some("bob".into()),
+        };
+        let done = crate::lists::act(&on.conn, &on.identity, crate::lists::Do::Label(label), now);
+        assert!(matches!(done, Ok(crate::lists::Done::Made(_))), "{done:?}");
+        assert!(
+            cordelia_storage::shared_lists::kept(&on.conn)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !cordelia_storage::shared_lists::first_held(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         let kept = kept_rows::kept(&on.conn, &[0x77; 32], &messages_id).unwrap();
         assert_eq!(kept.place, None);
         assert!(!on.follows_a_phrase());
+        assert_eq!(
+            cordelia_storage::shared_lists::kept(&on.conn).unwrap(),
+            None
+        );
+        assert!(
+            cordelia_storage::shared_lists::first_held(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
         assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
         assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());

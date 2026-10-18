@@ -740,6 +740,17 @@ pub fn add_mapping_looked(
     let mut list = mappings(db)?;
     let checked = check_mapping(body, home_dir, &list).map_err(ApiError::BadRequest)?;
     if let Some(mapping) = &checked {
+        // On one device a name is a name of the person's own or a shared
+        // channel's, never both (decision 2026-10-10 §2.2).
+        let filed = crate::lists::is_filed_under(db, &mapping.name)
+            .map_err(|e| ApiError::Internal(format!("the person's lists: {e}")))?;
+        if filed {
+            return Err(ApiError::BadRequest(format!(
+                "{:?} is the name a shared channel of yours is filed under: give this folder \
+                 another name",
+                mapping.name
+            )));
+        }
         let of_this = |looked: &&MapLooked| {
             looked.generation == control.generation_under(db)
                 && looked.claude_dir == claude_dir
@@ -2748,5 +2759,45 @@ mod tests {
         let mut two = Several::of_one_person(2);
         let added = state_of(two.machines.remove(1));
         assert!(!listed_alone(&added, &added.db.lock().unwrap()));
+    }
+
+    /// `cordelia sync map` refuses a name that the person has filed a
+    /// shared channel under (decision 2026-10-10 §2.2): on one device a
+    /// name is the person's own or a shared channel's, never both. Filed
+    /// under another, the name is mapped; and a folder is mapped beside
+    /// it under a name of its own.
+    #[test]
+    fn sync_map_refuses_a_name_a_shared_channel_is_filed_under() {
+        use crate::lists::{Do, Done, act, tests::filing};
+        use crate::several::Several;
+
+        let mut one = Several::of_one_person(1);
+        let now = one.tick();
+        let machine = one.machines.remove(0);
+        let identity = machine.identity;
+        let file = |db: &rusqlite::Connection, name: &str| {
+            let done = act(db, &identity, Do::File(filing(1, name)), now).unwrap();
+            assert!(matches!(done, Done::Made(_)), "{done:?}");
+        };
+        file(&machine.conn, "review");
+        let s = Settings {
+            db: machine.conn,
+            control: SyncControl::default(),
+        };
+        s.claude(serde_json::json!({ "dir": DIR }));
+        let home = std::path::Path::new(HOME);
+        let body = request("/home/sam/review", "review", false);
+        let refused = add_mapping(&s.control, &s.db, &body, home).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("a shared channel of yours is filed under"),
+            "{refused}"
+        );
+        assert!(s.names().is_empty());
+        s.map("/home/sam/notes", "notes");
+        file(&s.db, "design");
+        s.map("/home/sam/review", "review");
+        assert_eq!(s.names(), ["notes", "review"]);
     }
 }
