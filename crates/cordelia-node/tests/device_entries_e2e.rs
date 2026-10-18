@@ -660,8 +660,9 @@ enum Say {
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
 /// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
 /// has it answer with that answer of a show, which is no answer to a
-/// proof. For a pull, `Some(Say::NotNow)` has it refuse the pull for now,
-/// and `Some(Say::Reset)` has it reset the stream.
+/// proof, and `Some(Say::NotNow)` has it refuse the proof for now. For a
+/// pull, `Some(Say::NotNow)` has it refuse the pull for now, and
+/// `Some(Say::Reset)` has it reset the stream.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
 
 struct Script {
@@ -789,6 +790,10 @@ impl StandIn {
                     }
                 }
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
+                WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::NotNow)) => {
+                    not_now = true;
+                    Ok(None)
+                }
                 // An answer of a show, which is no answer to a proof.
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Answer(_))) => {
                     let Some(Say::Answer(answer)) = hooked else {
@@ -5337,7 +5342,8 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
 /// the channel to its end, with nothing handed twice and the proof sent
 /// once, whether the pull refused was the first after the proof or a
 /// later one. A pull reset for another reason ends the read there, in
-/// part.
+/// part. A proof refused for now ends it with nothing read, and is said
+/// as a proof's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     let relay = StandIn::started().await;
@@ -5430,6 +5436,14 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
             }
         }
     }
+
+    // A proof refused for now is said as a proof's: nothing was read.
+    relay.hook(|request| matches!(request, WireMessage::ChannelProve(_)).then_some(Say::NotNow));
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    let said = "the proof was refused for now: the relay takes no more from this connection in \
+                this minute";
+    assert_eq!(read[0].read, LeftRead::NotRead(said.into()));
+    assert_eq!(asked(&relay), (1, vec![]));
 }
 
 /// **A read of a generation that was left counts each proof it sends,

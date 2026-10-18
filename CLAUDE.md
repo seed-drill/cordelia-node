@@ -207,6 +207,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8 (within their hour at one time), 2 | parameter-rationale.md §12.6 |
 | `HAND_OVER_CHANGE_ENTRY_BYTES`, `MAX_HAND_OVER_BYTES` | 32,960, 54,275 (derived) | parameter-rationale.md §12.6 |
 | `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
+| `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
 | `PROTOCOL_ENTRY_SHOW`, `PROTOCOL_CHANNEL_PROVE`, `PROTOCOL_ENTRY_PULL`, `PROTOCOL_ENTRY_PUSH`, `PROTOCOL_RELAY_ENTRIES` | 0x10, 0x11, 0x12, 0x13, 0x14 | network-protocol.md §4.9 |
@@ -229,7 +230,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATEMENTS_LEFT_SAID_BELOW` | 16 | parameter-rationale.md §12.9 |
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
-| `RECOVERY_READ_ON_MAX_SECS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more) | parameter-rationale.md §12.9 |
+| `RECOVERY_READ_ON_MAX_SECS`, `RECOVERY_READ_ON_READS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more), 5 (derived: the readings that fit in it) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
 | `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |

@@ -2042,8 +2042,9 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
     let in_part = format!(
         "The personal channel of change 1 was read to its end at no relay: in part at {named}. \
          Devices added since that change, and names, may be missing from what was read. It was \
-         read for 10 minutes, which is what a channel at its largest takes: a relay that hands it \
-         more slowly than that, or stops, leaves it in part."
+         read on at each relay until the relay was not reached, held none of it, handed no more, \
+         or had been read for 10 minutes, as long as a channel at its largest takes: a relay that \
+         hands it more slowly than that, or stops, leaves it in part."
     );
     let warned = said.find(&in_part).unwrap_or_else(|| panic!("{said}"));
     let yes = said.find("Recover on this machine?").unwrap();

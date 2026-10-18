@@ -41,7 +41,7 @@ Each is one sentence that a test can hold. Section 9 names the tests. Security p
 7. **A folder's unmapping never lets go of a name that a carry on this version brought versions into,** whether the folder was mapped before the carry or after it.
 8. **On a device that has stopped, a carried name of which its own notes say it sent a version that it signed to no relay is let go only after the same typed word,** and the command says that the device could not read the relays.
 9. **No let-go lets go of an entry that the read did not ask about:** where the store has taken anything of the name's channel since the read ended, or a `discard` comes with a read that is more than ten minutes old or a number that is not the one found, the node refuses.
-10. **A recovery reads the personal channel of the change it recovers from on from the place each relay reached,** until each relay has handed it to its end or holds none of it, or until 615 seconds have passed (`RECOVERY_READ_ON_MAX_SECS`).
+10. **A recovery reads the personal channel of the change it recovers from on from the place each relay reached,** until each relay has handed it to its end or holds none of it, or until it has made `RECOVERY_READ_ON_READS` readings of `CARRY_READ_MAX_SECS`: five, the readings that fit in 615 seconds (`RECOVERY_READ_ON_MAX_SECS`).
 11. **A recovery says before its yes each relay at which it read that channel in part, and each at which it could not read the phrase's own channel to its end.**
 12. **The count of versions sent to no relay that a command says before its yes counts only entries that this device signed.**
 13. **Nothing on the wire changes:** a relay of alpha.11 serves a device of this version as it serves one of alpha.11.
@@ -160,12 +160,12 @@ The other lines of a recovery, of `cordelia devices` and of the prompt of the ne
 
 1. The first round is the read of today: from the start, for `CARRY_READ_MAX_SECS` at most.
 2. The node says, of each relay that it read in part, the place it reached there: the mark of the relay's holding and the next place, as a pull keeps them (`at_relays.mark`, `at_relays.place`).
-3. The command asks again, of those relays only, from those places. It makes its proofs again where a connection changed, as today. A relay that answers under another mark than the place was asked under has dropped and taken the channel again since: it is read from the start there, and what was read before is kept.
-4. It stops at a relay that has handed the channel to its end or holds none of it, and everywhere at `RECOVERY_READ_ON_MAX_SECS` (615 seconds) from the first round. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. **A relay that is not reached in a round is not asked again:** it stays as it was, and a relay that is down does not hold the read for 615 seconds. A relay that handed part of the channel and then answers that it holds none of it is read in part.
+3. The command asks again, of those relays only, from those places. Where a relay says in a round that its connection changed, the command makes its proofs again and reads again **that relay alone,** from the place it had: the others answered, and are not read again from the same place. A relay that answers under another mark than the place was asked under has dropped and taken the channel again since: it is read from the start there, and what was read before is kept.
+4. It stops at a relay that has handed the channel to its end or holds none of it, and everywhere once it has made `RECOVERY_READ_ON_READS` readings (five). **Each round is a reading, and so is each reading again of a relay whose connection changed.** The bound is counted in readings and not in seconds since the first round: what a reading takes beyond its `CARRY_READ_MAX_SECS` (a page in flight at its end, the handing of what it read to the command) then never costs the fifth reading, which a channel at its cap needs. So the reading is five readings of two minutes and what each takes beyond that. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. **A relay that is not reached in a round is not asked again:** it stays as it was, and a relay that is down does not hold the read for 615 seconds. A relay that handed part of the channel and then answers that it holds none of it is read in part.
 
 The personal channels of the generations before, which are read for names, are read once each, as today (section 11).
 
-**The phrase's own channel (step 1) is read in one round, as today.** It holds one entry, so a relay that hands anything of it hands it whole. A relay that holds none of it says so, and is not said. A relay that could not be read to its end (it was reached, and its read ended before the entry was handed) is said as today while the command reads, and again before the yes, whether or not a change was found elsewhere: it may hold a later change than the one recovered from.
+**The phrase's own channel (step 1) is read in one round, as today.** It holds one entry, so a relay that hands anything of it hands it whole. A relay that holds none of it says so, and is not said. A relay that could not be read to its end (it was not reached, or its read ended before the entry was handed) is said as today while the command reads, and again before the yes, whether or not a change was found elsewhere: it may hold a later change than the one recovered from.
 
 Through the door the node still stores nothing of what it pulls and pushes nothing (the record of 2026-10-04, section 4.6). It keeps no place of its own either: the command is handed the place, and asks from it.
 
@@ -188,11 +188,12 @@ nothing is made.
 
 The lines are on standard output, as the other lines of a recovery are. A size is counted as a relay counts it against its cap: each entry's content and `ENTRY_OVERHEAD_BYTES`. So 9.3 MiB is of the 16 MiB a relay may hold.
 
-Where a relay is still read in part at the end, the line of `WasRead::lines` for a channel read to its end at no relay ends so, in place of what it says of a device that filled the channel:
+Where a relay is still read in part at the end, the line of `WasRead::lines` for a channel read to its end at no relay ends so, in place of what it says of a device that filled the channel. It says what can have stopped the reading, and not that it lasted ten minutes, which it often did not:
 
 ```
-It was read for 10 minutes, which is what a channel at its largest takes: a relay that hands
-it more slowly than that, or stops, leaves it in part.
+It was read on at each relay until the relay was not reached, held none of it, handed no
+more, or had been read for 10 minutes, as long as a channel at its largest takes: a relay
+that hands it more slowly than that, or stops, leaves it in part.
 ```
 
 Step 1, before the yes, where the phrase's own channel could not be read to its end at a relay:
@@ -220,6 +221,7 @@ Only the command of a recovery and the node it talks to. The door's read gains a
 **Constants,** in `crates/cordelia-core/src/protocol.rs`:
 
 - `RECOVERY_READ_ON_MAX_SECS: u64 = 60 × MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / (PUSH_BYTES_PER_PEER_PER_MINUTE − SHOW_ANSWER_ROOM_BYTES) + CARRY_READ_MAX_SECS`, that is 60 × 16,777,216 / 2,030,592 = 495, and 495 + 120 = 615. For `parameter-rationale.md` §12.9: "How long a recovery reads the personal channel of the change it recovers from, at most, counted from its first round, and how long the check before a carried name is let go reads the name's channel (decision 2026-10-17 §3, §4.2). It is what a channel at its cap takes to read at what a device takes from one relay in a minute, less the room a relay keeps for the answer to a show, and one round more: so a relay that hands what it may is read to its end. What a person's devices write in the personal channel is small, so this is reached only where a channel is near its cap, or a relay is slow."
+- `RECOVERY_READ_ON_READS: u64 = RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS`, that is 5. For `parameter-rationale.md` §12.9: "How many readings of `CARRY_READ_MAX_SECS` a recovery makes of the personal channel of the change it recovers from, at most: each round is one, and so is each reading again of a relay whose connection changed. The bound is counted in readings so that what a reading takes beyond its time never costs the reading that reaches a channel at its cap."
 - No other. A round is `CARRY_READ_MAX_SECS`, and a line is said after each round.
 
 ## 4. What "sent to no relay" means where a carried name is let go (C3)
@@ -559,7 +561,8 @@ Each test is written so that taking its rule out makes it fail on an assertion. 
 - `recover_cmd.rs`, `test_a_relay_not_reached_in_a_round_is_not_asked_again`, and that a relay that handed part and then holds none is read in part.
 - Real processes, `recover_e2e.rs`, `a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end`. Devices that count fill the personal channel with about 6 MiB of words, and the desktop's record of a phone is among the last of them. The recovery says that it is reading on, says "read to its end", and asks about the phone. Taking the rule out, the phone has no row. It takes about four minutes.
 - Real processes, `recover_e2e.rs`, `a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look`. One relay, which is stopped during the second round, and is then not asked again: the reading ends within that round. The relay is started again before the yes. The command says what 3.3 says of a read in part, takes the yes, and the look ends and carries what was read. It takes about four minutes. This is the real-process test that today's rule lacks.
-- `protocol.rs`: `RECOVERY_READ_ON_MAX_SECS` is 615, from the values it is made of.
+- `protocol.rs`: `RECOVERY_READ_ON_MAX_SECS` is 615, from the values it is made of, and `RECOVERY_READ_ON_READS` is 5.
+- `recover_cmd.rs`, `test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound`: a relay that says its connection changed from 360 seconds on is read again alone, and only within the bound; the read ends within 615 seconds on a clock where each reading takes two minutes, and another relay is never read twice from the same place.
 
 **Property 12 (the count before a yes):**
 

@@ -401,6 +401,12 @@ pub enum LeftRefused {
 /// a request over the allowance. The connection is still open.
 const NOT_NOW: &str = "refused for now: the relay may hand this connection no more in this minute";
 
+/// What a read through the door for a carry is said to have ended with
+/// where the proof was refused so ([`NOT_NOW`]): the relay took no more
+/// from the connection for now, over its allowance.
+const PROOF_NOT_NOW: &str = "the proof was refused for now: the relay takes no more from this \
+                             connection in this minute";
+
 /// What a show was answered, and what it cost to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowAnswered {
@@ -898,7 +904,13 @@ impl Leave {
                 channel: *channel,
                 proof: *proof,
             });
-            let answer = self.asks(link, Protocol::ChannelProve, &request).await;
+            let answer = match self.asks(link, Protocol::ChannelProve, &request).await {
+                // Refused for now: said as a proof's, not as a page's.
+                Err(Refused::NotAnswered(why)) if why == NOT_NOW => {
+                    return Err(not(PROOF_NOT_NOW));
+                }
+                answer => answer,
+            };
             match answer.map_err(asks)? {
                 WireMessage::ChannelProved(proved) if proved.proved => {}
                 WireMessage::ChannelProved(_) => return Ok(LeftPage::NotHeld),
@@ -1052,6 +1064,27 @@ fn refused_for_now(e: &codec::CodecError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A request is refused for now only where the relay cut it off
+    /// with ERR_RATE_LIMIT** (decision 2026-10-17 §3.2): the answer reset
+    /// with that code, or the request stopped with it. Another code, or a
+    /// connection that was lost, is not that.
+    #[test]
+    fn a_request_is_refused_for_now_only_where_it_was_cut_off_with_the_rate_limit_code() {
+        let code = |n: u32| quinn::VarInt::from_u32(n);
+        let io = |e: std::io::Error| codec::CodecError::Io(e);
+        let reset = |n| io(quinn::ReadError::Reset(code(n)).into());
+        let stopped = |n| io(quinn::WriteError::Stopped(code(n)).into());
+        assert!(refused_for_now(&reset(ERR_RATE_LIMIT)));
+        assert!(refused_for_now(&stopped(ERR_RATE_LIMIT)));
+        assert!(!refused_for_now(&reset(0)));
+        assert!(!refused_for_now(&stopped(0)));
+        let lost = quinn::ReadError::ConnectionLost(quinn::ConnectionError::TimedOut);
+        assert!(!refused_for_now(&io(lost.into())));
+        let plain = std::io::Error::other("stream reset by peer: error 3");
+        assert!(!refused_for_now(&io(plain)));
+        assert!(!refused_for_now(&codec::CodecError::CborDecode("x".into())));
+    }
 
     /// The clock is the system's, and as far ahead of it as it was run:
     /// both the time that waits are measured by and the time of day.

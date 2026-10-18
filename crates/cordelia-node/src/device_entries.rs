@@ -681,16 +681,12 @@ impl DeviceEntries {
                     proved = true;
                     tokio::time::sleep(LEFT_ROOM_WAIT).await
                 }
-                Err(refused) if read.is_empty() => {
-                    return LeftRead::NotRead(match refused {
-                        LeftRefused::OwnChannel => {
-                            "it is a channel of this device's own, which is not read this way"
-                                .into()
-                        }
-                        LeftRefused::NotAnswered(why) => why,
-                        LeftRefused::AskedEnough => "asked enough".into(),
-                        LeftRefused::NotNow => "refused for now".into(),
-                    });
+                Err(LeftRefused::OwnChannel) if read.is_empty() => {
+                    let own = "it is a channel of this device's own, which is not read this way";
+                    return LeftRead::NotRead(own.into());
+                }
+                Err(LeftRefused::NotAnswered(why)) if read.is_empty() => {
+                    return LeftRead::NotRead(why);
                 }
                 Err(_) => {
                     return LeftRead::Read {
