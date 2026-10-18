@@ -123,12 +123,6 @@ pub struct OwnAt {
     pub place: (Mark, u64),
     /// What the relay handed, counted as it counts against its cap.
     pub bytes: u64,
-    /// How many pulls the relay refused for now in this read, in every
-    /// round: a relay refuses so a breach of its rates as well as a pull
-    /// it has no room for, and cuts off an address at BAN_THRESHOLD
-    /// breaches, so the read asks again only so often (decision
-    /// 2026-10-17 §4.2 item 2).
-    pub refused_for_now: u32,
     /// Each entry of the channel that the relay handed, by its slot, once
     /// each, in the order handed: what the door did with it is not
     /// asked here.
@@ -144,7 +138,6 @@ impl OwnAt {
             read: ReadAt::Reading,
             place: (NO_MARK, 0),
             bytes: 0,
-            refused_for_now: 0,
             handed: BTreeMap::new(),
         }
     }

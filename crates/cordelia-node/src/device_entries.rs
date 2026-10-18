@@ -122,8 +122,8 @@ use cordelia_api::state::{
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
-    CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
-    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
+    BAN_THRESHOLD, BAN_WINDOW_SECS, CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS,
+    ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
     RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
@@ -142,6 +142,10 @@ use rusqlite::Connection;
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
 };
+
+/// The window in which a relay counts breaches of its rates, and the
+/// device counts what a relay refused for now.
+const BAN_WINDOW: Duration = Duration::from_secs(BAN_WINDOW_SECS);
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -324,6 +328,10 @@ struct Kept {
     /// When the device last swept its old deletes, by the time of day in
     /// seconds: none since the node started.
     swept_at: Option<i64>,
+    /// The requests that each relay refused for now, by its node key,
+    /// each by when: those within BAN_WINDOW_SECS
+    /// ([`DeviceEntries::asks_again_after_a_refusal`]).
+    refused_for_now: HashMap<[u8; 32], std::collections::VecDeque<Instant>>,
 }
 
 /// A device's side of its relays, for the channels of its own (see the
@@ -2154,6 +2162,46 @@ impl DeviceEntries {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
         taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES
+    }
+
+    /// The relay at `link` refused a request for now: it reset the stream
+    /// with ERR_RATE_LIMIT ([`Refused::NotNow`]). The refusal is kept,
+    /// with its time, and the answer is whether a read asks the relay
+    /// again: only while the relay has refused fewer than BAN_THRESHOLD -
+    /// 1 requests so within BAN_WINDOW_SECS, this one with them.
+    ///
+    /// **Why:** a relay refuses with that reset a pull it has no room for
+    /// now, which is no breach, and also a breach of its rates, and cuts
+    /// off an address at BAN_THRESHOLD breaches within that window. The
+    /// device cannot tell the two apart, so it asks again only short of
+    /// that count. The count is the relay's, kept by its node key: across
+    /// rounds and across reads, of any channel, on any connection. A page
+    /// does not reset it; each refusal leaves it once the window has gone
+    /// by.
+    ///
+    /// **What it cannot count:** a pass that is refused does not ask
+    /// again, and is not counted here; the relay counts it, and so it
+    /// counts what other devices behind the same address do. The first
+    /// request of a read, which the device cannot know will be refused,
+    /// can still bring the relay's count to BAN_THRESHOLD. Nor does the
+    /// count outlive the node.
+    pub fn asks_again_after_a_refusal(&self, link: &Link) -> bool {
+        let now = self.clock.now();
+        let mut kept = lock(&self.kept);
+        let refused = kept.refused_for_now.entry(link.relay().0).or_default();
+        refused.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);
+        refused.push_back(now);
+        refused.len() < (BAN_THRESHOLD - 1) as usize
+    }
+
+    /// How many requests the relay whose node key is `relay` refused for
+    /// now within BAN_WINDOW_SECS, as the device counts them.
+    pub fn refused_for_now(&self, relay: &[u8; 32]) -> usize {
+        let now = self.clock.now();
+        let kept = lock(&self.kept);
+        let refused = kept.refused_for_now.get(relay);
+        let within = |at: &&Instant| now.saturating_duration_since(**at) < BAN_WINDOW;
+        refused.map_or(0, |refused| refused.iter().filter(within).count())
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
