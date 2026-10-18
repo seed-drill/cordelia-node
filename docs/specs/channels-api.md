@@ -1210,8 +1210,8 @@ never held, comes in only under **a word that the phrase signed:**
   its slot on, and the answer carries `let_go_versions`, how many such entries
   there were. It is refused with `409` where an entry is held by no relay
   (saying, of each relay, how its read ended), where the store has taken
-  anything of the name's channel since the read ended, and where the node
-  keeps no read by that ID. **Where an entry is held by no relay, the name
+  anything of the name's channel since the read ended, where a folder was
+  mapped to the name while it was read, and where the node keeps no read by that ID. **Where an entry is held by no relay, the name
   is let go with it only on the word `discard`** (decision 2026-10-17 §5):
   a command that asks at a terminal sends `"asks": true`, and is answered in
   place of the refusal with `not_let_go`: `read`, the ID the word is bound

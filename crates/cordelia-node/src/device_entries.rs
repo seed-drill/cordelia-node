@@ -123,8 +123,8 @@ use cordelia_api::state::{
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
-    BAN_THRESHOLD, BAN_WINDOW_SECS, CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS,
-    ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
+    CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
+    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
     RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
@@ -143,10 +143,6 @@ use rusqlite::Connection;
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
 };
-
-/// The window in which a relay counts breaches of its rates, and the
-/// device counts what a relay refused for now.
-const BAN_WINDOW: Duration = Duration::from_secs(BAN_WINDOW_SECS);
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -211,6 +207,10 @@ pub struct Counts {
 struct At<'a> {
     link: &'a Link,
     under: [u8; 32],
+    /// Whether each request is held to the relay's count of refusals for
+    /// now ([`DeviceEntries::asks_after_refusals`]): a read's are, and a
+    /// pass's are not.
+    gated: bool,
 }
 
 /// What became of one step of a relay's pass.
@@ -329,10 +329,6 @@ struct Kept {
     /// When the device last swept its old deletes, by the time of day in
     /// seconds: none since the node started.
     swept_at: Option<i64>,
-    /// The requests that each relay refused for now, by its node key,
-    /// each by when: those within BAN_WINDOW_SECS
-    /// ([`DeviceEntries::asks_again_after_a_refusal`]).
-    refused_for_now: HashMap<[u8; 32], std::collections::VecDeque<Instant>>,
 }
 
 /// A device's side of its relays, for the channels of its own (see the
@@ -830,7 +826,7 @@ impl DeviceEntries {
             for link in links {
                 if whole || !self.leave.has_heard(link.name()) {
                     let (engine, link) = (Arc::clone(self), (*link).clone());
-                    shows.spawn(async move { (link.id(), engine.show_at(&link).await) });
+                    shows.spawn(async move { (link.id(), engine.show_at(&link, false).await) });
                 }
             }
             while let Some(done) = shows.join_next().await {
@@ -917,7 +913,7 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         let gave_leave = match shown {
             Some(gave_leave) => Some(gave_leave),
-            None if whole => Some(self.show_at(link).await),
+            None if whole => Some(self.show_at(link, false).await),
             None => None,
         };
         // (A device that has stopped, or is in a fork, has no channel
@@ -1244,9 +1240,9 @@ impl DeviceEntries {
     /// whole show whose stream is reset, which is how a relay says "not
     /// now" to an asker that is over its bytes for the minute, is made
     /// again at the next pass.
-    async fn show_at(&self, link: &Link) -> bool {
+    async fn show_at(&self, link: &Link, gated: bool) -> bool {
         let mut round = Round::default();
-        let gave_leave = self.show_round(link, &mut round).await;
+        let gave_leave = self.show_round(link, &mut round, gated).await;
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -1278,7 +1274,7 @@ impl DeviceEntries {
 
     /// [`Self::show_at`], for one round of shows, with what became of
     /// them said in `round`.
-    async fn show_round(&self, link: &Link, round: &mut Round) -> bool {
+    async fn show_round(&self, link: &Link, round: &mut Round, gated: bool) -> bool {
         // The entry is shown whole where it was not yet on this
         // connection, where the relay asks for it, and where the relay
         // tells of another that the device does not keep.
@@ -1308,6 +1304,12 @@ impl DeviceEntries {
                 .get(&link.id())
                 .and_then(|of| of.shown_whole);
             let short = !whole && shown_whole == Some(entry.id());
+            // A show of a read is held to the relay's count of refusals
+            // for now, as each of its requests is: a short show refused
+            // for now is followed by a whole one only below the count.
+            if gated && !self.asks_after_refusals(link) {
+                return false;
+            }
             let answered = match self.leave.show(link, entry, short).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
@@ -1588,7 +1590,11 @@ impl DeviceEntries {
                 return false;
             }
         };
-        let at = At { link, under };
+        let at = At {
+            link,
+            under,
+            gated: false,
+        };
         let whole = kind == Pass::Whole;
         let mut read_all = true;
         for channel in &own {
@@ -1704,6 +1710,11 @@ impl DeviceEntries {
     ///
     /// `opened` is called under the database's lock once a stream is
     /// about to be opened, and not for one that is refused.
+    ///
+    /// **A read's request is held to the relay's count of refusals for
+    /// now** ([`At::gated`]): each show, and the request as it is sent and
+    /// as it is sent again after a show, is sent only below that count
+    /// ([`Leave::at_its_count`]); at it, nothing is ([`Refused::RefusedEnough`]).
     async fn through<R, T>(
         &self,
         at: &At<'_>,
@@ -1716,12 +1727,13 @@ impl DeviceEntries {
         let asked = Asked {
             under: &at.under,
             request,
+            gated: at.gated,
         };
         let link = at.link;
         let open = || self.leave.open(db, link, asked, &opened, &read, &take);
         match open().await {
             Err(Refused::NoLeave(NoLeave::NotGiven)) => {
-                self.show_at(link).await;
+                self.show_at(link, at.gated).await;
                 open().await
             }
             done => done,
@@ -2184,44 +2196,49 @@ impl DeviceEntries {
         taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES
     }
 
-    /// The relay at `link` refused a request for now: it reset the stream
-    /// with ERR_RATE_LIMIT ([`Refused::NotNow`]). The refusal is kept,
-    /// with its time, and the answer is whether a read asks the relay
-    /// again: only while the relay has refused fewer than BAN_THRESHOLD -
-    /// 1 requests so within BAN_WINDOW_SECS, this one with them.
+    /// Whether a read asks the relay at `link` at all, in a round: only
+    /// while the relay has refused fewer than BAN_THRESHOLD - 1 requests
+    /// for now within BAN_WINDOW_SECS ([`Leave::refused_for_now`]). A
+    /// relay at that count is not asked, by a read of any channel, until a
+    /// refusal has left the window: the device knows that one more refusal
+    /// may be the breach that has the relay cut off its address.
     ///
-    /// **Why:** a relay refuses with that reset a pull it has no room for
-    /// now, which is no breach, and also a breach of its rates, and cuts
-    /// off an address at BAN_THRESHOLD breaches within that window. The
-    /// device cannot tell the two apart, so it asks again only short of
-    /// that count. The count is the relay's, kept by its node key: across
-    /// rounds and across reads, of any channel, on any connection. A page
-    /// does not reset it; each refusal leaves it once the window has gone
-    /// by.
+    /// **Why:** a relay refuses with ERR_RATE_LIMIT a pull it has no room
+    /// for now, which is no breach, and also a breach of its rates, and
+    /// cuts off an address at BAN_THRESHOLD breaches within that window.
+    /// The device cannot tell the two apart. Every request that a relay
+    /// refuses so is counted for it, by its node key, where it was given
+    /// ([`Leave`]): a show, a proof, a pull or a push, of a pass or of a
+    /// read, on any connection. A page does not reset the count; each
+    /// refusal leaves it once the window has gone by.
     ///
-    /// **What it cannot count:** a pass that is refused does not ask
-    /// again, and is not counted here; the relay counts it, and so it
-    /// counts what other devices behind the same address do. The first
-    /// request of a read, which the device cannot know will be refused,
-    /// can still bring the relay's count to BAN_THRESHOLD. Nor does the
-    /// count outlive the node.
+    /// **What it cannot count:** what other devices behind the same
+    /// address are refused, which the relay counts against the address;
+    /// and anything from before the node started. A pass is not held back
+    /// by the count: it asks at its next pass.
+    ///
+    /// **What it costs a relay that is honest:** a relay near what it may
+    /// hand a connection in a minute refuses pulls for room, which are no
+    /// breach. For BAN_WINDOW_SECS after one such refusal, the next leaves
+    /// the relay not reached in that round, where it would have had room
+    /// again within its minute; after two, it is not asked at all. A read
+    /// there then ends in part where it could have read on (decision
+    /// 2026-10-17 §11).
+    pub fn asks_after_refusals(&self, link: &Link) -> bool {
+        !self.leave.at_its_count(&link.relay().0)
+    }
+
+    /// The relay at `link` refused a request for now ([`Refused::NotNow`]),
+    /// which was counted for it where it was given: whether a read asks
+    /// the relay again ([`Self::asks_after_refusals`]).
     pub fn asks_again_after_a_refusal(&self, link: &Link) -> bool {
-        let now = self.clock.now();
-        let mut kept = lock(&self.kept);
-        let refused = kept.refused_for_now.entry(link.relay().0).or_default();
-        refused.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);
-        refused.push_back(now);
-        refused.len() < (BAN_THRESHOLD - 1) as usize
+        self.asks_after_refusals(link)
     }
 
     /// How many requests the relay whose node key is `relay` refused for
     /// now within BAN_WINDOW_SECS, as the device counts them.
     pub fn refused_for_now(&self, relay: &[u8; 32]) -> usize {
-        let now = self.clock.now();
-        let kept = lock(&self.kept);
-        let refused = kept.refused_for_now.get(relay);
-        let within = |at: &&Instant| now.saturating_duration_since(**at) < BAN_WINDOW;
-        refused.map_or(0, |refused| refused.iter().filter(within).count())
+        self.leave.refused_for_now(relay)
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
