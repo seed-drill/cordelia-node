@@ -1324,6 +1324,34 @@ mod tests {
         for (entry, why) in &refused {
             assert_eq!(given(&s, 0, entry), Taken::Refused(*why));
         }
+        // A delete of a message's full size, in her slot, signed so: no
+        // honest node writes one, and it is refused as a delete.
+        let full_delete = {
+            use cordelia_core::protocol::{LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL};
+            let slot = cordelia_crypto::slots::slot_id(
+                &derive::slot_key(&channel.secret).unwrap(),
+                &message_name(&key, 1).unwrap(),
+            );
+            let channel_key = derive::signing_key(&channel.secret).unwrap();
+            let mut entry = cordelia_crypto::entry::Entry {
+                channel: channel_key.public_key(),
+                slot,
+                author: key,
+                rev: 3,
+                delete: true,
+                content: vec![0; cordelia_core::protocol::AGENT_MESSAGE_CONTENT_BYTES],
+                author_signature: [0; 64],
+                channel_signature: [0; 64],
+            };
+            let form = entry.signed_bytes();
+            entry.author_signature = alice.sign(&[LABEL_ENTRY_AUTHOR, &form[..]].concat());
+            entry.channel_signature = channel_key.sign(&[LABEL_ENTRY_CHANNEL, &form[..]].concat());
+            entry.check().unwrap()
+        };
+        assert_eq!(
+            given(&s, 0, &full_delete),
+            Taken::Refused(NotTaken::NotAShared)
+        );
         assert_eq!(everything(&s, 0), before);
         assert!(key_row(&s, 0, &channel, &key).is_none());
         // The highest revision below the half of band 0 is taken.
