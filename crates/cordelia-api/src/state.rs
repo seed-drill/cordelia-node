@@ -209,6 +209,11 @@ impl HeldUp {
 /// read at each relay. The node takes each asking up and answers it.
 /// And which channels a carry is being made into, before a folder's
 /// first cycle there ([`OwnChannels::carrying`]).
+///
+/// And it carries what a command's work asks for a read of a channel of
+/// the device's own with places of its own ([`OwnChannels::ask_own`],
+/// decision 2026-10-17 §4.2), and keeps each such read under its ID
+/// between rounds ([`OwnChannels::reads`]).
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -243,6 +248,12 @@ pub struct OwnChannels {
     /// yet.
     door: Mutex<std::collections::VecDeque<DoorAsk>>,
     door_asked: tokio::sync::Notify,
+    /// What was asked for a read of a channel of the device's own, and is
+    /// not taken up yet.
+    own: Mutex<std::collections::VecDeque<OwnAsk>>,
+    own_asked: tokio::sync::Notify,
+    /// The reads of channels of the device's own, each under its ID.
+    reads: crate::own_read::OwnReads,
     /// The channels that a carry is being made into, each with when that
     /// began.
     carrying: Mutex<std::collections::HashMap<[u8; 32], Instant>>,
@@ -304,8 +315,35 @@ pub enum LeftRead {
     /// ([`DoorAsk::Remake`]), and reads on there.
     NoRoom,
     /// What it handed of the channel, each entry as its bytes on the
-    /// wire, and whether the channel was read to its end.
-    Read { entries: Vec<Vec<u8>>, whole: bool },
+    /// wire, whether the channel was read to its end, and the place the
+    /// read reached there: a later read asked from it goes on from where
+    /// this one stopped (decision 2026-10-17 §3.2).
+    Read {
+        entries: Vec<Vec<u8>>,
+        whole: bool,
+        reached: LeftPlace,
+    },
+}
+
+/// A place in a channel at one relay, as a pull keeps it (decision
+/// 2026-10-17 §3.2): the mark of the relay's holding of the channel, and
+/// the place after which the next page begins. **A place means something
+/// only with its mark:** a relay that is asked from a place under a mark
+/// that is no longer its holding's reads from the start, and answers
+/// under the mark it has now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeftPlace {
+    pub mark: cordelia_storage::relay::Mark,
+    pub next: u64,
+}
+
+impl LeftPlace {
+    /// The start of a channel, under no mark: where a read that is given
+    /// no place begins.
+    pub const START: Self = Self {
+        mark: cordelia_storage::relay::NO_MARK,
+        next: 0,
+    };
 }
 
 /// A relay that the device is set up with, by its name, with what it
@@ -329,11 +367,14 @@ pub enum DoorAsk {
     /// `until`: it is of a generation that the device has left, or never
     /// followed. With `only`, it is read at the relays of those names
     /// alone, and each other is not answered for: a read goes on so at a
-    /// relay whose connection was made again.
+    /// relay whose connection was made again. At a relay named in `from`
+    /// it is read on from that place, and at any other from the start
+    /// (decision 2026-10-17 §3.2).
     Read {
         channel: [u8; 32],
         by: ProvedBy,
         only: Option<Vec<String>>,
+        from: std::collections::HashMap<String, LeftPlace>,
         until: Instant,
         answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
     },
@@ -348,6 +389,33 @@ pub enum DoorAsk {
     Remake {
         relay: String,
         peer: Option<[u8; 32]>,
+        answer: tokio::sync::oneshot::Sender<bool>,
+    },
+}
+
+/// What a command's work asks of the node for a read of a channel of the
+/// device's own with places of its own (decision 2026-10-17 §4.2): a pull
+/// of the channel, under leave, as a pass makes it, that keeps its places
+/// in memory under the read's ID ([`crate::own_read`]). What it read is
+/// in [`OwnChannels::reads`].
+pub enum OwnAsk {
+    /// Begin a read of the channel whose ID is `channel`, one that a pass
+    /// pulls, at every relay that the device is set up with, and read its
+    /// first round, until `until`. Answered with the read's ID: `None`
+    /// where the channel is not one that a pass pulls now, or the node is
+    /// held up, and nothing is read.
+    Begin {
+        channel: [u8; 32],
+        until: Instant,
+        answer: tokio::sync::oneshot::Sender<Option<crate::own_read::ReadId>>,
+    },
+    /// Read one round more of the read named `read`, at each relay where
+    /// it is read in part, from its place there, until `until`. Answered
+    /// with whether the node keeps that read, with no round of it
+    /// running: one that it does not is read nowhere.
+    ReadOn {
+        read: crate::own_read::ReadId,
+        until: Instant,
         answer: tokio::sync::oneshot::Sender<bool>,
     },
 }
@@ -456,6 +524,38 @@ impl OwnChannels {
             }
             self.door_asked.notified().await;
         }
+    }
+
+    /// A command's work asks for a read of a channel of the device's own:
+    /// the node takes it up, and answers on the asking's own channel.
+    pub fn ask_own(&self, ask: OwnAsk) {
+        self.own
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ask);
+        self.own_asked.notify_one();
+    }
+
+    /// Wait for a read of a channel of the device's own to be asked for,
+    /// and take it up: each asking is taken up once.
+    pub async fn wait_own(&self) -> OwnAsk {
+        loop {
+            let asked = self
+                .own
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            if let Some(asked) = asked {
+                return asked;
+            }
+            self.own_asked.notified().await;
+        }
+    }
+
+    /// The reads of channels of the device's own that the node keeps,
+    /// each under its ID, with its places and what each relay handed.
+    pub fn reads(&self) -> &crate::own_read::OwnReads {
+        &self.reads
     }
 
     /// A carry is being made into the channel whose ID is `channel`, from
@@ -691,10 +791,12 @@ impl OwnChannels {
 
     /// Keep nothing of which relays have handed the channel whose ID is
     /// `channel`: the device holds it no more. Held again, it is fetched
-    /// again before a folder's first cycle there.
+    /// again before a folder's first cycle there. Nor is anything kept of
+    /// a read of it that went ([`crate::own_read::OwnReads::forget_gone`]).
     pub fn forget_fetched(&self, channel: &[u8; 32]) {
         let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
         fetched.remove(channel);
+        self.reads.forget_gone(channel);
     }
 
     /// The node says which of the relays it is set up with are connected

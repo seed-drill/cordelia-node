@@ -41,7 +41,7 @@
 //! channel could not be read. What is carried waits in the store and is
 //! sent like anything the device writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use actix_web::{HttpRequest, HttpResponse, web};
@@ -50,7 +50,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use cordelia_core::protocol::{
-    CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS, OUTBOX_FLUSH_INTERVAL_SECS,
+    CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS, OUTBOX_FLUSH_INTERVAL_SECS, entry_cost,
 };
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -58,6 +58,7 @@ use cordelia_crypto::fingerprint;
 use cordelia_crypto::version::Version;
 use cordelia_storage::entries;
 use cordelia_storage::person::{self as held_rows, State};
+use cordelia_storage::relay::Mark;
 
 use crate::carry::{self, Allows, Handed, Removed, Rule, Tally, WasRead, Word};
 use crate::commands::{self, Waited};
@@ -65,7 +66,7 @@ use crate::error::ApiError;
 use crate::names;
 use crate::person::{self, Held, PersonError};
 use crate::publish::Standing;
-use crate::state::{AppState, DoorAsk, LeftAt, LeftRead, ProofMade, ProvedBy};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftPlace, LeftRead, ProofMade, ProvedBy};
 use crate::take::take;
 
 fn now() -> i64 {
@@ -99,10 +100,24 @@ pub async fn read_at_relays(
     by: ProvedBy,
     until: Instant,
 ) -> Vec<LeftAt> {
+    read_at_relays_from(state, channel, by, &HashMap::new(), until).await
+}
+
+/// [`read_at_relays`], read on at each relay named in `from` from the
+/// place given for it (decision 2026-10-17 §3.2), and at any other from
+/// the start. Where a connection is made again for room, the read there
+/// goes on from the same place.
+pub async fn read_at_relays_from(
+    state: &AppState,
+    channel: [u8; 32],
+    by: ProvedBy,
+    from: &HashMap<String, LeftPlace>,
+    until: Instant,
+) -> Vec<LeftAt> {
     if state.push_tx.is_none() {
         return Vec::new();
     }
-    let mut read = asks_to_read(state, channel, by.clone(), None, until).await;
+    let mut read = asks_to_read(state, channel, by.clone(), None, from, until).await;
     loop {
         let no_room = |at: &&LeftAt| at.read == LeftRead::NoRoom;
         let full: Vec<String> = read
@@ -117,7 +132,7 @@ pub async fn read_at_relays(
         let again = match &by {
             ProvedBy::Secret(_) if remade.is_empty() => return read,
             ProvedBy::Secret(_) => {
-                asks_to_read(state, channel, by.clone(), Some(remade), until).await
+                asks_to_read(state, channel, by.clone(), Some(remade), from, until).await
             }
             ProvedBy::Proofs(_) => full
                 .iter()
@@ -136,12 +151,13 @@ pub async fn read_at_relays(
 }
 
 /// One asking of the door to read `channel`: at every relay, or at those
-/// named in `only`.
+/// named in `only`, each from its place in `from` where it has one.
 async fn asks_to_read(
     state: &AppState,
     channel: [u8; 32],
     by: ProvedBy,
     only: Option<Vec<String>>,
+    from: &HashMap<String, LeftPlace>,
     until: Instant,
 ) -> Vec<LeftAt> {
     let (answer, answered) = tokio::sync::oneshot::channel();
@@ -149,6 +165,7 @@ async fn asks_to_read(
         channel,
         by,
         only,
+        from: from.clone(),
         until,
         answer,
     });
@@ -270,12 +287,17 @@ pub(crate) async fn fetched_whole(state: &AppState, deadline: Instant) -> bool {
 /// **With how many entries of the channel the relay handed** (decision
 /// 2026-10-04 §16): a read that is said to be in `part` ended before the
 /// channel's end, and may have ended before any entry of it was handed.
-/// Whoever goes on with what was read in part asks how many.
+/// Whoever goes on with what was read in part asks how many. **And with
+/// how many bytes they come to, as a relay counts them against a
+/// channel's cap** (decision 2026-10-17 §3.3): each entry's content and
+/// ENTRY_OVERHEAD_BYTES, so that a recovery that reads on says how far
+/// it has read.
 pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
-    let mut entries = Vec::new();
+    let mut entries: Vec<CheckedEntry> = Vec::new();
     let mut said = Vec::new();
     for at in read {
         let mut of_the_channel = 0;
+        let mut bytes = 0u64;
         let how = match &at.read {
             LeftRead::NotReached => "not reached".to_string(),
             LeftRead::NotHeld => "not held".to_string(),
@@ -285,6 +307,7 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
             LeftRead::Read {
                 entries: wire,
                 whole,
+                ..
             } => {
                 let checked = wire
                     .iter()
@@ -292,13 +315,20 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
                 let before = entries.len();
                 entries.extend(checked);
                 of_the_channel = entries.len() - before;
+                let costs = entries[before..].iter();
+                bytes = costs.map(|entry| entry_cost(entry.content.len())).sum();
                 match whole {
                     true => "whole".to_string(),
                     false => "part".to_string(),
                 }
             }
         };
-        said.push(json!({ "relay": at.relay, "read": how, "entries": of_the_channel }));
+        said.push(json!({
+            "relay": at.relay,
+            "read": how,
+            "entries": of_the_channel,
+            "bytes": bytes,
+        }));
     }
     (entries, said)
 }
@@ -530,10 +560,15 @@ pub async fn carry_name(
             done.nothing = Some("the new channel holds something for this name already".into());
             return Ok(done);
         }
+        // The carry of `cordelia sync map` brings into the folder's own
+        // name; any other is a carry by command (decision 2026-10-17 §4.3).
+        let bring = match only_where_empty {
+            true => carry::bring,
+            false => carry::bring_by_command,
+        };
         for was in &read {
             for version in &was.versions {
-                let brought =
-                    carry::bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
+                let brought = bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
                 done.tally.count(&version.name, brought);
             }
         }
@@ -1083,7 +1118,8 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
                     true => Rule::Above,
                     false => Rule::EmptySlots,
                 };
-                let brought = carry::bring(&conn, &state.identity, name, version, rule, now())?;
+                let brought =
+                    carry::bring_by_command(&conn, &state.identity, name, version, rule, now())?;
                 tally.count(&version.name, brought);
             }
             Ok(tally)
@@ -1201,12 +1237,47 @@ pub struct ProofFor {
 }
 
 #[derive(Deserialize)]
+pub struct PlaceFor {
+    /// The relay, by its name.
+    pub relay: String,
+    /// The mark of the relay's holding of the channel, in hex, as the
+    /// node said it ([`places_reached`]).
+    pub mark: String,
+    /// The place after which the next page begins.
+    pub place: u64,
+}
+
+#[derive(Deserialize)]
 pub struct ReadRequest {
     /// The ID of the channel, in hex.
     pub channel: String,
     /// The proof of its key for each relay's connection: made by whoever
     /// holds the channel's secret, which the node does not.
     pub proofs: Vec<ProofFor>,
+    /// The place to read on from at each relay that it names, as an
+    /// earlier read said it reached there (decision 2026-10-17 §3.2). A
+    /// relay that it does not name is read from the start.
+    #[serde(default)]
+    pub from: Vec<PlaceFor>,
+}
+
+/// The place that the read reached at each relay where it read the
+/// channel, to its end or in part: its name, the mark of its holding in
+/// hex, and the place (decision 2026-10-17 §3.2). **A relay that is not
+/// among them read nothing** (it was not reached, holds none, or did not
+/// answer): whoever asked keeps the place it had there. A command
+/// asks from it to read on where the read stopped.
+fn places_reached(read: &[LeftAt]) -> Vec<serde_json::Value> {
+    read.iter()
+        .filter_map(|at| match &at.read {
+            LeftRead::Read { reached, .. } => Some(json!({
+                "relay": at.relay,
+                "mark": hex::encode(reached.mark),
+                "place": reached.next,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Read, at each relay, a channel whose secret the node does not hold,
@@ -1224,24 +1295,36 @@ pub struct ReadRequest {
 /// asks for the sessions again ([`sessions_now`]) and makes its proofs
 /// again. It is never said to hold none for that.
 ///
+/// **At each relay that `from` gives a place for, the read goes on from
+/// it, and it says the place it reached at each relay it read** (decision
+/// 2026-10-17 §3.2): so a channel larger than one read is read on, a read
+/// at a time, by whoever holds its proofs. The node keeps no place of its
+/// own.
+///
 /// Answers with what is said of each relay, how many entries were
-/// handed, and what the reading is named by: the entries themselves are
-/// handed a part at a time ([`read_part`]). A channel of this device's
-/// own is not read this way.
+/// handed, the place reached at each relay it read, and what the reading
+/// is named by: the entries themselves are handed a part at a time
+/// ([`read_part`]). A channel of this device's own is not read this way.
 pub async fn read_with_proofs(
     state: &AppState,
     channel: [u8; 32],
     proofs: Vec<ProofMade>,
+    from: HashMap<String, LeftPlace>,
 ) -> serde_json::Value {
     let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-    let at = read_at_relays(state, channel, ProvedBy::Proofs(proofs), until).await;
+    let by = ProvedBy::Proofs(proofs);
+    let at = read_at_relays_from(state, channel, by, &from, until).await;
     let (_, said) = handed(&at);
-    // Each entry once, as it came: the command checks each itself.
+    let reached = places_reached(&at);
+    // Each entry once, as it came: the command checks each itself. A
+    // channel read on may be handed in thousands of entries, so what was
+    // handed already is looked up, not searched for.
     let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for relay in at {
         if let LeftRead::Read { entries: wire, .. } = relay.read {
             for bytes in wire {
-                if !entries.contains(&bytes) {
+                if seen.insert(bytes.clone()) {
                     entries.push(bytes);
                 }
             }
@@ -1249,7 +1332,7 @@ pub async fn read_with_proofs(
     }
     let count = entries.len();
     let id = state.own_channels.shelve(entries);
-    json!({ "relays": said, "read": id, "entries": count })
+    json!({ "relays": said, "read": id, "entries": count, "reached": reached })
 }
 
 /// `POST /api/v1/carry/read` ([`read_with_proofs`]).
@@ -1274,7 +1357,23 @@ pub async fn read_proved(
             proof,
         });
     }
-    Ok(HttpResponse::Ok().json(read_with_proofs(&state, channel, proofs).await))
+    let mut from = HashMap::new();
+    for place in &body.from {
+        let mark: Mark = hex::decode(&place.mark)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| bad("a mark"))?;
+        let at = LeftPlace {
+            mark,
+            next: place.place,
+        };
+        if from.insert(place.relay.clone(), at).is_some() {
+            let twice = format!("{} is given two places to read from", place.relay);
+            return Err(ApiError::BadRequest(twice));
+        }
+    }
+    let read = read_with_proofs(&state, channel, proofs, from).await;
+    Ok(HttpResponse::Ok().json(read))
 }
 
 /// `POST /api/v1/carry/sessions`: each relay that the device is set up
@@ -1402,8 +1501,14 @@ pub fn take_handed(
                     by_other_keys += 1;
                     continue;
                 }
-                let brought =
-                    carry::bring(&conn, &state.identity, &name, &version, Rule::Counts, now())?;
+                let brought = carry::bring_by_command(
+                    &conn,
+                    &state.identity,
+                    &name,
+                    &version,
+                    Rule::Counts,
+                    now(),
+                )?;
                 tally.count(&version.name, brought);
             }
             Ok((tally, by_other_keys))
@@ -1435,12 +1540,22 @@ pub async fn handed_take(
 mod tests {
     use super::*;
 
+    use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
+    use std::collections::BTreeSet;
+
     use cordelia_crypto::entry::Value;
     use cordelia_crypto::phrase::Phrase;
 
     use crate::several::{Machine, Node, OTHER_WORDS, SESSION, Several, entry_by};
 
     const LAB: &str = "lab";
+
+    /// What `n` entries of the smallest size come to, as a relay counts
+    /// them against a channel's cap: what is said a relay handed of a
+    /// channel of short files.
+    fn smallest(n: u64) -> u64 {
+        n * (MIN_ENTRY_CONTENT_BYTES + ENTRY_OVERHEAD_BYTES) as u64
+    }
 
     /// Devices 0 and 2 sync a name, and device 2 writes there what only
     /// the relay is sent: over a file that device 0 holds, a file of its
@@ -1478,7 +1593,10 @@ mod tests {
     /// that relay handed (decision 2026-10-04 §16). A read in part can
     /// have ended before any entry was handed: the word alone does not
     /// tell which. What does not pass the check is no entry, and is not
-    /// counted; and a relay that was not read handed none.
+    /// counted; and a relay that was not read handed none. **It says how
+    /// many bytes they come to, as a relay counts them against a
+    /// channel's cap** (decision 2026-10-17 §3.3): each entry's content
+    /// and ENTRY_OVERHEAD_BYTES.
     #[test]
     fn test_what_is_said_of_a_relay_says_how_many_entries_it_handed() {
         let mut s = Several::of_one_person(2);
@@ -1501,6 +1619,7 @@ mod tests {
         let read_as = |entries: &[Vec<u8>], whole: bool| LeftRead::Read {
             entries: entries.to_vec(),
             whole,
+            reached: LeftPlace::START,
         };
         let read = [
             at("one", read_as(&wire, true)),
@@ -1514,24 +1633,34 @@ mod tests {
         ];
         let (entries, said) = handed(&read);
         assert_eq!(entries.len(), 4);
-        let said: Vec<(&str, &str, u64)> = said
+        let said: Vec<(&str, &str, u64, u64)> = said
             .iter()
             .map(|of| {
                 let text = |field: &str| of[field].as_str().unwrap();
-                (text("relay"), text("read"), of["entries"].as_u64().unwrap())
+                let number = |field: &str| of[field].as_u64().unwrap();
+                (
+                    text("relay"),
+                    text("read"),
+                    number("entries"),
+                    number("bytes"),
+                )
             })
             .collect();
+        // Each entry of the two is a content of the smallest size.
+        let two = 2 * (MIN_ENTRY_CONTENT_BYTES as u64 + ENTRY_OVERHEAD_BYTES as u64);
+        let sizes: Vec<usize> = entries.iter().map(|entry| entry.content.len()).collect();
+        assert_eq!(sizes, [MIN_ENTRY_CONTENT_BYTES; 4]);
         assert_eq!(
             said,
             [
-                ("one", "whole", 2),
-                ("two", "part", 2),
-                ("three", "part", 0),
-                ("four", "whole", 0),
-                ("five", "not held", 0),
-                ("six", "not reached", 0),
-                ("seven", "not read: why", 0),
-                ("eight", CONNECTION_CHANGED, 0),
+                ("one", "whole", 2, two),
+                ("two", "part", 2, two),
+                ("three", "part", 0, 0),
+                ("four", "whole", 0, 0),
+                ("five", "not held", 0, 0),
+                ("six", "not reached", 0, 0),
+                ("seven", "not read: why", 0, 0),
+                ("eight", CONNECTION_CHANGED, 0, 0),
             ]
         );
     }
@@ -1579,7 +1708,7 @@ mod tests {
             said["generations"],
             json!([{
                 "number": 1,
-                "relays": [{ "relay": "relay", "read": "whole", "entries": 2 }],
+                "relays": [{ "relay": "relay", "read": "whole", "entries": 2, "bytes": smallest(2) }],
                 "by_other_keys": 1,
             }])
         );
@@ -1599,7 +1728,7 @@ mod tests {
         assert!(!part.read_all);
         assert_eq!(
             part.says(LAB)["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "part", "entries": 2 }])
+            json!([{ "relay": "relay", "read": "part", "entries": 2, "bytes": smallest(2) }])
         );
     }
 
@@ -2051,11 +2180,15 @@ mod tests {
         assert_eq!((&again["carried"], &again["held"]), (&json!(0), &json!(1)));
 
         // With a folder mapped, the second yes named the file: it comes
-        // in above the version that the new channel holds.
+        // in above the version that the new channel holds. The name is a
+        // carried name from then (decision 2026-10-17 §4.3).
+        let brought_in = || names::brought_in(&db(&node.state)).unwrap();
+        assert!(brought_in().is_empty());
         node.maps_a_folder(LAB);
         let word = node.word(&phrase, &from(&[removed], &["kept.md"]));
         let done = take_from(&node.state, &word).await.unwrap();
         assert_eq!(done["carried"], 1, "{done}");
+        assert_eq!(brought_in(), BTreeSet::from([LAB.to_string()]));
         assert_eq!(done["above"], json!([]));
         assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("over it"));
         // A file that the word does not name stays where it is.
@@ -2346,7 +2479,7 @@ mod tests {
         let said = done.says(LAB);
         assert_eq!(
             said["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1, "bytes": smallest(1) }])
         );
 
         // With proofs that a command made: the connection is made again,
@@ -2362,10 +2495,11 @@ mod tests {
             }]
         };
         let before = crate::several::session_after(2);
-        let read = read_with_proofs(&node.state, channel, made_over(before)).await;
+        let read = read_with_proofs(&node.state, channel, made_over(before), HashMap::new()).await;
         assert_eq!(*node.did.lock().unwrap(), ["no room", "remake"]);
         assert_eq!(read["entries"], 0, "{read}");
-        let changed = json!([{ "relay": "relay", "read": CONNECTION_CHANGED, "entries": 0 }]);
+        let changed =
+            json!([{ "relay": "relay", "read": CONNECTION_CHANGED, "entries": 0, "bytes": 0 }]);
         assert_eq!(CONNECTION_CHANGED, "not read: the connection changed");
         assert_eq!(read["relays"], changed);
         let now = crate::several::session_after(3);
@@ -2380,15 +2514,15 @@ mod tests {
         // connection changed. With proofs made again over the session
         // that the node says now, the channel is read.
         node.did.lock().unwrap().clear();
-        let read = read_with_proofs(&node.state, channel, made_over(before)).await;
+        let read = read_with_proofs(&node.state, channel, made_over(before), HashMap::new()).await;
         assert_eq!(*node.did.lock().unwrap(), ["changed"]);
         assert_eq!((&read["entries"], &read["relays"]), (&json!(0), &changed));
-        let read = read_with_proofs(&node.state, channel, made_over(now)).await;
+        let read = read_with_proofs(&node.state, channel, made_over(now), HashMap::new()).await;
         assert_eq!(*node.did.lock().unwrap(), ["changed", "read"]);
         assert_eq!(read["entries"], 1, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1, "bytes": smallest(1) }])
         );
 
         // The read goes on only once the connection is another: while
@@ -2418,8 +2552,180 @@ mod tests {
                 "relay": "relay",
                 "read": "not read: the connection has no room left for a proof",
                 "entries": 0,
+                "bytes": 0,
             })]
         );
+    }
+
+    /// Read the channel `channel` at the relay of `node` with `proofs`,
+    /// from `from`: what the node answered, and the entries it handed.
+    async fn reads_from(
+        node: &Node,
+        channel: [u8; 32],
+        proofs: Vec<ProofMade>,
+        from: HashMap<String, LeftPlace>,
+    ) -> (serde_json::Value, Vec<Vec<u8>>) {
+        let read = read_with_proofs(&node.state, channel, proofs, from).await;
+        let id = read["read"].as_u64().unwrap();
+        let shelved = node.state.own_channels.shelved(id, 0, usize::MAX);
+        (
+            read,
+            shelved.map(|(entries, _)| entries).unwrap_or_default(),
+        )
+    }
+
+    /// **A read with proofs goes on from the place it is given at each
+    /// relay, and says the place it reached there** (decision 2026-10-17
+    /// §3.2). The relay hands one entry of three in a read. Asked from no
+    /// place, the read hands the first, in part, and says the place after
+    /// it; asked from that place, the second; and from the next, the
+    /// third, to the channel's end. A place given for another relay, or
+    /// under a mark that is not the relay's holding's, reads from the
+    /// start. A relay that holds none of the channel has no place said.
+    #[actix_web::test]
+    async fn test_a_read_with_proofs_says_the_place_it_reached_at_each_relay() {
+        use crate::several::RELAY_MARK;
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1], LAB);
+        let old = s[1].own(LAB);
+        for file in ["a.md", "b.md", "c.md"] {
+            s.write(1, LAB, file, "of device 1");
+        }
+        let at_the_relay = s[1].stored_in(&old);
+        assert_eq!(at_the_relay.len(), 3);
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &at_the_relay);
+        node.per_read.store(1, SeqCst);
+        let own = node.state.identity.public_key();
+        let made_for = |secret: &[u8; 32]| {
+            vec![ProofMade {
+                relay: "relay".into(),
+                session: SESSION,
+                proof: cordelia_crypto::proof::make(secret, &SESSION, &own).unwrap(),
+            }]
+        };
+        let channel = derive::channel_id(&old).unwrap();
+        let wire = |n: usize| vec![at_the_relay[n].to_wire()];
+        let from = |relay: &str, mark: [u8; 8], next: u64| {
+            HashMap::from([(relay.to_string(), LeftPlace { mark, next })])
+        };
+        let said = |read: &serde_json::Value, how: &str, place: u64| {
+            assert_eq!(
+                read["relays"],
+                json!([{ "relay": "relay", "read": how, "entries": 1, "bytes": smallest(1) }])
+            );
+            assert_eq!(
+                read["reached"],
+                json!([{ "relay": "relay", "mark": hex::encode(RELAY_MARK), "place": place }])
+            );
+        };
+
+        // From no place: the first entry, in part, and the place after it.
+        let (read, entries) = reads_from(&node, channel, made_for(&old), HashMap::new()).await;
+        assert_eq!(entries, wire(0));
+        said(&read, "part", 1);
+        // Read on from the place reached: the second, and then the third,
+        // to the channel's end.
+        let on = from("relay", RELAY_MARK, 1);
+        let (read, entries) = reads_from(&node, channel, made_for(&old), on).await;
+        assert_eq!(entries, wire(1));
+        said(&read, "part", 2);
+        let on = from("relay", RELAY_MARK, 2);
+        let (read, entries) = reads_from(&node, channel, made_for(&old), on).await;
+        assert_eq!(entries, wire(2));
+        said(&read, "whole", 3);
+
+        // A place for a relay of another name, and a place under a mark
+        // that is not the relay's holding's: read from the start.
+        for on in [from("far", RELAY_MARK, 2), from("relay", [9; 8], 2)] {
+            let (read, entries) = reads_from(&node, channel, made_for(&old), on).await;
+            assert_eq!(entries, wire(0));
+            said(&read, "part", 1);
+        }
+
+        // A channel that the relay holds none of: no place is said.
+        let never = derive::own_secret(&old, "never-held").unwrap();
+        let not_held = derive::channel_id(&never).unwrap();
+        let on = from("relay", RELAY_MARK, 2);
+        let (read, entries) = reads_from(&node, not_held, made_for(&never), on).await;
+        assert!(entries.is_empty());
+        assert_eq!(read["relays"][0]["read"], "not held", "{read}");
+        assert_eq!(read["reached"], json!([]));
+
+        // At the route, the places are handed as the node said them.
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer t"))
+            .to_http_request();
+        let proof = &made_for(&old)[0];
+        let body = web::Json(ReadRequest {
+            channel: hex::encode(channel),
+            proofs: vec![ProofFor {
+                relay: proof.relay.clone(),
+                session: hex::encode(proof.session),
+                proof: hex::encode(proof.proof),
+            }],
+            from: vec![PlaceFor {
+                relay: "relay".into(),
+                mark: hex::encode(RELAY_MARK),
+                place: 1,
+            }],
+        });
+        let state = web::Data::from(std::sync::Arc::clone(&node.state));
+        let answered = read_proved(req, state, body).await.unwrap();
+        let body = actix_web::body::to_bytes(answered.into_body()).await;
+        let read: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        said(&read, "part", 2);
+
+        // Where the connection is made again for room, the read there
+        // goes on from the same place.
+        node.did.lock().unwrap().clear();
+        node.no_room.store(1, SeqCst);
+        let by = ProvedBy::Secret(Zeroizing::new(old));
+        let within = Instant::now() + Duration::from_secs(30);
+        let on = from("relay", RELAY_MARK, 2);
+        let at = read_at_relays_from(&node.state, channel, by, &on, within).await;
+        assert_eq!(*node.did.lock().unwrap(), ["no room", "remake", "read"]);
+        let expected = LeftRead::Read {
+            entries: wire(2),
+            whole: true,
+            reached: LeftPlace {
+                mark: RELAY_MARK,
+                next: 3,
+            },
+        };
+        assert_eq!(at[0].read, expected);
+    }
+
+    /// **A read with proofs hands each entry once** (decision 2026-10-04
+    /// §16), however many times the relays handed it: the command checks
+    /// each, and a channel read on is handed in thousands.
+    #[actix_web::test]
+    async fn test_a_read_with_proofs_hands_each_entry_once() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1], LAB);
+        let old = s[1].own(LAB);
+        s.write(1, LAB, "a.md", "of device 1");
+        s.write(1, LAB, "b.md", "of device 1");
+        let held = s[1].stored_in(&old);
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        let twice: Vec<CheckedEntry> = held.iter().chain(&held).cloned().collect();
+        node.relay_holds(&old, &twice);
+        let own = node.state.identity.public_key();
+        let made = vec![ProofMade {
+            relay: "relay".into(),
+            session: SESSION,
+            proof: cordelia_crypto::proof::make(&old, &SESSION, &own).unwrap(),
+        }];
+        let channel = derive::channel_id(&old).unwrap();
+        let read = read_with_proofs(&node.state, channel, made, HashMap::new()).await;
+        assert_eq!(read["entries"], 2, "{read}");
+        let id = read["read"].as_u64().unwrap();
+        let (shelved, _) = node.state.own_channels.shelved(id, 0, usize::MAX).unwrap();
+        let wire: Vec<Vec<u8>> = held.iter().map(|entry| entry.to_wire()).collect();
+        assert_eq!(shelved, wire);
     }
 
     /// The new channel was fetched whole where a whole pass that began
@@ -2528,11 +2834,11 @@ mod tests {
             session: SESSION,
             proof,
         };
-        let read = read_with_proofs(&node.state, channel, vec![made]).await;
+        let read = read_with_proofs(&node.state, channel, vec![made], HashMap::new()).await;
         assert_eq!(read["entries"], 3, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 3 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 3, "bytes": smallest(3) }])
         );
         assert_eq!(*node.asked.lock().unwrap(), [(channel, false)]);
         // A part at a time, and nothing is kept of it after the last.
@@ -2629,9 +2935,14 @@ mod tests {
         }
         assert_eq!(node.stored(), before);
         // With the phrase's word, and signed by the key of its run, each
-        // comes in as a carry by command brings one in.
+        // comes in as a carry by command brings one in: under a folder,
+        // the name is a carried name from then (decision 2026-10-17 §4.3).
+        node.maps_a_folder(LAB);
+        let brought_in = || names::brought_in(&db(&node.state)).unwrap();
+        assert!(brought_in().is_empty());
         let done = takes(&word, 0, &first_batch, &versions).unwrap();
         assert_eq!(done["carried"], 2, "{done}");
+        assert_eq!(brought_in(), BTreeSet::from([LAB.to_string()]));
         // **A batch is taken once:** posted again under its word, it is
         // refused, and nothing is judged again.
         let again = takes(&word, 0, &first_batch, &versions);

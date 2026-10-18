@@ -2897,6 +2897,17 @@ pub async fn p2p_loop(
                 }
             }
 
+            // A command's work asked for a read of a channel of the
+            // device's own with places of its own: the read before a
+            // carried name is let go (decision 2026-10-17 §4.2). Off the
+            // select loop: it waits on the relays.
+            ask = state.own_channels.wait_own(), if device_entries.is_some() => {
+                let relays = relays_with_links(&relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels);
+                if let Some(device) = device_entries.clone() {
+                    tokio::spawn(async move { device.own(&relays, ask).await });
+                }
+            }
+
             // ── Messages between the person's own agents, on a device ─
             // What has expired goes from the index, written over first,
             // and the log is truncated (decision 2026-10-09 §7.1). Off

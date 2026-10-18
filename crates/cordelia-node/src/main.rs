@@ -4025,30 +4025,196 @@ fn name_to_let_go(
 /// (decision 2026-10-04 §7.3). `alone` is whether the statement lists
 /// this device alone: there is then no other device to keep anything of
 /// the name, and nothing is said of one.
-fn let_go_says(name: &str, alone: bool) -> String {
+///
+/// `versions` is how many versions of the name that this device signed
+/// the node asked about, where it read the relays before it let go
+/// (decision 2026-10-17 §4.2, §4.6): a relay held each of them. Where it
+/// did not read them, on a device that has stopped, nothing is said of
+/// what a relay held.
+fn let_go_says(name: &str, alone: bool, versions: Option<u64>) -> String {
     let name = sync_label(name);
     let others = match alone {
         true => "",
         false => " Your other devices keep what they hold of it.",
     };
+    let held = match versions {
+        Some(0) => "this device wrote none of its versions, so nothing is lost by it.".to_string(),
+        Some(1) => {
+            "a relay held its 1 version when it was read just now, so nothing is lost by it."
+                .to_string()
+        }
+        Some(n) => format!(
+            "a relay held each of its {n} versions when it was read just now, so nothing is \
+             lost by it."
+        ),
+        None => format!(
+            "nothing more of {name} is sent from here or fetched, and what it had brought in \
+             and had not yet sent to a relay is not sent."
+        ),
+    };
     format!(
         "This device holds {name} no longer. It held it by a carry, with no folder mapped to \
-         it: nothing more of {name} is sent from here or fetched, and what it had brought in \
-         and had not yet sent to a relay is not sent.{others}"
+         it: {held}{others}"
     )
+}
+
+/// What `cordelia sync unmap <name>` says after each round of the read
+/// before a carried name is let go, where the read goes on (decision
+/// 2026-10-17 §4.6): of each relay still read in part, what it has
+/// handed so far, counted as a relay counts against its cap.
+fn reading_says(name: &str, reading: &serde_json::Value) -> Vec<String> {
+    let name = sync_label(name);
+    let relays = reading["relays"].as_array().cloned().unwrap_or_default();
+    relays
+        .iter()
+        .map(|relay| {
+            let bytes = relay["bytes"].as_u64().unwrap_or(0);
+            format!(
+                "Reading {name} at {}: {:.1} MiB so far.",
+                relay["relay"].as_str().unwrap_or("a relay"),
+                bytes as f64 / (1024.0 * 1024.0)
+            )
+        })
+        .collect()
+}
+
+/// Ask the node, by `ask`, to let go of `name`, a round of its read at a
+/// time (decision 2026-10-17 §4.2): where the node answers that the read
+/// goes on, what each relay has handed so far is said by `say`, and the
+/// next round is asked for under the read's ID. Gives back the node's
+/// last answer. `asks` is whether the command asks at a terminal: the
+/// node then answers a name that it lets go only on the word `discard`
+/// with what the command asks it by (§5.2), and refuses it otherwise.
+fn let_go_round_by_round(
+    name: &str,
+    asks: bool,
+    mut ask: impl FnMut(serde_json::Value) -> anyhow::Result<Told>,
+    mut say: impl FnMut(String),
+) -> anyhow::Result<Told> {
+    let mut asking = serde_json::json!({ "folder": name, "asks": asks });
+    loop {
+        let asked = ask(asking)?;
+        let Told::Yes(after) = &asked else {
+            return Ok(asked);
+        };
+        let Some(read) = after["reading"]["read"].as_str() else {
+            return Ok(asked);
+        };
+        for line in reading_says(name, &after["reading"]) {
+            say(line);
+        }
+        asking = serde_json::json!({ "folder": name, "read": read, "asks": asks });
+    }
+}
+
+/// What `cordelia sync unmap <name>` asks at a terminal where the node
+/// lets the name go only on the word `discard` (decision 2026-10-17
+/// §5.3): what the node said first (`said`, of the read or of the notes
+/// of a device that has stopped), where the versions may still be
+/// (`where`), and then the word, with no answer suggested.
+fn discard_asks(name: &str, not_let_go: &serde_json::Value) -> String {
+    let them = match not_let_go["versions"].as_u64() {
+        Some(1) => "it",
+        _ => "them",
+    };
+    format!(
+        "{}\n\n{}\n  Type `discard` to let {} go with {them}. Anything else keeps it: ",
+        not_let_go["said"].as_str().unwrap_or_default(),
+        not_let_go["where"].as_str().unwrap_or_default(),
+        sync_label(name)
+    )
+}
+
+/// What `cordelia sync unmap <name>` says where a word other than
+/// `discard` was typed (decision 2026-10-17 §5.3), as for any yes not
+/// given.
+fn kept_on_another_word_says(name: &str) -> String {
+    format!("{} is still held. Nothing was changed.", sync_label(name))
+}
+
+/// What `cordelia sync unmap <name>` says where the node let go of the
+/// name on the word `discard` (decision 2026-10-17 §5.3): how many
+/// versions that no relay held went with it, and, where the statement
+/// lists another device (`alone` is false), that the others keep theirs.
+/// On a device that has stopped (`stopped`), which read no relay, they
+/// are what its own notes said it sent to none.
+fn discarded_says(name: &str, gone: u64, alone: bool, stopped: bool) -> String {
+    let which = match stopped {
+        false => "that no relay held",
+        true => "that its own notes said it sent to no relay",
+    };
+    let went = match gone {
+        1 => format!("1 version {which} went"),
+        n => format!("{n} versions {which} went"),
+    };
+    let others = match alone {
+        true => "",
+        false => " Your other devices keep what they hold of it.",
+    };
+    format!(
+        "This device holds {} no longer, and {went} with it.{others}",
+        sync_label(name)
+    )
+}
+
+/// Ask the word `discard` at `at`, where the node answered `not_let_go`
+/// of `name` (decision 2026-10-17 §5.2), and send it by `ask` with the
+/// read's ID and the number shown. Gives back what the command says: the
+/// name kept on any other word, Enter, or an input that ended; or let go.
+/// The node's refusal of the word is this command's refusal.
+fn discard_or_keep(
+    at: &terminal::Terminal,
+    name: &str,
+    not_let_go: &serde_json::Value,
+    ask: impl FnOnce(serde_json::Value) -> anyhow::Result<Told>,
+) -> anyhow::Result<String> {
+    let typed = at.answer(&discard_asks(name, not_let_go))?;
+    if typed.as_deref() != Some("discard") {
+        return Ok(kept_on_another_word_says(name));
+    }
+    let word = serde_json::json!({
+        "folder": name,
+        "read": not_let_go["read"],
+        "versions": not_let_go["versions"],
+        "word": "discard",
+    });
+    match ask(word)? {
+        Told::Yes(after) => Ok(discarded_says(
+            name,
+            after["let_go_discarded"].as_u64().unwrap_or(0),
+            after["let_go_alone"] == true,
+            after["let_go_stopped"] == true,
+        )),
+        Told::No { message, .. } => anyhow::bail!("{message}"),
+    }
 }
 
 /// What `cordelia sync unmap` says once a folder is unmapped, where the
 /// node says that this device still holds the name that the folder was
-/// mapped to (decision 2026-10-04 §16): a carry or a recovery brought
-/// the name, and it is held as it was before the folder. The unmapping
-/// of the name is what lets it go, where nothing of it waits to be sent.
+/// mapped to (decision 2026-10-04 §16, decision 2026-10-17 §4.3, §4.6):
+/// a carry or a recovery brought versions into the name, and it is held
+/// as a carry holds a name. The unmapping of the name is what lets it
+/// go, once a relay holds each version of it that this device signed.
 /// `None` where the name went with its folder.
+///
+/// On a device that has stopped (`still_held_stopped`), nothing is ever
+/// sent again: the unmapping of the name asks first where the device's own
+/// notes say that it sent a version of it to no relay (§4.4).
 fn still_held_says(after: &serde_json::Value) -> Option<String> {
     let name = after["still_held"].as_str()?;
+    if after["still_held_stopped"] == true {
+        return Some(format!(
+            "This device still holds {0}, since a carry or a recovery brought versions into it. \
+             This device has stopped, and sends nothing more: `cordelia sync unmap {1}` lets it \
+             go, and asks first where this device's own notes say that it sent a version of {0} \
+             to no relay.",
+            sync_label(name),
+            shell_word(name)
+        ));
+    }
     Some(format!(
-        "This device still holds {}, since a carry or a recovery brought it: `cordelia sync \
-         unmap {}` lets it go, once nothing of it waits to be sent.",
+        "This device still holds {}, since a carry or a recovery brought versions into it: \
+         `cordelia sync unmap {}` lets it go, once a relay holds each of its versions.",
         sync_label(name),
         shell_word(name)
     ))
@@ -4057,14 +4223,21 @@ fn still_held_says(after: &serde_json::Value) -> Option<String> {
 /// What `cordelia sync unmap <name>` says of the node's answer where it
 /// asked the node to let go of a name (decision 2026-10-04 §7.3). The
 /// node let go of it: [`let_go_says`]. The node holds the name by a
-/// carry and did not let go of it, because something of it waits to be
-/// sent: the node's own words, as this command's refusal. `None` where
-/// the node holds no such name: the word names nothing of that kind.
+/// carry and did not let go of it, because no relay held a version of
+/// it that this device signed when it was read, or what was read has
+/// changed since (decision 2026-10-17 §4.2, §4.6): the node's own words,
+/// as this command's refusal. `None` where the node holds no such name:
+/// the word names nothing of that kind.
 fn let_go_answered(asked: &Told) -> Option<anyhow::Result<String>> {
     match asked {
         Told::Yes(after) => {
             let name = after["let_go"].as_str()?;
-            Some(Ok(let_go_says(name, after["let_go_alone"] == true)))
+            let versions = after["let_go_versions"].as_u64();
+            Some(Ok(let_go_says(
+                name,
+                after["let_go_alone"] == true,
+                versions,
+            )))
         }
         Told::No {
             status: 409,
@@ -4426,13 +4599,29 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             // (decision 2026-10-04 §7.3), with sync on or off. Where it
             // does not, the word names nothing here, as before.
             let names_a_mapping = by_name.is_some() || by_folder.is_some();
+            //
+            // The node reads the name's channel at the relays before it
+            // lets it go, a round at each request (decision 2026-10-17
+            // §4.2): where the read goes on, it says how far it has read,
+            // and is asked for the next round.
+            //
+            // Where the node lets the name go only on the word `discard`
+            // (decision 2026-10-17 §5.2), the word is asked at a terminal,
+            // and never without one: the node then refuses, and says how.
             if let Some(name) = name_to_let_go(&folder, &mappings, names_a_mapping) {
-                let asked = api_post_told(
-                    config_path,
-                    "/api/v1/sync/unmap",
-                    serde_json::json!({ "folder": name }),
-                    None,
-                )?;
+                let at = terminal::Terminal::at().ok();
+                let unmap = |asking| api_post_told(config_path, "/api/v1/sync/unmap", asking, None);
+                let asked =
+                    let_go_round_by_round(&name, at.is_some(), unmap, |line| println!("{line}"))?;
+                if let (Some(at), Told::Yes(after)) = (&at, &asked)
+                    && after["not_let_go"].is_object()
+                {
+                    println!(
+                        "{}",
+                        discard_or_keep(at, &name, &after["not_let_go"], unmap)?
+                    );
+                    return Ok(());
+                }
                 if let Some(said) = let_go_answered(&asked) {
                     println!("{}", said?);
                     return Ok(());
@@ -7429,7 +7618,7 @@ mod tests {
     /// brought in and not yet sent is not sent.
     #[test]
     fn test_what_unmap_says_of_a_name_that_a_carry_held() {
-        let said = let_go_says("lab", false);
+        let said = let_go_says("lab", false, None);
         assert!(
             said.starts_with(
                 "This device holds lab no longer. It held it by a carry, with no folder mapped \
@@ -7444,11 +7633,110 @@ mod tests {
         assert!(said.ends_with("Your other devices keep what they hold of it."));
         // Where the statement lists this device alone there is no other
         // device, and nothing is said of one.
-        let alone = let_go_says("lab", true);
+        let alone = let_go_says("lab", true, None);
         assert!(!alone.contains("other devices"), "{alone}");
         assert!(
             alone.ends_with("had not yet sent to a relay is not sent."),
             "{alone}"
+        );
+        // Where the node read the relays before it let go (decision
+        // 2026-10-17 §4.6): a relay held each version that it asked about.
+        assert_eq!(
+            let_go_says("lab", false, Some(12)),
+            "This device holds lab no longer. It held it by a carry, with no folder mapped to \
+             it: a relay held each of its 12 versions when it was read just now, so nothing is \
+             lost by it. Your other devices keep what they hold of it."
+        );
+        assert_eq!(
+            let_go_says("lab", true, Some(1)),
+            "This device holds lab no longer. It held it by a carry, with no folder mapped to \
+             it: a relay held its 1 version when it was read just now, so nothing is lost by it."
+        );
+        assert_eq!(
+            let_go_says("~", true, Some(0)),
+            "This device holds home memory no longer. It held it by a carry, with no folder \
+             mapped to it: this device wrote none of its versions, so nothing is lost by it."
+        );
+    }
+
+    /// While the read before a carried name is let go goes on, `cordelia
+    /// sync unmap <name>` says after each round what each relay that is
+    /// still read has handed so far (decision 2026-10-17 §4.6).
+    #[test]
+    fn test_what_unmap_says_while_it_reads() {
+        let reading = serde_json::json!({
+            "read": "00",
+            "relays": [
+                { "relay": "relay-one", "bytes": 4 * 1024 * 1024 + 20_000 },
+                { "relay": "relay-two", "bytes": 8_493_466 },
+            ],
+        });
+        assert_eq!(
+            reading_says("lab", &reading),
+            [
+                "Reading lab at relay-one: 4.0 MiB so far.",
+                "Reading lab at relay-two: 8.1 MiB so far.",
+            ]
+        );
+        assert!(reading_says("lab", &serde_json::json!({ "read": "00" })).is_empty());
+
+        // The command asks for each round under the read's ID, says what
+        // each relay has handed after it, and gives back the last answer.
+        let answers = std::cell::RefCell::new(vec![
+            Told::Yes(serde_json::json!({ "let_go": "lab", "let_go_versions": 3 })),
+            Told::Yes(serde_json::json!({ "reading": { "read": "ab", "relays": [
+                { "relay": "relay-one", "bytes": 8 * 1024 * 1024 }] } })),
+            Told::Yes(serde_json::json!({ "reading": { "read": "ab", "relays": [
+                { "relay": "relay-one", "bytes": 4 * 1024 * 1024 }] } })),
+        ]);
+        let mut asked = Vec::new();
+        let mut said = Vec::new();
+        let last = let_go_round_by_round(
+            "lab",
+            true,
+            |asking| {
+                asked.push(asking);
+                Ok(answers.borrow_mut().pop().unwrap())
+            },
+            |line| said.push(line),
+        )
+        .unwrap();
+        assert!(matches!(&last, Told::Yes(after) if after["let_go"] == "lab"));
+        assert_eq!(
+            asked,
+            [
+                serde_json::json!({ "folder": "lab", "asks": true }),
+                serde_json::json!({ "folder": "lab", "read": "ab", "asks": true }),
+                serde_json::json!({ "folder": "lab", "read": "ab", "asks": true }),
+            ]
+        );
+        assert_eq!(
+            said,
+            [
+                "Reading lab at relay-one: 4.0 MiB so far.",
+                "Reading lab at relay-one: 8.0 MiB so far.",
+            ]
+        );
+        // A refusal ends it. With no terminal, the node is told that the
+        // command does not ask (decision 2026-10-17 §5.2).
+        let mut without = None;
+        let refused = let_go_round_by_round(
+            "lab",
+            false,
+            |asking| {
+                without = Some(asking);
+                Ok(Told::No {
+                    status: 409,
+                    message: "no".into(),
+                })
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(refused, Told::No { status: 409, .. }));
+        assert_eq!(
+            without,
+            Some(serde_json::json!({ "folder": "lab", "asks": false }))
         );
     }
 
@@ -7464,15 +7752,19 @@ mod tests {
             let_go_answered(&Told::Yes(answer)).map(|said| said.unwrap())
         };
         let others = yes(serde_json::json!({ "let_go": "lab", "let_go_alone": false })).unwrap();
-        assert_eq!(others, let_go_says("lab", false));
+        assert_eq!(others, let_go_says("lab", false, None));
         let alone = yes(serde_json::json!({ "let_go": "lab", "let_go_alone": true })).unwrap();
-        assert_eq!(alone, let_go_says("lab", true));
+        assert_eq!(alone, let_go_says("lab", true, None));
         // A node that does not say is taken to have other devices.
         let unsaid = yes(serde_json::json!({ "let_go": "lab" })).unwrap();
-        assert_eq!(unsaid, let_go_says("lab", false));
+        assert_eq!(unsaid, let_go_says("lab", false, None));
         assert_eq!(yes(serde_json::json!({ "enabled": true })), None);
+        // How many versions a relay held, where the node read them.
+        let read = yes(serde_json::json!({ "let_go": "lab", "let_go_versions": 12 })).unwrap();
+        assert_eq!(read, let_go_says("lab", false, Some(12)));
 
-        let waits = "lab is not let go: 2 versions of it wait to be sent";
+        let waits = "lab is not let go: no relay that this device is set up with held 2 of its \
+                     versions when it was read just now.";
         let refused = let_go_answered(&Told::No {
             status: 409,
             message: waits.into(),
@@ -7485,25 +7777,103 @@ mod tests {
         assert!(not_mapped.is_none());
     }
 
+    /// **On a device that has stopped, the line after a folder's
+    /// unmapping says that nothing is sent again** (decision 2026-10-17
+    /// §4.6): the name's unmapping lets it go, and asks first where the
+    /// device's own notes say that it sent a version to no relay. It never
+    /// says "once nothing of it waits to be sent" there, nor that a relay
+    /// is waited for.
+    #[test]
+    fn test_what_unmap_says_on_a_device_that_has_stopped() {
+        let after = |name: &str, stopped: bool| serde_json::json!({ "still_held": name, "still_held_stopped": stopped });
+        let said = still_held_says(&after("lab", true)).unwrap();
+        assert_eq!(
+            said,
+            "This device still holds lab, since a carry or a recovery brought versions into it. \
+             This device has stopped, and sends nothing more: `cordelia sync unmap lab` lets it \
+             go, and asks first where this device's own notes say that it sent a version of lab \
+             to no relay."
+        );
+        assert!(!said.contains("waits to be sent") && !said.contains("once a relay"));
+        assert!(
+            still_held_says(&after("~", true))
+                .unwrap()
+                .contains("`cordelia sync unmap '~'` lets it go")
+        );
+        // On a device that sends, the line of a device that sends.
+        let sends = still_held_says(&after("lab", false)).unwrap();
+        assert!(
+            sends.ends_with("once a relay holds each of its versions."),
+            "{sends}"
+        );
+    }
+
+    /// **What `cordelia sync unmap <name>` asks before a `discard`, and
+    /// says after** (decision 2026-10-17 §5.3): what the node said, a
+    /// blank line, where the versions may still be, and the word, with no
+    /// answer suggested. After the word: how many went, and that the other
+    /// devices keep theirs where the statement lists another. On any other
+    /// word, that the name is still held.
+    #[test]
+    fn test_what_unmap_asks_and_says_of_a_discard() {
+        let not_let_go = serde_json::json!({
+            "read": "ab",
+            "versions": 3,
+            "said": "lab is not let go: no relay held 3 of its versions.",
+            "where": "Letting lab go now drops those 3 versions from this device.",
+        });
+        assert_eq!(
+            discard_asks("lab", &not_let_go),
+            "lab is not let go: no relay held 3 of its versions.\n\nLetting lab go now drops \
+             those 3 versions from this device.\n  Type `discard` to let lab go with them. \
+             Anything else keeps it: "
+        );
+        let one = serde_json::json!({ "versions": 1, "said": "a", "where": "b" });
+        assert!(discard_asks("lab", &one).ends_with("go with it. Anything else keeps it: "));
+        assert_eq!(
+            discarded_says("lab", 3, false, false),
+            "This device holds lab no longer, and 3 versions that no relay held went with it. \
+             Your other devices keep what they hold of it."
+        );
+        assert_eq!(
+            discarded_says("lab", 1, true, false),
+            "This device holds lab no longer, and 1 version that no relay held went with it."
+        );
+        // A device that has stopped read no relay: what went is what its
+        // own notes said.
+        let noted = discarded_says("lab", 2, true, true);
+        assert_eq!(
+            noted,
+            "This device holds lab no longer, and 2 versions that its own notes said it sent to \
+             no relay went with it."
+        );
+        assert!(!noted.contains("no relay held"), "{noted}");
+        assert_eq!(
+            kept_on_another_word_says("lab"),
+            "lab is still held. Nothing was changed."
+        );
+    }
+
     /// Once a folder is unmapped that was mapped to a name which a carry
     /// or a recovery holds, `cordelia sync unmap` says that this device
     /// still holds the name, and what lets it go (decision 2026-10-04
-    /// §16): the node's answer names the name. Nothing is said where the
-    /// name went with its folder.
+    /// §16, decision 2026-10-17 §4.6): the node's answer names the name.
+    /// Nothing is said where the name went with its folder.
     #[test]
     fn test_what_unmap_says_of_a_name_that_is_still_held_after_its_folder() {
         let after = |still_held: serde_json::Value| serde_json::json!({ "enabled": true, "generation": 4, "still_held": still_held });
         assert_eq!(
             still_held_says(&after("lab".into())).unwrap(),
-            "This device still holds lab, since a carry or a recovery brought it: `cordelia \
-             sync unmap lab` lets it go, once nothing of it waits to be sent."
+            "This device still holds lab, since a carry or a recovery brought versions into \
+             it: `cordelia sync unmap lab` lets it go, once a relay holds each of its versions."
         );
         // Home memory is said as that, and its name is one that a shell
         // would read: it is quoted in the command to copy.
         assert_eq!(
             still_held_says(&after("~".into())).unwrap(),
-            "This device still holds home memory, since a carry or a recovery brought it: \
-             `cordelia sync unmap '~'` lets it go, once nothing of it waits to be sent."
+            "This device still holds home memory, since a carry or a recovery brought versions \
+             into it: `cordelia sync unmap '~'` lets it go, once a relay holds each of its \
+             versions."
         );
         // The name went with its folder: the answer names none.
         let gone = serde_json::json!({ "enabled": true, "generation": 4 });

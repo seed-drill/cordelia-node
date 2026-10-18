@@ -1220,10 +1220,30 @@ pub const MAX_COUNTED_DEVICES: usize = MAX_STATEMENT_DEVICES;
 /// The most records of additions a reader keeps as not counted (decision
 /// 2026-10-04 §6). A device that counts can sign any number of records,
 /// and every reader loads what it keeps each time it asks who counts. Over
-/// this bound the oldest record that is not counted goes when a new one is
-/// kept: it is seen again as any record is, where it is given again. A
-/// record that counts is never dropped for room.
+/// this bound records go from the end of the order of keeping (decision
+/// 2026-10-17 §2.2), which goes by who signed them and not by when they
+/// were seen: one that went is seen again as any record is, where it is
+/// given again. A record that counts is never dropped for room.
 pub const MAX_NOT_COUNTED_RECORDS: usize = 256;
+
+/// How many keys that the 64 kept out each adder that may add keeps among
+/// the records a reader keeps, and among the rows a recovery shows,
+/// whatever another key signs, of the records the relays hold (decision
+/// 2026-10-17 §2.2). It is what is left of each bound once the records
+/// that let a key add, or the rows of the devices that count, have their
+/// places, shared among the 64 adders there can be.
+/// Derived: the lesser of (MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES -
+/// 1)) / MAX_COUNTED_DEVICES and (RECOVERY_MAX_DEVICES_SHOWN -
+/// MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES.
+pub const KEPT_OUT_PER_ADDER: usize = {
+    let kept = (MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1)) / MAX_COUNTED_DEVICES;
+    let shown = (RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES;
+    if kept < shown { kept } else { shown }
+};
+
+// Checked at compile time: each adder that may add keeps at least one key
+// that the 64 kept out, in both bounds.
+const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
 
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
@@ -1698,6 +1718,36 @@ pub const CARRY_READ_MAX_SECS: u64 = CHANGE_FETCH_MAX_SECS;
 /// Derived: a little longer than the carry may read, CARRY_READ_MAX_SECS.
 pub const CARRY_FIRST_MAX_SECS: u64 = CARRY_READ_MAX_SECS + 60;
 
+/// How long a recovery reads the personal channel of the change it
+/// recovers from, at most, counted from its first round (decision
+/// 2026-10-17 §3.2): it reads on from the place each relay reached, a
+/// round of CARRY_READ_MAX_SECS at a time, and begins no round that
+/// would end after this. Derived: what a channel at its cap
+/// (MAX_ENTRY_CHANNEL_BYTES_AT_RELAY) takes to read at what a device
+/// takes from one relay in a minute (PUSH_BYTES_PER_PEER_PER_MINUTE),
+/// less the room a relay keeps for the answer to a show
+/// (SHOW_ANSWER_ROOM_BYTES), and one round more: so a relay that hands
+/// what it may is read to its end.
+pub const RECOVERY_READ_ON_MAX_SECS: u64 = 60 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+    / (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES)
+    + CARRY_READ_MAX_SECS;
+
+// Checked at compile time: a recovery reads on for more than one round.
+const _: () = assert!(RECOVERY_READ_ON_MAX_SECS > CARRY_READ_MAX_SECS);
+
+/// How many readings of CARRY_READ_MAX_SECS a recovery makes of the
+/// personal channel of the change it recovers from at each relay, at most
+/// (decision 2026-10-17 §3.2): each round asked of a relay is one of its
+/// own, whether it hands part of the channel or says that its connection
+/// changed, so that what one relay does never costs another a reading, and
+/// there are this many rounds at most. The bound is counted in readings and
+/// not in seconds since the first round, so that what a reading takes
+/// beyond its CARRY_READ_MAX_SECS (a page in flight at its end, the handing
+/// of what it read to the command) never costs the reading that reaches a
+/// channel at its cap. Derived: as many readings as fit in
+/// RECOVERY_READ_ON_MAX_SECS.
+pub const RECOVERY_READ_ON_READS: u64 = RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS;
+
 /// How many words of a key's fingerprint name a removed key at `cordelia
 /// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
 /// 66 bits. A statement lists removed keys bare, so a machine that never
@@ -1714,6 +1764,16 @@ pub const LABEL_CARRY_WORD: &[u8] = b"cordelia v2 carry word";
 /// §7.3): ten minutes from when the phrase signed it. The command hands
 /// it to the node at once; a word that is found later is no word.
 pub const CARRY_WORD_SECS: i64 = 10 * 60;
+
+/// How long a read of a channel of the device's own stands, from the end
+/// of its last round, on the node's monotonic clock (decision 2026-10-17
+/// §4.2, §5.2): the read that `cordelia sync unmap` shows, for the
+/// `discard` that follows it. A read older than this is kept no more.
+/// Derived: as long as a word of the phrase for a carry stands. It is a
+/// `u64`: it bounds a `Duration`, where CARRY_WORD_SECS is compared with a
+/// time in seconds of the wall clock.
+pub const LET_GO_READ_STANDS_SECS: u64 = CARRY_WORD_SECS as u64;
+const _: () = assert!(CARRY_WORD_SECS > 0);
 
 /// How often a command that was typed the phrase makes its proofs again
 /// for one channel, at most (decision 2026-10-04 §16): a proof holds on
@@ -2605,6 +2665,33 @@ mod tests {
         assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
     }
 
+    /// Each adder that may add keeps its first three keys that the 64
+    /// kept out (decision 2026-10-17 §2.2): the lesser of what is left of
+    /// each bound of 256, shared among 64 adders.
+    #[test]
+    fn test_each_adder_keeps_its_first_three_kept_out_decision_2026_10_17_2_2() {
+        assert_eq!(KEPT_OUT_PER_ADDER, 3);
+        // What a reader keeps: 256, less the 63 that let a key add.
+        assert_eq!(MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1), 193);
+        assert_eq!(193 / MAX_COUNTED_DEVICES, 3);
+        // What a recovery shows: 256 rows, less the 64 that count.
+        assert_eq!(RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES, 192);
+        assert_eq!(192 / MAX_COUNTED_DEVICES, 3);
+        // At the floor, every adder's share fits each bound.
+        const {
+            assert!(
+                (MAX_COUNTED_DEVICES - 1) + MAX_COUNTED_DEVICES * KEPT_OUT_PER_ADDER
+                    <= MAX_NOT_COUNTED_RECORDS
+            )
+        };
+        const {
+            assert!(
+                MAX_COUNTED_DEVICES + MAX_COUNTED_DEVICES * KEPT_OUT_PER_ADDER
+                    <= RECOVERY_MAX_DEVICES_SHOWN
+            )
+        };
+    }
+
     #[test]
     fn test_what_a_device_holds_of_its_person_decision_2026_10_04_3() {
         assert_eq!(LEFT_SECRET_KEPT_DAYS, 90);
@@ -2699,6 +2786,7 @@ mod tests {
         assert_eq!(LABEL_CARRY_WORD, b"cordelia v2 carry word");
         assert!(LABELS.contains(&LABEL_CARRY_WORD));
         assert_eq!(CARRY_WORD_SECS, 600);
+        assert_eq!(LET_GO_READ_STANDS_SECS, 600);
         assert_eq!(LABEL_CARRY_BATCH, b"cordelia v2 carry batch");
         assert_eq!(CARRY_PROOFS_MADE_AGAIN, 2);
         assert!(LABELS.contains(&LABEL_CARRY_BATCH));
@@ -2726,6 +2814,33 @@ mod tests {
         // A recovery shows every device that a reader may count, and
         // every record that it may keep as not counted beside them.
         const { assert!(RECOVERY_MAX_DEVICES_SHOWN >= MAX_COUNTED_DEVICES) };
+    }
+
+    /// How long a recovery reads its personal channel on (decision
+    /// 2026-10-17 §3.2): what a channel at its cap takes at what a device
+    /// takes from one relay in a minute, less a show's room, and a round
+    /// more.
+    #[test]
+    fn test_a_recovery_reads_on_for_what_a_channel_at_its_cap_takes_decision_2026_10_17_3() {
+        assert_eq!(RECOVERY_READ_ON_MAX_SECS, 615);
+        assert_eq!(
+            16 * 1024 * 1024 * 60 / (2 * 1024 * 1024 - (65_536 + 1024)),
+            495
+        );
+        assert_eq!(
+            RECOVERY_READ_ON_MAX_SECS,
+            60 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+                / (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES)
+                + CARRY_READ_MAX_SECS
+        );
+        // Five whole readings fit in it, and a sixth does not: five reach
+        // a channel at its cap.
+        assert_eq!(RECOVERY_READ_ON_READS, 5);
+        const { assert!(RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS <= RECOVERY_READ_ON_MAX_SECS) };
+        const { assert!((RECOVERY_READ_ON_READS + 1) * CARRY_READ_MAX_SECS > RECOVERY_READ_ON_MAX_SECS) };
+        let per_round =
+            CARRY_READ_MAX_SECS * (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES) / 60;
+        assert!(RECOVERY_READ_ON_READS * per_round >= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
     }
 
     /// What the sync adapter goes by in a channel from its secret: how

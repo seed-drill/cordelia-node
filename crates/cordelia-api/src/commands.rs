@@ -469,7 +469,7 @@ pub async fn list(
     answer["folders"] = folders.into();
     if body.is_some_and(|request| request.sent_to_no_relay) {
         let (versions, of_names) =
-            crate::names::waits_in_every_name(&db(&state)).map_err(refused)?;
+            crate::names::waits_in_every_name(&db(&state), &state.identity).map_err(refused)?;
         answer["sent_to_no_relay"] = json!({ "versions": versions, "names": of_names });
     }
     answer["waiting"] = waiting(&state)?.into();

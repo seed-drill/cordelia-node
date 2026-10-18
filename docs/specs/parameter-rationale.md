@@ -1250,11 +1250,30 @@ the bound is kept as not counted, and a statement makes room.
 
 **Rationale:** A device that counts can sign any number of records, and
 every reader loads what it keeps each time it asks who counts. Over this
-bound the oldest record that is not counted goes when a new one is kept. A
+bound records go from the end of the order of keeping, which goes by who
+signed them and not by when they were seen (decision 2026-10-17 §2.2). A
 record that counts is never dropped for room.
 
 **Why 256:** chosen with the other bounds of 256 here; no measurement
 behind it yet.
+
+#### KEPT_OUT_PER_ADDER = 3
+
+**Derivation:** the lesser of
+`(MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1)) / MAX_COUNTED_DEVICES`
+(193 / 64 = 3) and
+`(RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES`
+(192 / 64 = 3), checked at compile time to be at least 1.
+
+**Rationale:** How many keys that the 64 kept out each adder that may add
+keeps among the records a reader keeps, and among the rows a recovery
+shows, whatever another key signs, of the records the relays hold
+(decision 2026-10-17 §2.2). It is what is left of each bound once the
+records that let a key add, or the rows of the devices that count, have
+their places, shared among the 64 adders there can be. It is not chosen:
+it follows from the three bounds it is made of. A person who adds more
+than three devices from one device while 64 count is told what could not
+be shown.
 
 #### LEFT_SECRET_KEPT_DAYS = 90
 
@@ -1500,10 +1519,13 @@ the bytes that a key and its address may be handed in a minute. A relay
 sizes a page of a channel so that this much is left in both allowances, and
 only the entry that answers a show may use it: a device that pulls at its
 full rate, or shares its address with one that does, is still told of a
-removal. A whole page can still be handed beside it: `protocol.rs` asserts
-that the room is less than half of a minute's allowance and that a full
-page is within the allowance, and the two together are 1,086,464 bytes of
-the 2,097,152.
+removal. A device keeps the same room back when it paces what it takes from
+a relay: it asks for no page that the relay would refuse for it, and a read
+that would have ended there waits for the minute instead (decision
+2026-10-17 §3.2). A whole page can still be handed beside it: `protocol.rs`
+asserts that the room is less than half of a minute's allowance and that a
+full page is within the allowance, and the two together are 1,086,464 bytes
+of the 2,097,152.
 
 **What is not defended:** whoever shows entries of its own from the same
 address can still use that room up (decision §2.5).
@@ -1614,6 +1636,43 @@ may read.
 the first cycle of a folder that has just been mapped to its name, at most.
 A carry that never says it has ended holds nothing up for longer.
 
+#### RECOVERY_READ_ON_MAX_SECS = 615
+
+**Derivation:** 60 × `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` /
+(`PUSH_BYTES_PER_PEER_PER_MINUTE` − `SHOW_ANSWER_ROOM_BYTES`) +
+`CARRY_READ_MAX_SECS`: 60 × 16,777,216 / 2,030,592 = 495, and 495 + 120 =
+615.
+
+**Rationale:** How long a recovery reads the personal channel of the change
+it recovers from, at most, counted from its first round, and how long the
+check before a carried name is let go reads the name's channel (decision
+2026-10-17 §3, §4.2). It is what a channel at its cap takes to read at what
+a device takes from one relay in a minute, less the room a relay keeps for
+the answer to a show, and one round more: so a relay that hands what it may
+is read to its end. What a person's devices write in the personal channel is
+small, so this is reached only where a channel is near its cap, or a relay
+is slow. A recovery counts it in readings of `CARRY_READ_MAX_SECS`
+(`RECOVERY_READ_ON_READS`): five fit, and reach a channel at its cap.
+
+#### RECOVERY_READ_ON_READS = 5
+
+**Derivation:** `RECOVERY_READ_ON_MAX_SECS` / `CARRY_READ_MAX_SECS`: 615 /
+120 = 5.
+
+**Rationale:** How many readings a recovery makes of the personal channel
+of the change it recovers from at each relay, at most (decision 2026-10-17
+§3.2). Each reading of a relay is one of its own, whether it hands part
+of the channel or says its connection changed, so that what one relay does
+never costs another a reading; so there are five rounds at most. The first
+round is the read of today, which reads a relay whose connection changed
+again within it, `CARRY_PROOFS_MADE_AGAIN` times at most, each one of that
+relay's readings: so the whole read is up to seven readings long where a
+connection changes in the first round, and five where none does. The bound
+is counted in readings and not in seconds since the first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
+(a page in flight at its end, the handing of what it read to the command)
+never costs the fifth reading, which a channel at its cap needs: four
+readings of a relay that hands what it may come to about 15.5 MiB.
+
 #### CARRY_FROM_WORDS = 6
 
 **Rationale:** How many words of a key's fingerprint name a removed key at
@@ -1634,6 +1693,21 @@ at once, and a word that is found later is no word.
 **Why ten minutes:** neither the code nor the record gives a reason for the
 number. It is longer than a carry may read a name (`CARRY_READ_MAX_SECS`);
 no measurement behind it yet.
+
+#### LET_GO_READ_STANDS_SECS = 600
+
+**Derivation:** `CARRY_WORD_SECS`, as a `u64`; `protocol.rs` asserts that
+`CARRY_WORD_SECS` is above 0.
+
+**Rationale:** How long the read that `cordelia sync unmap` shows, or the
+count that a device that has stopped took from its notes, stands for the
+`discard` that follows it (decision 2026-10-17 §5). The person reads the
+lines and types the word in that time. A word typed later lets go of
+nothing, and the command is run again. It is measured from the end of the
+read's last round, on the node's monotonic clock, so that a step of the wall
+clock neither widens nor shortens it, and a read older than it is kept no
+more. Derived: as long as a word of the phrase for a carry stands, the other
+act at a prompt that follows what the node read.
 
 #### CARRY_PART_MAX_BYTES = 512 KB
 

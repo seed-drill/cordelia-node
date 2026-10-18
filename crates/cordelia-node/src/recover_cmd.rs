@@ -9,17 +9,25 @@
 //!    a device that already follows a phrase. It then asks for the
 //!    phrase, and reads the phrase's own channel at every relay that the
 //!    machine is set up with, saying which it could not reach: the phrase
-//!    proves that channel's key, which no device can.
+//!    proves that channel's key, which no device can. Each relay at which
+//!    it could not read that channel to its end is said again before the
+//!    yes (decision 2026-10-17 §3.2): it may hold a later change.
 //! 2. It takes the change entry with the highest number whose signatures
 //!    hold and whose secret opens to its statement's commitment. Where
 //!    another was handed that is not on that one's chain, the two were
 //!    made apart: it shows both lists, asks which to recover from, and
 //!    the statement it makes settles them.
-//! 3. It reads that generation's personal channel and shows every
-//!    device, each with the first words of its key's fingerprint and how
-//!    much it signed there: the statement's devices first, always; then
+//! 3. It reads that generation's personal channel, on from where each
+//!    relay reached, round after round, for RECOVERY_READ_ON_MAX_SECS at
+//!    most (decision 2026-10-17 §3.2), and shows every device, each with
+//!    the first words of its key's fingerprint and how much it signed
+//!    there: the statement's devices first, always; then
 //!    the keys added since that count; then the records that do not
-//!    count; 256 rows in all. It says first where the answers could not
+//!    count, in the order a reader keeps them, so that each device that
+//!    may add has a row for its first three keys that the 64 kept out;
+//!    256 rows in all. A key that several devices added is shown with
+//!    each label beside the device that gave it (decision 2026-10-17
+//!    §2.4). It says first where the answers could not
 //!    all be kept: a statement has room for 256 removed keys. Of each
 //!    device that counts it asks one of three things: the person still
 //!    has it, it is lost or broken, or it may be in someone else's
@@ -59,24 +67,30 @@
 //! of the generation recovered from and of those before it,** which the
 //! machine keeps as a device keeps a secret it left (§3, §9).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use cordelia_api::carry::{self, Allows, Word};
+use cordelia_api::carrying::CONNECTION_CHANGED;
 use cordelia_api::change::{prepare_recovery, read_with};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
 use cordelia_core::protocol::{
-    MAX_COUNTED_DEVICES, MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
+    CARRY_PROOFS_MADE_AGAIN, CARRY_READ_MAX_SECS, KEPT_OUT_PER_ADDER, MAX_COUNTED_DEVICES,
+    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN,
+    RECOVERY_MAX_NAMES, RECOVERY_READ_ON_READS,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
 use cordelia_crypto::{derive, fingerprint};
 
-use crate::carry_cmd::{Sessions, entries_handed, key_written, read_with_secret};
+use crate::carry_cmd::{
+    Sessions, bytes_handed, entries_handed, key_written, read_round, read_with_secret,
+};
 use crate::person_cmd::{
     NOT_A_YES, counted, default_label, file_shown, list, look, made_all_the_same, named,
     names_this_device, own_key, text, time_of, typed_phrase,
@@ -189,17 +203,13 @@ fn asked_for_room_says(left: usize) -> String {
 
 /// What is said of a key that is asked about for the bound of 64 alone,
 /// before its answer is asked: what is said of any row ([`row_says`]),
-/// and what the answers do for it ([`asked_for_room_says`]). `under` is
-/// the key for whose record it is asked about: where the row shows
-/// another that added it, this one is named too. `left` is how many
-/// removals the phrase has left.
-fn for_room_says(rows: &[Row], at: usize, number: u64, under: &[u8; 32], left: usize) -> String {
-    let mut says = row_says(rows, at, number);
-    if rows[at].added_by.is_some_and(|(shown, _)| shown != *under) {
-        let label = rows.iter().find(|row| row.key == *under);
-        let label = label.map(|row| row.label.as_str()).unwrap_or_default();
-        says.push_str(&format!("\n  {} added it too.", named(label, under)));
-    }
+/// and what the answers do for it ([`asked_for_room_says`]). It is asked
+/// under the first adder, in the order of the rows, that is not in
+/// someone else's hands ([`recover::asked_for_room`]), and the row shows
+/// every such adder, each with its label (decision 2026-10-17 §2.4).
+/// `left` is how many removals the phrase has left.
+fn for_room_says(rows: &[Row], answers: &[Answer], at: usize, number: u64, left: usize) -> String {
+    let says = row_says(rows, answers, at, number);
     format!("{says}\n{}", asked_for_room_says(left))
 }
 
@@ -282,8 +292,9 @@ fn not_shown_says(not_shown: usize) -> Option<String> {
 
 /// What is said where a recovery did not keep every record of an
 /// addition that it read (decision 2026-10-04 §9, step 3): a reader
-/// keeps 256 records that do not count, the oldest it saw going first,
-/// so where more were written, one that was read is not among them.
+/// keeps 256 records that do not count, in the order of keeping
+/// (decision 2026-10-17 §2.2), so where more were written, one that was
+/// read is not among them.
 /// `number` is the number of the change recovered from. It gives two
 /// numbers, and is said where either is not 0:
 ///
@@ -301,7 +312,10 @@ fn not_shown_says(not_shown: usize) -> Option<String> {
 /// the bound of 64 kept out, may be among either.** Its key is removed
 /// afterwards as that of a row that was not asked about is
 /// ([`removed_afterwards`]), and one that the person still has is added
-/// again by hand.
+/// again by hand. **What is kept, and shown, leaves each adder that may
+/// add its first `KEPT_OUT_PER_ADDER` such keys** (decision 2026-10-17
+/// §2.2, §2.5): it says so, so that a person knows that only an adder
+/// that added more than that can have left one of theirs out.
 ///
 /// It is said before the first question ([`said_first`]), and again
 /// before the yes ([`will_do_lines`]).
@@ -340,7 +354,10 @@ fn no_row_says(generation: &Generation, number: u64) -> Option<String> {
         );
     }
     Some(format!(
-        "{}, because more were written than a recovery keeps. A device of yours that was added \
+        "{}, because more were written than a recovery keeps. Each device that may add keeps a \
+         row for at least the first {KEPT_OUT_PER_ADDER} devices that it added since change \
+         {number} and that {MAX_COUNTED_DEVICES} devices counted already kept out: a device that \
+         added more than that may have left one of them here. A device of yours that was added \
          since change {number} may be among them.{of_each} If it is a device of yours that is \
          gone, {}. One that you still have is added again by hand.",
         found.join(", and "),
@@ -441,6 +458,360 @@ fn none_found_says(not_read: &[String]) -> String {
     )
 }
 
+/// A number of bytes, in MiB, to one place after the point.
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The mark of a holding that a relay answers under where it holds none
+/// of a channel, as the node writes a mark.
+fn no_mark() -> String {
+    hex::encode(cordelia_storage::relay::NO_MARK)
+}
+
+/// How one relay stands while a recovery reads its personal channel on
+/// (decision 2026-10-17 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadingOn {
+    /// The relay, by its name.
+    relay: String,
+    /// What is said of the read there, as the node says it: `whole`,
+    /// `part`, `not held`, or why it was not read.
+    read: String,
+    /// How many entries of the channel it handed, over every round.
+    handed: u64,
+    /// What those came to, as a relay counts them against a channel's
+    /// cap.
+    bytes: u64,
+    /// The place that the read reached there, as the node said it: the
+    /// mark of the relay's holding, and the place.
+    place: Option<(String, u64)>,
+    /// Whether it is asked again in the next round.
+    on: bool,
+    /// How many readings it was asked in, the first round's among them:
+    /// RECOVERY_READ_ON_READS at most, its own, whatever another relay
+    /// does.
+    readings: u64,
+    /// Why its reading on stopped, where it was read in part or not at
+    /// all.
+    why: Option<String>,
+    /// Whether its last reading was one where its connection changed.
+    changed: bool,
+}
+
+impl ReadingOn {
+    /// How a relay stands after the first round, of what the node said
+    /// of it last, where it was asked in `readings` readings of that
+    /// round. It is read on where it was read in part and the read moved
+    /// on from the start, and where its connection changed.
+    fn first(said: &Value, readings: u64) -> Self {
+        let mut at = Self {
+            relay: text(said, "relay").to_string(),
+            read: text(said, "read").to_string(),
+            handed: entries_handed(said),
+            bytes: bytes_handed(said),
+            place: None,
+            on: false,
+            readings,
+            why: None,
+            changed: false,
+        };
+        let place = place_of(said);
+        if at.read == "whole" && place.as_ref().is_some_and(|(mark, _)| *mark == no_mark()) {
+            // It answered that it holds none of the channel.
+            at.read = match at.handed {
+                0 => "not held".into(),
+                _ => "part".into(),
+            };
+            if at.handed > 0 {
+                at.why = Some("it holds none of it now".into());
+            }
+        }
+        // Its connection changed at every reading of the first round: it
+        // is read in the next round, from the start, over the connection
+        // there is then.
+        at.changed = at.read == CONNECTION_CHANGED;
+        at.on = at.changed
+            || (at.read == "part"
+                && place
+                    .as_ref()
+                    .is_some_and(|(mark, next)| (mark.as_str(), *next) != (no_mark().as_str(), 0)));
+        at.place = place;
+        at
+    }
+
+    /// Take what the node said of the relay in a round after the first,
+    /// where it was asked from its place: `None` where the node said
+    /// nothing of it. Returns the line that is said of it after the
+    /// round.
+    ///
+    /// - **Read to its end** at a place under a mark: it stops there.
+    /// - **Read in part, and the place moved on:** it is asked again.
+    /// - **Read in part, and the place did not move** (the round ended
+    ///   before a page, or at a page of which nothing is an entry of the
+    ///   channel): that is no progress, and it is not asked again.
+    /// - **It holds none of the channel now** (it says so, or answers
+    ///   to its end under no mark): where it handed part of it, it is
+    ///   read in part; where it handed nothing, it holds none of it.
+    /// - **Its connection changed:** it handed nothing, and is asked
+    ///   again in the next round from the same place, over the connection
+    ///   there is then, where it has a reading left.
+    /// - **Anything else** (it was not reached, or not read): it is not
+    ///   asked again, and stays as it was.
+    fn round(&mut self, said: Option<&Value>) -> String {
+        self.on = false;
+        let read = said.map(|said| text(said, "read")).unwrap_or_default();
+        self.changed = read == CONNECTION_CHANGED;
+        let place = said.and_then(place_of);
+        // What it handed in the round counts, however the round ended.
+        if let Some(said) = said {
+            self.handed += entries_handed(said);
+            self.bytes += bytes_handed(said);
+        }
+        let holds_none = read == "not held"
+            || (read == "whole" && place.as_ref().is_some_and(|(mark, _)| *mark == no_mark()));
+        if holds_none && self.handed == 0 {
+            self.read = "not held".into();
+            return format!("  {}: it holds none of it.", self.relay);
+        }
+        if holds_none {
+            return self.in_part("it holds none of it now");
+        }
+        if read == CONNECTION_CHANGED {
+            self.on = true;
+            return format!(
+                "  {}: its connection changed; it is read again from where it was.",
+                self.relay
+            );
+        }
+        if !matches!(read, "whole" | "part") {
+            let why = match read {
+                "" => "the node said nothing of it".to_string(),
+                read => format!("it was {read}"),
+            };
+            return self.in_part(&why);
+        }
+        if read == "whole" {
+            self.read = "whole".into();
+            self.place = place;
+            return format!(
+                "  {}: read to its end, {} MiB.",
+                self.relay,
+                mib(self.bytes)
+            );
+        }
+        if place.is_none() || place == self.place {
+            return self.in_part("it handed nothing more");
+        }
+        self.place = place;
+        self.on = true;
+        format!("  {}: {} MiB read so far.", self.relay, mib(self.bytes))
+    }
+
+    /// Stop reading on at the relay for `why`: the line that says so. It
+    /// is read in part where it handed an entry of the channel, and
+    /// otherwise nothing of it was read there ([`read_as`]).
+    fn in_part(&mut self, why: &str) -> String {
+        self.on = false;
+        self.why = Some(why.to_string());
+        match self.handed {
+            0 => format!("  {}: nothing of it was read: {why}.", self.relay),
+            _ => format!(
+                "  {}: read in part, {} MiB: {why}.",
+                self.relay,
+                mib(self.bytes)
+            ),
+        }
+    }
+
+    /// The place to ask from, as the node is handed it.
+    fn from(&self) -> Option<Value> {
+        let (mark, place) = self.place.as_ref()?;
+        Some(json!({ "relay": self.relay, "mark": mark, "place": place }))
+    }
+
+    /// What is said of the relay once the reading on has ended, as the
+    /// node says it of a read.
+    fn said(&self) -> Value {
+        let mut said = json!({ "relay": self.relay, "read": self.read, "entries": self.handed });
+        if let Some(why) = &self.why {
+            said["why"] = why.as_str().into();
+        }
+        said
+    }
+}
+
+/// The place that the node said a read reached at a relay: the mark and
+/// the place, where it said them.
+fn place_of(said: &Value) -> Option<(String, u64)> {
+    Some((said["mark"].as_str()?.to_string(), said["place"].as_u64()?))
+}
+
+/// Read the personal channel of the change numbered `number` on, from
+/// where each relay reached, round after round (decision 2026-10-17
+/// §3.2). `round` reads it once: at every relay where it is given no
+/// relays, and otherwise at those it is given alone, each from its place
+/// in what it is given. `say` says a line.
+///
+/// 1. **The first round is the read of today:** from the start, at every
+///    relay, for CARRY_READ_MAX_SECS at most. **A relay whose connection
+///    changed is read again in it,** alone and from the start, over the
+///    connection there is then, as the read of today reads it again:
+///    CARRY_PROOFS_MADE_AGAIN times at most, each one of its own readings.
+/// 2. **Each relay that it read in part, where the read moved on, is
+///    asked again from the place it reached, and no other.** After the
+///    first round the command says that it reads on, and after each
+///    round one line of each relay that it asked: how far it has read,
+///    as a relay counts it against its cap.
+/// 3. **It stops at a relay that has handed the channel to its end or
+///    holds none of it, at one that was not reached in a round, at one
+///    where a round did not move the place, and at one that has been
+///    asked in RECOVERY_READ_ON_READS rounds:** each relay has its own
+///    count, so what one relay does never costs another a reading. **In a
+///    round after the first, a relay whose connection changed is asked
+///    again in the next round,** from where it was, over the connection
+///    there is then: that is one of its own readings, and no relay is read
+///    again within such a round. So there are RECOVERY_READ_ON_READS rounds
+///    at most, each one reading of CARRY_READ_MAX_SECS at every relay
+///    asked but the first, which is up to CARRY_PROOFS_MADE_AGAIN readings
+///    longer where a connection changed in it; and what a reading takes
+///    beyond that never costs the reading that reaches a channel at its
+///    cap. A relay that handed part and then holds none of it is read in
+///    part, and one that handed nothing and holds none of it holds none.
+///    Each relay read on that is not read to its end keeps why its reading
+///    on stopped, and what is said of it says it (`why`).
+///
+/// Returns every entry handed, each once, and what is said of each relay
+/// in the node's order, as the node says it of a read: a relay read on
+/// is said `whole` where it was read to its end, and otherwise `part`,
+/// with how many entries of the channel it handed in every round.
+fn read_on(
+    number: u64,
+    mut round: impl FnMut(
+        Option<&[String]>,
+        &[Value],
+    ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+    mut say: impl FnMut(String),
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let mut kept: HashSet<[u8; 32]> = HashSet::new();
+    let mut entries: Vec<CheckedEntry> = Vec::new();
+    let mut keep = |handed: Vec<CheckedEntry>| {
+        for entry in handed {
+            if kept.insert(entry.id()) {
+                entries.push(entry);
+            }
+        }
+    };
+    let (first, mut relays) = round(None, &[])?;
+    keep(first);
+    // The read of today reads again, from the start, a relay whose
+    // connection changed: the others answered, and what they said stands.
+    let mut readings: HashMap<String, u64> = HashMap::new();
+    for _ in 0..CARRY_PROOFS_MADE_AGAIN {
+        let changed: Vec<String> = relays
+            .iter()
+            .filter(|said| text(said, "read") == CONNECTION_CHANGED)
+            .map(|said| text(said, "relay").to_string())
+            .collect();
+        if changed.is_empty() {
+            break;
+        }
+        let (handed, again) = round(Some(&changed), &[])?;
+        keep(handed);
+        for relay in &changed {
+            *readings.entry(relay.clone()).or_insert(1) += 1;
+        }
+        for said in again {
+            let of = relays.iter_mut().find(|of| of["relay"] == said["relay"]);
+            if let Some(of) = of {
+                *of = said;
+            }
+        }
+    }
+    let first = |said: &Value| {
+        let readings = readings.get(text(said, "relay")).copied().unwrap_or(1);
+        ReadingOn::first(said, readings)
+    };
+    let mut at: Vec<ReadingOn> = relays.iter().map(first).collect();
+    for relay in &at {
+        if !relay.on && !matches!(relay.read.as_str(), "whole" | "not held") {
+            say(format!(
+                "  Could not read the personal channel at {} to its end ({}).",
+                relay.relay, relay.read
+            ));
+        }
+    }
+    // Only a relay that handed part of the channel says that it is larger
+    // than one read: one whose connection changed handed nothing.
+    let larger: Vec<&ReadingOn> = at.iter().filter(|r| r.on && !r.changed).collect();
+    if let Some(left) = larger
+        .iter()
+        .map(|r| RECOVERY_READ_ON_READS.saturating_sub(r.readings))
+        .max()
+    {
+        let names: Vec<&str> = larger.iter().map(|r| r.relay.as_str()).collect();
+        say(format!(
+            "\nThe personal channel of change {number} is larger than one read. Reading on at {}: a \
+             relay may hold up to {} MiB of it, which takes up to {} reads: up to {left} more are \
+             made, each of up to {} minutes and what it takes beyond that. Ctrl-C stops here, and \
+             nothing is made.",
+            names.join(", "),
+            MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / (1024 * 1024),
+            RECOVERY_READ_ON_READS,
+            CARRY_READ_MAX_SECS / 60
+        ));
+    }
+    for relay in at.iter().filter(|relay| relay.on) {
+        say(match relay.changed {
+            true => format!(
+                "  {}: its connection changed; it is read again from where it was.",
+                relay.relay
+            ),
+            false => format!("  {}: {} MiB read so far.", relay.relay, mib(relay.bytes)),
+        });
+    }
+    loop {
+        // A relay that has been asked in so many rounds is asked no more.
+        for relay in at.iter_mut().filter(|relay| relay.on) {
+            if relay.readings >= RECOVERY_READ_ON_READS {
+                let made = match relay.changed {
+                    true => format!(
+                        "its {RECOVERY_READ_ON_READS} reads were made, and its connection changed \
+                         at the last"
+                    ),
+                    false => format!("its {RECOVERY_READ_ON_READS} reads were made"),
+                };
+                say(relay.in_part(&made));
+            }
+        }
+        let asked: Vec<String> = at
+            .iter()
+            .filter(|r| r.on)
+            .map(|r| r.relay.clone())
+            .collect();
+        if asked.is_empty() {
+            break;
+        }
+        for relay in at.iter_mut().filter(|relay| relay.on) {
+            relay.readings += 1;
+        }
+        let from: Vec<Value> = at
+            .iter()
+            .filter(|r| r.on)
+            .filter_map(ReadingOn::from)
+            .collect();
+        let (handed, relays) = round(Some(&asked), &from)?;
+        keep(handed);
+        for relay in at.iter_mut().filter(|relay| asked.contains(&relay.relay)) {
+            let said = relays
+                .iter()
+                .find(|said| text(said, "relay") == relay.relay);
+            say(relay.round(said));
+        }
+    }
+    Ok((entries, at.iter().map(ReadingOn::said).collect()))
+}
+
 /// What a recovery knows of one relay for a personal channel that it
 /// read there (decision 2026-10-04 §16): one of four things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +852,9 @@ fn read_as(relay: &Value) -> ReadAs {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PersonalRead {
     relays: Vec<(String, ReadAs, String)>,
+    /// Why the reading on stopped at each relay that was read on and is
+    /// read in part, by its name (decision 2026-10-17 §3.3).
+    why: Vec<(String, String)>,
 }
 
 impl PersonalRead {
@@ -489,9 +863,25 @@ impl PersonalRead {
             let (name, said) = (text(relay, "relay"), text(relay, "read"));
             (name.to_string(), read_as(relay), said.to_string())
         };
+        let why = relays.iter().filter_map(|relay| {
+            let why = relay["why"].as_str()?;
+            Some((text(relay, "relay").to_string(), why.to_string()))
+        });
         Self {
             relays: relays.iter().map(of).collect(),
+            why: why.collect(),
         }
+    }
+
+    /// The relays of which `known` is what is known, each by its name,
+    /// and with why its reading on stopped, where that is known.
+    fn at_with_why(&self, known: &[ReadAs]) -> Vec<String> {
+        let why = |relay: &String| self.why.iter().find(|(of, _)| of == relay);
+        let named = |relay: String| match why(&relay) {
+            Some((_, why)) => format!("{relay} ({why})"),
+            None => relay,
+        };
+        self.at(known).into_iter().map(named).collect()
     }
 
     /// The relays of which `known` is what is known, each by its name.
@@ -573,9 +963,18 @@ const A_MISSING_NAME: &str = "A name that is missing is not carried. What a devi
     folder here is mapped to the name.";
 
 /// What a recovery read of the personal channels, for what it says
-/// before its yes of what it could not read (decision 2026-10-04 §16).
+/// before its yes of what it could not read (decision 2026-10-04 §16),
+/// and of the phrase's own channel (decision 2026-10-17 §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct WasRead {
+    /// The relays at which the phrase's own channel could not be read
+    /// to its end, each by its name: a relay that holds none of it is
+    /// not among them. Each may hold a later change than the one
+    /// recovered from.
+    phrase_not_read: Vec<String>,
+    /// The number of the latest change in what was read of the phrase's
+    /// own channel.
+    latest: u64,
     /// The number of the change recovered from.
     number: u64,
     /// Its personal channel, relay by relay.
@@ -592,6 +991,20 @@ struct WasRead {
 }
 
 impl WasRead {
+    /// What a recovery from the change numbered `number` read: of its
+    /// personal channel, `personal`; and of the phrase's own channel,
+    /// `phrase`, what the node said of each relay, where the latest
+    /// change found was numbered `latest`.
+    fn of(number: u64, personal: PersonalRead, phrase: &[Value], latest: u64) -> Self {
+        Self {
+            phrase_not_read: not_read_at(phrase),
+            latest,
+            number,
+            personal,
+            ..Default::default()
+        }
+    }
+
     /// Note what was read of the personal channel of a generation
     /// before, of the change numbered `number`: `relays` is what the node
     /// says of each relay ([`Self::before`],
@@ -639,13 +1052,30 @@ impl WasRead {
     ///   which relays it was not read; and what that costs.
     /// - **A personal channel of a generation before** that was not read
     ///   to its end: at which relays, by the change's number.
+    ///
+    /// And first, **where the phrase's own channel could not be read to
+    /// its end at a relay** (decision 2026-10-17 §3.2): at which, that it
+    /// may hold a later change, and which change this recovery is made
+    /// from. It is said whether or not a change was found elsewhere.
     fn lines(&self) -> Vec<String> {
         let (number, of) = (self.number, &self.personal);
         let mut lines = Vec::new();
-        let part = of.at(&[ReadAs::Part]);
-        let nothing = of.at(&[ReadAs::Nothing]);
+        if !self.phrase_not_read.is_empty() {
+            let latest = match self.latest == number {
+                true => ", the latest in what was read",
+                false => "",
+            };
+            lines.push(format!(
+                "The recovery phrase's own channel could not be read to its end at {}: it may \
+                 hold a later change. This recovery is made from change {number}{latest}. Only \
+                 the recovery phrase writes in that channel.",
+                self.phrase_not_read.join(", ")
+            ));
+        }
+        let part = of.at_with_why(&[ReadAs::Part]);
+        let nothing = of.at_with_why(&[ReadAs::Nothing]);
         if of.any(ReadAs::Whole) {
-            let not_to_the_end = of.at(&[ReadAs::Part, ReadAs::Nothing]);
+            let not_to_the_end = of.at_with_why(&[ReadAs::Part, ReadAs::Nothing]);
             if !not_to_the_end.is_empty() {
                 lines.push(format!(
                     "The personal channel of the change recovered from could not be read to its \
@@ -666,10 +1096,9 @@ impl WasRead {
             lines.push(format!(
                 "The personal channel of change {number} was read to its end at no relay: in part \
                  at {}{not_at_all}.{none_held} Devices added since that change, and names, may be \
-                 missing from what was read. What a person's own devices write there is small: a \
-                 read that does not reach the end may be a sign that a device of that change \
-                 filled the channel.",
-                part.join(", ")
+                 missing from what was read. A relay that hands it more slowly than a channel at \
+                 its largest needs, or stops, leaves it in part.",
+                part.join(", "),
             ));
             lines.push(A_MISSING_DEVICE.to_string());
             lines.push(A_MISSING_NAME.to_string());
@@ -751,15 +1180,63 @@ fn lists_lines(statement: &Statement, own: &[u8; 32]) -> anyhow::Result<Vec<Stri
 /// statement lists it or who added it since and when, and how much it
 /// signed in the personal channel. A record that does not count is said
 /// to be one, and where it fails only for the bound of 64 counted
-/// devices, that is said.
-fn row_says(rows: &[Row], at: usize, number: u64) -> String {
+/// devices, that is said. `answers` are those given so far.
+///
+/// **A key that the 64 kept out, and that several adders added, is shown
+/// with each label beside the adder that gave it** (decision 2026-10-17
+/// §2.4, §1 property 3), in the order of the adders' rows, so that no one
+/// adder's label stands for the key: where the labels differ, the row
+/// says that the words are what tells two apart. An adder that may be in
+/// someone else's hands ([`recover::adders_shown`]) is counted, and not
+/// shown, also where it is the only one: the key is then shown by its
+/// words alone ([`recover::label_shown`]). And where the key signed a record of an addition, the row says
+/// that the device it added is not shown (§2.3).
+fn row_says(rows: &[Row], answers: &[Answer], at: usize, number: u64) -> String {
     let row = &rows[at];
     let label_of = |key: &[u8; 32]| {
         let known = rows.iter().find(|row| row.key == *key);
         known.map(|row| row.label.clone()).unwrap_or_default()
     };
+    let for_room =
+        format!(", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted already");
+    let label = recover::label_shown(rows, answers, row);
+    let (shown, hidden) = recover::adders_shown(rows, answers, row);
+    let mut more = Vec::new();
     let whose = match row.added_by {
         None => format!("a device of change {number}"),
+        // Several adders, or one that may be in someone else's hands: each
+        // that is shown with its label, and the others counted.
+        Some(_) if row.no_room.len() > 1 || hidden > 0 => {
+            let from: Vec<String> = shown
+                .iter()
+                .map(|(adder, at, label)| {
+                    let adder = named(&label_of(adder), adder);
+                    format!("from {adder} at {} as {label:?}", time_of(*at))
+                })
+                .collect();
+            let hands = match (shown.is_empty(), hidden) {
+                (_, 0) => String::new(),
+                (true, n) => format!(
+                    " by {} that may be in someone else's hands",
+                    counted(n, "device")
+                ),
+                (false, n) => {
+                    format!(", and {n} more added it, which may be in someone else's hands")
+                }
+            };
+            let labels: BTreeSet<&str> = shown.iter().map(|(_, _, label)| label.as_str()).collect();
+            if labels.len() > 1 {
+                more.push(
+                    "  The labels differ. A label is what the device that added it called it: the \
+                     words are what tells two apart.",
+                );
+            }
+            let from = match from.is_empty() {
+                true => String::new(),
+                false => format!(", {}", from.join(", and ")),
+            };
+            format!("added since change {number}{from}{hands}{for_room}")
+        }
         Some((adder, at)) => format!(
             "added since change {number}, from {} at {}{}",
             named(&label_of(&adder), &adder),
@@ -767,18 +1244,26 @@ fn row_says(rows: &[Row], at: usize, number: u64) -> String {
             match (row.counts, row.no_room.is_empty()) {
                 (true, _) => String::new(),
                 (false, true) => ", by a record that does not count".to_string(),
-                (false, false) => format!(
-                    ", by a record that does not count: {MAX_COUNTED_DEVICES} devices counted \
-                     already"
-                ),
+                (false, false) => for_room,
             }
         ),
     };
-    format!(
+    if row.signed_a_record {
+        more.push(
+            "  A device that it added is not shown here: a device that does not count adds \
+             nothing.",
+        );
+    }
+    let mut says = format!(
         "\n{}, {whose}. It signed {} in the personal channel of that change.",
-        named(&row.label, &row.key),
+        named(label, &row.key),
         counted(row.signed, "entry").replace("entrys", "entries")
-    )
+    );
+    for line in more {
+        says.push('\n');
+        says.push_str(line);
+    }
+    says
 }
 
 /// Ask one of the three things of a device. **No answer is suggested:**
@@ -823,8 +1308,12 @@ fn will_do_lines(
     let rows = &generation.rows;
     let taken = recover::takes(rows, answers);
     let mut lines = Vec::new();
+    // Each by the label that its row showed (decision 2026-10-17 §2.4).
     let shown = |keys: Vec<&Row>| -> String {
-        let all: Vec<String> = keys.iter().map(|row| named(&row.label, &row.key)).collect();
+        let all: Vec<String> = keys
+            .iter()
+            .map(|row| named(recover::label_shown(rows, answers, row), &row.key))
+            .collect();
         all.join(", ")
     };
     let from: Vec<&Row> = rows
@@ -928,6 +1417,103 @@ fn will_do_lines(
     lines
 }
 
+/// What the command does at one row of a recovery (decision 2026-10-04
+/// §9, step 3): it says the row and answers it itself, or says it and
+/// asks.
+#[derive(Debug, PartialEq, Eq)]
+enum AtARow {
+    /// What is said, and the answer that stands for it: this machine
+    /// itself, or a record of which nothing is asked.
+    Said(String, Answer),
+    /// What is said before the question.
+    Asks(String),
+}
+
+/// What the command does at the row at `at`, with `answers` the answers
+/// given so far, to every row before it: **what is said of a row turns
+/// on them** (decision 2026-10-17 §2.4), since an adder that may be in
+/// someone else's hands is not shown, nor its label. `number` is the
+/// number of the change recovered from, `own` this machine's key, `room`
+/// what the change has room for, and `removed_already` whether a change
+/// has removed a key already: the one recovered from, or the one made
+/// apart from it.
+fn at_a_row(
+    rows: &[Row],
+    answers: &[Answer],
+    at: usize,
+    number: u64,
+    own: &[u8; 32],
+    room: &recover::Room,
+    removed_already: &dyn Fn(&[u8; 32]) -> bool,
+) -> AtARow {
+    let says = row_says(rows, answers, at, number);
+    if rows[at].key == *own {
+        let says = format!("{says}\n  It is this machine: it is the one device of the change.");
+        return AtARow::Said(says, Answer::Have);
+    }
+    // A record that does not count is shown as that, and nothing is
+    // asked of it: unless only the bound of 64 kept its key out, a key
+    // signed it that may add and is not in someone else's hands, and no
+    // change has removed its key already.
+    if !rows[at].counts {
+        let removed = removed_already(&rows[at].key);
+        if asked_though_it_does_not_count(rows, answers, at, removed).is_none() {
+            let says = format!("{says}\n{}", not_asked_says(&rows[at], removed));
+            return AtARow::Said(says, Answer::NotAsked);
+        }
+        let left = removals_left(room, rows, answers, removed_already);
+        return AtARow::Asks(for_room_says(rows, answers, at, number, left));
+    }
+    let mut says = says;
+    // What was said of the device that added it bears on it.
+    let adders_answer = rows[at]
+        .added_by
+        .and_then(|(adder, _)| rows.iter().position(|row| row.key == adder))
+        .is_some_and(|adder| {
+            let mut so_far = answers.to_vec();
+            so_far.push(Answer::Have);
+            recover::in_other_hands(rows, &so_far, adder)
+        });
+    if adders_answer {
+        says.push_str(
+            "\n  It was added by a device that may be in someone else's hands: nothing that it \
+             wrote is brought back, whatever is said of it.",
+        );
+    }
+    AtARow::Asks(says)
+}
+
+/// The keys that the node is handed with the label of each (decision
+/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone;
+/// `still_have`, each that they still have; and `not_shown`, each row
+/// that could not be shown. **Each label is the one that its row was
+/// shown by** ([`recover::label_shown`], decision 2026-10-17 §2.4): the
+/// node keeps it, and `cordelia devices` shows it afterwards, so an adder
+/// that may be in someone else's hands chooses none. Where every adder of
+/// a key may be, the label is empty, which the node keeps as none: the
+/// key is shown by its words alone, as its row was. `own` is this
+/// machine's key, which is no key of these.
+fn labels_for_the_node(generation: &Generation, answers: &[Answer], own: &[u8; 32]) -> Value {
+    let rows = &generation.rows;
+    let key_and_label = |row: &Row| -> Value {
+        let label = recover::label_shown(rows, answers, row);
+        json!({ "key": hex::encode(row.key), "label": label })
+    };
+    let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
+        rows.iter()
+            .zip(answers)
+            .filter(|(row, said)| answer(said) && row.key != *own)
+            .map(|(row, _)| key_and_label(row))
+            .collect()
+    };
+    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
+    json!({
+        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
+        "still_have": labelled(|said| *said == Answer::Have),
+        "not_shown": not_shown,
+    })
+}
+
 /// `cordelia recover` (see the module's documentation).
 pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
@@ -974,11 +1560,11 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     // 1. The phrase, and its own channel at every relay.
     let phrase = typed_phrase(&at)?;
     println!("Reading the recovery phrase's own channel at each relay...");
-    let (handed, not_read) = {
+    let (handed, phrase_read) = {
         let secret = phrase.channel_secret()?;
-        let (handed, relays) = read_channel(config_path, &secret, &mut sessions, &own, "it")?;
-        (handed, not_read_at(&relays))
+        read_channel(config_path, &secret, &mut sessions, &own, "it")?
     };
+    let not_read = not_read_at(&phrase_read);
 
     // 2. The change entry with the highest number, of those whose
     //    signatures hold and whose secret opens to the commitment.
@@ -992,6 +1578,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let Some(found) = recover::found(candidates) else {
         anyhow::bail!("{}", none_found_says(&not_read));
     };
+    let latest = found.from.statement.statement.number;
     let (from, apart) = match found.second() {
         None => (found.from.clone(), None),
         Some((other, on_neither)) => {
@@ -1033,8 +1620,16 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     );
     let (generation, personal_read) = {
         let personal = Zeroizing::new(derive::personal_secret(&for_phrase.secret)?);
-        let what = "the personal channel";
-        let (handed, relays) = read_channel(config_path, &personal, &mut sessions, &own, what)?;
+        // It is read on from where each relay reached, round after
+        // round (decision 2026-10-17 §3.2).
+        let (handed, relays) = read_on(
+            statement.number,
+            |asked, from| {
+                let (sessions, own) = (&mut sessions, &own);
+                read_round(config_path, &personal, sessions, own, asked, from)
+            },
+            |line| println!("{line}"),
+        )?;
         // It goes on with what it could read. Where no relay handed an
         // entry of the channel, and none said that it holds none of it,
         // nothing is known, and nothing is asked.
@@ -1068,46 +1663,22 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     };
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
-        let says = row_says(rows, at_row, statement.number);
-        if rows[at_row].key == own {
-            println!("{says}\n  It is this machine: it is the one device of the change.");
-            answers.push(Answer::Have);
-            continue;
+        let removed = &removed_already;
+        match at_a_row(
+            rows,
+            &answers,
+            at_row,
+            statement.number,
+            &own,
+            &room,
+            removed,
+        ) {
+            AtARow::Said(says, answer) => {
+                println!("{says}");
+                answers.push(answer);
+            }
+            AtARow::Asks(says) => answers.push(asks_of(&at, &says)?),
         }
-        // A record that does not count is shown as that, and nothing is
-        // asked of it: unless only the bound of 64 kept its key out, a
-        // key signed it that may add and is not in someone else's
-        // hands, and no change has removed its key already.
-        if !rows[at_row].counts {
-            let removed = removed_already(&rows[at_row].key);
-            let under = asked_though_it_does_not_count(rows, &answers, at_row, removed);
-            let Some((under, _)) = under else {
-                println!("{says}\n{}", not_asked_says(&rows[at_row], removed));
-                answers.push(Answer::NotAsked);
-                continue;
-            };
-            let left = removals_left(&room, rows, &answers, removed_already);
-            let says = for_room_says(rows, at_row, statement.number, &under, left);
-            answers.push(asks_of(&at, &says)?);
-            continue;
-        }
-        let mut says = says;
-        // What was said of the device that added it bears on it.
-        let adders_answer = rows[at_row]
-            .added_by
-            .and_then(|(adder, _)| rows.iter().position(|row| row.key == adder))
-            .is_some_and(|adder| {
-                let mut so_far = answers.clone();
-                so_far.push(Answer::Have);
-                recover::in_other_hands(rows, &so_far, adder)
-            });
-        if adders_answer {
-            says.push_str(
-                "\n  It was added by a device that may be in someone else's hands: nothing that \
-                 it wrote is brought back, whatever is said of it.",
-            );
-        }
-        answers.push(asks_of(&at, &says)?);
     }
     if let Some(says) = not_shown_says(generation.not_shown.len()) {
         println!("\n{says}");
@@ -1122,11 +1693,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let mut before: Vec<Vec<String>> = Vec::new();
     // What was read of the personal channels, for what is said before
     // the yes: nothing refuses for a generation before.
-    let mut was_read = WasRead {
-        number: statement.number,
-        personal: personal_read,
-        ..Default::default()
-    };
+    let mut was_read = WasRead::of(statement.number, personal_read, &phrase_read, latest);
     for earlier in &for_phrase.earlier {
         let personal = Zeroizing::new(derive::personal_secret(&earlier.secret)?);
         let what = format!("the personal channel of change {}", earlier.number);
@@ -1196,23 +1763,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         left.push(json!({ "number": earlier.number, "secret": hex::encode(&earlier.secret[..]) }));
     }
     drop(for_phrase);
-    let key_and_label =
-        |row: &Row| -> Value { json!({ "key": hex::encode(row.key), "label": row.label }) };
-    let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
-        rows.iter()
-            .zip(&answers)
-            .filter(|(row, said)| answer(said) && row.key != own)
-            .map(|(row, _)| key_and_label(row))
-            .collect()
-    };
-    let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
+    let labels = labels_for_the_node(&generation, &answers, &own);
     let mut body = json!({
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
-        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
-        "still_have": labelled(|said| *said == Answer::Have),
-        "not_shown": not_shown,
+        "gone": labels["gone"],
+        "still_have": labels["still_have"],
+        "not_shown": labels["not_shown"],
         "word": word,
     });
     drop(statement_key);
@@ -1868,6 +2426,8 @@ fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use cordelia_core::protocol::RECOVERY_READ_ON_MAX_SECS;
+
     fn row(n: u8, label: &str, added_by: Option<u8>, counts: bool) -> Row {
         Row {
             key: [n; 32],
@@ -1877,6 +2437,7 @@ mod tests {
             signed: usize::from(n),
             no_room: Vec::new(),
             record_let_go: false,
+            signed_a_record: false,
         }
     }
 
@@ -1898,7 +2459,7 @@ mod tests {
     #[test]
     fn test_what_is_said_of_a_device_before_its_answer_is_asked() {
         let rows = rows();
-        let laptop = row_says(&rows, 0, 7);
+        let laptop = row_says(&rows, &[], 0, 7);
         assert_eq!(
             laptop,
             format!(
@@ -1907,7 +2468,7 @@ mod tests {
                 fingerprint::shown(&[1; 32])
             )
         );
-        let phone = row_says(&rows, 2, 7);
+        let phone = row_says(&rows, &[], 2, 7);
         assert!(
             phone.contains(&format!(
                 "\"phone\", added since change 7, from ({}) \"desktop\" at 2027-01-15 08:00 UTC. \
@@ -1917,7 +2478,7 @@ mod tests {
             "{phone}"
         );
         // A record that does not count is said to be one.
-        let tablet = row_says(&rows, 3, 7);
+        let tablet = row_says(&rows, &[], 3, 7);
         assert!(
             tablet.contains("by a record that does not count"),
             "{tablet}"
@@ -1925,7 +2486,7 @@ mod tests {
         // A label is another device's word: quoted, it cannot pass for
         // what the command says itself.
         let odd = vec![row(9, "x\") (abandon ability", None, true)];
-        let says = row_says(&odd, 0, 1);
+        let says = row_says(&odd, &[], 0, 1);
         assert!(says.contains("\"x\\\") (abandon ability\""), "{says}");
     }
 
@@ -1935,43 +2496,45 @@ mod tests {
     /// question: nothing that it wrote is brought back, `lost` or
     /// `hands` removes its key, and `have` leaves it to be added again;
     /// and each key that is removed takes one of the removals that the
-    /// phrase has left, with how many are left. Before the yes it is
-    /// named among those from whom the look takes nothing, where it was
-    /// said to be gone.
+    /// phrase has left, with how many are left. Where two adders added it,
+    /// each label is shown beside the adder that gave it, and no adder is
+    /// named apart (decision 2026-10-17 §2.4); where it signed a record,
+    /// its row says that what it added is not shown (§2.3). Before the
+    /// yes it is named among those from whom the look takes nothing,
+    /// where it was said to be gone.
     #[test]
     fn test_what_is_said_of_a_key_that_only_the_bound_of_64_kept_out() {
         let mut rows = rows();
-        // A watch that the desktop added, and the laptop too: its record
-        // found no room.
+        // A watch that the laptop added: its record found no room.
         let mut watch = row(5, "watch", Some(1), false);
-        watch.no_room = vec![([1; 32], 1_800_000_000), ([2; 32], 1_800_000_000)];
+        watch.no_room = vec![([1; 32], 1_800_000_000, "watch".into())];
         rows.push(watch);
-        let says = row_says(&rows, 4, 7);
-        assert!(
-            says.contains(&format!(
-                "\"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 UTC, \
-                 by a record that does not count: 64 devices counted already. It signed 5 entries",
+        let says = row_says(&rows, &[], 4, 7);
+        assert_eq!(
+            says,
+            format!(
+                "\n({}) \"watch\", added since change 7, from ({}) \"laptop\" at 2027-01-15 08:00 \
+                 UTC, by a record that does not count: 64 devices counted already. It signed 5 \
+                 entries in the personal channel of that change.",
+                fingerprint::shown(&[5; 32]),
                 fingerprint::shown(&[1; 32])
-            )),
-            "{says}"
-        );
-        // Asked about for the record that the device shown signed.
-        let asked = for_room_says(&rows, 4, 7, &[1; 32], 191);
-        assert!(asked.starts_with(&says), "{asked}");
-        assert!(!asked.contains("added it too"), "{asked}");
-        assert!(
-            asked.ends_with(
-                "\n  That is the one thing its record fails for, so it is asked about all the \
-                 same. Nothing that it wrote is brought back by this recovery, whatever is said \
-                 of it: `lost` or `hands` removes its key, and what it wrote then comes in by \
-                 `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves it \
-                 to be added again by hand. Each key that is removed takes one of the removals \
-                 that the recovery phrase has left: 191 of 256."
             ),
-            "{asked}"
+        );
+        // Asked about for the record that the laptop signed.
+        let asked = for_room_says(&rows, &[], 4, 7, 191);
+        assert_eq!(
+            asked,
+            format!(
+                "{says}\n  That is the one thing its record fails for, so it is asked about all \
+                 the same. Nothing that it wrote is brought back by this recovery, whatever is \
+                 said of it: `lost` or `hands` removes its key, and what it wrote then comes in \
+                 by `cordelia sync carry <name> --from <device>`, with the phrase; `have` leaves \
+                 it to be added again by hand. Each key that is removed takes one of the \
+                 removals that the recovery phrase has left: 191 of 256."
+            ),
         );
         assert!(
-            for_room_says(&rows, 4, 7, &[1; 32], 0).ends_with("has left: 0 of 256."),
+            for_room_says(&rows, &[], 4, 7, 0).ends_with("has left: 0 of 256."),
             "the number that is left is said"
         );
         // How many are left, as the row is asked about: what the change
@@ -1989,16 +2552,35 @@ mod tests {
         assert_eq!(removals_left(&room, &rows, &so_far, was_removed), 195);
         let none = recover::Room { can_go: 1, ..room };
         assert_eq!(removals_left(&none, &rows, &so_far, |_| false), 0);
-        // Asked about for the record of another device than the one
-        // shown: that one is named too.
-        let asked = for_room_says(&rows, 4, 7, &[2; 32], 191);
+
+        // The desktop added it too, under another label, and it signed a
+        // record of its own: both labels are shown, each beside its
+        // adder, and the line of what it added follows. Neither adder is
+        // named apart from the others.
+        let mut two = rows.clone();
+        two[4]
+            .no_room
+            .push(([2; 32], 1_800_000_060, "kitchen watch".into()));
+        two[4].signed_a_record = true;
+        let asked = for_room_says(&two, &[], 4, 7, 191);
         assert!(
             asked.contains(&format!(
-                "\n  ({}) \"desktop\" added it too.\n  That is the one thing",
+                "from ({}) \"laptop\" at 2027-01-15 08:00 UTC as \"watch\", and from ({}) \
+                 \"desktop\" at 2027-01-15 08:01 UTC as \"kitchen watch\", by a record",
+                fingerprint::shown(&[1; 32]),
                 fingerprint::shown(&[2; 32])
             )),
             "{asked}"
         );
+        assert!(
+            asked.contains(
+                "\n  The labels differ. A label is what the device that added it called it: the \
+                 words are what tells two apart.\n  A device that it added is not shown here: a \
+                 device that does not count adds nothing.\n  That is the one thing"
+            ),
+            "{asked}"
+        );
+        assert!(!asked.contains("added it too"), "{asked}");
 
         // Before the yes: said to be lost, it is one of those from whom
         // the look takes nothing, with the command that brings what it
@@ -2034,6 +2616,338 @@ mod tests {
         (hands[0], hands[1]) = (Answer::OtherHands, Answer::OtherHands);
         let all = will_do_lines(&generation, &hands, &names, &[9; 32], &read_whole()).join("\n");
         assert!(!all.contains("\"watch\""), "{all}");
+    }
+
+    /// What is said of a key that the 64 kept out and that two adders
+    /// added under two labels (decision 2026-10-17 §2.5): the row shows
+    /// each label beside the adder that gave it, in the order of the
+    /// adders' rows, and says that the labels differ. An adder that may be
+    /// in someone else's hands is counted, and not shown, nor is its label
+    /// (§2.4): no one adder's label stands for the key.
+    #[test]
+    fn test_what_is_said_of_a_key_added_under_two_labels() {
+        let mut rows = rows();
+        // A key that the laptop added as a phone and the desktop as a
+        // kitchen tablet. The label that the row holds is no adder's own
+        // word here, so what is shown is the adders'.
+        let mut phone = row(6, "not shown", Some(1), false);
+        phone.no_room = vec![
+            ([1; 32], 1_800_000_000, "phone".into()),
+            ([2; 32], 1_800_123_400, "kitchen tablet".into()),
+        ];
+        phone.signed = 4;
+        phone.signed_a_record = true;
+        rows.push(phone);
+        let (w1, w2, w6) = (
+            fingerprint::shown(&[1; 32]),
+            fingerprint::shown(&[2; 32]),
+            fingerprint::shown(&[6; 32]),
+        );
+        let labels_differ = "  The labels differ. A label is what the device that added it \
+                             called it: the words are what tells two apart.";
+        let added_one = "  A device that it added is not shown here: a device that does not \
+                         count adds nothing.";
+        assert_eq!(
+            row_says(&rows, &[Answer::Have, Answer::Lost], 4, 3),
+            format!(
+                "\n({w6}) \"phone\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 \
+                 08:00 UTC as \"phone\", and from ({w2}) \"desktop\" at 2027-01-16 18:16 UTC as \
+                 \"kitchen tablet\", by a record that does not count: 64 devices counted \
+                 already. It signed 4 entries in the personal channel of that change.\
+                 \n{labels_differ}\n{added_one}"
+            )
+        );
+        // The laptop may be in someone else's hands: it is counted, and
+        // neither it nor its label is shown.
+        let hands = [Answer::OtherHands, Answer::Lost];
+        let says = row_says(&rows, &hands, 4, 3);
+        assert_eq!(
+            says,
+            format!(
+                "\n({w6}) \"kitchen tablet\", added since change 3, from ({w2}) \"desktop\" at \
+                 2027-01-16 18:16 UTC as \"kitchen tablet\", and 1 more added it, which may be in \
+                 someone else's hands, by a record that does not count: 64 devices counted \
+                 already. It signed 4 entries in the personal channel of that change.\
+                 \n{added_one}"
+            )
+        );
+        assert!(!says.contains("\"phone\"") && !says.contains(&w1), "{says}");
+        // Both may be: neither is shown.
+        let says = row_says(&rows, &[Answer::OtherHands, Answer::OtherHands], 4, 3);
+        assert_eq!(
+            says,
+            format!(
+                "\nthe device ({w6}), added since change 3 by 2 devices that may be in someone \
+                 else's hands, by a record that does not count: 64 devices counted already. It \
+                 signed 4 entries in the personal channel of that change.\n{added_one}"
+            )
+        );
+        // An adder whose own adder may be in someone else's hands may be
+        // too: a watch that the laptop added, and the phone, which the
+        // desktop added. The phone was said to be one that the person
+        // still has, and the desktop may be in someone else's hands: the
+        // phone is counted, and its label is not shown.
+        let mut watch = row(7, "not shown", Some(1), false);
+        watch.no_room = vec![
+            ([1; 32], 1_800_000_000, "watch".into()),
+            ([3; 32], 1_800_000_000, "kitchen watch".into()),
+        ];
+        rows.push(watch);
+        let chain = [Answer::Have, Answer::OtherHands, Answer::Have];
+        let says = row_says(&rows, &chain, 5, 3);
+        assert!(
+            says.starts_with(&format!(
+                "\n({}) \"watch\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 \
+                 08:00 UTC as \"watch\", and 1 more added it, which may be in someone else's \
+                 hands, by a record",
+                fingerprint::shown(&[7; 32])
+            )),
+            "{says}"
+        );
+        assert!(!says.contains("kitchen watch"), "{says}");
+        // One adder alone that may be in someone else's hands is counted
+        // and not shown, as among several: the key is shown by its words.
+        let mut pager = row(8, "pager", Some(1), false);
+        pager.no_room = vec![([1; 32], 1_800_000_000, "pager".into())];
+        rows.push(pager);
+        assert_eq!(
+            row_says(&rows, &[Answer::OtherHands], 6, 3),
+            format!(
+                "\nthe device ({}), added since change 3 by 1 device that may be in someone \
+                 else's hands, by a record that does not count: 64 devices counted already. It \
+                 signed 8 entries in the personal channel of that change.",
+                fingerprint::shown(&[8; 32])
+            )
+        );
+        let shown_alone = row_says(&rows, &[Answer::Have], 6, 3);
+        assert!(
+            shown_alone.contains(&format!(
+                "\"pager\", added since change 3, from ({w1}) \"laptop\" at 2027-01-15 08:00 \
+                 UTC, by a record that does not count: 64"
+            )),
+            "{shown_alone}"
+        );
+
+        // The same label from both: nothing is said of labels.
+        rows[4].no_room[1].2 = "phone".into();
+        let says = row_says(&rows, &[Answer::Have, Answer::Lost], 4, 3);
+        assert!(says.contains("as \"phone\", and from"), "{says}");
+        assert!(!says.contains("The labels differ"), "{says}");
+    }
+
+    /// The rows of a test, and a key that the 64 kept out, which the
+    /// laptop added as a phone and the desktop as a kitchen tablet: its
+    /// row holds the laptop's label, as a recovery reads it, the laptop's
+    /// row being the first.
+    fn rows_with_two_labels() -> Vec<Row> {
+        let mut rows = rows();
+        let mut kept_out = row(6, "phone", Some(1), false);
+        kept_out.no_room = vec![
+            ([1; 32], 1_800_000_000, "phone".into()),
+            ([2; 32], 1_800_000_000, "kitchen tablet".into()),
+        ];
+        rows.push(kept_out);
+        rows
+    }
+
+    /// What the command does at a row turns on the answers given so far
+    /// (decision 2026-10-17 §2.4): an adder that was said to be in
+    /// someone else's hands is not shown, whether the row is asked about
+    /// or is not.
+    #[test]
+    fn test_what_is_said_at_a_row_turns_on_the_answers_so_far() {
+        let rows = rows_with_two_labels();
+        let room = recover::Room {
+            removed: 0,
+            asked: 5,
+            can_go: 256,
+        };
+        let at = |answers: &[Answer], n: usize| {
+            at_a_row(&rows, answers, n, 3, &[9; 32], &room, &|_| false)
+        };
+        // The laptop may be in someone else's hands, and the desktop is
+        // kept: the key is asked about under the desktop, by its label.
+        let so_far = [
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::Have,
+            Answer::NotAsked,
+        ];
+        let AtARow::Asks(says) = at(&so_far, 4) else {
+            panic!("the key is asked about");
+        };
+        assert_eq!(says, for_room_says(&rows, &so_far, 4, 3, 255));
+        assert!(
+            says.contains("\"kitchen tablet\", added since change 3"),
+            "{says}"
+        );
+        assert!(says.contains("and 1 more added it"), "{says}");
+        assert!(!says.contains("\"phone\""), "{says}");
+        // Both may be: nothing is asked, and neither label is shown.
+        let both = [
+            Answer::OtherHands,
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::NotAsked,
+        ];
+        let AtARow::Said(says, Answer::NotAsked) = at(&both, 4) else {
+            panic!("nothing is asked of the key");
+        };
+        assert!(says.starts_with("\nthe device ("), "{says}");
+        assert!(
+            !says.contains("\"phone\"") && !says.contains("kitchen"),
+            "{says}"
+        );
+        // This machine is answered as one that the person has.
+        let own = at_a_row(&rows, &[], 0, 3, &[1; 32], &room, &|_| false);
+        assert!(matches!(own, AtARow::Said(_, Answer::Have)), "{own:?}");
+    }
+
+    /// **A row that does not count, has one adder, and was not kept out
+    /// by the 64 follows the label shown as every other row does**
+    /// (decision 2026-10-17 §2.4): where its adder may be in someone
+    /// else's hands, the row, the lines before the yes and what the node
+    /// keeps name the key by its words alone, and not by that adder's
+    /// label. Where the adder is kept, its label is shown.
+    #[test]
+    fn test_a_row_that_does_not_count_shows_no_label_of_an_adder_in_someone_elses_hands() {
+        let rows = rows();
+        let generation = Generation {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let room = recover::Room {
+            removed: 0,
+            asked: 4,
+            can_go: 196,
+        };
+        // The desktop and the phone, which added the tablet, may be in
+        // someone else's hands; the tablet's record does not count for
+        // another reason.
+        let answers = [Answer::Have, Answer::OtherHands, Answer::OtherHands];
+        assert!(rows[3].no_room.is_empty() && !rows[3].counts);
+        assert_eq!(recover::label_shown(&rows, &answers, &rows[3]), "");
+        let AtARow::Said(says, _) = at_a_row(&rows, &answers, 3, 3, &[9; 32], &room, &|_| false)
+        else {
+            panic!("a record that does not count is not asked about");
+        };
+        let words = fingerprint::shown(&[4; 32]);
+        assert!(
+            says.starts_with(&format!("\nthe device ({words}), added since")),
+            "{says}"
+        );
+        assert!(!says.contains("\"tablet\""), "{says}");
+        let mut answered = answers.to_vec();
+        answered.push(Answer::NotAsked);
+        let labels = labels_for_the_node(&generation, &answered, &[9; 32]);
+        assert!(!labels.to_string().contains("tablet"), "{labels}");
+        // The phone kept: the tablet is shown by its label.
+        let kept = [Answer::Have, Answer::Have, Answer::Have];
+        assert_eq!(recover::label_shown(&rows, &kept, &rows[3]), "tablet");
+        let AtARow::Said(says, _) = at_a_row(&rows, &kept, 3, 3, &[9; 32], &room, &|_| false)
+        else {
+            panic!("a record that does not count is not asked about");
+        };
+        assert!(says.contains("\"tablet\""), "{says}");
+        // A row that counts keeps its label, though its adder, the
+        // desktop, may be in someone else's hands: its own row says what
+        // was said of it.
+        assert_eq!(recover::label_shown(&rows, &answers, &rows[2]), "phone");
+    }
+
+    /// The label by which a key that the 64 kept out is named before the
+    /// yes, and the label that the node is handed for it and keeps, is
+    /// the one that its row was shown by (decision 2026-10-17 §2.4): that
+    /// of the first adder that is not in someone else's hands. Where every
+    /// adder may be, the label is empty, which the node keeps as none.
+    #[test]
+    fn test_a_key_kept_out_by_the_64_is_named_by_the_label_its_row_showed() {
+        let mut rows = rows_with_two_labels();
+        let not_shown = |n: u8| {
+            let mut beyond = row(n, "beyond", Some(1), false);
+            beyond.no_room = vec![([1; 32], 1_800_000_000, "beyond".into())];
+            beyond
+        };
+        let generation = Generation {
+            rows: rows.clone(),
+            not_shown: vec![not_shown(20)],
+            ..Default::default()
+        };
+        let names = recover::Names::default();
+        // The laptop may be in someone else's hands; the desktop and the
+        // phone are kept, and the key is lost.
+        let answers = [
+            Answer::OtherHands,
+            Answer::Have,
+            Answer::Have,
+            Answer::NotAsked,
+            Answer::Lost,
+        ];
+        let all = will_do_lines(&generation, &answers, &names, &[9; 32], &read_whole()).join("\n");
+        assert!(
+            all.contains(&format!(
+                "It takes nothing from: ({}) \"laptop\", ({}) \"kitchen tablet\".",
+                fingerprint::shown(&[1; 32]),
+                fingerprint::shown(&[6; 32])
+            )),
+            "{all}"
+        );
+        let labels = labels_for_the_node(&generation, &answers, &[9; 32]);
+        let labelled =
+            |key: u8, label: &str| json!({ "key": hex::encode([key; 32]), "label": label });
+        assert_eq!(
+            labels["gone"],
+            json!([labelled(1, "laptop"), labelled(6, "kitchen tablet")])
+        );
+        assert_eq!(
+            labels["still_have"],
+            json!([labelled(2, "desktop"), labelled(3, "phone")])
+        );
+        // The row that could not be shown was added by the laptop alone:
+        // it has no label.
+        assert_eq!(labels["not_shown"], json!([labelled(20, "")]));
+        // With the laptop kept, each is by the laptop's label.
+        let mut kept = answers;
+        kept[0] = Answer::Have;
+        let labels = labels_for_the_node(&generation, &kept, &[9; 32]);
+        assert_eq!(labels["gone"], json!([labelled(6, "phone")]));
+        assert_eq!(labels["not_shown"], json!([labelled(20, "beyond")]));
+        // This machine is handed as none of them.
+        rows[0].key = [9; 32];
+        let generation = Generation {
+            rows,
+            ..Default::default()
+        };
+        let labels = labels_for_the_node(&generation, &kept, &[9; 32]);
+        assert!(
+            !labels["still_have"]
+                .to_string()
+                .contains(&hex::encode([9u8; 32]))
+        );
+    }
+
+    /// The row of a key that the 64 kept out says that what it added is
+    /// not shown where it signed a record of an addition, and not where it
+    /// signed none (decision 2026-10-17 §2.3, §2.5).
+    #[test]
+    fn test_a_row_kept_out_by_the_64_says_that_what_it_added_is_not_shown() {
+        let mut rows = rows();
+        let mut tablet = row(5, "tablet", Some(1), false);
+        tablet.no_room = vec![([1; 32], 1_800_000_000, "tablet".into())];
+        rows.push(tablet);
+        let line = "\n  A device that it added is not shown here: a device that does not count \
+                    adds nothing.";
+        let none = row_says(&rows, &[], 4, 7);
+        assert!(!none.contains("A device that it added"), "{none}");
+        rows[4].signed_a_record = true;
+        let signed = row_says(&rows, &[], 4, 7);
+        assert_eq!(signed, format!("{none}{line}"));
+        // Asked about, the line is said before what the answers do.
+        let asked = for_room_says(&rows, &[], 4, 7, 191);
+        assert!(
+            asked.starts_with(&format!("{signed}\n  That is the one thing")),
+            "{asked}"
+        );
     }
 
     /// Of two changes made apart, the command says how many more are on
@@ -2283,9 +3197,8 @@ mod tests {
                     true => format!(
                         "The personal channel of change 3 was read to its end at no relay: in \
                          part at {}{}.{} Devices added since that change, and names, may be \
-                         missing from what was read. What a person's own devices write there is \
-                         small: a read that does not reach the end may be a sign that a device \
-                         of that change filled the channel.\n",
+                         missing from what was read. A relay that hands it more slowly than a \
+                         channel at its largest needs, or stops, leaves it in part.\n",
                         at(Part),
                         match any(Nothing) {
                             true => format!(", and not at all at {}", at(Nothing)),
@@ -2356,9 +3269,8 @@ mod tests {
             read.lines()[0],
             "The personal channel of change 3 was read to its end at no relay: in part at one, \
              three. two, four hold none of it. Devices added since that change, and names, may \
-             be missing from what was read. What a person's own devices write there is small: a \
-             read that does not reach the end may be a sign that a device of that change filled \
-             the channel."
+             be missing from what was read. A relay that hands it more slowly than a channel at \
+             its largest needs, or stops, leaves it in part."
         );
         assert_eq!(read.lines()[1..], [missing_device, missing_name]);
 
@@ -2474,7 +3386,10 @@ mod tests {
     /// machine cannot show its key; of such a row, that its line gives
     /// its key where nothing is asked of it; how a key is removed
     /// afterwards where its device is gone; and that one the person
-    /// still has is added again by hand. It is said where either number
+    /// still has is added again by hand. After its first sentence it
+    /// says that each device that may add keeps a row for at least its
+    /// first three that the 64 kept out (decision 2026-10-17 §2.5). It
+    /// is said where either number
     /// is not 0: before the first question, after what is said where the
     /// answers could not all be kept, and again before the yes.
     #[test]
@@ -2487,8 +3402,11 @@ mod tests {
                         wrote is brought back. This machine cannot show its key.";
         let of_a_row = "Where nothing is asked of such a row, nothing that its device wrote is \
                         brought back, and its line gives its key.";
-        let because = "because more were written than a recovery keeps. A device of yours that \
-                       was added since change 7 may be among them.";
+        let because = "because more were written than a recovery keeps. Each device that may add \
+                       keeps a row for at least the first 3 devices that it added since change 7 \
+                       and that 64 devices counted already kept out: a device that added more \
+                       than that may have left one of them here. A device of yours that was added \
+                       since change 7 may be among them.";
         // The rows of a test, with `let_go` more: each a row that does
         // not count, of a key one of whose records was not kept.
         let of = |no_row: usize, let_go: u8| {
@@ -2520,6 +3438,10 @@ mod tests {
         );
         assert!(
             one.contains("added since change 3 may be among them"),
+            "{one}"
+        );
+        assert!(
+            one.contains("the first 3 devices that it added since change 3 and that 64"),
             "{one}"
         );
         // Such a row, and every key has a row: the sentence is said for
@@ -3358,7 +4280,7 @@ mod tests {
 
         // A watch that only the bound kept out, which the laptop added.
         let mut watch = row(5, "watch", Some(1), false);
-        watch.no_room = vec![([1; 32], 1_800_000_000)];
+        watch.no_room = vec![([1; 32], 1_800_000_000, "watch".into())];
         let key = cordelia_crypto::bech32::encode_public_key(&[5; 32]).unwrap();
         assert_eq!(
             not_asked_says(&watch, false),
@@ -3448,5 +4370,617 @@ mod tests {
                 .unwrap()
                 .starts_with("1 more record beyond the 256 that are shown: nothing is asked")
         );
+    }
+
+    /// The entries of a channel of a test, `n` of them.
+    fn channel_of(n: usize) -> Vec<CheckedEntry> {
+        use cordelia_crypto::entry::{Entry, Inside, Value as Held};
+        let author = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        (0..n)
+            .map(|at| {
+                let inside = Inside {
+                    name: format!("{at}.md"),
+                    value: Held::Text("x".into()),
+                    chain: Some(Vec::new()),
+                };
+                let sealed = Entry::seal(&[9; 32], &author, 1, &inside).unwrap();
+                sealed.check().unwrap()
+            })
+            .collect()
+    }
+
+    /// What a relay of a test counts each entry as, against a channel's
+    /// cap: so that three come to 4.0 MiB.
+    const COUNTED_AS: u64 = 1_398_102;
+
+    /// The mark of the holding of a relay of a test.
+    const MARK: [u8; 8] = [6; 8];
+
+    /// What a relay named `relay`, which holds `held` under [`MARK`] and
+    /// hands `per_read` entries in a read, hands when it is asked from
+    /// `from`: from the place given for it under that mark, and from the
+    /// start where none is. What the node says of it carries the place
+    /// reached, as the command reads it.
+    fn hands(
+        relay: &str,
+        held: &[CheckedEntry],
+        from: &[Value],
+        per_read: usize,
+    ) -> (Vec<CheckedEntry>, Value) {
+        let asked = from.iter().find(|place| place["relay"] == relay);
+        let start = match asked {
+            Some(place) if place["mark"] == hex::encode(MARK) => {
+                place["place"].as_u64().unwrap() as usize
+            }
+            _ => 0,
+        };
+        let end = (start + per_read).min(held.len());
+        let handed = held[start..end].to_vec();
+        let said = json!({
+            "relay": relay,
+            "read": if end == held.len() { "whole" } else { "part" },
+            "entries": handed.len(),
+            "bytes": handed.len() as u64 * COUNTED_AS,
+            "mark": hex::encode(MARK),
+            "place": end,
+        });
+        (handed, said)
+    }
+
+    /// What one round of a test is asked: the relays named, where it
+    /// names any, and the places.
+    type Asked = Vec<(Option<Vec<String>>, Vec<Value>)>;
+
+    /// Read on with `round`, each round taking CARRY_READ_MAX_SECS on a
+    /// clock of the test's own: what was read, what is said of each
+    /// relay, what each round was asked, and the lines said.
+    fn reads_on(
+        mut round: impl FnMut(usize, &[Value]) -> (Vec<CheckedEntry>, Vec<Value>),
+    ) -> (Vec<CheckedEntry>, Vec<Value>, Asked, Vec<String>) {
+        use std::cell::RefCell;
+        let asked: RefCell<Asked> = RefCell::new(Vec::new());
+        let mut lines = Vec::new();
+        let (entries, said) = read_on(
+            3,
+            |relays, from| {
+                let number = asked.borrow().len();
+                asked
+                    .borrow_mut()
+                    .push((relays.map(<[String]>::to_vec), from.to_vec()));
+                Ok(round(number, from))
+            },
+            |line| lines.push(line),
+        )
+        .unwrap();
+        (entries, said, asked.into_inner(), lines)
+    }
+
+    /// The relays named, as a round is asked them.
+    fn asked_of(relays: &[&str]) -> Option<Vec<String>> {
+        Some(relays.iter().map(|relay| relay.to_string()).collect())
+    }
+
+    /// The place to ask from at a relay of a test.
+    fn place(relay: &str, at: u64) -> Value {
+        json!({ "relay": relay, "mark": hex::encode(MARK), "place": at })
+    }
+
+    /// **A recovery reads its personal channel on from the place each
+    /// relay reached, round after round, until its end** (decision
+    /// 2026-10-17 §3.2, §3.3; §1, property 10). The relay hands a third
+    /// of the channel in a read. The first round reads from the start, at
+    /// every relay; the second and third are asked of that relay alone,
+    /// each from the place the last reached. Every entry is kept, each
+    /// once, and the relay is said to have handed the channel to its end.
+    /// The command says after the first round that it reads on, and after
+    /// each round how far it has read.
+    #[test]
+    fn test_a_recovery_reads_its_personal_channel_on_until_its_end() {
+        let held = channel_of(9);
+        let (entries, said, asked, lines) = reads_on(|_, from| {
+            let (handed, said) = hands("relay-one", &held, from, 3);
+            (handed, vec![said])
+        });
+        assert_eq!(
+            asked,
+            [
+                (None, vec![]),
+                (asked_of(&["relay-one"]), vec![place("relay-one", 3)]),
+                (asked_of(&["relay-one"]), vec![place("relay-one", 6)]),
+            ]
+        );
+        let ids = |of: &[CheckedEntry]| of.iter().map(|e| e.id()).collect::<Vec<_>>();
+        assert_eq!(ids(&entries), ids(&held));
+        assert_eq!(
+            said,
+            [json!({ "relay": "relay-one", "read": "whole", "entries": 9 })]
+        );
+        assert_eq!(PersonalRead::of(&said).at(&[ReadAs::Whole]), ["relay-one"]);
+        assert_eq!(
+            lines.join("\n"),
+            "\nThe personal channel of change 3 is larger than one read. Reading on at relay-one: \
+             a relay may hold up to 16 MiB of it, which takes up to 5 reads: up to 4 more are \
+             made, each of up to 2 minutes and what it takes beyond that. Ctrl-C stops here, and \
+             nothing is made.\n  \
+             relay-one: 4.0 MiB read so far.\n  \
+             relay-one: 8.0 MiB read so far.\n  \
+             relay-one: read to its end, 12.0 MiB."
+        );
+
+        // A channel read to its end at the first round is not read on,
+        // and nothing more is said.
+        let (entries, said, asked, lines) = reads_on(|_, from| {
+            let (handed, said) = hands("relay-one", &held, from, 9);
+            (handed, vec![said])
+        });
+        assert_eq!((entries.len(), asked.len()), (9, 1));
+        assert_eq!(said[0]["read"], "whole");
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// **A relay is asked in RECOVERY_READ_ON_READS rounds at most, its
+    /// own count** (decision 2026-10-17 §3.2; §1, property 10). The relay
+    /// hands one entry of a hundred in a read: five rounds are read, the
+    /// relay is said to have been read in part, and why: its five reads
+    /// were made.
+    ///
+    /// **A relay whose connection changed is read again in the first
+    /// round, and after it is asked again in the next round, from where
+    /// it was; each is one of its readings:** one whose connection changes
+    /// at the first reading and at the two readings again of the first
+    /// round is asked from the start in each of them, said once to be read
+    /// again, and still read on in the two rounds it has left. It is not
+    /// said to be larger than one read: it handed nothing.
+    #[test]
+    fn test_a_recovery_stops_reading_on_at_the_bound() {
+        let held = channel_of(100);
+        let (entries, said, asked, lines) = reads_on(|_, from| {
+            let (handed, said) = hands("relay-one", &held, from, 1);
+            (handed, vec![said])
+        });
+        assert_eq!(asked.len(), 5);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(asked[4].1, [place("relay-one", 4)]);
+        let made = "its 5 reads were made";
+        assert_eq!(
+            said,
+            [json!({ "relay": "relay-one", "read": "part", "entries": 5, "why": made })]
+        );
+        assert_eq!(PersonalRead::of(&said).at(&[ReadAs::Part]), ["relay-one"]);
+        assert_eq!(
+            lines.last().unwrap(),
+            "  relay-one: read in part, 6.7 MiB: its 5 reads were made."
+        );
+        // Five readings of a round's time are within the bound, and a
+        // sixth is not.
+        let readings = RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS;
+        assert!(readings <= RECOVERY_READ_ON_MAX_SECS);
+        assert!(readings + CARRY_READ_MAX_SECS > RECOVERY_READ_ON_MAX_SECS);
+
+        // Its connection changed at the first three rounds.
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let (entries, said, asked, lines) = reads_on(|round, from| match round {
+            0..=2 => {
+                let of = json!({ "relay": "relay-one", "read": changed, "entries": 0 });
+                (Vec::new(), vec![of])
+            }
+            _ => {
+                let (handed, said) = hands("relay-one", &held, from, 1);
+                (handed, vec![said])
+            }
+        });
+        assert_eq!(asked.len(), 5);
+        assert_eq!(
+            asked[1..4],
+            [
+                (asked_of(&["relay-one"]), vec![]),
+                (asked_of(&["relay-one"]), vec![]),
+                (asked_of(&["relay-one"]), vec![]),
+            ]
+        );
+        assert_eq!(asked[4].1, [place("relay-one", 1)]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(said[0]["why"], made);
+        let again = "  relay-one: its connection changed; it is read again from where it was.";
+        assert_eq!(lines[0], again);
+        assert_eq!(lines.iter().filter(|line| *line == again).count(), 1);
+        assert!(
+            !lines.iter().any(|line| line.contains("larger")),
+            "{lines:#?}"
+        );
+    }
+
+    /// **The end of a channel is what the node says it is** (decision
+    /// 2026-10-17 §3.2): a relay whose page leaves the place it was asked
+    /// from is said to have handed the channel to its end, and is not
+    /// asked again, though it said a place before the one it was asked
+    /// from. So is one that answers to its end under another mark: it
+    /// dropped the channel and took it again, and was read from the
+    /// start.
+    #[test]
+    fn test_a_page_that_leaves_the_place_ends_the_reading_as_read_to_its_end() {
+        let held = channel_of(9);
+        // The page left the place: nothing more is handed. Under another
+        // mark, what the relay holds now is handed from its start: the
+        // first two entries, which were handed before and are kept once.
+        for (mark, at, again) in [(MARK, 1u64, 0usize), ([8; 8], 2, 2)] {
+            let (entries, said, asked, lines) = reads_on(|round, from| match round {
+                0 => {
+                    let (handed, said) = hands("relay-one", &held, from, 3);
+                    (handed, vec![said])
+                }
+                _ => {
+                    let left = json!({
+                        "relay": "relay-one", "read": "whole", "entries": again,
+                        "bytes": again as u64 * COUNTED_AS, "mark": hex::encode(mark),
+                        "place": at,
+                    });
+                    (held[..again].to_vec(), vec![left])
+                }
+            });
+            assert_eq!(asked.len(), 2, "{mark:?}");
+            assert_eq!(entries.len(), 3);
+            let handed = 3 + again;
+            assert_eq!(
+                said,
+                [json!({ "relay": "relay-one", "read": "whole", "entries": handed })]
+            );
+            assert_eq!(
+                *lines.last().unwrap(),
+                format!(
+                    "  relay-one: read to its end, {} MiB.",
+                    mib(handed as u64 * COUNTED_AS)
+                )
+            );
+        }
+    }
+
+    /// **A relay that is not reached in a round is not asked again, and a
+    /// relay that handed part of the channel and then holds none of it is
+    /// read in part** (decision 2026-10-17 §3.2; §1, property 10). Six
+    /// relays hand a part of the channel at the first round. At the
+    /// second: one is not reached; two answers that it holds none; three
+    /// hands one entry more and then answers to its end under no mark,
+    /// which is how a relay that drops the channel during a read answers,
+    /// and that entry is counted; four hands nothing more, at the
+    /// place it was asked from, which is no progress; the node says
+    /// nothing of five; and six reads on. Only six is asked at the third
+    /// round. Each of the five is read in part, with what it handed, and
+    /// what is said of each says why it was not read on.
+    ///
+    /// At the first round, a relay that answers to its end under no mark
+    /// holds none of it, where it handed nothing; and is read in part,
+    /// and not read on, where it handed something. One whose read in part
+    /// did not move from the start is not read on either.
+    #[test]
+    fn test_a_relay_not_reached_in_a_round_is_not_asked_again() {
+        let held = channel_of(9);
+        let none = hex::encode(cordelia_storage::relay::NO_MARK);
+        let six = ["one", "two", "three", "four", "five", "six"];
+        let (entries, said, asked, lines) = reads_on(|round, from| {
+            let mut entries = Vec::new();
+            let mut said = Vec::new();
+            for relay in six {
+                let (handed, mut of) = hands(relay, &held, from, 3);
+                match (round, relay) {
+                    (0, _) | (_, "six") => entries.extend(handed),
+                    (_, "one") => {
+                        of = json!({ "relay": "one", "read": "not reached", "entries": 0 })
+                    }
+                    (_, "two") => of = json!({ "relay": "two", "read": "not held", "entries": 0 }),
+                    (_, "three") => {
+                        of = json!({ "relay": "three", "read": "whole", "entries": 1,
+                                     "bytes": COUNTED_AS, "mark": none, "place": 0 })
+                    }
+                    (_, "four") => {
+                        of = json!({ "relay": "four", "read": "part", "entries": 0,
+                                     "bytes": 0, "mark": hex::encode(MARK), "place": 3 })
+                    }
+                    _ => continue,
+                }
+                said.push(of);
+            }
+            if round == 0 {
+                let dropped = json!({ "relay": "seven", "read": "whole", "entries": 0,
+                                      "bytes": 0, "mark": none, "place": 0 });
+                let dropped_after = json!({ "relay": "eight", "read": "whole", "entries": 2,
+                                            "bytes": 2 * COUNTED_AS, "mark": none, "place": 0 });
+                let at_the_start = json!({ "relay": "nine", "read": "part", "entries": 0,
+                                           "bytes": 0, "mark": none, "place": 0 });
+                said.extend([dropped, dropped_after, at_the_start]);
+            }
+            (entries, said)
+        });
+        let places: Vec<Value> = six.iter().map(|relay| place(relay, 3)).collect();
+        assert_eq!(
+            asked,
+            [
+                (None, vec![]),
+                (asked_of(&six), places),
+                (asked_of(&["six"]), vec![place("six", 6)]),
+            ]
+        );
+        assert_eq!(entries.len(), 9);
+        let read_as = |relay: &str| {
+            let of = said.iter().find(|of| of["relay"] == relay).unwrap();
+            (read_as(of), entries_handed(of))
+        };
+        for relay in ["one", "two", "four", "five"] {
+            assert_eq!(read_as(relay), (ReadAs::Part, 3), "{relay}");
+        }
+        // What it handed in the round that ended so is counted.
+        assert_eq!(read_as("three"), (ReadAs::Part, 4));
+        assert_eq!(read_as("six"), (ReadAs::Whole, 9));
+        assert_eq!(read_as("seven"), (ReadAs::NotHeld, 0));
+        assert_eq!(read_as("eight"), (ReadAs::Part, 2));
+        assert_eq!(read_as("nine"), (ReadAs::Nothing, 0));
+        for line in [
+            "  Could not read the personal channel at eight to its end (part).",
+            "  Could not read the personal channel at nine to its end (part).",
+            "  one: read in part, 4.0 MiB: it was not reached.",
+            "  two: read in part, 4.0 MiB: it holds none of it now.",
+            "  three: read in part, 5.3 MiB: it holds none of it now.",
+            "  four: read in part, 4.0 MiB: it handed nothing more.",
+            "  five: read in part, 4.0 MiB: the node said nothing of it.",
+            "  six: read to its end, 12.0 MiB.",
+        ] {
+            assert!(lines.contains(&line.to_string()), "{line}: {lines:#?}");
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("seven")),
+            "{lines:#?}"
+        );
+    }
+
+    /// **A recovery says before its yes each relay at which it could not
+    /// read the phrase's own channel to its end** (decision 2026-10-17
+    /// §3.2, §3.3; §1, property 11), where another relay held a change:
+    /// it may hold a later one. A relay that holds none of it, and one
+    /// that handed it whole, are not said. Where the change recovered
+    /// from is not the latest that was read (two were made apart, and the
+    /// other was chosen), that is not said to be the latest.
+    #[test]
+    fn test_a_phrase_channel_not_read_to_its_end_is_said_again_before_the_yes() {
+        let phrase = [
+            json!({ "relay": "relay-one", "read": "whole", "entries": 1 }),
+            json!({ "relay": "relay-two", "read": "part", "entries": 0 }),
+            json!({ "relay": "relay-three", "read": "not held", "entries": 0 }),
+            json!({ "relay": "relay-four", "read": "not reached", "entries": 0 }),
+        ];
+        let personal = read_whole().personal;
+        let was_read = WasRead::of(3, personal.clone(), &phrase, 3);
+        let said = "The recovery phrase's own channel could not be read to its end at relay-two, \
+                    relay-four: it may hold a later change. This recovery is made from change 3, \
+                    the latest in what was read. Only the recovery phrase writes in that channel.";
+        assert_eq!(was_read.lines(), [said]);
+        let generation = Generation {
+            rows: rows(),
+            ..Default::default()
+        };
+        let names = recover::Names::default();
+        let all = will_do_lines(&generation, &[Answer::Have; 4], &names, &[1; 32], &was_read);
+        assert!(all.contains(&said.to_string()), "{all:#?}");
+        // From a change that is not the latest read.
+        let apart = WasRead::of(3, personal.clone(), &phrase, 4);
+        assert!(
+            apart.lines()[0].contains("This recovery is made from change 3. Only"),
+            "{:?}",
+            apart.lines()
+        );
+        // Read whole, or held by none, at every relay: nothing is said.
+        let whole = WasRead::of(3, personal, &[phrase[0].clone(), phrase[2].clone()], 3);
+        assert!(whole.lines().is_empty(), "{:?}", whole.lines());
+    }
+
+    /// **A relay whose connection keeps changing costs no other relay a
+    /// reading, and no round after the first is longer than one reading**
+    /// (decision 2026-10-17 §3.2; §1, property 10). The read on, a round
+    /// of it and the asking of only some relays, on a clock of the test's
+    /// own where each reading takes CARRY_READ_MAX_SECS. Relay a hands ten
+    /// entries of a hundred in a reading; b says at every reading that its
+    /// connection changed. b is read again twice in the first round, as
+    /// the read of today reads it, and then asked in the next round each
+    /// time, each as one of its own readings; a gets its five readings,
+    /// each from where the last ended; and the whole read ends within
+    /// RECOVERY_READ_ON_READS readings and the CARRY_PROOFS_MADE_AGAIN of
+    /// the first round. b handed nothing, and is said so, with why: its
+    /// five reads were made, the last as its connection changed.
+    #[test]
+    fn test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound() {
+        use crate::carry_cmd::one_reading;
+        use std::cell::{Cell, RefCell};
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let a = channel_of(100);
+        let clock = Cell::new(0u64);
+        let a_from: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+        let b_asked = Cell::new(0);
+        let set_up: Sessions = vec![("a".into(), [1; 32]), ("b".into(), [2; 32])];
+        let mut sessions = set_up.clone();
+        let mut lines = Vec::new();
+        let (_, said) = read_on(
+            3,
+            |asked, from| {
+                let read = |of_those: &Sessions, places: &[Value]| {
+                    clock.set(clock.get() + CARRY_READ_MAX_SECS);
+                    let (mut entries, mut said) = (Vec::new(), Vec::new());
+                    for (relay, _) in of_those {
+                        if relay == "b" {
+                            b_asked.set(b_asked.get() + 1);
+                            said.push(json!({ "relay": "b", "read": changed, "entries": 0 }));
+                            continue;
+                        }
+                        let at = places.iter().find(|place| place["relay"] == "a");
+                        let at = at.map_or(0, |place| place["place"].as_u64().unwrap());
+                        a_from.borrow_mut().push(at);
+                        let (handed, of) = hands(relay, &a, places, 10);
+                        entries.extend(handed);
+                        said.push(of);
+                    }
+                    Ok((entries, said))
+                };
+                let ask = || Ok(set_up.clone());
+                one_reading(&mut sessions, asked, from, read, ask)
+            },
+            |line| lines.push(line),
+        )
+        .unwrap();
+        let readings = RECOVERY_READ_ON_READS + CARRY_PROOFS_MADE_AGAIN as u64;
+        assert_eq!(clock.get(), readings * CARRY_READ_MAX_SECS);
+        assert_eq!(*a_from.borrow(), [0, 10, 20, 30, 40]);
+        assert_eq!(b_asked.get(), 5);
+        let read_as = |relay: &str| {
+            let of = said.iter().find(|of| of["relay"] == relay).unwrap();
+            (read_as(of), entries_handed(of), of["why"].clone())
+        };
+        let made = "its 5 reads were made";
+        let made_changed = format!("{made}, and its connection changed at the last");
+        assert_eq!(read_as("a"), (ReadAs::Part, 50, json!(made)));
+        assert_eq!(read_as("b"), (ReadAs::Nothing, 0, json!(made_changed)));
+        let b = format!("  b: nothing of it was read: {made_changed}.");
+        assert!(lines.contains(&b), "{lines:#?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("  b: read in part"))
+        );
+        // Before the yes, b is named with why.
+        let was = WasRead::of(3, PersonalRead::of(&said), &[], 3);
+        let line = &was.lines()[0];
+        assert!(
+            line.contains(&format!(
+                "in part at a ({made}), and not at all at b ({made_changed})."
+            )),
+            "{line}"
+        );
+    }
+
+    /// **What is said before the yes of a channel read in part says, for
+    /// each relay read on, why its reading stopped, and nothing of how
+    /// long it was read** (decision 2026-10-17 §3.3). Relay a is read in
+    /// all its five readings and not to the end; b hands part of it in
+    /// the first round and then says at every reading that its
+    /// connection changed; c holds none of it at the second round. Each
+    /// is named with its reason.
+    #[test]
+    fn test_what_is_said_of_a_read_in_part_says_why_each_relay_stopped() {
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let held = channel_of(100);
+        let (_, said, _, _) = reads_on(|round, from| {
+            let mut entries = Vec::new();
+            let mut said = Vec::new();
+            for relay in ["a", "b", "c"] {
+                let (handed, mut of) = hands(relay, &held, from, 1);
+                match (round, relay) {
+                    (0, _) | (_, "a") => entries.extend(handed),
+                    (_, "b") => of = json!({ "relay": "b", "read": changed, "entries": 0 }),
+                    (_, _) => of = json!({ "relay": "c", "read": "not held", "entries": 0 }),
+                }
+                said.push(of);
+            }
+            (entries, said)
+        });
+        let read = PersonalRead::of(&said);
+        let was = WasRead::of(3, read, &[], 3);
+        let line = &was.lines()[0];
+        assert!(
+            line.starts_with(
+                "The personal channel of change 3 was read to its end at no relay: in part at a \
+                 (its 5 reads were made), b (its 5 reads were made, and its connection changed at \
+                 the last), c (it holds none of it now). \
+                 Devices added since that change, and names, may be missing from what was read. A \
+                 relay that hands it more slowly than a channel at its largest needs, or stops, \
+                 leaves it in part."
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("minutes"), "{line}");
+    }
+
+    /// **A relay whose connection changed in the first round, and that
+    /// holds none of the channel, is said to hold none of it** (decision
+    /// 2026-10-17 §3.2, §3.3; §1, properties 10 and 11). Relay a holds two
+    /// entries and hands them whole at the first reading; b says that its
+    /// connection changed.
+    ///
+    /// - **b is read again within the first round,** alone and from the
+    ///   start, as the read of today reads it, and holds none of it: no
+    ///   line is said, nothing is read on, and nothing is said before the
+    ///   yes. Every name not listed is then listed nowhere.
+    /// - **Where its connection changes at every reading of the first
+    ///   round,** it is read in the next, and only it is said to be read
+    ///   again: the channel is not said to be larger than one read. There
+    ///   it holds none of it, and is said to: it handed nothing.
+    /// - **Where it is then not reached,** nothing of it was read, and it
+    ///   is named before the yes with why.
+    #[test]
+    fn test_a_relay_whose_connection_changed_and_that_holds_none_is_said_to_hold_none() {
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let held = channel_of(2);
+        let personal = |said: &[Value]| WasRead::of(3, PersonalRead::of(said), &[], 3);
+        let b_said = |read: &str| json!({ "relay": "b", "read": read, "entries": 0 });
+        // b's connection changed at the readings before `changes`, and it
+        // says `then` at the reading after.
+        let reads = |changes: usize, then: &'static str| {
+            let held = held.clone();
+            reads_on(move |round, from| match round {
+                0 => {
+                    let (handed, a) = hands("a", &held, from, 2);
+                    (handed, vec![a, b_said(changed)])
+                }
+                n if n < changes => (Vec::new(), vec![b_said(changed)]),
+                _ => (Vec::new(), vec![b_said(then)]),
+            })
+        };
+
+        let (entries, said, asked, lines) = reads(1, "not held");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(asked, [(None, vec![]), (asked_of(&["b"]), vec![])]);
+        assert!(lines.is_empty(), "{lines:#?}");
+        assert_eq!(
+            said,
+            [
+                json!({ "relay": "a", "read": "whole", "entries": 2 }),
+                json!({ "relay": "b", "read": "not held", "entries": 0 }),
+            ]
+        );
+        let was = personal(&said);
+        assert!(was.lines().is_empty(), "{:?}", was.lines());
+        assert!(was.to_the_end());
+
+        // Its connection changed at the three readings of the first round.
+        let (_, said, asked, lines) = reads(3, "not held");
+        assert_eq!(asked.len(), 4);
+        assert_eq!(asked[3], (asked_of(&["b"]), vec![]));
+        assert_eq!(
+            lines,
+            [
+                "  b: its connection changed; it is read again from where it was.",
+                "  b: it holds none of it.",
+            ]
+        );
+        assert_eq!(
+            said[1],
+            json!({ "relay": "b", "read": "not held", "entries": 0 })
+        );
+        let was = personal(&said);
+        assert!(was.lines().is_empty(), "{:?}", was.lines());
+        assert!(was.to_the_end());
+
+        // And then it was not reached.
+        let (_, said, _, lines) = reads(3, "not reached");
+        assert_eq!(
+            lines[1..],
+            ["  b: nothing of it was read: it was not reached."]
+        );
+        let was = personal(&said);
+        assert_eq!(
+            was.lines(),
+            [
+                "The personal channel of the change recovered from could not be read to its end at \
+              b (it was not reached): devices added since that change, and names, may be missing \
+              here."
+            ]
+        );
+        assert!(!was.to_the_end());
     }
 }

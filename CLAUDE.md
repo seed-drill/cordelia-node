@@ -69,10 +69,18 @@ cordelia-node/
                          #   and the notice), first_start (a node that is held up), sync,
                          #   history; reader (what a device keeps of an entry of the
                          #   messages channel that the door stores, and the hourly task of
-                         #   messages); sender (what a device does to send a message: the
-                         #   next number, its checks, sending again and clearing); marks
-                         #   (what an agent read: the device's table and its list, the
-                         #   other devices' lists, and whether a message is unread);
+                         #   messages); own_read (a read of a channel of the device's own
+                         #   with places of its own, kept in memory under its ID: the read
+                         #   before a carried name is let go); let_go (what that read
+                         #   finds: the entries this device signed, each held where a
+                         #   relay handed it or moved its slot on, and when it reads on;
+                         #   what a device that has stopped counts from its notes; the
+                         #   lines before and after a `discard`);
+                         #   sender (what a device does
+                         #   to send a message: the next number, its checks, sending again
+                         #   and clearing); marks (what an agent read: the device's table
+                         #   and its list, the other devices' lists, and whether a message
+                         #   is unread);
                          #   messages (the routes of `msg summary`, `msg read`, `msg
                          #   send` and `msg log`: the folder's agent, the message an ID
                          #   names, the seven categories taken out of text another device
@@ -125,7 +133,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -207,6 +215,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8 (within their hour at one time), 2 | parameter-rationale.md §12.6 |
 | `HAND_OVER_CHANGE_ENTRY_BYTES`, `MAX_HAND_OVER_BYTES` | 32,960, 54,275 (derived) | parameter-rationale.md §12.6 |
 | `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
+| `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
 | `PROTOCOL_ENTRY_SHOW`, `PROTOCOL_CHANNEL_PROVE`, `PROTOCOL_ENTRY_PULL`, `PROTOCOL_ENTRY_PUSH`, `PROTOCOL_RELAY_ENTRIES` | 0x10, 0x11, 0x12, 0x13, 0x14 | network-protocol.md §4.9 |
@@ -229,7 +238,9 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATEMENTS_LEFT_SAID_BELOW` | 16 | parameter-rationale.md §12.9 |
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
+| `RECOVERY_READ_ON_MAX_SECS`, `RECOVERY_READ_ON_READS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more), 5 (derived: the readings that fit in it) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
+| `LET_GO_READ_STANDS_SECS` | 600s (derived: a read before a let-go stands for its `discard`, on the monotonic clock) | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
 | `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |
 | `DEVICE_DELETE_SWEEP_INTERVAL_SECS` | 86400s (a device's sweep of old deletes) | parameter-rationale.md §12.9 |
