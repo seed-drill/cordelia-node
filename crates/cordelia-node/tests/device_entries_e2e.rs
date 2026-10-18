@@ -5708,7 +5708,8 @@ async fn a_read_with_places_of_its_own_waits_out_a_pull_refused_for_now() {
 /// its count of breaches (BAN_THRESHOLD): a relay refuses a breach of its
 /// rates with the same reset, and cuts off an address at that count. It
 /// is then not reached in that round, so it does not hold the round to
-/// its time, nor a read of another channel behind it. A relay that
+/// its time, nor a read of another channel behind it, which asks it
+/// nothing once it is at that count. A relay that
 /// refuses a pull for now a minute after the last page it handed is not
 /// reached at once. A relay that resets every pull otherwise is not
 /// reached at once.
@@ -5771,7 +5772,10 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
         answered.await.unwrap().unwrap()
     });
     comes_to_be("a pull refused", || refused.load(Ordering::SeqCst) >= 1).await;
+    relay.requests();
+    let began = std::time::Instant::now();
     let second = begins_a_read(&device, lab, Duration::from_secs(20)).await;
+    let waited = began.elapsed();
     let first = tokio::time::timeout(Duration::from_secs(5), first).await;
     let first = first.expect("the first read ends").unwrap();
     let at = read_at(&device, &first, "relay");
@@ -5779,8 +5783,13 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
     let counted = device.engine.refused_for_now(&relay.key);
     assert_eq!(counted, (BAN_THRESHOLD - 1) as usize);
     assert_eq!(refused.load(Ordering::SeqCst), u64::from(BAN_THRESHOLD - 1));
+    // The second read was not held up behind the first: it ended within
+    // seconds, and the relay, at its count by then, was not asked for
+    // the second channel at all.
+    assert!(waited < Duration::from_secs(10), "{waited:?}");
     let second = read_at(&device, &second.unwrap(), "relay");
-    assert_eq!(second.read, ReadAt::ToItsEnd);
+    assert_eq!(second.read, ReadAt::NotReached);
+    assert!(pulled_from(&relay.requests(), &lab).is_empty());
 
     // Refused for now as a minute has gone by since the round began:
     // asked once, and not reached. (The refusals before have left the
@@ -5817,8 +5826,10 @@ type ToRefuse = ([u8; 32], u64);
 /// fewer than BAN_THRESHOLD - 1 requests so in that window.
 ///
 /// - A page between two refusals does not reset the count: the second
-///   refusal leaves the relay not reached.
-/// - A refusal in each of two rounds of one read counts as two.
+///   refusal leaves the relay not reached, and a relay at that count is
+///   not asked at all while they are within the window.
+/// - A refusal in each of two rounds of one read counts as two, though
+///   each was on a connection of its own.
 /// - A second read at the relay, of another channel, starts from the
 ///   count that the first left.
 /// - A refusal older than the window counts no more.
@@ -5875,10 +5886,32 @@ async fn what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window()
     assert_eq!((at.read, at.place), (ReadAt::InPart, ([9; 8], 1)));
     assert_eq!(refused(&device), 2);
 
-    // A refusal in each of two rounds: the first round ends while it
-    // waits the first out, and the second refusal, in the next round,
-    // leaves the relay not reached.
-    device.clock.run_ahead(BAN_WINDOW);
+    // A relay at that count is not asked at all, by a read of another
+    // channel, while both refusals are within the window: nearly ten
+    // minutes later still.
+    let asked_of_lab = |relay: &StandIn| {
+        let of_lab = |one: &WireMessage| match one {
+            WireMessage::EntryPull(pull) => pull.channel == lab,
+            WireMessage::ChannelProve(prove) => prove.channel == lab,
+            _ => false,
+        };
+        relay.requests().iter().filter(|one| of_lab(one)).count()
+    };
+    for ahead in [Duration::ZERO, BAN_WINDOW - Duration::from_secs(5)] {
+        device.clock.run_ahead(ahead);
+        assert_eq!(refused(&device), 2);
+        relay.requests();
+        let gated = begins_a_read(&device, lab, lasts).await.unwrap();
+        let at = read_at(&device, &gated, "relay");
+        assert_eq!((at.read, at.place), (ReadAt::NotReached, ([0; 8], 0)));
+        assert_eq!(asked_of_lab(&relay), 0);
+    }
+
+    // A refusal in each of two rounds, on two connections: the first
+    // round ends while it waits the first out, and the second refusal,
+    // in the next round on a new connection, leaves the relay not
+    // reached.
+    device.clock.run_ahead(Duration::from_secs(10));
     assert_eq!(refused(&device), 0);
     *refuse.lock().unwrap() = vec![(notes, 0)];
     let read = begins_a_read(&device, notes, Duration::from_secs(1)).await;
@@ -5886,6 +5919,7 @@ async fn what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window()
     let at = read_at(&device, &read, "relay");
     assert_eq!((at.read, at.place), (ReadAt::Reading, ([0; 8], 0)));
     assert_eq!(refused(&device), 1);
+    device.connects_to("relay", relay.port, relay.key).await;
     *refuse.lock().unwrap() = vec![(notes, 0)];
     assert!(reads_on(&device, &read, lasts).await);
     let at = read_at(&device, &read, "relay");

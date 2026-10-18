@@ -26,8 +26,18 @@
 //! an address at BAN_THRESHOLD breaches in that window. The count is the
 //! relay's, kept by the device across rounds and reads, and not reset by
 //! a page. It cannot count what the pass is refused, which asks again at
-//! its next pass, nor what other devices behind one address are refused;
-//! and the first request of a read can still be refused once more. **Every other failure ends the
+//! its next pass, nor what other devices behind one address are refused.
+//! **A relay at that count is not asked at all,** in any round of any
+//! read, until a refusal has left the window
+//! ([`DeviceEntries::asks_after_refusals`]).
+//!
+//! **What that costs a relay that is honest:** one near what it may hand
+//! a connection in a minute refuses pulls for room, which are no breach.
+//! For BAN_WINDOW_SECS after one, the next leaves the relay not reached in
+//! that round, though it would have room again within its minute; after
+//! two, it is not asked at all. A read there ends in part where it could
+//! have read on. Telling the two apart needs a code of the relay's own
+//! (decision 2026-10-17 §11). **Every other failure ends the
 //! relay's read in that round as not reached:** no answer, a stream that
 //! times out or is reset otherwise, an answer that is not a page, a
 //! connection that was lost. A relay that is down, or broken, does not
@@ -242,6 +252,12 @@ impl DeviceEntries {
         mut at: OwnAt,
         until: Instant,
     ) -> OwnAt {
+        // A relay that has refused as many requests for now as the device
+        // gives one in BAN_WINDOW_SECS is not asked at all.
+        if !self.asks_after_refusals(link) {
+            at.not_reached();
+            return at;
+        }
         let asks = At {
             link,
             under: *under,
