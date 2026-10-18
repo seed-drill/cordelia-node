@@ -5377,7 +5377,8 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
 ///
 /// **It asks again only within a minute of the last page the relay
 /// handed,** as a read of the device's own channel does: a refusal that
-/// comes later than that ends the read there in part.
+/// comes later than that ends the read there in part, and one that comes
+/// within a minute of a page asks again, however long ago the read began.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     let relay = StandIn::started().await;
@@ -5536,6 +5537,29 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     a.clock.run_ahead(window());
     let read = reads_left_from(&a, old, by_secret(), None, on, soon()).await;
     assert_eq!(handed_ids(&read[0].read), Some((ids(&held[2..]), true)));
+
+    // A page more than a minute after the read began, and a refusal just
+    // after it: the minute is the page's, and the read asks again and
+    // goes on to the channel's end.
+    a.clock.run_ahead(window());
+    relay.requests();
+    let clock = a.clock.clone();
+    let pulls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&pulls);
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(_) => match counted.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                clock.run_ahead(Duration::from_secs(61));
+                None
+            }
+            1 => Some(Say::NotNow),
+            _ => None,
+        },
+        _ => None,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    assert_eq!(handed_ids(&read[0].read), Some((ids(&held), true)));
+    assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2, 3]));
 
     // A refusal that comes more than a minute after the last page: the
     // read ends there in part, and does not ask again.
