@@ -1265,8 +1265,14 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
                     |key| to_look.takes.contains(key),
                 )?;
                 for version in &was.versions {
-                    let brought =
-                        carry::bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
+                    let brought = carry::bring_by_command(
+                        &conn,
+                        &state.identity,
+                        name,
+                        version,
+                        Rule::Counts,
+                        now(),
+                    )?;
                     tally.count(&format!("{name}: {}", version.name), brought);
                 }
             }
@@ -3615,6 +3621,9 @@ mod tests {
             remade: Default::default(),
             remake_takes: Default::default(),
             held_back_at_reads: Default::default(),
+            own_relays: Default::default(),
+            own_rounds: Default::default(),
+            own_round_waits: Default::default(),
         };
         let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
         let (number, to_look) = follows(&alone, &made).unwrap();
@@ -3711,6 +3720,55 @@ mod tests {
         // machine that follows the phrase already, and holds the names.
         assert!(follows(&node, &made).is_err());
         assert!(held_back(&node, Instant::now()).is_empty());
+    }
+
+    /// **A name that the look of a recovery brought versions into while a
+    /// folder was mapped to it is a carried name** (decision 2026-10-17
+    /// §4.3, §1 property 7): the folder's unmapping does not let go of
+    /// it, and it is held from then as a carry holds a name. A look that
+    /// brings nothing into a mapped name sets no mark, and the folder's
+    /// unmapping then stops the name.
+    #[actix_web::test]
+    async fn test_a_name_the_look_brought_versions_into_under_a_folder_is_held_after_the_folders_unmapping()
+     {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let answers = [Answer::Lost, Answer::Lost];
+        let desk = BTreeSet::from(["desk".to_string()]);
+        let unmaps_desk = |node: &Node| {
+            let db = db(&node.state);
+            meta::set(&db, meta::SYNC_CLAUDE_MAPPINGS, "[]").unwrap();
+            crate::sync::names_follow(&node.state, &db, &["desk".to_string()]);
+            held_rows::channel_of_name(&db, "desk").unwrap().is_some()
+        };
+
+        let node = new_machine(9, &gone);
+        node.state.own_channels.set_up_with(1);
+        node.maps_a_folder("desk");
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["carried"], 4, "{found}");
+        {
+            let db = db(&node.state);
+            assert_eq!(names::brought_in(&db).unwrap(), desk);
+            assert!(!names::carried(&db).unwrap().contains("desk"));
+        }
+        assert!(unmaps_desk(&node));
+        assert!(names::carried(&db(&node.state)).unwrap().contains("desk"));
+
+        // A look that brings nothing: the folder's name is the folder's.
+        let node = new_machine(10, &gone);
+        node.state.own_channels.set_up_with(1);
+        node.maps_a_folder("desk");
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look) = follows(&node, &made).unwrap();
+        node.not_connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let found = the_look(&node.state, number, &to_look).await;
+        assert_eq!(found["carried"], 0, "{found}");
+        assert!(names::brought_in(&db(&node.state)).unwrap().is_empty());
+        assert!(!unmaps_desk(&node));
     }
 
     /// Where the new channels could not be fetched whole before the look

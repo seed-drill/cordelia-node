@@ -102,6 +102,8 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             carried: None,
             let_go: None,
             let_go_alone: None,
+            let_go_versions: None,
+            reading: None,
             still_held: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
@@ -463,8 +465,11 @@ fn mapped_names(db: &rusqlite::Connection) -> Result<Vec<String>, ApiError> {
 ///   2026-10-04 §16): what was brought in there, and no relay was sent,
 ///   is nowhere else in the generation applied. The name is then held as
 ///   it was before the folder was mapped, with everything its channel
-///   holds, and is let go by its name, where nothing of it waits to be
-///   sent ([`let_go_of_a_carried_name`]).
+///   holds. **Nor is a name that a carry brought versions into while the
+///   folder was mapped** ([`crate::names::brought_in`], decision
+///   2026-10-17 §4.3): it is held from then as a carry holds a name. Such
+///   a name is let go by its name, once a relay holds each version of it
+///   that this device signed ([`let_go_of_a_carried_name`]).
 /// - With sync on, it holds each name that is mapped, and says that it
 ///   syncs it ([`crate::names::hold_mapped`]).
 /// - With sync off, it says of no name that it syncs it
@@ -479,10 +484,17 @@ pub fn names_follow(state: &AppState, db: &rusqlite::Connection, before: &[Strin
     let done = || -> Result<(), crate::person::PersonError> {
         let mapped = mapped_names(db).unwrap_or_default();
         // A name that a carry or a recovery holds stays held when its
-        // folder is unmapped.
+        // folder is unmapped; and so does one that a carry brought
+        // versions into while the folder was mapped (decision 2026-10-17
+        // §4.3), which is held from now as a carry holds a name.
         let carried = crate::names::carried(db)?;
+        let brought_in = crate::names::brought_in(db)?;
         let let_go = |name: &&String| !mapped.contains(name) && !carried.contains(*name);
         for name in before.iter().filter(let_go) {
+            if brought_in.contains(name) {
+                crate::names::held_after_its_folder(db, &state.identity, name, now)?;
+                continue;
+            }
             if let Some(channel) = crate::names::stop(db, &state.identity, name, now)? {
                 state.own_channels.forget_fetched(&channel);
             }
@@ -1105,20 +1117,6 @@ pub fn remove_mapping(
     Ok(())
 }
 
-/// What the node says where a name that a carry holds is not let go
-/// (decision 2026-10-04 §7.3): `waits` versions of it wait to be sent.
-pub fn not_let_go_says(name: &str, waits: usize) -> String {
-    let (versions, them, they_are) = match waits {
-        1 => ("1 version of it waits".to_string(), "it", "it is"),
-        n => (format!("{n} versions of it wait"), "them", "they are"),
-    };
-    format!(
-        "{name} is not let go: {versions} to be sent, and this device has sent {them} to no \
-         relay yet. The name can be let go once {they_are} sent: `cordelia devices` shows what \
-         this device has still to send."
-    )
-}
-
 /// Let go of the name `name`, where this device holds it by a carry that
 /// a person asked for, or by a recovery, with no folder mapped to it
 /// ([`crate::names::carried`], decision 2026-10-04 §7.3): the device says
@@ -1127,23 +1125,57 @@ pub fn not_let_go_says(name: &str, waits: usize) -> String {
 /// of the name's channel goes with it. Says whether the name was let go:
 /// not where the device does not hold it so, and nothing is done then.
 ///
-/// **While anything of the name waits to be sent, it is not let go**
-/// ([`crate::names::waits_to_be_sent`]): what a carry or a recovery
-/// brought in here, and no relay was sent, is nowhere else in the
-/// generation applied. The refusal says how much waits, and that the
-/// name can be let go once it is sent ([`not_let_go_says`]).
+/// **On a device that sends, it is let go only by the read made before
+/// it** (decision 2026-10-17 §4.2), the read named `read`, which found
+/// `found` ([`crate::let_go::round`]); `None` on a device that has
+/// stopped, which reads no relay. With a read, it is refused:
+///
+/// - where the node keeps the read no more
+///   ([`crate::let_go::started_again_says`]);
+/// - where the store has taken anything of the name's channel since the
+///   read ended, or the name's channel is another (item 8,
+///   [`crate::let_go::took_something_says`]): what would be let go is not
+///   what the read asked about;
+/// - where no relay held an entry of the name that this device signed
+///   ([`crate::let_go::not_held_says`]): what a carry or a recovery
+///   brought in here, and no relay holds, is nowhere else in the
+///   generation applied.
+///
+/// A name that is let go ends the read it was bound to.
 pub fn let_go_of_a_carried_name(
     state: &AppState,
     db: &rusqlite::Connection,
     name: &str,
+    read: Option<(&crate::own_read::ReadId, &crate::let_go::Found)>,
 ) -> Result<bool, ApiError> {
     use crate::commands::refused;
+    use crate::let_go as check;
     if !crate::names::carried(db).map_err(refused)?.contains(name) {
         return Ok(false);
     }
-    let waits = crate::names::waits_to_be_sent(db, &state.identity, name).map_err(refused)?;
-    if waits > 0 {
-        return Err(ApiError::Conflict(not_let_go_says(name, waits)));
+    if let Some((read, found)) = read {
+        let reads = state.own_channels.reads();
+        let Some(kept) = reads.get(read, std::time::Instant::now()) else {
+            return Err(ApiError::Conflict(check::started_again_says(name)));
+        };
+        let channel = cordelia_storage::person::channel_of_name(db, name)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let taken = cordelia_storage::at_relays::last_taken(db, &kept.channel)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if channel != Some(kept.channel) || taken != found.taken {
+            return Err(ApiError::Conflict(check::took_something_says(name)));
+        }
+        if !found.each_held() {
+            let said = state.own_channels.read();
+            let now = chrono::Utc::now().timestamp();
+            let relays = check::relays_say(db, &kept, found, &said, now).map_err(refused)?;
+            return Err(ApiError::Conflict(check::not_held_says(
+                name,
+                found.not_held.len(),
+                &relays,
+            )));
+        }
+        reads.forget(read);
     }
     let now = chrono::Utc::now().timestamp();
     let held = crate::names::stop(db, &state.identity, name, now).map_err(refused)?;
@@ -1177,40 +1209,112 @@ fn still_held_by_a_carry(db: &rusqlite::Connection, before: &[String]) -> Option
 /// **Where the folder was mapped to a name that a carry or a recovery
 /// holds, the name is still held, and the answer says so**
 /// ([`still_held_by_a_carry`]).
+///
+/// **On a device that sends, a carried name is let go only after a read
+/// of its channel at the relays** (decision 2026-10-17 §4.2): the read
+/// runs outside the database's lock, a round at each request. Where it
+/// goes on, the answer carries `reading`, with the read's ID, which the
+/// command sends back to ask for the next round. Where it has ended, the
+/// lock is taken and the name is let go by what it found.
 pub async fn unmap(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<SyncUnmapRequest>,
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
-    let mut let_go = None;
-    let mut alone = None;
-    let mut still_held = None;
-    {
+    Ok(HttpResponse::Ok().json(unmapped(&state, &body).await?))
+}
+
+/// What [`unmap`] does once the request is let in, and its answer.
+pub async fn unmapped(
+    state: &AppState,
+    body: &SyncUnmapRequest,
+) -> Result<SyncStatusResponse, ApiError> {
+    let status = |let_go: Option<String>, still_held: Option<String>| {
+        let mut status = status(state)?;
+        status.let_go = let_go;
+        status.still_held = still_held;
+        Ok::<_, ApiError>(status)
+    };
+    let name = &body.folder;
+    let read = match body.read.as_deref() {
+        None => None,
+        Some(read) => Some(read_named(read)?),
+    };
+    if read.is_none() {
         let db = state
             .db
             .lock()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         let before = mapped_names(&db)?;
-        match remove_mapping(&state.sync_control, &db, &body) {
+        match remove_mapping(&state.sync_control, &db, body) {
             Ok(()) => {
-                names_follow(&state, &db, &before);
-                still_held = still_held_by_a_carry(&db, &before);
+                names_follow(state, &db, &before);
+                let still_held = still_held_by_a_carry(&db, &before);
+                drop(db);
+                return status(None, still_held);
             }
-            Err(not_mapped) => match let_go_of_a_carried_name(&state, &db, &body.folder)? {
-                true => {
-                    let_go = Some(body.folder.clone());
-                    alone = Some(listed_alone(&state, &db));
+            Err(not_mapped) => {
+                use crate::commands::refused;
+                if !crate::names::carried(&db).map_err(refused)?.contains(name) {
+                    return Err(not_mapped);
                 }
-                false => return Err(not_mapped),
-            },
+                // A device that has stopped reads no relay.
+                let stands = crate::at_relays::stands(&db).map_err(refused)?;
+                if stands != crate::at_relays::Stands::Applied {
+                    let_go_of_a_carried_name(state, &db, name, None)?;
+                    let alone = listed_alone(state, &db);
+                    drop(db);
+                    let mut status = status(Some(name.clone()), None)?;
+                    status.let_go_alone = Some(alone);
+                    return Ok(status);
+                }
+            }
         }
     }
-    let mut status = status(&state)?;
-    status.let_go = let_go;
-    status.let_go_alone = alone;
-    status.still_held = still_held;
-    Ok(HttpResponse::Ok().json(status))
+    // The read, with the lock let go: it waits on the relays.
+    match crate::let_go::round(state, name, read).await? {
+        crate::let_go::Round::Reading { read, at } => {
+            let relays: Vec<serde_json::Value> = at
+                .at
+                .iter()
+                .filter(|at| at.read.reads_on())
+                .map(|at| serde_json::json!({ "relay": at.relay, "bytes": at.bytes }))
+                .collect();
+            let mut status = status(None, None)?;
+            status.reading = Some(serde_json::json!({
+                "read": hex::encode(read),
+                "relays": relays,
+            }));
+            Ok(status)
+        }
+        crate::let_go::Round::Ended { read, found, .. } => {
+            let alone = {
+                let db = state
+                    .db
+                    .lock()
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                if !let_go_of_a_carried_name(state, &db, name, Some((&read, &found)))? {
+                    return Err(ApiError::BadRequest(format!(
+                        "{name} is not mapped on this device"
+                    )));
+                }
+                listed_alone(state, &db)
+            };
+            let mut status = status(Some(name.clone()), None)?;
+            status.let_go_alone = Some(alone);
+            status.let_go_versions = Some(found.asked);
+            Ok(status)
+        }
+    }
+}
+
+/// The ID of a read, as a command sends it: hex of sixteen bytes.
+fn read_named(read: &str) -> Result<crate::own_read::ReadId, ApiError> {
+    let bytes = hex::decode(read).map_err(|_| ApiError::BadRequest("a read's ID is hex".into()))?;
+    bytes
+        .try_into()
+        .map_err(|_| ApiError::BadRequest("a read's ID is sixteen bytes".into()))
 }
 
 /// Whether the statement that this device has applied lists this device
@@ -1559,6 +1663,85 @@ mod tests {
     const HOME: &str = "/home/sam";
     const DIR: &str = "/home/sam/.claude";
 
+    /// Every entry that the store holds of `channel`, checked.
+    fn stored_of(
+        db: &rusqlite::Connection,
+        channel: &[u8; 32],
+    ) -> Vec<cordelia_crypto::entry::CheckedEntry> {
+        cordelia_storage::entries::channel_entries_after(db, channel, 0, 100_000)
+            .unwrap()
+            .into_iter()
+            .map(|held| held.entry.check().unwrap())
+            .collect()
+    }
+
+    /// A relay of [`read_at`]: its name, its key where it was reached, and
+    /// what it handed, or `None` where it was not reached.
+    type ReadAtRelay<'a> = (
+        &'a str,
+        Option<[u8; 32]>,
+        Option<&'a [cordelia_crypto::entry::CheckedEntry]>,
+    );
+
+    /// A read of the channel of `name` before it is let go, as the node
+    /// keeps it once its round has ended, and what it found: at each relay,
+    /// by its name and with its key where it was reached, what it handed
+    /// of the channel, to its end, or `None` where it was not reached.
+    fn read_at(
+        state: &AppState,
+        db: &rusqlite::Connection,
+        name: &str,
+        relays: &[ReadAtRelay],
+    ) -> (crate::own_read::ReadId, crate::let_go::Found) {
+        use crate::own_read::Handed;
+        use crate::several::RELAY_MARK;
+        let channel = cordelia_storage::person::channel_of_name(db, name)
+            .unwrap()
+            .unwrap();
+        let under = crate::at_relays::kept_id(db).unwrap().unwrap();
+        let names: Vec<String> = relays.iter().map(|(name, ..)| name.to_string()).collect();
+        let reads = state.own_channels.reads();
+        let now = std::time::Instant::now();
+        let read = reads.begin(&channel, &under, &names, now).unwrap();
+        let (_, _, mut at) = reads.to_read(&read, now).unwrap();
+        for (one, (_, key, handed)) in at.iter_mut().zip(relays) {
+            one.key = *key;
+            let Some(entries) = handed else {
+                one.not_reached();
+                continue;
+            };
+            let next = entries.len() as u64;
+            for entries in [*entries, &[]] {
+                let counted = 0;
+                let mark = RELAY_MARK;
+                one.handed(Handed::Page {
+                    entries,
+                    counted,
+                    mark,
+                    next,
+                });
+            }
+        }
+        reads.read(&read, at, now);
+        let kept = reads.get(&read, now).unwrap();
+        let found = crate::let_go::found(db, &state.identity, name, &kept).unwrap();
+        (read, found)
+    }
+
+    /// [`read_at`], at relays that were each reached and handed so much.
+    fn read_of(
+        state: &AppState,
+        db: &rusqlite::Connection,
+        name: &str,
+        relays: &[(&str, &[cordelia_crypto::entry::CheckedEntry])],
+    ) -> (crate::own_read::ReadId, crate::let_go::Found) {
+        let relays: Vec<_> = relays
+            .iter()
+            .map(|(name, handed)| (*name, None, Some(*handed)))
+            .collect();
+        read_at(state, db, name, &relays)
+    }
+
     /// A database with sync on, and a way to run each handler's work.
     struct Settings {
         db: rusqlite::Connection,
@@ -1592,6 +1775,7 @@ mod tests {
         fn unmap(&self, folder_or_name: &str) {
             let body = SyncUnmapRequest {
                 folder: folder_or_name.into(),
+                read: None,
             };
             remove_mapping(&self.control, &self.db, &body).unwrap();
         }
@@ -2045,6 +2229,7 @@ mod tests {
             _ => {
                 let body = SyncUnmapRequest {
                     folder: "lab".into(),
+                    read: None,
                 };
                 remove_mapping(&s.control, &s.db, &body)
             }
@@ -2105,6 +2290,7 @@ mod tests {
         );
         let body = SyncUnmapRequest {
             folder: "nothing".into(),
+            read: None,
         };
         assert!(remove_mapping(&s.control, &s.db, &body).is_err());
         let body = request("/srv/outside", "outside", false);
@@ -2414,6 +2600,7 @@ mod tests {
             does(state, &|db| {
                 let body = SyncUnmapRequest {
                     folder: name.to_string(),
+                    read: None,
                 };
                 remove_mapping(&state.sync_control, db, &body).unwrap()
             })
@@ -2489,8 +2676,9 @@ mod tests {
     /// carry, with versions that no relay was sent; a folder is mapped to
     /// it, and unmapped before its first cycle. The name is then held as
     /// it was before the folder was mapped: with every version it had,
-    /// said still, and by a carry. Unmapping the name is refused while a
-    /// version of it has been sent to no relay.
+    /// said still, and by a carry. Unmapping the name is refused while no
+    /// relay held a version of it that this device signed, when the
+    /// relays were read (decision 2026-10-17 §4.2).
     ///
     /// Where nothing of the name waits, the folder's unmapping leaves it
     /// held all the same: it is the unmapping of the name that lets it
@@ -2529,6 +2717,7 @@ mod tests {
             let before = mapped_names(&db).unwrap();
             let body = SyncUnmapRequest {
                 folder: word.to_string(),
+                read: None,
             };
             remove_mapping(&state.sync_control, &db, &body).unwrap();
             names_follow(&state, &db, &before);
@@ -2595,18 +2784,27 @@ mod tests {
             assert_eq!(waits(), 2);
             assert!(state.own_channels.first_fetch_done(&lab, at));
         }
-        // Unmapping the name meets the check that is there: it is
-        // refused while a version of it has been sent to no relay.
-        let refusal = let_go_of_a_carried_name(&state, &db, "lab").unwrap_err();
-        let ApiError::Conflict(why) = &refusal else {
+        // Unmapping the name meets the check before a let-go: it is
+        // refused while no relay held what was brought in, when the
+        // relays were read (decision 2026-10-17 §4.2).
+        let (read, found) = read_of(&state, &db, "lab", &[("relay-one", &[])]);
+        assert_eq!((found.asked, found.not_held.len()), (2, 2));
+        let refusal = let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found)));
+        let Err(ApiError::Conflict(why)) = &refusal else {
             panic!("{refusal:?}");
         };
-        assert_eq!(*why, not_let_go_says("lab", 2));
+        assert!(
+            why.starts_with(
+                "lab is not let go: no relay that this device is set up with held 2 of its \
+                 versions when it was read just now."
+            ),
+            "{why}"
+        );
         assert_eq!(of_lab(), carried_in);
 
-        // A relay is sent what was brought in: nothing of the name
-        // waits. The folder's unmapping leaves the name held all the
-        // same, and the unmapping of the name lets it go.
+        // A relay holds what was brought in, and the notes say so: the
+        // folder's unmapping leaves the name held all the same, and the
+        // unmapping of the name lets it go, once a read finds it there.
         let last = kept_rows::last_taken(&db, &lab).unwrap();
         kept_rows::sent(&db, &[0xa1; 32], &lab, last).unwrap();
         assert_eq!(waits(), 0);
@@ -2614,10 +2812,14 @@ mod tests {
         assert_eq!(unmaps("/home/sam/notes").as_deref(), Some("lab"));
         assert_eq!(as_before_the_folder(), before_the_folder);
         assert_eq!(of_lab(), carried_in);
-        assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+        let at_the_relay = stored_of(&db, &lab);
+        let (read, found) = read_of(&state, &db, "lab", &[("relay-one", &at_the_relay)]);
+        assert!(found.each_held());
+        assert!(let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found))).unwrap());
         assert!(held().is_empty() && said().is_empty() && by_a_carry().is_empty());
         assert!(of_lab().is_empty());
         assert!(!state.own_channels.first_fetch_done(&lab, at));
+        assert!(!state.own_channels.reads().stands(&read));
 
         // A name that no carry holds is let go with its folder.
         maps("/home/sam/work", "team");
@@ -2684,78 +2886,897 @@ mod tests {
         // A name that a folder is mapped to, and one that is not held:
         // neither is let go of, and nothing changes.
         for not_so in ["team", "never"] {
-            assert!(!let_go_of_a_carried_name(&state, &db, not_so).unwrap());
+            assert!(!let_go_of_a_carried_name(&state, &db, not_so, None).unwrap());
         }
         assert_eq!(held(&db), ["lab", "team"]);
         assert_eq!(of_lab(&db), 1);
 
-        // The name that the carry holds, while what was brought in has
-        // been sent to no relay: it is not let go, the refusal says how
-        // much waits, and nothing changes.
-        let refusal = let_go_of_a_carried_name(&state, &db, "lab").unwrap_err();
-        let ApiError::Conflict(why) = &refusal else {
+        // The name that the carry holds, while no relay held what was
+        // brought in when it was read: it is not let go, the refusal says
+        // how many versions and what each relay did, and nothing changes.
+        // A relay had no room for it two minutes ago, by what the node
+        // last said, and the other was not reached.
+        let relay = [0xa1; 32];
+        let last = cordelia_storage::at_relays::last_taken(&db, &lab).unwrap();
+        cordelia_storage::at_relays::sent(&db, &relay, &lab, last).unwrap();
+        cordelia_storage::at_relays::refused(&db, &relay, &lab, last).unwrap();
+        let wall = chrono::Utc::now().timestamp();
+        state.own_channels.say(crate::state::AtRelays {
+            relays: vec![crate::state::AtRelay {
+                relay: "relay-one".into(),
+                holds_latest: Some(true),
+                heard_since_woke: true,
+                no_room: Some(crate::state::NoRoom {
+                    at: wall - 150,
+                    over_allowance: false,
+                    of_the_change: false,
+                }),
+                another_form: 0,
+                refuses: None,
+            }],
+            cannot_go_on: None,
+        });
+        let (read, found) = read_at(
+            &state,
+            &db,
+            "lab",
+            &[
+                ("relay-one", Some(relay), Some(&[])),
+                ("relay-two", None, None),
+            ],
+        );
+        let refusal = let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found)));
+        let Err(ApiError::Conflict(why)) = &refusal else {
             panic!("{refusal:?}");
         };
-        assert_eq!(*why, not_let_go_says("lab", 1));
         assert_eq!(
             *why,
-            "lab is not let go: 1 version of it waits to be sent, and this device has sent it \
-             to no relay yet. The name can be let go once it is sent: `cordelia devices` shows \
-             what this device has still to send."
-        );
-        assert!(
-            not_let_go_says("lab", 3).starts_with(
-                "lab is not let go: 3 versions of it wait to be sent, and this device has sent \
-                 them to no relay yet. The name can be let go once they are sent:"
-            ),
-            "{}",
-            not_let_go_says("lab", 3)
+            "lab is not let go: no relay that this device is set up with held 1 of its versions \
+             when it was read just now.\n  relay-one: read to its end. It had no room for it, \
+             the last time 2 minutes ago.\n  relay-two: not reached.\nThis device goes on \
+             sending it, and lab can be let go once a relay holds it. To let it go now, with \
+             it, run `cordelia sync unmap lab` at a terminal."
         );
         assert_eq!(held(&db), ["lab", "team"]);
         assert_eq!(said(&db), ["lab", "team"]);
         assert_eq!(by_a_carry(&db), ["lab"]);
         assert_eq!(of_lab(&db), 1);
         assert!(state.own_channels.first_fetch_done(&lab, at));
-        // A relay had no room for it: it waits still.
-        let relay = [0xa1; 32];
-        let last = cordelia_storage::at_relays::last_taken(&db, &lab).unwrap();
-        cordelia_storage::at_relays::sent(&db, &relay, &lab, last).unwrap();
-        cordelia_storage::at_relays::refused(&db, &relay, &lab, last).unwrap();
-        assert!(let_go_of_a_carried_name(&state, &db, "lab").is_err());
-        assert_eq!(of_lab(&db), 1);
-        // A device that has stopped sends nothing: nothing waits to be
-        // sent there, and what it holds of a name is its person's to
-        // let go.
+        // The read stands still: what was refused is not let go of it.
+        assert!(state.own_channels.reads().stands(&read));
+
+        // Of three versions, where a relay had no room for two of them:
+        // so many are said, and of the relay.
         assert_eq!(
-            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
-            1
+            crate::let_go::not_held_says(
+                "lab",
+                3,
+                &["  relay-one: read in part. It had no room for 2 of them.".into()]
+            ),
+            "lab is not let go: no relay that this device is set up with held 3 of its versions \
+             when it was read just now.\n  relay-one: read in part. It had no room for 2 of \
+             them.\nThis device goes on sending them, and lab can be let go once a relay holds \
+             them. To let it go now, with them, run `cordelia sync unmap lab` at a terminal."
         );
-        held_rows::set_state(&db, held_rows::State::NotListed).unwrap();
-        assert_eq!(
-            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
-            0
-        );
-        held_rows::set_state(&db, held_rows::State::Applied).unwrap();
+
         // The relay holds it: the name is let go.
-        cordelia_storage::at_relays::not_refused(&db, &relay, &lab, last).unwrap();
-        assert_eq!(
-            crate::names::waits_to_be_sent(&db, &state.identity, "lab").unwrap(),
-            0
-        );
+        let at_the_relay = stored_of(&db, &lab);
+        let (read, found) = read_of(&state, &db, "lab", &[("relay-one", &at_the_relay)]);
         assert!(listed_alone(&state, &db));
-        assert!(let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+        assert!(let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found))).unwrap());
         assert_eq!(held(&db), ["team"]);
         assert_eq!(said(&db), ["team"]);
         assert!(by_a_carry(&db).is_empty());
         assert_eq!(of_lab(&db), 0);
         assert!(!state.own_channels.first_fetch_done(&lab, at));
         // Once.
-        assert!(!let_go_of_a_carried_name(&state, &db, "lab").unwrap());
+        assert!(!let_go_of_a_carried_name(&state, &db, "lab", None).unwrap());
 
         // A statement that lists another device does not list this one
         // alone: here, the device that added this one.
         let mut two = Several::of_one_person(2);
         let added = state_of(two.machines.remove(1));
         assert!(!listed_alone(&added, &added.db.lock().unwrap()));
+    }
+
+    // ── The read before a carried name is let go (decision 2026-10-17) ──
+
+    /// The relay keys of the tests below.
+    const ONE: [u8; 32] = [0xa1; 32];
+    const TWO: [u8; 32] = [0xa2; 32];
+
+    /// Device 0 of two, as a node, holding `lab` by a carry with no folder
+    /// mapped to it, with a file of its own there: the entry that a read
+    /// asks about. Returns the node, that entry, and the secret of the
+    /// name's channel. The relays of a read are set by each test.
+    fn holds_lab_by_a_carry() -> (
+        crate::several::Node,
+        cordelia_crypto::entry::CheckedEntry,
+        [u8; 32],
+    ) {
+        let mut s = crate::several::Several::of_one_person(2);
+        let now = s.tick();
+        crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "lab", now).unwrap();
+        let mine = s.write(0, "lab", "a.md", "brought in by a carry");
+        let secret = s[0].own("lab");
+        let node = crate::several::Node::of(s.machines.remove(0));
+        node.state.own_channels.set_up_with(1);
+        (node, mine, secret)
+    }
+
+    /// A relay of a read that holds `entries` of the channel whose secret
+    /// is `secret`.
+    fn holding(
+        name: &str,
+        key: [u8; 32],
+        secret: &[u8; 32],
+        entries: &[cordelia_crypto::entry::CheckedEntry],
+    ) -> crate::several::OwnRelay {
+        let mut relay = crate::several::OwnRelay::new(name, key);
+        let channel = cordelia_crypto::derive::channel_id(secret).unwrap();
+        relay.holds.insert(channel, entries.to_vec());
+        relay
+    }
+
+    /// `cordelia sync unmap <name>`, as the command asks it of the node:
+    /// round after round, while the read goes on. Answers with the name
+    /// that was let go and how many versions the read asked about, or the
+    /// refusal.
+    async fn lets_go(
+        node: &crate::several::Node,
+        name: &str,
+    ) -> Result<(Option<String>, Option<usize>), ApiError> {
+        let mut read = None;
+        loop {
+            let body = SyncUnmapRequest {
+                folder: name.to_string(),
+                read: read.take(),
+            };
+            let answer = unmapped(&node.state, &body).await?;
+            match &answer.reading {
+                Some(reading) => read = Some(reading["read"].as_str().unwrap().to_string()),
+                None => return Ok((answer.let_go, answer.let_go_versions)),
+            }
+        }
+    }
+
+    /// Whether the node still holds `name`.
+    fn still_holds(node: &crate::several::Node, name: &str) -> bool {
+        let db = node.state.db.lock().unwrap();
+        cordelia_storage::person::channel_of_name(&db, name)
+            .unwrap()
+            .is_some()
+    }
+
+    /// **A version is held only where a relay that the device is set up
+    /// with handed it, in a read that began after the person asked**
+    /// (decision 2026-10-17 §4.2, §1 property 6). Each of these leaves the
+    /// name held: a relay that the device is no longer set up with; one
+    /// that refused the entry as not checking; one that holds another
+    /// entry of the device's at that revision with another text; one that
+    /// dropped the channel after the push; one that had no room; one read
+    /// in part; the same version signed by a key that holds the secret and
+    /// does not count. In each but the one with no room, the device's
+    /// notes say that a relay was sent it. Each of these lets it go: the
+    /// entry itself; the same version signed by another key that counts;
+    /// an entry at a higher revision by a key that counts.
+    #[actix_web::test]
+    async fn test_a_version_is_held_only_where_a_relay_read_after_the_ask_handed_it() {
+        use crate::several::{OwnRelay, entry_by, identity_of, text};
+        use cordelia_storage::at_relays as kept_rows;
+        let said = text("brought in by a carry");
+        // What device 1, which counts, wrote in another slot: a relay
+        // that holds the channel without the entry holds it.
+        fn beside(secret: &[u8; 32]) -> cordelia_crypto::entry::CheckedEntry {
+            crate::several::entry_by(&identity_of(1), secret, 1, "b.md", text("b"), &[])
+        }
+        type Case = Box<dyn Fn(&cordelia_crypto::entry::CheckedEntry, &[u8; 32]) -> Vec<OwnRelay>>;
+        let held_by_none: Vec<(&str, [u8; 32], Case)> = vec![
+            (
+                "sent to a relay that it is no longer set up with",
+                [0xa9; 32],
+                Box::new(|_, secret| vec![holding("relay-one", ONE, secret, &[beside(secret)])]),
+            ),
+            (
+                "refused as not checking",
+                ONE,
+                Box::new(|_, secret| vec![holding("relay-one", ONE, secret, &[beside(secret)])]),
+            ),
+            (
+                "another entry of the device's at that revision",
+                ONE,
+                Box::new(|mine, secret| {
+                    let other = text("another text at the same revision");
+                    let another = entry_by(&identity_of(0), secret, mine.rev, "a.md", other, &[]);
+                    vec![holding("relay-one", ONE, secret, &[another])]
+                }),
+            ),
+            (
+                "dropped the channel after the push",
+                ONE,
+                Box::new(|_, _| vec![OwnRelay::new("relay-one", ONE)]),
+            ),
+            (
+                "read in part",
+                ONE,
+                Box::new(|mine, secret| {
+                    let mut relay =
+                        holding("relay-one", ONE, secret, &[beside(secret), mine.clone()]);
+                    relay.per_round = 1;
+                    relay.rounds_reached = Some(std::sync::Arc::new(1.into()));
+                    vec![relay]
+                }),
+            ),
+            (
+                "the same version by a key that does not count",
+                ONE,
+                Box::new(|mine, secret| {
+                    let said = text("brought in by a carry");
+                    let not_counted =
+                        entry_by(&identity_of(9), secret, mine.rev, "a.md", said, &[]);
+                    vec![holding("relay-one", ONE, secret, &[not_counted])]
+                }),
+            ),
+        ];
+        for (case, sent_to, relays) in &held_by_none {
+            let (node, mine, secret) = holds_lab_by_a_carry();
+            {
+                let db = node.state.db.lock().unwrap();
+                let lab = cordelia_storage::person::channel_of_name(&db, "lab")
+                    .unwrap()
+                    .unwrap();
+                let last = kept_rows::last_taken(&db, &lab).unwrap();
+                kept_rows::sent(&db, sent_to, &lab, last).unwrap();
+                // By the notes, nothing waits to be sent.
+                assert_eq!(
+                    crate::names::waits_to_be_sent(&db, &node.state.identity, "lab").unwrap(),
+                    0,
+                    "{case}"
+                );
+            }
+            node.own_relays_are(relays(&mine, &secret));
+            let refused = lets_go(&node, "lab").await;
+            assert!(
+                matches!(&refused, Err(ApiError::Conflict(why)) if why.starts_with(
+                    "lab is not let go: no relay that this device is set up with held 1 of its \
+                     versions"
+                )),
+                "{case}: {refused:?}"
+            );
+            assert!(still_holds(&node, "lab"), "{case}");
+        }
+        // A relay that had no room for it.
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        {
+            let db = node.state.db.lock().unwrap();
+            let lab = cordelia_storage::person::channel_of_name(&db, "lab")
+                .unwrap()
+                .unwrap();
+            let last = kept_rows::last_taken(&db, &lab).unwrap();
+            kept_rows::sent(&db, &ONE, &lab, last).unwrap();
+            kept_rows::refused(&db, &ONE, &lab, last).unwrap();
+        }
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[beside(&secret)])]);
+        let refused = lets_go(&node, "lab").await;
+        assert!(
+            matches!(&refused, Err(ApiError::Conflict(why)) if why.contains(
+                "  relay-one: read to its end. It had no room for it."
+            )),
+            "{refused:?}"
+        );
+        assert!(still_holds(&node, "lab"));
+        let _ = mine;
+
+        // Held, and let go: the entry itself, at one relay of two; the same
+        // version by another key that counts; an entry above it by a key
+        // that counts.
+        let lets_it_go: Vec<(&str, Case)> = vec![
+            (
+                "the entry itself, at one relay",
+                Box::new(|mine, secret| {
+                    let mut away = OwnRelay::new("relay-two", TWO);
+                    away.reached = false;
+                    vec![
+                        holding("relay-one", ONE, secret, std::slice::from_ref(mine)),
+                        away,
+                    ]
+                }),
+            ),
+            (
+                "the same version by another key that counts",
+                Box::new(|mine, secret| {
+                    let said = text("brought in by a carry");
+                    let same = entry_by(&identity_of(1), secret, mine.rev, "a.md", said, &[]);
+                    vec![holding("relay-one", ONE, secret, &[same])]
+                }),
+            ),
+            (
+                "a version above it by a key that counts",
+                Box::new(|mine, secret| {
+                    let later = text("a later text");
+                    let above = entry_by(&identity_of(1), secret, mine.rev + 1, "a.md", later, &[]);
+                    vec![holding("relay-one", ONE, secret, &[above])]
+                }),
+            ),
+        ];
+        for (case, relays) in &lets_it_go {
+            let (node, mine, secret) = holds_lab_by_a_carry();
+            node.own_relays_are(relays(&mine, &secret));
+            let done = lets_go(&node, "lab").await;
+            assert!(
+                matches!(&done, Ok((Some(name), Some(1))) if name == "lab"),
+                "{case}: {done:?}"
+            );
+            assert!(!still_holds(&node, "lab"), "{case}");
+        }
+        let _ = said;
+    }
+
+    /// **An entry of this device's that lost a tie is held only where it
+    /// was handed** (decision 2026-10-17 §4.2 items 4 and 5): the winner
+    /// of the tie, handed alone, does not hold it, and the name stays
+    /// held. Handed with the winner, it is held.
+    #[actix_web::test]
+    async fn test_an_entry_that_lost_a_tie_is_held_only_where_it_was_handed() {
+        use crate::publish::value_hash;
+        use crate::several::{Node, Several, text};
+        // Two texts written apart at one revision: this device's is the
+        // one with the lower hash, which loses.
+        let (mine_said, theirs_said) = (0..)
+            .map(|n| (format!("mine {n}"), "theirs".to_string()))
+            .find(|(mine, theirs)| value_hash(&text(mine)) < value_hash(&text(theirs)))
+            .unwrap();
+        let fixture = || {
+            let mut s = Several::of_one_person(2);
+            let now = s.tick();
+            crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "lab", now).unwrap();
+            s.hold(&[1], "lab");
+            let mine = s.write(0, "lab", "a.md", &mine_said);
+            let theirs = s.write(1, "lab", "a.md", &theirs_said);
+            assert_eq!(mine.rev, theirs.rev);
+            s.pass(1, 0);
+            let current = s[0].slot("lab", "a.md").current.unwrap();
+            assert_eq!(current.entries[0].author, s.key(1));
+            let secret = s[0].own("lab");
+            let node = Node::of(s.machines.remove(0));
+            node.state.own_channels.set_up_with(1);
+            (node, mine, theirs, secret)
+        };
+        let (node, _, theirs, secret) = fixture();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[theirs])]);
+        let refused = lets_go(&node, "lab").await;
+        assert!(matches!(refused, Err(ApiError::Conflict(_))), "{refused:?}");
+        assert!(still_holds(&node, "lab"));
+
+        let (node, mine, theirs, secret) = fixture();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[theirs, mine])]);
+        let done = lets_go(&node, "lab").await;
+        assert!(matches!(&done, Ok((Some(_), Some(1)))), "{done:?}");
+        assert!(!still_holds(&node, "lab"));
+    }
+
+    /// **An entry that is no version moves nothing on** (decision
+    /// 2026-10-17 §4.2 item 5): a relay hands, above the device's entry,
+    /// an entry by a key that counts in a band above the statement, and
+    /// one that does not open. Neither holds it, and the name stays held.
+    #[actix_web::test]
+    async fn test_an_entry_that_is_no_version_moves_nothing_on() {
+        use crate::several::{entry_by, identity_of, signed_in, text};
+        use cordelia_core::protocol::REV_COUNT_BITS;
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        let band_above = (2u64 << REV_COUNT_BITS) + 1;
+        let above_the_statement = entry_by(
+            &identity_of(1),
+            &secret,
+            band_above,
+            "a.md",
+            text("above"),
+            &[],
+        );
+        let does_not_open = signed_in(
+            &secret,
+            &identity_of(1),
+            mine.slot,
+            mine.rev + 1,
+            vec![7; 256],
+        );
+        assert_eq!(above_the_statement.slot, mine.slot);
+        for handed in [vec![above_the_statement], vec![does_not_open]] {
+            node.own_relays_are(vec![holding("relay-one", ONE, &secret, &handed)]);
+            let refused = lets_go(&node, "lab").await;
+            assert!(matches!(refused, Err(ApiError::Conflict(_))), "{refused:?}");
+            assert!(still_holds(&node, "lab"));
+        }
+        // Handed beside them, the entry itself is held.
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[mine])]);
+        assert!(lets_go(&node, "lab").await.is_ok());
+    }
+
+    /// **The read before a let-go keeps its own places** (decision
+    /// 2026-10-17 §4.2 item 2): after it, the place that the device keeps
+    /// at each relay, and how far it has sent each relay the channel, are
+    /// as they were, though the read took a page there, and what another
+    /// device wrote came in through the door.
+    #[actix_web::test]
+    async fn test_the_read_before_a_let_go_keeps_its_own_places() {
+        use crate::several::{entry_by, identity_of, text};
+        use cordelia_storage::at_relays as kept_rows;
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        let theirs = entry_by(&identity_of(1), &secret, 1, "b.md", text("b"), &[]);
+        let lab = cordelia_crypto::derive::channel_id(&secret).unwrap();
+        let kept_at = |key: &[u8; 32]| {
+            let db = node.state.db.lock().unwrap();
+            kept_rows::kept(&db, key, &lab).unwrap()
+        };
+        {
+            let db = node.state.db.lock().unwrap();
+            kept_rows::keep_place(&db, &ONE, &lab, &[3; 8], 1).unwrap();
+            kept_rows::sent(&db, &ONE, &lab, 1).unwrap();
+        }
+        let before = (kept_at(&ONE), kept_at(&TWO));
+        // Each relay hands what another device wrote, and neither holds
+        // the version: the name stays held, with what the read took.
+        node.own_relays_are(vec![
+            holding("relay-one", ONE, &secret, std::slice::from_ref(&theirs)),
+            holding("relay-two", TWO, &secret, std::slice::from_ref(&theirs)),
+        ]);
+        assert!(lets_go(&node, "lab").await.is_err());
+        let took = {
+            let db = node.state.db.lock().unwrap();
+            cordelia_storage::at_relays::holds_by(&db, &lab, &identity_of(1).public_key()).unwrap()
+        };
+        assert!(took);
+        assert_eq!((kept_at(&ONE), kept_at(&TWO)), before);
+        let _ = mine;
+        assert_eq!(before.0.place, Some(([3; 8], 1)));
+        assert_eq!(before.1, kept_rows::KeptThere::default());
+    }
+
+    /// **A let-go reads on until each version is found** (decision
+    /// 2026-10-17 §4.2 item 1): a relay that hands a third of the channel
+    /// at each round hands the device's entry in the third, and the name
+    /// is let go then, with no fourth round. Each round but the last is
+    /// answered with what each relay has handed so far.
+    #[actix_web::test]
+    async fn test_a_let_go_reads_on_until_each_version_is_found() {
+        use crate::several::{entry_by, identity_of, text};
+        use std::sync::atomic::Ordering::SeqCst;
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        let mut channel: Vec<_> = (0..8)
+            .map(|n| {
+                let file = format!("{n}.md");
+                entry_by(&identity_of(1), &secret, 1, &file, text("by device 1"), &[])
+            })
+            .collect();
+        channel.push(mine);
+        let mut relay = holding("relay-one", ONE, &secret, &channel);
+        relay.per_round = 3;
+        // The second holds none of it: it is not read on, nor said.
+        node.own_relays_are(vec![relay, crate::several::OwnRelay::new("relay-two", TWO)]);
+        // The first round, as the command sees it.
+        let body = SyncUnmapRequest {
+            folder: "lab".into(),
+            read: None,
+        };
+        let first = unmapped(&node.state, &body).await.unwrap();
+        let reading = first.reading.unwrap();
+        assert_eq!(reading["relays"][0]["relay"], "relay-one");
+        assert_eq!(reading["relays"].as_array().unwrap().len(), 1);
+        assert!(reading["relays"][0]["bytes"].as_u64().unwrap() > 3 * 1024);
+        assert_eq!(first.let_go, None);
+        let done = lets_go_on(&node, reading["read"].as_str().unwrap()).await;
+        assert!(matches!(&done, Ok((Some(_), Some(1)))), "{done:?}");
+        assert_eq!(node.own_rounds.load(SeqCst), 3);
+        assert!(!still_holds(&node, "lab"));
+    }
+
+    /// [`lets_go`], from the read named `read`.
+    async fn lets_go_on(
+        node: &crate::several::Node,
+        read: &str,
+    ) -> Result<(Option<String>, Option<usize>), ApiError> {
+        let mut read = Some(read.to_string());
+        loop {
+            let body = SyncUnmapRequest {
+                folder: "lab".into(),
+                read: read.take(),
+            };
+            let answer = unmapped(&node.state, &body).await?;
+            match &answer.reading {
+                Some(reading) => read = Some(reading["read"].as_str().unwrap().to_string()),
+                None => return Ok((answer.let_go, answer.let_go_versions)),
+            }
+        }
+    }
+
+    /// **A let-go lets go only of what was read** (decision 2026-10-17
+    /// §4.2 item 8, §1 property 9): a read is made, and then the store
+    /// takes an entry of the name: the let-go is refused, and says to run
+    /// the command again. An ID that the node does not know is refused, and
+    /// so is the ID of a read of another channel.
+    #[actix_web::test]
+    async fn test_a_let_go_lets_go_only_of_what_was_read() {
+        use crate::several::{entry_by, identity_of, text};
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        let state = &node.state;
+        {
+            let db = state.db.lock().unwrap();
+            let (read, found) = read_of(state, &db, "lab", &[("relay-one", &[mine])]);
+            assert!(found.each_held());
+            let theirs = entry_by(&identity_of(1), &secret, 1, "b.md", text("b"), &[]);
+            crate::take::take(&db, &state.identity, &theirs, 1).unwrap();
+            let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
+            let Err(ApiError::Conflict(why)) = &refused else {
+                panic!("{refused:?}");
+            };
+            assert_eq!(
+                *why,
+                "lab is not let go: this device took something of it while it was read. Run \
+                 `cordelia sync unmap lab` again."
+            );
+            assert!(
+                cordelia_storage::person::channel_of_name(&db, "lab")
+                    .unwrap()
+                    .is_some()
+            );
+            // A read that the node keeps no more: it was started again.
+            state.own_channels.reads().forget(&read);
+            let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
+            assert!(
+                matches!(&refused, Err(ApiError::Conflict(why)) if *why == crate::let_go::started_again_says("lab")),
+                "{refused:?}"
+            );
+        }
+        for unknown in [hex::encode([9u8; 16])] {
+            let body = SyncUnmapRequest {
+                folder: "lab".into(),
+                read: Some(unknown),
+            };
+            let refused = unmapped(state, &body).await;
+            assert!(
+                matches!(&refused, Err(ApiError::Conflict(why)) if *why
+                    == "lab is still held: the node was started again since lab was read. Run \
+                        `cordelia sync unmap lab` again."),
+                "{:?}",
+                refused.err()
+            );
+        }
+        // A read of another channel is not this name's.
+        let other = {
+            let db = state.db.lock().unwrap();
+            let under = crate::at_relays::kept_id(&db).unwrap().unwrap();
+            let now = std::time::Instant::now();
+            state
+                .own_channels
+                .reads()
+                .begin(&[4; 32], &under, &[], now)
+                .unwrap()
+        };
+        let body = SyncUnmapRequest {
+            folder: "lab".into(),
+            read: Some(hex::encode(other)),
+        };
+        assert!(matches!(
+            unmapped(state, &body).await,
+            Err(ApiError::Conflict(why)) if why == crate::let_go::started_again_says("lab")
+        ));
+
+        // A read that the node forgets while its round is asked for: the
+        // node no longer keeps it when the round would read.
+        let mut relay = holding("relay-one", ONE, &secret, &[]);
+        relay.per_round = 1;
+        relay.holds.values_mut().for_each(|held| {
+            held.push(entry_by(
+                &identity_of(1),
+                &secret,
+                1,
+                "c.md",
+                text("c"),
+                &[],
+            ));
+            held.push(entry_by(
+                &identity_of(1),
+                &secret,
+                1,
+                "d.md",
+                text("d"),
+                &[],
+            ));
+        });
+        node.own_relays_are(vec![relay]);
+        let first = unmapped(
+            state,
+            &SyncUnmapRequest {
+                folder: "lab".into(),
+                read: None,
+            },
+        )
+        .await
+        .unwrap();
+        let read = first.reading.unwrap()["read"].as_str().unwrap().to_string();
+        let held_round = node.own_round_waits.lock().await;
+        let next = SyncUnmapRequest {
+            folder: "lab".into(),
+            read: Some(read.clone()),
+        };
+        let (asked, ()) = tokio::join!(unmapped(state, &next), async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let id: crate::own_read::ReadId = hex::decode(&read).unwrap().try_into().unwrap();
+            state.own_channels.reads().forget(&id);
+            drop(held_round);
+        });
+        assert!(matches!(
+            asked,
+            Err(ApiError::Conflict(why)) if why == crate::let_go::started_again_says("lab")
+        ));
+
+        // A name that the device does not hold by a carry is no name to
+        // let go.
+        let never = SyncUnmapRequest {
+            folder: "never".into(),
+            read: None,
+        };
+        assert!(matches!(
+            unmapped(state, &never).await,
+            Err(ApiError::BadRequest(_))
+        ));
+
+        // The name's channel is another since the read: it is not let go.
+        let db = state.db.lock().unwrap();
+        let (read, found) = read_of(state, &db, "lab", &[]);
+        assert_eq!(found.asked, 1);
+        db.execute(
+            "UPDATE person_names SET channel = ?1 WHERE name = 'lab'",
+            [[8u8; 32].as_slice()],
+        )
+        .unwrap();
+        let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
+        assert!(
+            matches!(&refused, Err(ApiError::Conflict(why)) if *why == crate::let_go::took_something_says("lab")),
+            "{refused:?}"
+        );
+        drop(db);
+        assert!(still_holds(&node, "lab"));
+    }
+
+    /// **The read before a let-go does not hold the database's lock**
+    /// (decision 2026-10-17 §4.2 item 3): while its round runs, another
+    /// request is answered.
+    #[actix_web::test]
+    async fn test_the_read_before_a_let_go_does_not_hold_the_lock() {
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[mine])]);
+        let node = std::sync::Arc::new(node);
+        let round = node.own_round_waits.clone().lock_owned().await;
+        let asked = {
+            let node = std::sync::Arc::clone(&node);
+            tokio::spawn(async move { lets_go(&node, "lab").await.map_err(|e| e.to_string()) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!asked.is_finished());
+        assert!(node.state.db.try_lock().is_ok());
+        assert!(status(&node.state).is_ok());
+        drop(round);
+        let done = asked.await.unwrap();
+        assert!(matches!(&done, Ok((Some(_), _))), "{done:?}");
+    }
+
+    /// **A folder's unmapping does not let go of a name that a carry
+    /// brought versions into while the folder was mapped** (decision
+    /// 2026-10-17 §4.3, §1 property 7): `cordelia sync carry` brings a
+    /// version in through the carry by command, and the folder is
+    /// unmapped. The name is held, and is a carried name: what a carry
+    /// holds with no folder. It stays among those brought in, until the
+    /// device stops it.
+    #[actix_web::test]
+    async fn test_a_name_a_carry_brought_versions_into_under_a_folder_is_held_after_the_folders_unmapping()
+     {
+        let node = left_a_version_of_lab();
+        let home = std::path::Path::new("/home/sam");
+        maps_lab(&node, home);
+        let done = crate::carrying::carry_name(&node.state, "lab", false)
+            .await
+            .unwrap();
+        assert_eq!(done.tally.carried, 1);
+        let db = node.state.db.lock().unwrap();
+        let lab = BTreeSetOf::from(["lab".to_string()]);
+        assert_eq!(crate::names::brought_in(&db).unwrap(), lab);
+        assert!(crate::names::carried(&db).unwrap().is_empty());
+        // Sync is turned off: the word of the folder's name is taken back.
+        let said = || crate::names::said_here(&db, &node.state.identity).unwrap();
+        let off: SyncClaudeRequest =
+            serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap();
+        let before = mapped_names(&db).unwrap();
+        set_claude(&node.state.sync_control, &db, &off, Some(home)).unwrap();
+        names_follow(&node.state, &db, &before);
+        assert!(!said().contains("lab"));
+        let before = mapped_names(&db).unwrap();
+        assert_eq!(before, ["lab"]);
+        let body = SyncUnmapRequest {
+            folder: "/home/sam/notes".into(),
+            read: None,
+        };
+        remove_mapping(&node.state.sync_control, &db, &body).unwrap();
+        names_follow(&node.state, &db, &before);
+        assert_eq!(still_held_by_a_carry(&db, &before).as_deref(), Some("lab"));
+        assert!(
+            cordelia_storage::person::channel_of_name(&db, "lab")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(crate::names::carried(&db).unwrap(), lab);
+        assert_eq!(crate::names::brought_in(&db).unwrap(), lab);
+        // It is said again, with sync off, as a name that a carry holds.
+        assert!(said().contains("lab"));
+        // The device stops it: it is among neither list any more.
+        crate::names::stop(&db, &node.state.identity, "lab", 1).unwrap();
+        assert!(crate::names::brought_in(&db).unwrap().is_empty());
+        assert!(crate::names::carried(&db).unwrap().is_empty());
+    }
+
+    type BTreeSetOf = std::collections::BTreeSet<String>;
+
+    /// Device 0 of three, as a node, after device 2 was removed: the relay
+    /// holds, in the generation left, a file of `lab` that device 1 wrote,
+    /// which device 0 never held. Sync is on.
+    fn left_a_version_of_lab() -> crate::several::Node {
+        use crate::several::{Node, Several};
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1], "lab");
+        let old = s[1].own("lab");
+        s.write(1, "lab", "stays.md", "of device 1");
+        let at_the_relay = s[1].stored_in(&old);
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &at_the_relay);
+        let db = node.state.db.lock().unwrap();
+        let on: SyncClaudeRequest =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+        set_claude(
+            &node.state.sync_control,
+            &db,
+            &on,
+            Some(std::path::Path::new("/home/sam")),
+        )
+        .unwrap();
+        drop(db);
+        node
+    }
+
+    /// A folder is mapped to `lab`, as `cordelia sync map` stores it.
+    fn maps_lab(node: &crate::several::Node, home: &std::path::Path) {
+        let db = node.state.db.lock().unwrap();
+        let before = mapped_names(&db).unwrap();
+        add_mapping(
+            &node.state.sync_control,
+            &db,
+            &request("/home/sam/notes", "lab", false),
+            home,
+        )
+        .unwrap();
+        names_follow(&node.state, &db, &before);
+    }
+
+    /// **Only a version brought in marks a name** (decision 2026-10-17
+    /// §4.3): the carry that `cordelia sync map` makes brings a version
+    /// into the folder's own name, and sets no mark; a carry by command
+    /// that brings nothing, since the name holds it already, sets none.
+    /// The folder's unmapping then stops the name, as any folder's.
+    #[actix_web::test]
+    async fn test_only_a_version_brought_in_marks_a_name() {
+        let node = left_a_version_of_lab();
+        maps_lab(&node, std::path::Path::new("/home/sam"));
+        let mapped = crate::carrying::carry_name(&node.state, "lab", true)
+            .await
+            .unwrap();
+        assert_eq!(mapped.tally.carried, 1);
+        let again = crate::carrying::carry_name(&node.state, "lab", false)
+            .await
+            .unwrap();
+        assert_eq!((again.tally.carried, again.tally.held), (0, 1));
+        let db = node.state.db.lock().unwrap();
+        assert!(crate::names::brought_in(&db).unwrap().is_empty());
+        let before = mapped_names(&db).unwrap();
+        let body = SyncUnmapRequest {
+            folder: "lab".into(),
+            read: None,
+        };
+        remove_mapping(&node.state.sync_control, &db, &body).unwrap();
+        names_follow(&node.state, &db, &before);
+        assert_eq!(still_held_by_a_carry(&db, &before), None);
+        assert!(
+            cordelia_storage::person::channel_of_name(&db, "lab")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A device that has stopped reads no relay before it lets a carried
+    /// name go (decision 2026-10-17 §4.4 says what it asks first): the
+    /// name is let go at once, and the answer says nothing of a read.
+    #[actix_web::test]
+    async fn test_a_device_that_has_stopped_reads_no_relay_before_a_let_go() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[mine])]);
+        {
+            let db = node.state.db.lock().unwrap();
+            cordelia_storage::person::set_state(&db, cordelia_storage::person::State::NotListed)
+                .unwrap();
+        }
+        let done = lets_go(&node, "lab").await;
+        assert!(
+            matches!(&done, Ok((Some(name), None)) if name == "lab"),
+            "{done:?}"
+        );
+        assert_eq!(node.own_rounds.load(SeqCst), 0);
+        assert!(!still_holds(&node, "lab"));
+        // A name that it does not hold by a carry is no name to let go.
+        let never = SyncUnmapRequest {
+            folder: "never".into(),
+            read: None,
+        };
+        let refused = unmapped(&node.state, &never).await;
+        assert!(matches!(refused, Err(ApiError::BadRequest(_))));
+    }
+
+    /// What is said of each relay where a carried name is not let go
+    /// (decision 2026-10-17 §4.6): how its read ended.
+    #[actix_web::test]
+    async fn test_what_is_said_of_each_relay_where_a_name_is_not_let_go() {
+        use crate::own_read::Handed;
+        use crate::several::{RELAY_MARK, entry_by, identity_of, text};
+        use cordelia_storage::relay::NO_MARK;
+        let (node, _, secret) = holds_lab_by_a_carry();
+        let state = &node.state;
+        let db = state.db.lock().unwrap();
+        let beside = [entry_by(
+            &identity_of(1),
+            &secret,
+            1,
+            "b.md",
+            text("b"),
+            &[],
+        )];
+        let lab = cordelia_storage::person::channel_of_name(&db, "lab")
+            .unwrap()
+            .unwrap();
+        let under = crate::at_relays::kept_id(&db).unwrap().unwrap();
+        let names: Vec<String> = ["one", "two", "three", "four", "five"]
+            .iter()
+            .map(|n| format!("relay-{n}"))
+            .collect();
+        let reads = state.own_channels.reads();
+        let now = std::time::Instant::now();
+        let read = reads.begin(&lab, &under, &names, now).unwrap();
+        let (_, _, mut at) = reads.to_read(&read, now).unwrap();
+        let page = |entries, mark, next| Handed::Page {
+            entries,
+            counted: 0,
+            mark,
+            next,
+        };
+        // To its end; none of it; part and then none; not reached; and
+        // still reading at the bound.
+        at[0].handed(page(&[], RELAY_MARK, 0));
+        at[1].handed(page(&[], NO_MARK, 0));
+        at[2].handed(page(&beside, RELAY_MARK, 1));
+        at[2].handed(page(&[], NO_MARK, 0));
+        at[3].not_reached();
+        at[4].handed(page(&beside, RELAY_MARK, 1));
+        reads.read(&read, at, now);
+        let kept = reads.get(&read, now).unwrap();
+        let found = crate::let_go::found(&db, &state.identity, "lab", &kept).unwrap();
+        let said = crate::let_go::relays_say(&db, &kept, &found, &Default::default(), 0).unwrap();
+        assert_eq!(
+            said,
+            [
+                "  relay-one: read to its end.",
+                "  relay-two: holds none of it.",
+                "  relay-three: read in part.",
+                "  relay-four: not reached.",
+                "  relay-five: read in part, for 10 minutes.",
+            ]
+        );
     }
 }

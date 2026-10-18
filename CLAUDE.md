@@ -71,7 +71,10 @@ cordelia-node/
                          #   messages channel that the door stores, and the hourly task of
                          #   messages); own_read (a read of a channel of the device's own
                          #   with places of its own, kept in memory under its ID: the read
-                         #   before a carried name is let go); sender (what a device does
+                         #   before a carried name is let go); let_go (what that read
+                         #   finds: the entries this device signed, each held where a
+                         #   relay handed it or moved its slot on, and when it reads on);
+                         #   sender (what a device does
                          #   to send a message: the next number, its checks, sending again
                          #   and clearing); marks (what an agent read: the device's table
                          #   and its list, the other devices' lists, and whether a message
@@ -128,7 +131,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`. `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -233,6 +236,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATEMENTS_LEFT_SAID_BELOW` | 16 | parameter-rationale.md §12.9 |
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
+| `RECOVERY_READ_ON_MAX_SECS`, `RECOVERY_READ_ON_READS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more), 5 (derived: the readings that fit in it) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
 | `LET_GO_READ_STANDS_SECS` | 600s (derived: a read before a let-go stands for its `discard`, on the monotonic clock) | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |

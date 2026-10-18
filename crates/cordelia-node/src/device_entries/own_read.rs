@@ -19,7 +19,15 @@
 //! resets the next pull with ERR_RATE_LIMIT, and the read asks again once
 //! a little time has gone by, as where the device has asked what it asks
 //! in a minute. A minute after the last page it was handed there, the
-//! relay is not reached in that round. **Every other failure ends the
+//! relay is not reached in that round. **And it asks again only while
+//! the relay has refused fewer than BAN_THRESHOLD - 1 requests so within
+//! BAN_WINDOW_SECS** ([`DeviceEntries::asks_again_after_a_refusal`]): a
+//! relay refuses a breach of its rates with the same reset, and cuts off
+//! an address at BAN_THRESHOLD breaches in that window. The count is the
+//! relay's, kept by the device across rounds and reads, and not reset by
+//! a page. It cannot count what the pass is refused, which asks again at
+//! its next pass, nor what other devices behind one address are refused;
+//! and the first request of a read can still be refused once more. **Every other failure ends the
 //! relay's read in that round as not reached:** no answer, a stream that
 //! times out or is reset otherwise, an answer that is not a page, a
 //! connection that was lost. A relay that is down, or broken, does not
@@ -51,7 +59,6 @@ use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{EntryPull, WireMessage};
 use cordelia_storage::relay::Mark;
 
-use super::leave::NOT_NOW;
 use super::{
     At, DeviceEntries, LEFT_ROOM_WAIT, Link, Refused, Relay, Step, counted_as_handed, lock,
 };
@@ -239,7 +246,14 @@ impl DeviceEntries {
             link,
             under: *under,
         };
-        if !matches!(self.prove(&asks, channel, false).await, Step::Done(true)) {
+        at.key = Some(link.relay().0);
+        // The proof too is within the round's time: where the time goes
+        // while the relay is asked, the read stands there as it was.
+        let left = until.saturating_duration_since(self.clock.now());
+        let Ok(proved) = tokio::time::timeout(left, self.prove(&asks, channel, false)).await else {
+            return at;
+        };
+        if !matches!(proved, Step::Done(true)) {
             at.not_reached();
             return at;
         }
@@ -334,10 +348,15 @@ impl DeviceEntries {
                 // Refused for now: the relay counts the answers to shows
                 // in its minute, which the device does not see. Within a
                 // minute of the last page it handed, it has room again:
-                // the read waits, and asks again.
-                Err(Refused::NotAnswered(why))
-                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
-                {
+                // the read waits, and asks again, short of the relay's
+                // count of breaches.
+                Err(Refused::NotNow) => {
+                    let again = self.asks_again_after_a_refusal(link);
+                    let within = self.clock.now() < paged + A_MINUTE;
+                    if !within || !again {
+                        at.not_reached();
+                        return at;
+                    }
                     tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
                     continue;
                 }

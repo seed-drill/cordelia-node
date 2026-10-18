@@ -36,12 +36,13 @@ use cordelia_storage::person::{self as held_rows, Kept, State};
 use crate::adding::{Accepted, Added, accept, add_device};
 use crate::carry::{Allows, Word};
 use crate::change::make_change;
+use crate::own_read::ReadId;
 use crate::person::{
     Applied, Held, Shown, applied_name, applied_secret, first_statement, held, hold_name,
     kept_entry, latest_entry, shown, who_counts,
 };
 use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
-use crate::state::{AppState, DoorAsk, LeftAt, LeftPlace, LeftRead, ProvedBy};
+use crate::state::{AppState, DoorAsk, LeftAt, LeftPlace, LeftRead, OwnAsk, ProvedBy};
 use crate::take::{Taken, take};
 
 pub(crate) const WORDS: &str =
@@ -514,6 +515,51 @@ pub(crate) struct Node {
     /// short of the longest that a carry holds one back, measured from
     /// the read.
     pub(crate) held_back_at_reads: Arc<Mutex<Vec<std::collections::BTreeSet<[u8; 32]>>>>,
+    /// The relays that a read of a channel of the device's own is made at
+    /// (decision 2026-10-17 §4.2), each with what it holds: none, until a
+    /// test sets them.
+    pub(crate) own_relays: Arc<Mutex<Vec<OwnRelay>>>,
+    /// How many rounds of such reads the stand-in has read.
+    pub(crate) own_rounds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Held by each round of such a read while it reads: a test that
+    /// holds it holds the round there.
+    pub(crate) own_round_waits: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A relay at which a read of a channel of the device's own is made, in
+/// a test: what it holds of each channel, and how it answers.
+#[derive(Clone)]
+pub(crate) struct OwnRelay {
+    /// Its name, as the device's configuration gives it.
+    pub(crate) name: String,
+    /// Its node key.
+    pub(crate) key: [u8; 32],
+    /// What it holds of each channel, in its order. A channel that is not
+    /// here it holds none of.
+    pub(crate) holds: HashMap<[u8; 32], Vec<CheckedEntry>>,
+    /// Whether it is reached.
+    pub(crate) reached: bool,
+    /// How many rounds more it is reached in, where a test says: in
+    /// every one, where it is `None`.
+    pub(crate) rounds_reached: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// How many entries it hands in one round: all that follow the place,
+    /// and then a page of nothing, where it is 0.
+    pub(crate) per_round: usize,
+}
+
+impl OwnRelay {
+    /// The relay called `name`, reached, which holds nothing and hands
+    /// all it holds in one round.
+    pub(crate) fn new(name: &str, key: [u8; 32]) -> Self {
+        Self {
+            name: name.to_string(),
+            key,
+            holds: HashMap::new(),
+            reached: true,
+            rounds_reached: None,
+            per_round: 0,
+        }
+    }
 }
 
 /// The session of the connection to the relay of a test.
@@ -679,6 +725,47 @@ impl Node {
                 }
             }
         });
+        let own_relays: Arc<Mutex<Vec<OwnRelay>>> = Default::default();
+        let own_rounds: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let own_round_waits: Arc<tokio::sync::Mutex<()>> = Default::default();
+        let (node, at_relays, rounds, waits) = (
+            Arc::clone(&state),
+            Arc::clone(&own_relays),
+            Arc::clone(&own_rounds),
+            Arc::clone(&own_round_waits),
+        );
+        tokio::spawn(async move {
+            loop {
+                let ask = node.own_channels.wait_own().await;
+                let reads = node.own_channels.reads();
+                let names: Vec<String> = at_relays
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|relay| relay.name.clone())
+                    .collect();
+                match ask {
+                    OwnAsk::Begin {
+                        channel, answer, ..
+                    } => {
+                        let under = crate::at_relays::kept_id(&db(&node)).unwrap().unwrap();
+                        let read = reads
+                            .begin(&channel, &under, &names, std::time::Instant::now())
+                            .unwrap();
+                        let _round = waits.lock().await;
+                        own_round(&node, &at_relays, &read);
+                        rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = answer.send(Some(read));
+                    }
+                    OwnAsk::ReadOn { read, answer, .. } => {
+                        let _round = waits.lock().await;
+                        let known = own_round(&node, &at_relays, &read);
+                        rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = answer.send(known);
+                    }
+                }
+            }
+        });
         Self {
             state,
             relay,
@@ -692,7 +779,16 @@ impl Node {
             remade,
             remake_takes,
             held_back_at_reads,
+            own_relays,
+            own_rounds,
+            own_round_waits,
         }
+    }
+
+    /// The relays that a read of a channel of the device's own is made
+    /// at are these.
+    pub(crate) fn own_relays_are(&self, relays: Vec<OwnRelay>) {
+        *self.own_relays.lock().unwrap() = relays;
     }
 
     /// The relay holds `entries` of the channel whose secret is
@@ -732,6 +828,95 @@ impl Node {
         let mapped = serde_json::json!([{ "folder": "/home/sam/notes", "name": name }]).to_string();
         meta::set(&db(&self.state), meta::SYNC_CLAUDE_MAPPINGS, &mapped).unwrap();
     }
+}
+
+/// One round of the read named `read` of a channel of the device's own,
+/// at the relays of a test, as the node reads it: each page is taken
+/// through the one door with places of the read's own, and what each
+/// relay handed is noted. Says whether the node kept the read.
+fn own_round(state: &AppState, relays: &Mutex<Vec<OwnRelay>>, read: &ReadId) -> bool {
+    use crate::at_relays::{Page, Places};
+    use crate::own_read::Handed;
+    let reads = state.own_channels.reads();
+    let Some((channel, _, at)) = reads.to_read(read, std::time::Instant::now()) else {
+        return false;
+    };
+    let relays = relays.lock().unwrap().clone();
+    let conn = db(state);
+    let own = crate::at_relays::channels(&conn, &state.identity)
+        .unwrap()
+        .into_iter()
+        .find(|own| own.id == channel);
+    let mut done = Vec::new();
+    for mut one in at {
+        let relay = relays.iter().find(|relay| relay.name == one.relay);
+        let reached = |relay: &&OwnRelay| {
+            relay.reached
+                && relay.rounds_reached.as_ref().is_none_or(|left| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    left.fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                        .is_ok()
+                })
+        };
+        let (Some(relay), Some(own)) = (relay.filter(reached), &own) else {
+            one.not_reached();
+            done.push(one);
+            continue;
+        };
+        one.key = Some(relay.key);
+        let Some(held) = relay.holds.get(&channel) else {
+            one.handed(Handed::Page {
+                entries: &[],
+                counted: 0,
+                mark: cordelia_storage::relay::NO_MARK,
+                next: 0,
+            });
+            done.push(one);
+            continue;
+        };
+        let start = match one.place.0 == RELAY_MARK {
+            true => (one.place.1 as usize).min(held.len()),
+            false => 0,
+        };
+        let end = match relay.per_round {
+            0 => held.len(),
+            most => (start + most).min(held.len()),
+        };
+        let page = &held[start..end];
+        let taken = Page {
+            relay: &relay.key,
+            channel: own,
+            entries: page,
+            mark: RELAY_MARK,
+            next: end as u64,
+        };
+        crate::at_relays::take_page(&conn, &state.identity, &taken, Places::Own, wall_clock())
+            .unwrap();
+        let counted = page
+            .iter()
+            .map(|entry| {
+                (entry.to_wire().len() + cordelia_core::protocol::ENTRY_OVERHEAD_BYTES) as u64
+            })
+            .sum();
+        let more = one.handed(Handed::Page {
+            entries: page,
+            counted,
+            mark: RELAY_MARK,
+            next: end as u64,
+        });
+        if more && relay.per_round == 0 {
+            one.handed(Handed::Page {
+                entries: &[],
+                counted: 0,
+                mark: RELAY_MARK,
+                next: end as u64,
+            });
+        }
+        done.push(one);
+    }
+    drop(conn);
+    reads.read(read, done, std::time::Instant::now());
+    true
 }
 
 pub(crate) fn text(said: &str) -> Value {

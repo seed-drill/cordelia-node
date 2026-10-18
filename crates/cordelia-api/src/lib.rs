@@ -12,7 +12,9 @@
 //! what a device says of its person ([`look`]); and what a device does at
 //! a relay for the channels of its own ([`at_relays`]), which the node
 //! asks when it has leave to use a connection; and a read of a channel of
-//! its own with places of its own ([`own_read`], decision 2026-10-17).
+//! its own with places of its own ([`own_read`], decision 2026-10-17),
+//! which is what a device reads before a carried name is let go
+//! ([`let_go`]).
 //!
 //! What a relay holds of a generation that was left comes in only where
 //! a person asks: the one function that judges a version for such a
@@ -48,6 +50,7 @@ pub mod found;
 pub mod handlers;
 pub mod history;
 pub mod leaving;
+pub mod let_go;
 pub mod local;
 pub mod look;
 pub mod marks;
