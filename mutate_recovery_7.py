@@ -41,7 +41,7 @@ TIE = sync("test_an_entry_that_lost_a_tie_is_held_only_where_it_was_handed")
 NO_VERSION = sync("test_an_entry_that_is_no_version_moves_nothing_on")
 READS_ON = sync("test_a_let_go_reads_on_until_each_version_is_found")
 ONLY_READ = sync("test_a_let_go_lets_go_only_of_what_was_read")
-STOPPED = sync("test_a_device_that_has_stopped_reads_no_relay_before_a_let_go")
+STOPPED = sync("test_a_stopped_device_lets_go_at_once_where_its_notes_show_nothing_unsent")
 RELAYS_SAY = sync("test_what_is_said_of_each_relay_where_a_name_is_not_let_go")
 NO_FOLDER = sync("test_a_name_that_a_carry_holds_with_no_folder_is_let_go")
 FOLDER = sync("test_a_folders_unmapping_does_not_let_go_of_a_name_that_a_carry_holds")
@@ -102,8 +102,10 @@ MUTATIONS = [
      '''        if !held {}''',
      [HELD]),
     ("A4 what the store had taken is not noted", LET_GO,
-     '''        taken: kept_rows::last_taken(conn, &channel)?,''',
-     '''        taken: 0,''',
+     '''        not_held: Vec::new(),
+        taken: kept_rows::last_taken(conn, &channel)?,''',
+     '''        not_held: Vec::new(),
+        taken: 0,''',
      [HELD]),
     # ── Reading on (§4.2 item 1) ──
     ("R1 the read goes on where each entry is held", LET_GO,
@@ -161,20 +163,20 @@ MUTATIONS = [
      [READS_ON]),
     # ── Bound to its read (§4.2 item 8) ──
     ("B1 a read the node no longer keeps lets go", SYNC,
-     '''        let Some(kept) = reads.get(read, std::time::Instant::now()) else {
-            return Err(ApiError::Conflict(check::started_again_says(name)));
-        };''',
-     '''        let Some(kept) = reads.get(read, std::time::Instant::now()) else {
-            unreachable!("the read is kept");
-        };''',
+     '''    let Some(kept) = reads.get(read, std::time::Instant::now()) else {
+        return Err(ApiError::Conflict(check::started_again_says(name)));
+    };''',
+     '''    let Some(kept) = reads.get(read, std::time::Instant::now()) else {
+        unreachable!("the read is kept");
+    };''',
      [ONLY_READ]),
     ("B2 what the store took since the read is let go", SYNC,
-     '''        if channel != Some(kept.channel) || taken != found.taken {''',
-     '''        if channel != Some(kept.channel) || (taken != found.taken && false) {''',
+     '''    if channel != Some(kept.channel) || taken != found.taken {''',
+     '''    if channel != Some(kept.channel) || (taken != found.taken && false) {''',
      [ONLY_READ]),
     ("B3 a name whose channel is another since the read is let go", SYNC,
-     '''        if channel != Some(kept.channel) || taken != found.taken {''',
-     '''        if (channel != Some(kept.channel) && false) || taken != found.taken {''',
+     '''    if channel != Some(kept.channel) || taken != found.taken {''',
+     '''    if (channel != Some(kept.channel) && false) || taken != found.taken {''',
      [ONLY_READ]),
     ("B4 a name of which no relay held an entry is let go", SYNC,
      '''        if !found.each_held() {
@@ -372,8 +374,8 @@ MUTATIONS = [
      '''                bytes as f64 / 1024.0''',
      [main("test_what_unmap_says_while_it_reads")]),
     ("C4 the command asks for the next round from the start", MAIN,
-     '''        asking = serde_json::json!({ "folder": name, "read": read });''',
-     '''        asking = serde_json::json!({ "folder": name, "read": null });''',
+     '''        asking = serde_json::json!({ "folder": name, "read": read, "asks": asks });''',
+     '''        asking = serde_json::json!({ "folder": name, "read": null, "asks": asks });''',
      [main("test_what_unmap_says_while_it_reads")]),
     ("C5 the command says nothing while it reads", MAIN,
      '''        for line in reading_says(name, &after["reading"]) {
