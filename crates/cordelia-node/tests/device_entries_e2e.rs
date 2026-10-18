@@ -1995,6 +1995,7 @@ async fn a_pass_held_by_its_pace_stops_and_moves_no_place() {
         let asked = Asked {
             under: &under,
             request: &proof,
+            gated: false,
         };
         let opened =
             device
