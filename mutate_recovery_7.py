@@ -281,14 +281,14 @@ MUTATIONS = [
         at.key = Some(link.relay().0);''',
      [device_entries("a_let_gos_read_asks_a_relay_at_its_count_nothing")]),
     ("F1 a folder mapped during the read does not keep the name", SYNC,
-     '''        if crate::names::has_folder(db, name).map_err(refused)? {
-            return Err(ApiError::Conflict(check::changed_since_says(name)));''',
-     '''        if crate::names::has_folder(db, name).map_err(refused)? && false {
-            return Err(ApiError::Conflict(check::changed_since_says(name)));''',
+     '''    if crate::names::has_folder(db, name).map_err(crate::commands::refused)? {
+        return Err(ApiError::Conflict(check::folder_mapped_says(name)));''',
+     '''    if crate::names::has_folder(db, name).map_err(crate::commands::refused)? && false {
+        return Err(ApiError::Conflict(check::folder_mapped_says(name)));''',
      [sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")]),
     ("F2 the refusal for a folder mapped during the read says another thing", LET_GO,
-     '''"{} is still held: what was read has changed since, or is too old. Run `cordelia sync \\''',
-     '''"{} is still held: the read is done. Run `cordelia sync \\''',
+     '''         {shown} is held by that folder now. Nothing was let go."''',
+     '''         {shown} is held by it no longer. Nothing was let go."''',
      [sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")]),
     ("F3 home memory is said by its name", LET_GO,
      '''        true => "home memory".to_string(),''',

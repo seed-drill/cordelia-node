@@ -44,6 +44,8 @@ WHILE_READS = main("test_what_unmap_says_while_it_reads")
 LABEL = recover_cmd(
     "test_a_row_that_does_not_count_shows_no_label_of_an_adder_in_someone_elses_hands")
 OWN_ONLY = storage("test_what_was_sent_to_no_relay_counts_only_this_devices_own_entries")
+FOLDER_WORD = sync("test_a_folder_mapped_while_the_word_is_asked_keeps_the_name")
+FOLDER_READ = sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")
 DISCARD_E2E = e2e("a_carried_name_that_no_relay_takes_is_let_go_on_a_typed_discard")
 REMOVED_E2E = e2e("a_removed_device_lets_go_of_a_carried_name_only_on_a_typed_discard")
 
@@ -122,6 +124,26 @@ MUTATIONS = [
             }),
         };""",
      [GONE]),
+    ("D14 a folder mapped while the word is asked does not keep the name", SYNC,
+     """    // A folder mapped to the name while the word was asked holds it now.
+    if crate::names::has_folder(db, name).map_err(refused)? {""",
+     """    // A folder mapped to the name while the word was asked holds it now.
+    if crate::names::has_folder(db, name).map_err(refused)? && false {""",
+     [FOLDER_WORD]),
+    ("D15 the line of a folder mapped during the read is the word's line", SYNC,
+     """    if crate::names::has_folder(db, name).map_err(crate::commands::refused)? {
+        return Err(ApiError::Conflict(check::folder_mapped_says(name)));""",
+     """    if crate::names::has_folder(db, name).map_err(crate::commands::refused)? {
+        return Err(ApiError::Conflict(check::changed_says(name)));""",
+     [FOLDER_READ]),
+    ("D16 the line of a folder mapped during the read says to unmap again", LET_GO,
+     """         {shown} is held by that folder now. Nothing was let go."
+    )""",
+     """         {shown} is held by that folder now. Nothing was let go. Run `cordelia sync unmap {}` \\
+         again.",
+        typed(name)
+    )""",
+     [FOLDER_READ, FOLDER_WORD]),
     # ── At a terminal, and not without one (§5.2, property 5) ──
     ("A1 the command at a terminal is refused as one without", SYNC,
      """                if body.asks && !found.each_held() && carried.contains(name) {""",
