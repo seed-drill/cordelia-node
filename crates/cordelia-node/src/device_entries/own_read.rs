@@ -19,11 +19,15 @@
 //! resets the next pull with ERR_RATE_LIMIT, and the read asks again once
 //! a little time has gone by, as where the device has asked what it asks
 //! in a minute. A minute after the last page it was handed there, the
-//! relay is not reached in that round. **And it takes no more than
-//! BAN_THRESHOLD - 1 such refusals at a relay in the whole read:** a
+//! relay is not reached in that round. **And it asks again only while
+//! the relay has refused fewer than BAN_THRESHOLD - 1 requests so within
+//! BAN_WINDOW_SECS** ([`DeviceEntries::asks_again_after_a_refusal`]): a
 //! relay refuses a breach of its rates with the same reset, and cuts off
-//! an address at BAN_THRESHOLD breaches, so the read never gives a relay
-//! that many. At the next, the relay is not reached. **Every other failure ends the
+//! an address at BAN_THRESHOLD breaches in that window. The count is the
+//! relay's, kept by the device across rounds and reads, and not reset by
+//! a page. It cannot count what the pass is refused, which asks again at
+//! its next pass, nor what other devices behind one address are refused;
+//! and the first request of a read can still be refused once more. **Every other failure ends the
 //! relay's read in that round as not reached:** no answer, a stream that
 //! times out or is reset otherwise, an answer that is not a page, a
 //! connection that was lost. A relay that is down, or broken, does not
@@ -50,7 +54,7 @@ use std::time::{Duration, Instant};
 use cordelia_api::at_relays::{self, Own, Page, PageTaken, Places};
 use cordelia_api::own_read::{Handed, OwnAt, ReadId};
 use cordelia_api::state::OwnAsk;
-use cordelia_core::protocol::{BAN_THRESHOLD, CARRY_READ_MAX_SECS, ENTRY_PAGE_MAX_ENTRIES};
+use cordelia_core::protocol::{CARRY_READ_MAX_SECS, ENTRY_PAGE_MAX_ENTRIES};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{EntryPull, WireMessage};
 use cordelia_storage::relay::Mark;
@@ -347,9 +351,9 @@ impl DeviceEntries {
                 // the read waits, and asks again, short of the relay's
                 // count of breaches.
                 Err(Refused::NotNow) => {
-                    at.refused_for_now += 1;
+                    let again = self.asks_again_after_a_refusal(link);
                     let within = self.clock.now() < paged + A_MINUTE;
-                    if !within || at.refused_for_now >= BAN_THRESHOLD - 1 {
+                    if !within || !again {
                         at.not_reached();
                         return at;
                     }
