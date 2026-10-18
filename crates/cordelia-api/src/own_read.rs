@@ -40,7 +40,17 @@
 //! replaced stops. So the reads that a node keeps are at most as many as
 //! the channels of its own, and **each stands for
 //! LET_GO_READ_STANDS_SECS** from the end of its last round, on the
-//! node's monotonic clock (decision 2026-10-17 §5.2).
+//! node's monotonic clock (decision 2026-10-17 §5.2). The node keeps
+//! besides the ID of the last read of each channel that it kept no more,
+//! for its age or because another read of the channel took its place, and
+//! nothing else of it: a `discard` that comes too late is told so, and not
+//! told that the node was started again.
+//!
+//! **What the check before a let-go found when the read ended is kept
+//! with it** ([`OwnRead::found`]): a `discard` lets go of what was shown,
+//! and of nothing that the store took since. A device that has stopped
+//! reads no relay, and keeps the count that it took from its own notes so,
+//! as a read at no relay (decision 2026-10-17 §4.4).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -227,6 +237,10 @@ pub struct OwnRead {
     /// When its last round ended, or it began where none has: it stands
     /// for LET_GO_READ_STANDS_SECS from then.
     ended: Instant,
+    /// What the check before a let-go found when the read ended
+    /// (decision 2026-10-17 §5.2): a `discard` is bound to it. `None`
+    /// until then.
+    pub found: Option<crate::let_go::Found>,
 }
 
 impl OwnRead {
@@ -250,14 +264,46 @@ const STANDS: Duration = Duration::from_secs(LET_GO_READ_STANDS_SECS);
 #[derive(Debug, Default)]
 pub struct OwnReads {
     reads: Mutex<HashMap<ReadId, OwnRead>>,
+    /// The ID of the last read of each channel that is kept no more, for
+    /// its age or because another read of the channel took its place, by
+    /// the channel: at most one for each, as reads are.
+    gone: Mutex<HashMap<[u8; 32], ReadId>>,
 }
 
 impl OwnReads {
     /// The reads that stand at `now`: each that is older is forgotten.
     fn standing(&self, now: Instant) -> std::sync::MutexGuard<'_, HashMap<ReadId, OwnRead>> {
         let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        let before: Vec<([u8; 32], ReadId)> = reads
+            .iter()
+            .map(|(read, kept)| (kept.channel, *read))
+            .collect();
         reads.retain(|_, kept| kept.reading || now.saturating_duration_since(kept.ended) < STANDS);
+        let gone: Vec<_> = before
+            .into_iter()
+            .filter(|(_, read)| !reads.contains_key(read))
+            .collect();
+        if !gone.is_empty() {
+            self.went(gone);
+        }
         reads
+    }
+
+    /// The reads `gone`, each with its channel, are kept no more.
+    fn went(&self, gone: Vec<([u8; 32], ReadId)>) {
+        let mut kept = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        kept.extend(gone);
+    }
+
+    /// Whether the read named `read` is one that this node made and keeps
+    /// no more, by `now`, for its age or because another read of its
+    /// channel took its place: it is the last of its channel that went so.
+    /// A read that the node never made, or made before it was started
+    /// again, is not.
+    pub fn gone(&self, read: &ReadId, now: Instant) -> bool {
+        drop(self.standing(now));
+        let gone = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        gone.values().any(|old| old == read)
     }
 
     /// Begin a read of `channel`, which is of the statement of the change
@@ -283,10 +329,16 @@ impl OwnReads {
             begun: now,
             reading: false,
             ended: now,
+            found: None,
         };
         let mut reads = self.standing(now);
+        let replaced = reads
+            .iter()
+            .find(|(_, kept)| kept.channel == *channel)
+            .map(|(old, _)| (*channel, *old));
         reads.retain(|_, kept| kept.channel != *channel);
         reads.insert(id, read);
+        self.went(replaced.into_iter().collect());
         Ok(id)
     }
 
@@ -331,6 +383,15 @@ impl OwnReads {
         }
         kept.reading = false;
         kept.ended = now;
+    }
+
+    /// The read named `read` has ended, and the check before a let-go
+    /// found `found` in it, at `now`: a `discard` is bound to that. Where
+    /// it was forgotten, nothing is kept.
+    pub fn found(&self, read: &ReadId, found: crate::let_go::Found, now: Instant) {
+        if let Some(kept) = self.standing(now).get_mut(read) {
+            kept.found = Some(found);
+        }
     }
 
     /// The read named `read`, as it stands at `now`, where the node keeps
@@ -584,6 +645,44 @@ mod tests {
         reads.read(&again, at, now);
         assert_eq!(reads.get(&again, now), None);
         assert_eq!(reads.get(&[9; 16], now), None);
+    }
+
+    /// **A read that is kept no more, for its age or because another read
+    /// of its channel took its place, is known as gone** (decision
+    /// 2026-10-17 §5.3): a `discard` that comes with it is told that what
+    /// was read is too old or has changed, and not that the node was
+    /// started again. A read that was let go of, or never made, is not
+    /// gone. What a read found is kept with it.
+    #[test]
+    fn test_a_read_kept_no_more_for_its_age_or_its_place_is_known_as_gone() {
+        let reads = OwnReads::default();
+        let relays = ["relay-one".to_string()];
+        let begun = Instant::now();
+        let stands = Duration::from_secs(LET_GO_READ_STANDS_SECS);
+        let (channel, under) = ([1; 32], [3; 32]);
+        let old = reads.begin(&channel, &under, &relays, begun).unwrap();
+        assert!(!reads.gone(&old, begun));
+        assert!(reads.gone(&old, begun + stands));
+        assert_eq!(reads.get(&old, begun + stands), None);
+
+        let first = reads.begin(&channel, &under, &relays, begun).unwrap();
+        let found = crate::let_go::Found {
+            asked: 2,
+            not_held: vec![4],
+            taken: 7,
+        };
+        reads.found(&first, found.clone(), begun);
+        assert_eq!(reads.get(&first, begun).unwrap().found, Some(found));
+        let second = reads.begin(&channel, &under, &relays, begun).unwrap();
+        assert!(reads.gone(&first, begun));
+        assert!(!reads.gone(&second, begun));
+        assert_eq!(reads.get(&second, begun).unwrap().found, None);
+        // Another channel's read takes the place of none.
+        let other = reads.begin(&[2; 32], &under, &relays, begun).unwrap();
+        assert!(reads.gone(&first, begun) && !reads.gone(&other, begun));
+        reads.forget(&second);
+        assert!(!reads.gone(&second, begun));
+        assert!(!reads.gone(&[9; 16], begun));
     }
 
     /// A read stands for LET_GO_READ_STANDS_SECS from the end of its last

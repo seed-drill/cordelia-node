@@ -6598,6 +6598,7 @@ async fn a_let_gos_read_asks_a_relay_at_its_count_nothing() {
     let body = SyncUnmapRequest {
         folder: "lab".into(),
         read: None,
+        ..Default::default()
     };
     let serves = async {
         let ask = device.state.own_channels.wait_own().await;

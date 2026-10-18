@@ -2803,6 +2803,58 @@ mod tests {
         assert!(matches!(own, AtARow::Said(_, Answer::Have)), "{own:?}");
     }
 
+    /// **A row that does not count, has one adder, and was not kept out
+    /// by the 64 follows the label shown as every other row does**
+    /// (decision 2026-10-17 §2.4): where its adder may be in someone
+    /// else's hands, the row, the lines before the yes and what the node
+    /// keeps name the key by its words alone, and not by that adder's
+    /// label. Where the adder is kept, its label is shown.
+    #[test]
+    fn test_a_row_that_does_not_count_shows_no_label_of_an_adder_in_someone_elses_hands() {
+        let rows = rows();
+        let generation = Generation {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let room = recover::Room {
+            removed: 0,
+            asked: 4,
+            can_go: 196,
+        };
+        // The desktop and the phone, which added the tablet, may be in
+        // someone else's hands; the tablet's record does not count for
+        // another reason.
+        let answers = [Answer::Have, Answer::OtherHands, Answer::OtherHands];
+        assert!(rows[3].no_room.is_empty() && !rows[3].counts);
+        assert_eq!(recover::label_shown(&rows, &answers, &rows[3]), "");
+        let AtARow::Said(says, _) = at_a_row(&rows, &answers, 3, 3, &[9; 32], &room, &|_| false)
+        else {
+            panic!("a record that does not count is not asked about");
+        };
+        let words = fingerprint::shown(&[4; 32]);
+        assert!(
+            says.starts_with(&format!("\nthe device ({words}), added since")),
+            "{says}"
+        );
+        assert!(!says.contains("\"tablet\""), "{says}");
+        let mut answered = answers.to_vec();
+        answered.push(Answer::NotAsked);
+        let labels = labels_for_the_node(&generation, &answered, &[9; 32]);
+        assert!(!labels.to_string().contains("tablet"), "{labels}");
+        // The phone kept: the tablet is shown by its label.
+        let kept = [Answer::Have, Answer::Have, Answer::Have];
+        assert_eq!(recover::label_shown(&rows, &kept, &rows[3]), "tablet");
+        let AtARow::Said(says, _) = at_a_row(&rows, &kept, 3, 3, &[9; 32], &room, &|_| false)
+        else {
+            panic!("a record that does not count is not asked about");
+        };
+        assert!(says.contains("\"tablet\""), "{says}");
+        // A row that counts keeps its label, though its adder, the
+        // desktop, may be in someone else's hands: its own row says what
+        // was said of it.
+        assert_eq!(recover::label_shown(&rows, &answers, &rows[2]), "phone");
+    }
+
     /// The label by which a key that the 64 kept out is named before the
     /// yes, and the label that the node is handed for it and keeps, is
     /// the one that its row was shown by (decision 2026-10-17 §2.4): that

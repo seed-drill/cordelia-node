@@ -653,10 +653,20 @@ pub fn adders_shown<'a>(
 /// that of the first adder shown ([`adders_shown`]), so that no adder
 /// that may be in someone else's hands chooses it; and none where every
 /// adder may be: the key is then shown by its words alone, as an empty
-/// label is everywhere.
+/// label is everywhere. **So too for a record that does not count for
+/// another reason:** its one adder's label is not shown where that adder
+/// may be in someone else's hands ([`in_other_hands`] of its row).
 pub fn label_shown<'a>(rows: &[Row], answers: &[Answer], row: &'a Row) -> &'a str {
     if row.no_room.is_empty() {
-        return &row.label;
+        let adders_hands = !row.counts
+            && row.added_by.is_some_and(|(adder, _)| {
+                let place = rows.iter().position(|row| row.key == adder);
+                place.is_some_and(|place| in_other_hands(rows, answers, place))
+            });
+        return match adders_hands {
+            true => "",
+            false => &row.label,
+        };
     }
     let (shown, _) = adders_shown(rows, answers, row);
     shown.first().map_or("", |(_, _, label)| label.as_str())
