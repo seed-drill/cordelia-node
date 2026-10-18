@@ -9,11 +9,11 @@ the next; the lines after each round, and the line before the yes with
 why each relay stopped; and the line of step 1 before the yes (decision
 2026-10-17 §3.1 to §3.3; §1, properties 10 and 11). With it: the bytes a
 relay handed, as the node says them; a device that keeps back the room a
-relay keeps for a show, and waits out a pull refused for now, only so
-often in a row; and reads that keep each entry once. A part for each
-rule of the slice: put each fault in, and confirm the test named for it
-fails on an assertion. Run from the root of a checkout that nothing else
-edits."""
+relay keeps for a show, and waits out a pull refused for now, on slice
+6's count of refusals: asking a relay at its count nothing; and reads
+that keep each entry once. A part for each rule of the slice: put each
+fault in, and confirm the test named for it fails on an assertion. Run
+from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
 
 # One name for each file a part edits.
@@ -51,7 +51,7 @@ IN_PART = cmd("test_a_recovery_goes_on_with_what_it_could_read_of_the_personal_c
 SHOW_ROOM = (NODE_E2E, "a_device_takes_from_a_relay_no_page_from_the_room_kept_for_a_show")
 NOT_NOW = (NODE_E2E, "a_read_of_a_left_channel_waits_out_a_pull_refused_for_now")
 NODE_LIB = ("cordelia-node", ["--lib"])
-CUT_OFF = (NODE_LIB, "device_entries::leave::tests::a_request_is_refused_for_now_only_where_it_was_cut_off_with_the_rate_limit_code")
+CUT_OFF = (NODE_LIB, "device_entries::leave::tests::a_request_is_refused_for_now_only_by_the_rate_limits_code")
 CHANGING = cmd("test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound")
 ONE_READING = carry("test_one_reading_reads_no_relay_again_and_asks_for_the_sessions_where_one_changed")
 WHY = cmd("test_what_is_said_of_a_read_in_part_says_why_each_relay_stopped")
@@ -263,17 +263,19 @@ MUTATIONS = [
                     proved = true;''',
      [NOT_NOW]),
     ("RO41 a pull refused for now is not told from one not answered", LEAVE,
-     '''Err(Refused::NotAnswered(why)) if why == NOT_NOW => return Err(LeftRefused::NotNow),''',
-     '''Err(Refused::NotAnswered(why)) if false && why == NOT_NOW => return Err(LeftRefused::NotNow),''',
+     '''            Err(Refused::NotNow) => return Err(LeftRefused::NotNow),''',
+     '''            Err(Refused::NotNow) if false => return Err(LeftRefused::NotNow),''',
      [NOT_NOW]),
     ("RO42 a stream reset with any code is taken as refused for now", LEAVE,
-     '''    let code = quinn::VarInt::from_u32(ERR_RATE_LIMIT);''',
-     '''    let code = quinn::VarInt::from_u32(0);''',
+     '''    let code = quinn::VarInt::from_u32(ERR_RATE_LIMIT);
+    let Some(inner) = io.get_ref() else {''',
+     '''    let code = quinn::VarInt::from_u32(0);
+    let Some(inner) = io.get_ref() else {''',
      [NOT_NOW]),
     ("RO43 the proof is sent again after a pull refused for now", ENTRIES,
      '''                    proved = true;
-                    refused_in_a_row += 1;''',
-     '''                    refused_in_a_row += 1;''',
+                    if !self.asks_again_after_a_refusal(link) {''',
+     '''                    if !self.asks_again_after_a_refusal(link) {''',
      [NOT_NOW]),
     ("RO44 a reading asks for the sessions again where no connection changed", CARRY_CMD,
      '''    if relays.iter().any(connection_changed) {''',
@@ -308,8 +310,8 @@ MUTATIONS = [
             self.handed += entries_handed(said);''',
      [NOT_REACHED]),
     ("RO49 a proof refused for now is said as a page's", LEAVE,
-     '''                    return Err(not(PROOF_NOT_NOW));''',
-     '''                    return Err(not(NOT_NOW));''',
+     '''                Err(Refused::NotNow) => return Err(not(PROOF_NOT_NOW)),''',
+     '''                Err(Refused::NotNow) => return Err(not("refused for now")),''',
      [NOT_NOW]),
     ("RO50 a request stopped with the rate-limit code is not refused for now", LEAVE,
      '''        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
@@ -329,19 +331,18 @@ MUTATIONS = [
      '''        self.why = Some(why.to_string());''',
      '''        let _ = why;''',
      [AT_THE_BOUND, WHY]),
-    ("RO51 a read asks again after any number of refusals for now in a row", ENTRIES,
-     '''                    if refused_in_a_row >= LEFT_REFUSED_IN_A_ROW_MAX {''',
-     '''                    if false && refused_in_a_row >= LEFT_REFUSED_IN_A_ROW_MAX {''',
+    ("RO51 a read asks again after a refusal for now at the relay's count", ENTRIES,
+     '''                    if !self.asks_again_after_a_refusal(link) {''',
+     '''                    if false && !self.asks_again_after_a_refusal(link) {''',
      [NOT_NOW]),
-    ("RO52 a page between two refusals for now does not start the count again", ENTRIES,
-     '''                    refused_in_a_row = 0;''',
-     '''                    let _ = refused_in_a_row;''',
+    ("RO52 a read asks a relay at its count", ENTRIES,
+     '''            if !self.asks_after_refusals(link) {''',
+     '''            if false && !self.asks_after_refusals(link) {''',
      [NOT_NOW]),
-    # BAN_THRESHOLD itself is refused at compile time.
-    ("RO53 a read ends at the first refusal for now", PROTOCOL,
-     '''pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 1;''',
-     '''pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 2;''',
-     [BOUND, NOT_NOW]),
+    ("RO53 a read that asked a relay at its count nothing says it was not reached", ENTRIES,
+     '''                    true => LeftRead::NotRead(AT_ITS_COUNT.into()),''',
+     '''                    true => LeftRead::NotReached,''',
+     [NOT_NOW]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
