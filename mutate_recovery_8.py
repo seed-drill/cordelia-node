@@ -15,7 +15,8 @@ OWN_READ = 'crates/cordelia-api/src/own_read.rs'
 RECOVER = 'crates/cordelia-api/src/recover.rs'
 AT_RELAYS = 'crates/cordelia-storage/src/at_relays.rs'
 MAIN = 'crates/cordelia-node/src/main.rs'
-ORIG = {f: open(f).read() for f in (LET_GO, SYNC, OWN_READ, RECOVER, AT_RELAYS, MAIN)}
+STATE = 'crates/cordelia-api/src/state.rs'
+ORIG = {f: open(f).read() for f in (LET_GO, SYNC, OWN_READ, RECOVER, AT_RELAYS, MAIN, STATE)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 API = ("cordelia-api", ["--lib"])
@@ -44,6 +45,7 @@ WHILE_READS = main("test_what_unmap_says_while_it_reads")
 LABEL = recover_cmd(
     "test_a_row_that_does_not_count_shows_no_label_of_an_adder_in_someone_elses_hands")
 OWN_ONLY = storage("test_what_was_sent_to_no_relay_counts_only_this_devices_own_entries")
+BOUND_WORD = sync("test_the_word_is_asked_only_where_the_read_still_binds_the_let_go")
 FOLDER_WORD = sync("test_a_folder_mapped_while_the_word_is_asked_keeps_the_name")
 FOLDER_READ = sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")
 DISCARD_E2E = e2e("a_carried_name_that_no_relay_takes_is_let_go_on_a_typed_discard")
@@ -204,8 +206,8 @@ MUTATIONS = [
      """        true => String::new(),""",
      [WHERE]),
     ("W6 what was written here is not said to go for good", LET_GO,
-     """since it was carried is on this device alone, and goes for good: this device does not \\""",
-     """since it was carried is on this device alone: this device does not \\""",
+     """since it was carried is on this device alone, and goes for good: \\""",
+     """since it was carried is on this device alone: \\""",
      [WHERE]),
     ("W7 one version is said as those", LET_GO,
      """        1 => ("that version".to_string(), "it is"),""",
@@ -296,6 +298,44 @@ MUTATIONS = [
      """    format!("{} is still held. Nothing was changed.", sync_label(name))""",
      """    format!("{} is still held.", sync_label(name))""",
      [ASKS]),
+    # ── The review of the slice: what a device that has stopped says, the
+    # read's binding before the word, and what is kept of reads that went ──
+    ("R1 the word is asked where the read no longer binds the let-go", SYNC,
+     """    let kept = bound_to_its_read(state, db, name, read, found)?;
+    let said = state.own_channels.read();""",
+     """    let kept = state.own_channels.reads().get(read, std::time::Instant::now()).unwrap();
+    let said = state.own_channels.read();""",
+     [BOUND_WORD]),
+    ("R2 a device that has stopped is offered a carry", LET_GO,
+     """    let carried = match stopped {""",
+     """    let carried = match stopped && false {""",
+     [WHERE, STOPPED]),
+    ("R3 the prompt of a device that has stopped is a sending device's", SYNC,
+     """crate::let_go::word_asked(&db, name, &read, n, said, wall, true)""",
+     """crate::let_go::word_asked(&db, name, &read, n, said, wall, false)""",
+     [STOPPED]),
+    ("R4 the node does not say that the device that let go has stopped", SYNC,
+     """    status.let_go_stopped = Some(stopped);""",
+     """    status.let_go_stopped = Some(false);""",
+     [STOPPED]),
+    ("R5 the line after the word on a stopped device says no relay held", MAIN,
+     """        true => "that its own notes said it sent to no relay",""",
+     """        true => "that no relay held",""",
+     [ASKS]),
+    ("R6 the command does not hear that the device has stopped", MAIN,
+     """            after["let_go_stopped"] == true,""",
+     """            false,""",
+     [REMOVED_E2E]),
+    ("R7 a read that went is kept after its name is stopped", STATE,
+     """        self.reads.forget_gone(channel);""",
+     """        let _ = &self.reads;""",
+     [STOPPED]),
+    ("R8 forgetting what went of a channel forgets nothing", OWN_READ,
+     """        let mut gone = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        gone.remove(channel);""",
+     """        let gone = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = (gone, channel);""",
+     [GONE]),
     # ── The label of a row by an adder in someone else's hands (§2.4) ──
     ("L1 a row that does not count shows its adder's label", RECOVER,
      """        let adders_hands = !row.counts
