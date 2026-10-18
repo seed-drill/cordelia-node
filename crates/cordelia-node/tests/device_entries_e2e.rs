@@ -5671,6 +5671,9 @@ async fn a_read_with_places_of_its_own_waits_out_a_pull_refused_for_now() {
     device.connects_to("relay", relay.port, relay.key).await;
     device.passes().await;
     for reset in [Say::NotNow, Say::Reset] {
+        // Each from no refusal for now that the relay is counted to have
+        // given.
+        device.clock.run_ahead(BAN_WINDOW);
         let (once, how) = (Arc::new(AtomicBool::new(true)), reset.clone());
         relay.hook(move |request| {
             let second = matches!(request, WireMessage::EntryPull(pull) if pull.channel == notes && pull.after == 1);
