@@ -1210,7 +1210,8 @@ never held, comes in only under **a word that the phrase signed:**
   its slot on, and the answer carries `let_go_versions`, how many such entries
   there were. It is refused with `409` where an entry is held by no relay
   (saying, of each relay, how its read ended), where the store has taken
-  anything of the name's channel since the read ended, and where the node
+  anything of the name's channel since the read ended, where a folder was
+  mapped to the name while it was read, and where the node
   keeps no read by that ID. A device that has stopped reads no relay, and is
   not refused. With a folder that was mapped to a name which a carry or a
   recovery holds, or into which a carry brought versions while the folder was

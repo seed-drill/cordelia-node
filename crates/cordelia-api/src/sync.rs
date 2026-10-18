@@ -23,7 +23,7 @@ use crate::types::*;
 
 /// The name home memory syncs under unless it is given another. No other
 /// folder may take it: every device shows it as home memory.
-const HOME_NAME: &str = "~";
+pub(crate) const HOME_NAME: &str = "~";
 
 pub(crate) fn mappings(db: &rusqlite::Connection) -> Result<Vec<SyncMapping>, ApiError> {
     Ok(meta::get(db, meta::SYNC_CLAUDE_MAPPINGS)?
@@ -1136,6 +1136,8 @@ pub fn remove_mapping(
 ///   read ended, or the name's channel is another (item 8,
 ///   [`crate::let_go::took_something_says`]): what would be let go is not
 ///   what the read asked about;
+/// - where a folder is mapped to the name now: one was mapped while the
+///   relays were read ([`crate::let_go::changed_since_says`]);
 /// - where no relay held an entry of the name that this device signed
 ///   ([`crate::let_go::not_held_says`]): what a carry or a recovery
 ///   brought in here, and no relay holds, is nowhere else in the
@@ -1164,6 +1166,12 @@ pub fn let_go_of_a_carried_name(
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if channel != Some(kept.channel) || taken != found.taken {
             return Err(ApiError::Conflict(check::took_something_says(name)));
+        }
+        // The lock was let go while the relays were read: a folder that
+        // was mapped to the name since holds it, and takes nothing into
+        // the store until its first cycle.
+        if crate::names::has_folder(db, name).map_err(refused)? {
+            return Err(ApiError::Conflict(check::changed_since_says(name)));
         }
         if !found.each_held() {
             let said = state.own_channels.read();
@@ -3183,6 +3191,15 @@ mod tests {
                 }),
             ),
             (
+                "the entry itself, at the second relay alone",
+                Box::new(|mine, secret| {
+                    vec![
+                        OwnRelay::new("relay-one", ONE),
+                        holding("relay-two", TWO, secret, std::slice::from_ref(mine)),
+                    ]
+                }),
+            ),
+            (
                 "the same version by another key that counts",
                 Box::new(|mine, secret| {
                     let said = text("brought in by a carry");
@@ -3778,5 +3795,85 @@ mod tests {
                 "  relay-five: read in part, for 10 minutes.",
             ]
         );
+    }
+
+    /// **A folder mapped to a carried name while its relays were read keeps
+    /// the name** (decision 2026-10-17 §4.2 item 8, §4.3): the lock is let
+    /// go during the read, and a folder that is mapped takes nothing into
+    /// the store until its first cycle, so the store's order does not show
+    /// it. The let-go is refused, the folder stays mapped, and the name
+    /// keeps its channel. Once the folder is unmapped again, a new read
+    /// lets the name go.
+    #[test]
+    fn test_a_folder_mapped_while_the_relays_are_read_keeps_the_name() {
+        use crate::several::{Several, state_of};
+        use cordelia_storage::person as held_rows;
+        let home = std::path::Path::new("/home/sam");
+        let mut s = Several::of_one_person(1);
+        let now = s.tick();
+        crate::names::hold_for_a_carry(&s[0].conn, &s[0].identity, "lab", now).unwrap();
+        s.write(0, "lab", "a.md", "brought in by a carry");
+        let state = state_of(s.machines.remove(0));
+        state.own_channels.set_up_with(1);
+        let db = state.db.lock().unwrap();
+        let on: SyncClaudeRequest =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+        set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+        let lab = held_rows::channel_of_name(&db, "lab").unwrap().unwrap();
+        let at_the_relay = stored_of(&db, &lab);
+        let (read, found) = read_of(&state, &db, "lab", &[("relay-one", &at_the_relay)]);
+        assert!(found.each_held());
+
+        // A folder is mapped to the name before the let-go takes the lock.
+        let before = mapped_names(&db).unwrap();
+        let body = request("/home/sam/notes", "lab", false);
+        add_mapping(&state.sync_control, &db, &body, home).unwrap();
+        names_follow(&state, &db, &before);
+        let refused = let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found)));
+        let Err(ApiError::Conflict(why)) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(
+            *why,
+            "lab is still held: what was read has changed since, or is too old. Run `cordelia \
+             sync unmap lab` again."
+        );
+        assert_eq!(mapped_names(&db).unwrap(), ["lab"]);
+        assert_eq!(held_rows::channel_of_name(&db, "lab").unwrap(), Some(lab));
+        assert_eq!(stored_of(&db, &lab).len(), at_the_relay.len());
+
+        // Unmapped again, the name is held by the carry, and a new read
+        // lets it go.
+        let before = mapped_names(&db).unwrap();
+        let body = SyncUnmapRequest {
+            folder: "/home/sam/notes".into(),
+            read: None,
+        };
+        remove_mapping(&state.sync_control, &db, &body).unwrap();
+        names_follow(&state, &db, &before);
+        let (read, found) = read_of(&state, &db, "lab", &[("relay-one", &at_the_relay)]);
+        assert!(let_go_of_a_carried_name(&state, &db, "lab", Some((&read, &found))).unwrap());
+        assert_eq!(held_rows::channel_of_name(&db, "lab").unwrap(), None);
+    }
+
+    /// Home memory's name is said as that in what the node says of a
+    /// let-go, as the command says it, and is quoted in the command to
+    /// copy.
+    #[test]
+    fn test_what_the_node_says_of_a_let_go_names_home_memory_as_that() {
+        use crate::let_go::*;
+        for said in [
+            started_again_says("~"),
+            changed_since_says("~"),
+            took_something_says("~"),
+            not_read_says("~"),
+            not_held_says("~", 1, &[]),
+        ] {
+            assert!(said.starts_with("home memory is "), "{said}");
+            assert!(said.contains("`cordelia sync unmap '~'`"), "{said}");
+            assert!(!said.contains("~ is"), "{said}");
+        }
+        assert!(not_held_says("~", 2, &[]).contains(", and home memory can be let go once"));
+        assert!(started_again_says("~").contains("since home memory was read"));
     }
 }
