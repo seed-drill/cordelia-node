@@ -13,16 +13,24 @@
 //! Where the minute is used, it waits, as a read through the door for a
 //! carry does.
 //!
-//! **A refusal on a connection that is still open is waited out:** a
-//! relay that has handed a connection what it may in a minute resets the
-//! next pull, and the read asks again once a little time has gone by, as
-//! where the device has asked what it asks in a minute.
+//! **A pull that the relay refuses for now is waited out, for a minute
+//! at most:** a relay that has handed a connection what it may in a
+//! minute, with the answers to shows that the device does not see,
+//! resets the next pull with ERR_RATE_LIMIT, and the read asks again once
+//! a little time has gone by, as where the device has asked what it asks
+//! in a minute. A minute after the last page it was handed there, the
+//! relay is not reached in that round. **Every other failure ends the
+//! relay's read in that round as not reached:** no answer, a stream that
+//! times out or is reset otherwise, an answer that is not a page, a
+//! connection that was lost. A relay that is down, or broken, does not
+//! hold the read (decision 2026-10-17 §3.2 item 4).
 //!
 //! **One round runs at a time on the node, and none for longer than a
 //! carry may read** (CARRY_READ_MAX_SECS, the round of decision
 //! 2026-10-17 §3.5): a round that is asked for waits for the one that
 //! runs, until its own time is gone. A read that another of the same
-//! channel took the place of stops at its next page.
+//! channel took the place of stops at its next page, and a round whose
+//! asker has gone stops, and its read is forgotten.
 //!
 //! **It runs outside the database's lock.** The lock is taken to read
 //! which channels are the device's own, and to take each page, as a pass
@@ -43,12 +51,18 @@ use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{EntryPull, WireMessage};
 use cordelia_storage::relay::Mark;
 
+use super::leave::NOT_NOW;
 use super::{
     At, DeviceEntries, LEFT_ROOM_WAIT, Link, Refused, Relay, Step, counted_as_handed, lock,
 };
 
 /// The longest that one round of a read lasts.
 const ROUND_MOST: Duration = Duration::from_secs(CARRY_READ_MAX_SECS);
+
+/// The minute in which a relay counts what it hands a connection
+/// (PUSH_BYTES_PER_PEER_PER_MINUTE): a relay that refuses a pull for now
+/// has room again within it.
+const A_MINUTE: Duration = Duration::from_secs(60);
 
 /// What came of one pull of the read.
 enum Pulled {
@@ -82,25 +96,38 @@ impl DeviceEntries {
             OwnAsk::Begin {
                 channel,
                 until,
-                answer,
+                mut answer,
             } => {
                 let until = until.min(self.clock.now() + ROUND_MOST);
                 let begun = self.begin_own(relays, &channel);
                 if let Some(read) = &begun {
-                    self.read_own(relays, read, until).await;
+                    tokio::select! {
+                        _ = self.read_own(relays, read, until) => {}
+                        _ = answer.closed() => return self.asker_gone(read),
+                    }
                 }
                 let _ = answer.send(begun);
             }
             OwnAsk::ReadOn {
                 read,
                 until,
-                answer,
+                mut answer,
             } => {
                 let until = until.min(self.clock.now() + ROUND_MOST);
-                let known = self.read_own(relays, &read, until).await;
+                let known = tokio::select! {
+                    known = self.read_own(relays, &read, until) => known,
+                    _ = answer.closed() => return self.asker_gone(&read),
+                };
                 let _ = answer.send(known);
             }
         }
+    }
+
+    /// Whoever asked for a round of the read named `read` has gone: the
+    /// round stopped where it was, and nothing will ask for the read, so
+    /// it is kept no more.
+    fn asker_gone(&self, read: &ReadId) {
+        self.state.own_channels.reads().forget(read);
     }
 
     /// Keep a new read of `channel` at each of `relays`, where it is one
@@ -197,7 +224,8 @@ impl DeviceEntries {
     /// was not made, or not answered, the relay is not reached.
     ///
     /// It stops where the read named `read` stands no more: another read
-    /// of the channel took its place.
+    /// of the channel took its place. Neither a wait nor a request runs
+    /// past `until`.
     async fn read_own_at(
         &self,
         link: &Link,
@@ -217,14 +245,18 @@ impl DeviceEntries {
         }
         let relay = link.relay().0;
         let reads = self.state.own_channels.reads();
+        // When the relay last handed this read a page, or the round began.
+        let mut paged = self.clock.now();
         loop {
-            if self.clock.now() >= until || !reads.stands(read) {
+            let now = self.clock.now();
+            if now >= until || !reads.stands(read) {
                 return at;
             }
+            let left = until - now;
             // Within what the device takes from this relay in a minute,
             // with the pass: where the minute is used, it waits for room.
             if !self.room_to_take(link) {
-                tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
                 continue;
             }
             let (mark, after) = at.place;
@@ -235,74 +267,78 @@ impl DeviceEntries {
                 limit: ENTRY_PAGE_MAX_ENTRIES,
             });
             let now = self.unix();
-            let taken = self
-                .through(
-                    &asks,
-                    &request,
-                    |_| (),
-                    |answer| {
-                        // A page of more entries than a page may hold is
-                        // refused where it is read off the wire.
-                        let WireMessage::EntryPulled(page) = answer else {
-                            return (0, None);
-                        };
-                        // What the relay handed counts as taken from it,
-                        // whatever is then done with it.
-                        let handed: u64 = page
-                            .entries
-                            .iter()
-                            .map(|bytes| counted_as_handed(bytes.len()))
-                            .sum();
-                        self.took(link, handed);
-                        let entries: Option<Vec<CheckedEntry>> = page
-                            .entries
-                            .iter()
-                            .map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
-                            .collect();
-                        (
-                            handed,
-                            entries.map(|entries| (entries, page.mark, page.next)),
-                        )
-                    },
-                    |db, (handed, page)| {
-                        let Some((entries, mark, next)) = page else {
-                            return (handed, Pulled::NotThePage);
-                        };
-                        let page = Page {
-                            relay: &relay,
-                            channel,
-                            entries: &entries,
-                            mark,
-                            next,
-                        };
-                        let identity = &self.state.identity;
-                        let pulled =
-                            match at_relays::take_page(db, identity, &page, Places::Own, now) {
-                                Ok(PageTaken::Taken { .. }) => Pulled::Page(entries, mark, next),
-                                Ok(PageTaken::NotThePage) => Pulled::NotThePage,
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "could not take a page");
-                                    Pulled::Failed
-                                }
-                            };
-                        (handed, pulled)
-                    },
-                )
-                .await;
+            let taken = self.through(
+                &asks,
+                &request,
+                |_| (),
+                |answer| {
+                    // A page of more entries than a page may hold is
+                    // refused where it is read off the wire.
+                    let WireMessage::EntryPulled(page) = answer else {
+                        return (0, None);
+                    };
+                    // What the relay handed counts as taken from it,
+                    // whatever is then done with it.
+                    let handed: u64 = page
+                        .entries
+                        .iter()
+                        .map(|bytes| counted_as_handed(bytes.len()))
+                        .sum();
+                    self.took(link, handed);
+                    let entries: Option<Vec<CheckedEntry>> = page
+                        .entries
+                        .iter()
+                        .map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+                        .collect();
+                    (
+                        handed,
+                        entries.map(|entries| (entries, page.mark, page.next)),
+                    )
+                },
+                |db, (handed, page)| {
+                    let Some((entries, mark, next)) = page else {
+                        return (handed, Pulled::NotThePage);
+                    };
+                    let page = Page {
+                        relay: &relay,
+                        channel,
+                        entries: &entries,
+                        mark,
+                        next,
+                    };
+                    let identity = &self.state.identity;
+                    let pulled = match at_relays::take_page(db, identity, &page, Places::Own, now) {
+                        Ok(PageTaken::Taken { .. }) => Pulled::Page(entries, mark, next),
+                        Ok(PageTaken::NotThePage) => Pulled::NotThePage,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "could not take a page");
+                            Pulled::Failed
+                        }
+                    };
+                    (handed, pulled)
+                },
+            );
+            // The round's time is gone while the relay is asked: the read
+            // stands there as it was.
+            let Ok(taken) = tokio::time::timeout(left, taken).await else {
+                return at;
+            };
             let (counted, pulled) = match taken {
                 Ok(taken) => taken,
                 // Asked enough of this relay for this minute, with the
                 // pass: it waits, and asks again.
                 Err(Refused::AskedEnough) => {
-                    tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
                     continue;
                 }
-                // A relay that has handed what it may in a minute resets
-                // the pull, though the device counted room for it: the
-                // device does not count the answers to its shows. On a
-                // connection that is still open it waits, and asks again.
-                Err(Refused::NotAnswered(_)) if link.is_open() => {
-                    tokio::time::sleep(LEFT_ROOM_WAIT).await;
+                // Refused for now: the relay counts the answers to shows
+                // in its minute, which the device does not see. Within a
+                // minute of the last page it handed, it has room again:
+                // the read waits, and asks again.
+                Err(Refused::NotAnswered(why))
+                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
+                {
+                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
                     continue;
                 }
                 Err(_) => {
@@ -312,6 +348,7 @@ impl DeviceEntries {
             };
             let page = match &pulled {
                 Pulled::Page(entries, mark, next) => {
+                    paged = self.clock.now();
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;

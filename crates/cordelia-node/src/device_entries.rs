@@ -1904,12 +1904,17 @@ impl DeviceEntries {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
-                                got_somewhere: got_somewhere(
-                                    (mark, after),
-                                    (page_mark, next),
-                                    &each,
-                                    read_again,
-                                ),
+                                // A page asked from a place forgotten
+                                // since is no end of the channel: the pull
+                                // goes on, from the start.
+                                stale: places == Places::Own,
+                                got_somewhere: places == Places::Own
+                                    || got_somewhere(
+                                        (mark, after),
+                                        (page_mark, next),
+                                        &each,
+                                        read_again,
+                                    ),
                             }),
                             Ok(PageTaken::NotThePage) => None,
                             Err(e) => {
@@ -1921,7 +1926,7 @@ impl DeviceEntries {
                 )
                 .await;
             match taken {
-                Ok(Some(page)) if page.entries == 0 => return Step::Done(true),
+                Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -2288,6 +2293,9 @@ struct PageSeen {
     read_again: bool,
     /// Whether the pull got somewhere by it ([`got_somewhere`]).
     got_somewhere: bool,
+    /// Whether it was asked from a place that is no longer the one kept:
+    /// every place was forgotten while it was asked for.
+    stale: bool,
 }
 
 /// Whether a pull got somewhere by a page: it was `asked` from a mark and
