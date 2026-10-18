@@ -47,6 +47,7 @@ pub mod found;
 pub mod handlers;
 pub mod history;
 pub mod leaving;
+pub mod lists;
 pub mod local;
 pub mod look;
 pub mod marks;
