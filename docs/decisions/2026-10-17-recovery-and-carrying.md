@@ -158,10 +158,10 @@ The other lines of a recovery, of `cordelia devices` and of the prompt of the ne
 
 **The command reads the personal channel of the change it recovers from (step 3) on from where each relay reached,** round after round:
 
-1. The first round is the read of today: from the start, for `CARRY_READ_MAX_SECS` at most.
+1. The first round is the read of today: from the start, for `CARRY_READ_MAX_SECS` at most. As today, a relay whose connection changed is read again within it, alone and from the start, over the connection there is then: `CARRY_PROOFS_MADE_AGAIN` times at most, each one of its readings. One that holds none of the channel then is said to hold none.
 2. The node says, of each relay that it read in part, the place it reached there: the mark of the relay's holding and the next place, as a pull keeps them (`at_relays.mark`, `at_relays.place`).
-3. The command asks again, of those relays only, from those places. Where a relay says in a round that its connection changed, it handed nothing: the command asks for the sessions again, and **asks that relay in the next round,** from the place it had, over the connection there is then. No relay is read again within a round. A relay that answers under another mark than the place was asked under has dropped and taken the channel again since: it is read from the start there, and what was read before is kept.
-4. It stops at a relay that has handed the channel to its end or holds none of it, and at a relay that has been asked in `RECOVERY_READ_ON_READS` rounds (five). **Each relay has its own count:** a round asked of a relay is one of its readings, whether it hands part of the channel or says that its connection changed, so what one relay does never costs another a reading. The bound is counted in readings and not in seconds since the first round: what a reading takes beyond its `CARRY_READ_MAX_SECS` (a page in flight at its end, the handing of what it read to the command) then never costs the fifth reading, which a channel at its cap needs. There are five rounds at most, each one reading at every relay asked, so the reading is five readings of two minutes and what each takes beyond that. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. **A relay that is not reached in a round is not asked again:** it stays as it was, and a relay that is down does not hold the read for 615 seconds. A relay that handed part of the channel and then answers that it holds none of it is read in part.
+3. The command asks again, of those relays only, from those places, and of each relay whose connection changed at every reading of the first round. Where a relay says in a later round that its connection changed, it handed nothing: the command asks for the sessions again, and **asks that relay in the next round,** from the place it had, over the connection there is then. No relay is read again within a round after the first. A relay that answers under another mark than the place was asked under has dropped and taken the channel again since: it is read from the start there, and what was read before is kept.
+4. It stops at a relay that has handed the channel to its end or holds none of it, and at a relay that has been asked in `RECOVERY_READ_ON_READS` rounds (five). **Each relay has its own count:** a round asked of a relay is one of its readings, whether it hands part of the channel or says that its connection changed, so what one relay does never costs another a reading. The bound is counted in readings and not in seconds since the first round: what a reading takes beyond its `CARRY_READ_MAX_SECS` (a page in flight at its end, the handing of what it read to the command) then never costs the fifth reading, which a channel at its cap needs. There are five rounds at most, each one reading at every relay asked but the first, which is up to two readings longer where a connection changed in it: so the reading is five readings of two minutes, or seven where a connection changed in the first round, and what each takes beyond that. **The end is what `read_left` says it is:** a page that holds nothing, or that leaves the place where it was. A relay that stalls so is read to its end, as today. **A relay that is not reached in a round is not asked again:** it stays as it was, and a relay that is down does not hold the read for 615 seconds. A relay that handed part of the channel and then answers that it holds none of it is read in part; one that handed nothing and then answers so holds none of it.
 
 The personal channels of the generations before, which are read for names, are read once each, as today (section 11).
 
@@ -175,12 +175,12 @@ The command holds the phrase while it reads, as it does today for the first roun
 
 ### 3.3 What a person reads
 
-After the first round, where a relay was read in part, and then one line after each round:
+After the first round, where a relay was read in part, and then one line after each round (a relay whose connection changed at every reading of the first round is not named in the first line: it handed nothing, and its line is the one below):
 
 ```
 The personal channel of change 3 is larger than one read. Reading on at relay-one: a relay
-may hold up to 16 MiB of it, which takes up to 5 reads of up to 2 minutes each. Ctrl-C stops
-here, and nothing is made.
+may hold up to 16 MiB of it, which takes up to 5 reads: up to 4 more are made, each of up to
+2 minutes and what it takes beyond that. Ctrl-C stops here, and nothing is made.
   relay-one: 4.0 MiB read so far.
   relay-one: 8.1 MiB read so far.
   relay-one: read to its end, 9.3 MiB.
@@ -188,7 +188,7 @@ here, and nothing is made.
 
 The lines are on standard output, as the other lines of a recovery are. A size is counted as a relay counts it against its cap: each entry's content and `ENTRY_OVERHEAD_BYTES`. So 9.3 MiB is of the 16 MiB a relay may hold.
 
-Where a relay is still read in part at the end, the line of `WasRead::lines` for a channel read to its end at no relay names, for each relay read on, why its reading stopped, as the line said of it after its last round does: its five reads were made, it holds none of it now, it handed nothing more, it was not reached, or it was not read. It says nothing of how long the channel was read. It ends so, in place of what it says of a device that filled the channel:
+Where a relay is still read in part at the end, the line of `WasRead::lines` for a channel read to its end at no relay names, for each relay read on, why its reading stopped, as the line said of it after its last round does: its five reads were made (and its connection changed at the last, where it did), it holds none of it now, it handed nothing more, it was not reached, or it was not read. It says nothing of how long the channel was read. It ends so, in place of what it says of a device that filled the channel:
 
 ```
 The personal channel of change 3 was read to its end at no relay: in part at relay-one (its
@@ -196,6 +196,8 @@ The personal channel of change 3 was read to its end at no relay: in part at rel
 names, may be missing from what was read. A relay that hands it more slowly than a channel
 at its largest needs, or stops, leaves it in part.
 ```
+
+Each other line before the yes that names a relay read on that was not read to its end names why too, whether it handed part of the channel or nothing. After its last round, a relay read on that handed nothing is said as "  relay-two: nothing of it was read: it was not reached.", and one that holds none of it as "  relay-two: it holds none of it."
 
 After a round in which a relay's connection changed: "  relay-two: its connection changed; it is read again from where it was."
 

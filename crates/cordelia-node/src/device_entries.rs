@@ -609,13 +609,17 @@ impl DeviceEntries {
     /// now, on a connection that is still open, is waited out the same
     /// way** (decision 2026-10-17 §3.2): the relay counts the answers to
     /// shows in its minute, which the device does not see, and a refusal
-    /// for room is not the end of what it will hand. **But only while the
-    /// relay is below its count of refusals for now**
-    /// ([`Self::asks_again_after_a_refusal`]): it resets with the same
-    /// code a request over its rates, which it counts as a breach. At the
-    /// count the read ends there in part. And **a relay at its count is
-    /// asked nothing at all** ([`Self::asks_after_refusals`]): before each
-    /// request, the read looks, and where the relay is at its count it
+    /// for room is not the end of what it will hand. **But only within a
+    /// minute of the last page the relay handed, or of the read's start,
+    /// and only while the relay is below its count of refusals for now**
+    /// ([`Self::asks_again_after_a_refusal`]), as a read of the device's
+    /// own channel asks again: within its minute a relay has room again,
+    /// and it resets with the same code a request over its rates, which it
+    /// counts as a breach. Otherwise the read ends there in part. And **a
+    /// relay at its count is asked nothing at all**
+    /// ([`Self::asks_after_refusals`]): before each step of the read, the
+    /// read looks, and the door holds its pull to the count again as it
+    /// goes out ([`Leave::left`]); where the relay is at its count the read
     /// ends with what it had, or says that the relay was not read. A
     /// channel that is not read to its end by `until` is handed back as
     /// that.
@@ -639,6 +643,8 @@ impl DeviceEntries {
         let reached = |(mark, next): (Mark, u64)| LeftPlace { mark, next };
         let mut read: Vec<Vec<u8>> = Vec::new();
         let mut proved = false;
+        // When the relay last handed a page, or the read began.
+        let mut paged = self.clock.now();
         loop {
             if Instant::now() >= until {
                 return LeftRead::Read {
@@ -697,6 +703,7 @@ impl DeviceEntries {
                         of.counts.pulled += entries.len() as u64;
                     }
                     proved = true;
+                    paged = self.clock.now();
                     let moved = (mark, next) != place;
                     let nothing = entries.is_empty();
                     read.extend(entries.iter().map(|entry| entry.to_wire()));
@@ -730,14 +737,16 @@ impl DeviceEntries {
                 // again (decision 2026-10-17 §3.2). The proof was
                 // answered.
                 //
-                // But only while the relay is below its count: it resets
-                // with the same code a request over its rates, which it
-                // counts as a breach. The refusal was counted where it
-                // was given ([`Leave`]); at the count the read ends there
-                // in part.
+                // But only within a minute of the last page, in which the
+                // relay has room again, and while the relay is below its
+                // count: it resets with the same code a request over its
+                // rates, which it counts as a breach. The refusal was
+                // counted where it was given ([`Leave`]); otherwise the
+                // read ends there in part.
                 Err(LeftRefused::NotNow) => {
                     proved = true;
-                    if !self.asks_again_after_a_refusal(link) {
+                    let within = self.clock.now() < paged + own_read::A_MINUTE;
+                    if !within || !self.asks_again_after_a_refusal(link) {
                         return LeftRead::Read {
                             entries: read,
                             whole: false,
@@ -745,6 +754,10 @@ impl DeviceEntries {
                         };
                     }
                     tokio::time::sleep(LEFT_ROOM_WAIT).await
+                }
+                // The door held its pull to the relay's count.
+                Err(LeftRefused::AtItsCount) if read.is_empty() && !proved => {
+                    return LeftRead::NotRead(AT_ITS_COUNT.into());
                 }
                 Err(LeftRefused::OwnChannel) if read.is_empty() => {
                     let own = "it is a channel of this device's own, which is not read this way";

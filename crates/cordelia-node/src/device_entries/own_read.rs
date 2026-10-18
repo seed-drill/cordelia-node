@@ -97,7 +97,7 @@ const ROUND_MOST: Duration = Duration::from_secs(CARRY_READ_MAX_SECS);
 /// The minute in which a relay counts what it hands a connection
 /// (PUSH_BYTES_PER_PEER_PER_MINUTE): a relay that refuses a pull for now
 /// has room again within it.
-const A_MINUTE: Duration = Duration::from_secs(60);
+pub(super) const A_MINUTE: Duration = Duration::from_secs(60);
 
 /// What came of one pull of the read.
 enum Pulled {
