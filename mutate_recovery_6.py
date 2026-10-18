@@ -256,8 +256,8 @@ MUTATIONS = [
      '''                    let within = self.clock.now() < paged + 100 * A_MINUTE;''',
      [E2E_EVERY]),
     ("NR20 every failure on a request is a refusal for now", LEAVE,
-     '''            match refused_for_now(&e) {''',
-     '''            match !refused_for_now(&e) || refused_for_now(&e) {''',
+     '''        match refused_for_now(e) {''',
+     '''        match !refused_for_now(e) || refused_for_now(e) {''',
      [E2E_OVERSIZE, E2E_RESET]),
     ("NR22 a wait for a refusal runs past the round's time", NODE_READ,
      '''                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;
@@ -298,11 +298,11 @@ MUTATIONS = [
     }''',
      [UNIT_WINDOW]),
     ("NR40 a request refused for now through the one way in is not counted", LEAVE,
-     '''                true => {
-                    self.refused_at(link);
-                    Refused::NotNow''',
-     '''                true => {
-                    Refused::NotNow''',
+     '''            true => {
+                self.refused_at(link);
+                Refused::NotNow''',
+     '''            true => {
+                Refused::NotNow''',
      [E2E_EVERY, E2E_COUNTED, E2E_PROOF_SHOW]),
     ("NR41 a show refused for now is not counted", LEAVE,
      '''            if refused_for_now(&e) {
@@ -333,11 +333,11 @@ MUTATIONS = [
                 return false;''',
      [E2E_AT_COUNT]),
     ("NR45 a request of the one door refused for now is not counted", LEAVE,
-     '''                true => {
-                    self.refused_at(link);
-                    Refused::NotNow''',
-     '''                true => {
-                    Refused::NotNow''',
+     '''            true => {
+                self.refused_at(link);
+                Refused::NotNow''',
+     '''            true => {
+                Refused::NotNow''',
      [E2E_WHEREVER]),
     ("NR46 a request asked outside the door refused for now is not counted", LEAVE,
      '''            if refused_for_now(&e) {
