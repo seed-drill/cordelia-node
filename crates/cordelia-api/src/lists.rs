@@ -2658,6 +2658,8 @@ pub(crate) mod tests {
         assert_eq!(refused(&s, 0, more, now), Refused::Full(Part::Subscription));
         // Undone, a subscription keeps its place, and is done again.
         on(&s, 0, Do::Subscribe(subscription(1, "a0", false)), now);
+        let again = Do::Subscribe(subscription(1, "a0", false));
+        assert_eq!(refused(&s, 0, again, now), Refused::NothingToUndo);
         on(&s, 0, Do::Subscribe(subscription(1, "a0", true)), now);
         for k in 0..64u8 {
             on(&s, 0, Do::Label(label(k, Some("k"))), now);
@@ -2667,6 +2669,8 @@ pub(crate) mod tests {
         on(&s, 0, Do::Label(label(1, Some("again"))), now);
         let long = Do::Label(label(2, Some(&"l".repeat(65))));
         on(&s, 0, Do::Label(label(1, None)), now);
+        let again = Do::Label(label(1, None));
+        assert_eq!(refused(&s, 0, again, now), Refused::NothingToUndo);
         assert!(matches!(
             refused(&s, 0, long, now),
             Refused::NotWritten(ListError::Label)
