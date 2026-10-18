@@ -70,14 +70,14 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use cordelia_api::carry::{self, Allows, Word};
+use cordelia_api::carrying::CONNECTION_CHANGED;
 use cordelia_api::change::{prepare_recovery, read_with};
 use cordelia_api::look::lists_of;
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Row};
 use cordelia_core::protocol::{
     CARRY_READ_MAX_SECS, MAX_COUNTED_DEVICES, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
-    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES,
-    RECOVERY_READ_ON_MAX_SECS, RECOVERY_READ_ON_READS,
+    MAX_STATEMENT_REMOVED, RECOVERY_MAX_DEVICES_SHOWN, RECOVERY_MAX_NAMES, RECOVERY_READ_ON_READS,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::statement::{Device, Statement, StatementError};
@@ -481,6 +481,12 @@ struct ReadingOn {
     place: Option<(String, u64)>,
     /// Whether it is asked again in the next round.
     on: bool,
+    /// How many readings it was asked in, the first round's among them:
+    /// RECOVERY_READ_ON_READS at most, its own, whatever another relay
+    /// does.
+    readings: u64,
+    /// Why its reading on stopped, where it was read in part.
+    why: Option<String>,
 }
 
 impl ReadingOn {
@@ -495,6 +501,8 @@ impl ReadingOn {
             bytes: bytes_handed(said),
             place: None,
             on: false,
+            readings: 1,
+            why: None,
         };
         let place = place_of(said);
         if at.read == "whole" && place.as_ref().is_some_and(|(mark, _)| *mark == no_mark()) {
@@ -503,11 +511,17 @@ impl ReadingOn {
                 0 => "not held".into(),
                 _ => "part".into(),
             };
+            if at.handed > 0 {
+                at.why = Some("it holds none of it now".into());
+            }
         }
-        at.on = at.read == "part"
-            && place
-                .as_ref()
-                .is_some_and(|(mark, next)| (mark.as_str(), *next) != (no_mark().as_str(), 0));
+        // Its connection changed: it is read in the next round, from the
+        // start, over the connection there is then.
+        at.on = at.read == CONNECTION_CHANGED
+            || (at.read == "part"
+                && place
+                    .as_ref()
+                    .is_some_and(|(mark, next)| (mark.as_str(), *next) != (no_mark().as_str(), 0)));
         at.place = place;
         at
     }
@@ -525,6 +539,9 @@ impl ReadingOn {
     /// - **It holds none of the channel now** (it says so, or answers
     ///   to its end under no mark): it handed part of it, and is read in
     ///   part.
+    /// - **Its connection changed:** it handed nothing, and is asked
+    ///   again in the next round from the same place, over the connection
+    ///   there is then, where it has a reading left.
     /// - **Anything else** (it was not reached, or not read): it is not
     ///   asked again, and stays as it was.
     fn round(&mut self, said: Option<&Value>) -> String {
@@ -541,10 +558,17 @@ impl ReadingOn {
         if holds_none {
             return self.in_part("it holds none of it now");
         }
+        if read == CONNECTION_CHANGED {
+            self.on = true;
+            return format!(
+                "  {}: its connection changed; it is read again from where it was.",
+                self.relay
+            );
+        }
         if !matches!(read, "whole" | "part") {
             let why = match read {
-                "" => "it could not be read again".to_string(),
-                read => format!("it could not be read again ({read})"),
+                "" => "the node said nothing of it".to_string(),
+                read => format!("it was {read}"),
             };
             return self.in_part(&why);
         }
@@ -569,6 +593,7 @@ impl ReadingOn {
     /// that says so.
     fn in_part(&mut self, why: &str) -> String {
         self.on = false;
+        self.why = Some(why.to_string());
         format!(
             "  {}: read in part, {} MiB: {why}.",
             self.relay,
@@ -585,7 +610,11 @@ impl ReadingOn {
     /// What is said of the relay once the reading on has ended, as the
     /// node says it of a read.
     fn said(&self) -> Value {
-        json!({ "relay": self.relay, "read": self.read, "entries": self.handed })
+        let mut said = json!({ "relay": self.relay, "read": self.read, "entries": self.handed });
+        if let Some(why) = &self.why {
+            said["why"] = why.as_str().into();
+        }
+        said
     }
 }
 
@@ -599,9 +628,7 @@ fn place_of(said: &Value) -> Option<(String, u64)> {
 /// where each relay reached, round after round (decision 2026-10-17
 /// §3.2). `round` reads it once: at every relay where it is given no
 /// relays, and otherwise at those it is given alone, each from its place
-/// in what it is given; it reads again a relay whose connection changed
-/// only where the function it is handed says yes, which counts that
-/// reading. `say` says a line.
+/// in what it is given. `say` says a line.
 ///
 /// 1. **The first round is the read of today:** from the start, at every
 ///    relay, for CARRY_READ_MAX_SECS at most.
@@ -612,13 +639,18 @@ fn place_of(said: &Value) -> Option<(String, u64)> {
 ///    as a relay counts it against its cap.
 /// 3. **It stops at a relay that has handed the channel to its end or
 ///    holds none of it, at one that was not reached in a round, at one
-///    where a round did not move the place, and everywhere once
-///    RECOVERY_READ_ON_READS readings have been made:** each round is a
-///    reading, and so is each reading again of a relay whose connection
-///    changed. Counted so, the bound is RECOVERY_READ_ON_MAX_SECS of
-///    readings of CARRY_READ_MAX_SECS, and what a reading takes beyond
-///    that never costs the reading that reaches a channel at its cap. A
-///    relay that handed part and then holds none of it is read in part.
+///    where a round did not move the place, and at one that has been
+///    asked in RECOVERY_READ_ON_READS rounds:** each relay has its own
+///    count, so what one relay does never costs another a reading. **A
+///    relay whose connection changed is asked again in the next round,**
+///    from where it was, over the connection there is then: that is one
+///    of its own readings, and no relay is read again within a round. So
+///    there are RECOVERY_READ_ON_READS rounds at most, each one reading
+///    of CARRY_READ_MAX_SECS at every relay asked, and what a reading
+///    takes beyond that never costs the reading that reaches a channel at
+///    its cap. A relay that handed part and then holds none of it is read
+///    in part. Each relay read in part keeps why its reading on stopped,
+///    and what is said of it says it (`why`).
 ///
 /// Returns every entry handed, each once, and what is said of each relay
 /// in the node's order, as the node says it of a read: a relay read on
@@ -629,21 +661,10 @@ fn read_on(
     mut round: impl FnMut(
         Option<&[String]>,
         &[Value],
-        &dyn Fn() -> bool,
     ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
     mut say: impl FnMut(String),
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
-    // The readings made, the first round's among them: another is made
-    // only where it is within the bound, and is counted then.
-    let readings = std::cell::Cell::new(1u64);
-    let another = || {
-        let within = readings.get() < RECOVERY_READ_ON_READS;
-        if within {
-            readings.set(readings.get() + 1);
-        }
-        within
-    };
-    let (first, relays) = round(None, &[], &another)?;
+    let (first, relays) = round(None, &[])?;
     let mut kept: HashSet<[u8; 32]> = HashSet::new();
     let mut entries: Vec<CheckedEntry> = Vec::new();
     for entry in first {
@@ -668,11 +689,12 @@ fn read_on(
     if !on.is_empty() {
         say(format!(
             "\nThe personal channel of change {number} is larger than one read. Reading on at {}: a \
-             relay may hold up to {} MiB of it, which takes up to {} minutes to read. Ctrl-C stops \
-             here, and nothing is made.",
+             relay may hold up to {} MiB of it, which takes up to {} reads of up to {} minutes \
+             each. Ctrl-C stops here, and nothing is made.",
             on.join(", "),
             MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / (1024 * 1024),
-            RECOVERY_READ_ON_MAX_SECS / 60
+            RECOVERY_READ_ON_READS,
+            CARRY_READ_MAX_SECS / 60
         ));
         for relay in at.iter().filter(|relay| relay.on) {
             say(format!(
@@ -683,6 +705,13 @@ fn read_on(
         }
     }
     loop {
+        // A relay that has been asked in so many rounds is asked no more.
+        let made = format!("its {RECOVERY_READ_ON_READS} reads were made");
+        for relay in at.iter_mut().filter(|relay| relay.on) {
+            if relay.readings >= RECOVERY_READ_ON_READS {
+                say(relay.in_part(&made));
+            }
+        }
         let asked: Vec<String> = at
             .iter()
             .filter(|r| r.on)
@@ -691,18 +720,15 @@ fn read_on(
         if asked.is_empty() {
             break;
         }
-        if !another() {
-            for relay in at.iter_mut().filter(|relay| relay.on) {
-                say(relay.in_part("the time to read it on is up"));
-            }
-            break;
+        for relay in at.iter_mut().filter(|relay| relay.on) {
+            relay.readings += 1;
         }
         let from: Vec<Value> = at
             .iter()
             .filter(|r| r.on)
             .filter_map(ReadingOn::from)
             .collect();
-        let (handed, relays) = round(Some(&asked), &from, &another)?;
+        let (handed, relays) = round(Some(&asked), &from)?;
         for entry in handed {
             if kept.insert(entry.id()) {
                 entries.push(entry);
@@ -758,6 +784,9 @@ fn read_as(relay: &Value) -> ReadAs {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PersonalRead {
     relays: Vec<(String, ReadAs, String)>,
+    /// Why the reading on stopped at each relay that was read on and is
+    /// read in part, by its name (decision 2026-10-17 §3.3).
+    why: Vec<(String, String)>,
 }
 
 impl PersonalRead {
@@ -766,9 +795,25 @@ impl PersonalRead {
             let (name, said) = (text(relay, "relay"), text(relay, "read"));
             (name.to_string(), read_as(relay), said.to_string())
         };
+        let why = relays.iter().filter_map(|relay| {
+            let why = relay["why"].as_str()?;
+            Some((text(relay, "relay").to_string(), why.to_string()))
+        });
         Self {
             relays: relays.iter().map(of).collect(),
+            why: why.collect(),
         }
+    }
+
+    /// The relays of which `known` is what is known, each by its name,
+    /// and with why its reading on stopped, where that is known.
+    fn at_with_why(&self, known: &[ReadAs]) -> Vec<String> {
+        let why = |relay: &String| self.why.iter().find(|(of, _)| of == relay);
+        let named = |relay: String| match why(&relay) {
+            Some((_, why)) => format!("{relay} ({why})"),
+            None => relay,
+        };
+        self.at(known).into_iter().map(named).collect()
     }
 
     /// The relays of which `known` is what is known, each by its name.
@@ -959,7 +1004,7 @@ impl WasRead {
                 self.phrase_not_read.join(", ")
             ));
         }
-        let part = of.at(&[ReadAs::Part]);
+        let part = of.at_with_why(&[ReadAs::Part]);
         let nothing = of.at(&[ReadAs::Nothing]);
         if of.any(ReadAs::Whole) {
             let not_to_the_end = of.at(&[ReadAs::Part, ReadAs::Nothing]);
@@ -983,12 +1028,9 @@ impl WasRead {
             lines.push(format!(
                 "The personal channel of change {number} was read to its end at no relay: in part \
                  at {}{not_at_all}.{none_held} Devices added since that change, and names, may be \
-                 missing from what was read. It was read on at each relay until the relay was \
-                 not reached, held none of it, handed no more, or had been read for {} minutes, as \
-                 long as a channel at its largest takes: a relay that hands it more slowly than \
-                 that, or stops, leaves it in part.",
+                 missing from what was read. A relay that hands it more slowly than a channel at \
+                 its largest needs, or stops, leaves it in part.",
                 part.join(", "),
-                RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS / 60
             ));
             lines.push(A_MISSING_DEVICE.to_string());
             lines.push(A_MISSING_NAME.to_string());
@@ -1357,9 +1399,9 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         // round (decision 2026-10-17 §3.2).
         let (handed, relays) = read_on(
             statement.number,
-            |asked, from, another| {
+            |asked, from| {
                 let (sessions, own) = (&mut sessions, &own);
-                read_round(config_path, &personal, sessions, own, asked, from, another)
+                read_round(config_path, &personal, sessions, own, asked, from)
             },
             |line| println!("{line}"),
         )?;
@@ -2192,6 +2234,8 @@ fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use cordelia_core::protocol::RECOVERY_READ_ON_MAX_SECS;
+
     fn row(n: u8, label: &str, added_by: Option<u8>, counts: bool) -> Row {
         Row {
             key: [n; 32],
@@ -2607,10 +2651,8 @@ mod tests {
                     true => format!(
                         "The personal channel of change 3 was read to its end at no relay: in \
                          part at {}{}.{} Devices added since that change, and names, may be \
-                         missing from what was read. It was read on at each relay until the relay \
-                         was not reached, held none of it, handed no more, or had been read for 10 \
-                         minutes, as long as a channel at its largest takes: a relay that hands it \
-                         more slowly than that, or stops, leaves it in part.\n",
+                         missing from what was read. A relay that hands it more slowly than a \
+                         channel at its largest needs, or stops, leaves it in part.\n",
                         at(Part),
                         match any(Nothing) {
                             true => format!(", and not at all at {}", at(Nothing)),
@@ -2681,10 +2723,8 @@ mod tests {
             read.lines()[0],
             "The personal channel of change 3 was read to its end at no relay: in part at one, \
              three. two, four hold none of it. Devices added since that change, and names, may \
-             be missing from what was read. It was read on at each relay until the relay was not \
-             reached, held none of it, handed no more, or had been read for 10 minutes, as long as \
-             a channel at its largest takes: a relay that hands it more slowly than that, or \
-             stops, leaves it in part."
+             be missing from what was read. A relay that hands it more slowly than a channel at \
+             its largest needs, or stops, leaves it in part."
         );
         assert_eq!(read.lines()[1..], [missing_device, missing_name]);
 
@@ -3841,25 +3881,17 @@ mod tests {
     fn reads_on(
         mut round: impl FnMut(usize, &[Value]) -> (Vec<CheckedEntry>, Vec<Value>),
     ) -> (Vec<CheckedEntry>, Vec<Value>, Asked, Vec<String>) {
-        reads_on_with(|number, from, _| round(number, from))
-    }
-
-    /// [`reads_on`], where `round` is also handed what says whether a
-    /// relay may be read again within the round, and counts it.
-    fn reads_on_with(
-        mut round: impl FnMut(usize, &[Value], &dyn Fn() -> bool) -> (Vec<CheckedEntry>, Vec<Value>),
-    ) -> (Vec<CheckedEntry>, Vec<Value>, Asked, Vec<String>) {
         use std::cell::RefCell;
         let asked: RefCell<Asked> = RefCell::new(Vec::new());
         let mut lines = Vec::new();
         let (entries, said) = read_on(
             3,
-            |relays, from, another| {
+            |relays, from| {
                 let number = asked.borrow().len();
                 asked
                     .borrow_mut()
                     .push((relays.map(<[String]>::to_vec), from.to_vec()));
-                Ok(round(number, from, another))
+                Ok(round(number, from))
             },
             |line| lines.push(line),
         )
@@ -3911,7 +3943,8 @@ mod tests {
         assert_eq!(
             lines.join("\n"),
             "\nThe personal channel of change 3 is larger than one read. Reading on at relay-one: \
-             a relay may hold up to 16 MiB of it, which takes up to 10 minutes to read. Ctrl-C \
+             a relay may hold up to 16 MiB of it, which takes up to 5 reads of up to 2 minutes \
+             each. Ctrl-C \
              stops here, and nothing is made.\n  \
              relay-one: 4.0 MiB read so far.\n  \
              relay-one: 8.0 MiB read so far.\n  \
@@ -3929,14 +3962,17 @@ mod tests {
         assert!(lines.is_empty(), "{lines:?}");
     }
 
-    /// **A recovery begins no round of reading on that would end after
-    /// RECOVERY_READ_ON_MAX_SECS from the first** (decision 2026-10-17
-    /// §3.2; §1, property 10). Each round takes CARRY_READ_MAX_SECS, and
-    /// the relay hands one entry of a hundred in a read: five rounds are
-    /// read, the relay is said to have been read in part, and the command
-    /// says that the time to read it on is up.
-    /// The bound is counted in readings, and a reading again of a relay
-    /// within a round is one.
+    /// **A relay is asked in RECOVERY_READ_ON_READS rounds at most, its
+    /// own count** (decision 2026-10-17 §3.2; §1, property 10). The relay
+    /// hands one entry of a hundred in a read: five rounds are read, the
+    /// relay is said to have been read in part, and why: its five reads
+    /// were made.
+    ///
+    /// **A relay whose connection changed is asked again in the next
+    /// round, from where it was, and that is one of its readings:** one
+    /// whose connection changes at the first round and the two after it
+    /// is asked from the start in each of them, and still read on in the
+    /// two rounds it has left.
     #[test]
     fn test_a_recovery_stops_reading_on_at_the_bound() {
         let held = channel_of(100);
@@ -3947,14 +3983,15 @@ mod tests {
         assert_eq!(asked.len(), 5);
         assert_eq!(entries.len(), 5);
         assert_eq!(asked[4].1, [place("relay-one", 4)]);
+        let made = "its 5 reads were made";
         assert_eq!(
             said,
-            [json!({ "relay": "relay-one", "read": "part", "entries": 5 })]
+            [json!({ "relay": "relay-one", "read": "part", "entries": 5, "why": made })]
         );
         assert_eq!(PersonalRead::of(&said).at(&[ReadAs::Part]), ["relay-one"]);
         assert_eq!(
             lines.last().unwrap(),
-            "  relay-one: read in part, 6.7 MiB: the time to read it on is up."
+            "  relay-one: read in part, 6.7 MiB: its 5 reads were made."
         );
         // Five readings of a round's time are within the bound, and a
         // sixth is not.
@@ -3962,22 +3999,32 @@ mod tests {
         assert!(readings <= RECOVERY_READ_ON_MAX_SECS);
         assert!(readings + CARRY_READ_MAX_SECS > RECOVERY_READ_ON_MAX_SECS);
 
-        // A reading again of a relay whose connection changed, within a
-        // round, is a reading of the bound: two in the first round leave
-        // two rounds more. One that the bound has no room for is not
-        // made.
-        let (_, said, asked, _) = reads_on_with(|number, from, another| {
-            if number == 0 {
-                assert!(another() && another());
+        // Its connection changed at the first three rounds.
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let (entries, said, asked, lines) = reads_on(|round, from| match round {
+            0..=2 => {
+                let of = json!({ "relay": "relay-one", "read": changed, "entries": 0 });
+                (Vec::new(), vec![of])
             }
-            if number == 2 {
-                assert!(!another());
+            _ => {
+                let (handed, said) = hands("relay-one", &held, from, 1);
+                (handed, vec![said])
             }
-            let (handed, said) = hands("relay-one", &held, from, 1);
-            (handed, vec![said])
         });
-        assert_eq!(asked.len(), 3);
-        assert_eq!(said[0]["entries"], 3);
+        assert_eq!(asked.len(), 5);
+        assert_eq!(
+            asked[1..4],
+            [
+                (asked_of(&["relay-one"]), vec![]),
+                (asked_of(&["relay-one"]), vec![]),
+                (asked_of(&["relay-one"]), vec![]),
+            ]
+        );
+        assert_eq!(asked[4].1, [place("relay-one", 1)]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(said[0]["why"], made);
+        let again = "  relay-one: its connection changed; it is read again from where it was.";
+        assert_eq!(lines.iter().filter(|line| *line == again).count(), 2);
     }
 
     /// **The end of a channel is what the node says it is** (decision
@@ -4107,11 +4154,11 @@ mod tests {
         for line in [
             "  Could not read the personal channel at eight to its end (part).",
             "  Could not read the personal channel at nine to its end (part).",
-            "  one: read in part, 4.0 MiB: it could not be read again (not reached).",
+            "  one: read in part, 4.0 MiB: it was not reached.",
             "  two: read in part, 4.0 MiB: it holds none of it now.",
             "  three: read in part, 5.3 MiB: it holds none of it now.",
             "  four: read in part, 4.0 MiB: it handed nothing more.",
-            "  five: read in part, 4.0 MiB: it could not be read again.",
+            "  five: read in part, 4.0 MiB: the node said nothing of it.",
             "  six: read to its end, 12.0 MiB.",
         ] {
             assert!(lines.contains(&line.to_string()), "{line}: {lines:#?}");
@@ -4162,53 +4209,51 @@ mod tests {
         assert!(whole.lines().is_empty(), "{:?}", whole.lines());
     }
 
-    /// **A relay whose connection keeps changing costs no reading beyond
-    /// the bound, and costs the other relays no reading of what they
-    /// handed already** (decision 2026-10-17 §3.2; §1, property 10). The
-    /// read on, a round of it and the asking of only some relays, on a
-    /// clock of the test's own where each reading takes
-    /// CARRY_READ_MAX_SECS. Relays a and b each hand ten entries of a
-    /// hundred in a reading; b says that its connection changed from 360
-    /// s on. b alone is read again, and only while the bound has room:
-    /// the whole read ends within RECOVERY_READ_ON_MAX_SECS, and a is
-    /// never read twice from the same place.
+    /// **A relay whose connection keeps changing costs no other relay a
+    /// reading, and no round is longer than one reading** (decision
+    /// 2026-10-17 §3.2; §1, property 10). The read on, a round of it and
+    /// the asking of only some relays, on a clock of the test's own where
+    /// each reading takes CARRY_READ_MAX_SECS. Relay a hands ten entries
+    /// of a hundred in a reading; b says at every reading that its
+    /// connection changed. a gets its five readings, each from where the
+    /// last ended; b is asked in the next round each time, as one of its
+    /// own readings; and the whole read ends within
+    /// RECOVERY_READ_ON_MAX_SECS.
     #[test]
     fn test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound() {
-        use crate::carry_cmd::round_again_where_changed;
+        use crate::carry_cmd::one_reading;
         use std::cell::{Cell, RefCell};
         let changed = cordelia_api::carrying::CONNECTION_CHANGED;
-        let (a, b) = (channel_of(100), channel_of(100));
+        let a = channel_of(100);
         let clock = Cell::new(0u64);
         let a_from: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+        let b_asked = Cell::new(0);
         let set_up: Sessions = vec![("a".into(), [1; 32]), ("b".into(), [2; 32])];
         let mut sessions = set_up.clone();
         let mut lines = Vec::new();
         let (_, said) = read_on(
             3,
-            |asked, from, another| {
+            |asked, from| {
                 let read = |of_those: &Sessions, places: &[Value]| {
-                    let now = clock.get();
-                    clock.set(now + CARRY_READ_MAX_SECS);
+                    clock.set(clock.get() + CARRY_READ_MAX_SECS);
                     let (mut entries, mut said) = (Vec::new(), Vec::new());
                     for (relay, _) in of_those {
-                        if relay == "b" && now >= 360 {
+                        if relay == "b" {
+                            b_asked.set(b_asked.get() + 1);
                             said.push(json!({ "relay": "b", "read": changed, "entries": 0 }));
                             continue;
                         }
-                        if relay == "a" {
-                            let at = places.iter().find(|place| place["relay"] == "a");
-                            let at = at.map_or(0, |place| place["place"].as_u64().unwrap());
-                            a_from.borrow_mut().push(at);
-                        }
-                        let held = if relay == "a" { &a } else { &b };
-                        let (handed, of) = hands(relay, held, places, 10);
+                        let at = places.iter().find(|place| place["relay"] == "a");
+                        let at = at.map_or(0, |place| place["place"].as_u64().unwrap());
+                        a_from.borrow_mut().push(at);
+                        let (handed, of) = hands(relay, &a, places, 10);
                         entries.extend(handed);
                         said.push(of);
                     }
                     Ok((entries, said))
                 };
                 let ask = || Ok(set_up.clone());
-                round_again_where_changed(&mut sessions, asked, from, read, ask, another)
+                one_reading(&mut sessions, asked, from, read, ask)
             },
             |line| lines.push(line),
         )
@@ -4218,26 +4263,59 @@ mod tests {
             "ran {} s",
             clock.get()
         );
-        assert_eq!(*a_from.borrow(), [0, 10, 20, 30]);
+        assert_eq!(*a_from.borrow(), [0, 10, 20, 30, 40]);
+        assert_eq!(b_asked.get(), 5);
         let read_as = |relay: &str| {
             let of = said.iter().find(|of| of["relay"] == relay).unwrap();
-            (read_as(of), entries_handed(of))
+            (read_as(of), entries_handed(of), of["why"].clone())
         };
-        assert_eq!(read_as("a"), (ReadAs::Part, 40));
-        assert_eq!(read_as("b"), (ReadAs::Part, 30));
-        assert!(
-            lines.contains(&format!(
-                "  b: read in part, {} MiB: it could not be read again ({changed}).",
-                mib(30 * COUNTED_AS)
-            )),
-            "{lines:#?}"
-        );
+        let made = json!("its 5 reads were made");
+        assert_eq!(read_as("a"), (ReadAs::Part, 50, made.clone()));
+        assert_eq!(read_as("b"), (ReadAs::Nothing, 0, made));
         assert_eq!(
             lines.last().unwrap(),
-            &format!(
-                "  a: read in part, {} MiB: the time to read it on is up.",
-                mib(40 * COUNTED_AS)
-            )
+            "  b: read in part, 0.0 MiB: its 5 reads were made."
         );
+    }
+
+    /// **What is said before the yes of a channel read in part says, for
+    /// each relay read on, why its reading stopped, and nothing of how
+    /// long it was read** (decision 2026-10-17 §3.3). Relay a is read in
+    /// all its five readings and not to the end; b hands part of it in
+    /// the first round and then says at every reading that its
+    /// connection changed; c holds none of it at the second round. Each
+    /// is named with its reason.
+    #[test]
+    fn test_what_is_said_of_a_read_in_part_says_why_each_relay_stopped() {
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let held = channel_of(100);
+        let (_, said, _, _) = reads_on(|round, from| {
+            let mut entries = Vec::new();
+            let mut said = Vec::new();
+            for relay in ["a", "b", "c"] {
+                let (handed, mut of) = hands(relay, &held, from, 1);
+                match (round, relay) {
+                    (0, _) | (_, "a") => entries.extend(handed),
+                    (_, "b") => of = json!({ "relay": "b", "read": changed, "entries": 0 }),
+                    (_, _) => of = json!({ "relay": "c", "read": "not held", "entries": 0 }),
+                }
+                said.push(of);
+            }
+            (entries, said)
+        });
+        let read = PersonalRead::of(&said);
+        let was = WasRead::of(3, read, &[], 3);
+        let line = &was.lines()[0];
+        assert!(
+            line.starts_with(
+                "The personal channel of change 3 was read to its end at no relay: in part at a \
+                 (its 5 reads were made), b (its 5 reads were made), c (it holds none of it now). \
+                 Devices added since that change, and names, may be missing from what was read. A \
+                 relay that hands it more slowly than a channel at its largest needs, or stops, \
+                 leaves it in part."
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("minutes"), "{line}");
     }
 }

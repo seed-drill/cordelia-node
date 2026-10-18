@@ -1635,9 +1635,10 @@ is slow. A recovery counts it in readings of `CARRY_READ_MAX_SECS`
 120 = 5.
 
 **Rationale:** How many readings a recovery makes of the personal channel
-of the change it recovers from, at most (decision 2026-10-17 §3.2). Each
-round is one, and so is each reading again of a relay whose connection
-changed. The bound is counted in readings and not in seconds since the
+of the change it recovers from at each relay, at most (decision 2026-10-17
+§3.2). Each round asked of a relay is one of its own, whether it hands part
+of the channel or says its connection changed, so that what one relay does
+never costs another a reading; so there are five rounds at most. The bound is counted in readings and not in seconds since the
 first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
 (a page in flight at its end, the handing of what it read to the command)
 never costs the fifth reading, which a channel at its cap needs: four

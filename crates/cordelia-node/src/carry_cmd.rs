@@ -839,12 +839,11 @@ pub(crate) fn read_with_secret(
 
 /// One round of a read on (decision 2026-10-17 §3.2): [`read_with_secret`],
 /// at the relays named in `asked` alone where it names any, and at each
-/// relay that `from` gives a place for, on from that place. What is said
-/// of each relay read there, whole or in part, carries the place it
-/// reached: its `mark` and `place`, as `from` is given them
-/// ([`read_through_the_node`]). Where a connection changed, only the
-/// relays whose connection changed are read again, and only while
-/// `may_read_again` says yes ([`round_again_where_changed`]).
+/// relay that `from` gives a place for, on from that place, read once.
+/// What is said of each relay read there, whole or in part, carries the
+/// place it reached: its `mark` and `place`, as `from` is given them
+/// ([`read_through_the_node`]). Where a connection changed, the relay is
+/// not read again in this round ([`one_reading`]).
 pub(crate) fn read_round(
     config_path: &str,
     secret: &[u8; 32],
@@ -852,10 +851,9 @@ pub(crate) fn read_round(
     own: &[u8; 32],
     asked: Option<&[String]>,
     from: &[Value],
-    may_read_again: impl FnMut() -> bool,
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
     let channel = derive::channel_id(secret)?;
-    round_again_where_changed(
+    one_reading(
         sessions,
         asked,
         from,
@@ -864,66 +862,34 @@ pub(crate) fn read_round(
             read_through_the_node(config_path, &channel, proofs, from)
         },
         || sessions_now(config_path),
-        may_read_again,
     )
 }
 
-/// A round of a read on, with what reads and what asks for the sessions
-/// given (decision 2026-10-17 §3.2): `read` reads the channel with proofs
-/// over the sessions it is handed, from the places it is handed; `ask`
-/// gives the sessions as the node says them now.
+/// One reading of a round of a read on, with what reads and what asks for
+/// the sessions given (decision 2026-10-17 §3.2): `read` reads the channel
+/// with proofs over the sessions it is handed, from the places it is
+/// handed; `ask` gives the sessions as the node says them now.
 ///
 /// The relays named in `asked` (every relay where it names none) are read
-/// once, each from its place in `from` ([`at_those_alone`]). **Where the
-/// node says of some that their connection changed, the sessions are
-/// asked for again, and those relays alone are read again,** from the
-/// places they had: the others answered, and what they handed stands. So
-/// a relay whose connection keeps changing costs the others no reading
-/// of what they handed already. That is done CARRY_PROOFS_MADE_AGAIN
-/// times at most, and **only while `may_read_again` says yes**: each
-/// reading again is a reading of the read on's bound. What is handed is
-/// kept, each entry once, and what is said last of a relay stands.
-pub(crate) fn round_again_where_changed(
+/// once, each from its place in `from` ([`at_those_alone`]). **No relay is
+/// read again in the round:** where the node says of one that its
+/// connection changed, the sessions are asked for again, so that the next
+/// round makes its proofs over the connection there is then, and that
+/// relay is asked again there, as one of its own readings. So a relay
+/// whose connection keeps changing costs no other relay a reading, and
+/// makes no round longer than one reading.
+pub(crate) fn one_reading(
     sessions: &mut Sessions,
     asked: Option<&[String]>,
     from: &[Value],
-    mut read: impl FnMut(&Sessions, &[Value]) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
-    mut ask: impl FnMut() -> anyhow::Result<Sessions>,
-    mut may_read_again: impl FnMut() -> bool,
+    read: impl FnOnce(&Sessions, &[Value]) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+    ask: impl FnOnce() -> anyhow::Result<Sessions>,
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
-    let mut entries: Vec<CheckedEntry> = Vec::new();
-    let mut kept: HashSet<[u8; 32]> = HashSet::new();
-    let mut said: Vec<Value> = Vec::new();
-    let mut those: Option<Vec<String>> = asked.map(<[String]>::to_vec);
-    let mut places: Vec<Value> = from.to_vec();
-    for made_again in 0..=CARRY_PROOFS_MADE_AGAIN {
-        let (handed, relays) = at_those_alone(those.as_deref(), sessions, |of_those| {
-            read(of_those, &places)
-        })?;
-        for entry in handed {
-            if kept.insert(entry.id()) {
-                entries.push(entry);
-            }
-        }
-        for relay in relays {
-            match said.iter_mut().find(|of| of["relay"] == relay["relay"]) {
-                Some(of) => *of = relay,
-                None => said.push(relay),
-            }
-        }
-        let changed: Vec<String> = said
-            .iter()
-            .filter(|of| connection_changed(of))
-            .map(|of| text(of, "relay").to_string())
-            .collect();
-        if changed.is_empty() || made_again == CARRY_PROOFS_MADE_AGAIN || !may_read_again() {
-            break;
-        }
-        places.retain(|place| changed.iter().any(|relay| place["relay"] == *relay));
-        those = Some(changed);
+    let (entries, relays) = at_those_alone(asked, sessions, |of_those| read(of_those, from))?;
+    if relays.iter().any(connection_changed) {
         *sessions = ask()?;
     }
-    Ok((entries, said))
+    Ok((entries, relays))
 }
 
 /// One reading, at the relays named in `asked` alone where it names any
@@ -1781,93 +1747,51 @@ mod tests {
         assert_eq!(bytes_handed(&said("one", "part")), 0);
     }
 
-    /// **A round of a read on reads again only the relays whose
-    /// connection changed, from the places they had, and only while it
-    /// may** (decision 2026-10-17 §3.2). One reads in part, and two says
-    /// that its connection changed: the sessions are asked for again, and
-    /// two alone is read again, from its place. What one said stands, and
-    /// what both handed is kept, each entry once. Where it may not read
-    /// again, two is said as one whose connection changed.
+    /// **One reading of a round reads each relay asked once, and asks
+    /// for the sessions again only where a connection changed** (decision
+    /// 2026-10-17 §3.2). One reads in part, and two says that its
+    /// connection changed: two is not read again in the round, and the
+    /// sessions are asked for, for the next. Where no connection changed,
+    /// they are not.
     #[test]
-    fn test_a_round_reads_again_only_the_relays_whose_connection_changed() {
-        use cordelia_crypto::entry::{Inside, Value as Held};
+    fn test_one_reading_reads_no_relay_again_and_asks_for_the_sessions_where_one_changed() {
         use std::cell::RefCell;
-        let author = NodeIdentity::generate().unwrap();
-        let entry = |n: u8| {
-            let inside = Inside {
-                name: format!("{n}.md"),
-                value: Held::Text("x".into()),
-                chain: Some(Vec::new()),
-            };
-            let sealed = Entry::seal(&[9; 32], &author, 1, &inside).unwrap();
-            sealed.check().unwrap()
-        };
-        let (first, second, third) = (entry(1), entry(2), entry(3));
         let changed = cordelia_api::carrying::CONNECTION_CHANGED;
         let set_up: Sessions = vec![("one".into(), [1; 32]), ("two".into(), [2; 32])];
+        let after: Sessions = vec![("one".into(), [1; 32]), ("two".into(), [3; 32])];
         let place = |relay: &str, at: u64| json!({ "relay": relay, "mark": "06", "place": at });
         let from = [place("one", 4), place("two", 7)];
-        let run = |may: bool| {
-            let read: RefCell<Vec<(Vec<String>, Vec<Value>)>> = RefCell::new(Vec::new());
+        for two in ["part", changed] {
+            let read: RefCell<Vec<(Sessions, Vec<Value>)>> = RefCell::new(Vec::new());
             let asked = RefCell::new(0);
             let mut sessions = set_up.clone();
-            let (entries, said) = round_again_where_changed(
+            let (_, said) = one_reading(
                 &mut sessions,
                 None,
                 &from,
                 |of_those, places| {
-                    let relays = of_those.iter().map(|(relay, _)| relay.clone()).collect();
-                    read.borrow_mut().push((relays, places.to_vec()));
-                    Ok(match read.borrow().len() {
-                        1 => (
-                            vec![first.clone(), second.clone()],
-                            vec![
-                                json!({ "relay": "one", "read": "part", "entries": 2 }),
-                                json!({ "relay": "two", "read": changed, "entries": 0 }),
-                            ],
-                        ),
-                        _ => (
-                            vec![second.clone(), third.clone()],
-                            vec![json!({ "relay": "two", "read": "part", "entries": 2 })],
-                        ),
-                    })
+                    read.borrow_mut().push((of_those.clone(), places.to_vec()));
+                    Ok((
+                        Vec::new(),
+                        vec![
+                            json!({ "relay": "one", "read": "part" }),
+                            json!({ "relay": "two", "read": two }),
+                        ],
+                    ))
                 },
                 || {
                     *asked.borrow_mut() += 1;
-                    Ok(set_up.clone())
+                    Ok(after.clone())
                 },
-                || may,
             )
             .unwrap();
-            let ids: Vec<[u8; 32]> = entries.iter().map(|entry| entry.id()).collect();
-            (ids, said, read.into_inner(), asked.into_inner())
-        };
-        let (ids, said, read, asked) = run(true);
-        assert_eq!(ids, [first.id(), second.id(), third.id()]);
-        assert_eq!(
-            said,
-            [
-                json!({ "relay": "one", "read": "part", "entries": 2 }),
-                json!({ "relay": "two", "read": "part", "entries": 2 }),
-            ]
-        );
-        let both = vec!["one".to_string(), "two".to_string()];
-        assert_eq!(
-            read,
-            [
-                (both, from.to_vec()),
-                (vec!["two".to_string()], vec![place("two", 7)])
-            ]
-        );
-        assert_eq!(asked, 1);
-        // It may not read again: two is said as it was.
-        let (ids, said, read, asked) = run(false);
-        assert_eq!(ids, [first.id(), second.id()]);
-        assert_eq!(
-            said[1],
-            json!({ "relay": "two", "read": changed, "entries": 0 })
-        );
-        assert_eq!((read.len(), asked), (1, 0));
+            assert_eq!(*read.borrow(), [(set_up.clone(), from.to_vec())]);
+            assert_eq!(said[1]["read"], two);
+            match two == changed {
+                true => assert_eq!((*asked.borrow(), &sessions), (1, &after)),
+                false => assert_eq!((*asked.borrow(), &sessions), (0, &set_up)),
+            }
+        }
     }
 
     /// **A read on asks only the relays it names** (decision 2026-10-17
