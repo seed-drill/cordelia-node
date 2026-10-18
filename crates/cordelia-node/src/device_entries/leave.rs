@@ -108,8 +108,8 @@ use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
-    ENTRY_PAGE_MAX_ENTRIES, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
-    WAKE_WAIT_SECS,
+    ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES,
+    SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -390,6 +390,13 @@ pub enum LeftRefused {
     /// The relay did not answer, or not as it answers such a request.
     NotAnswered(String),
 }
+
+/// What a request is said to have been answered with where the relay
+/// reset its stream with ERR_RATE_LIMIT: as a relay refuses a pull for
+/// more than it may hand the connection for now, which is no breach, or
+/// a request over the allowance. The connection is still open.
+pub(super) const NOT_NOW: &str =
+    "refused for now: the relay may hand this connection no more in this minute";
 
 /// What a show was answered, and what it cost to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1012,9 +1019,27 @@ async fn exchange(
     let mut stream = tokio::io::join(&mut recv, &mut send);
     let answer = codec::send_request(&mut stream, protocol, request)
         .await
-        .map_err(|e| e.to_string());
+        .map_err(|e| match refused_for_now(&e) {
+            true => NOT_NOW.to_string(),
+            false => e.to_string(),
+        });
     let _ = send.finish();
     answer
+}
+
+/// Whether a request failed because the relay reset its stream with
+/// ERR_RATE_LIMIT ([`NOT_NOW`]): the answer, or the request, was cut off
+/// with that code. A connection that was lost is not that.
+fn refused_for_now(e: &codec::CodecError) -> bool {
+    let codec::CodecError::Io(io) = e else {
+        return false;
+    };
+    let code = quinn::VarInt::from_u32(ERR_RATE_LIMIT);
+    let Some(inner) = io.get_ref() else {
+        return false;
+    };
+    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(at)) if *at == code)
+        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)
 }
 
 #[cfg(test)]

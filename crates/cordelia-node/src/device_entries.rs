@@ -85,6 +85,16 @@
 //! relay made again and reads on: a new connection starts with none
 //! remembered.
 //!
+//! ## A read of a channel of its own, with places of its own
+//!
+//! Before a carried name is let go, the device reads the name's channel
+//! at each relay (decision 2026-10-17 §4.2): [`DeviceEntries::own`] takes
+//! such an asking up. It is a pull under leave, as a pass makes it,
+//! within the pass's budget at each relay, each page through the one
+//! door; but its places are its own, kept in memory under the read's ID,
+//! and it marks nothing as sent. It reads round by round, as it is
+//! asked, outside the database's lock.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -95,6 +105,7 @@
 //! at a relay is left before it is sent there again.
 
 pub mod leave;
+mod own_read;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -102,7 +113,7 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
 use cordelia_api::at_relays::{
-    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Pushed, Sent, Stands, Which,
+    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands, Which,
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
@@ -116,7 +127,7 @@ use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, entry_cost, left_proofs_kept_back,
+    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -219,6 +230,12 @@ struct OfLink {
     /// that was left, each from the moment its proof is sent. It is what
     /// the relay remembers for the connection, or more.
     proved: HashMap<[u8; 32], Instant>,
+    /// Of those, the channels whose proof was answered no, by a relay
+    /// that does not hold the channel, where whoever proved it did not act
+    /// on that: a read with places of its own (decision 2026-10-17 §4.2).
+    /// A pass proves such a channel again, and acts on the answer: the
+    /// relay is sent the channel from the start.
+    no_unheeded: HashSet<[u8; 32]>,
     /// When the channels of the names that the personal channel lists
     /// were last proved on it, all of them.
     listed_proved: Option<Instant>,
@@ -327,6 +344,9 @@ pub struct DeviceEntries {
     /// One asking at a time at each relay for what the device of a typed
     /// key hands over, by the relay's name.
     asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One round at a time of a read of a channel of the device's own
+    /// (decision 2026-10-17 §4.2).
+    own_rounds: tokio::sync::Mutex<()>,
 }
 
 impl DeviceEntries {
@@ -348,6 +368,7 @@ impl DeviceEntries {
             waking: tokio::sync::Mutex::new(()),
             turns: Mutex::default(),
             asking: Mutex::default(),
+            own_rounds: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1706,17 +1727,20 @@ impl DeviceEntries {
     ///
     /// What is remembered is that the proof was made and answered, and
     /// not what was answered: a relay remembers a proof that held for a
-    /// channel it does not hold yet.
+    /// channel it does not hold yet. **But a "no" that was not acted on is
+    /// remembered too:** where the device holds the channel, it proves it
+    /// again, so that the relay is sent it from the start.
     async fn prove(&self, at: &At<'_>, channel: &Own, held: bool) -> Step {
         let link = at.link;
         let now = self.clock.now();
         {
             let kept = lock(&self.kept);
-            let proved = kept.links.get(&link.id()).map(|of| &of.proved);
-            let lately = proved
-                .and_then(|proved| proved.get(&channel.id))
+            let of = kept.links.get(&link.id());
+            let lately = of
+                .and_then(|of| of.proved.get(&channel.id))
                 .is_some_and(|at| now.saturating_duration_since(*at) < PROOF_AGAIN);
-            if lately {
+            let unheeded = of.is_some_and(|of| of.no_unheeded.contains(&channel.id));
+            if lately && !(held && unheeded) {
                 return Step::Done(true);
             }
         }
@@ -1753,10 +1777,14 @@ impl DeviceEntries {
             )
             .await;
         match answered {
-            Ok(Some(_)) => {
+            Ok(Some(proved)) => {
                 let mut kept = lock(&self.kept);
                 let of = kept.links.entry(link.id()).or_default();
                 of.proved.insert(channel.id, now);
+                match !proved && !held {
+                    true => of.no_unheeded.insert(channel.id),
+                    false => of.no_unheeded.remove(&channel.id),
+                };
                 kept.relays
                     .entry(link.name().to_string())
                     .or_default()
@@ -1882,16 +1910,31 @@ impl DeviceEntries {
                             mark: page_mark,
                             next,
                         };
-                        match at_relays::take_page(db, &self.state.identity, &page, now) {
+                        // Where every place was forgotten while the page
+                        // was asked for, the place it was asked from is
+                        // not the one kept: its entries are taken, and it
+                        // moves no place, so that the channel is read
+                        // again from the start (§16).
+                        let asked_from = at_relays::place(db, &relay, &channel.id);
+                        let places = match asked_from {
+                            Ok(kept) if kept == (mark, after) => Places::Kept,
+                            _ => Places::Own,
+                        };
+                        match at_relays::take_page(db, &self.state.identity, &page, places, now) {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
-                                got_somewhere: got_somewhere(
-                                    (mark, after),
-                                    (page_mark, next),
-                                    &each,
-                                    read_again,
-                                ),
+                                // A page asked from a place forgotten
+                                // since is no end of the channel: the pull
+                                // goes on, from the start.
+                                stale: places == Places::Own,
+                                got_somewhere: places == Places::Own
+                                    || got_somewhere(
+                                        (mark, after),
+                                        (page_mark, next),
+                                        &each,
+                                        read_again,
+                                    ),
                             }),
                             Ok(PageTaken::NotThePage) => None,
                             Err(e) => {
@@ -1903,7 +1946,7 @@ impl DeviceEntries {
                 )
                 .await;
             match taken {
-                Ok(Some(page)) if page.entries == 0 => return Step::Done(true),
+                Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -2124,11 +2167,13 @@ impl DeviceEntries {
     /// Whether the device takes a page more from the relay at `link`
     /// now: what that relay handed it in the last minute leaves room for
     /// one entry of the largest size, within what a relay may hand a
-    /// connection in a minute.
+    /// connection in a minute, beside the room that a relay keeps for the
+    /// answer to a show (SHOW_ANSWER_ROOM_BYTES), which it hands no page
+    /// into.
     fn room_to_take(&self, link: &Link) -> bool {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
-        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES)
+        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES
     }
 
     /// The relay at `link` handed a page that is counted at `bytes`.
@@ -2268,6 +2313,9 @@ struct PageSeen {
     read_again: bool,
     /// Whether the pull got somewhere by it ([`got_somewhere`]).
     got_somewhere: bool,
+    /// Whether it was asked from a place that is no longer the one kept:
+    /// every place was forgotten while it was asked for.
+    stale: bool,
 }
 
 /// Whether a pull got somewhere by a page: it was `asked` from a mark and

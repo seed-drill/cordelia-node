@@ -1629,6 +1629,21 @@ at once, and a word that is found later is no word.
 number. It is longer than a carry may read a name (`CARRY_READ_MAX_SECS`);
 no measurement behind it yet.
 
+#### LET_GO_READ_STANDS_SECS = 600
+
+**Derivation:** `CARRY_WORD_SECS`, as a `u64`; `protocol.rs` asserts that
+`CARRY_WORD_SECS` is above 0.
+
+**Rationale:** How long the read that `cordelia sync unmap` shows, or the
+count that a device that has stopped took from its notes, stands for the
+`discard` that follows it (decision 2026-10-17 §5). The person reads the
+lines and types the word in that time. A word typed later lets go of
+nothing, and the command is run again. It is measured from the end of the
+read's last round, on the node's monotonic clock, so that a step of the wall
+clock neither widens nor shortens it, and a read older than it is kept no
+more. Derived: as long as a word of the phrase for a carry stands, the other
+act at a prompt that follows what the node read.
+
 #### CARRY_PART_MAX_BYTES = 512 KB
 
 **Derivation:** Half of what one message of the wire holds,

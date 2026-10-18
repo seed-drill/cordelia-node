@@ -38,6 +38,11 @@
 //! again from the start, since what that key signed was refused when it
 //! arrived, and was not kept.
 //!
+//! A read with places of its own ([`Places::Own`], decision 2026-10-17
+//! §4.2) takes its pages through the same function and the same door, and
+//! moves no place that the device keeps and nothing that it notes as
+//! sent: [`crate::own_read`] keeps its places, in memory.
+//!
 //! ## Sending (§7.3)
 //!
 //! What a device holds of a channel is sent to each relay in the order in
@@ -430,6 +435,21 @@ pub struct Page<'a> {
     pub next: u64,
 }
 
+/// Whose place a page is taken under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Places {
+    /// The place that the device keeps at the relay, which a pass reads
+    /// on from: the page moves it, and what the page brought is sent as
+    /// a pass's page has it sent.
+    Kept,
+    /// A place of a read's own, kept in memory by whoever reads
+    /// (decision 2026-10-17 §4.2 item 2): the read before a carried name
+    /// is let go. The page moves no place that the device keeps, and
+    /// marks nothing as sent: the pass's place and its notes of what was
+    /// sent are left as they were.
+    Own,
+}
+
 /// What became of a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageTaken {
@@ -467,15 +487,33 @@ pub enum PageTaken {
 ///   was fetched.
 /// - What the page brought is not sent back to the relay it came from,
 ///   where nothing else was waiting to be sent there.
+///
+/// **A page under places of a read's own ([`Places::Own`]) is taken
+/// through the same door, and does none of the above** (decision
+/// 2026-10-17 §4.2 item 2): the place kept at the relay, and how far the
+/// relay was sent the channel, are as they were. Whoever reads keeps its
+/// places itself. Where an entry makes a key count, or lets one add,
+/// every place kept is still forgotten: that is owed by whoever takes
+/// such an entry (decision 2026-10-04 §16).
 pub fn take_page(
     conn: &Connection,
     identity: &NodeIdentity,
     page: &Page,
+    places: Places,
     now: i64,
 ) -> Result<PageTaken, PersonError> {
     let channel = &page.channel.id;
     if page.entries.iter().any(|entry| entry.channel != *channel) {
         return Ok(PageTaken::NotThePage);
+    }
+    if places == Places::Own {
+        return in_one(conn, || {
+            let (each, read_again) = through_the_door(conn, identity, page, now)?;
+            if read_again {
+                kept_rows::forget_places(conn)?;
+            }
+            Ok(PageTaken::Taken { each, read_again })
+        });
     }
     in_one(conn, || {
         let kept = kept_rows::kept(conn, page.relay, channel)?;
@@ -494,20 +532,7 @@ pub fn take_page(
         // page: where nothing does, nothing does after it.
         let waiting = kept_rows::last_taken(conn, channel)? > sent_from(conn, page.channel, &kept)?;
 
-        let mut each = Vec::with_capacity(page.entries.len());
-        let mut read_again = false;
-        for entry in page.entries {
-            let taken = take(conn, identity, entry, now)?;
-            if let Taken::Own {
-                came_to_count,
-                came_to_add,
-                ..
-            } = &taken
-            {
-                read_again |= *came_to_count > 0 || *came_to_add > 0;
-            }
-            each.push(taken);
-        }
+        let (each, read_again) = through_the_door(conn, identity, page, now)?;
 
         if page.mark != NO_MARK {
             kept_rows::keep_place(conn, page.relay, channel, &page.mark, page.next)?;
@@ -521,6 +546,32 @@ pub fn take_page(
         }
         Ok(PageTaken::Taken { each, read_again })
     })
+}
+
+/// Each entry of `page` through the one door, in its order: what became
+/// of each, and whether a key came to count or to may add by one of
+/// them.
+fn through_the_door(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    page: &Page,
+    now: i64,
+) -> Result<(Vec<Taken>, bool), PersonError> {
+    let mut each = Vec::with_capacity(page.entries.len());
+    let mut read_again = false;
+    for entry in page.entries {
+        let taken = take(conn, identity, entry, now)?;
+        if let Taken::Own {
+            came_to_count,
+            came_to_add,
+            ..
+        } = &taken
+        {
+            read_again |= *came_to_count > 0 || *came_to_add > 0;
+        }
+        each.push(taken);
+    }
+    Ok((each, read_again))
 }
 
 /// `relay` answered a proof of `channel` with no: it does not hold the
@@ -1303,7 +1354,7 @@ mod tests {
                 mark: holding.mark,
                 next,
             };
-            match take_page(&on.conn, &on.identity, &page, now).unwrap() {
+            match take_page(&on.conn, &on.identity, &page, Places::Kept, now).unwrap() {
                 PageTaken::Taken { each, read_again } => {
                     all.extend(each);
                     again |= read_again;
@@ -1701,7 +1752,7 @@ mod tests {
                 mark,
                 next,
             };
-            take_page(&on.conn, &on.identity, &page, 1_800_001_000).unwrap()
+            take_page(&on.conn, &on.identity, &page, Places::Kept, 1_800_001_000).unwrap()
         }
         let stored = |n: usize| PageTaken::Taken {
             each: vec![STORED; n],
@@ -1811,7 +1862,7 @@ mod tests {
                 mark,
                 next,
             };
-            take_page(&on.conn, &on.identity, &page, 1_800_001_000).unwrap()
+            take_page(&on.conn, &on.identity, &page, Places::Kept, 1_800_001_000).unwrap()
         }
         // Both relays handed it the two entries, and were then sent what
         // it wrote itself.
@@ -1882,7 +1933,7 @@ mod tests {
         on.conn
             .execute_batch("ALTER TABLE at_relays RENAME TO elsewhere")
             .unwrap();
-        assert!(take_page(&on.conn, &on.identity, &page, now).is_err());
+        assert!(take_page(&on.conn, &on.identity, &page, Places::Kept, now).is_err());
         on.conn
             .execute_batch("ALTER TABLE elsewhere RENAME TO at_relays")
             .unwrap();
@@ -1897,12 +1948,12 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'no place is written'); END",
             )
             .unwrap();
-        assert!(take_page(&on.conn, &on.identity, &page, now).is_err());
+        assert!(take_page(&on.conn, &on.identity, &page, Places::Kept, now).is_err());
         on.conn.execute_batch("DROP TRIGGER no_place").unwrap();
         assert!(on.stored_in(&on.own("notes")).is_empty());
         assert_eq!(place(&on.conn, &RELAY, &notes.id).unwrap(), (NO_MARK, 0));
         // The control.
-        assert!(take_page(&on.conn, &on.identity, &page, now).is_ok());
+        assert!(take_page(&on.conn, &on.identity, &page, Places::Kept, now).is_ok());
         assert_eq!(on.stored_in(&on.own("notes")).len(), 2);
         assert_eq!(place(&on.conn, &RELAY, &notes.id).unwrap(), (MARK, 2));
     }
@@ -2101,7 +2152,7 @@ mod tests {
             next: 1,
         };
         assert_eq!(
-            take_page(&on_0.conn, &on_0.identity, &alone, now).unwrap(),
+            take_page(&on_0.conn, &on_0.identity, &alone, Places::Kept, now).unwrap(),
             PageTaken::Taken {
                 each: vec![record(already, 0, 1)],
                 read_again: true,
@@ -2149,6 +2200,159 @@ mod tests {
         }
         assert!(s[1].counts(&identity_of(9).public_key()));
         assert!(s[2].counts(&identity_of(9).public_key()));
+    }
+
+    /// Take a page of `entries` of `channel`, which `relay` handed under
+    /// `mark` with `next` as the place to ask after, under `places`.
+    fn taken_as(
+        on: &Machine,
+        channel: &Own,
+        relay: &[u8; 32],
+        entries: &[CheckedEntry],
+        (mark, next): (Mark, u64),
+        places: Places,
+    ) -> PageTaken {
+        let page = Page {
+            relay,
+            channel,
+            entries,
+            mark,
+            next,
+        };
+        take_page(&on.conn, &on.identity, &page, places, 1_800_001_000).unwrap()
+    }
+
+    /// A page of a read with places of its own (decision 2026-10-17 §4.2
+    /// item 2) goes through the one door, and what it brings is stored.
+    /// The place that the device keeps at the relay, and how far it sent
+    /// the relay the channel, are as they were: under the same mark, under
+    /// another, and under the mark of no holding against a place kept. At
+    /// a relay of which the device keeps nothing, nothing is kept after.
+    /// Taken as a pass takes it, the same page moves both.
+    #[test]
+    fn test_a_page_under_places_of_a_reads_own_leaves_the_stored_place_and_what_was_sent() {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "notes");
+        let first = [
+            s.write(0, "notes", "a.md", "a text"),
+            s.write(0, "notes", "b.md", "a text"),
+        ];
+        let later = [
+            s.write(0, "notes", "c.md", "a text"),
+            s.write(0, "notes", "d.md", "a text"),
+        ];
+        let on = &s[1];
+        let notes = notes_of(on);
+        let kept = |relay: &[u8; 32]| kept_rows::kept(&on.conn, relay, &notes.id).unwrap();
+        let stored = |n: usize| PageTaken::Taken {
+            each: vec![STORED; n],
+            read_again: false,
+        };
+
+        // A pass took the first two: its place is past them, and nothing
+        // waits to be sent there.
+        let page = taken_as(on, &notes, &RELAY, &first, (MARK, 2), Places::Kept);
+        assert_eq!(page, stored(2));
+        let before = kept(&RELAY);
+        assert_eq!(before.place, Some((MARK, 2)));
+        assert!(before.sent_to > 0);
+
+        // The read with places of its own is handed the third, under the
+        // same mark: it is stored, and nothing kept moves.
+        let page = taken_as(on, &notes, &RELAY, &later[..1], (MARK, 3), Places::Own);
+        assert_eq!(page, stored(1));
+        assert_eq!(on.stored_in(&on.own("notes")).len(), 3);
+        assert_eq!(kept(&RELAY), before);
+        // Under another mark: the relay's other holding moves nothing kept
+        // either, and nothing is to be sent again.
+        let page = taken_as(
+            on,
+            &notes,
+            &RELAY,
+            &later[1..],
+            (OTHER_MARK, 1),
+            Places::Own,
+        );
+        assert_eq!(page, stored(1));
+        assert_eq!(kept(&RELAY), before);
+        // The mark of no holding against the place kept.
+        let page = taken_as(on, &notes, &RELAY, &[], (NO_MARK, 0), Places::Own);
+        assert_eq!(page, stored(0));
+        assert_eq!(kept(&RELAY), before);
+        // A relay of which the device keeps nothing.
+        let page = taken_as(on, &notes, &OTHER_RELAY, &first, (MARK, 2), Places::Own);
+        assert_eq!(
+            page,
+            PageTaken::Taken {
+                each: vec![HELD; 2],
+                read_again: false,
+            }
+        );
+        assert_eq!(kept(&OTHER_RELAY), kept_rows::KeptThere::default());
+
+        // What the read brought is offered to the relay at the next push,
+        // which answers that it holds it.
+        let waits = sends(on, &RELAY, &notes, Which::Since);
+        assert_eq!(ids(&waits.entries), ids_of(&later));
+
+        // The control: taken as a pass takes it, a page moves the place,
+        // and where nothing waits, what was sent.
+        let fresh = s.write(0, "notes", "e.md", "a text");
+        let on = &s[1];
+        let kept = |relay: &[u8; 32]| kept_rows::kept(&on.conn, relay, &notes.id).unwrap();
+        sends_all(on, &RELAY, &notes, Which::Since);
+        let before = kept(&RELAY);
+        let fresh = [fresh];
+        taken_as(on, &notes, &RELAY, &fresh, (MARK, 5), Places::Kept);
+        let after = kept(&RELAY);
+        assert_eq!(after.place, Some((MARK, 5)));
+        assert!(after.sent_to > before.sent_to);
+        taken_as(on, &notes, &OTHER_RELAY, &first, (MARK, 2), Places::Kept);
+        assert_eq!(kept(&OTHER_RELAY).place, Some((MARK, 2)));
+    }
+
+    /// Where a page of a read with places of its own makes a key count,
+    /// every place that the device keeps is still forgotten (decision
+    /// 2026-10-04 §16): what that key signed was refused when a pass read
+    /// it, and the pass reads it again.
+    #[test]
+    fn test_a_page_under_places_of_a_reads_own_that_makes_a_key_count_has_everything_read_again() {
+        let mut s = Several::new(4);
+        s.make_phrase(0);
+        for new in [1, 2] {
+            assert!(matches!(s.add(0, new), Accepted::Joined(_)));
+        }
+        s.meet(&[0, 1, 2]);
+        s.hold(&[0, 1, 2], "notes");
+        let earlier = s.write(0, "notes", "earlier.md", "by device 0");
+        assert!(matches!(s.add(0, 3), Accepted::Joined(_)));
+        s.hold(&[3], "notes");
+        let by_3 = s.write(3, "notes", "a.md", "by device 3");
+        let now = s.tick();
+        let mut personal: Vec<CheckedEntry> = s[0].stored_in(&s[0].personal());
+        personal.extend(s[3].stored_in(&s[3].personal()));
+        let notes = Holding::of(&[earlier, by_3]);
+
+        // A pass of device 1 read the name: what device 3 wrote was
+        // refused, and its place is past it.
+        let on = &s[1];
+        let (of_notes, of_personal) = (notes_of(on), channel_of(on, Kind::Personal));
+        reads(on, &RELAY, &of_notes, &notes, now);
+        assert_eq!(place(&on.conn, &RELAY, &of_notes.id).unwrap(), (MARK, 2));
+
+        // The read with places of its own is handed the record of device
+        // 3: it comes to count, and the pass's place is forgotten.
+        let page = taken_as(on, &of_personal, &RELAY, &personal, (MARK, 9), Places::Own);
+        let PageTaken::Taken { read_again, .. } = page else {
+            panic!("{page:?}");
+        };
+        assert!(read_again);
+        assert!(on.counts(&s.key(3)));
+        assert_eq!(place(&on.conn, &RELAY, &of_notes.id).unwrap(), (NO_MARK, 0));
+        assert_eq!(
+            place(&on.conn, &RELAY, &of_personal.id).unwrap(),
+            (NO_MARK, 0)
+        );
     }
 
     // ── Sending ──────────────────────────────────────────────────────
