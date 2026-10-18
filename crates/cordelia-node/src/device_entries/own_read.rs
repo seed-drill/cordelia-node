@@ -275,6 +275,7 @@ impl DeviceEntries {
             under: *under,
             gated: true,
         };
+        at.key = Some(link.relay().0);
         // The proof too is within the round's time: where the time goes
         // while the relay is asked, the read stands there as it was.
         let left = until.saturating_duration_since(self.clock.now());

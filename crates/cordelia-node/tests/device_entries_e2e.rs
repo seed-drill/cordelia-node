@@ -94,6 +94,17 @@ impl Device {
     /// [`Self::new`], for a device whose relays remember the proofs of
     /// `most_proved` channels for one connection.
     fn proving_at_most(label: &'static str, most_proved: usize) -> Self {
+        Self::built(label, most_proved, false)
+    }
+
+    /// [`Self::new`], for a device whose node has a network: a route that
+    /// asks the node to read the relays does not refuse at once, as it does
+    /// on a node with none.
+    fn with_a_network(label: &'static str) -> Self {
+        Self::built(label, MAX_CHANNELS_PROVED_ON_A_CONNECTION, true)
+    }
+
+    fn built(label: &'static str, most_proved: usize, network: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let identity = NodeIdentity::generate().unwrap();
         let for_transport = Arc::new(NodeIdentity::from_seed(*identity.seed()).unwrap());
@@ -116,7 +127,7 @@ impl Device {
             sync_errors: AtomicU64::new(0),
             peers_hot: AtomicU64::new(0),
             peers_warm: AtomicU64::new(0),
-            push_tx: None,
+            push_tx: network.then(|| tokio::sync::mpsc::unbounded_channel().0),
             announce_tx: None,
             peers: Default::default(),
             relays: Default::default(),
@@ -6205,6 +6216,86 @@ async fn a_read_sends_nothing_while_the_relay_is_at_its_count() {
     device.passes().await;
     assert!(!pulled_from(&relay.requests(), &notes).is_empty());
     assert_eq!(refused(&device), (BAN_THRESHOLD - 1) as usize);
+}
+
+/// **A let-go's read asks a relay at its count of refusals for now
+/// nothing** (decision 2026-10-17 §4.2 item 2): the read before a carried
+/// name is let go goes through the read with places of its own, which
+/// is held to the relay's count as every read is. At the count, `sync
+/// unmap` of the name reaches the relay with no request, says that it
+/// was not reached, and the name stays held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_let_gos_read_asks_a_relay_at_its_count_nothing() {
+    use cordelia_api::sync::unmapped;
+    use cordelia_api::types::SyncUnmapRequest;
+    use cordelia_core::protocol::BAN_THRESHOLD;
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::with_a_network("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let now = device.now();
+    cordelia_api::names::hold_for_a_carry(&device.db(), &device.state.identity, "lab", now)
+        .unwrap();
+    device.writes("lab", "a.md", "brought in by a carry");
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
+    let lasts = Duration::from_secs(10);
+
+    // The relay is brought to its count: a proof refused for now on a new
+    // connection, and then a short show.
+    device.connects_to("relay", relay.port, relay.key).await;
+    relay.hook(move |request| {
+        let of_notes =
+            matches!(request, WireMessage::ChannelProve(prove) if prove.channel == notes);
+        of_notes.then_some(Say::NotNow)
+    });
+    begins_a_read(&device, notes, lasts).await.unwrap();
+    device
+        .clock
+        .run_ahead(Duration::from_secs(SHOW_LEAVE_SECS + 1));
+    relay.hook(move |request| {
+        let shows = matches!(
+            request,
+            WireMessage::EntryShow(_) | WireMessage::EntryShowShort(_)
+        );
+        shows.then_some(Say::NotNow)
+    });
+    begins_a_read(&device, notes, lasts).await.unwrap();
+    assert_eq!(refused(&device), (BAN_THRESHOLD - 1) as usize);
+    relay.hook(|_| None);
+    device
+        .clock
+        .run_ahead(Duration::from_secs(SHOW_LEAVE_SECS + 1));
+    relay.requests();
+
+    // The let-go, as the command asks it, with the node taking its read
+    // up as the node's loop does.
+    let body = SyncUnmapRequest {
+        folder: "lab".into(),
+        read: None,
+    };
+    let serves = async {
+        let ask = device.state.own_channels.wait_own().await;
+        device.engine.own(&device.relays, ask).await;
+    };
+    let (refusal, ()) = tokio::join!(unmapped(&device.state, &body), serves);
+    let Err(cordelia_api::error::ApiError::Conflict(why)) = refusal else {
+        panic!("not refused");
+    };
+    assert!(
+        why.starts_with(
+            "lab is not let go: no relay that this device is set up with held 1 of its versions"
+        ),
+        "{why}"
+    );
+    assert!(why.contains("\n  relay: not reached.\n"), "{why}");
+    assert!(relay.requests().is_empty());
+    assert_eq!(refused(&device), (BAN_THRESHOLD - 1) as usize);
+    let lab = device.channel("lab");
+    assert!(device.holds_of(&lab).len() == 1);
 }
 
 /// A request refused for now counts for the relay wherever it was made:

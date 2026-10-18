@@ -447,6 +447,10 @@ pub struct SyncMapRequest {
 #[derive(Deserialize)]
 pub struct SyncUnmapRequest {
     pub folder: String,
+    /// The read before a carried name is let go, where the command asks
+    /// for its next round (decision 2026-10-17 §4.2): its ID, as hex.
+    #[serde(default)]
+    pub read: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -520,6 +524,19 @@ pub struct SyncStatusResponse {
     /// device of the person's then holds anything of the name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub let_go_alone: Option<bool>,
+    /// Beside `let_go`: how many versions of the name that this device
+    /// signed were asked about, each of which a relay held when it was
+    /// read just now (decision 2026-10-17 §4.2). Not there where the name
+    /// was let go with no read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go_versions: Option<usize>,
+    /// The read before a carried name is let go, where it goes on
+    /// (decision 2026-10-17 §4.2): `read`, its ID as hex, which the
+    /// command sends to ask for its next round, and `relays`, each relay
+    /// still read in part with what it has handed so far (`relay`,
+    /// `bytes`, counted as a relay counts against its cap).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<serde_json::Value>,
     /// The name that a folder was mapped to, where this device still
     /// holds it once the folder is unmapped (decision 2026-10-04 §16): a
     /// carry or a recovery brought it, and it is held as it was before
