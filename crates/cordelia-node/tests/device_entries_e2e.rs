@@ -5437,6 +5437,7 @@ async fn a_read_with_places_of_its_own_reads_on_under_its_id_from_the_place_it_r
     assert_eq!(kept(&device), before);
 
     // The next round goes on from there.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     relay.requests();
     assert!(reads_on(&device, &read, lasts).await);
     let pulled = pulled_from(&relay.requests(), &notes);
@@ -5453,7 +5454,9 @@ async fn a_read_with_places_of_its_own_reads_on_under_its_id_from_the_place_it_r
     assert!(pulled_from(&other.requests(), &notes).is_empty());
     assert_eq!(read_at(&device, &read, "other").read, ReadAt::NotReached);
 
-    // A read the node does not know; a channel that is not its own.
+    // A read the node does not know; a channel that is not its own. (A
+    // pull that a round cut off at its time may still arrive.)
+    tokio::time::sleep(Duration::from_millis(300)).await;
     relay.requests();
     assert!(!reads_on(&device, &[7; 16], lasts).await);
     assert_eq!(begins_a_read(&device, [7; 32], lasts).await, None);
@@ -5537,6 +5540,14 @@ async fn a_read_with_places_of_its_own_takes_within_what_the_pass_takes_from_a_r
     assert_eq!((at.read, at.place), (ReadAt::Reading, ([5; 8], most)));
     assert_eq!(device.counts("relay").pulled, most);
 
+    // A round of a second, while there is no room, waits no longer than
+    // its second, and asks nothing.
+    let began = std::time::Instant::now();
+    assert!(reads_on(&device, &read, Duration::from_secs(1)).await);
+    let elapsed = began.elapsed();
+    assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
+    assert!(pulled_from(&relay.requests(), &notes).is_empty());
+
     // The pass takes nothing more there in that minute.
     device.clock.run_ahead(Duration::from_secs(SHOW_LEAVE_SECS));
     device.passes().await;
@@ -5545,8 +5556,9 @@ async fn a_read_with_places_of_its_own_takes_within_what_the_pass_takes_from_a_r
 
 /// What a read with places of its own asks of a relay is within what the
 /// device asks of that relay in a minute on the streams of its channels,
-/// with the pass: where that is asked, the read asks nothing more, waits,
-/// and is still read in part when its round ends.
+/// with the pass: where that is asked, the read asks nothing more, waits
+/// no longer than its round's time, and is still read in part when its
+/// round ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_with_places_of_its_own_asks_within_what_the_device_asks_of_a_relay() {
     let relay = StandIn::started().await;
@@ -5585,7 +5597,10 @@ async fn a_read_with_places_of_its_own_asks_within_what_the_device_asks_of_a_rel
     assert_eq!(refused, Some(Refused::AskedEnough));
     relay.requests();
 
-    let read = begins_a_read(&device, notes, Duration::from_secs(3)).await;
+    let began = std::time::Instant::now();
+    let read = begins_a_read(&device, notes, Duration::from_secs(1)).await;
+    let elapsed = began.elapsed();
+    assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
     let read = read.unwrap();
     let asked: Vec<WireMessage> = relay.requests();
     let of_a_channel = |one: &&WireMessage| {
@@ -5681,13 +5696,17 @@ async fn a_read_with_places_of_its_own_waits_out_a_pull_refused_for_now() {
     }
 }
 
-/// A relay that refuses every pull for now is waited out for a minute
-/// from the last page it handed, and then is not reached in that round:
-/// it does not hold the round to its time, and so holds up no read of
-/// another channel. A relay that resets every pull otherwise is not
+/// A relay that refuses every pull for now is asked again only short of
+/// its count of breaches (BAN_THRESHOLD): a relay refuses a breach of its
+/// rates with the same reset, and cuts off an address at that count. It
+/// is then not reached in that round, so it does not hold the round to
+/// its time, nor a read of another channel behind it. A relay that
+/// refuses a pull for now a minute after the last page it handed is not
+/// reached at once. A relay that resets every pull otherwise is not
 /// reached at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_read() {
+    use cordelia_core::protocol::BAN_THRESHOLD;
     let relay = StandIn::started().await;
     relay.holds_what_is_proved(true);
     let mut device = Device::new("laptop");
@@ -5716,14 +5735,14 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
     );
     assert!(began.elapsed() < Duration::from_secs(5));
 
-    // Refused for now, every time: the time runs ahead by a minute at the
-    // third refusal, and the relay is then not reached.
-    let (refused, clock) = (Arc::new(AtomicU64::new(0)), device.clock.clone());
+    // Refused for now, every time: asked no more than BAN_THRESHOLD - 1
+    // times, and a read of another channel, asked for meanwhile, reads on.
+    let refused = Arc::new(AtomicU64::new(0));
     let counted = refused.clone();
     relay.hook(move |request| {
         let of_notes = matches!(request, WireMessage::EntryPull(pull) if pull.channel == notes);
-        if of_notes && counted.fetch_add(1, Ordering::SeqCst) == 2 {
-            clock.run_ahead(A_MINUTE);
+        if of_notes {
+            counted.fetch_add(1, Ordering::SeqCst);
         }
         of_notes.then_some(Say::NotNow)
     });
@@ -5743,16 +5762,35 @@ async fn a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_re
         engine.own(&relays, ask).await;
         answered.await.unwrap().unwrap()
     });
-    comes_to_be("three pulls refused", || {
-        refused.load(Ordering::SeqCst) >= 3
-    })
-    .await;
+    comes_to_be("a pull refused", || refused.load(Ordering::SeqCst) >= 1).await;
     let second = begins_a_read(&device, lab, Duration::from_secs(20)).await;
     let first = tokio::time::timeout(Duration::from_secs(5), first).await;
     let first = first.expect("the first read ends").unwrap();
-    assert_eq!(read_at(&device, &first, "relay").read, ReadAt::NotReached);
+    let at = read_at(&device, &first, "relay");
+    assert_eq!(
+        (at.read, at.refused_for_now),
+        (ReadAt::NotReached, BAN_THRESHOLD - 1)
+    );
+    assert_eq!(refused.load(Ordering::SeqCst), u64::from(BAN_THRESHOLD - 1));
     let second = read_at(&device, &second.unwrap(), "relay");
     assert_eq!(second.read, ReadAt::ToItsEnd);
+
+    // Refused for now as a minute has gone by since the round began:
+    // asked once, and not reached.
+    let (once, clock) = (Arc::new(AtomicBool::new(true)), device.clock.clone());
+    relay.hook(move |request| {
+        let of_notes = matches!(request, WireMessage::EntryPull(pull) if pull.channel == notes);
+        if !(of_notes && once.swap(false, Ordering::SeqCst)) {
+            return None;
+        }
+        clock.run_ahead(A_MINUTE);
+        Some(Say::NotNow)
+    });
+    relay.requests();
+    let read = begins_a_read(&device, notes, Duration::from_secs(110)).await;
+    let at = read_at(&device, &read.unwrap(), "relay");
+    assert_eq!((at.read, at.refused_for_now), (ReadAt::NotReached, 1));
+    assert_eq!(pulled_from(&relay.requests(), &notes).len(), 1);
 }
 
 /// The minute in which a refusal for now is waited out is counted from
@@ -5841,6 +5879,33 @@ async fn a_round_ends_at_its_time_while_a_relay_is_waited_for_or_asked() {
         began.elapsed()
     );
     assert_eq!(read_at(&device, &read, "relay").read, ReadAt::Reading);
+}
+
+/// The proof that a read makes on a new connection is within the round's
+/// time too: a relay that does not answer it does not hold the round past
+/// its time, and the read stands there as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_ends_at_its_time_while_its_proof_is_not_answered() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    device.connects_to("relay", relay.port, relay.key).await;
+    relay.hook(move |request| {
+        let of_notes =
+            matches!(request, WireMessage::ChannelProve(prove) if prove.channel == notes);
+        of_notes.then_some(Say::Nothing)
+    });
+    let began = std::time::Instant::now();
+    let read = begins_a_read(&device, notes, Duration::from_secs(1)).await;
+    let elapsed = began.elapsed();
+    assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
+    let at = read_at(&device, &read.unwrap(), "relay");
+    assert_eq!((at.read, at.place), (ReadAt::Reading, ([0; 8], 0)));
 }
 
 /// The minute that a test runs a device's clock ahead by.
@@ -5949,6 +6014,31 @@ async fn a_round_whose_asker_has_gone_stops() {
     let again = begins_a_read(&device, notes, Duration::from_millis(300)).await;
     assert!(again.is_some());
     assert!(began.elapsed() < Duration::from_secs(5));
+
+    // So too where the asker of a read's first round has gone.
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let until = device.clock.now() + Duration::from_secs(60);
+    let ask = OwnAsk::Begin {
+        channel: notes,
+        until,
+        answer,
+    };
+    let (engine, relays) = (device.engine.clone(), device.relays.clone());
+    let round = tokio::spawn(async move { engine.own(&relays, ask).await });
+    let before = pulls.load(Ordering::SeqCst);
+    comes_to_be("the first round pulls", || {
+        pulls.load(Ordering::SeqCst) >= before + 3
+    })
+    .await;
+    drop(answered);
+    tokio::time::timeout(Duration::from_secs(5), round)
+        .await
+        .expect("the first round stops")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = pulls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(pulls.load(Ordering::SeqCst), after);
 }
 
 /// A relay that answers a read's proof with no, as one that dropped the

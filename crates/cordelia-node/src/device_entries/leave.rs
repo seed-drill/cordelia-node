@@ -330,6 +330,12 @@ pub enum Refused {
     /// was built under: it applied a change since. Nothing was sent, or
     /// nothing of what came back was taken. The channels are read afresh.
     KeptAnother,
+    /// A request that the relay refused for now: it reset the stream with
+    /// ERR_RATE_LIMIT ([`refused_for_now`]), as it does where it has
+    /// handed the connection what it may in a minute. That is also how a
+    /// relay refuses a breach of its rates: whoever waits it out asks
+    /// again only a few times. Nothing was taken.
+    NotNow,
 }
 
 /// What is asked on a stream for a channel of the device's own: the
@@ -390,13 +396,6 @@ pub enum LeftRefused {
     /// The relay did not answer, or not as it answers such a request.
     NotAnswered(String),
 }
-
-/// What a request is said to have been answered with where the relay
-/// reset its stream with ERR_RATE_LIMIT: as a relay refuses a pull for
-/// more than it may hand the connection for now, which is no breach, or
-/// a request over the allowance. The connection is still open.
-pub(super) const NOT_NOW: &str =
-    "refused for now: the relay may hand this connection no more in this minute";
 
 /// What a show was answered, and what it cost to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,9 +712,15 @@ impl Leave {
             let _ = recv.stop(0u32.into());
             return Err(refused);
         }
-        let answer = exchange(send, recv, protocol, request)
-            .await
-            .map_err(Refused::NotAnswered)?;
+        // A request that the relay refused for now is said so; any other
+        // failure is said as it was. (The doors beside this one ask with
+        // `ask`, and say what failed as it was.)
+        let answer = exchange(send, recv, protocol, request).await.map_err(|e| {
+            match refused_for_now(&e) {
+                true => Refused::NotNow,
+                false => Refused::NotAnswered(e.to_string()),
+            }
+        })?;
         let answer = read(answer);
         let conn = lock(db);
         self.may_use(&conn, link, under)?;
@@ -992,7 +997,9 @@ async fn ask(
     request: &WireMessage,
 ) -> Result<WireMessage, String> {
     let (send, recv) = open_stream(conn).await?;
-    exchange(send, recv, protocol, request).await
+    exchange(send, recv, protocol, request)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Open a new stream on `conn`, within the codec's one timeout. The peer
@@ -1015,21 +1022,16 @@ async fn exchange(
     mut recv: quinn::RecvStream,
     protocol: Protocol,
     request: &WireMessage,
-) -> Result<WireMessage, String> {
+) -> Result<WireMessage, codec::CodecError> {
     let mut stream = tokio::io::join(&mut recv, &mut send);
-    let answer = codec::send_request(&mut stream, protocol, request)
-        .await
-        .map_err(|e| match refused_for_now(&e) {
-            true => NOT_NOW.to_string(),
-            false => e.to_string(),
-        });
+    let answer = codec::send_request(&mut stream, protocol, request).await;
     let _ = send.finish();
     answer
 }
 
 /// Whether a request failed because the relay reset its stream with
-/// ERR_RATE_LIMIT ([`NOT_NOW`]): the answer, or the request, was cut off
-/// with that code. A connection that was lost is not that.
+/// ERR_RATE_LIMIT: the answer, or the request, was cut off with that
+/// code. A connection that was lost is not that.
 fn refused_for_now(e: &codec::CodecError) -> bool {
     let codec::CodecError::Io(io) = e else {
         return false;
@@ -1045,6 +1047,39 @@ fn refused_for_now(e: &codec::CodecError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request is refused for now where its answer was reset, or its
+    /// request stopped, with ERR_RATE_LIMIT, and by nothing else: not by
+    /// another code, not by a connection that was lost, not by an answer
+    /// that does not decode.
+    #[test]
+    fn a_request_is_refused_for_now_only_by_the_rate_limits_code() {
+        let code = quinn::VarInt::from_u32(ERR_RATE_LIMIT);
+        let other = quinn::VarInt::from_u32(0);
+        let io = |e: std::io::Error| codec::CodecError::Io(e);
+        assert!(refused_for_now(&io(quinn::ReadError::Reset(code).into())));
+        assert!(refused_for_now(
+            &io(quinn::WriteError::Stopped(code).into())
+        ));
+        assert!(!refused_for_now(&io(quinn::ReadError::Reset(other).into())));
+        assert!(!refused_for_now(&io(
+            quinn::WriteError::Stopped(other).into()
+        )));
+        let lost = quinn::ConnectionError::LocallyClosed;
+        assert!(!refused_for_now(&io(quinn::ReadError::ConnectionLost(
+            lost.clone()
+        )
+        .into())));
+        assert!(!refused_for_now(&io(quinn::WriteError::ConnectionLost(
+            lost
+        )
+        .into())));
+        let bare = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(!refused_for_now(&io(bare)));
+        assert!(!refused_for_now(&codec::CodecError::CborDecode(
+            "no".into()
+        )));
+    }
 
     /// The clock is the system's, and as far ahead of it as it was run:
     /// both the time that waits are measured by and the time of day.
