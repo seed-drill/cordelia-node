@@ -843,7 +843,7 @@ pub(crate) fn read_with_secret(
 /// What is said of each relay read there, whole or in part, carries the
 /// place it reached: its `mark` and `place`, as `from` is given them
 /// ([`read_through_the_node`]). Where a connection changed, the relay is
-/// not read again in this round ([`one_reading`]).
+/// not read again here ([`one_reading`]): the read on reads it again.
 pub(crate) fn read_round(
     config_path: &str,
     secret: &[u8; 32],
@@ -872,12 +872,12 @@ pub(crate) fn read_round(
 ///
 /// The relays named in `asked` (every relay where it names none) are read
 /// once, each from its place in `from` ([`at_those_alone`]). **No relay is
-/// read again in the round:** where the node says of one that its
-/// connection changed, the sessions are asked for again, so that the next
-/// round makes its proofs over the connection there is then, and that
-/// relay is asked again there, as one of its own readings. So a relay
-/// whose connection keeps changing costs no other relay a reading, and
-/// makes no round longer than one reading.
+/// read again here:** where the node says of one that its connection
+/// changed, the sessions are asked for again, so that the next reading
+/// makes its proofs over the connection there is then. The read on asks
+/// that relay again, as one of its own readings: alone, within the first
+/// round, and in the next round after that. So a relay whose connection
+/// keeps changing costs no other relay a reading.
 pub(crate) fn one_reading(
     sessions: &mut Sessions,
     asked: Option<&[String]>,

@@ -654,6 +654,8 @@ enum Say {
     NotNow,
     /// It answers nothing, and keeps the stream open.
     Nothing,
+    /// It answers a proof as it would, once the test says so.
+    AnswerWhen(Arc<tokio::sync::Notify>),
 }
 
 /// What a test has a stand-in do as each request arrives, before it is
@@ -663,7 +665,8 @@ enum Say {
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
 /// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
 /// has it answer with that answer of a show, which is no answer to a
-/// proof, and `Some(Say::NotNow)` has it refuse the proof for now. For a
+/// proof, `Some(Say::NotNow)` has it refuse the proof for now, and
+/// `Some(Say::AnswerWhen(_))` has it answer only once told to. For a
 /// pull, `Some(Say::NotNow)` has it refuse the pull for now, and
 /// `Some(Say::Reset)` has it reset the stream.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
@@ -773,6 +776,7 @@ impl StandIn {
         // answered and the stream is kept open. A reset for now is with
         // the code a relay resets with for its allowance.
         let mut not_now = false;
+        let mut when: Option<Arc<tokio::sync::Notify>> = None;
         let does = {
             let mut script = script.lock().unwrap();
             let hooked = script.hook.as_mut().and_then(|hook| hook(&request));
@@ -789,7 +793,7 @@ impl StandIn {
                             not_now = true;
                             Ok(None)
                         }
-                        Say::Nothing => Err(()),
+                        Say::Nothing | Say::AnswerWhen(_) => Err(()),
                     }
                 }
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
@@ -805,6 +809,9 @@ impl StandIn {
                     Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
                 }
                 WireMessage::ChannelProve(_) => {
+                    if let Some(Say::AnswerWhen(told)) = hooked {
+                        when = Some(told);
+                    }
                     Ok(Some(WireMessage::ChannelProved(ChannelProved {
                         proved: script.proves,
                     })))
@@ -850,6 +857,11 @@ impl StandIn {
                 false => does,
             }
         };
+        // Waited for with the script let go: other streams are answered
+        // meanwhile.
+        if let Some(when) = when {
+            when.notified().await;
+        }
         match does {
             Ok(Some(answer)) => {
                 let _ = codec::write_frame(&mut send, &answer).await;
@@ -5362,6 +5374,10 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
 /// says that it was not read. Once the window has gone by it is read
 /// again. A proof refused for now is counted too, ends the read with
 /// nothing read, and is said as a proof's.
+///
+/// **It asks again only within a minute of the last page the relay
+/// handed,** as a read of the device's own channel does: a refusal that
+/// comes later than that ends the read there in part.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     let relay = StandIn::started().await;
@@ -5469,9 +5485,14 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     a.clock.run_ahead(window());
     let pulls = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&pulls);
+    let second: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+    let at_the_second = Arc::clone(&second);
     relay.hook(move |request| match request {
         WireMessage::EntryPull(_) => {
             let n = counted.fetch_add(1, Ordering::SeqCst);
+            if n == 3 {
+                *at_the_second.lock().unwrap() = Some(std::time::Instant::now());
+            }
             [1, 3].contains(&n).then_some(Say::NotNow)
         }
         _ => None,
@@ -5487,10 +5508,15 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
         panic!("{read:?}");
     };
     // It waited out the first refusal, and not the second: at the count
-    // it ends at once.
+    // it ends at once, well within the wait it would have made.
     let wait = Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS);
     assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
-    assert!(began.elapsed() < wait * 7 / 4, "{:?}", began.elapsed());
+    let since = second
+        .lock()
+        .unwrap()
+        .expect("the second refusal")
+        .elapsed();
+    assert!(since < wait, "{since:?}");
     assert!(!*whole, "{read:?}");
     assert_eq!(ids(entries), ids(&held[..2]));
     assert_eq!(*reached, LeftPlace { mark, next: 2 });
@@ -5510,6 +5536,29 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     a.clock.run_ahead(window());
     let read = reads_left_from(&a, old, by_secret(), None, on, soon()).await;
     assert_eq!(handed_ids(&read[0].read), Some((ids(&held[2..]), true)));
+
+    // A refusal that comes more than a minute after the last page: the
+    // read ends there in part, and does not ask again.
+    a.clock.run_ahead(window());
+    relay.requests();
+    let clock = a.clock.clone();
+    let pulls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&pulls);
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == 1 => {
+            clock.run_ahead(Duration::from_secs(61));
+            Some(Say::NotNow)
+        }
+        _ => None,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    let LeftRead::Read { entries, whole, .. } = &read[0].read else {
+        panic!("{read:?}");
+    };
+    assert!(!*whole, "{read:?}");
+    assert_eq!(ids(entries), ids(&held[..1]));
+    assert_eq!(asked(&relay), (1, vec![0, 1]));
+    assert_eq!(refused(&a), 1);
 
     // A proof refused for now is said as a proof's: nothing was read,
     // and it is counted.
@@ -6524,6 +6573,61 @@ async fn a_request_refused_for_now_counts_wherever_it_was_made() {
         ReadAt::NotReached
     );
     assert!(pulled_from(&relay.requests(), &notes).is_empty());
+}
+
+/// **The door for a carry holds its pull to the relay's count of
+/// refusals for now as the pull goes out** (decision 2026-10-17 §3.2), as
+/// each request of a read is held: a refusal at another door may come
+/// while the proof is answered. The relay answers a read's proof only
+/// once two pulls of passes have been refused for now: the relay is then
+/// at its count, and the read sends no pull, and says that the relay was
+/// not read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_through_the_carry_door_holds_its_pull_to_the_count_after_its_proof() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.holds("lab");
+    let (old_secret, old) = (device.name_secret("lab"), device.channel("lab"));
+    device.changes(&phrase(), &[&device], &[]);
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
+
+    let go = Arc::new(tokio::sync::Notify::new());
+    let told = Arc::clone(&go);
+    relay.hook(move |request| match request {
+        WireMessage::ChannelProve(prove) if prove.channel == old => {
+            Some(Say::AnswerWhen(Arc::clone(&told)))
+        }
+        WireMessage::EntryPull(pull) if pull.channel == notes => Some(Say::NotNow),
+        _ => None,
+    });
+    relay.requests();
+    let by = ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let passes = async {
+        for n in [1, 2] {
+            device
+                .clock
+                .run_ahead(Duration::from_secs(SHOW_LEAVE_SECS + 1));
+            device.passes().await;
+            assert_eq!(refused(&device), n);
+        }
+        go.notify_one();
+    };
+    let (read, ()) = tokio::join!(reads_left(&device, old, by), passes);
+    let at_its_count = "the relay has refused as many requests for now as this device gives it, \
+                        and is asked nothing more for a while";
+    assert_eq!(read[0].read, LeftRead::NotRead(at_its_count.into()));
+    let requests = relay.requests();
+    let proved = requests
+        .iter()
+        .filter(|one| matches!(one, WireMessage::ChannelProve(prove) if prove.channel == old));
+    assert_eq!(proved.count(), 1);
+    assert!(pulled_from(&requests, &old).is_empty(), "{requests:?}");
 }
 
 /// The window in which a relay counts breaches, and a device what a

@@ -2091,7 +2091,10 @@ fn recovers_and_reads_on(new: &Node, words: &str, relay: &str) -> AtTerminal {
     at.says("Recovering from change 1. Reading its personal channel at each relay...")
         .says("The personal channel of change 1 is larger than one read. Reading on at ")
         .says(relay)
-        .says(": a relay may hold up to 16 MiB of it, which takes up to 5 reads of up to 2 minutes each.")
+        .says(
+            ": a relay may hold up to 16 MiB of it, which takes up to 5 reads: up to 4 more are \
+             made, each of up to 2 minutes and what it takes beyond that.",
+        )
         .says("Ctrl-C stops here, and nothing is made.")
         .says(&format!("  {relay}: "))
         .says(" MiB read so far.");

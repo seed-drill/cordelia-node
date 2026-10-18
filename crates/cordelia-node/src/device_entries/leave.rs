@@ -408,6 +408,10 @@ pub enum LeftRefused {
     /// open ([`Refused::NotNow`]), and that was counted for it. The
     /// proof, where one was sent, was answered.
     NotNow,
+    /// The relay is at its count of refusals for now
+    /// ([`Leave::at_its_count`]): the pull was not sent. The proof, where
+    /// one was sent, was answered.
+    AtItsCount,
     /// The relay did not answer, or not as it answers such a request.
     NotAnswered(String),
 }
@@ -943,6 +947,13 @@ impl Leave {
                 WireMessage::ChannelProved(_) => return Ok(LeftPage::NotHeld),
                 _ => return Err(not("a proof was not answered as one")),
             }
+        }
+        // The pull is held to the relay's count as it goes out, as each
+        // request of a read is ([`Self::open`]): a refusal at another door
+        // may have come while the proof was answered, and one more may be
+        // the breach that has the relay cut off the address.
+        if self.at_its_count(&link.relay().0) {
+            return Err(LeftRefused::AtItsCount);
         }
         let (mark, after) = place;
         let pull = WireMessage::EntryPull(EntryPull {
