@@ -59,6 +59,7 @@
 //! hash. The key is overwritten once the last batch is handed, and the
 //! secrets that the phrase opened once the last channel is read.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -830,10 +831,86 @@ pub(crate) fn read_with_secret(
         sessions,
         |sessions| {
             let proofs = proofs_for(secret, sessions, own)?;
-            read_through_the_node(config_path, &channel, proofs)
+            read_through_the_node(config_path, &channel, proofs, &[])
         },
         || sessions_now(config_path),
     )
+}
+
+/// One round of a read on (decision 2026-10-17 §3.2): [`read_with_secret`],
+/// at the relays named in `asked` alone where it names any, and at each
+/// relay that `from` gives a place for, on from that place, read once.
+/// What is said of each relay read there, whole or in part, carries the
+/// place it reached: its `mark` and `place`, as `from` is given them
+/// ([`read_through_the_node`]). Where a connection changed, the relay is
+/// not read again here ([`one_reading`]): the read on reads it again.
+pub(crate) fn read_round(
+    config_path: &str,
+    secret: &[u8; 32],
+    sessions: &mut Sessions,
+    own: &[u8; 32],
+    asked: Option<&[String]>,
+    from: &[Value],
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let channel = derive::channel_id(secret)?;
+    one_reading(
+        sessions,
+        asked,
+        from,
+        |sessions, from| {
+            let proofs = proofs_for(secret, sessions, own)?;
+            read_through_the_node(config_path, &channel, proofs, from)
+        },
+        || sessions_now(config_path),
+    )
+}
+
+/// One reading of a round of a read on, with what reads and what asks for
+/// the sessions given (decision 2026-10-17 §3.2): `read` reads the channel
+/// with proofs over the sessions it is handed, from the places it is
+/// handed; `ask` gives the sessions as the node says them now.
+///
+/// The relays named in `asked` (every relay where it names none) are read
+/// once, each from its place in `from` ([`at_those_alone`]). **No relay is
+/// read again here:** where the node says of one that its connection
+/// changed, the sessions are asked for again, so that the next reading
+/// makes its proofs over the connection there is then. The read on asks
+/// that relay again, as one of its own readings: alone, within the first
+/// round, and in the next round after that. So a relay whose connection
+/// keeps changing costs no other relay a reading.
+pub(crate) fn one_reading(
+    sessions: &mut Sessions,
+    asked: Option<&[String]>,
+    from: &[Value],
+    read: impl FnOnce(&Sessions, &[Value]) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+    ask: impl FnOnce() -> anyhow::Result<Sessions>,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let (entries, relays) = at_those_alone(asked, sessions, |of_those| read(of_those, from))?;
+    if relays.iter().any(connection_changed) {
+        *sessions = ask()?;
+    }
+    Ok((entries, relays))
+}
+
+/// One reading, at the relays named in `asked` alone where it names any
+/// (decision 2026-10-17 §3.2): `read` is handed the sessions of those
+/// relays alone, and what it says of any other relay is dropped. **The
+/// node says of a relay that it was handed no proof for that its
+/// connection changed:** that is no reason to make the proofs again.
+fn at_those_alone(
+    asked: Option<&[String]>,
+    sessions: &Sessions,
+    read: impl FnOnce(&Sessions) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let is_asked = |relay: &str| asked.is_none_or(|asked| asked.iter().any(|a| a == relay));
+    let of_those: Sessions = sessions
+        .iter()
+        .filter(|(relay, _)| is_asked(relay))
+        .cloned()
+        .collect();
+    let (entries, mut relays) = read(&of_those)?;
+    relays.retain(|said| is_asked(text(said, "relay")));
+    Ok((entries, relays))
 }
 
 /// Whether what the node says of a relay is that its connection is
@@ -854,6 +931,13 @@ pub(crate) fn entries_handed(said: &Value) -> u64 {
     said["entries"].as_u64().unwrap_or(0)
 }
 
+/// How many bytes the node says that the entries a relay handed come to,
+/// as a relay counts them against a channel's cap (decision 2026-10-17
+/// §3.3): none where it says nothing of that.
+pub(crate) fn bytes_handed(said: &Value) -> u64 {
+    said["bytes"].as_u64().unwrap_or(0)
+}
+
 /// [`read_with_secret`], with what reads and what asks for the sessions
 /// given: `read` reads the channel with proofs over the sessions it is
 /// handed, and `ask` gives the sessions as the node says them now.
@@ -867,18 +951,20 @@ pub(crate) fn entries_handed(said: &Value) -> u64 {
 /// reading, that is what is said of the relay. **How many entries of the
 /// channel a relay handed is the most that it handed at any one
 /// reading** (decision 2026-10-04 §16): what it handed is kept, whatever
-/// a later reading says of it.
+/// a later reading says of it. So are the bytes they came to (decision
+/// 2026-10-17 §3.3).
 fn read_again_where_changed(
     sessions: &mut Sessions,
     mut read: impl FnMut(&Sessions) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
     mut ask: impl FnMut() -> anyhow::Result<Sessions>,
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
     let mut entries: Vec<CheckedEntry> = Vec::new();
+    let mut kept: HashSet<[u8; 32]> = HashSet::new();
     let mut said: Vec<Value> = Vec::new();
     for made_again in 0..=CARRY_PROOFS_MADE_AGAIN {
         let (handed, relays) = read(sessions)?;
         for entry in handed {
-            if !entries.iter().any(|held| held.id() == entry.id()) {
+            if kept.insert(entry.id()) {
                 entries.push(entry);
             }
         }
@@ -887,10 +973,13 @@ fn read_again_where_changed(
             match said.iter_mut().find(|of| of["relay"] == relay["relay"]) {
                 Some(of) if read_to_its_end(of) => {}
                 Some(of) => {
-                    let handed_before = entries_handed(of);
+                    let (handed_before, bytes_before) = (entries_handed(of), bytes_handed(of));
                     *of = relay;
                     if handed_before > entries_handed(of) {
                         of["entries"] = handed_before.into();
+                    }
+                    if bytes_before > bytes_handed(of) {
+                        of["bytes"] = bytes_before.into();
                     }
                 }
                 None => said.push(relay),
@@ -909,18 +998,28 @@ fn read_again_where_changed(
 /// what the relays handed, a part at a time. Each entry is checked here
 /// as whatever a device is given is checked: one that does not pass is
 /// dropped. Returns the entries, and what the node says of each relay.
+///
+/// At each relay that `from` gives a place for (`relay`, `mark` and
+/// `place`), the read goes on from it (decision 2026-10-17 §3.2). What is
+/// said of each relay where the node read, whole or in part, carries the
+/// place it reached there, as its `mark` and `place`: a relay without
+/// them read nothing, and keeps the place it had.
 pub(crate) fn read_through_the_node(
     config_path: &str,
     channel: &[u8; 32],
     proofs: Vec<Value>,
+    from: &[Value],
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
     let read = told(api_post_told(
         config_path,
         "/api/v1/carry/read",
-        json!({ "channel": hex::encode(channel), "proofs": proofs }),
+        json!({ "channel": hex::encode(channel), "proofs": proofs, "from": from }),
         Some(CARRY_WAITS),
     ))?;
-    let relays: Vec<Value> = list(&read, "relays").cloned().collect();
+    let reached: Vec<&Value> = list(&read, "reached").collect();
+    let relays: Vec<Value> = list(&read, "relays")
+        .map(|relay| with_the_place_reached(relay, &reached))
+        .collect();
     let mut entries: Vec<CheckedEntry> = Vec::new();
     let mut from = (read["entries"].as_u64().unwrap_or(0) > 0).then_some(0u64);
     while let Some(at) = from {
@@ -939,6 +1038,19 @@ pub(crate) fn read_through_the_node(
         from = part["next"].as_u64();
     }
     Ok((entries, relays))
+}
+
+/// What the node said of a relay, with the place that the read reached
+/// there, of `reached` as the node said it: its `mark` and `place`. A
+/// relay that `reached` does not name is as it was said.
+fn with_the_place_reached(relay: &Value, reached: &[&Value]) -> Value {
+    let mut said = relay.clone();
+    let at = reached.iter().find(|at| at["relay"] == relay["relay"]);
+    if let Some(at) = at {
+        said["mark"] = at["mark"].clone();
+        said["place"] = at["place"].clone();
+    }
+    said
 }
 
 /// How many bytes `version` takes in the body of the request that hands
@@ -1618,6 +1730,138 @@ mod tests {
         );
         assert_eq!(entries_handed(&relays[0]), 2);
         assert_eq!(entries_handed(&said("one", "part")), 0);
+        // So are the bytes that they came to (decision 2026-10-17 §3.3).
+        let sized = |read: &str, entries: u64, bytes: u64| json!({ "relay": "one", "read": read, "entries": entries, "bytes": bytes });
+        let (_, relays, _, _, _) = run(vec![
+            (
+                vec![first.clone()],
+                vec![sized("part", 1, 4096), handed("two", changed, 0)],
+            ),
+            (
+                Vec::new(),
+                vec![sized("not reached", 0, 0), handed("two", "whole", 0)],
+            ),
+        ]);
+        assert_eq!(relays[0], sized("not reached", 1, 4096));
+        assert_eq!(bytes_handed(&relays[0]), 4096);
+        assert_eq!(bytes_handed(&said("one", "part")), 0);
+    }
+
+    /// **One reading of a round reads each relay asked once, and asks
+    /// for the sessions again only where a connection changed** (decision
+    /// 2026-10-17 §3.2). One reads in part, and two says that its
+    /// connection changed: two is not read again in the round, and the
+    /// sessions are asked for, for the next. Where no connection changed,
+    /// they are not.
+    #[test]
+    fn test_one_reading_reads_no_relay_again_and_asks_for_the_sessions_where_one_changed() {
+        use std::cell::RefCell;
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let set_up: Sessions = vec![("one".into(), [1; 32]), ("two".into(), [2; 32])];
+        let after: Sessions = vec![("one".into(), [1; 32]), ("two".into(), [3; 32])];
+        let place = |relay: &str, at: u64| json!({ "relay": relay, "mark": "06", "place": at });
+        let from = [place("one", 4), place("two", 7)];
+        for two in ["part", changed] {
+            let read: RefCell<Vec<(Sessions, Vec<Value>)>> = RefCell::new(Vec::new());
+            let asked = RefCell::new(0);
+            let mut sessions = set_up.clone();
+            let (_, said) = one_reading(
+                &mut sessions,
+                None,
+                &from,
+                |of_those, places| {
+                    read.borrow_mut().push((of_those.clone(), places.to_vec()));
+                    Ok((
+                        Vec::new(),
+                        vec![
+                            json!({ "relay": "one", "read": "part" }),
+                            json!({ "relay": "two", "read": two }),
+                        ],
+                    ))
+                },
+                || {
+                    *asked.borrow_mut() += 1;
+                    Ok(after.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(*read.borrow(), [(set_up.clone(), from.to_vec())]);
+            assert_eq!(said[1]["read"], two);
+            match two == changed {
+                true => assert_eq!((*asked.borrow(), &sessions), (1, &after)),
+                false => assert_eq!((*asked.borrow(), &sessions), (0, &set_up)),
+            }
+        }
+    }
+
+    /// **A read on asks only the relays it names** (decision 2026-10-17
+    /// §3.2): it makes proofs for those alone, and what the node says of
+    /// another relay, that its connection changed for want of a proof, is
+    /// dropped, and sets off no reading again. A read that names none
+    /// asks every relay.
+    #[test]
+    fn test_a_read_on_asks_only_the_relays_it_names() {
+        use std::cell::RefCell;
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let sessions: Sessions = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(n, relay)| (relay.to_string(), [n as u8; 32]))
+            .collect();
+        // As the node answers: each relay that it was handed a proof for
+        // read in part, and any other with its connection changed.
+        let node = |of_those: &Sessions| -> Vec<Value> {
+            sessions
+                .iter()
+                .map(
+                    |(relay, _)| match of_those.iter().any(|(r, _)| r == relay) {
+                        true => json!({ "relay": relay, "read": "part" }),
+                        false => json!({ "relay": relay, "read": changed }),
+                    },
+                )
+                .collect()
+        };
+        let handed: RefCell<Vec<Sessions>> = RefCell::new(Vec::new());
+        let asked = ["two".to_string()];
+        let mut at = sessions.clone();
+        let (_, relays) = read_again_where_changed(
+            &mut at,
+            |sessions| {
+                at_those_alone(Some(&asked), sessions, |of_those| {
+                    handed.borrow_mut().push(of_those.clone());
+                    Ok((Vec::new(), node(of_those)))
+                })
+            },
+            || panic!("the sessions are not asked for again"),
+        )
+        .unwrap();
+        assert_eq!(*handed.borrow(), [vec![sessions[1].clone()]]);
+        assert_eq!(relays, [json!({ "relay": "two", "read": "part" })]);
+        // Named none: every relay.
+        let (_, relays) = at_those_alone(None, &sessions, |of_those| {
+            assert_eq!(*of_those, sessions);
+            Ok((Vec::new(), node(of_those)))
+        })
+        .unwrap();
+        assert_eq!(relays.len(), 3);
+        assert!(!relays.iter().any(connection_changed));
+    }
+
+    /// **What is said of a relay carries the place that the read reached
+    /// there, as the node said it** (decision 2026-10-17 §3.2): its mark
+    /// and its place. A relay that the node names no place for is said as
+    /// it was: it read nothing, and keeps the place it had.
+    #[test]
+    fn test_what_is_said_of_a_relay_carries_the_place_it_reached() {
+        let one = json!({ "relay": "one", "read": "part", "entries": 2 });
+        let two = json!({ "relay": "two", "read": "not reached", "entries": 0 });
+        let reached = json!({ "relay": "one", "mark": "0606060606060606", "place": 7 });
+        assert_eq!(
+            with_the_place_reached(&one, &[&reached]),
+            json!({ "relay": "one", "read": "part", "entries": 2,
+                    "mark": "0606060606060606", "place": 7 })
+        );
+        assert_eq!(with_the_place_reached(&two, &[&reached]), two);
     }
 
     /// Versions are handed to the node a batch at a time, each within

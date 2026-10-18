@@ -106,6 +106,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             reading: None,
             not_let_go: None,
             let_go_discarded: None,
+            let_go_stopped: None,
             still_held: None,
             still_held_stopped: None,
         };
@@ -1397,8 +1398,9 @@ pub async fn unmapped(
                             return Err(ApiError::Conflict(format!("{said} {terminal}")));
                         }
                         let wall = chrono::Utc::now().timestamp();
-                        let asked = crate::let_go::word_asked(&db, name, &read, n, said, wall)
-                            .map_err(refused)?;
+                        let asked =
+                            crate::let_go::word_asked(&db, name, &read, n, said, wall, true)
+                                .map_err(refused)?;
                         drop(db);
                         let mut status = status(None, None)?;
                         status.not_let_go = Some(asked);
@@ -1483,7 +1485,8 @@ fn word_asked_after_a_read(
     let wall = chrono::Utc::now().timestamp();
     let relays = check::relays_say(db, &kept, found, &said, wall).map_err(refused)?;
     let lines = check::not_held_lines(name, found.not_held.len(), &relays);
-    check::word_asked(db, name, read, found.not_held.len(), lines, wall).map_err(refused)
+    let n = found.not_held.len();
+    check::word_asked(db, name, read, n, lines, wall, false).map_err(refused)
 }
 
 /// What [`unmapped`] does where the command sends the word that the person
@@ -1503,7 +1506,7 @@ fn discarded(
                 .into(),
         ));
     };
-    let (gone, alone) = {
+    let (gone, alone, stopped) = {
         let db = state
             .db
             .lock()
@@ -1516,12 +1519,19 @@ fn discarded(
                 "{name} is not mapped on this device"
             )));
         };
-        (gone, listed_alone(state, &db))
+        // A device that has stopped read no relay: what went is what its
+        // own notes said it sent to none (decision 2026-10-17 §5.3).
+        let stopped = !matches!(
+            crate::at_relays::stands(&db),
+            Ok(crate::at_relays::Stands::Applied)
+        );
+        (gone, listed_alone(state, &db), stopped)
     };
     let mut status = status(state)?;
     status.let_go = Some(name.to_string());
     status.let_go_alone = Some(alone);
     status.let_go_discarded = Some(gone);
+    status.let_go_stopped = Some(stopped);
     Ok(status)
 }
 
@@ -4137,6 +4147,7 @@ mod tests {
         let gone = unmapped(state, &the_word("lab", &asked, 1)).await.unwrap();
         assert_eq!(gone.let_go.as_deref(), Some("lab"));
         assert_eq!(gone.let_go_discarded, Some(1));
+        assert_eq!(gone.let_go_stopped, Some(false));
         assert_eq!(gone.let_go_versions, None);
         assert!(!still_holds(&node, "lab"));
         // The word again: the name is no longer held.
@@ -4174,6 +4185,63 @@ mod tests {
             assert_eq!(answer.still_held.as_deref(), Some("lab"));
             assert_eq!(answer.still_held_stopped, Some(stopped));
         }
+    }
+
+    /// **The word is asked only where the read still binds the let-go**
+    /// (decision 2026-10-17 §4.2 item 8, §5.2): at a terminal, where the
+    /// store took something of the name's channel since the read ended,
+    /// the node answers with that refusal and asks no word; and where a
+    /// folder was mapped to the name while the relays were read, it says
+    /// that the folder holds the name, in place of the prompt.
+    #[actix_web::test]
+    async fn test_the_word_is_asked_only_where_the_read_still_binds_the_let_go() {
+        use crate::several::{entry_by, identity_of, text};
+        let (node, _, secret) = holds_lab_by_a_carry();
+        let state = &node.state;
+        // The store takes an entry of the name after the read has ended.
+        {
+            let db = state.db.lock().unwrap();
+            let (read, found) = read_of(state, &db, "lab", &[]);
+            assert!(!found.each_held());
+            let theirs = entry_by(&identity_of(1), &secret, 1, "b.md", text("b"), &[]);
+            crate::take::take(&db, &state.identity, &theirs, 1).unwrap();
+            let asked = word_asked_after_a_read(state, &db, "lab", &read, &found);
+            assert!(
+                matches!(&asked, Err(ApiError::Conflict(why)) if *why == crate::let_go::took_something_says("lab")),
+                "{asked:?}"
+            );
+        }
+        // A folder is mapped to the name while the relays are read.
+        let home = std::path::Path::new("/home/sam");
+        {
+            let db = state.db.lock().unwrap();
+            let on: SyncClaudeRequest =
+                serde_json::from_value(serde_json::json!({ "enabled": true, "dir": DIR })).unwrap();
+            set_claude(&state.sync_control, &db, &on, Some(home)).unwrap();
+        }
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[])]);
+        let held_round = node.own_round_waits.lock().await;
+        let first = SyncUnmapRequest {
+            folder: "lab".into(),
+            asks: true,
+            ..Default::default()
+        };
+        let (asked, ()) = tokio::join!(unmapped(state, &first), async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            {
+                let db = state.db.lock().unwrap();
+                let before = mapped_names(&db).unwrap();
+                let body = request("/home/sam/notes", "lab", false);
+                add_mapping(&state.sync_control, &db, &body, home).unwrap();
+                names_follow(state, &db, &before);
+            }
+            drop(held_round);
+        });
+        let Err(ApiError::Conflict(why)) = &asked else {
+            panic!("asked the word: {:?}", asked.map(|a| a.not_let_go));
+        };
+        assert_eq!(*why, crate::let_go::folder_mapped_says("lab"));
+        assert!(still_holds(&node, "lab"));
     }
 
     /// **A folder mapped to a carried name while the word is asked keeps
@@ -4327,17 +4395,50 @@ mod tests {
             );
         }
         assert!(still_holds(&node, "lab"));
-        // Counted again, with the number and in time: the name goes.
+        // Counted again, with the number and in time: the name goes. The
+        // device holds a secret it left, and has stopped: the prompt says
+        // that another device brings in again what a carry brought, and
+        // not the days that this device holds the secret for.
+        assert!(
+            node.state
+                .own_channels
+                .reads()
+                .gone(&read, std::time::Instant::now())
+        );
+        {
+            let db = node.state.db.lock().unwrap();
+            let left = chrono::Utc::now().timestamp() - 3600;
+            cordelia_storage::person::keep_left_secret(&db, 9, &[9; 32], left).unwrap();
+        }
         let asked = asked_the_word(&node, "lab").await;
+        let held_for = asked["where"].as_str().unwrap();
+        assert!(
+            held_for.contains(
+                "This device carries nothing while it has stopped: on another of your devices, \
+                 `cordelia sync carry lab` brings in again"
+            ),
+            "{held_for}"
+        );
+        assert!(!held_for.contains("more days"), "{held_for}");
         let gone = unmapped(&node.state, &the_word("lab", &asked, 1))
             .await
             .unwrap();
         assert_eq!(gone.let_go.as_deref(), Some("lab"));
         assert_eq!(gone.let_go_discarded, Some(1));
+        // It read no relay: what went is what its notes said.
+        assert_eq!(gone.let_go_stopped, Some(true));
         // The statement lists this device alone: device 1 was added since.
         assert_eq!(gone.let_go_alone, Some(true));
         assert!(!still_holds(&node, "lab"));
         assert_eq!(node.own_rounds.load(SeqCst), 0);
+        // The name is stopped: nothing is kept of its read that went.
+        assert!(
+            !node
+                .state
+                .own_channels
+                .reads()
+                .gone(&read, std::time::Instant::now())
+        );
     }
 
     /// What is said of each relay where a carried name is not let go

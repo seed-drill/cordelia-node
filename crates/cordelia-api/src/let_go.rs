@@ -574,7 +574,18 @@ pub fn left_secret_days(conn: &Connection, now: i64) -> Result<Option<i64>, Pers
 /// written on this device since goes for good. `folder` is whether a
 /// folder was mapped to the name ([`crate::names::brought_in`]): it keeps
 /// its files. It promises nothing that the device does not know.
-pub fn where_says(name: &str, not_held: usize, days: Option<i64>, folder: bool) -> String {
+///
+/// **On a device that has stopped** (`stopped`), a carry is refused: what
+/// a carry brought is brought in again by the same commands on another of
+/// the person's devices, and the days that this device holds its secrets
+/// for are no help, so they are not said.
+pub fn where_says(
+    name: &str,
+    not_held: usize,
+    days: Option<i64>,
+    folder: bool,
+    stopped: bool,
+) -> String {
     let typed_name = typed(name);
     let name = shown(name);
     let (those, are) = match not_held {
@@ -601,14 +612,25 @@ pub fn where_says(name: &str, not_held: usize, days: Option<i64>, folder: bool) 
         1 => "whether it is one".to_string(),
         n => format!("which of the {n} those are"),
     };
+    let carried = match stopped {
+        false => format!(
+            "A version that a carry brought into {name} is still at the relays, in the channel it \
+             was carried from, for {days} at most: `cordelia sync carry {typed_name}` brings in \
+             again what a device that counts wrote, and `cordelia sync carry {typed_name} --from \
+             <device>`, with the recovery phrase, what a removed device wrote."
+        ),
+        true => format!(
+            "A version that a carry brought into {name} is still at the relays, in the channel it \
+             was carried from. This device carries nothing while it has stopped: on another of \
+             your devices, `cordelia sync carry {typed_name}` brings in again what a device that \
+             counts wrote, and `cordelia sync carry {typed_name} --from <device>`, with the \
+             recovery phrase, what a removed device wrote."
+        ),
+    };
     format!(
-        "Letting {name} go now drops {those} from this device. A version that a carry brought \
-         into {name} is still at the relays, in the channel it was carried from, for {days} at \
-         most: `cordelia sync carry {typed_name}` brings in again what a device that counts \
-         wrote, and `cordelia sync carry {typed_name} --from <device>`, with the recovery \
-         phrase, what a removed device wrote.{folder_keeps} A version written on this device \
-         since it was carried is on this device alone, and goes for good: this device does not \
-         keep {which}."
+        "Letting {name} go now drops {those} from this device. {carried}{folder_keeps} A version \
+         written on this device since it was carried is on this device alone, and goes for good: \
+         this device does not keep {which}."
     )
 }
 
@@ -616,8 +638,9 @@ pub fn where_says(name: &str, not_held: usize, days: Option<i64>, folder: bool) 
 /// a terminal and `name` is let go only on the word (decision 2026-10-17
 /// §5.2): the read's ID `read`, as hex, and `versions`, the number found,
 /// which the command sends back with the word; `said`, what is said
-/// first; and `where`, where the versions may still be ([`where_says`]).
-/// `now` is the time in seconds.
+/// first; and `where`, where the versions may still be ([`where_says`]),
+/// on a device that has stopped where `stopped`. `now` is the time in
+/// seconds.
 pub fn word_asked(
     conn: &Connection,
     name: &str,
@@ -625,6 +648,7 @@ pub fn word_asked(
     versions: usize,
     said: String,
     now: i64,
+    stopped: bool,
 ) -> Result<serde_json::Value, PersonError> {
     let days = left_secret_days(conn, now)?;
     let folder = crate::names::brought_in(conn)?.contains(name);
@@ -632,7 +656,7 @@ pub fn word_asked(
         "read": hex::encode(read),
         "versions": versions,
         "said": said,
-        "where": where_says(name, versions, days, folder),
+        "where": where_says(name, versions, days, folder, stopped),
     }))
 }
 
@@ -687,7 +711,7 @@ mod tests {
     #[test]
     fn test_where_the_versions_a_discard_lets_go_of_may_still_be() {
         assert_eq!(
-            where_says("lab", 3, Some(61), false),
+            where_says("lab", 3, Some(61), false, false),
             "Letting lab go now drops those 3 versions from this device. A version that a carry \
              brought into lab is still at the relays, in the channel it was carried from, for 61 \
              more days at most: `cordelia sync carry lab` brings in again what a device that \
@@ -697,7 +721,7 @@ mod tests {
              of the 3 those are."
         );
         // A folder was mapped to it: the sentence follows the second.
-        let folder = where_says("lab", 3, Some(61), true);
+        let folder = where_says("lab", 3, Some(61), true, false);
         assert!(
             folder.contains(
                 "what a removed device wrote. A folder that was mapped to lab keeps its files: \
@@ -705,7 +729,7 @@ mod tests {
             ),
             "{folder}"
         );
-        let one = where_says("~", 1, Some(1), false);
+        let one = where_says("~", 1, Some(1), false, false);
         assert!(
             one.starts_with("Letting home memory go now drops that version from"),
             "{one}"
@@ -718,14 +742,28 @@ mod tests {
             one.ends_with("this device does not keep whether it is one."),
             "{one}"
         );
+        // On a device that has stopped, which carries nothing: another
+        // device brings it in again, and no days are said.
+        let stopped = where_says("lab", 3, Some(61), true, true);
+        assert_eq!(
+            stopped,
+            "Letting lab go now drops those 3 versions from this device. A version that a carry \
+             brought into lab is still at the relays, in the channel it was carried from. This \
+             device carries nothing while it has stopped: on another of your devices, `cordelia \
+             sync carry lab` brings in again what a device that counts wrote, and `cordelia sync \
+             carry lab --from <device>`, with the recovery phrase, what a removed device wrote. A \
+             folder that was mapped to lab keeps its files: what it wrote may still be there. A \
+             version written on this device since it was carried is on this device alone, and \
+             goes for good: this device does not keep which of the 3 those are."
+        );
         // No secret of a generation it left.
         assert_eq!(
-            where_says("lab", 3, None, false),
+            where_says("lab", 3, None, false, false),
             "Letting lab go now drops those 3 versions from this device: they are on this device \
              alone."
         );
         assert_eq!(
-            where_says("lab", 1, None, true),
+            where_says("lab", 1, None, true, false),
             "Letting lab go now drops that version from this device: it is on this device alone. \
              A folder that was mapped to lab keeps its files: what it wrote may still be there."
         );

@@ -295,6 +295,15 @@ impl OwnReads {
         kept.extend(gone);
     }
 
+    /// The device holds the channel `channel` no more: the name it was the
+    /// channel of is stopped. Nothing is kept of a read of it that went,
+    /// so that what is kept of reads that went is at most one for each
+    /// channel the device holds.
+    pub fn forget_gone(&self, channel: &[u8; 32]) {
+        let mut gone = self.gone.lock().unwrap_or_else(|e| e.into_inner());
+        gone.remove(channel);
+    }
+
     /// Whether the read named `read` is one that this node made and keeps
     /// no more, by `now`, for its age or because another read of its
     /// channel took its place: it is the last of its channel that went so.
@@ -683,6 +692,14 @@ mod tests {
         reads.forget(&second);
         assert!(!reads.gone(&second, begun));
         assert!(!reads.gone(&[9; 16], begun));
+        // The channel's name is stopped: nothing is kept of its read that
+        // went, and another channel's is kept.
+        let other_old = reads.begin(&[2; 32], &under, &relays, begun).unwrap();
+        assert!(reads.gone(&other, begun));
+        reads.forget_gone(&channel);
+        assert!(!reads.gone(&first, begun));
+        assert!(reads.gone(&other, begun) && !reads.gone(&other_old, begun));
+        assert_eq!(reads.gone.lock().unwrap().len(), 1);
     }
 
     /// A read stands for LET_GO_READ_STANDS_SECS from the end of its last

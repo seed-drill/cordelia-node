@@ -1726,7 +1726,9 @@ fn a_recovery_that_was_cut_short_is_recovered_from_and_the_rest_comes_by_from() 
 /// command goes on. Before its yes it says at which relay the channel
 /// could not be read, and that devices added since and names may be
 /// missing. **It says the same of the personal channel of the generation
-/// before, which is read for names,** by that change's number.
+/// before, which is read for names,** by that change's number, **and of
+/// the phrase's own channel** (decision 2026-10-17 §3.2; §1, property
+/// 11).
 #[test]
 fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let first = relay_named("relay-one");
@@ -1784,6 +1786,16 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
          end at {down}: names that are listed only there may be missing."
     );
     let warned = said.find(&before).unwrap_or_else(|| panic!("{said}"));
+    assert!(warned < asked, "{said}");
+    // The phrase's own channel could not be read at that relay either:
+    // that is said again before the yes, since it may hold a later
+    // change (decision 2026-10-17 §3.2).
+    let phrase = format!(
+        "The recovery phrase's own channel could not be read to its end at {down}: it may hold a \
+         later change. This recovery is made from change 2, the latest in what was read. Only \
+         the recovery phrase writes in that channel."
+    );
+    let warned = said.find(&phrase).unwrap_or_else(|| panic!("{said}"));
     assert!(warned < asked, "{said}");
     // It was read to its end at one relay: what a read in part costs is
     // not said.
@@ -1973,4 +1985,244 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
         });
     }
     let _: Value = person_of(&new);
+}
+
+/// What `device`, which is stopped, signs in the personal channel of the
+/// change it has applied with: its key, that statement, the channel's
+/// secret, and the first revision of the statement's band.
+fn signs_in_the_personal_channel(
+    device: &Node,
+) -> (
+    cordelia_crypto::identity::NodeIdentity,
+    cordelia_crypto::statement::Statement,
+    [u8; 32],
+    u64,
+) {
+    use cordelia_crypto::identity::NodeIdentity;
+    use cordelia_crypto::statement::SignedStatement;
+    let identity = NodeIdentity::from_file(&device.data_dir().join("identity.key")).unwrap();
+    let conn = store_of(device);
+    let statement: Vec<u8> = conn
+        .query_row("SELECT statement FROM person", [], |row| row.get(0))
+        .unwrap();
+    let statement = SignedStatement::from_bytes(&statement).unwrap().statement;
+    let secret: Vec<u8> = conn
+        .query_row(
+            "SELECT secret FROM person_secrets WHERE left_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let secret: [u8; 32] = secret.try_into().unwrap();
+    let personal = cordelia_crypto::derive::personal_secret(&secret).unwrap();
+    let rev = (statement.number << cordelia_core::protocol::REV_COUNT_BITS) + 1;
+    (identity, statement, personal, rev)
+}
+
+/// Put `entries` in the store of `relay`, which is stopped, after
+/// everything it holds and in their order: a page hands them so.
+fn relay_takes(relay: &Node, entries: &[cordelia_crypto::entry::CheckedEntry]) {
+    use cordelia_storage::relay::{self, Asker, Room, Taken};
+    let conn = rusqlite::Connection::open(relay.data_dir().join("cordelia.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    let mut room = Room::new(1 << 40);
+    let asker = Asker::ListedRelay {
+        held_since: None,
+        used_at: None,
+    };
+    let now = chrono::Utc::now().timestamp();
+    for entry in entries {
+        let taken = relay::take(&conn, &mut room, entry, &asker, now).unwrap();
+        assert_eq!(taken, Taken::Stored);
+    }
+}
+
+/// How many entries of about 64 KB fill the personal channel to some 7
+/// MiB, as a relay counts it: more than one read of CARRY_READ_MAX_SECS
+/// takes at what a device takes from a relay in a minute, by half again.
+const FILLING: u16 = 110;
+
+/// Put in the store of `relay`, which is stopped, FILLING entries that
+/// `device` signed in the personal channel of the change it has applied,
+/// each of about 64 KB: words under names that hold nothing a reader
+/// keeps, which fill the channel as a relay counts it. `device` is
+/// stopped.
+fn fills_the_personal_channel(relay: &Node, device: &Node) {
+    use cordelia_crypto::entry::{Entry, Inside, Value};
+    let (identity, _, personal, rev) = signs_in_the_personal_channel(device);
+    let words: Vec<_> = (0..FILLING)
+        .map(|n| {
+            let inside = Inside {
+                name: format!("words/{n}"),
+                value: Value::Other(vec![0x5a; 50_000]),
+                chain: Some(Vec::new()),
+            };
+            Entry::seal(&personal, &identity, rev, &inside)
+                .unwrap()
+                .check()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(words[0].content.len(), 64 * 1024);
+    relay_takes(relay, &words);
+}
+
+/// A person's two devices, which a relay of the test's own was sent
+/// everything of, all stopped; and the relay, stopped, holding besides
+/// some 7 MiB of words that the laptop signed in the personal channel:
+/// more than one read takes.
+fn a_personal_channel_larger_than_one_read() -> (Node, Two) {
+    let mut relay = relay_named("relay-one");
+    let mut two = two_devices(&[&relay], None);
+    two.laptop.stop();
+    two.desktop.stop();
+    relay.stop();
+    fills_the_personal_channel(&relay, &two.laptop);
+    (relay, two)
+}
+
+/// `cordelia recover` on `new`, at a terminal: the phrase `words`, and
+/// then what it says until it has said that it reads the personal
+/// channel on at `relay`, with how far the first round read.
+fn recovers_and_reads_on(new: &Node, words: &str, relay: &str) -> AtTerminal {
+    let mut at = new.at_terminal(&["recover", "--name", new.name]);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(words);
+    at.says("Recovering from change 1. Reading its personal channel at each relay...")
+        .says("The personal channel of change 1 is larger than one read. Reading on at ")
+        .says(relay)
+        .says(
+            ": a relay may hold up to 16 MiB of it, which takes up to 5 reads: up to 4 more are \
+             made, each of up to 2 minutes and what it takes beyond that.",
+        )
+        .says("Ctrl-C stops here, and nothing is made.")
+        .says(&format!("  {relay}: "))
+        .says(" MiB read so far.");
+    at
+}
+
+/// **A recovery reads a personal channel larger than one read to its
+/// end** (decision 2026-10-17 §3.2, §3.3; §1, property 10). The laptop
+/// fills the personal channel with some 7 MiB of words, and the desktop's
+/// record of a phone is the last entry the relay holds. The first round
+/// reads part of the channel; the recovery says that it reads on, says
+/// how far each round read, and that the channel was read to its end;
+/// and it asks about the phone, which the desktop added. Read once, as a
+/// recovery read before, the phone has no row.
+#[test]
+fn a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end() {
+    use cordelia_crypto::addition::Addition;
+    use cordelia_crypto::entry::{Entry, Inside, Value as Held};
+    use cordelia_crypto::identity::NodeIdentity;
+    use cordelia_crypto::statement::Device;
+    let (mut relay, two) = a_personal_channel_larger_than_one_read();
+    // The desktop adds a phone: its record comes after the words.
+    let (desktop, statement, personal, rev) = signs_in_the_personal_channel(&two.desktop);
+    let phone = NodeIdentity::from_seed([0x7c; 32]).unwrap().public_key();
+    let now = chrono::Utc::now().timestamp();
+    let record = Addition::under(
+        &statement,
+        Device::new(phone, "phone").unwrap(),
+        desktop.public_key(),
+        now as u64,
+    )
+    .unwrap()
+    .sign(&desktop)
+    .unwrap();
+    let inside = Inside {
+        name: cordelia_api::person::added_name(&phone).unwrap(),
+        value: Held::Other(record.to_bytes().unwrap()),
+        chain: Some(Vec::new()),
+    };
+    let added = Entry::seal(&personal, &desktop, rev, &inside)
+        .unwrap()
+        .check()
+        .unwrap();
+    relay_takes(&relay, &[added]);
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+
+    let new = device_at("new", &[&relay]);
+    let named = format!("127.0.0.1:{}", relay.p2p);
+    let mut at = recovers_and_reads_on(&new, &two.words, &named);
+    at.says(&format!("  {named}: read to its end, "));
+    // The phone is asked about, with the laptop and the desktop.
+    answers_and_yes(&mut at, &["lost", "lost", "lost"]);
+    at.says("The change is made (change 2)")
+        .says("The look is made");
+    let said = at.done();
+    println!("{said}");
+    // Three were asked about: the phone is the third.
+    assert!(
+        said.contains("\"phone\", added since change 1, from "),
+        "{said}"
+    );
+    assert!(said.contains("removed keys (3):"), "{said}");
+    // It was read to its end: nothing is said of a read in part.
+    assert!(!said.contains("read in part"), "{said}");
+    assert!(!said.contains("could not be read to its end"), "{said}");
+    assert!(said.contains("1 name is carried: lab."), "{said}");
+    assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
+}
+
+/// **A recovery whose personal channel stays read in part goes on to its
+/// yes and to the look** (decision 2026-10-17 §3.2, §3.3; §1, properties
+/// 10 and 11). The relay holds some 7 MiB of the personal channel, and
+/// is stopped once the recovery says that it reads on: the relay is not
+/// reached at the round it was stopped in, or at the next, and is not
+/// asked again, so the reading ends there and not at the bound. The
+/// command says that it read the channel in part at that relay, and why;
+/// says before its yes what a read in part costs; and, the relay started
+/// again, takes the yes, and the look carries what was read.
+#[test]
+fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
+    let (mut relay, two) = a_personal_channel_larger_than_one_read();
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    let new = device_at("new", &[&relay]);
+    let named = format!("127.0.0.1:{}", relay.p2p);
+    let mut at = recovers_and_reads_on(&new, &two.words, &named);
+    let stopped = std::time::Instant::now();
+    relay.stop();
+    at.says(&format!("  {named}: read in part, "));
+    // Not asked again once it was not reached: the reading ended within
+    // the round it was stopped in, or at the next, which ends at once.
+    let took = stopped.elapsed();
+    let round = Duration::from_secs(cordelia_core::protocol::CARRY_READ_MAX_SECS);
+    assert!(took < round + Duration::from_secs(60), "{took:?}");
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    // The look reads over the connections that the node has: one with a
+    // session, as the node says it of the relay.
+    wait_for(
+        "the new machine reaches the relay again",
+        &[&relay, &new],
+        120,
+        || {
+            let said = new.post("/api/v1/carry/sessions", json!({}));
+            let sessions = said["sessions"].as_array()?;
+            let reached = |at: &Value| at["relay"] == named && at["session"].is_string();
+            let connected = relays_of(&new)
+                .iter()
+                .all(|relay| relay["state"] == "connected");
+            (connected && sessions.iter().any(reached)).then_some(())
+        },
+    );
+    answers_and_yes(&mut at, &["lost", "lost"]);
+    at.says("The change is made (change 2)")
+        .says("The look is made");
+    let said = at.done();
+    println!("{said}");
+    let in_part = format!(
+        "The personal channel of change 1 was read to its end at no relay: in part at {named} \
+         (it was not reached). Devices added since that change, and names, may be missing from \
+         what was read. A relay that hands it more slowly than a channel at its largest needs, or \
+         stops, leaves it in part."
+    );
+    let warned = said.find(&in_part).unwrap_or_else(|| panic!("{said}"));
+    let yes = said.find("Recover on this machine?").unwrap();
+    assert!(warned < yes, "{said}");
+    assert!(said.contains("1 name is carried: lab."), "{said}");
+    assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
+    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
 }

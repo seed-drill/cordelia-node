@@ -404,9 +404,23 @@ pub enum LeftRefused {
     OwnChannel,
     /// The device has asked as much of this relay as it asks in a minute.
     AskedEnough,
+    /// The relay refused the pull for now, on a connection that is still
+    /// open ([`Refused::NotNow`]), and that was counted for it. The
+    /// proof, where one was sent, was answered.
+    NotNow,
+    /// The relay is at its count of refusals for now
+    /// ([`Leave::at_its_count`]): the pull was not sent. The proof, where
+    /// one was sent, was answered.
+    AtItsCount,
     /// The relay did not answer, or not as it answers such a request.
     NotAnswered(String),
 }
+
+/// What a read through the door for a carry is said to have ended with
+/// where the proof was refused for now ([`Refused::NotNow`]): the relay
+/// took no more from the connection for now, over its allowance.
+const PROOF_NOT_NOW: &str = "the proof was refused for now: the relay takes no more from this \
+                             connection in this minute";
 
 /// What a show was answered, and what it cost to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,15 +755,9 @@ impl Leave {
         }
         // A request that the relay refused for now is said so, and
         // counted for the relay; any other failure is said as it was.
-        let answer = exchange(send, recv, protocol, request).await.map_err(|e| {
-            match refused_for_now(&e) {
-                true => {
-                    self.refused_at(link);
-                    Refused::NotNow
-                }
-                false => Refused::NotAnswered(e.to_string()),
-            }
-        })?;
+        let answer = exchange(send, recv, protocol, request)
+            .await
+            .map_err(|e| self.refused(link, &e))?;
         let answer = read(answer);
         let conn = lock(db);
         self.may_use(&conn, link, under)?;
@@ -929,12 +937,23 @@ impl Leave {
                 channel: *channel,
                 proof: *proof,
             });
-            let answer = self.asks(link, Protocol::ChannelProve, &request).await;
+            let answer = match self.asks(link, Protocol::ChannelProve, &request).await {
+                // Refused for now: said as a proof's, not as a page's.
+                Err(Refused::NotNow) => return Err(not(PROOF_NOT_NOW)),
+                answer => answer,
+            };
             match answer.map_err(asks)? {
                 WireMessage::ChannelProved(proved) if proved.proved => {}
                 WireMessage::ChannelProved(_) => return Ok(LeftPage::NotHeld),
                 _ => return Err(not("a proof was not answered as one")),
             }
+        }
+        // The pull is held to the relay's count as it goes out, as each
+        // request of a read is ([`Self::open`]): a refusal at another door
+        // may have come while the proof was answered, and one more may be
+        // the breach that has the relay cut off the address.
+        if self.at_its_count(&link.relay().0) {
+            return Err(LeftRefused::AtItsCount);
         }
         let (mark, after) = place;
         let pull = WireMessage::EntryPull(EntryPull {
@@ -944,7 +963,11 @@ impl Leave {
             limit: ENTRY_PAGE_MAX_ENTRIES,
         });
         let answer = self.asks(link, Protocol::EntryPull, &pull).await;
-        let page = match answer.map_err(asks)? {
+        let page = match answer {
+            Err(Refused::NotNow) => return Err(LeftRefused::NotNow),
+            answer => answer.map_err(asks)?,
+        };
+        let page = match page {
             WireMessage::EntryPulled(page) => page,
             _ => return Err(not("a pull was not answered with a page")),
         };
@@ -972,7 +995,9 @@ impl Leave {
     /// Ask `request` of the relay at `link` on a stream of `protocol`,
     /// for the pair channel of a typed key, or for a channel of a
     /// generation that was left, where the device has not asked as much
-    /// of that relay as it asks in a minute.
+    /// of that relay as it asks in a minute. A request that the relay
+    /// refused for now is said so, and counted for the relay
+    /// ([`Self::refused`]).
     async fn asks(
         &self,
         link: &Link,
@@ -982,9 +1007,25 @@ impl Leave {
         if !lock(&self.inner).may_ask(link.name()) {
             return Err(Refused::AskedEnough);
         }
-        self.ask_counted(link, protocol, request)
+        let (send, recv) = open_stream(&link.conn)
             .await
-            .map_err(Refused::NotAnswered)
+            .map_err(Refused::NotAnswered)?;
+        let answer = exchange(send, recv, protocol, request).await;
+        answer.map_err(|e| self.refused(link, &e))
+    }
+
+    /// What a request that failed with `e` was refused with: for now,
+    /// where the relay reset it with ERR_RATE_LIMIT ([`refused_for_now`]),
+    /// which is counted for the relay ([`Self::refused_at`]); otherwise
+    /// it was not answered, as it failed.
+    fn refused(&self, link: &Link, e: &codec::CodecError) -> Refused {
+        match refused_for_now(e) {
+            true => {
+                self.refused_at(link);
+                Refused::NotNow
+            }
+            false => Refused::NotAnswered(e.to_string()),
+        }
     }
 
     /// Ask `request` of the relay at `link` on a new stream of
