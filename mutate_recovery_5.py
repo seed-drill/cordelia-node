@@ -8,9 +8,11 @@ again; the lines after each round; and the line of step 1 before the yes
 (decision 2026-10-17 §3.1 to §3.3; §1, properties 10 and 11). With it:
 the bytes a relay handed, as the node says them; a device that keeps
 back the room a relay keeps for a show, and waits out a pull refused for
-now; and reads that keep each entry once. A part for each rule of the
-slice: put each fault in, and confirm the test named for it fails on an
-assertion. Run from the root of a checkout that nothing else edits."""
+now, only so often in a row; reads that keep each entry once; and a
+round that reads again only the relays whose connection changed, within
+a bound counted in readings. A part for each rule of the slice: put each
+fault in, and confirm the test named for it fails on an assertion. Run
+from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
 
 # One name for each file a part edits.
@@ -47,6 +49,10 @@ PHRASE = cmd("test_a_phrase_channel_not_read_to_its_end_is_said_again_before_the
 IN_PART = cmd("test_a_recovery_goes_on_with_what_it_could_read_of_the_personal_channel")
 SHOW_ROOM = (NODE_E2E, "a_device_takes_from_a_relay_no_page_from_the_room_kept_for_a_show")
 NOT_NOW = (NODE_E2E, "a_read_of_a_left_channel_waits_out_a_pull_refused_for_now")
+NODE_LIB = ("cordelia-node", ["--lib"])
+CUT_OFF = (NODE_LIB, "device_entries::leave::tests::a_request_is_refused_for_now_only_where_it_was_cut_off_with_the_rate_limit_code")
+CHANGING = cmd("test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound")
+ROUND_AGAIN = carry("test_a_round_reads_again_only_the_relays_whose_connection_changed")
 LARGER = (RECOVER_E2E, "a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end")
 STAYS = (RECOVER_E2E, "a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look")
 TWO_RELAYS = (RECOVER_E2E, "a_recovery_says_at_which_relay_the_personal_channel_was_not_read")
@@ -83,8 +89,12 @@ MUTATIONS = [
      '''                if seen.insert(bytes.clone()) || true {''',
      [ONCE]),
     ("RO6 a reading again keeps an entry as often as it was handed", CARRY_CMD,
-     '''            if kept.insert(entry.id()) {''',
-     '''            if kept.insert(entry.id()) || true {''',
+     '''        let (handed, relays) = read(sessions)?;
+        for entry in handed {
+            if kept.insert(entry.id()) {''',
+     '''        let (handed, relays) = read(sessions)?;
+        for entry in handed {
+            if kept.insert(entry.id()) || true {''',
      [AGAIN]),
     ("RO7 a reading again keeps the bytes said last, not the most", CARRY_CMD,
      '''                    if bytes_before > bytes_handed(of) {''',
@@ -115,14 +125,16 @@ MUTATIONS = [
             break;
         }''',
      [TO_ITS_END, LARGER]),
-    ("RO13 a round begins until the bound itself", RECOVER_CMD,
-     '''let bound = Duration::from_secs(RECOVERY_READ_ON_MAX_SECS - CARRY_READ_MAX_SECS);''',
-     '''let bound = Duration::from_secs(RECOVERY_READ_ON_MAX_SECS);''',
+    ("RO13 the bound allows a reading more", RECOVER_CMD,
+     '''        let within = readings.get() < RECOVERY_READ_ON_READS;''',
+     '''        let within = readings.get() <= RECOVERY_READ_ON_READS;''',
+     [AT_THE_BOUND, CHANGING]),
+    ("RO14 a reading is not counted", RECOVER_CMD,
+     '''            readings.set(readings.get() + 1);''',
+     '''            readings.set(readings.get());''',
      [AT_THE_BOUND]),
-    ("RO14 no round begins that would end at the bound itself", RECOVER_CMD,
-     '''        if elapsed() > bound {''',
-     '''        if elapsed() >= bound {''',
-     [AT_THE_BOUND]),
+    # Counted in readings, asking a relay that is down again uses the
+    # readings up at once: the real-process read in part ends either way.
     ("RO15 a relay not reached in a round is asked again", RECOVER_CMD,
      '''                read => format!("it could not be read again ({read})"),
             };
@@ -131,7 +143,7 @@ MUTATIONS = [
             };
             self.on = true;
             return why;''',
-     [NOT_REACHED, STAYS]),
+     [NOT_REACHED]),
     ("RO16 a relay that answers to its end under no mark is read whole", RECOVER_CMD,
      '''            || (read == "whole" && place.as_ref().is_some_and(|(mark, _)| *mark == no_mark()));''',
      '''            || false;''',
@@ -213,14 +225,14 @@ MUTATIONS = [
      '''                say(relay.in_part("the time to read it on is up"));''',
      '''                relay.in_part("the time to read it on is up");''',
      [AT_THE_BOUND]),
-    ("RO33 a recovery reads its personal channel once, with no clock", RECOVER_CMD,
-     '''            || began.elapsed(),''',
-     '''            || Duration::from_secs(RECOVERY_READ_ON_MAX_SECS),''',
-     [LARGER]),
-    ("RO34 the line of a read in part says a device filled it", RECOVER_CMD,
-     '''                 missing from what was read. It was read for {} minutes, which is what a channel \\''',
-     '''                 missing from what was read. It was read for {} seconds, which is what a channel \\''',
-     [IN_PART, STAYS]),
+    ("RO33 the first round counts as all the readings", RECOVER_CMD,
+     '''    let readings = std::cell::Cell::new(1u64);''',
+     '''    let readings = std::cell::Cell::new(RECOVERY_READ_ON_READS);''',
+     [TO_ITS_END]),
+    ("RO34 the line of a read in part says another length of reading", RECOVER_CMD,
+     '''                RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS / 60''',
+     '''                RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS / 30''',
+     [IN_PART]),
     ("RO35 the phrase's own channel is not said before the yes", RECOVER_CMD,
      '''        if !self.phrase_not_read.is_empty() {''',
      '''        if false {''',
@@ -259,12 +271,65 @@ MUTATIONS = [
      '''    let code = quinn::VarInt::from_u32(0);''',
      [NOT_NOW]),
     ("RO43 the proof is sent again after a pull refused for now", ENTRIES,
-     '''                Err(LeftRefused::NotNow) => {
-                    proved = true;
-                    tokio::time::sleep(LEFT_ROOM_WAIT).await''',
-     '''                Err(LeftRefused::NotNow) => {
-                    tokio::time::sleep(LEFT_ROOM_WAIT).await''',
+     '''                    proved = true;
+                    refused_in_a_row += 1;''',
+     '''                    refused_in_a_row += 1;''',
      [NOT_NOW]),
+    ("RO44 a round keeps an entry as often as it was handed", CARRY_CMD,
+     '''            read(of_those, &places)
+        })?;
+        for entry in handed {
+            if kept.insert(entry.id()) {''',
+     '''            read(of_those, &places)
+        })?;
+        for entry in handed {
+            if kept.insert(entry.id()) || true {''',
+     [ROUND_AGAIN]),
+    ("RO45 a round reads again every relay asked", CARRY_CMD,
+     '''        those = Some(changed);''',
+     '''        those = asked.map(<[String]>::to_vec);
+        let _ = changed;''',
+     [ROUND_AGAIN, CHANGING]),
+    ("RO46 a round reads again whatever the bound says", CARRY_CMD,
+     '''        if changed.is_empty() || made_again == CARRY_PROOFS_MADE_AGAIN || !may_read_again() {''',
+     '''        if changed.is_empty() || made_again == CARRY_PROOFS_MADE_AGAIN {''',
+     [ROUND_AGAIN, CHANGING]),
+    ("RO47 a round reads again with no new sessions", CARRY_CMD,
+     '''        those = Some(changed);
+        *sessions = ask()?;''',
+     '''        those = Some(changed);''',
+     [ROUND_AGAIN]),
+    ("RO48 what a relay handed in a round that ended early is not counted", RECOVER_CMD,
+     '''        if let Some(said) = said {
+            self.handed += entries_handed(said);''',
+     '''        let gone = |said: &&Value| {
+            text(said, "read") == "not held"
+                || place_of(said).is_none_or(|(mark, _)| mark == no_mark())
+        };
+        if let Some(said) = said.filter(|said| !gone(said)) {
+            self.handed += entries_handed(said);''',
+     [NOT_REACHED]),
+    ("RO49 a proof refused for now is said as a page's", LEAVE,
+     '''                    return Err(not(PROOF_NOT_NOW));''',
+     '''                    return Err(not(NOT_NOW));''',
+     [NOT_NOW]),
+    ("RO50 a request stopped with the rate-limit code is not refused for now", LEAVE,
+     '''        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
+     '''        || false''',
+     [CUT_OFF]),
+    ("RO51 a read asks again after any number of refusals for now in a row", ENTRIES,
+     '''                    if refused_in_a_row >= LEFT_REFUSED_IN_A_ROW_MAX {''',
+     '''                    if false && refused_in_a_row >= LEFT_REFUSED_IN_A_ROW_MAX {''',
+     [NOT_NOW]),
+    ("RO52 a page between two refusals for now does not start the count again", ENTRIES,
+     '''                    refused_in_a_row = 0;''',
+     '''                    let _ = refused_in_a_row;''',
+     [NOT_NOW]),
+    # BAN_THRESHOLD itself is refused at compile time.
+    ("RO53 a read ends at the first refusal for now", PROTOCOL,
+     '''pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 1;''',
+     '''pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 2;''',
+     [BOUND, NOT_NOW]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
