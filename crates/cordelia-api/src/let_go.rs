@@ -326,14 +326,37 @@ fn typed(name: &str) -> String {
     }
 }
 
+/// The name as a line says it: home memory's name is said as that, as
+/// the command says it in every line of its own.
+fn shown(name: &str) -> String {
+    match name == crate::sync::HOME_NAME {
+        true => "home memory".to_string(),
+        false => name.to_string(),
+    }
+}
+
 /// What is said where the node no longer keeps the read that a command
 /// asks to go on with (decision 2026-10-17 §4.6): it was started again
 /// during the read, and kept nothing of it.
 pub fn started_again_says(name: &str) -> String {
+    let shown = shown(name);
     format!(
-        "{name} is still held: the node was started again since {name} was read. Run `cordelia \
-         sync unmap {}` again.",
+        "{shown} is still held: the node was started again since {shown} was read. Run \
+         `cordelia sync unmap {}` again.",
         typed(name)
+    )
+}
+
+/// What is said where a folder was mapped to the name while it was read
+/// (decision 2026-10-17 §4.2 item 8): the store's order does not show it,
+/// since a folder takes nothing in until its first cycle. The name is
+/// held by that folder now. Nothing tells the person to unmap the name
+/// again: that would unmap the folder.
+pub fn folder_mapped_says(name: &str) -> String {
+    let shown = shown(name);
+    format!(
+        "{shown} is still held: a folder was mapped to {shown} while the relays were read, and \
+         {shown} is held by that folder now. Nothing was let go."
     )
 }
 
@@ -342,8 +365,9 @@ pub fn started_again_says(name: &str) -> String {
 /// let go would not be what the read asked about.
 pub fn took_something_says(name: &str) -> String {
     format!(
-        "{name} is not let go: this device took something of it while it was read. Run \
+        "{} is not let go: this device took something of it while it was read. Run \
          `cordelia sync unmap {}` again.",
+        shown(name),
         typed(name)
     )
 }
@@ -355,8 +379,9 @@ pub fn took_something_says(name: &str) -> String {
 /// since it ended. Nothing was let go.
 pub fn changed_says(name: &str) -> String {
     format!(
-        "{name} is still held: what was read has changed since, or is too old. Run `cordelia \
+        "{} is still held: what was read has changed since, or is too old. Run `cordelia \
          sync unmap {}` again.",
+        shown(name),
         typed(name)
     )
 }
@@ -365,8 +390,9 @@ pub fn changed_says(name: &str) -> String {
 /// it did not end in its time: nothing was let go.
 pub fn not_read_says(name: &str) -> String {
     format!(
-        "{name} is not let go: this device could not read the relays just now. Run `cordelia \
+        "{} is not let go: this device could not read the relays just now. Run `cordelia \
          sync unmap {}` again.",
+        shown(name),
         typed(name)
     )
 }
@@ -475,8 +501,9 @@ pub fn not_held_lines(name: &str, not_held: usize, relays: &[String]) -> String 
         1 => ("1 of its versions".to_string(), "it"),
         n => (format!("{n} of its versions"), "them"),
     };
+    let shown = shown(name);
     let mut said = format!(
-        "{name} is not let go: no relay that this device is set up with held {it} when it was \
+        "{shown} is not let go: no relay that this device is set up with held {it} when it was \
          read just now."
     );
     for line in relays {
@@ -484,7 +511,7 @@ pub fn not_held_lines(name: &str, not_held: usize, relays: &[String]) -> String 
         said.push_str(line);
     }
     said.push_str(&format!(
-        "\nThis device goes on sending {them}, and {name} can be let go once a relay holds \
+        "\nThis device goes on sending {them}, and {shown} can be let go once a relay holds \
          {them}."
     ));
     said
@@ -498,6 +525,7 @@ pub fn not_held_lines(name: &str, not_held: usize, relays: &[String]) -> String 
 /// among what it would carry then.
 pub fn stopped_says(name: &str, state: held_rows::State, not_held: usize) -> String {
     use held_rows::State;
+    let name = shown(name);
     let why = match state {
         State::Removed => "it was removed",
         State::NotListed => "it is in no list of the last change",
@@ -548,6 +576,7 @@ pub fn left_secret_days(conn: &Connection, now: i64) -> Result<Option<i64>, Pers
 /// its files. It promises nothing that the device does not know.
 pub fn where_says(name: &str, not_held: usize, days: Option<i64>, folder: bool) -> String {
     let typed_name = typed(name);
+    let name = shown(name);
     let (those, are) = match not_held {
         1 => ("that version".to_string(), "it is"),
         n => (format!("those {n} versions"), "they are"),
@@ -678,7 +707,7 @@ mod tests {
         );
         let one = where_says("~", 1, Some(1), false);
         assert!(
-            one.starts_with("Letting ~ go now drops that version from"),
+            one.starts_with("Letting home memory go now drops that version from"),
             "{one}"
         );
         assert!(
@@ -752,6 +781,25 @@ mod tests {
                 "{said}"
             );
         }
+    }
+
+    /// **An entry of this device's that is no version is the same version
+    /// as nothing** (decision 2026-10-17 §4.2 item 5): handed beside a
+    /// version at its revision, it is not held by it, though the version
+    /// is current there. Its own version handed holds a real entry.
+    #[test]
+    fn test_an_own_entry_that_is_no_version_is_held_by_no_version_at_its_revision() {
+        use crate::several::{Several, entry_by, identity_of, signed_in, text};
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        let secret = s[0].own("lab");
+        let theirs = entry_by(&identity_of(1), &secret, 1, "a.md", text("a"), &[]);
+        let no_version = signed_in(&secret, &identity_of(0), theirs.slot, 1, vec![7; 256]);
+        let mine = entry_by(&identity_of(0), &secret, 1, "a.md", text("a"), &[]);
+        let counts = |_: &[u8; 32]| true;
+        let handed = std::slice::from_ref(&theirs);
+        assert!(!held_in(handed, &no_version, &secret, 1, counts).unwrap());
+        assert!(held_in(handed, &mine, &secret, 1, counts).unwrap());
     }
 
     /// What is said of how long ago a relay last had no room.

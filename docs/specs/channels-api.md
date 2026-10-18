@@ -1210,9 +1210,11 @@ never held, comes in only under **a word that the phrase signed:**
   its slot on, and the answer carries `let_go_versions`, how many such entries
   there were. It is refused with `409` where an entry is held by no relay
   (saying, of each relay, how its read ended), where the store has taken
-  anything of the name's channel since the read ended, and where the node
-  keeps no read by that ID. **Where an entry is held by no relay, the name
-  is let go with it only on the word `discard`** (decision 2026-10-17 §5):
+  anything of the name's channel since the read ended, where a folder was
+  mapped to the name while it was read (saying that the folder holds it
+  now, and not to run the command again, which would unmap the folder),
+  and where the node keeps no read by that ID. **Where an entry is held by
+  no relay, the name is let go with it only on the word `discard`** (decision 2026-10-17 §5):
   a command that asks at a terminal sends `"asks": true`, and is answered in
   place of the refusal with `not_let_go`: `read`, the ID the word is bound
   to, as hex; `versions`, how many versions no relay held; `said`, the lines
@@ -1222,7 +1224,8 @@ never held, comes in only under **a word that the phrase signed:**
   `let_go_discarded`, how many went. It is refused with `409` where the read
   no longer stands (`LET_GO_READ_STANDS_SECS` from its end, on the node's
   monotonic clock), the number is another, or the store has taken anything
-  of the name's channel since, and with `400` for any other word. **A
+  of the name's channel since, where a folder was mapped to the name since,
+  and with `400` for any other word. **A
   device that has stopped reads no relay** (§4.4): where its own notes say
   that it sent a version of the name that it signed to no relay, it is
   refused with `409`, saying why it stopped, or with `"asks": true` it

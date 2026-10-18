@@ -24,10 +24,38 @@
 //! BAN_WINDOW_SECS** ([`DeviceEntries::asks_again_after_a_refusal`]): a
 //! relay refuses a breach of its rates with the same reset, and cuts off
 //! an address at BAN_THRESHOLD breaches in that window. The count is the
-//! relay's, kept by the device across rounds and reads, and not reset by
-//! a page. It cannot count what the pass is refused, which asks again at
-//! its next pass, nor what other devices behind one address are refused;
-//! and the first request of a read can still be refused once more. **Every other failure ends the
+//! relay's, kept where each request is answered ([`Leave`]): every
+//! request that the relay refused so, a show, a proof, a pull or a push,
+//! of a pass or of a read, across rounds and reads and connections, and
+//! not reset by a page. It cannot count what other devices behind one
+//! address are refused, nor what was refused before the node started.
+//! **A relay at that count is asked nothing more by a read,** neither a
+//! show, nor a proof, nor a pull, in any round of any read, until a
+//! refusal has left the window: each request of a read is held to the
+//! count as it is about to be sent ([`DeviceEntries::asks_after_refusals`]),
+//! and where it is held the relay is not reached. A pass is not held back
+//! by it.
+//!
+//! **What that costs a relay that is honest:** one near what it may hand
+//! a connection in a minute refuses pulls for room, which are no breach.
+//! For BAN_WINDOW_SECS after one, the next leaves the relay not reached in
+//! that round, though it would have room again within its minute; after
+//! two, it is not asked at all. A read there ends in part where it could
+//! have read on. The pass's refusals count too, though the pass is not
+//! held back: two of its pulls refused for room keep every read away from
+//! that relay for up to BAN_WINDOW_SECS, the read before a carried name is
+//! let go among them, and the let-go is then refused and the command says
+//! to run it again. The count is of refusals already made, not of
+//! requests in flight, and that window is accepted: a request already in
+//! flight from another door on the same connection (a pass, its shows,
+//! the door for a carry or for a typed key) can be refused at the same
+//! moment as a read's, so a read's request can be the relay's third
+//! refusal within its window. A relay's refusal for room is no breach; a
+//! breach comes only from the rate of requests, which the device's own
+//! pace keeps under; the worst is that one address is cut off for a
+//! while. If a cut-off is ever seen, counting the requests in flight with
+//! the refusals is the change to make. Telling the two apart needs a code of the relay's own
+//! (decision 2026-10-17 §11). **Every other failure ends the
 //! relay's read in that round as not reached:** no answer, a stream that
 //! times out or is reset otherwise, an answer that is not a page, a
 //! connection that was lost. A relay that is down, or broken, does not
@@ -245,6 +273,7 @@ impl DeviceEntries {
         let asks = At {
             link,
             under: *under,
+            gated: true,
         };
         at.key = Some(link.relay().0);
         // The proof too is within the round's time: where the time goes
