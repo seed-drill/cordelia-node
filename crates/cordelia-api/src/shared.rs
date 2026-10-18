@@ -1313,7 +1313,8 @@ pub(crate) mod tests {
         let carol = member(2);
         labels(&s, desktop, &carol.public_key(), Some("carol"), now);
         labels(&s, desktop, &s.key(phone), Some("the phone"), now);
-        fill_to(&s, desktop, &channel, 4 * 1_024, now);
+        // Written before the keys that fill the room: so each is among the
+        // 64 shown by the order of first holding, whatever it is to Bob.
         let carols = message(&carol, &channel, 1, "carol's", now);
         assert_eq!(
             stores(&s, desktop, &carols, now),
@@ -1323,6 +1324,7 @@ pub(crate) mod tests {
             let entry = message(&s[device].identity, &channel, 1, body, now);
             stores(&s, desktop, &entry, now);
         }
+        fill_to(&s, desktop, &channel, 4 * 1_024, now);
         let room_before = row(&s, desktop, &channel).room;
         assert_eq!(room_before, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - 4 * 1_024);
         let others = |s: &Several, now: i64| -> Vec<String> {
@@ -1919,7 +1921,8 @@ pub(crate) mod tests {
             stores(&s, 0, &misplaced, now),
             Some(Read::NotAMessage(NotShared::NotInItsSlots))
         );
-        assert_eq!(counted().not_messages, 1);
+        // It is passed over before its number is held: H stays at none.
+        assert_eq!((counted().not_messages, counted().highest), (1, 0));
         // A message of the messages channel's form.
         let own_form = cordelia_crypto::message::Message {
             asks: false,
@@ -1994,12 +1997,13 @@ pub(crate) mod tests {
         let edge = message(&alice, &channel, 1, "number 1", now);
         assert_eq!(stores(&s, 0, &edge, now), Some(Read::Overwritten));
         assert_eq!(counted().overwritten, before + 1);
-        // A clearing at a number that is not live counts nothing.
-        let name = message_name(&key, 8).unwrap();
+        // A clearing at a number that is not live counts nothing, below
+        // the number counted from too.
+        let name = message_name(&key, 1).unwrap();
         let cleared = entry_by(
             &alice,
             &channel.secret,
-            clearing_rev(8).unwrap(),
+            clearing_rev(1).unwrap(),
             &name,
             Value::Other(cordelia_crypto::message::clearing_value()),
             &[],
