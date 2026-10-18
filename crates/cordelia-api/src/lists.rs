@@ -24,11 +24,12 @@
 //!   keeps each part within its bound, and writes its list where what it
 //!   holds changed, where 30 days have passed since it last wrote it, or
 //!   where the fetched time it last wrote is ahead of its clock.
-//! - **Which act is in force** is decided by the statement and the
-//!   records of addition alone ([`Makers`]): an act whose maker counts,
+//! - **Which act is in force** ([`Makers`]): an act whose maker counts,
 //!   or is a key the statement lists as removed, is in force; one whose
 //!   maker this device counted and a statement left in no list is held
-//!   and not in force; one of any other key is not taken at all.
+//!   and not in force; one of any other key is never taken, kept or
+//!   copied, but, carried in a fresh list, it hides the older acts on its
+//!   item, so that every device holds the same items in force.
 //! - **A recovery** reads the lists of the devices it shows, fresh by the
 //!   newest fetched time among them ([`recovered`]).
 //!
@@ -143,15 +144,19 @@ impl Makers {
 struct Checked(RefCell<HashMap<Vec<u8>, bool>>);
 
 impl Checked {
+    /// Whether `act` holds ([`AnyAct::holds`]), whoever its maker is.
+    fn holds(&self, act: &AnyAct) -> bool {
+        *self
+            .0
+            .borrow_mut()
+            .entry(act.written())
+            .or_insert_with(|| act.holds())
+    }
+
     /// Whether `act` may be taken: its maker is one of the person's as
     /// [`Makers`] knows them, and it holds.
     fn takes(&self, act: &AnyAct, makers: &Makers) -> bool {
-        makers.maker(&act.maker()).is_some()
-            && *self
-                .0
-                .borrow_mut()
-                .entry(act.written())
-                .or_insert_with(|| act.holds())
+        makers.maker(&act.maker()).is_some() && self.holds(act)
     }
 }
 
@@ -494,23 +499,36 @@ fn lists_held(
     Ok(read)
 }
 
-/// Of `candidates` on one item, the newest that may be taken, by
-/// [`Order`]: each is checked only until one is.
-fn newest_taken(
-    candidates: Vec<AnyAct>,
-    makers: &Makers,
-    checked: &Checked,
-) -> Option<(AnyAct, Order)> {
+/// What an item comes to, of the acts on it that a device reads (§3.4).
+enum Newest {
+    /// The newest act that holds is of a maker this device knows: it is
+    /// taken.
+    Taken(AnyAct),
+    /// The newest act that holds is of a key this device does not know,
+    /// carried in the list of a device that counts: it is not taken, kept
+    /// or copied, and it hides every older act on the item. The newest of
+    /// those that the device would take, where there is one, is held
+    /// hidden, not in force and not written, until no list it reads
+    /// carries the act that hides it.
+    Hidden(Option<AnyAct>),
+}
+
+/// What `candidates` on one item come to, by [`Order`]: each is checked
+/// only until the newest that holds is found, and then, where its maker
+/// is not known, until the newest that may be taken.
+fn newest(candidates: Vec<AnyAct>, makers: &Makers, checked: &Checked) -> Option<Newest> {
     let mut ordered: Vec<(Order, AnyAct)> = candidates
         .into_iter()
         .map(|act| (Order::of_act(&act, makers), act))
         .collect();
     ordered.sort_by(|a, b| b.0.cmp(&a.0));
     ordered.dedup_by(|a, b| a.0 == b.0);
-    ordered
-        .into_iter()
-        .find(|(_, act)| checked.takes(act, makers))
-        .map(|(order, act)| (act, order))
+    let mut acts = ordered.into_iter().map(|(_, act)| act);
+    let first = acts.find(|act| checked.holds(act))?;
+    if makers.maker(&first.maker()).is_some() {
+        return Some(Newest::Taken(first));
+    }
+    Some(Newest::Hidden(acts.find(|act| checked.takes(act, makers))))
 }
 
 /// Where each act goes once each part is kept within its bound (§3.4):
@@ -527,8 +545,9 @@ struct Bounded {
 /// subscriptions and labels, the undone items first; then the newest
 /// first. A filing, a
 /// subscription or a label past its bound is left out, up to as many
-/// again; a drop past 64 is freed.
-fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
+/// again; a drop past 64 is freed. An act held `hidden` is never in the
+/// list: it is among what is left out, as the bound allows.
+fn within_bounds(chosen: Vec<AnyAct>, hidden: Vec<AnyAct>, makers: &Makers) -> Bounded {
     let mut bounded = Bounded {
         list: Vec::new(),
         left_out: Vec::new(),
@@ -559,23 +578,30 @@ fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
             false,
         ),
     ];
-    for (of_part, most, freed_past) in parts {
-        let mut acts: Vec<&AnyAct> = chosen.iter().filter(|act| of_part(act)).collect();
+    let ranked = |acts: &mut Vec<&AnyAct>| {
         acts.sort_by_cached_key(|act| {
             (
                 makers.rank(&act.maker()),
                 !act.undone(),
                 Reverse(Order::of_act(act, makers)),
             )
-        });
+        })
+    };
+    for (of_part, most, freed_past) in parts {
+        let mut acts: Vec<&AnyAct> = chosen.iter().filter(|act| of_part(act)).collect();
+        ranked(&mut acts);
+        let mut left: Vec<&AnyAct> = hidden.iter().filter(|act| of_part(act)).collect();
         for (at, act) in acts.into_iter().enumerate() {
-            match (at < most, freed_past, at < 2 * most) {
-                (true, _, _) => bounded.list.push(act.clone()),
-                (false, true, _) => bounded.freed_early.push(act.clone()),
-                (false, false, true) => bounded.left_out.push(act.clone()),
-                (false, false, false) => {}
+            match (at < most, freed_past) {
+                (true, _) => bounded.list.push(act.clone()),
+                (false, true) => bounded.freed_early.push(act.clone()),
+                (false, false) => left.push(act),
             }
         }
+        ranked(&mut left);
+        bounded
+            .left_out
+            .extend(left.into_iter().take(most).cloned());
     }
     bounded
 }
@@ -585,14 +611,14 @@ fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
 /// an undone act (a drop, an unsubscription, a removed label) only of an
 /// item that an act among them does, or that `held_items` names. `above`
 /// gives, for an item, what an act must order above to be taken. One act
-/// for each item.
+/// for each item: those taken, and those held hidden ([`Newest`]).
 fn newest_of_each(
     acts: impl IntoIterator<Item = AnyAct>,
     held_items: &BTreeSet<Key>,
     above: impl Fn(&Key) -> Option<Order>,
     makers: &Makers,
     checked: &Checked,
-) -> Vec<AnyAct> {
+) -> (Vec<AnyAct>, Vec<AnyAct>) {
     let mut by_item: BTreeMap<Key, Vec<AnyAct>> = BTreeMap::new();
     for act in acts {
         by_item.entry(act.key()).or_default().push(act);
@@ -608,7 +634,7 @@ fn newest_of_each(
         })
         .map(|(key, _)| key.clone())
         .collect();
-    let mut chosen = Vec::new();
+    let (mut chosen, mut hidden) = (Vec::new(), Vec::new());
     for (key, acts) in by_item {
         let floor = above(&key);
         let candidates: Vec<AnyAct> = acts
@@ -620,11 +646,13 @@ fn newest_of_each(
                     .is_none_or(|floor| Order::of_act(act, makers) > *floor)
             })
             .collect();
-        if let Some((act, _)) = newest_taken(candidates, makers, checked) {
-            chosen.push(act);
+        match newest(candidates, makers, checked) {
+            Some(Newest::Taken(act)) => chosen.push(act),
+            Some(Newest::Hidden(Some(act))) => hidden.push(act),
+            Some(Newest::Hidden(None)) | None => {}
         }
     }
-    chosen
+    (chosen, hidden)
 }
 
 /// Take the lists of the person's other devices (§3.4): for each item,
@@ -648,7 +676,8 @@ fn take_lists(lists: &mut Lists, others: &[Read], makers: &Makers, now: i64) {
         .collect();
     let freed = &lists.freed;
     let above = |key: &Key| freed.get(key).map(|freed| Order::of_freed(freed, makers));
-    let chosen = newest_of_each(candidates, &held_items, above, makers, &Checked::default());
+    let (chosen, hidden) =
+        newest_of_each(candidates, &held_items, above, makers, &Checked::default());
 
     // The act now held on each item keeps its first holding where it is
     // the act held before; another act on the item is first held now.
@@ -663,7 +692,11 @@ fn take_lists(lists: &mut Lists, others: &[Read], makers: &Makers, now: i64) {
         first_held.insert(act.key(), (act.signature(), at));
         kept.push(act);
     }
-    let bounded = within_bounds(kept, makers);
+    for act in &hidden {
+        let at = lists.first_held_of(act).unwrap_or(now);
+        first_held.insert(act.key(), (act.signature(), at));
+    }
+    let bounded = within_bounds(kept, hidden, makers);
     for act in &bounded.freed_early {
         free(lists, act, now);
         first_held.remove(&act.key());
@@ -758,21 +791,27 @@ fn dated(
 ) -> (u64, u64) {
     let now = u64::try_from(now).unwrap_or(0);
     let ahead = now.saturating_add(KEPT_SECS as u64);
-    let mut held = lists.held();
+    let mut carried = lists.held();
     for read in others {
-        held.extend(acts_of(&read.list));
+        carried.extend(acts_of(&read.list));
     }
-    // What a device would not take does not date its acts.
-    let held: Vec<AnyAct> = held
-        .into_iter()
+    // An act of a key the device does not know stands in the order on its
+    // item, so the next act there goes above it; it dates no other item,
+    // and no act that does not hold dates any.
+    let on_item: Vec<&AnyAct> = carried
+        .iter()
+        .filter(|act| act.key() == *key && checked.holds(act))
+        .collect();
+    let held: Vec<AnyAct> = carried
+        .iter()
         .filter(|act| checked.takes(act, makers))
+        .cloned()
         .collect();
     let freed = lists.freed.get(key);
 
-    let of_item = held
+    let of_item = on_item
         .iter()
-        .filter(|act| act.key() == *key)
-        .map(AnyAct::time)
+        .map(|act| act.time())
         .chain(freed.map(|freed| freed.time))
         .max()
         .unwrap_or(0);
@@ -971,8 +1010,10 @@ pub fn act(
                 if !subscription.subscribed && !subscribed {
                     return Ok(Done::Refused(Refused::NothingToUndo));
                 }
+                // An unsubscription undoes what the device holds, and, as a
+                // drop, needs no place, a copy not in force among it (§3.4).
                 let of = |act: &AnyAct| matches!(act, AnyAct::Subscription(_));
-                if full(of, SHARED_MAX_SUBSCRIPTIONS, &key) {
+                if subscription.subscribed && full(of, SHARED_MAX_SUBSCRIPTIONS, &key) {
                     return Ok(Done::Refused(Refused::Full(Part::Subscription)));
                 }
                 make(subscription.clone(), dated_for(&key), identity)
@@ -987,8 +1028,9 @@ pub fn act(
                 if label.label.is_none() && !labelled {
                     return Ok(Done::Refused(Refused::NothingToUndo));
                 }
+                // A removed label needs no place, as an unsubscription.
                 let of = |act: &AnyAct| matches!(act, AnyAct::Label(_));
-                if full(of, SHARED_MAX_LABELS, &key) {
+                if label.label.is_some() && full(of, SHARED_MAX_LABELS, &key) {
                     return Ok(Done::Refused(Refused::Full(Part::Label)));
                 }
                 make(label.clone(), dated_for(&key), identity).map(|a| vec![AnyAct::Label(a)])
@@ -999,17 +1041,23 @@ pub fn act(
             Err(e) => return Ok(Done::Refused(Refused::NotWritten(e))),
         };
 
+        // The new acts take the place of what the device held on their
+        // items; what it left out stays left out, a hidden act among it,
+        // until its next whole fetch takes the lists again.
         let keys: BTreeSet<Key> = made.iter().map(AnyAct::key).collect();
-        let mut held: Vec<AnyAct> = lists
-            .held()
-            .into_iter()
-            .filter(|act| !keys.contains(&act.key()))
-            .collect();
+        let others_of = |list: &SharedList| -> Vec<AnyAct> {
+            acts_of(list)
+                .into_iter()
+                .filter(|act| !keys.contains(&act.key()))
+                .collect()
+        };
+        let mut held = others_of(&lists.list);
+        let left_out = others_of(&lists.left_out);
         for act in &made {
             lists.first_held.insert(act.key(), (act.signature(), now));
             held.push(act.clone());
         }
-        let bounded = within_bounds(held, &makers);
+        let bounded = within_bounds(held, left_out, &makers);
         for act in &bounded.freed_early {
             free(&mut lists, act, now);
             lists.first_held.remove(&act.key());
@@ -1088,7 +1136,8 @@ pub fn fetched_whole(
 
 /// What a device holds of the person's lists, each act with what its
 /// maker is to it (§3.4): its own list's acts, and what it left out past
-/// a bound, which is not in force on this device. Nothing on a device
+/// a bound or holds hidden under an act of a key it does not know, which
+/// is not in force on this device. Nothing on a device
 /// that follows no phrase.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Holds {
@@ -1243,8 +1292,8 @@ pub fn recovered(
         .filter(|(_, _, list)| newest - at(list) < KEPT_SECS)
         .flat_map(|(_, _, list)| acts_of(list));
     let checked = Checked::default();
-    let chosen = newest_of_each(fresh, &BTreeSet::new(), |_| None, &makers, &checked);
-    let bounded = within_bounds(chosen, &makers);
+    let (chosen, hidden) = newest_of_each(fresh, &BTreeSet::new(), |_| None, &makers, &checked);
+    let bounded = within_bounds(chosen, hidden, &makers);
     (list_of(bounded.list, 0), list_of(bounded.left_out, 0))
 }
 
@@ -1794,6 +1843,115 @@ pub(crate) mod tests {
             assert!(is_filed_under(&s[n].conn, "review").unwrap(), "device {n}");
             assert!(!is_filed_under(&s[n].conn, "other").unwrap(), "device {n}");
         }
+    }
+
+    /// Devices of one person hold the same items in force whatever their
+    /// history (decision 2026-10-10 §3.4, "a key in no list"): the desktop
+    /// files a channel, and the phone drops it, which the laptop takes and
+    /// the desktop has not; a settlement lists the laptop and the desktop.
+    /// The tablet, added after it, does not know the phone, and the
+    /// phone's drop, carried in the laptop's list, hides the desktop's
+    /// filing there too: none of the three holds the channel in force.
+    /// Once the phone is removed, its drop is taken on all three.
+    #[test]
+    fn a_device_added_after_a_settlement_holds_what_the_older_devices_hold() {
+        let mut s = person(4, 3);
+        let mut now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        on(&s, 1, Do::File(filing(1, "review")), now + 1);
+        for n in [0, 2] {
+            fetch_from(&s, &[1], n, now + 2);
+            assert_eq!(filed(&s, n), ["review"], "device {n}");
+        }
+        on(&s, 2, Do::Drop(channel(1)), now + 3);
+        fetch_from(&s, &[2], 0, now + 4);
+        assert!(filed(&s, 0).is_empty());
+        assert_eq!(filed(&s, 1), ["review"]);
+        s.now = now + 5;
+        s.change(0, &[0, 1], &[]);
+        now = s.now + 1;
+        give(&s, 0, 1, now);
+        s.now = now;
+        s.add(0, 3);
+        now = s.now + 1;
+        fetch_from(&s, &[0, 1], 3, now);
+        for round in 0..3 {
+            for n in [0, 1, 3] {
+                fetch_from(&s, &[0, 1, 3], n, now + 1 + round);
+            }
+        }
+        for n in [0, 1, 3] {
+            assert!(filed(&s, n).is_empty(), "device {n}");
+            assert!(!is_filed_under(&s[n].conn, "review").unwrap(), "device {n}");
+        }
+        // The tablet neither keeps nor copies the drop it does not know.
+        assert!(acts_of(&kept(&s, 3)).is_empty());
+        s.now = now + 10;
+        s.change(0, &[0, 1, 3], &[2]);
+        now = s.now + 1;
+        for n in [1, 3] {
+            give(&s, 0, n, now);
+        }
+        for round in 0..2 {
+            for n in [0, 1, 3] {
+                fetch_from(&s, &[0, 1, 3], n, now + round);
+            }
+        }
+        for n in [0, 1, 3] {
+            assert!(filed(&s, n).is_empty(), "device {n}");
+            let holds = holds(&s[n].conn).unwrap();
+            assert_eq!(holds.drops.len(), 1, "device {n}");
+            assert_eq!(holds.drops[0].1, Maker::Removed, "device {n}");
+        }
+    }
+
+    /// An unsubscription, and a removed label, need no place, as a drop
+    /// does (decision 2026-10-10 §3.4): the phone's subscription and label,
+    /// held on the laptop as copies not in force once a settlement leaves
+    /// the phone in no list, are undone there with each part full of
+    /// items in force.
+    #[test]
+    fn undoing_a_copy_not_in_force_needs_no_place() {
+        let mut s = person(3, 3);
+        let mut now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        let agent = "github.com/owner/repo";
+        on(&s, 2, Do::Subscribe(subscription(1, agent, true)), now + 1);
+        on(&s, 2, Do::Label(label(1, Some("theirs"))), now + 1);
+        fetch_from(&s, &[2], 0, now + 2);
+        s.now = now + 3;
+        s.change(0, &[0, 1], &[]);
+        now = s.now + 1;
+        fetch(&s, 0, now);
+        for seed in 100..100 + SHARED_MAX_SUBSCRIPTIONS as u8 {
+            on(
+                &s,
+                0,
+                Do::Subscribe(subscription(seed, agent, true)),
+                now + 1,
+            );
+        }
+        for key in 100..100 + SHARED_MAX_LABELS as u8 {
+            on(&s, 0, Do::Label(label(key, Some("k"))), now + 1);
+        }
+        assert_eq!(subscribes(&s, 0, 1, agent), None);
+        assert_eq!(labelled(&s, 0, 1), None);
+        assert_eq!(
+            refused(&s, 0, Do::Subscribe(subscription(99, agent, true)), now + 2),
+            Refused::Full(Part::Subscription)
+        );
+        assert_eq!(
+            refused(&s, 0, Do::Label(label(99, Some("k"))), now + 2),
+            Refused::Full(Part::Label)
+        );
+        on(&s, 0, Do::Subscribe(subscription(1, agent, false)), now + 2);
+        on(&s, 0, Do::Label(label(1, None)), now + 2);
+        assert_eq!(subscribes(&s, 0, 1, agent), Some(false));
+        assert_eq!(labelled(&s, 0, 1), Some(None));
     }
 
     // ── The dating of an act ───────────────────────────────────────────
@@ -3021,6 +3179,33 @@ pub(crate) mod tests {
         list_of(acts, u64::try_from(fetched).unwrap())
     }
 
+    /// At a recovery too, an act of a key that is none of the devices it
+    /// shows, newer than an act on its item, hides it (decision 2026-10-10
+    /// §3.4, §3.5): the phone's filing is not taken, and is left out.
+    #[test]
+    fn at_a_recovery_an_act_of_a_key_no_device_is_hides_its_item() {
+        let s = person(3, 3);
+        let now = s.now + 10;
+        let at = u64::try_from(now).unwrap();
+        let stranger = NodeIdentity::from_seed([0x55; 32]).unwrap();
+        let filed = Act::make(filing(1, "review"), at - 2, 0, &s[2].identity, is_a_name);
+        let phone = list(vec![AnyAct::Filing(filed.unwrap())], now);
+        let dropped = Dropped {
+            channel: channel(1),
+        };
+        let drop = Act::make(dropped, at - 1, 0, &stranger, is_a_name);
+        let desktop = list(vec![AnyAct::Drop(drop.unwrap())], now);
+        let lists = [
+            (s.key(1), Answered::Lost, desktop),
+            (s.key(2), Answered::Lost, phone.clone()),
+        ];
+        let maker = |key: &[u8; 32]| (*key != stranger.public_key()).then_some(Maker::Removed);
+        let (taken, left_out) = recovered(&lists, maker, now);
+        assert!(acts_of(&taken).is_empty());
+        assert_eq!(left_out.filings, phone.filings);
+        assert!(left_out.drops.is_empty());
+    }
+
     /// A recovery takes the lists of the devices it shows by the newest
     /// fetched time among them, each taken as no later than its clock, and
     /// the lists of devices in someone else's hands left out of that
@@ -3260,14 +3445,27 @@ pub(crate) mod tests {
         let far = clock + 5 * ahead;
         let lists = with(vec![act_on(&stranger, 9, far, 0)]);
         assert_eq!(dated_with(&lists, &[], &key), (far + 1, 0));
-        // Not of a key it does not know, nor of an act that does not hold.
+        // An act of a key it does not know stands in the order on its own
+        // item, and on no other; an act that does not hold dates none.
         let lists = with(vec![act_on(&unknown, 9, far, 0)]);
-        assert_eq!(dated_with(&lists, &[], &key), (clock + 1, 0));
+        assert_eq!(dated_with(&lists, &[], &key), (far + 1, 0));
+        assert_eq!(dated_with(&lists, &[], &other_key), (clock + 1, 0));
         let mut forged = act_on(&s[1].identity, 9, far, 0);
         if let AnyAct::Label(act) = &mut forged {
             act.signature[0] ^= 1;
         }
-        assert_eq!(dated_with(&with(vec![forged]), &[], &key), (clock + 1, 0));
+        assert_eq!(
+            dated_with(&with(vec![forged.clone()]), &[], &key),
+            (clock + 1, 0)
+        );
+        let mut forged_other = act_on(&s[1].identity, 8, far, 0);
+        if let AnyAct::Label(act) = &mut forged_other {
+            act.signature[0] ^= 1;
+        }
+        assert_eq!(
+            dated_with(&with(vec![forged_other]), &[], &key),
+            (clock + 1, 0)
+        );
         assert_eq!(dated_with(&lists, &[], &other_key), (clock + 1, 0));
         // An act freed on the item.
         assert_eq!(
@@ -3375,21 +3573,38 @@ pub(crate) mod tests {
     // ── Makers the person never had, places, and undoes of nothing ──────
 
     /// The acts of a key that was never a device of the person's, as the
-    /// device knows them, are not taken at all (decision 2026-10-10
-    /// §3.4): a drop of the person's channel signed by such a key, in a
-    /// list of a device that counts, undoes nothing, and 16 filings of it
-    /// take no place; nor does a removal of the device whose list held
-    /// them make them anything.
+    /// device knows them, are never taken (decision 2026-10-10 §3.4): a
+    /// drop of the person's channel signed by such a key, newer than its
+    /// filing and in a list of a device that counts, hides the filing,
+    /// and is not kept or copied; the act held hidden is the laptop's
+    /// filing, with its first holding, and not a filing of that key in
+    /// between; 16 filings of it take no place; and once the device whose
+    /// list carried the drop is removed, and the phone writes its list
+    /// again, the filing is in force again on every device.
     #[test]
-    fn an_act_of_a_key_the_person_never_had_undoes_nothing_and_takes_no_place() {
+    fn an_act_of_a_key_the_person_never_had_hides_and_takes_no_place() {
         let mut s = person(3, 3);
         let mut now = s.now + 10;
         for n in 0..3 {
             fetch(&s, n, now);
         }
         on(&s, 0, Do::File(filing(1, "review")), now + 1);
+        let review = (Part::Channel, channel(1).to_vec());
+        let first_held = |s: &Several| {
+            Lists::load(&s[0].conn)
+                .unwrap()
+                .first_held
+                .get(&review)
+                .cloned()
+        };
+        let held_first = first_held(&s);
+        assert!(held_first.is_some());
         let stranger = NodeIdentity::from_seed([0x55; 32]).unwrap();
-        let at = u64::try_from(now + 2).unwrap();
+        let between = u64::try_from(now + 50).unwrap();
+        let theirs = Act::make(filing(1, "theirs"), between, 0, &stranger, is_a_name);
+        let theirs = vec![AnyAct::Filing(theirs.unwrap())];
+        write_by_hand(&s, 2, &s.key(2), value_of(theirs, between), now + 2);
+        let at = u64::try_from(now + 100).unwrap();
         let mut acts = vec![AnyAct::Drop(
             Act::make(
                 Dropped {
@@ -3407,18 +3622,31 @@ pub(crate) mod tests {
             acts.push(AnyAct::Filing(made.unwrap()));
         }
         write_by_hand(&s, 1, &s.key(1), value_of(acts, at), now + 3);
-        fetch_from(&s, &[1], 0, now + 4);
-        assert_eq!(filed(&s, 0), ["review"]);
-        assert_eq!(acts_of(&kept(&s, 0)).len(), 1);
+        fetch_from(&s, &[1, 2], 0, now + 4);
+        assert!(filed(&s, 0).is_empty());
+        assert!(acts_of(&kept(&s, 0)).is_empty());
+        match &holds(&s[0].conn).unwrap().left_out[..] {
+            [(AnyAct::Filing(hidden), _)] => {
+                assert_eq!((&hidden.item.name[..], hidden.maker), ("review", s.key(0)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(first_held(&s), held_first);
         on(&s, 0, Do::File(filing(2, "design")), now + 5);
+        assert_eq!(filed(&s, 0), ["design"]);
         s.now = now + 6;
         s.change(0, &[0, 2], &[1]);
         now = s.now + 1;
         give(&s, 0, 2, now);
+        for round in 0..2 {
+            for n in [0, 2] {
+                fetch_from(&s, &[0, 1, 2], n, now + round);
+            }
+        }
         for n in [0, 2] {
-            fetch_from(&s, &[0, 1, 2], n, now);
             assert_eq!(filed(&s, n), ["design", "review"], "device {n}");
         }
+        assert_eq!(first_held(&s), held_first);
     }
 
     /// A place is taken by an item in force alone (decision 2026-10-10
