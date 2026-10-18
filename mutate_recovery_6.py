@@ -53,6 +53,7 @@ E2E_GONE = e2e("a_round_whose_asker_has_gone_stops")
 E2E_PROVES_ONCE = e2e("a_pass_proves_again_only_after_a_no_given_to_a_read_and_once")
 E2E_COUNTED = e2e("what_a_relay_refused_for_now_is_counted_for_the_relay_over_the_window")
 E2E_PROOF_TIME = e2e("a_round_ends_at_its_time_while_its_proof_is_not_answered")
+UNIT_WINDOW = (("cordelia-node", ["--lib"]), "device_entries::tests::a_refusal_for_now_counts_for_its_relay_within_the_window_and_no_longer")
 UNIT_NOT_NOW = (("cordelia-node", ["--lib"]), "device_entries::leave::tests::a_request_is_refused_for_now_only_by_the_rate_limits_code")
 E2E_LEFT_ROOM = e2e("a_read_of_a_left_channel_takes_no_page_from_the_room_kept_for_a_show")
 E2E_PROOF = e2e("a_relay_that_answered_a_reads_proof_with_no_is_sent_the_channel_again")
@@ -264,14 +265,6 @@ MUTATIONS = [
                 }
                 Err(_) => {''',
      [E2E_DEADLINE]),
-    ("NR26 refusals for now are asked again without bound", DEVICE,
-     '''        refused.len() < (BAN_THRESHOLD - 1) as usize''',
-     '''        refused.len() < usize::MAX''',
-     [E2E_EVERY, E2E_COUNTED]),
-    ("NR27 refusals for now are asked again up to the relay's count", DEVICE,
-     '''        refused.len() < (BAN_THRESHOLD - 1) as usize''',
-     '''        refused.len() < BAN_THRESHOLD as usize''',
-     [E2E_EVERY, E2E_COUNTED]),
     ("NR32 a page resets the count of refusals", NODE_READ,
      '''                    paged = self.clock.now();''',
      '''                    paged = self.clock.now();
@@ -282,10 +275,44 @@ MUTATIONS = [
      '''        lock(&self.kept).refused_for_now.remove(&link.relay().0);
         let asks = At {''',
      [E2E_COUNTED]),
+    ("NR26 refusals for now are asked again without bound", DEVICE,
+     '''        refusals_within(&mut kept.refused_for_now, &relay, now) < (BAN_THRESHOLD - 1) as usize''',
+     '''        refusals_within(&mut kept.refused_for_now, &relay, now) < usize::MAX''',
+     [E2E_EVERY, E2E_COUNTED]),
+    ("NR27 refusals for now are asked again up to the relay's count", DEVICE,
+     '''        refusals_within(&mut kept.refused_for_now, &relay, now) < (BAN_THRESHOLD - 1) as usize''',
+     '''        refusals_within(&mut kept.refused_for_now, &relay, now) < BAN_THRESHOLD as usize''',
+     [E2E_EVERY, E2E_COUNTED]),
     ("NR34 a refusal never leaves the window", DEVICE,
-     '''        refused.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);''',
-     '''        refused.retain(|_| true);''',
+     '''    at.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);''',
+     '''    at.retain(|_| true);''',
+     [UNIT_WINDOW, E2E_COUNTED]),
+    ("NR35 a relay at its count of refusals is asked all the same", NODE_READ,
+     '''        if !self.asks_after_refusals(link) {''',
+     '''        if false && !self.asks_after_refusals(link) {''',
      [E2E_COUNTED]),
+    ("NR36 the gate lets a relay be asked up to its count", DEVICE,
+     '''            < (BAN_THRESHOLD - 1) as usize
+    }''',
+     '''            < BAN_THRESHOLD as usize
+    }''',
+     [E2E_COUNTED]),
+    ("NR37 the window is half a minute", DEVICE,
+     '''const BAN_WINDOW: Duration = Duration::from_secs(BAN_WINDOW_SECS);''',
+     '''const BAN_WINDOW: Duration = Duration::from_secs(30);''',
+     [UNIT_WINDOW, E2E_COUNTED]),
+    ("NR38 refusals are counted by connection", DEVICE,
+     '''        let (now, relay) = (self.clock.now(), link.relay().0);''',
+     '''        let (now, relay) = (self.clock.now(), link.id());''',
+     [E2E_COUNTED]),
+    ("NR39 a relay with no refusal left is kept", DEVICE,
+     '''    if within == 0 {
+        refused.remove(relay);
+    }''',
+     '''    if within == 0 {
+        let _ = relay;
+    }''',
+     [UNIT_WINDOW]),
     ("NR28 the proof runs past the round's time", NODE_READ,
      '''tokio::time::timeout(left, self.prove(&asks, channel, false))''',
      '''tokio::time::timeout(left + ROUND_MOST, self.prove(&asks, channel, false))''',
