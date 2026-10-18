@@ -108,8 +108,8 @@ use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
-    BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, OWN_ENTRY_REQUESTS_PER_MINUTE,
-    SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -340,6 +340,10 @@ pub enum Refused {
     /// relay refuses a breach of its rates: whoever waits it out asks
     /// again only a few times. Nothing was taken.
     NotNow,
+    /// Nothing was sent: the relay has refused for now as many requests
+    /// as the device gives one in BAN_WINDOW_SECS, and the request was
+    /// held to that count ([`Asked::gated`], [`Leave::at_its_count`]).
+    RefusedEnough,
 }
 
 /// What is asked on a stream for a channel of the device's own: the
@@ -353,6 +357,9 @@ pub struct Asked<'a> {
     /// A proof of a channel's key, a pull of a page, or a push of
     /// entries.
     pub request: &'a WireMessage,
+    /// Whether the request is held to the relay's count of refusals for
+    /// now ([`Leave::at_its_count`]): a read's are, and a pass's are not.
+    pub gated: bool,
 }
 
 /// What a relay handed of the pair channel of a key that a person typed
@@ -695,7 +702,11 @@ impl Leave {
         read: impl FnOnce(WireMessage) -> R,
         take: impl FnOnce(&Connection, R) -> T,
     ) -> Result<T, Refused> {
-        let Asked { under, request } = asked;
+        let Asked {
+            under,
+            request,
+            gated,
+        } = asked;
         let protocol = match request {
             WireMessage::ChannelProve(_) => Protocol::ChannelProve,
             WireMessage::EntryPull(_) => Protocol::EntryPull,
@@ -705,6 +716,12 @@ impl Leave {
         {
             let conn = lock(db);
             self.may_use(&conn, link, under)?;
+            // A read sends nothing to a relay at its count of refusals for
+            // now: one more may be the breach that has it cut off the
+            // address.
+            if gated && self.at_its_count(&link.relay().0) {
+                return Err(Refused::RefusedEnough);
+            }
             if !lock(&self.inner).may_ask(link.name()) {
                 return Err(Refused::AskedEnough);
             }
@@ -990,12 +1007,30 @@ impl Leave {
         })
     }
 
+    /// Whether the relay whose node key is `relay` has refused for now as
+    /// many requests within BAN_WINDOW_SECS as the device gives one,
+    /// BAN_THRESHOLD - 1: a relay cuts off an address at BAN_THRESHOLD
+    /// breaches in that window, and refuses a breach with the same reset.
+    pub fn at_its_count(&self, relay: &[u8; 32]) -> bool {
+        self.refused_for_now(relay) >= (BAN_THRESHOLD - 1) as usize
+    }
+
     /// The relay at `link` refused a request for now: it is counted, with
-    /// its time, for the relay's node key.
+    /// its time, for the relay's node key, and those it refused before the
+    /// window are forgotten.
     fn refused_at(&self, link: &Link) {
+        self.refused_by(link.relay().0);
+    }
+
+    /// The relay whose node key is `relay` refused a request for now
+    /// ([`Self::refused_at`]).
+    fn refused_by(&self, relay: [u8; 32]) {
         let now = self.clock.now();
         let mut inner = lock(&self.inner);
-        let refused = inner.refused_for_now.entry(link.relay().0).or_default();
+        // Those older than the window are forgotten first, so that a relay
+        // that refuses pass after pass keeps no more than the window holds.
+        refusals_within(&mut inner.refused_for_now, &relay, now);
+        let refused = inner.refused_for_now.entry(relay).or_default();
         refused.push_back(now);
     }
 
@@ -1108,6 +1143,27 @@ fn refusals_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a relay refused for now before the window is forgotten as it
+    /// refuses again: a relay that refuses request after request, and is
+    /// never asked how many, keeps no more than the window holds.
+    #[test]
+    fn a_relay_that_refuses_again_keeps_no_more_than_the_window_holds() {
+        let clock = Clock::system();
+        let leave = Leave::new(clock.clone());
+        let relay = [1; 32];
+        let kept = |leave: &Leave| {
+            let inner = lock(&leave.inner);
+            inner.refused_for_now.get(&relay).map_or(0, |at| at.len())
+        };
+        leave.refused_by(relay);
+        leave.refused_by(relay);
+        assert_eq!(kept(&leave), 2);
+        clock.run_ahead(BAN_WINDOW + Duration::from_secs(1));
+        leave.refused_by(relay);
+        assert_eq!(kept(&leave), 1);
+        assert_eq!(leave.refused_for_now(&relay), 1);
+    }
 
     /// A refusal for now counts for its relay within BAN_WINDOW_SECS of
     /// when it was given, and no longer: one 600 seconds old counts, as
