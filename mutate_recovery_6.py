@@ -63,6 +63,9 @@ E2E_REPLACED = e2e("a_read_that_another_read_of_its_channel_replaced_stops")
 E2E_ONE_ROUND = e2e("one_round_of_a_read_runs_at_a_time_on_the_node")
 E2E_FAILED = e2e("a_page_that_a_read_could_not_take_leaves_the_relay_not_reached")
 E2E_CHANGE = e2e("a_round_after_a_change_asks_a_relay_nothing")
+E2E_AT_COUNT = e2e("a_read_sends_nothing_while_the_relay_is_at_its_count")
+E2E_WHEREVER = e2e("a_request_refused_for_now_counts_wherever_it_was_made")
+UNIT_PRUNED = (("cordelia-node", ["--lib"]), "device_entries::leave::tests::a_relay_that_refuses_again_keeps_no_more_than_the_window_holds")
 E2E_RACE = e2e("a_pull_in_flight_when_every_place_is_forgotten_keeps_no_place")
 
 OWN_BRANCH = '''            let (each, read_again) = through_the_door(conn, identity, page, now)?;
@@ -266,14 +269,14 @@ MUTATIONS = [
                 }
                 Err(_) => {''',
      [E2E_DEADLINE]),
-    ("NR26 refusals for now are asked again without bound", DEVICE,
-     '''        self.leave.refused_for_now(&link.relay().0) < (BAN_THRESHOLD - 1) as usize''',
-     '''        self.leave.refused_for_now(&link.relay().0) < usize::MAX''',
-     [E2E_EVERY, E2E_COUNTED, E2E_PROOF_SHOW]),
-    ("NR27 refusals for now are asked up to the relay's count", DEVICE,
-     '''        self.leave.refused_for_now(&link.relay().0) < (BAN_THRESHOLD - 1) as usize''',
-     '''        self.leave.refused_for_now(&link.relay().0) < BAN_THRESHOLD as usize''',
-     [E2E_EVERY, E2E_COUNTED, E2E_PROOF_SHOW]),
+    ("NR26 refusals for now are asked again without bound", LEAVE,
+     '''        self.refused_for_now(relay) >= (BAN_THRESHOLD - 1) as usize''',
+     '''        self.refused_for_now(relay) >= usize::MAX''',
+     [E2E_EVERY, E2E_COUNTED, E2E_PROOF_SHOW, E2E_AT_COUNT]),
+    ("NR27 refusals for now are asked up to the relay's count", LEAVE,
+     '''        self.refused_for_now(relay) >= (BAN_THRESHOLD - 1) as usize''',
+     '''        self.refused_for_now(relay) >= BAN_THRESHOLD as usize''',
+     [E2E_EVERY, E2E_COUNTED, E2E_PROOF_SHOW, E2E_AT_COUNT]),
     ("NR34 a refusal never leaves the window", LEAVE,
      '''    at.retain(|at| now.saturating_duration_since(*at) <= BAN_WINDOW);''',
      '''    at.retain(|_| true);''',
@@ -283,8 +286,8 @@ MUTATIONS = [
      '''const BAN_WINDOW: Duration = Duration::from_secs(30);''',
      [UNIT_WINDOW, E2E_COUNTED]),
     ("NR38 refusals are counted by connection", LEAVE,
-     '''        let refused = inner.refused_for_now.entry(link.relay().0).or_default();''',
-     '''        let refused = inner.refused_for_now.entry(link.id()).or_default();''',
+     '''        self.refused_by(link.relay().0);''',
+     '''        self.refused_by(link.id());''',
      [E2E_COUNTED]),
     ("NR39 a relay with no refusal left is kept", LEAVE,
      '''    if within == 0 {
@@ -313,26 +316,40 @@ MUTATIONS = [
      '''    at.retain(|at| now.saturating_duration_since(*at) <= BAN_WINDOW);''',
      '''    at.retain(|at| now.saturating_duration_since(*at) < BAN_WINDOW);''',
      [UNIT_WINDOW]),
-    ("NR43 the gate comes after the proof", NODE_READ,
-     ['''        if !self.asks_after_refusals(link) {
-            at.not_reached();
-            return at;
-        }
-        let asks = At {''',
-      '''        let relay = link.relay().0;
-        let reads = self.state.own_channels.reads();'''],
-     ['''        let asks = At {''',
-      '''        if !self.asks_after_refusals(link) {
-            at.not_reached();
-            return at;
-        }
-        let relay = link.relay().0;
-        let reads = self.state.own_channels.reads();'''],
-     [E2E_COUNTED, E2E_PROOF_SHOW]),
-    ("NR35 a relay at its count of refusals is asked all the same", NODE_READ,
-     '''        if !self.asks_after_refusals(link) {''',
-     '''        if false && !self.asks_after_refusals(link) {''',
-     [E2E_COUNTED]),
+    ("NR35 a read's request is sent to a relay at its count of refusals", LEAVE,
+     '''            if gated && self.at_its_count(&link.relay().0) {''',
+     '''            if false && gated && self.at_its_count(&link.relay().0) {''',
+     [E2E_AT_COUNT]),
+    ("NR43 a read's requests are not held to the count", NODE_READ,
+     '''            gated: true,
+        };''',
+     '''            gated: false,
+        };''',
+     [E2E_AT_COUNT, E2E_COUNTED]),
+    ("NR44 a read's show is made again at the relay's count", DEVICE,
+     '''            if gated && !self.asks_after_refusals(link) {
+                return false;''',
+     '''            if false && gated && !self.asks_after_refusals(link) {
+                return false;''',
+     [E2E_AT_COUNT]),
+    ("NR45 a request of the one door refused for now is not counted", LEAVE,
+     '''                true => {
+                    self.refused_at(link);
+                    Refused::NotNow''',
+     '''                true => {
+                    Refused::NotNow''',
+     [E2E_WHEREVER]),
+    ("NR46 a request asked outside the door refused for now is not counted", LEAVE,
+     '''            if refused_for_now(&e) {
+                self.refused_at(link);
+            }''',
+     '''            let _ = refused_for_now(&e);''',
+     [E2E_WHEREVER, E2E_AT_COUNT]),
+    ("LV4 a relay that refuses again keeps every refusal it made", LEAVE,
+     '''        refusals_within(&mut inner.refused_for_now, &relay, now);
+        let refused''',
+     '''        let refused''',
+     [UNIT_PRUNED]),
     ("NR28 the proof runs past the round's time", NODE_READ,
      '''tokio::time::timeout(left, self.prove(&asks, channel, false))''',
      '''tokio::time::timeout(left + ROUND_MOST, self.prove(&asks, channel, false))''',
@@ -429,11 +446,9 @@ MUTATIONS = [
      [E2E_FAILED]),
     ("NR18 a round reads under the change entry kept now", NODE_READ,
      ['''                    .find(|own| own.id == channel && own.is_pulled())''',
-      '''            under: *under,
-        };'''],
+      '''            under: *under,'''],
      ['''                    .find(|own| own.is_pulled() && matches!(own.kind, at_relays::Kind::Name(_)))''',
-      '''            under: at_relays::kept_id(&lock(&self.state.db)).ok().flatten().unwrap_or(*under),
-        };'''],
+      '''            under: at_relays::kept_id(&lock(&self.state.db)).ok().flatten().unwrap_or(*under),'''],
      [E2E_CHANGE]),
     ("DE1 a read's no fills the pass's proof", DEVICE,
      '''            if lately && !(held && unheeded) {''',
