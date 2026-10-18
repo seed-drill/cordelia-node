@@ -1323,15 +1323,18 @@ fn a_removed_device_lets_go_of_a_carried_name_only_on_a_typed_discard() {
     let mut at = laptop.at_terminal(&["sync", "unmap", "lab"]);
     at.says("It cannot read the relays to learn whether they hold lab.")
         .says("Letting lab go now drops those 2 versions from this device.")
+        .says("This device carries nothing while it has stopped: on another of your devices,")
         .says("Type `discard` to let lab go with them. Anything else keeps it:")
         .types("discard");
     let said = at.done();
     assert!(
         said.contains(
-            "This device holds lab no longer, and 2 versions that no relay held went with it."
+            "This device holds lab no longer, and 2 versions that its own notes said it sent to \
+             no relay went with it."
         ),
         "{said}"
     );
+    assert!(!said.contains("more days at most"), "{said}");
     // The name is held no more: the node knows no such name.
     let (status, entries) = of_lab();
     assert_eq!(status, 404, "{entries}");

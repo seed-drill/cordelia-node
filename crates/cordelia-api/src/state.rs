@@ -786,10 +786,12 @@ impl OwnChannels {
 
     /// Keep nothing of which relays have handed the channel whose ID is
     /// `channel`: the device holds it no more. Held again, it is fetched
-    /// again before a folder's first cycle there.
+    /// again before a folder's first cycle there. Nor is anything kept of
+    /// a read of it that went ([`crate::own_read::OwnReads::forget_gone`]).
     pub fn forget_fetched(&self, channel: &[u8; 32]) {
         let mut fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
         fetched.remove(channel);
+        self.reads.forget_gone(channel);
     }
 
     /// The node says which of the relays it is set up with are connected

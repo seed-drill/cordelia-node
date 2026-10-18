@@ -1221,7 +1221,8 @@ never held, comes in only under **a word that the phrase signed:**
   of the refusal but the last; and `where`, where those versions may still
   be. The word comes back as `{ "folder": "<name>", "read": "<hex>",
   "versions": n, "word": "discard" }`, and the answer carries `let_go` and
-  `let_go_discarded`, how many went. It is refused with `409` where the read
+  `let_go_discarded`, how many went, with `let_go_stopped`, whether the
+  device has stopped, so that what went is what its own notes said. It is refused with `409` where the read
   no longer stands (`LET_GO_READ_STANDS_SECS` from its end, on the node's
   monotonic clock), the number is another, or the store has taken anything
   of the name's channel since, where a folder was mapped to the name since,

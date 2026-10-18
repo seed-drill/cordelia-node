@@ -3906,10 +3906,16 @@ fn kept_on_another_word_says(name: &str) -> String {
 /// name on the word `discard` (decision 2026-10-17 §5.3): how many
 /// versions that no relay held went with it, and, where the statement
 /// lists another device (`alone` is false), that the others keep theirs.
-fn discarded_says(name: &str, gone: u64, alone: bool) -> String {
+/// On a device that has stopped (`stopped`), which read no relay, they
+/// are what its own notes said it sent to none.
+fn discarded_says(name: &str, gone: u64, alone: bool, stopped: bool) -> String {
+    let which = match stopped {
+        false => "that no relay held",
+        true => "that its own notes said it sent to no relay",
+    };
     let went = match gone {
-        1 => "1 version that no relay held went".to_string(),
-        n => format!("{n} versions that no relay held went"),
+        1 => format!("1 version {which} went"),
+        n => format!("{n} versions {which} went"),
     };
     let others = match alone {
         true => "",
@@ -3947,6 +3953,7 @@ fn discard_or_keep(
             name,
             after["let_go_discarded"].as_u64().unwrap_or(0),
             after["let_go_alone"] == true,
+            after["let_go_stopped"] == true,
         )),
         Told::No { message, .. } => anyhow::bail!("{message}"),
     }
@@ -7404,14 +7411,23 @@ mod tests {
         let one = serde_json::json!({ "versions": 1, "said": "a", "where": "b" });
         assert!(discard_asks("lab", &one).ends_with("go with it. Anything else keeps it: "));
         assert_eq!(
-            discarded_says("lab", 3, false),
+            discarded_says("lab", 3, false, false),
             "This device holds lab no longer, and 3 versions that no relay held went with it. \
              Your other devices keep what they hold of it."
         );
         assert_eq!(
-            discarded_says("lab", 1, true),
+            discarded_says("lab", 1, true, false),
             "This device holds lab no longer, and 1 version that no relay held went with it."
         );
+        // A device that has stopped read no relay: what went is what its
+        // own notes said.
+        let noted = discarded_says("lab", 2, true, true);
+        assert_eq!(
+            noted,
+            "This device holds lab no longer, and 2 versions that its own notes said it sent to \
+             no relay went with it."
+        );
+        assert!(!noted.contains("no relay held"), "{noted}");
         assert_eq!(
             kept_on_another_word_says("lab"),
             "lab is still held. Nothing was changed."

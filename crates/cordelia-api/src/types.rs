@@ -563,6 +563,11 @@ pub struct SyncStatusResponse {
     /// many versions that no relay held went with it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub let_go_discarded: Option<usize>,
+    /// Beside `let_go_discarded`: whether this device has stopped, so that
+    /// it read no relay, and what went is what its own notes said it sent
+    /// to none (decision 2026-10-17 §5.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go_stopped: Option<bool>,
     /// Beside `still_held`: whether this device has stopped, and sends
     /// nothing more (decision 2026-10-17 §4.6).
     #[serde(skip_serializing_if = "Option::is_none")]

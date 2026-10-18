@@ -428,6 +428,8 @@ go now is not among it.
 
 The words in brackets are those of its status: "it was removed", "it is in no list of the last change", "it could not open the last change", "two changes were made apart". The last sentence is said only where the device can be added again (it is in no list, or could not open a change). With no terminal there, the command says the first paragraph and "To let it go now, with them, run `cordelia sync unmap lab` at a terminal.", on standard error, with status 1.
 
+On a device that has stopped, the second sentence of the second paragraph says what is true there, where a carry is refused, and says no days: "A version that a carry brought into lab is still at the relays, in the channel it was carried from. This device carries nothing while it has stopped: on another of your devices, `cordelia sync carry lab` brings in again what a device that counts wrote, and `cordelia sync carry lab --from <device>`, with the recovery phrase, what a removed device wrote." And on `discard` it read no relay, so the line says what its notes said: "This device holds lab no longer, and 3 versions that its own notes said it sent to no relay went with it."
+
 ### 5.4 Turned down
 
 - **The phrase.** An agent with a shell can give a yes and not the phrase. But nothing comes in by a discard: it lets go of what one device holds. The phrase is for what lets a removed key's work in, or changes who is a device.
