@@ -114,9 +114,10 @@ use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
     ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
-    OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
+    LEFT_REFUSED_IN_A_ROW_MAX, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
+    OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost,
+    left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -577,8 +578,11 @@ impl DeviceEntries {
     /// now, on a connection that is still open, is waited out the same
     /// way** (decision 2026-10-17 §3.2): the relay counts the answers to
     /// shows in its minute, which the device does not see, and a refusal
-    /// for room is not the end of what it will hand. A channel that is
-    /// not read to its end by `until` is handed back as that.
+    /// for room is not the end of what it will hand. **Only
+    /// LEFT_REFUSED_IN_A_ROW_MAX in a row, with no page between:** the
+    /// relay resets with the same code a request over its rate, which it
+    /// counts as a breach, and the read then ends there in part. A channel
+    /// that is not read to its end by `until` is handed back as that.
     ///
     /// **The proof is counted from the moment it is sent, whatever the
     /// relay answers** (decision 2026-10-04 §16): a relay remembers every
@@ -599,6 +603,7 @@ impl DeviceEntries {
         let reached = |(mark, next): (Mark, u64)| LeftPlace { mark, next };
         let mut read: Vec<Vec<u8>> = Vec::new();
         let mut proved = false;
+        let mut refused_in_a_row = 0u32;
         loop {
             if Instant::now() >= until {
                 return LeftRead::Read {
@@ -645,6 +650,7 @@ impl DeviceEntries {
                         of.counts.pulled += entries.len() as u64;
                     }
                     proved = true;
+                    refused_in_a_row = 0;
                     let moved = (mark, next) != place;
                     let nothing = entries.is_empty();
                     read.extend(entries.iter().map(|entry| entry.to_wire()));
@@ -677,8 +683,22 @@ impl DeviceEntries {
                 // is no end of what it will hand: it waits, and asks
                 // again (decision 2026-10-17 §3.2). The proof was
                 // answered.
+                //
+                // But only so many times in a row with no page between:
+                // the relay resets with the same code a request over its
+                // rate, which it counts as a breach, and the device stays
+                // below the breaches that cut an address off. Then the
+                // read ends there in part.
                 Err(LeftRefused::NotNow) => {
                     proved = true;
+                    refused_in_a_row += 1;
+                    if refused_in_a_row >= LEFT_REFUSED_IN_A_ROW_MAX {
+                        return LeftRead::Read {
+                            entries: read,
+                            whole: false,
+                            reached: reached(place),
+                        };
+                    }
                     tokio::time::sleep(LEFT_ROOM_WAIT).await
                 }
                 Err(LeftRefused::OwnChannel) if read.is_empty() => {
