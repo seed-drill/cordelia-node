@@ -559,10 +559,15 @@ pub async fn carry_name(
             done.nothing = Some("the new channel holds something for this name already".into());
             return Ok(done);
         }
+        // The carry of `cordelia sync map` brings into the folder's own
+        // name; any other is a carry by command (decision 2026-10-17 §4.3).
+        let bring = match only_where_empty {
+            true => carry::bring,
+            false => carry::bring_by_command,
+        };
         for was in &read {
             for version in &was.versions {
-                let brought =
-                    carry::bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
+                let brought = bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
                 done.tally.count(&version.name, brought);
             }
         }
@@ -1108,7 +1113,8 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
                     true => Rule::Above,
                     false => Rule::EmptySlots,
                 };
-                let brought = carry::bring(&conn, &state.identity, name, version, rule, now())?;
+                let brought =
+                    carry::bring_by_command(&conn, &state.identity, name, version, rule, now())?;
                 tally.count(&version.name, brought);
             }
             Ok(tally)
@@ -1490,8 +1496,14 @@ pub fn take_handed(
                     by_other_keys += 1;
                     continue;
                 }
-                let brought =
-                    carry::bring(&conn, &state.identity, &name, &version, Rule::Counts, now())?;
+                let brought = carry::bring_by_command(
+                    &conn,
+                    &state.identity,
+                    &name,
+                    &version,
+                    Rule::Counts,
+                    now(),
+                )?;
                 tally.count(&version.name, brought);
             }
             Ok((tally, by_other_keys))
@@ -1524,6 +1536,8 @@ mod tests {
     use super::*;
 
     use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
+    use std::collections::BTreeSet;
+
     use cordelia_crypto::entry::Value;
     use cordelia_crypto::phrase::Phrase;
 
@@ -2161,11 +2175,15 @@ mod tests {
         assert_eq!((&again["carried"], &again["held"]), (&json!(0), &json!(1)));
 
         // With a folder mapped, the second yes named the file: it comes
-        // in above the version that the new channel holds.
+        // in above the version that the new channel holds. The name is a
+        // carried name from then (decision 2026-10-17 §4.3).
+        let brought_in = || names::brought_in(&db(&node.state)).unwrap();
+        assert!(brought_in().is_empty());
         node.maps_a_folder(LAB);
         let word = node.word(&phrase, &from(&[removed], &["kept.md"]));
         let done = take_from(&node.state, &word).await.unwrap();
         assert_eq!(done["carried"], 1, "{done}");
+        assert_eq!(brought_in(), BTreeSet::from([LAB.to_string()]));
         assert_eq!(done["above"], json!([]));
         assert_eq!(node.text(LAB, "kept.md").as_deref(), Some("over it"));
         // A file that the word does not name stays where it is.
@@ -2733,9 +2751,14 @@ mod tests {
         }
         assert_eq!(node.stored(), before);
         // With the phrase's word, and signed by the key of its run, each
-        // comes in as a carry by command brings one in.
+        // comes in as a carry by command brings one in: under a folder,
+        // the name is a carried name from then (decision 2026-10-17 §4.3).
+        node.maps_a_folder(LAB);
+        let brought_in = || names::brought_in(&db(&node.state)).unwrap();
+        assert!(brought_in().is_empty());
         let done = takes(&word, 0, &first_batch, &versions).unwrap();
         assert_eq!(done["carried"], 2, "{done}");
+        assert_eq!(brought_in(), BTreeSet::from([LAB.to_string()]));
         // **A batch is taken once:** posted again under its word, it is
         // refused, and nothing is judged again.
         let again = takes(&word, 0, &first_batch, &versions);

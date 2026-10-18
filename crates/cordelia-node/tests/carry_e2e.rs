@@ -421,8 +421,8 @@ fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
     );
     assert!(
         said.contains(
-            "This device still holds lab, since a carry or a recovery brought it: `cordelia \
-             sync unmap lab` lets it go, once nothing of it waits to be sent."
+            "This device still holds lab, since a carry or a recovery brought versions into \
+             it: `cordelia sync unmap lab` lets it go, once a relay holds each of its versions."
         ),
         "{said}"
     );
@@ -434,10 +434,14 @@ fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
         has_sent_everything(&laptop)
     });
 
-    // The name has no folder to unmap: unmapping its name lets go of it.
+    // The name has no folder to unmap: unmapping its name lets go of it,
+    // once the read that it waits for finds each version at the relay
+    // (decision 2026-10-17 §4.2).
     let said = laptop.cli(&["sync", "unmap", "lab"]);
-    assert!(
-        said.starts_with("This device holds lab no longer. It held it by a carry"),
+    assert_eq!(
+        said.trim_end(),
+        "This device holds lab no longer. It held it by a carry, with no folder mapped to it: a \
+         relay held each of its 2 versions when it was read just now, so nothing is lost by it.",
         "{said}"
     );
     assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
@@ -875,4 +879,273 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
         .types(&words);
     let said = at.done();
     assert!(said.contains("lab: nothing to bring in"), "{said}");
+}
+
+// ── The read before a carried name is let go (decision 2026-10-17 §4.2) ──
+
+/// What `relay` holds of channels from their secrets, in bytes as a
+/// relay counts them against its cap, read from its database.
+fn relay_holds_bytes(relay: &Node) -> u64 {
+    let db = rusqlite::Connection::open_with_flags(
+        relay.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+    cordelia_storage::relay::used_bytes(&db).unwrap()
+}
+
+/// `relay`, stopped, may hold `bytes` when it starts again, whatever cap
+/// it was set before.
+fn cap_of(relay: &Node, bytes: u64) {
+    let config = std::fs::read_to_string(relay.config()).unwrap();
+    let without: Vec<&str> = config
+        .lines()
+        .filter(|line| !line.starts_with("max_storage_bytes"))
+        .collect();
+    std::fs::write(relay.config(), without.join("\n") + "\n").unwrap();
+    relay.max_storage_bytes(bytes);
+}
+
+/// `cordelia sync unmap lab` on `laptop`, which lets the name go: run
+/// again while the relay, just started again, is not reached by the
+/// read, as a person runs it again. Any other refusal fails.
+fn lets_go_once_the_relay_is_read(laptop: &Node) -> String {
+    let mut said = String::new();
+    wait_for("the name is let go", &[laptop], 120, || {
+        let out = laptop.command(&["sync", "unmap", "lab"]);
+        if out.status.success() {
+            said = String::from_utf8(out.stdout).unwrap();
+            return Some(());
+        }
+        let refused = String::from_utf8_lossy(&out.stderr);
+        assert!(refused.contains(": not reached."), "{refused}");
+        None
+    });
+    said
+}
+
+/// The desktop alone syncs `lab`, writes two files, and is then off for
+/// good. The laptop renews, and holds nothing of the name in the new
+/// generation. Returns the relay, the laptop, and the desktop, stopped.
+fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node) {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(d_mem.join("one.md"), "written on the desktop\n").unwrap();
+    std::fs::write(d_mem.join("two.md"), "and this\n").unwrap();
+    sync_is_turned_on(&desktop);
+    let out = desktop.cli(&["sync", "map", &path(&d_notes), "lab"]);
+    assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    wait_for(
+        "the desktop has sent its files",
+        &[&relay, &desktop],
+        120,
+        || (held(&desktop).len() == 2 && has_sent_everything(&desktop).is_some()).then_some(()),
+    );
+    desktop.stop();
+    let mut at = renews(&laptop, &["stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for(
+        "the relay holds the change",
+        &[&relay, &laptop],
+        180,
+        || has_sent_everything(&laptop),
+    );
+    (relay, laptop, desktop)
+}
+
+/// **A carried name is not let go while no relay holds what it brought**
+/// (decision 2026-10-17 §4.2, §4.6, §1 property 6). The relay may hold
+/// what it holds and no more, so it has no room for the new channel that
+/// `cordelia sync carry` brings the desktop's files into. `cordelia sync
+/// unmap lab`, with no terminal, reads the relays and is refused, on
+/// standard error, saying how many versions no relay held and what the
+/// relay did. The relay is given room: the laptop sends what waits, and
+/// the name is let go, saying that a relay held each version.
+#[test]
+fn a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought() {
+    let (mut relay, laptop, _desktop) = the_desktop_wrote_lab_and_left();
+    relay.stop();
+    let used = relay_holds_bytes(&relay);
+    cap_of(&relay, used);
+    relay.start();
+    wait_for("relay healthy again", &[&relay, &laptop], 30, || {
+        healthy(&relay)
+    });
+    wait_for(
+        "the laptop reaches the relay again",
+        &[&relay, &laptop],
+        60,
+        || has_hot_peer(&laptop),
+    );
+
+    // The carry reads the new channel first: once a pass has read it at
+    // the relay that holds none of it, it brings the desktop's files in.
+    wait_for(
+        "the carry brings the files in",
+        &[&relay, &laptop],
+        120,
+        || {
+            let said = laptop.cli(&["sync", "carry", "lab"]);
+            said.contains("lab: 2 versions brought in").then_some(())
+        },
+    );
+    wait_for(
+        "the relay has refused the new channel",
+        &[&relay, &laptop],
+        120,
+        || {
+            let relays = person_of(&laptop)["relays"].clone();
+            relays[0]["no_room_at"].as_i64().map(|_| ())
+        },
+    );
+    let refused = laptop.refused(&["sync", "unmap", "lab"]);
+    println!("{refused}");
+    assert!(
+        refused.starts_with(
+            "Error: lab is not let go: no relay that this device is set up with held 2 of its \
+             versions when it was read just now.\n"
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(": holds none of it. It had no room for 2 of them, the last time "),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(
+            "This device goes on sending them, and lab can be let go once a relay holds them. \
+             To let it go now, with them, run `cordelia sync unmap lab` at a terminal."
+        ),
+        "{refused}"
+    );
+    assert_eq!(held(&laptop).len(), 2);
+
+    // The relay is given room: what waits is sent, and the name is let go.
+    relay.stop();
+    cap_of(&relay, used + 4 * 1024 * 1024);
+    relay.start();
+    wait_for("relay healthy with room", &[&relay, &laptop], 30, || {
+        healthy(&relay)
+    });
+    wait_for(
+        "the laptop reaches the relay again",
+        &[&relay, &laptop],
+        60,
+        || has_hot_peer(&laptop),
+    );
+    wait_for(
+        "the laptop has sent what it carried",
+        &[&relay, &laptop],
+        660,
+        || has_sent_everything(&laptop),
+    );
+    let said = lets_go_once_the_relay_is_read(&laptop);
+    assert!(
+        said.starts_with(
+            "This device holds lab no longer. It held it by a carry, with no folder mapped to \
+             it: a relay held each of its 2 versions when it was read just now"
+        ),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+}
+
+/// **A relay that dropped a carried channel keeps the name held**
+/// (decision 2026-10-17 §4.2, §1 property 6). The relay is sent
+/// everything that the carry brought, and the laptop's notes say so. The
+/// relay is then started again with a cap that leaves the channel out:
+/// it drops it, as the channel it held for the shortest time. Until the
+/// laptop has sent it again, which it has room for once the cap is back,
+/// the name is not let go.
+#[test]
+fn a_relay_that_dropped_a_carried_channel_keeps_the_name_held() {
+    let (mut relay, laptop, _desktop) = the_desktop_wrote_lab_and_left();
+    let said = laptop.cli(&["sync", "carry", "lab"]);
+    assert!(said.contains("lab: 2 versions brought in"), "{said}");
+    wait_for(
+        "the laptop has sent what it carried",
+        &[&relay, &laptop],
+        180,
+        || has_sent_everything(&laptop),
+    );
+
+    // The relay drops the channel of lab, the one it took last, and has
+    // no room to take it again.
+    relay.stop();
+    let used = relay_holds_bytes(&relay);
+    let lab_bytes: u64 = {
+        let db = rusqlite::Connection::open_with_flags(
+            relay.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT bytes FROM relay_channels ORDER BY held_since DESC, rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as u64
+    };
+    cap_of(&relay, used - lab_bytes);
+    relay.start();
+    wait_for("relay healthy again", &[&relay, &laptop], 30, || {
+        healthy(&relay)
+    });
+    wait_for(
+        "the relay is within its cap",
+        &[&relay, &laptop],
+        30,
+        || (relay_holds_bytes(&relay) == used - lab_bytes).then_some(()),
+    );
+    wait_for(
+        "the laptop reaches the relay again",
+        &[&relay, &laptop],
+        60,
+        || has_hot_peer(&laptop),
+    );
+    let refused = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(
+        refused.starts_with(
+            "Error: lab is not let go: no relay that this device is set up with held 2 of its \
+             versions when it was read just now.\n"
+        ),
+        "{refused}"
+    );
+    assert_eq!(held(&laptop).len(), 2);
+
+    // With room again, the laptop sends the channel again, and then the
+    // name is let go.
+    relay.stop();
+    cap_of(&relay, used + 4 * 1024 * 1024);
+    relay.start();
+    wait_for("relay healthy with room", &[&relay, &laptop], 30, || {
+        healthy(&relay)
+    });
+    wait_for(
+        "the laptop reaches the relay again",
+        &[&relay, &laptop],
+        60,
+        || has_hot_peer(&laptop),
+    );
+    wait_for(
+        "the laptop has sent lab again",
+        &[&relay, &laptop],
+        660,
+        || {
+            (relay_holds_bytes(&relay) >= used).then_some(())?;
+            has_sent_everything(&laptop)
+        },
+    );
+    let said = lets_go_once_the_relay_is_read(&laptop);
+    assert!(
+        said.starts_with("This device holds lab no longer."),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
 }

@@ -236,6 +236,29 @@ pub fn bring(
     })
 }
 
+/// [`bring`], for a carry by command or the look of a recovery: where the
+/// version is carried, the name is a carried name from then, in the same
+/// transaction (decision 2026-10-17 §4.3, [`crate::names::note_brought_in`]),
+/// so that a folder's unmapping does not let go of what was brought in.
+/// The carry that `cordelia sync map` makes calls [`bring`]: its name is
+/// the folder's.
+pub fn bring_by_command(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    version: &Version,
+    rule: Rule,
+    now: i64,
+) -> Result<Brought, PersonError> {
+    in_one(conn, || {
+        let brought = bring(conn, identity, name, version, rule, now)?;
+        if brought == Brought::Carried {
+            crate::names::note_brought_in(conn, name)?;
+        }
+        Ok(brought)
+    })
+}
+
 /// What [`bring`] would do with `version`, with nothing written: for a
 /// command that says what it found before it asks its yes (decision
 /// 2026-10-04 §7.3). [`Brought::Carried`] says that the version would be

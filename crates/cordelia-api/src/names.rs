@@ -447,6 +447,72 @@ fn keep_carried(conn: &Connection, names: &BTreeSet<String>) -> Result<(), Perso
     Ok(())
 }
 
+/// The names into which a carry by command, or the look of a recovery,
+/// brought a version while a folder of this device's was mapped to them
+/// (decision 2026-10-17 §4.3): each is a carried name, as a name in
+/// [`carried`] is, and a folder's unmapping does not let go of it
+/// ([`held_after_its_folder`]).
+pub fn brought_in(conn: &Connection) -> Result<BTreeSet<String>, PersonError> {
+    Ok(meta::get(conn, meta::PERSON_NAMES_BROUGHT_IN)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default())
+}
+
+/// Keep `names` as the names that a carry brought versions into under a
+/// folder.
+fn keep_brought_in(conn: &Connection, names: &BTreeSet<String>) -> Result<(), PersonError> {
+    if names.is_empty() {
+        meta::remove(conn, meta::PERSON_NAMES_BROUGHT_IN)?;
+        return Ok(());
+    }
+    let kept = serde_json::to_string(names)
+        .map_err(|e| PersonError::Held(format!("the names brought in under a folder: {e}")))?;
+    meta::set(conn, meta::PERSON_NAMES_BROUGHT_IN, &kept)?;
+    Ok(())
+}
+
+/// A carry by command, or the look of a recovery, brought a version into
+/// `name` (decision 2026-10-17 §4.3): where a folder of this device's is
+/// mapped to the name, the name is kept among those [`brought_in`]. Where
+/// none is, [`hold_for_a_carry`] kept it among those [`carried`] already.
+/// The caller calls this in the transaction of the bring.
+pub fn note_brought_in(conn: &Connection, name: &str) -> Result<(), PersonError> {
+    if !has_folder(conn, name)? {
+        return Ok(());
+    }
+    let mut kept = brought_in(conn)?;
+    if kept.insert(name.to_string()) {
+        keep_brought_in(conn, &kept)?;
+    }
+    Ok(())
+}
+
+/// The last folder that was mapped to `name` is unmapped, and a carry
+/// brought versions into the name ([`brought_in`]): the name is held as a
+/// carry holds a name with no folder (decision 2026-10-17 §4.3). It is
+/// kept among those [`carried`], and the device says that it syncs it,
+/// where it may write. It stays among those [`brought_in`], which then
+/// says that a folder was mapped to it.
+pub fn held_after_its_folder(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    now: i64,
+) -> Result<(), PersonError> {
+    in_one(conn, || {
+        let mut kept = carried(conn)?;
+        if kept.insert(name.to_string()) {
+            keep_carried(conn, &kept)?;
+        }
+        // With sync off its folder's word was taken back: a name held by
+        // a carry keeps its word, with sync on or off.
+        if Standing::to_write(conn).is_ok() {
+            say(conn, identity, name, now)?;
+        }
+        Ok(())
+    })
+}
+
 /// This device comes to hold `name` for a carry that a person asked for
 /// (decision 2026-10-04 §7.3, §9): it holds the name, so that its channel
 /// is fetched and what is carried into it is sent, and it lists the name
@@ -577,6 +643,10 @@ pub fn stop(
         let mut kept = carried(conn)?;
         if kept.remove(name) {
             keep_carried(conn, &kept)?;
+        }
+        let mut brought = brought_in(conn)?;
+        if brought.remove(name) {
+            keep_brought_in(conn, &brought)?;
         }
         let Some(channel) = held_rows::channel_of_name(conn, name)? else {
             return Ok(None);
@@ -1492,10 +1562,24 @@ mod tests {
         assert!(hold_for_a_carry(&alone.conn, &alone.identity, "brought", now).is_err());
         assert!(hold_for_a_carry(conn, identity, "Not-A-Name", now).is_err());
         assert!(kept(conn).is_empty());
-        // And a device that leaves its phrase keeps none.
+        // A version brought into a name marks it only where a folder is
+        // mapped to it (decision 2026-10-17 §4.3): the other is held by
+        // the carry already.
         hold_for_a_carry(conn, identity, "brought", now).unwrap();
+        note_brought_in(conn, "mapped").unwrap();
+        note_brought_in(conn, "brought").unwrap();
+        assert_eq!(
+            brought_in(conn).unwrap(),
+            BTreeSet::from(["mapped".to_string()])
+        );
+        // And a device that leaves its phrase keeps none.
         crate::leaving::forget(conn, identity, false, now).unwrap();
         assert!(kept(conn).is_empty());
+        assert!(brought_in(conn).unwrap().is_empty());
+        assert_eq!(
+            meta::get(conn, meta::PERSON_NAMES_BROUGHT_IN).unwrap(),
+            None
+        );
     }
 
     /// What a device has sent to no relay is counted over every name
