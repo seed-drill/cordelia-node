@@ -104,7 +104,10 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
             let_go_alone: None,
             let_go_versions: None,
             reading: None,
+            not_let_go: None,
+            let_go_discarded: None,
             still_held: None,
+            still_held_stopped: None,
         };
         let notices = cordelia_storage::first_start::notices(&db)?;
         let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
@@ -1155,16 +1158,7 @@ pub fn let_go_of_a_carried_name(
     }
     if let Some((read, found)) = read {
         let reads = state.own_channels.reads();
-        let Some(kept) = reads.get(read, std::time::Instant::now()) else {
-            return Err(ApiError::Conflict(check::started_again_says(name)));
-        };
-        let channel = cordelia_storage::person::channel_of_name(db, name)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let taken = cordelia_storage::at_relays::last_taken(db, &kept.channel)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        if channel != Some(kept.channel) || taken != found.taken {
-            return Err(ApiError::Conflict(check::took_something_says(name)));
-        }
+        let kept = bound_to_its_read(state, db, name, read, found)?;
         if !found.each_held() {
             let said = state.own_channels.read();
             let now = chrono::Utc::now().timestamp();
@@ -1185,6 +1179,96 @@ pub fn let_go_of_a_carried_name(
     tracing::info!(%name, "sync: a name that was held by a carry, with no folder, is let go");
     state.own_channels.written();
     Ok(true)
+}
+
+/// The read named `read`, which found `found`, as the node keeps it,
+/// where a let-go of `name` may still be bound to it (decision 2026-10-17
+/// §4.2 item 8): refused where the node keeps the read no more
+/// ([`crate::let_go::started_again_says`]), and where the store has taken
+/// anything of the name's channel since the read ended, or the name's
+/// channel is another ([`crate::let_go::took_something_says`]).
+fn bound_to_its_read(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    name: &str,
+    read: &crate::own_read::ReadId,
+    found: &crate::let_go::Found,
+) -> Result<crate::own_read::OwnRead, ApiError> {
+    use crate::let_go as check;
+    let reads = state.own_channels.reads();
+    let Some(kept) = reads.get(read, std::time::Instant::now()) else {
+        return Err(ApiError::Conflict(check::started_again_says(name)));
+    };
+    let channel = cordelia_storage::person::channel_of_name(db, name)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let taken = cordelia_storage::at_relays::last_taken(db, &kept.channel)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if channel != Some(kept.channel) || taken != found.taken {
+        return Err(ApiError::Conflict(check::took_something_says(name)));
+    }
+    Ok(kept)
+}
+
+/// Let go of `name`, a carried name, on the word `discard` (decision
+/// 2026-10-17 §5.2, §1 properties 5, 8 and 9), with the entries of it
+/// that no relay held in the read named `read`, or that the notes of a
+/// device that has stopped say it sent to none ([`crate::let_go::noted`]).
+/// `versions` is the number that the command said would go. Returns how
+/// many went with it, or `None` where the device does not hold the name
+/// by a carry, and nothing is done then.
+///
+/// **What is let go is what was shown, and nothing else.** Refused, with
+/// [`crate::let_go::changed_says`], where the read no longer stands at
+/// `now`, on the node's monotonic clock, for its age or because another
+/// read of the name took its place ([`crate::own_read::OwnReads::gone`]);
+/// where it has found nothing yet; where `versions` is not the number it
+/// found; and where the store has taken anything of the name's channel
+/// since it ended, or the name's channel is another. A read that this
+/// node never made, as after it was started again, is refused with
+/// [`crate::let_go::started_again_says`]. `wall` is the time in seconds
+/// that the name's word is taken back at: nothing of the word's time
+/// turns on it.
+pub fn discard_a_carried_name(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    name: &str,
+    read: &crate::own_read::ReadId,
+    versions: usize,
+    now: std::time::Instant,
+    wall: i64,
+) -> Result<Option<usize>, ApiError> {
+    use crate::commands::refused;
+    use crate::let_go as check;
+    if !crate::names::carried(db).map_err(refused)?.contains(name) {
+        return Ok(None);
+    }
+    let reads = state.own_channels.reads();
+    let changed = || ApiError::Conflict(check::changed_says(name));
+    let Some(kept) = reads.get(read, now) else {
+        return Err(match reads.gone(read, now) {
+            true => changed(),
+            false => ApiError::Conflict(check::started_again_says(name)),
+        });
+    };
+    let Some(found) = &kept.found else {
+        return Err(changed());
+    };
+    let channel = cordelia_storage::person::channel_of_name(db, name)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let taken = cordelia_storage::at_relays::last_taken(db, &kept.channel)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let bound = channel == Some(kept.channel) && taken == found.taken;
+    if !bound || versions != found.not_held.len() {
+        return Err(changed());
+    }
+    reads.forget(read);
+    let held = crate::names::stop(db, &state.identity, name, wall).map_err(refused)?;
+    if let Some(channel) = held {
+        state.own_channels.forget_fetched(&channel);
+    }
+    tracing::info!(%name, versions, "sync: a carried name is let go on the word, with what no relay held");
+    state.own_channels.written();
+    Ok(Some(versions))
 }
 
 /// The name that a folder was mapped to before a change of settings,
@@ -1216,6 +1300,17 @@ fn still_held_by_a_carry(db: &rusqlite::Connection, before: &[String]) -> Option
 /// goes on, the answer carries `reading`, with the read's ID, which the
 /// command sends back to ask for the next round. Where it has ended, the
 /// lock is taken and the name is let go by what it found.
+///
+/// **Where an entry of the name is held by no relay, it is let go only on
+/// the word `discard`** (decision 2026-10-17 §5.2): a command that asks at
+/// a terminal says so (`asks`), and is answered with what it asks by
+/// (`not_let_go`); any other is refused with the lines of §4.6. The word
+/// comes back with the read's ID and the number found
+/// ([`discard_a_carried_name`]). **A device that has stopped reads no
+/// relay** (§4.4): where its own notes say that it sent a version of the
+/// name to no relay, the same word is asked, bound to the count it took
+/// from them ([`crate::let_go::noted`]); where they say none, the name
+/// goes at once.
 pub async fn unmap(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1241,6 +1336,9 @@ pub async fn unmapped(
         None => None,
         Some(read) => Some(read_named(read)?),
     };
+    if let Some(word) = &body.word {
+        return discarded(state, name, word, read, body.versions);
+    }
     if read.is_none() {
         let db = state
             .db
@@ -1251,16 +1349,46 @@ pub async fn unmapped(
             Ok(()) => {
                 names_follow(state, &db, &before);
                 let still_held = still_held_by_a_carry(&db, &before);
+                // A device that has stopped sends nothing more, and the
+                // command says so (decision 2026-10-17 §4.6).
+                let stopped = still_held.is_some().then(|| {
+                    let stands = crate::at_relays::stands(&db);
+                    !matches!(stands, Ok(crate::at_relays::Stands::Applied))
+                });
                 drop(db);
-                return status(None, still_held);
+                let mut status = status(None, still_held)?;
+                status.still_held_stopped = stopped;
+                return Ok(status);
             }
             Err(not_mapped) => {
                 use crate::commands::refused;
                 if !crate::names::carried(&db).map_err(refused)?.contains(name) {
                     return Err(not_mapped);
                 }
-                // A device that has stopped reads no relay.
+                // A device that has stopped reads no relay: its own notes
+                // decide (decision 2026-10-17 §4.4).
                 let stands = crate::at_relays::stands(&db).map_err(refused)?;
+                if let crate::at_relays::Stands::Stopped(stopped) = stands {
+                    let reads = state.own_channels.reads();
+                    let now = std::time::Instant::now();
+                    let noted = crate::let_go::noted(&db, &state.identity, reads, name, now)
+                        .map_err(refused)?;
+                    if let Some((read, found)) = noted {
+                        let n = found.not_held.len();
+                        let said = crate::let_go::stopped_says(name, stopped, n);
+                        if !body.asks {
+                            let terminal = crate::let_go::at_a_terminal_says(name, n);
+                            return Err(ApiError::Conflict(format!("{said} {terminal}")));
+                        }
+                        let wall = chrono::Utc::now().timestamp();
+                        let asked = crate::let_go::word_asked(&db, name, &read, n, said, wall)
+                            .map_err(refused)?;
+                        drop(db);
+                        let mut status = status(None, None)?;
+                        status.not_let_go = Some(asked);
+                        return Ok(status);
+                    }
+                }
                 if stands != crate::at_relays::Stands::Applied {
                     let_go_of_a_carried_name(state, &db, name, None)?;
                     let alone = listed_alone(state, &db);
@@ -1294,6 +1422,16 @@ pub async fn unmapped(
                     .db
                     .lock()
                     .map_err(|e| ApiError::Internal(e.to_string()))?;
+                // At a terminal, what was held by no relay is said, and the
+                // word is asked (decision 2026-10-17 §5.2).
+                let carried = crate::names::carried(&db).map_err(crate::commands::refused)?;
+                if body.asks && !found.each_held() && carried.contains(name) {
+                    let asked = word_asked_after_a_read(state, &db, name, &read, &found)?;
+                    drop(db);
+                    let mut status = status(None, None)?;
+                    status.not_let_go = Some(asked);
+                    return Ok(status);
+                }
                 if !let_go_of_a_carried_name(state, &db, name, Some((&read, &found)))? {
                     return Err(ApiError::BadRequest(format!(
                         "{name} is not mapped on this device"
@@ -1307,6 +1445,68 @@ pub async fn unmapped(
             Ok(status)
         }
     }
+}
+
+/// What the node answers a command that asks at a terminal where the read
+/// named `read` found entries of `name` that no relay held (decision
+/// 2026-10-17 §5.2, §5.3): the lines of §4.6 but the last, and where the
+/// versions may still be, with the read's ID and the number found
+/// ([`crate::let_go::word_asked`]). Refused as a let-go is where the read
+/// no longer binds it ([`bound_to_its_read`]).
+fn word_asked_after_a_read(
+    state: &AppState,
+    db: &rusqlite::Connection,
+    name: &str,
+    read: &crate::own_read::ReadId,
+    found: &crate::let_go::Found,
+) -> Result<serde_json::Value, ApiError> {
+    use crate::commands::refused;
+    use crate::let_go as check;
+    let kept = bound_to_its_read(state, db, name, read, found)?;
+    let said = state.own_channels.read();
+    let wall = chrono::Utc::now().timestamp();
+    let relays = check::relays_say(db, &kept, found, &said, wall).map_err(refused)?;
+    let lines = check::not_held_lines(name, found.not_held.len(), &relays);
+    check::word_asked(db, name, read, found.not_held.len(), lines, wall).map_err(refused)
+}
+
+/// What [`unmapped`] does where the command sends the word that the person
+/// typed (decision 2026-10-17 §5.2): only `discard` is one, sent with the
+/// read's ID and the number that was said ([`discard_a_carried_name`]).
+fn discarded(
+    state: &AppState,
+    name: &str,
+    word: &str,
+    read: Option<crate::own_read::ReadId>,
+    versions: Option<usize>,
+) -> Result<SyncStatusResponse, ApiError> {
+    let (Some(read), Some(versions), "discard") = (read, versions, word) else {
+        return Err(ApiError::BadRequest(
+            "a name is let go with what no relay holds on the word `discard`, sent with the ID \
+             of its read and the number of versions found"
+                .into(),
+        ));
+    };
+    let (gone, alone) = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let now = std::time::Instant::now();
+        let wall = chrono::Utc::now().timestamp();
+        let Some(gone) = discard_a_carried_name(state, &db, name, &read, versions, now, wall)?
+        else {
+            return Err(ApiError::BadRequest(format!(
+                "{name} is not mapped on this device"
+            )));
+        };
+        (gone, listed_alone(state, &db))
+    };
+    let mut status = status(state)?;
+    status.let_go = Some(name.to_string());
+    status.let_go_alone = Some(alone);
+    status.let_go_discarded = Some(gone);
+    Ok(status)
 }
 
 /// The ID of a read, as a command sends it: hex of sixteen bytes.
@@ -1776,6 +1976,7 @@ mod tests {
             let body = SyncUnmapRequest {
                 folder: folder_or_name.into(),
                 read: None,
+                ..Default::default()
             };
             remove_mapping(&self.control, &self.db, &body).unwrap();
         }
@@ -2230,6 +2431,7 @@ mod tests {
                 let body = SyncUnmapRequest {
                     folder: "lab".into(),
                     read: None,
+                    ..Default::default()
                 };
                 remove_mapping(&s.control, &s.db, &body)
             }
@@ -2291,6 +2493,7 @@ mod tests {
         let body = SyncUnmapRequest {
             folder: "nothing".into(),
             read: None,
+            ..Default::default()
         };
         assert!(remove_mapping(&s.control, &s.db, &body).is_err());
         let body = request("/srv/outside", "outside", false);
@@ -2601,6 +2804,7 @@ mod tests {
                 let body = SyncUnmapRequest {
                     folder: name.to_string(),
                     read: None,
+                    ..Default::default()
                 };
                 remove_mapping(&state.sync_control, db, &body).unwrap()
             })
@@ -2718,6 +2922,7 @@ mod tests {
             let body = SyncUnmapRequest {
                 folder: word.to_string(),
                 read: None,
+                ..Default::default()
             };
             remove_mapping(&state.sync_control, &db, &body).unwrap();
             names_follow(&state, &db, &before);
@@ -3031,6 +3236,7 @@ mod tests {
             let body = SyncUnmapRequest {
                 folder: name.to_string(),
                 read: read.take(),
+                ..Default::default()
             };
             let answer = unmapped(&node.state, &body).await?;
             match &answer.reading {
@@ -3357,6 +3563,7 @@ mod tests {
         let body = SyncUnmapRequest {
             folder: "lab".into(),
             read: None,
+            ..Default::default()
         };
         let first = unmapped(&node.state, &body).await.unwrap();
         let reading = first.reading.unwrap();
@@ -3380,6 +3587,7 @@ mod tests {
             let body = SyncUnmapRequest {
                 folder: "lab".into(),
                 read: read.take(),
+                ..Default::default()
             };
             let answer = unmapped(&node.state, &body).await?;
             match &answer.reading {
@@ -3431,6 +3639,7 @@ mod tests {
             let body = SyncUnmapRequest {
                 folder: "lab".into(),
                 read: Some(unknown),
+                ..Default::default()
             };
             let refused = unmapped(state, &body).await;
             assert!(
@@ -3455,6 +3664,7 @@ mod tests {
         let body = SyncUnmapRequest {
             folder: "lab".into(),
             read: Some(hex::encode(other)),
+            ..Default::default()
         };
         assert!(matches!(
             unmapped(state, &body).await,
@@ -3489,6 +3699,7 @@ mod tests {
             &SyncUnmapRequest {
                 folder: "lab".into(),
                 read: None,
+                ..Default::default()
             },
         )
         .await
@@ -3498,6 +3709,7 @@ mod tests {
         let next = SyncUnmapRequest {
             folder: "lab".into(),
             read: Some(read.clone()),
+            ..Default::default()
         };
         let (asked, ()) = tokio::join!(unmapped(state, &next), async {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3515,6 +3727,7 @@ mod tests {
         let never = SyncUnmapRequest {
             folder: "never".into(),
             read: None,
+            ..Default::default()
         };
         assert!(matches!(
             unmapped(state, &never).await,
@@ -3522,21 +3735,90 @@ mod tests {
         ));
 
         // The name's channel is another since the read: it is not let go.
-        let db = state.db.lock().unwrap();
-        let (read, found) = read_of(state, &db, "lab", &[]);
-        assert_eq!(found.asked, 1);
-        db.execute(
-            "UPDATE person_names SET channel = ?1 WHERE name = 'lab'",
-            [[8u8; 32].as_slice()],
-        )
-        .unwrap();
-        let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
-        assert!(
-            matches!(&refused, Err(ApiError::Conflict(why)) if *why == crate::let_go::took_something_says("lab")),
-            "{refused:?}"
-        );
-        drop(db);
+        {
+            let db = state.db.lock().unwrap();
+            let (read, found) = read_of(state, &db, "lab", &[]);
+            assert_eq!(found.asked, 1);
+            db.execute(
+                "UPDATE person_names SET channel = ?1 WHERE name = 'lab'",
+                [[8u8; 32].as_slice()],
+            )
+            .unwrap();
+            let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
+            assert!(
+                matches!(&refused, Err(ApiError::Conflict(why)) if *why == crate::let_go::took_something_says("lab")),
+                "{refused:?}"
+            );
+        }
         assert!(still_holds(&node, "lab"));
+
+        // ── The word lets go only of what was read (decision 2026-10-17
+        // §5.2, §1 property 9) ──
+        use cordelia_core::protocol::LET_GO_READ_STANDS_SECS;
+        let stands = std::time::Duration::from_secs(LET_GO_READ_STANDS_SECS);
+        let changed = crate::let_go::changed_says("lab");
+        fn refused_so<T>(refused: &Result<T, ApiError>, said: &str) -> bool {
+            matches!(refused, Err(ApiError::Conflict(why)) if why == said)
+        }
+        // No relay holds the entry. A read is made, and then the store
+        // takes an entry of the name: the word is refused.
+        let (node, _, secret) = holds_lab_by_a_carry();
+        let state = &node.state;
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[])]);
+        let asked = asked_the_word(&node, "lab").await;
+        assert_eq!(asked["versions"], 1);
+        {
+            let db = state.db.lock().unwrap();
+            let theirs = entry_by(&identity_of(1), &secret, 1, "b.md", text("b"), &[]);
+            crate::take::take(&db, &state.identity, &theirs, 1).unwrap();
+        }
+        let refused = unmapped(state, &the_word("lab", &asked, 1)).await;
+        assert!(refused_so(&refused, &changed), "{:?}", refused.err());
+        assert!(still_holds(&node, "lab"));
+        // A read older than LET_GO_READ_STANDS_SECS on the monotonic clock,
+        // whatever the wall clock says.
+        let asked = asked_the_word(&node, "lab").await;
+        let read = word_read(&asked);
+        {
+            let db = state.db.lock().unwrap();
+            let wall = chrono::Utc::now().timestamp();
+            let late = std::time::Instant::now() + stands;
+            let refused = discard_a_carried_name(state, &db, "lab", &read, 1, late, wall);
+            assert!(refused_so(&refused, &changed), "{refused:?}");
+        }
+        assert!(still_holds(&node, "lab"));
+
+        // A number that is not the one found; an ID the node does not
+        // know; a word that is not the word: each is refused.
+        let asked = asked_the_word(&node, "lab").await;
+        let read = word_read(&asked);
+        let refused = unmapped(state, &the_word("lab", &asked, 2)).await;
+        assert!(refused_so(&refused, &changed), "{:?}", refused.err());
+        let unknown = SyncUnmapRequest {
+            read: Some(hex::encode([9u8; 16])),
+            ..the_word("lab", &asked, 1)
+        };
+        let refused = unmapped(state, &unknown).await;
+        let again = crate::let_go::started_again_says("lab");
+        assert!(refused_so(&refused, &again), "{:?}", refused.err());
+        let yes = SyncUnmapRequest {
+            word: Some("yes".into()),
+            ..the_word("lab", &asked, 1)
+        };
+        let refused = unmapped(state, &yes).await;
+        assert!(matches!(refused, Err(ApiError::BadRequest(_))));
+        assert!(still_holds(&node, "lab"));
+        // In time on the monotonic clock, with the wall clock a day ahead:
+        // the name goes, with the version, and the read with it.
+        {
+            let db = state.db.lock().unwrap();
+            let in_time = std::time::Instant::now() + stands - std::time::Duration::from_secs(1);
+            let wall = chrono::Utc::now().timestamp() + 86_400;
+            let gone = discard_a_carried_name(state, &db, "lab", &read, 1, in_time, wall);
+            assert!(matches!(gone, Ok(Some(1))), "{gone:?}");
+        }
+        assert!(!still_holds(&node, "lab"));
+        assert!(!state.own_channels.reads().stands(&read));
     }
 
     /// **The read before a let-go does not hold the database's lock**
@@ -3595,6 +3877,7 @@ mod tests {
         let body = SyncUnmapRequest {
             folder: "/home/sam/notes".into(),
             read: None,
+            ..Default::default()
         };
         remove_mapping(&node.state.sync_control, &db, &body).unwrap();
         names_follow(&node.state, &db, &before);
@@ -3680,6 +3963,7 @@ mod tests {
         let body = SyncUnmapRequest {
             folder: "lab".into(),
             read: None,
+            ..Default::default()
         };
         remove_mapping(&node.state.sync_control, &db, &body).unwrap();
         names_follow(&node.state, &db, &before);
@@ -3691,18 +3975,154 @@ mod tests {
         );
     }
 
-    /// A device that has stopped reads no relay before it lets a carried
-    /// name go (decision 2026-10-17 §4.4 says what it asks first): the
-    /// name is let go at once, and the answer says nothing of a read.
+    /// `cordelia sync unmap <name>` at a terminal, as the command asks it
+    /// of the node: round after round, while the read goes on, until the
+    /// node answers with what the command asks the word by. Any other
+    /// answer fails the test.
+    async fn asked_the_word(node: &crate::several::Node, name: &str) -> serde_json::Value {
+        let mut read = None;
+        loop {
+            let body = SyncUnmapRequest {
+                folder: name.to_string(),
+                read: read.take(),
+                asks: true,
+                ..Default::default()
+            };
+            let answer = unmapped(&node.state, &body).await.unwrap();
+            if let Some(reading) = &answer.reading {
+                read = Some(reading["read"].as_str().unwrap().to_string());
+                continue;
+            }
+            let Some(asked) = answer.not_let_go else {
+                panic!("not asked: let go {:?}", answer.let_go);
+            };
+            return asked;
+        }
+    }
+
+    /// The ID of the read that the node asks the word by.
+    fn word_read(asked: &serde_json::Value) -> crate::own_read::ReadId {
+        let read = hex::decode(asked["read"].as_str().unwrap()).unwrap();
+        read.try_into().unwrap()
+    }
+
+    /// The word `discard`, as the command sends it after `asked`, with
+    /// `versions` as the number shown.
+    fn the_word(name: &str, asked: &serde_json::Value, versions: usize) -> SyncUnmapRequest {
+        SyncUnmapRequest {
+            folder: name.to_string(),
+            read: asked["read"].as_str().map(str::to_string),
+            word: Some("discard".into()),
+            versions: Some(versions),
+            ..Default::default()
+        }
+    }
+
+    /// **On a device that reads the relays, a carried name is let go with
+    /// an entry that no relay holds only on the word** (decision
+    /// 2026-10-17 §5.2, §1 property 5). With no terminal, the node refuses
+    /// with the lines of §4.6, and the name stays. At a terminal, it
+    /// answers in place of the refusal with those lines but the last, where
+    /// the version may still be (here, for as long as the device holds the
+    /// secret it left), the number found, and the ID the word is bound to:
+    /// the name stays until the word comes. With the word, it goes, and
+    /// the answer says how many versions went with it.
     #[actix_web::test]
-    async fn test_a_device_that_has_stopped_reads_no_relay_before_a_let_go() {
+    async fn test_a_carried_name_that_no_relay_holds_is_let_go_only_on_the_word() {
+        let (node, _, secret) = holds_lab_by_a_carry();
+        let state = &node.state;
+        {
+            let db = state.db.lock().unwrap();
+            let left = chrono::Utc::now().timestamp() - 3600;
+            cordelia_storage::person::keep_left_secret(&db, 9, &[9; 32], left).unwrap();
+        }
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[])]);
+        let refused = lets_go(&node, "lab").await;
+        let Err(ApiError::Conflict(why)) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.ends_with("run `cordelia sync unmap lab` at a terminal."),
+            "{why}"
+        );
+        assert!(still_holds(&node, "lab"));
+
+        let asked = asked_the_word(&node, "lab").await;
+        assert!(still_holds(&node, "lab"));
+        assert_eq!(asked["versions"], 1);
+        assert_eq!(
+            asked["said"],
+            "lab is not let go: no relay that this device is set up with held 1 of its versions \
+             when it was read just now.\n  relay-one: read to its end.\nThis device goes on \
+             sending it, and lab can be let go once a relay holds it."
+        );
+        let held_for = asked["where"].as_str().unwrap();
+        assert!(held_for.contains("for 90 more days at most"), "{held_for}");
+        assert_eq!(
+            *why,
+            format!(
+                "{} {}",
+                asked["said"].as_str().unwrap(),
+                crate::let_go::at_a_terminal_says("lab", 1)
+            )
+        );
+        // A let-go with no word, by the same read, is still refused.
+        let read = word_read(&asked);
+        let kept = state
+            .own_channels
+            .reads()
+            .get(&read, std::time::Instant::now());
+        let found = kept.and_then(|kept| kept.found).unwrap();
+        assert_eq!(found.not_held.len(), 1);
+        {
+            let db = state.db.lock().unwrap();
+            let refused = let_go_of_a_carried_name(state, &db, "lab", Some((&read, &found)));
+            assert!(matches!(refused, Err(ApiError::Conflict(_))), "{refused:?}");
+        }
+        let gone = unmapped(state, &the_word("lab", &asked, 1)).await.unwrap();
+        assert_eq!(gone.let_go.as_deref(), Some("lab"));
+        assert_eq!(gone.let_go_discarded, Some(1));
+        assert_eq!(gone.let_go_versions, None);
+        assert!(!still_holds(&node, "lab"));
+        // The word again: the name is no longer held.
+        let again = unmapped(state, &the_word("lab", &asked, 1)).await;
+        assert!(
+            matches!(again, Err(ApiError::BadRequest(_))),
+            "{:?}",
+            again.err()
+        );
+    }
+
+    /// **A device that has stopped lets a carried name go at once where
+    /// its own notes show nothing that it sent to no relay, and otherwise
+    /// only on the word** (decision 2026-10-17 §4.4, §1 property 8). It
+    /// reads no relay either way. Where its notes say that it sent the
+    /// version it wrote to no relay, the name is not let go: with no
+    /// terminal the node refuses, saying why the device stopped and what
+    /// its notes say, and how to let it go now; at a terminal it answers
+    /// with the count it took from its notes, under an ID. A `discard`
+    /// with another number is refused, and so is one with that ID once
+    /// it is older than LET_GO_READ_STANDS_SECS on the monotonic clock.
+    /// With the number, in time, the name goes, with the version.
+    #[actix_web::test]
+    async fn test_a_stopped_device_lets_go_at_once_where_its_notes_show_nothing_unsent() {
+        use cordelia_core::protocol::LET_GO_READ_STANDS_SECS;
+        use cordelia_storage::at_relays as kept_rows;
+        use cordelia_storage::person::{State, set_state};
         use std::sync::atomic::Ordering::SeqCst;
-        let (node, mine, secret) = holds_lab_by_a_carry();
-        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[mine])]);
+        let stands = std::time::Duration::from_secs(LET_GO_READ_STANDS_SECS);
+        // Its notes say that it sent what it wrote to a relay: the name goes
+        // at once, though no relay is read, and the relay holds none of it.
+        let (node, _, secret) = holds_lab_by_a_carry();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[])]);
         {
             let db = node.state.db.lock().unwrap();
-            cordelia_storage::person::set_state(&db, cordelia_storage::person::State::NotListed)
+            let lab = cordelia_storage::person::channel_of_name(&db, "lab")
+                .unwrap()
                 .unwrap();
+            let last = kept_rows::last_taken(&db, &lab).unwrap();
+            kept_rows::sent(&db, &ONE, &lab, last).unwrap();
+            set_state(&db, State::NotListed).unwrap();
         }
         let done = lets_go(&node, "lab").await;
         assert!(
@@ -3714,10 +4134,75 @@ mod tests {
         // A name that it does not hold by a carry is no name to let go.
         let never = SyncUnmapRequest {
             folder: "never".into(),
-            read: None,
+            ..Default::default()
         };
         let refused = unmapped(&node.state, &never).await;
         assert!(matches!(refused, Err(ApiError::BadRequest(_))));
+
+        // Its notes say that it sent what it wrote to no relay, though a
+        // relay holds it: the device cannot know, and does not ask.
+        let (node, mine, secret) = holds_lab_by_a_carry();
+        node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[mine])]);
+        {
+            let db = node.state.db.lock().unwrap();
+            set_state(&db, State::Removed).unwrap();
+        }
+        let refused = lets_go(&node, "lab").await;
+        let Err(ApiError::Conflict(why)) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(
+            *why,
+            "This device has stopped (it was removed), and sends nothing more. It cannot read the \
+             relays to learn whether they hold lab. Its own notes say that it sent 1 version of \
+             lab, which it wrote or carried, to no relay. To let it go now, with it, run \
+             `cordelia sync unmap lab` at a terminal."
+        );
+        assert!(still_holds(&node, "lab"));
+        let asked = asked_the_word(&node, "lab").await;
+        assert_eq!(asked["versions"], 1);
+        assert_eq!(
+            asked["said"],
+            crate::let_go::stopped_says("lab", State::Removed, 1)
+        );
+        assert_eq!(
+            asked["where"],
+            "Letting lab go now drops that version from this device: it is on this device alone."
+        );
+        assert_eq!(node.own_rounds.load(SeqCst), 0);
+        assert!(still_holds(&node, "lab"));
+        // Another number.
+        let changed = crate::let_go::changed_says("lab");
+        let refused = unmapped(&node.state, &the_word("lab", &asked, 2)).await;
+        assert!(
+            matches!(&refused, Err(ApiError::Conflict(why)) if *why == changed),
+            "{:?}",
+            refused.err()
+        );
+        // Too old, on the monotonic clock.
+        let read = word_read(&asked);
+        {
+            let db = node.state.db.lock().unwrap();
+            let late = std::time::Instant::now() + stands;
+            let wall = chrono::Utc::now().timestamp();
+            let refused = discard_a_carried_name(&node.state, &db, "lab", &read, 1, late, wall);
+            assert!(
+                matches!(&refused, Err(ApiError::Conflict(why)) if *why == changed),
+                "{refused:?}"
+            );
+        }
+        assert!(still_holds(&node, "lab"));
+        // Counted again, with the number and in time: the name goes.
+        let asked = asked_the_word(&node, "lab").await;
+        let gone = unmapped(&node.state, &the_word("lab", &asked, 1))
+            .await
+            .unwrap();
+        assert_eq!(gone.let_go.as_deref(), Some("lab"));
+        assert_eq!(gone.let_go_discarded, Some(1));
+        // The statement lists this device alone: device 1 was added since.
+        assert_eq!(gone.let_go_alone, Some(true));
+        assert!(!still_holds(&node, "lab"));
+        assert_eq!(node.own_rounds.load(SeqCst), 0);
     }
 
     /// What is said of each relay where a carried name is not let go
