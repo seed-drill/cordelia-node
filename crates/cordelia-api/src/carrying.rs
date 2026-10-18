@@ -41,7 +41,7 @@
 //! channel could not be read. What is carried waits in the store and is
 //! sent like anything the device writes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use actix_web::{HttpRequest, HttpResponse, web};
@@ -50,7 +50,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use cordelia_core::protocol::{
-    CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS, OUTBOX_FLUSH_INTERVAL_SECS,
+    CARRY_PART_MAX_BYTES, CARRY_READ_MAX_SECS, OUTBOX_FLUSH_INTERVAL_SECS, entry_cost,
 };
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -286,12 +286,17 @@ pub(crate) async fn fetched_whole(state: &AppState, deadline: Instant) -> bool {
 /// **With how many entries of the channel the relay handed** (decision
 /// 2026-10-04 §16): a read that is said to be in `part` ended before the
 /// channel's end, and may have ended before any entry of it was handed.
-/// Whoever goes on with what was read in part asks how many.
+/// Whoever goes on with what was read in part asks how many. **And with
+/// how many bytes they come to, as a relay counts them against a
+/// channel's cap** (decision 2026-10-17 §3.3): each entry's content and
+/// ENTRY_OVERHEAD_BYTES, so that a recovery that reads on says how far
+/// it has read.
 pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
-    let mut entries = Vec::new();
+    let mut entries: Vec<CheckedEntry> = Vec::new();
     let mut said = Vec::new();
     for at in read {
         let mut of_the_channel = 0;
+        let mut bytes = 0u64;
         let how = match &at.read {
             LeftRead::NotReached => "not reached".to_string(),
             LeftRead::NotHeld => "not held".to_string(),
@@ -309,13 +314,20 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
                 let before = entries.len();
                 entries.extend(checked);
                 of_the_channel = entries.len() - before;
+                let costs = entries[before..].iter();
+                bytes = costs.map(|entry| entry_cost(entry.content.len())).sum();
                 match whole {
                     true => "whole".to_string(),
                     false => "part".to_string(),
                 }
             }
         };
-        said.push(json!({ "relay": at.relay, "read": how, "entries": of_the_channel }));
+        said.push(json!({
+            "relay": at.relay,
+            "read": how,
+            "entries": of_the_channel,
+            "bytes": bytes,
+        }));
     }
     (entries, said)
 }
@@ -1299,12 +1311,15 @@ pub async fn read_with_proofs(
     let at = read_at_relays_from(state, channel, by, &from, until).await;
     let (_, said) = handed(&at);
     let reached = places_reached(&at);
-    // Each entry once, as it came: the command checks each itself.
+    // Each entry once, as it came: the command checks each itself. A
+    // channel read on may be handed in thousands of entries, so what was
+    // handed already is looked up, not searched for.
     let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for relay in at {
         if let LeftRead::Read { entries: wire, .. } = relay.read {
             for bytes in wire {
-                if !entries.contains(&bytes) {
+                if seen.insert(bytes.clone()) {
                     entries.push(bytes);
                 }
             }
@@ -1520,6 +1535,7 @@ pub async fn handed_take(
 mod tests {
     use super::*;
 
+    use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
     use std::collections::BTreeSet;
 
     use cordelia_crypto::entry::Value;
@@ -1528,6 +1544,13 @@ mod tests {
     use crate::several::{Machine, Node, OTHER_WORDS, SESSION, Several, entry_by};
 
     const LAB: &str = "lab";
+
+    /// What `n` entries of the smallest size come to, as a relay counts
+    /// them against a channel's cap: what is said a relay handed of a
+    /// channel of short files.
+    fn smallest(n: u64) -> u64 {
+        n * (MIN_ENTRY_CONTENT_BYTES + ENTRY_OVERHEAD_BYTES) as u64
+    }
 
     /// Devices 0 and 2 sync a name, and device 2 writes there what only
     /// the relay is sent: over a file that device 0 holds, a file of its
@@ -1565,7 +1588,10 @@ mod tests {
     /// that relay handed (decision 2026-10-04 §16). A read in part can
     /// have ended before any entry was handed: the word alone does not
     /// tell which. What does not pass the check is no entry, and is not
-    /// counted; and a relay that was not read handed none.
+    /// counted; and a relay that was not read handed none. **It says how
+    /// many bytes they come to, as a relay counts them against a
+    /// channel's cap** (decision 2026-10-17 §3.3): each entry's content
+    /// and ENTRY_OVERHEAD_BYTES.
     #[test]
     fn test_what_is_said_of_a_relay_says_how_many_entries_it_handed() {
         let mut s = Several::of_one_person(2);
@@ -1602,24 +1628,34 @@ mod tests {
         ];
         let (entries, said) = handed(&read);
         assert_eq!(entries.len(), 4);
-        let said: Vec<(&str, &str, u64)> = said
+        let said: Vec<(&str, &str, u64, u64)> = said
             .iter()
             .map(|of| {
                 let text = |field: &str| of[field].as_str().unwrap();
-                (text("relay"), text("read"), of["entries"].as_u64().unwrap())
+                let number = |field: &str| of[field].as_u64().unwrap();
+                (
+                    text("relay"),
+                    text("read"),
+                    number("entries"),
+                    number("bytes"),
+                )
             })
             .collect();
+        // Each entry of the two is a content of the smallest size.
+        let two = 2 * (MIN_ENTRY_CONTENT_BYTES as u64 + ENTRY_OVERHEAD_BYTES as u64);
+        let sizes: Vec<usize> = entries.iter().map(|entry| entry.content.len()).collect();
+        assert_eq!(sizes, [MIN_ENTRY_CONTENT_BYTES; 4]);
         assert_eq!(
             said,
             [
-                ("one", "whole", 2),
-                ("two", "part", 2),
-                ("three", "part", 0),
-                ("four", "whole", 0),
-                ("five", "not held", 0),
-                ("six", "not reached", 0),
-                ("seven", "not read: why", 0),
-                ("eight", CONNECTION_CHANGED, 0),
+                ("one", "whole", 2, two),
+                ("two", "part", 2, two),
+                ("three", "part", 0, 0),
+                ("four", "whole", 0, 0),
+                ("five", "not held", 0, 0),
+                ("six", "not reached", 0, 0),
+                ("seven", "not read: why", 0, 0),
+                ("eight", CONNECTION_CHANGED, 0, 0),
             ]
         );
     }
@@ -1667,7 +1703,7 @@ mod tests {
             said["generations"],
             json!([{
                 "number": 1,
-                "relays": [{ "relay": "relay", "read": "whole", "entries": 2 }],
+                "relays": [{ "relay": "relay", "read": "whole", "entries": 2, "bytes": smallest(2) }],
                 "by_other_keys": 1,
             }])
         );
@@ -1687,7 +1723,7 @@ mod tests {
         assert!(!part.read_all);
         assert_eq!(
             part.says(LAB)["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "part", "entries": 2 }])
+            json!([{ "relay": "relay", "read": "part", "entries": 2, "bytes": smallest(2) }])
         );
     }
 
@@ -2259,7 +2295,7 @@ mod tests {
         let said = done.says(LAB);
         assert_eq!(
             said["generations"][0]["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1, "bytes": smallest(1) }])
         );
 
         // With proofs that a command made: the connection is made again,
@@ -2278,7 +2314,8 @@ mod tests {
         let read = read_with_proofs(&node.state, channel, made_over(before), HashMap::new()).await;
         assert_eq!(*node.did.lock().unwrap(), ["no room", "remake"]);
         assert_eq!(read["entries"], 0, "{read}");
-        let changed = json!([{ "relay": "relay", "read": CONNECTION_CHANGED, "entries": 0 }]);
+        let changed =
+            json!([{ "relay": "relay", "read": CONNECTION_CHANGED, "entries": 0, "bytes": 0 }]);
         assert_eq!(CONNECTION_CHANGED, "not read: the connection changed");
         assert_eq!(read["relays"], changed);
         let now = crate::several::session_after(3);
@@ -2301,7 +2338,7 @@ mod tests {
         assert_eq!(read["entries"], 1, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 1 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 1, "bytes": smallest(1) }])
         );
 
         // The read goes on only once the connection is another: while
@@ -2331,6 +2368,7 @@ mod tests {
                 "relay": "relay",
                 "read": "not read: the connection has no room left for a proof",
                 "entries": 0,
+                "bytes": 0,
             })]
         );
     }
@@ -2392,7 +2430,7 @@ mod tests {
         let said = |read: &serde_json::Value, how: &str, place: u64| {
             assert_eq!(
                 read["relays"],
-                json!([{ "relay": "relay", "read": how, "entries": 1 }])
+                json!([{ "relay": "relay", "read": how, "entries": 1, "bytes": smallest(1) }])
             );
             assert_eq!(
                 read["reached"],
@@ -2474,6 +2512,36 @@ mod tests {
             },
         };
         assert_eq!(at[0].read, expected);
+    }
+
+    /// **A read with proofs hands each entry once** (decision 2026-10-04
+    /// §16), however many times the relays handed it: the command checks
+    /// each, and a channel read on is handed in thousands.
+    #[actix_web::test]
+    async fn test_a_read_with_proofs_hands_each_entry_once() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[1], LAB);
+        let old = s[1].own(LAB);
+        s.write(1, LAB, "a.md", "of device 1");
+        s.write(1, LAB, "b.md", "of device 1");
+        let held = s[1].stored_in(&old);
+        s.change(0, &[0, 1], &[2]);
+        let node = Node::of(s.machines.remove(0));
+        let twice: Vec<CheckedEntry> = held.iter().chain(&held).cloned().collect();
+        node.relay_holds(&old, &twice);
+        let own = node.state.identity.public_key();
+        let made = vec![ProofMade {
+            relay: "relay".into(),
+            session: SESSION,
+            proof: cordelia_crypto::proof::make(&old, &SESSION, &own).unwrap(),
+        }];
+        let channel = derive::channel_id(&old).unwrap();
+        let read = read_with_proofs(&node.state, channel, made, HashMap::new()).await;
+        assert_eq!(read["entries"], 2, "{read}");
+        let id = read["read"].as_u64().unwrap();
+        let (shelved, _) = node.state.own_channels.shelved(id, 0, usize::MAX).unwrap();
+        let wire: Vec<Vec<u8>> = held.iter().map(|entry| entry.to_wire()).collect();
+        assert_eq!(shelved, wire);
     }
 
     /// The new channel was fetched whole where a whole pass that began
@@ -2586,7 +2654,7 @@ mod tests {
         assert_eq!(read["entries"], 3, "{read}");
         assert_eq!(
             read["relays"],
-            json!([{ "relay": "relay", "read": "whole", "entries": 3 }])
+            json!([{ "relay": "relay", "read": "whole", "entries": 3, "bytes": smallest(3) }])
         );
         assert_eq!(*node.asked.lock().unwrap(), [(channel, false)]);
         // A part at a time, and nothing is kept of it after the last.

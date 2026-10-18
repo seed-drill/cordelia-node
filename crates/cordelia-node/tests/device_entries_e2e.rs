@@ -33,7 +33,7 @@ use cordelia_api::state::{
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_REFUSED_RETRY_MAX_SECS,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
     OWN_ENTRY_REQUESTS_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE, SHOW_ANSWER_ROOM_BYTES,
     SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
@@ -665,6 +665,8 @@ enum Say {
     NotNow,
     /// It answers nothing, and keeps the stream open.
     Nothing,
+    /// It answers a proof as it would, once the test says so.
+    AnswerWhen(Arc<tokio::sync::Notify>),
 }
 
 /// What a test has a stand-in do as each request arrives, before it is
@@ -674,7 +676,8 @@ enum Say {
 /// stream, or keeps it open. For a proof, `Some(Say::Nothing)` has it
 /// answer nothing, and keep the stream open, and `Some(Say::Answer(_))`
 /// has it answer with that answer of a show, which is no answer to a
-/// proof, and `Some(Say::NotNow)` has it refuse the proof for now. For a
+/// proof, `Some(Say::NotNow)` has it refuse the proof for now, and
+/// `Some(Say::AnswerWhen(_))` has it answer only once told to. For a
 /// pull, `Some(Say::NotNow)` has it refuse the pull for now, and
 /// `Some(Say::Reset)` has it reset the stream.
 type Hook = Box<dyn FnMut(&WireMessage) -> Option<Say> + Send>;
@@ -784,6 +787,7 @@ impl StandIn {
         // answered and the stream is kept open. A reset for now is with
         // the code a relay resets with for its allowance.
         let mut not_now = false;
+        let mut when: Option<Arc<tokio::sync::Notify>> = None;
         let does = {
             let mut script = script.lock().unwrap();
             let hooked = script.hook.as_mut().and_then(|hook| hook(&request));
@@ -800,7 +804,7 @@ impl StandIn {
                             not_now = true;
                             Ok(None)
                         }
-                        Say::Nothing => Err(()),
+                        Say::Nothing | Say::AnswerWhen(_) => Err(()),
                     }
                 }
                 WireMessage::ChannelProve(_) if matches!(hooked, Some(Say::Nothing)) => Err(()),
@@ -816,6 +820,9 @@ impl StandIn {
                     Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
                 }
                 WireMessage::ChannelProve(_) => {
+                    if let Some(Say::AnswerWhen(told)) = hooked {
+                        when = Some(told);
+                    }
                     Ok(Some(WireMessage::ChannelProved(ChannelProved {
                         proved: script.proves,
                     })))
@@ -861,6 +868,11 @@ impl StandIn {
                 false => does,
             }
         };
+        // Waited for with the script let go: other streams are answered
+        // meanwhile.
+        if let Some(when) = when {
+            when.notified().await;
+        }
         match does {
             Ok(Some(answer)) => {
                 let _ = codec::write_frame(&mut send, &answer).await;
@@ -3519,6 +3531,72 @@ async fn a_device_takes_from_one_relay_only_so_much_in_a_minute() {
     assert_eq!(device.has_leave("relay"), Ok(()));
 }
 
+/// **A device takes from one relay in a minute no more than the relay
+/// hands: what a relay may hand a connection, less the room it keeps for
+/// the answer to a show** (decision 2026-10-17 §3.1, §3.2). A relay that
+/// hands one entry of the largest size in a page is pulled from until
+/// what is left of the minute, beside that room, holds no other: so many
+/// pages as the relay would hand, and not one that it would refuse. A
+/// read of a channel of a generation that was left waits there, and goes
+/// on in the next minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_takes_from_a_relay_no_page_from_the_room_kept_for_a_show() {
+    use cordelia_core::protocol::{
+        MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, PUSH_BYTES_PER_PEER_PER_MINUTE,
+        SHOW_ANSWER_ROOM_BYTES,
+    };
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let notes = device.channel("notes");
+    let secret = device.name_secret("notes");
+    let author = NodeIdentity::from_seed(*device.state.identity.seed()).unwrap();
+    let largest = move |n: u64| -> Vec<u8> {
+        let name = format!("{n}.md");
+        let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - name.len());
+        let entry = sealed(&author, &secret, 1, &name, Value::Text(text));
+        assert_eq!(entry.content.len(), MAX_ITEM_BYTES);
+        entry.to_wire()
+    };
+    relay.pulls(move |pull| {
+        if pull.channel != notes {
+            return EntryPulled {
+                entries: Vec::new(),
+                next: pull.after,
+                mark: pull.mark,
+            };
+        }
+        let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+        EntryPulled {
+            entries: vec![largest(after).into()],
+            next: after + 1,
+            mark: [5; 8],
+        }
+    });
+    device.connects_to("relay", relay.port, relay.key).await;
+    let pulls_of_notes = |relay: &StandIn| {
+        let of_notes = |one: &WireMessage| matches!(one, WireMessage::EntryPull(pull) if pull.channel == notes);
+        relay.requests().iter().filter(|one| of_notes(one)).count() as u64
+    };
+    // As many as a relay hands in a minute: 30 of the largest.
+    let hands =
+        (PUSH_BYTES_PER_PEER_PER_MINUTE - SHOW_ANSWER_ROOM_BYTES) / entry_cost(MAX_ITEM_BYTES);
+    assert_eq!(hands, 30);
+    // A pass pulls so many pages of a channel: pass after pass, until a
+    // pass pulls nothing.
+    let mut pulled = 0;
+    loop {
+        device.passes().await;
+        match pulls_of_notes(&relay) {
+            0 => break,
+            more => pulled += more,
+        }
+    }
+    assert_eq!(pulled, hands);
+    assert_eq!(device.counts("relay").pulled, hands);
+}
+
 /// An entry that is sealed by `author` in the channel whose secret is
 /// `secret`: for what a test writes with a key that is no device's here.
 fn sealed(author: &NodeIdentity, secret: &[u8; 32], rev: u64, name: &str, value: Value) -> Entry {
@@ -5286,6 +5364,250 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
     assert_eq!(pulls(&relay), [(mark, 3)]);
 }
 
+/// **A read of a left channel waits out a pull that the relay refuses
+/// for now, and goes on to the channel's end** (decision 2026-10-17
+/// §3.2), against a stand-in that hands a page of one entry. The relay
+/// refuses one pull for now, as a relay does where what it handed the
+/// connection in a minute, with the answers to shows, leaves no room for
+/// the page: the connection is still open, and that is no end of what it
+/// will hand. The read waits, asks for the same page again, and hands
+/// the channel to its end, with nothing handed twice and the proof sent
+/// once, whether the pull refused was the first after the proof or a
+/// later one. A pull reset for another reason ends the read there, in
+/// part.
+///
+/// **Each refusal for now at the carry door is counted for the relay,
+/// over BAN_WINDOW_SECS, with every other** ([`Leave::refused_for_now`]):
+/// the read asks again only while the relay is below its count. A second
+/// refusal within the window, a page between or not, puts the relay at
+/// its count: the read ends there in part, and **a read of the relay
+/// after that, as a recovery's next round is, asks it nothing,** and
+/// says that it was not read. Once the window has gone by it is read
+/// again. A proof refused for now is counted too, ends the read with
+/// nothing read, and is said as a proof's.
+///
+/// **It asks again only within a minute of the last page the relay
+/// handed,** as a read of the device's own channel does: a refusal that
+/// comes later than that ends the read there in part, and one that comes
+/// within a minute of a page asks again, however long ago the read began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
+    let relay = StandIn::started().await;
+    let mut a = Device::new("laptop");
+    a.makes_the_phrase(&phrase());
+    a.holds("lab");
+    let (old_secret, old) = (a.name_secret("lab"), a.channel("lab"));
+    let held: Vec<Vec<u8>> = ["a.md", "b.md", "c.md"]
+        .iter()
+        .map(|file| {
+            let text = Value::Text(format!("{file} of the old"));
+            sealed(&a.state.identity, &old_secret, 1, file, text).to_wire()
+        })
+        .collect();
+    let id = |bytes: &Vec<u8>| Entry::from_wire(bytes).unwrap().id();
+    let ids = |of: &[Vec<u8>]| of.iter().map(id).collect::<BTreeSet<_>>();
+    a.changes(&phrase(), &[&a], &[]);
+    a.connects_to("relay", relay.port, relay.key).await;
+    relay.holds_what_is_proved(true);
+    let mark = [7u8; 8];
+    let hands = held.clone();
+    relay.pulls(move |pull| {
+        let after = if pull.mark == mark { pull.after } else { 0 };
+        let page: Vec<Vec<u8>> = hands.iter().skip(after as usize).take(1).cloned().collect();
+        EntryPulled {
+            next: after + page.len() as u64,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let by_secret = || ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let soon = || std::time::Instant::now() + Duration::from_secs(30);
+    let asked = |relay: &StandIn| -> (usize, Vec<u64>) {
+        let requests = relay.requests();
+        let proofs = requests
+            .iter()
+            .filter(|one| matches!(one, WireMessage::ChannelProve(_)))
+            .count();
+        let pulls = requests
+            .iter()
+            .filter_map(|one| match one {
+                WireMessage::EntryPull(pull) => Some(pull.after),
+                _ => None,
+            })
+            .collect();
+        (proofs, pulls)
+    };
+    relay.requests();
+
+    let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
+    let window = || BAN_WINDOW + Duration::from_secs(1);
+
+    // A pull refused for now: the first, just after the proof, and then
+    // a later one. And a pull reset for another reason, which is not
+    // counted. Each case begins with the window gone by.
+    for (reset, at) in [(Say::NotNow, 0), (Say::NotNow, 1), (Say::Reset, 1)] {
+        a.clock.run_ahead(window());
+        let pulls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&pulls);
+        let how = reset.clone();
+        relay.hook(move |request| match request {
+            WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == at => {
+                Some(how.clone())
+            }
+            _ => None,
+        });
+        let began = std::time::Instant::now();
+        let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+        let LeftRead::Read {
+            entries,
+            whole,
+            reached,
+        } = &read[0].read
+        else {
+            panic!("{read:?}");
+        };
+        match reset {
+            Say::NotNow => {
+                assert!(*whole, "{read:?}");
+                assert_eq!(entries.len(), 3);
+                assert_eq!(ids(entries), ids(&held));
+                assert_eq!(*reached, LeftPlace { mark, next: 3 });
+                // The same page asked again, and the proof sent once.
+                let mut pulled = vec![0, 1, 2, 3];
+                pulled.insert(at as usize, at);
+                assert_eq!(asked(&relay), (1, pulled), "{at}");
+                // It waited before it asked again, and the refusal was
+                // counted.
+                assert!(began.elapsed() >= Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS));
+                assert_eq!(refused(&a), 1);
+            }
+            _ => {
+                assert!(!*whole, "{read:?}");
+                assert_eq!(ids(entries), ids(&held[..1]));
+                assert_eq!(*reached, LeftPlace { mark, next: 1 });
+                assert_eq!(asked(&relay), (1, vec![0, 1]));
+                assert_eq!(refused(&a), 0);
+            }
+        }
+    }
+
+    // Refused for now twice within the window, with a page between: the
+    // relay is at its count at the second, and the read ends there in
+    // part, with no wait.
+    a.clock.run_ahead(window());
+    let pulls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&pulls);
+    let second: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+    let at_the_second = Arc::clone(&second);
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(_) => {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            if n == 3 {
+                *at_the_second.lock().unwrap() = Some(std::time::Instant::now());
+            }
+            [1, 3].contains(&n).then_some(Say::NotNow)
+        }
+        _ => None,
+    });
+    let began = std::time::Instant::now();
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    let LeftRead::Read {
+        entries,
+        whole,
+        reached,
+    } = &read[0].read
+    else {
+        panic!("{read:?}");
+    };
+    // It waited out the first refusal, and not the second: at the count
+    // it ends at once, well within the wait it would have made.
+    let wait = Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS);
+    assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
+    let since = second
+        .lock()
+        .unwrap()
+        .expect("the second refusal")
+        .elapsed();
+    assert!(since < wait, "{since:?}");
+    assert!(!*whole, "{read:?}");
+    assert_eq!(ids(entries), ids(&held[..2]));
+    assert_eq!(*reached, LeftPlace { mark, next: 2 });
+    assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2]));
+    assert_eq!(refused(&a), 2);
+
+    // At its count, the relay is asked nothing by the next read, from
+    // where the last ended: it was not read. Once the window has gone by,
+    // the read goes on there to the channel's end.
+    relay.hook(|_| None);
+    let on = HashMap::from([("relay".to_string(), *reached)]);
+    let read = reads_left_from(&a, old, by_secret(), None, on.clone(), soon()).await;
+    let at_its_count = "the relay has refused as many requests for now as this device gives it, \
+                        and is asked nothing more for a while";
+    assert_eq!(read[0].read, LeftRead::NotRead(at_its_count.into()));
+    assert_eq!(asked(&relay), (0, vec![]));
+    a.clock.run_ahead(window());
+    let read = reads_left_from(&a, old, by_secret(), None, on, soon()).await;
+    assert_eq!(handed_ids(&read[0].read), Some((ids(&held[2..]), true)));
+
+    // A page more than a minute after the read began, and a refusal just
+    // after it: the minute is the page's, and the read asks again and
+    // goes on to the channel's end.
+    a.clock.run_ahead(window());
+    relay.requests();
+    let clock = a.clock.clone();
+    let pulls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&pulls);
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(_) => match counted.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                clock.run_ahead(Duration::from_secs(61));
+                None
+            }
+            1 => Some(Say::NotNow),
+            _ => None,
+        },
+        _ => None,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    assert_eq!(handed_ids(&read[0].read), Some((ids(&held), true)));
+    assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2, 3]));
+
+    // A refusal that comes more than a minute after the last page: the
+    // read ends there in part, and does not ask again.
+    a.clock.run_ahead(window());
+    relay.requests();
+    let clock = a.clock.clone();
+    let pulls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&pulls);
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(_) if counted.fetch_add(1, Ordering::SeqCst) == 1 => {
+            clock.run_ahead(Duration::from_secs(61));
+            Some(Say::NotNow)
+        }
+        _ => None,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    let LeftRead::Read { entries, whole, .. } = &read[0].read else {
+        panic!("{read:?}");
+    };
+    assert!(!*whole, "{read:?}");
+    assert_eq!(ids(entries), ids(&held[..1]));
+    assert_eq!(asked(&relay), (1, vec![0, 1]));
+    assert_eq!(refused(&a), 1);
+
+    // A proof refused for now is said as a proof's: nothing was read,
+    // and it is counted.
+    a.clock.run_ahead(window());
+    relay.requests();
+    relay.hook(|request| matches!(request, WireMessage::ChannelProve(_)).then_some(Say::NotNow));
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+    let said = "the proof was refused for now: the relay takes no more from this connection in \
+                this minute";
+    assert_eq!(read[0].read, LeftRead::NotRead(said.into()));
+    assert_eq!(asked(&relay), (1, vec![]));
+    assert_eq!(refused(&a), 1);
+}
+
 /// **A read of a generation that was left counts each proof it sends,
 /// and keeps places back for the device's own channels** (decision
 /// 2026-10-04 §16), against a stand-in that sees every request. A relay
@@ -6318,10 +6640,12 @@ async fn a_request_refused_for_now_counts_wherever_it_was_made() {
     let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
     let window = || BAN_WINDOW + Duration::from_secs(1);
 
-    // A pull through the door for a carry.
+    // A pull through the door for a carry: the first, which the read
+    // waits out and asks again.
+    let first = Arc::new(AtomicBool::new(true));
     relay.hook(move |request| {
         let of_old = matches!(request, WireMessage::EntryPull(pull) if pull.channel == old);
-        of_old.then_some(Say::NotNow)
+        (of_old && first.swap(false, Ordering::SeqCst)).then_some(Say::NotNow)
     });
     let by = ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
     reads_left(&device, old, by).await;
@@ -6364,6 +6688,61 @@ async fn a_request_refused_for_now_counts_wherever_it_was_made() {
         ReadAt::NotReached
     );
     assert!(pulled_from(&relay.requests(), &notes).is_empty());
+}
+
+/// **The door for a carry holds its pull to the relay's count of
+/// refusals for now as the pull goes out** (decision 2026-10-17 §3.2), as
+/// each request of a read is held: a refusal at another door may come
+/// while the proof is answered. The relay answers a read's proof only
+/// once two pulls of passes have been refused for now: the relay is then
+/// at its count, and the read sends no pull, and says that the relay was
+/// not read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_through_the_carry_door_holds_its_pull_to_the_count_after_its_proof() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.holds("lab");
+    let (old_secret, old) = (device.name_secret("lab"), device.channel("lab"));
+    device.changes(&phrase(), &[&device], &[]);
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    let refused = |device: &Device| device.engine.refused_for_now(&relay.key);
+
+    let go = Arc::new(tokio::sync::Notify::new());
+    let told = Arc::clone(&go);
+    relay.hook(move |request| match request {
+        WireMessage::ChannelProve(prove) if prove.channel == old => {
+            Some(Say::AnswerWhen(Arc::clone(&told)))
+        }
+        WireMessage::EntryPull(pull) if pull.channel == notes => Some(Say::NotNow),
+        _ => None,
+    });
+    relay.requests();
+    let by = ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let passes = async {
+        for n in [1, 2] {
+            device
+                .clock
+                .run_ahead(Duration::from_secs(SHOW_LEAVE_SECS + 1));
+            device.passes().await;
+            assert_eq!(refused(&device), n);
+        }
+        go.notify_one();
+    };
+    let (read, ()) = tokio::join!(reads_left(&device, old, by), passes);
+    let at_its_count = "the relay has refused as many requests for now as this device gives it, \
+                        and is asked nothing more for a while";
+    assert_eq!(read[0].read, LeftRead::NotRead(at_its_count.into()));
+    let requests = relay.requests();
+    let proved = requests
+        .iter()
+        .filter(|one| matches!(one, WireMessage::ChannelProve(prove) if prove.channel == old));
+    assert_eq!(proved.count(), 1);
+    assert!(pulled_from(&requests, &old).is_empty(), "{requests:?}");
 }
 
 /// The window in which a relay counts breaches, and a device what a
