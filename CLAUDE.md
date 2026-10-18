@@ -210,6 +210,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8 (within their hour at one time), 2 | parameter-rationale.md §12.6 |
 | `HAND_OVER_CHANGE_ENTRY_BYTES`, `MAX_HAND_OVER_BYTES` | 32,960, 54,275 (derived) | parameter-rationale.md §12.6 |
 | `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
+| `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
 | `PROTOCOL_ENTRY_SHOW`, `PROTOCOL_CHANNEL_PROVE`, `PROTOCOL_ENTRY_PULL`, `PROTOCOL_ENTRY_PUSH`, `PROTOCOL_RELAY_ENTRIES` | 0x10, 0x11, 0x12, 0x13, 0x14 | network-protocol.md §4.9 |

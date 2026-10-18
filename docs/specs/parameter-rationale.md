@@ -1245,11 +1245,30 @@ the bound is kept as not counted, and a statement makes room.
 
 **Rationale:** A device that counts can sign any number of records, and
 every reader loads what it keeps each time it asks who counts. Over this
-bound the oldest record that is not counted goes when a new one is kept. A
+bound records go from the end of the order of keeping, which goes by who
+signed them and not by when they were seen (decision 2026-10-17 §2.2). A
 record that counts is never dropped for room.
 
 **Why 256:** chosen with the other bounds of 256 here; no measurement
 behind it yet.
+
+#### KEPT_OUT_PER_ADDER = 3
+
+**Derivation:** the lesser of
+`(MAX_NOT_COUNTED_RECORDS - (MAX_COUNTED_DEVICES - 1)) / MAX_COUNTED_DEVICES`
+(193 / 64 = 3) and
+`(RECOVERY_MAX_DEVICES_SHOWN - MAX_COUNTED_DEVICES) / MAX_COUNTED_DEVICES`
+(192 / 64 = 3), checked at compile time to be at least 1.
+
+**Rationale:** How many keys that the 64 kept out each adder that may add
+keeps among the records a reader keeps, and among the rows a recovery
+shows, whatever another key signs, of the records the relays hold
+(decision 2026-10-17 §2.2). It is what is left of each bound once the
+records that let a key add, or the rows of the devices that count, have
+their places, shared among the 64 adders there can be. It is not chosen:
+it follows from the three bounds it is made of. A person who adds more
+than three devices from one device while 64 count is told what could not
+be shown.
 
 #### LEFT_SECRET_KEPT_DAYS = 90
 

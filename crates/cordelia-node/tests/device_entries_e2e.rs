@@ -13,7 +13,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -27,7 +27,8 @@ use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::sender::{self, At, NotSent, Request, Sent};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftRead, OwnAsk, ProofMade, ProvedBy,
+    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, OwnAsk,
+    ProofMade, ProvedBy,
 };
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
@@ -4675,12 +4676,26 @@ async fn reads_left_at(
     by: ProvedBy,
     only: Option<Vec<String>>,
 ) -> Vec<LeftAt> {
-    let (answer, answered) = tokio::sync::oneshot::channel();
     let until = std::time::Instant::now() + Duration::from_secs(30);
+    reads_left_from(device, channel, by, only, HashMap::new(), until).await
+}
+
+/// [`reads_left_at`], read on at each relay named in `from` from the
+/// place given for it, until `until`.
+async fn reads_left_from(
+    device: &Device,
+    channel: [u8; 32],
+    by: ProvedBy,
+    only: Option<Vec<String>>,
+    from: HashMap<String, LeftPlace>,
+    until: std::time::Instant,
+) -> Vec<LeftAt> {
+    let (answer, answered) = tokio::sync::oneshot::channel();
     let ask = DoorAsk::Read {
         channel,
         by,
         only,
+        from,
         until,
         answer,
     };
@@ -4692,7 +4707,7 @@ async fn reads_left_at(
 /// is named by; `None` where it handed none of the channel.
 fn handed_ids(read: &LeftRead) -> Option<(BTreeSet<[u8; 32]>, bool)> {
     match read {
-        LeftRead::Read { entries, whole } => {
+        LeftRead::Read { entries, whole, .. } => {
             let ids = entries
                 .iter()
                 .map(|bytes| Entry::from_wire(bytes).unwrap().id())
@@ -5048,6 +5063,216 @@ async fn the_door_for_a_carry_proves_and_pulls_and_does_nothing_else() {
     }
     assert!(asked_enough);
     assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
+}
+
+/// **A read of a left channel goes on from a place, and says the place
+/// it reached** (decision 2026-10-17 §3.2), against a stand-in that hands
+/// a page of one entry. Asked from a place under the mark of the relay's
+/// holding, the read pulls from that place, hands what follows it, and
+/// says the place where the channel ended. **Asked under a mark that the
+/// relay no longer has, it reads from the start:** the relay reads a
+/// place of another holding as none, and the place reached is under the
+/// mark it has now. Where the read stops before the channel's end (a
+/// page of which nothing is an entry of the channel, a page that is no
+/// answer, or the time gone by), the place reached is the one it would
+/// ask from next: a read asked from it goes on, and hands nothing twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_a_left_channel_goes_on_from_a_place() {
+    let relay = StandIn::started().await;
+    let mut a = Device::new("laptop");
+    a.makes_the_phrase(&phrase());
+    a.holds("lab");
+    let (old_secret, old) = (a.name_secret("lab"), a.channel("lab"));
+    let held: Vec<Vec<u8>> = ["a.md", "b.md", "c.md", "d.md"]
+        .iter()
+        .map(|file| {
+            let text = Value::Text(format!("{file} of the old"));
+            sealed(&a.state.identity, &old_secret, 1, file, text).to_wire()
+        })
+        .collect();
+    let id = |bytes: &Vec<u8>| Entry::from_wire(bytes).unwrap().id();
+    let ids = |of: &[Vec<u8>]| of.iter().map(id).collect::<BTreeSet<_>>();
+    a.changes(&phrase(), &[&a], &[]);
+    a.connects_to("relay", relay.port, relay.key).await;
+    relay.holds_what_is_proved(true);
+
+    // The relay holds the channel under its mark, an entry at each
+    // place from 1, and hands one in a page. A place under another mark
+    // is no place in this holding: it is read from the start.
+    let mark = [7u8; 8];
+    let hands = held.clone();
+    relay.pulls(move |pull| {
+        let after = if pull.mark == mark { pull.after } else { 0 };
+        let page: Vec<Vec<u8>> = hands.iter().skip(after as usize).take(1).cloned().collect();
+        EntryPulled {
+            next: after + page.len() as u64,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let by_secret = || ProvedBy::Secret(zeroize::Zeroizing::new(old_secret));
+    let place = |mark: [u8; 8], next: u64| LeftPlace { mark, next };
+    let from = |at: LeftPlace| HashMap::from([("relay".to_string(), at)]);
+    let soon = || std::time::Instant::now() + Duration::from_secs(30);
+    let pulls = |relay: &StandIn| -> Vec<([u8; 8], u64)> {
+        let asked = relay.requests();
+        asked
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPull(pull) => Some((pull.mark, pull.after)),
+                _ => None,
+            })
+            .collect()
+    };
+    relay.requests();
+
+    // From a place: what follows it, to the channel's end, and the place
+    // where it ended.
+    let read = reads_left_from(&a, old, by_secret(), None, from(place(mark, 2)), soon()).await;
+    let LeftRead::Read {
+        entries,
+        whole,
+        reached,
+    } = &read[0].read
+    else {
+        panic!("{read:?}");
+    };
+    assert!(*whole);
+    assert_eq!(ids(entries), ids(&held[2..]));
+    assert_eq!(*reached, place(mark, 4));
+    assert_eq!(pulls(&relay), [(mark, 2), (mark, 3), (mark, 4)]);
+
+    // Under a mark that the relay no longer has: from the start, and the
+    // place reached is under the mark it has now.
+    let read = reads_left_from(&a, old, by_secret(), None, from(place([9; 8], 2)), soon()).await;
+    let LeftRead::Read {
+        entries,
+        whole,
+        reached,
+    } = &read[0].read
+    else {
+        panic!("{read:?}");
+    };
+    assert!(*whole);
+    assert_eq!(ids(entries), ids(&held));
+    assert_eq!(*reached, place(mark, 4));
+    assert_eq!(pulls(&relay)[0], ([9; 8], 2));
+
+    // The time gone by before a page is asked: nothing is read, and the
+    // place reached is the one it was asked from.
+    let gone = std::time::Instant::now();
+    let read = reads_left_from(&a, old, by_secret(), None, from(place(mark, 3)), gone).await;
+    let expected = LeftRead::Read {
+        entries: Vec::new(),
+        whole: false,
+        reached: place(mark, 3),
+    };
+    assert_eq!(read[0].read, expected);
+    assert!(pulls(&relay).is_empty());
+
+    // The time goes by after some pages: the read is in part, and the
+    // place reached is the one after the last page handed. A read asked
+    // from it hands the rest, and nothing twice. Each page is handed a
+    // while after it is asked for, so that the time goes by between two.
+    let slow = held.clone();
+    relay.pulls(move |pull| {
+        std::thread::sleep(Duration::from_millis(400));
+        let after = if pull.mark == mark { pull.after } else { 0 };
+        let page: Vec<Vec<u8>> = slow.iter().skip(after as usize).take(1).cloned().collect();
+        EntryPulled {
+            next: after + page.len() as u64,
+            entries: page.into_iter().map(Into::into).collect(),
+            mark,
+        }
+    });
+    let until = std::time::Instant::now() + Duration::from_millis(1000);
+    let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), until).await;
+    let LeftRead::Read {
+        entries: first,
+        whole,
+        reached,
+    } = read[0].read.clone()
+    else {
+        panic!("{read:?}");
+    };
+    let handed = first.len();
+    assert!(!whole, "{read:?}");
+    assert!((2..held.len()).contains(&handed), "{read:?}");
+    assert_eq!(ids(&first), ids(&held[..handed]));
+    assert_eq!(reached, place(mark, handed as u64));
+    let read = reads_left_from(&a, old, by_secret(), None, from(reached), soon()).await;
+    let LeftRead::Read {
+        entries: rest,
+        whole,
+        ..
+    } = &read[0].read
+    else {
+        panic!("{read:?}");
+    };
+    assert!(*whole);
+    assert!(ids(&first).is_disjoint(&ids(rest)));
+    assert_eq!(ids(rest), ids(&held[handed..]));
+    relay.requests();
+
+    // A place given only for a relay of another name: this relay is read
+    // from the start, under no mark.
+    let only_far = HashMap::from([("far".to_string(), place(mark, 2))]);
+    let read = reads_left_from(&a, old, by_secret(), None, only_far, soon()).await;
+    assert_eq!(handed_ids(&read[0].read), Some((ids(&held), true)));
+    assert_eq!(pulls(&relay)[0], ([0; 8], 0));
+
+    // A page of which nothing is an entry of the channel, and a page
+    // that holds more than a page may, which is no answer: the read stops
+    // with what it had, in part, at the place before that page. Asked
+    // from it, the read goes on there.
+    for after_the_first in [vec![vec![1u8, 2, 3]], vec![held[0].clone(); 101]] {
+        let first = held[0].clone();
+        relay.pulls(move |pull| {
+            let page = match pull.after {
+                0 => vec![first.clone()],
+                _ => after_the_first.clone(),
+            };
+            EntryPulled {
+                next: pull.after + 1,
+                entries: page.into_iter().map(Into::into).collect(),
+                mark,
+            }
+        });
+        let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+        let LeftRead::Read {
+            entries,
+            whole,
+            reached,
+        } = &read[0].read
+        else {
+            panic!("{read:?}");
+        };
+        assert!(!*whole);
+        assert_eq!(ids(entries), ids(&held[..1]));
+        assert_eq!(*reached, place(mark, 1));
+        let read = reads_left_from(&a, old, by_secret(), None, from(*reached), soon()).await;
+        let again = handed_ids(&read[0].read);
+        assert!(again.is_none_or(|(ids, _)| ids.is_empty()), "{read:?}");
+        assert_eq!(pulls(&relay), [([0; 8], 0), (mark, 1), (mark, 1)]);
+    }
+
+    // The relay dropped the channel and took it again, under a new mark,
+    // and holds nothing of it yet: the read is whole, and the place
+    // reached is under the new mark, at its start.
+    let new_mark = [8u8; 8];
+    relay.pulls(move |_| EntryPulled {
+        entries: Vec::new(),
+        next: 0,
+        mark: new_mark,
+    });
+    let read = reads_left_from(&a, old, by_secret(), None, from(place(mark, 3)), soon()).await;
+    let expected = LeftRead::Read {
+        entries: Vec::new(),
+        whole: true,
+        reached: place(new_mark, 0),
+    };
+    assert_eq!(read[0].read, expected);
+    assert_eq!(pulls(&relay), [(mark, 3)]);
 }
 
 /// **A read of a generation that was left counts each proof it sends,

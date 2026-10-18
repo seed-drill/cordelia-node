@@ -314,8 +314,35 @@ pub enum LeftRead {
     /// ([`DoorAsk::Remake`]), and reads on there.
     NoRoom,
     /// What it handed of the channel, each entry as its bytes on the
-    /// wire, and whether the channel was read to its end.
-    Read { entries: Vec<Vec<u8>>, whole: bool },
+    /// wire, whether the channel was read to its end, and the place the
+    /// read reached there: a later read asked from it goes on from where
+    /// this one stopped (decision 2026-10-17 §3.2).
+    Read {
+        entries: Vec<Vec<u8>>,
+        whole: bool,
+        reached: LeftPlace,
+    },
+}
+
+/// A place in a channel at one relay, as a pull keeps it (decision
+/// 2026-10-17 §3.2): the mark of the relay's holding of the channel, and
+/// the place after which the next page begins. **A place means something
+/// only with its mark:** a relay that is asked from a place under a mark
+/// that is no longer its holding's reads from the start, and answers
+/// under the mark it has now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeftPlace {
+    pub mark: cordelia_storage::relay::Mark,
+    pub next: u64,
+}
+
+impl LeftPlace {
+    /// The start of a channel, under no mark: where a read that is given
+    /// no place begins.
+    pub const START: Self = Self {
+        mark: cordelia_storage::relay::NO_MARK,
+        next: 0,
+    };
 }
 
 /// A relay that the device is set up with, by its name, with what it
@@ -339,11 +366,14 @@ pub enum DoorAsk {
     /// `until`: it is of a generation that the device has left, or never
     /// followed. With `only`, it is read at the relays of those names
     /// alone, and each other is not answered for: a read goes on so at a
-    /// relay whose connection was made again.
+    /// relay whose connection was made again. At a relay named in `from`
+    /// it is read on from that place, and at any other from the start
+    /// (decision 2026-10-17 §3.2).
     Read {
         channel: [u8; 32],
         by: ProvedBy,
         only: Option<Vec<String>>,
+        from: std::collections::HashMap<String, LeftPlace>,
         until: Instant,
         answer: tokio::sync::oneshot::Sender<Vec<LeftAt>>,
     },
