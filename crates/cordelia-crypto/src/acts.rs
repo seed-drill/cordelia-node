@@ -399,6 +399,16 @@ impl<T: Item> Act<T> {
         Ok(())
     }
 
+    /// The act as a list writes it: its item's fields, its time, its
+    /// count, its maker's key and its signature. Two acts on one item that
+    /// agree in all else are ordered by these bytes (decision 2026-10-10
+    /// §3.4), so that every device orders them alike.
+    pub fn written(&self) -> Result<Vec<u8>, ListError> {
+        let mut out = Vec::new();
+        self.write(&mut out, &|_| true)?;
+        Ok(out)
+    }
+
     fn read(
         reader: &mut Reader,
         read_item: ReadItem<T>,
@@ -984,6 +994,31 @@ mod tests {
         assert!(wrong.signed_by_its_maker());
         assert!(!wrong.holds());
         assert!(act(filing(9, "review"), &laptop).holds());
+    }
+
+    /// An act's bytes are those a list writes for it, after the part's
+    /// count: its item's fields, its time, its count, its maker and its
+    /// signature.
+    #[test]
+    fn an_acts_bytes_are_those_a_list_writes_for_it() {
+        let laptop = device(1);
+        let made = act(
+            Label {
+                key: [9; 32],
+                label: Some("bob".into()),
+            },
+            &laptop,
+        );
+        let value = SharedList {
+            labels: vec![made.clone()],
+            ..SharedList::default()
+        }
+        .to_value(names)
+        .unwrap();
+        let written = made.written().unwrap();
+        assert_eq!(written, value[13..]);
+        assert_eq!(written.len(), 32 + 2 + 3 + 8 + 8 + 32 + 64);
+        assert_eq!(written[written.len() - 64..], made.signature);
     }
 
     /// A list copied by other devices keeps each act's maker and signature:
