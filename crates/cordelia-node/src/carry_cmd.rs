@@ -826,37 +826,104 @@ pub(crate) fn read_with_secret(
     sessions: &mut Sessions,
     own: &[u8; 32],
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
-    read_with_secret_from(config_path, secret, sessions, own, None, &[])
+    let channel = derive::channel_id(secret)?;
+    read_again_where_changed(
+        sessions,
+        |sessions| {
+            let proofs = proofs_for(secret, sessions, own)?;
+            read_through_the_node(config_path, &channel, proofs, &[])
+        },
+        || sessions_now(config_path),
+    )
 }
 
-/// [`read_with_secret`], at the relays named in `asked` alone where it
-/// names any, and at each relay that `from` gives a place for, on from
-/// that place (decision 2026-10-17 §3.2). What is said of each relay
-/// read there, whole or in part, carries the place it reached: its
-/// `mark` and `place`, as `from` is given them ([`read_through_the_node`]).
-///
-/// **A relay that is not asked is not said:** the node is handed no
-/// proof for it, and would say that its connection changed, which is no
-/// reason to make the proofs again.
-pub(crate) fn read_with_secret_from(
+/// One round of a read on (decision 2026-10-17 §3.2): [`read_with_secret`],
+/// at the relays named in `asked` alone where it names any, and at each
+/// relay that `from` gives a place for, on from that place. What is said
+/// of each relay read there, whole or in part, carries the place it
+/// reached: its `mark` and `place`, as `from` is given them
+/// ([`read_through_the_node`]). Where a connection changed, only the
+/// relays whose connection changed are read again, and only while
+/// `may_read_again` says yes ([`round_again_where_changed`]).
+pub(crate) fn read_round(
     config_path: &str,
     secret: &[u8; 32],
     sessions: &mut Sessions,
     own: &[u8; 32],
     asked: Option<&[String]>,
     from: &[Value],
+    may_read_again: impl FnMut() -> bool,
 ) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
     let channel = derive::channel_id(secret)?;
-    read_again_where_changed(
+    round_again_where_changed(
         sessions,
-        |sessions| {
-            at_those_alone(asked, sessions, |of_those| {
-                let proofs = proofs_for(secret, of_those, own)?;
-                read_through_the_node(config_path, &channel, proofs, from)
-            })
+        asked,
+        from,
+        |sessions, from| {
+            let proofs = proofs_for(secret, sessions, own)?;
+            read_through_the_node(config_path, &channel, proofs, from)
         },
         || sessions_now(config_path),
+        may_read_again,
     )
+}
+
+/// A round of a read on, with what reads and what asks for the sessions
+/// given (decision 2026-10-17 §3.2): `read` reads the channel with proofs
+/// over the sessions it is handed, from the places it is handed; `ask`
+/// gives the sessions as the node says them now.
+///
+/// The relays named in `asked` (every relay where it names none) are read
+/// once, each from its place in `from` ([`at_those_alone`]). **Where the
+/// node says of some that their connection changed, the sessions are
+/// asked for again, and those relays alone are read again,** from the
+/// places they had: the others answered, and what they handed stands. So
+/// a relay whose connection keeps changing costs the others no reading
+/// of what they handed already. That is done CARRY_PROOFS_MADE_AGAIN
+/// times at most, and **only while `may_read_again` says yes**: each
+/// reading again is a reading of the read on's bound. What is handed is
+/// kept, each entry once, and what is said last of a relay stands.
+pub(crate) fn round_again_where_changed(
+    sessions: &mut Sessions,
+    asked: Option<&[String]>,
+    from: &[Value],
+    mut read: impl FnMut(&Sessions, &[Value]) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)>,
+    mut ask: impl FnMut() -> anyhow::Result<Sessions>,
+    mut may_read_again: impl FnMut() -> bool,
+) -> anyhow::Result<(Vec<CheckedEntry>, Vec<Value>)> {
+    let mut entries: Vec<CheckedEntry> = Vec::new();
+    let mut kept: HashSet<[u8; 32]> = HashSet::new();
+    let mut said: Vec<Value> = Vec::new();
+    let mut those: Option<Vec<String>> = asked.map(<[String]>::to_vec);
+    let mut places: Vec<Value> = from.to_vec();
+    for made_again in 0..=CARRY_PROOFS_MADE_AGAIN {
+        let (handed, relays) = at_those_alone(those.as_deref(), sessions, |of_those| {
+            read(of_those, &places)
+        })?;
+        for entry in handed {
+            if kept.insert(entry.id()) {
+                entries.push(entry);
+            }
+        }
+        for relay in relays {
+            match said.iter_mut().find(|of| of["relay"] == relay["relay"]) {
+                Some(of) => *of = relay,
+                None => said.push(relay),
+            }
+        }
+        let changed: Vec<String> = said
+            .iter()
+            .filter(|of| connection_changed(of))
+            .map(|of| text(of, "relay").to_string())
+            .collect();
+        if changed.is_empty() || made_again == CARRY_PROOFS_MADE_AGAIN || !may_read_again() {
+            break;
+        }
+        places.retain(|place| changed.iter().any(|relay| place["relay"] == *relay));
+        those = Some(changed);
+        *sessions = ask()?;
+    }
+    Ok((entries, said))
 }
 
 /// One reading, at the relays named in `asked` alone where it names any
