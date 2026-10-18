@@ -5,12 +5,16 @@ from the place each relay reached, round after round, until each relay
 has handed it to its end or holds none of it, or has been asked in
 RECOVERY_READ_ON_READS rounds, its own count; a relay not reached in a
 round is not asked again, and one whose connection changed is asked in
-the next; the lines after each round, and the line before the yes with
-why each relay stopped; and the line of step 1 before the yes (decision
+the next, after it is read again within the first round, as the read of
+today does; a relay that handed nothing and holds none said to hold none,
+and one that handed nothing said so, with why; the lines after each
+round, and the line before the yes with why each relay stopped; and the line of step 1 before the yes (decision
 2026-10-17 §3.1 to §3.3; §1, properties 10 and 11). With it: the bytes a
 relay handed, as the node says them; a device that keeps back the room a
 relay keeps for a show, and waits out a pull refused for now, on slice
-6's count of refusals: asking a relay at its count nothing; and reads
+6's count of refusals: asking a relay at its count nothing, the door
+holding its pull to the count after its proof, and asking again only
+within a minute of the last page; and reads
 that keep each entry once. A part for each rule of the slice: put each
 fault in, and confirm the test named for it fails on an assertion. Run
 from the root of a checkout that nothing else edits."""
@@ -55,6 +59,8 @@ CUT_OFF = (NODE_LIB, "device_entries::leave::tests::a_request_is_refused_for_now
 CHANGING = cmd("test_a_relay_whose_connection_keeps_changing_costs_no_reading_beyond_the_bound")
 ONE_READING = carry("test_one_reading_reads_no_relay_again_and_asks_for_the_sessions_where_one_changed")
 WHY = cmd("test_what_is_said_of_a_read_in_part_says_why_each_relay_stopped")
+HOLDS_NONE = cmd("test_a_relay_whose_connection_changed_and_that_holds_none_is_said_to_hold_none")
+DOOR_COUNT = (NODE_E2E, "a_read_through_the_carry_door_holds_its_pull_to_the_count_after_its_proof")
 LARGER = (RECOVER_E2E, "a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end")
 STAYS = (RECOVER_E2E, "a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look")
 TWO_RELAYS = (RECOVER_E2E, "a_recovery_says_at_which_relay_the_personal_channel_was_not_read")
@@ -199,35 +205,38 @@ MUTATIONS = [
         self.on = true;''',
      '''        self.on = true;''',
      [TO_ITS_END]),
-    ("RO28 the first round keeps an entry as often as it was handed", RECOVER_CMD,
-     '''    for entry in first {
-        if kept.insert(entry.id()) {''',
-     '''    for entry in first {
-        if kept.insert(entry.id()) || true {''',
-     [NOT_REACHED]),
-    ("RO29 a later round keeps an entry as often as it was handed", RECOVER_CMD,
-     '''    for entry in handed {
+    ("RO28 a read on keeps an entry as often as it was handed", RECOVER_CMD,
+     '''    let mut keep = |handed: Vec<CheckedEntry>| {
+        for entry in handed {
             if kept.insert(entry.id()) {''',
-     '''    for entry in handed {
+     '''    let mut keep = |handed: Vec<CheckedEntry>| {
+        for entry in handed {
             if kept.insert(entry.id()) || true {''',
-     [LEAVES]),
+     [NOT_REACHED, LEAVES]),
+    ("RO29 what a later round handed is not kept", RECOVER_CMD,
+     '''        keep(handed);
+        for relay in at.iter_mut()''',
+     '''        let _ = handed;
+        for relay in at.iter_mut()''',
+     [TO_ITS_END]),
     ("RO30 nothing is said after a round", RECOVER_CMD,
      '''            say(relay.round(said));''',
      '''            relay.round(said);''',
      [TO_ITS_END, NOT_REACHED]),
     ("RO31 nothing is said of reading on after the first round", RECOVER_CMD,
-     '''    if !on.is_empty() {
-        say(format!(''',
-     '''    if false {
-        say(format!(''',
+     '''        .max()
+    {''',
+     '''        .max()
+        .filter(|_| false)
+    {''',
      [TO_ITS_END, LARGER]),
     ("RO32 a relay whose reads were all made is not said", RECOVER_CMD,
      '''                say(relay.in_part(&made));''',
      '''                relay.in_part(&made);''',
      [AT_THE_BOUND]),
     ("RO33 the first round counts as all the readings", RECOVER_CMD,
-     '''            readings: 1,''',
-     '''            readings: RECOVERY_READ_ON_READS,''',
+     '''.copied().unwrap_or(1);''',
+     '''.copied().unwrap_or(RECOVERY_READ_ON_READS);''',
      [TO_ITS_END]),
     ("RO34 the line of a read in part says no relay's reason", RECOVER_CMD,
      '''        let part = of.at_with_why(&[ReadAs::Part]);''',
@@ -274,8 +283,8 @@ MUTATIONS = [
      [NOT_NOW]),
     ("RO43 the proof is sent again after a pull refused for now", ENTRIES,
      '''                    proved = true;
-                    if !self.asks_again_after_a_refusal(link) {''',
-     '''                    if !self.asks_again_after_a_refusal(link) {''',
+                    let within''',
+     '''                    let within''',
      [NOT_NOW]),
     ("RO44 a reading asks for the sessions again where no connection changed", CARRY_CMD,
      '''    if relays.iter().any(connection_changed) {''',
@@ -286,9 +295,9 @@ MUTATIONS = [
             self.on = true;''',
      '''        if read == CONNECTION_CHANGED {
             self.on = false;''',
-     [AT_THE_BOUND, CHANGING]),
+     [CHANGING]),
     ("RO46 a relay whose connection changed in the first round is not read on", RECOVER_CMD,
-     '''        at.on = at.read == CONNECTION_CHANGED
+     '''        at.on = at.changed
             ||''',
      '''        at.on = false
             ||''',
@@ -332,8 +341,8 @@ MUTATIONS = [
      '''        let _ = why;''',
      [AT_THE_BOUND, WHY]),
     ("RO51 a read asks again after a refusal for now at the relay's count", ENTRIES,
-     '''                    if !self.asks_again_after_a_refusal(link) {''',
-     '''                    if false && !self.asks_again_after_a_refusal(link) {''',
+     '''                    if !within || !self.asks_again_after_a_refusal(link) {''',
+     '''                    if !within {''',
      [NOT_NOW]),
     ("RO52 a read asks a relay at its count", ENTRIES,
      '''            if !self.asks_after_refusals(link) {''',
@@ -342,6 +351,90 @@ MUTATIONS = [
     ("RO53 a read that asked a relay at its count nothing says it was not reached", ENTRIES,
      '''                    true => LeftRead::NotRead(AT_ITS_COUNT.into()),''',
      '''                    true => LeftRead::NotReached,''',
+     [NOT_NOW]),
+    ("RO57 a relay whose connection changed is not read again in the first round", RECOVER_CMD,
+     '''    for _ in 0..CARRY_PROOFS_MADE_AGAIN {''',
+     '''    for _ in 0..0 {''',
+     [HOLDS_NONE, AT_THE_BOUND, CHANGING]),
+    ("RO58 the first round reads a relay again once more than the read of today", RECOVER_CMD,
+     '''    for _ in 0..CARRY_PROOFS_MADE_AGAIN {''',
+     '''    for _ in 0..CARRY_PROOFS_MADE_AGAIN + 1 {''',
+     [AT_THE_BOUND, CHANGING]),
+    ("RO59 a reading again within the first round is not counted", RECOVER_CMD,
+     '''            *readings.entry(relay.clone()).or_insert(1) += 1;''',
+     '''            *readings.entry(relay.clone()).or_insert(1) += 0;''',
+     [AT_THE_BOUND, CHANGING]),
+    ("RO60 the first round reads every relay again where a connection changed", RECOVER_CMD,
+     '''        let (handed, again) = round(Some(&changed), &[])?;''',
+     '''        let (handed, again) = round(None, &[])?;''',
+     [HOLDS_NONE]),
+    ("RO61 what a relay read again in the first round said is not taken", RECOVER_CMD,
+     '''            if let Some(of) = of {
+                *of = said;''',
+     '''            if let Some(of) = of {
+                let _ = (of, said);''',
+     [HOLDS_NONE]),
+    ("RO62 a relay that handed nothing and holds none is said in part", RECOVER_CMD,
+     '''        if holds_none && self.handed == 0 {''',
+     '''        if false {''',
+     [HOLDS_NONE]),
+    ("RO63 a relay that handed nothing and holds none is not said to hold none", RECOVER_CMD,
+     '''            self.read = "not held".into();
+            return format!("  {}: it holds none of it.", self.relay);''',
+     '''            return format!("  {}: it holds none of it.", self.relay);''',
+     [HOLDS_NONE]),
+    ("RO64 a relay that handed nothing is said to be read in part", RECOVER_CMD,
+     '''            0 => format!("  {}: nothing of it was read: {why}.", self.relay),''',
+     '''            0 => format!("  {}: read in part, 0.0 MiB: {why}.", self.relay),''',
+     [HOLDS_NONE, CHANGING]),
+    ("RO65 a relay whose connection changed is said larger than one read", RECOVER_CMD,
+     '''.filter(|r| r.on && !r.changed)''',
+     '''.filter(|r| r.on)''',
+     [AT_THE_BOUND]),
+    ("RO66 a relay whose connection changed in the first round is not said", RECOVER_CMD,
+     '''    for relay in at.iter().filter(|relay| relay.on) {
+        say(match relay.changed {''',
+     '''    for relay in at.iter().filter(|relay| relay.on && !relay.changed) {
+        say(match relay.changed {''',
+     [HOLDS_NONE, AT_THE_BOUND]),
+    ("RO67 the first line of reading on counts no read made", RECOVER_CMD,
+     '''.map(|r| RECOVERY_READ_ON_READS.saturating_sub(r.readings))''',
+     '''.map(|_| RECOVERY_READ_ON_READS)''',
+     [TO_ITS_END, LARGER]),
+    ("RO68 reads made with a change at the last say nothing of it", RECOVER_CMD,
+     '''                let made = match relay.changed {''',
+     '''                let made = match false {''',
+     [CHANGING, WHY]),
+    ("RO69 a later round does not say whether its connection changed", RECOVER_CMD,
+     '''        self.changed = read == CONNECTION_CHANGED;''',
+     '''''',
+     [AT_THE_BOUND, WHY]),
+    ("RO70 a relay of which nothing was read is named with no reason", RECOVER_CMD,
+     '''        let nothing = of.at_with_why(&[ReadAs::Nothing]);''',
+     '''        let nothing = of.at(&[ReadAs::Nothing]);''',
+     [CHANGING]),
+    ("RO71 a relay not read to its end where another was is named with no reason", RECOVER_CMD,
+     '''            let not_to_the_end = of.at_with_why(&[ReadAs::Part, ReadAs::Nothing]);''',
+     '''            let not_to_the_end = of.at(&[ReadAs::Part, ReadAs::Nothing]);''',
+     [HOLDS_NONE]),
+    ("RO72 the door sends a pull at the relay's count after its proof", LEAVE,
+     '''        if self.at_its_count(&link.relay().0) {
+            return Err(LeftRefused::AtItsCount);''',
+     '''        if false {
+            return Err(LeftRefused::AtItsCount);''',
+     [DOOR_COUNT]),
+    ("RO73 a pull the door held to the count is said as a read in part", ENTRIES,
+     '''                Err(LeftRefused::AtItsCount) if read.is_empty() && !proved => {''',
+     '''                Err(LeftRefused::AtItsCount) if false => {''',
+     [DOOR_COUNT]),
+    ("RO74 a read asks again after a refusal more than a minute after a page", ENTRIES,
+     '''                    let within = self.clock.now() < paged + own_read::A_MINUTE;''',
+     '''                    let within = true;''',
+     [NOT_NOW]),
+    ("RO75 a page does not begin the minute again", ENTRIES,
+     '''                    paged = self.clock.now();
+                    let moved''',
+     '''                    let moved''',
      [NOT_NOW]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
