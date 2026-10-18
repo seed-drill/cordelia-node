@@ -5886,7 +5886,8 @@ async fn a_connection_that_closes_mid_read_leaves_the_relay_not_reached() {
     });
     comes_to_be("a pull refused", || refused.load(Ordering::SeqCst) >= 1).await;
     device.disconnects("relay");
-    let read = tokio::time::timeout(Duration::from_secs(10), read).await;
+    // Well within the leave of ten seconds, which ends any wait.
+    let read = tokio::time::timeout(Duration::from_secs(3), read).await;
     let read = read
         .expect("the read ends once the connection closes")
         .unwrap();
