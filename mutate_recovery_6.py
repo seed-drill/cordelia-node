@@ -14,8 +14,9 @@ AT_RELAYS = 'crates/cordelia-api/src/at_relays.rs'
 OWN_READ = 'crates/cordelia-api/src/own_read.rs'
 NODE_READ = 'crates/cordelia-node/src/device_entries/own_read.rs'
 DEVICE = 'crates/cordelia-node/src/device_entries.rs'
+LEAVE = 'crates/cordelia-node/src/device_entries/leave.rs'
 PROTOCOL = 'crates/cordelia-core/src/protocol.rs'
-ORIG = {f: open(f).read() for f in (AT_RELAYS, OWN_READ, NODE_READ, DEVICE, PROTOCOL)}
+ORIG = {f: open(f).read() for f in (AT_RELAYS, OWN_READ, NODE_READ, DEVICE, PROTOCOL, LEAVE)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 API = ("cordelia-api", ["--lib"])
@@ -42,7 +43,15 @@ E2E_TAKES = e2e("a_read_with_places_of_its_own_takes_within_what_the_pass_takes_
 E2E_ASKS = e2e("a_read_with_places_of_its_own_asks_within_what_the_device_asks_of_a_relay")
 STANDS = own_read("test_a_read_stands_for_so_long_from_the_end_of_its_last_round")
 CONSTANTS = (CORE, "protocol::tests::test_a_carry_by_command_and_a_recovery_decision_2026_10_04_7_3_and_9")
-E2E_RESET = e2e("a_read_with_places_of_its_own_asks_again_where_a_relay_resets_a_pull")
+E2E_RESET = e2e("a_read_with_places_of_its_own_waits_out_a_pull_refused_for_now")
+E2E_EVERY = e2e("a_relay_that_refuses_every_pull_is_not_reached_and_holds_up_no_other_read")
+E2E_CLOSED = e2e("a_connection_that_closes_mid_read_leaves_the_relay_not_reached")
+E2E_OVERSIZE = e2e("a_page_of_more_entries_than_a_page_holds_is_not_taken_by_a_read")
+E2E_LAST_PAGE = e2e("a_refusal_for_now_is_waited_out_for_a_minute_from_the_last_page")
+E2E_DEADLINE = e2e("a_round_ends_at_its_time_while_a_relay_is_waited_for_or_asked")
+E2E_GONE = e2e("a_round_whose_asker_has_gone_stops")
+E2E_PROVES_ONCE = e2e("a_pass_proves_again_only_after_a_no_given_to_a_read_and_once")
+E2E_LEFT_ROOM = e2e("a_read_of_a_left_channel_takes_no_page_from_the_room_kept_for_a_show")
 E2E_PROOF = e2e("a_relay_that_answered_a_reads_proof_with_no_is_sent_the_channel_again")
 E2E_ROUND_MOST = e2e("a_round_of_a_read_lasts_no_longer_than_a_carry_may_read")
 E2E_REPLACED = e2e("a_read_that_another_read_of_its_channel_replaced_stops")
@@ -192,8 +201,8 @@ MUTATIONS = [
      '''            if !self.room_to_take(link) && false {''',
      [E2E_TAKES]),
     ("NR5 what the read takes is not counted with the pass", NODE_READ,
-     '''                        self.took(link, handed);''',
-     '''                        let _ = handed;''',
+     '''                    self.took(link, handed);''',
+     '''                    let _ = handed;''',
      [E2E_TAKES]),
     ("NR6 asked enough ends the relay's read instead of waiting", NODE_READ,
      '''                Err(Refused::AskedEnough) => {''',
@@ -230,18 +239,80 @@ MUTATIONS = [
      '''(self.state.held.why().is_none())''',
      '''(true)''',
      [E2E_READS_ON]),
-    ("NR13 a pull that a relay reset ends the relay's read", NODE_READ,
-     '''                Err(Refused::NotAnswered(_)) if link.is_open() => {''',
-     '''                Err(Refused::NotAnswered(_)) if false => {''',
+    ("NR13 a refusal for now ends the relay's read", NODE_READ,
+     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
+     '''                    if false && why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
      [E2E_RESET]),
+    ("NR19 a refusal for now is waited out for ever", NODE_READ,
+     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
+     '''                    if why == NOT_NOW && self.clock.now() < paged + 100 * A_MINUTE =>''',
+     [E2E_EVERY]),
+    ("NR20 every failure on a connection is waited out", NODE_READ,
+     '''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>''',
+     '''                    if !why.is_empty() && self.clock.now() < paged + A_MINUTE =>''',
+     [E2E_CLOSED, E2E_OVERSIZE, E2E_RESET]),
+    ("NR21 the minute is counted from the round's start", NODE_READ,
+     '''                    paged = self.clock.now();''',
+     '''                    let _ = &mut paged;''',
+     [E2E_LAST_PAGE]),
+    ("NR22 a wait for a refusal runs past the round's time", NODE_READ,
+     ['''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
+                {
+                    tokio::time::sleep(LEFT_ROOM_WAIT.min(left)).await;'''],
+     ['''                    if why == NOT_NOW && self.clock.now() < paged + A_MINUTE =>
+                {
+                    tokio::time::sleep(LEFT_ROOM_WAIT).await;'''],
+     [E2E_DEADLINE]),
+    ("NR23 a request runs past the round's time", NODE_READ,
+     '''            let Ok(taken) = tokio::time::timeout(left, taken).await else {''',
+     '''            let Ok(taken) = tokio::time::timeout(left + ROUND_MOST, taken).await else {''',
+     [E2E_DEADLINE]),
+    ("NR24 a round goes on after its asker has gone", NODE_READ,
+     '''                    _ = answer.closed() => return self.asker_gone(&read),''',
+     '''                    _ = std::future::pending::<()>() => return self.asker_gone(&read),''',
+     [E2E_GONE]),
+    ("NR25 the read of a gone asker is kept", NODE_READ,
+     '''        self.state.own_channels.reads().forget(read);''',
+     '''        let _ = read;''',
+     [E2E_GONE]),
+    ("LV1 a reset for now is not told from any other", LEAVE,
+     '''    matches!(inner.downcast_ref(), Some(quinn::ReadError::Reset(at)) if *at == code)
+        || matches!(inner.downcast_ref(), Some(quinn::WriteError::Stopped(at)) if *at == code)''',
+     '''    let _ = (inner, code);
+    false''',
+     [E2E_RESET]),
+    ("DE4 an unheeded no is never cleared", DEVICE,
+     '''                    false => of.no_unheeded.remove(&channel.id),''',
+     '''                    false => false,''',
+     [E2E_PROVES_ONCE]),
+    ("DE5 a read's yes is kept as an unheeded no", DEVICE,
+     '''                match !proved && !held {''',
+     '''                match !held {''',
+     [E2E_PROVES_ONCE]),
+    ("DE6 an empty page from a forgotten place is the channel's end", DEVICE,
+     '''                Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),''',
+     '''                Ok(Some(page)) if page.entries == 0 => return Step::Done(true),''',
+     [E2E_RACE]),
+    ("DE7 a page from a forgotten place got nowhere", DEVICE,
+     '''                                got_somewhere: places == Places::Own
+                                    || got_somewhere(''',
+     '''                                got_somewhere: false
+                                    || got_somewhere(''',
+     [E2E_RACE]),
+    ("DE8 the door's read takes beyond the minute's room", DEVICE,
+     '''            if !self.room_to_take(link) {
+                tokio::time::sleep(LEFT_ROOM_WAIT).await;''',
+     '''            if false {
+                tokio::time::sleep(LEFT_ROOM_WAIT).await;''',
+     [E2E_LEFT_ROOM]),
     ("NR14 a round lasts as long as its asker said", NODE_READ,
      '''                let until = until.min(self.clock.now() + ROUND_MOST);
                 let begun = self.begin_own(relays, &channel);''',
      '''                let begun = self.begin_own(relays, &channel);''',
      [E2E_ROUND_MOST]),
     ("NR15 a read that another took the place of reads on", NODE_READ,
-     '''            if self.clock.now() >= until || !reads.stands(read) {''',
-     '''            if self.clock.now() >= until {''',
+     '''            if now >= until || !reads.stands(read) {''',
+     '''            if now >= until {''',
      [E2E_REPLACED]),
     ("NR16 rounds of two reads run at once", NODE_READ,
      '''        let Ok(_one_round) = tokio::time::timeout(wait, self.own_rounds.lock()).await else {''',
@@ -269,7 +340,7 @@ MUTATIONS = [
     ("DE2 a device takes a page into the room kept for a show", DEVICE,
      '''        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + SHOW_ANSWER_ROOM_BYTES''',
      '''        taken_from(of).room() >= entry_cost(MAX_ITEM_BYTES) + 0 * SHOW_ANSWER_ROOM_BYTES''',
-     [E2E_TAKES]),
+     [E2E_TAKES, E2E_LEFT_ROOM]),
     ("DE3 a pull in flight keeps its place when every place was forgotten", DEVICE,
      '''                            Ok(kept) if kept == (mark, after) => Places::Kept,''',
      '''                            Ok(_) => Places::Kept,''',
