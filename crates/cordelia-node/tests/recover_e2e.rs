@@ -1920,7 +1920,7 @@ fn recovers_and_reads_on(new: &Node, words: &str, relay: &str) -> AtTerminal {
     at.says("Recovering from change 1. Reading its personal channel at each relay...")
         .says("The personal channel of change 1 is larger than one read. Reading on at ")
         .says(relay)
-        .says(": a relay may hold up to 16 MiB of it, which takes up to 10 minutes to read.")
+        .says(": a relay may hold up to 16 MiB of it, which takes up to 5 reads of up to 2 minutes each.")
         .says("Ctrl-C stops here, and nothing is made.")
         .says(&format!("  {relay}: "))
         .says(" MiB read so far.");
@@ -2040,11 +2040,10 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
     let said = at.done();
     println!("{said}");
     let in_part = format!(
-        "The personal channel of change 1 was read to its end at no relay: in part at {named}. \
-         Devices added since that change, and names, may be missing from what was read. It was \
-         read on at each relay until the relay was not reached, held none of it, handed no more, \
-         or had been read for 10 minutes, as long as a channel at its largest takes: a relay that \
-         hands it more slowly than that, or stops, leaves it in part."
+        "The personal channel of change 1 was read to its end at no relay: in part at {named} \
+         (it was not reached). Devices added since that change, and names, may be missing from \
+         what was read. A relay that hands it more slowly than a channel at its largest needs, or \
+         stops, leaves it in part."
     );
     let warned = said.find(&in_part).unwrap_or_else(|| panic!("{said}"));
     let yes = said.find("Recover on this machine?").unwrap();

@@ -1723,13 +1723,15 @@ pub const RECOVERY_READ_ON_MAX_SECS: u64 = 60 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
 const _: () = assert!(RECOVERY_READ_ON_MAX_SECS > CARRY_READ_MAX_SECS);
 
 /// How many readings of CARRY_READ_MAX_SECS a recovery makes of the
-/// personal channel of the change it recovers from, at most (decision
-/// 2026-10-17 §3.2): each round is one, and so is each reading again of a
-/// relay whose connection changed. The bound is counted in readings and
+/// personal channel of the change it recovers from at each relay, at most
+/// (decision 2026-10-17 §3.2): each round asked of a relay is one of its
+/// own, whether it hands part of the channel or says that its connection
+/// changed, so that what one relay does never costs another a reading, and
+/// there are this many rounds at most. The bound is counted in readings and
 /// not in seconds since the first round, so that what a reading takes
-/// beyond its CARRY_READ_MAX_SECS (a page in flight at its end, the
-/// handing of what it read to the command) never costs the reading that
-/// reaches a channel at its cap. Derived: as many readings as fit in
+/// beyond its CARRY_READ_MAX_SECS (a page in flight at its end, the handing
+/// of what it read to the command) never costs the reading that reaches a
+/// channel at its cap. Derived: as many readings as fit in
 /// RECOVERY_READ_ON_MAX_SECS.
 pub const RECOVERY_READ_ON_READS: u64 = RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS;
 
