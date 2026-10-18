@@ -27,7 +27,8 @@
 //! - **Which act is in force** is decided by the statement and the
 //!   records of addition alone ([`Makers`]): an act whose maker counts,
 //!   or is a key the statement lists as removed, is in force; one whose
-//!   maker is in no list is held and not in force.
+//!   maker this device counted and a statement left in no list is held
+//!   and not in force; one of any other key is not taken at all.
 //! - **A recovery** reads the lists of the devices it shows, fresh by the
 //!   newest fetched time among them ([`recovered`]).
 //!
@@ -35,8 +36,9 @@
 //! Nothing here sends anything: what is written waits in the store, and
 //! the node sends it.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::Connection;
 
@@ -76,8 +78,9 @@ pub enum Maker {
     /// A key that the person's statement lists as removed: its acts are
     /// in force, and named with what undoes them (§3.5).
     Removed,
-    /// A key that neither counts nor is removed: its acts are held, and
-    /// not in force.
+    /// A key that this device counted, and that a statement since lists
+    /// neither as a device nor as removed (a settlement, or a recovery):
+    /// its acts are held, and not in force.
     InNoList,
 }
 
@@ -88,31 +91,67 @@ impl Maker {
     }
 }
 
-/// Who the makers are, by the statement the device has applied and the
-/// records of addition it keeps, and nothing else (§3.4): two devices
-/// that hold the same take the same acts.
+/// Who the makers are, by the statement the device has applied, the
+/// records of addition it keeps and the keys a statement left out, and
+/// nothing else (§3.4): two devices that hold the same take the same acts.
 pub struct Makers {
     counting: Counting,
     removed: Vec<[u8; 32]>,
+    left_out: Vec<[u8; 32]>,
 }
 
 impl Makers {
-    fn of(standing: &Standing) -> Self {
-        Self {
+    fn of(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
+        let left_out = cordelia_storage::acts::left_out(conn)?;
+        Ok(Self {
             counting: standing.counting.clone(),
             removed: standing.held.statement.statement.removed.clone(),
+            left_out: left_out.into_iter().map(|left| left.key).collect(),
+        })
+    }
+
+    /// What `key` is as a maker: `None` where it is none of the three, a
+    /// key that was never a device of the person's as this device knows
+    /// them, whose acts are not taken at all.
+    pub fn maker(&self, key: &[u8; 32]) -> Option<Maker> {
+        if self.counting.counts(key) {
+            Some(Maker::Counts)
+        } else if self.removed.contains(key) {
+            Some(Maker::Removed)
+        } else if self.left_out.contains(key) {
+            Some(Maker::InNoList)
+        } else {
+            None
         }
     }
 
-    /// What `key` is as a maker.
-    pub fn maker(&self, key: &[u8; 32]) -> Maker {
-        if self.counting.counts(key) {
-            Maker::Counts
-        } else if self.removed.contains(key) {
-            Maker::Removed
-        } else {
-            Maker::InNoList
+    /// Where a maker stands past a bound: those that count first, then
+    /// removed keys, then those not in force.
+    fn rank(&self, key: &[u8; 32]) -> u8 {
+        match self.maker(key) {
+            Some(Maker::Counts) => 0,
+            Some(Maker::Removed) => 1,
+            Some(Maker::InNoList) => 2,
+            None => 3,
         }
+    }
+}
+
+/// What each act's check gave ([`AnyAct::holds`]), by its bytes as a list
+/// writes them: an act that many lists carry is checked once.
+#[derive(Default)]
+struct Checked(RefCell<HashMap<Vec<u8>, bool>>);
+
+impl Checked {
+    /// Whether `act` may be taken: its maker is one of the person's as
+    /// [`Makers`] knows them, and it holds.
+    fn takes(&self, act: &AnyAct, makers: &Makers) -> bool {
+        makers.maker(&act.maker()).is_some()
+            && *self
+                .0
+                .borrow_mut()
+                .entry(act.written())
+                .or_insert_with(|| act.holds())
     }
 }
 
@@ -220,7 +259,7 @@ impl Order {
     fn of(time: u64, count: u64, maker: [u8; 32], written: Vec<u8>, makers: &Makers) -> Self {
         Self {
             time,
-            counts: makers.maker(&maker) == Maker::Counts,
+            counts: makers.maker(&maker) == Some(Maker::Counts),
             count: if time == SHARED_ACT_TIME_MAX {
                 count
             } else {
@@ -455,9 +494,13 @@ fn lists_held(
     Ok(read)
 }
 
-/// Of `candidates` on one item, the newest that holds, by [`Order`]: each
-/// is checked only until one holds.
-fn newest_that_holds(candidates: Vec<AnyAct>, makers: &Makers) -> Option<(AnyAct, Order)> {
+/// Of `candidates` on one item, the newest that may be taken, by
+/// [`Order`]: each is checked only until one is.
+fn newest_taken(
+    candidates: Vec<AnyAct>,
+    makers: &Makers,
+    checked: &Checked,
+) -> Option<(AnyAct, Order)> {
     let mut ordered: Vec<(Order, AnyAct)> = candidates
         .into_iter()
         .map(|act| (Order::of_act(&act, makers), act))
@@ -466,7 +509,7 @@ fn newest_that_holds(candidates: Vec<AnyAct>, makers: &Makers) -> Option<(AnyAct
     ordered.dedup_by(|a, b| a.0 == b.0);
     ordered
         .into_iter()
-        .find(|(_, act)| act.holds())
+        .find(|(_, act)| checked.takes(act, makers))
         .map(|(order, act)| (act, order))
 }
 
@@ -479,9 +522,10 @@ struct Bounded {
 }
 
 /// Keep each part of `chosen`, one act for each item, within its bound
-/// (§3.4, "past a bound"): of subscriptions and labels, the undone items
-/// first; then the items whose makers count, then those of removed keys,
-/// then those not in force; then the newest first. A filing, a
+/// (§3.4, "past a bound"): the items whose makers count first, then those
+/// of removed keys, then those not in force; within each, of
+/// subscriptions and labels, the undone items first; then the newest
+/// first. A filing, a
 /// subscription or a label past its bound is left out, up to as many
 /// again; a drop past 64 is freed.
 fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
@@ -519,8 +563,8 @@ fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
         let mut acts: Vec<&AnyAct> = chosen.iter().filter(|act| of_part(act)).collect();
         acts.sort_by_cached_key(|act| {
             (
+                makers.rank(&act.maker()),
                 !act.undone(),
-                makers.maker(&act.maker()),
                 Reverse(Order::of_act(act, makers)),
             )
         });
@@ -537,49 +581,46 @@ fn within_bounds(chosen: Vec<AnyAct>, makers: &Makers) -> Bounded {
 }
 
 /// The newest act on each item among `acts`, as a device takes them
-/// (§3.4): an act that holds, and a drop only of a channel that is filed
-/// among them or that `held_channels` names. `above` gives, for an item,
-/// what an act must order above to be taken. One act for each item.
+/// (§3.4): an act whose maker is one of the person's and that holds, and
+/// an undone act (a drop, an unsubscription, a removed label) only of an
+/// item that an act among them does, or that `held_items` names. `above`
+/// gives, for an item, what an act must order above to be taken. One act
+/// for each item.
 fn newest_of_each(
     acts: impl IntoIterator<Item = AnyAct>,
-    held_channels: &BTreeSet<Vec<u8>>,
+    held_items: &BTreeSet<Key>,
     above: impl Fn(&Key) -> Option<Order>,
     makers: &Makers,
+    checked: &Checked,
 ) -> Vec<AnyAct> {
     let mut by_item: BTreeMap<Key, Vec<AnyAct>> = BTreeMap::new();
     for act in acts {
         by_item.entry(act.key()).or_default().push(act);
     }
-    // A drop of a channel nobody filed is not taken: a device in someone
-    // else's hands cannot push out the person's drops with drops of IDs
-    // that were never filed (§3.4).
-    let filed: BTreeSet<Vec<u8>> = by_item
+    // An undo of what nobody did is not taken: a device in someone else's
+    // hands cannot fill the person's places, or push out the person's
+    // drops, with undoes of items that were never there (§3.4).
+    let done: BTreeSet<Key> = by_item
         .iter()
-        .filter(|((part, _), acts)| {
-            *part == Part::Channel
-                && acts
-                    .iter()
-                    .any(|act| matches!(act, AnyAct::Filing(_)) && act.holds())
+        .filter(|(_, acts)| {
+            acts.iter()
+                .any(|act| !act.undone() && checked.takes(act, makers))
         })
-        .map(|((_, item), _)| item.clone())
+        .map(|(key, _)| key.clone())
         .collect();
     let mut chosen = Vec::new();
     for (key, acts) in by_item {
         let floor = above(&key);
         let candidates: Vec<AnyAct> = acts
             .into_iter()
-            .filter(|act| {
-                !matches!(act, AnyAct::Drop(_))
-                    || filed.contains(&key.1)
-                    || held_channels.contains(&key.1)
-            })
+            .filter(|act| !act.undone() || done.contains(&key) || held_items.contains(&key))
             .filter(|act| {
                 floor
                     .as_ref()
                     .is_none_or(|floor| Order::of_act(act, makers) > *floor)
             })
             .collect();
-        if let Some((act, _)) = newest_that_holds(candidates, makers) {
+        if let Some((act, _)) = newest_taken(candidates, makers, checked) {
             chosen.push(act);
         }
     }
@@ -599,17 +640,15 @@ fn take_lists(lists: &mut Lists, others: &[Read], makers: &Makers, now: i64) {
     for read in &fresh {
         candidates.extend(acts_of(&read.list));
     }
-    let held_channels: BTreeSet<Vec<u8>> = lists
+    let held_items: BTreeSet<Key> = lists
         .held()
         .iter()
         .map(AnyAct::key)
         .chain(lists.freed.keys().cloned())
-        .filter(|(part, _)| *part == Part::Channel)
-        .map(|(_, item)| item)
         .collect();
     let freed = &lists.freed;
     let above = |key: &Key| freed.get(key).map(|freed| Order::of_freed(freed, makers));
-    let chosen = newest_of_each(candidates, &held_channels, above, makers);
+    let chosen = newest_of_each(candidates, &held_items, above, makers, &Checked::default());
 
     // The act now held on each item keeps its first holding where it is
     // the act held before; another act on the item is first held now.
@@ -669,7 +708,8 @@ fn free(lists: &mut Lists, act: &AnyAct, now: i64) {
 }
 
 /// A device whose own list is not fresh to itself comes back (§3.4, "a
-/// device that comes back"): it takes out of its own list each item that
+/// device that comes back"): it takes out of its own list, and of what it
+/// left out of it, each item that
 /// it held at its previous whole fetch, `previous`, and has made no act on
 /// since, where another device that counts has a list fresh to it, whose
 /// fetched time is after the item's time, and which holds nothing for the
@@ -689,7 +729,12 @@ fn come_back(lists: &mut Lists, others: &[Read], previous: Option<i64>, now: i64
         .into_iter()
         .filter(|act| !let_go(act))
         .collect();
+    let left_out: Vec<AnyAct> = acts_of(&lists.left_out)
+        .into_iter()
+        .filter(|act| !let_go(act))
+        .collect();
     lists.list = list_of(list, lists.list.fetched);
+    lists.left_out = list_of(left_out, 0);
 }
 
 /// The time and the count that a new act on `key` is dated with (§3.4):
@@ -703,14 +748,25 @@ fn come_back(lists: &mut Lists, others: &[Read], previous: Option<i64>, now: i64
 ///
 /// The acts of removed keys are left out of that last part, so that a
 /// thief cannot lift the dating of every item.
-fn dated(lists: &Lists, others: &[Read], makers: &Makers, key: &Key, now: i64) -> (u64, u64) {
+fn dated(
+    lists: &Lists,
+    others: &[Read],
+    makers: &Makers,
+    checked: &Checked,
+    key: &Key,
+    now: i64,
+) -> (u64, u64) {
     let now = u64::try_from(now).unwrap_or(0);
     let ahead = now.saturating_add(KEPT_SECS as u64);
     let mut held = lists.held();
     for read in others {
         held.extend(acts_of(&read.list));
     }
-    let held: Vec<AnyAct> = held.into_iter().filter(AnyAct::holds).collect();
+    // What a device would not take does not date its acts.
+    let held: Vec<AnyAct> = held
+        .into_iter()
+        .filter(|act| checked.takes(act, makers))
+        .collect();
     let freed = lists.freed.get(key);
 
     let of_item = held
@@ -726,7 +782,7 @@ fn dated(lists: &Lists, others: &[Read], makers: &Makers, key: &Key, now: i64) -
         .chain(std::iter::once(lists.list.fetched));
     let of_others = held
         .iter()
-        .filter(|act| makers.maker(&act.maker()) == Maker::Counts)
+        .filter(|act| makers.maker(&act.maker()) == Some(Maker::Counts))
         .map(AnyAct::time)
         .chain(fetched)
         .map(|time| time.min(ahead))
@@ -745,7 +801,7 @@ fn dated(lists: &Lists, others: &[Read], makers: &Makers, key: &Key, now: i64) -
         .filter(|act| {
             act.key() == *key
                 && act.time() == SHARED_ACT_TIME_MAX
-                && makers.maker(&act.maker()) == Maker::Counts
+                && makers.maker(&act.maker()) == Some(Maker::Counts)
         })
         .map(AnyAct::count)
         .chain(
@@ -852,83 +908,90 @@ pub fn act(
 ) -> Result<Done, PersonError> {
     in_one(conn, || {
         let standing = Standing::to_write(conn)?;
-        let makers = Makers::of(&standing);
+        let makers = Makers::of(conn, &standing)?;
         let own = identity.public_key();
         let others = lists_held(conn, &standing, &own)?;
         let mut lists = Lists::load(conn)?;
-        let filed = |channel: &[u8; 32], lists: &Lists| {
-            lists
-                .list
-                .filings
-                .iter()
-                .any(|f| f.item.channel == *channel)
+        let checked = Checked::default();
+        // What the device holds on an item: in its list, or left out.
+        let held = lists.held();
+        let held_on = |key: &Key| held.iter().find(|act| act.key() == *key);
+        // A place is taken by an item in force in the list (§3.4): an act
+        // not in force, or one left out past a bound, takes none.
+        let in_list: Vec<AnyAct> = acts_of(&lists.list)
+            .into_iter()
+            .filter(|act| makers.maker(&act.maker()).is_some_and(Maker::in_force))
+            .collect();
+        let placed = |key: &Key| in_list.iter().any(|act| act.key() == *key);
+        let full = |of: fn(&AnyAct) -> bool, most: usize, key: &Key| {
+            in_list.iter().filter(|act| of(act)).count() >= most && !placed(key)
         };
-        let made = match &what {
+        let filed = |channel: &[u8; 32]| {
+            let key = (Part::Channel, channel.to_vec());
+            matches!(held_on(&key), Some(AnyAct::Filing(_)))
+        };
+        let dated_for = |key: &Key| dated(&lists, &others, &makers, &checked, key, now);
+        let made: Result<Vec<AnyAct>, ListError> = match &what {
             Do::File(filing) => {
-                let full = lists.list.filings.len() >= SHARED_MAX_CHANNELS;
-                if full && !filed(&filing.channel, &lists) {
+                let key = (Part::Channel, filing.channel.to_vec());
+                let of = |act: &AnyAct| matches!(act, AnyAct::Filing(_));
+                if full(of, SHARED_MAX_CHANNELS, &key) {
                     return Ok(Done::Refused(Refused::Full(Part::Channel)));
                 }
-                make(&lists, &others, &makers, filing.clone(), identity, now)
-                    .map(|act| vec![AnyAct::Filing(act)])
+                make(filing.clone(), dated_for(&key), identity).map(|a| vec![AnyAct::Filing(a)])
             }
             Do::Drop(channel) => {
-                if !filed(channel, &lists) {
+                if !filed(channel) {
                     return Ok(Done::Refused(Refused::NotFiled));
                 }
+                let key = (Part::Channel, channel.to_vec());
                 let dropped = Dropped { channel: *channel };
-                make(&lists, &others, &makers, dropped, identity, now)
-                    .map(|act| vec![AnyAct::Drop(act)])
+                make(dropped, dated_for(&key), identity).map(|a| vec![AnyAct::Drop(a)])
             }
             Do::Move { from, to } => {
-                if !filed(from, &lists) {
+                if !filed(from) {
                     return Ok(Done::Refused(Refused::NotFiled));
                 }
-                if filed(&to.channel, &lists) {
+                let key = (Part::Channel, to.channel.to_vec());
+                if placed(&key) {
                     return Ok(Done::Refused(Refused::Filed));
                 }
+                let from_key = (Part::Channel, from.to_vec());
                 let dropped = Dropped { channel: *from };
-                let filing = make(&lists, &others, &makers, to.clone(), identity, now);
-                let drop = make(&lists, &others, &makers, dropped, identity, now);
+                let filing = make(to.clone(), dated_for(&key), identity);
+                let drop = make(dropped, dated_for(&from_key), identity);
                 filing.and_then(|filing| Ok(vec![AnyAct::Filing(filing), AnyAct::Drop(drop?)]))
             }
             Do::Subscribe(subscription) => {
-                let held = lists.list.subscriptions.iter().find(|held| {
-                    held.item.channel == subscription.channel
-                        && held.item.agent == subscription.agent
-                });
-                if !subscription.subscribed && held.is_none_or(|held| !held.item.subscribed) {
+                let key = (Part::Subscription, subscription.item());
+                let subscribed = matches!(
+                    held_on(&key),
+                    Some(AnyAct::Subscription(held)) if held.item.subscribed
+                );
+                if !subscription.subscribed && !subscribed {
                     return Ok(Done::Refused(Refused::NothingToUndo));
                 }
-                let full = lists.list.subscriptions.len() >= SHARED_MAX_SUBSCRIPTIONS;
-                if full && held.is_none() {
+                let of = |act: &AnyAct| matches!(act, AnyAct::Subscription(_));
+                if full(of, SHARED_MAX_SUBSCRIPTIONS, &key) {
                     return Ok(Done::Refused(Refused::Full(Part::Subscription)));
                 }
-                make(
-                    &lists,
-                    &others,
-                    &makers,
-                    subscription.clone(),
-                    identity,
-                    now,
-                )
-                .map(|act| vec![AnyAct::Subscription(act)])
+                make(subscription.clone(), dated_for(&key), identity)
+                    .map(|a| vec![AnyAct::Subscription(a)])
             }
             Do::Label(label) => {
-                let held = lists
-                    .list
-                    .labels
-                    .iter()
-                    .find(|held| held.item.key == label.key);
-                if label.label.is_none() && held.is_none_or(|held| held.item.label.is_none()) {
+                let key = (Part::Label, label.key.to_vec());
+                let labelled = matches!(
+                    held_on(&key),
+                    Some(AnyAct::Label(held)) if held.item.label.is_some()
+                );
+                if label.label.is_none() && !labelled {
                     return Ok(Done::Refused(Refused::NothingToUndo));
                 }
-                let full = lists.list.labels.len() >= SHARED_MAX_LABELS;
-                if full && held.is_none() {
+                let of = |act: &AnyAct| matches!(act, AnyAct::Label(_));
+                if full(of, SHARED_MAX_LABELS, &key) {
                     return Ok(Done::Refused(Refused::Full(Part::Label)));
                 }
-                make(&lists, &others, &makers, label.clone(), identity, now)
-                    .map(|act| vec![AnyAct::Label(act)])
+                make(label.clone(), dated_for(&key), identity).map(|a| vec![AnyAct::Label(a)])
             }
         };
         let made = match made {
@@ -962,40 +1025,15 @@ pub fn act(
     })
 }
 
-/// An act on `item`, dated for it and signed by `identity`; refused where
-/// what the item holds cannot be written in a list.
-fn make<T: InPart>(
-    lists: &Lists,
-    others: &[Read],
-    makers: &Makers,
+/// An act on `item`, dated with `(time, count)` and signed by
+/// `identity`; refused where what the item holds cannot be written in a
+/// list.
+fn make<T: Item>(
     item: T,
+    (time, count): (u64, u64),
     identity: &NodeIdentity,
-    now: i64,
 ) -> Result<Act<T>, ListError> {
-    let key = (T::PART, item.item());
-    let (time, count) = dated(lists, others, makers, &key, now);
     Act::make(item, time, count, identity, is_a_name)
-}
-
-/// What each kind of item is within.
-trait InPart: Item {
-    const PART: Part;
-}
-
-impl InPart for Filing {
-    const PART: Part = Part::Channel;
-}
-
-impl InPart for Dropped {
-    const PART: Part = Part::Channel;
-}
-
-impl InPart for Subscription {
-    const PART: Part = Part::Subscription;
-}
-
-impl InPart for Label {
-    const PART: Part = Part::Label;
 }
 
 /// What a device does at a whole fetch of the personal channel, a pull
@@ -1010,17 +1048,20 @@ impl InPart for Label {
 /// The fetch's time is kept whatever the device holds: it is the fetched
 /// time its next act is written with. A device that holds nothing, where
 /// no other device of the person's has written a list, writes no list. A
-/// device that does not stand applied does nothing.
+/// device that does not stand applied does nothing; one whose database
+/// cannot be read says so.
 pub fn fetched_whole(
     conn: &Connection,
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<bool, PersonError> {
     in_one(conn, || {
-        let Ok(standing) = Standing::to_write(conn) else {
-            return Ok(false);
+        let standing = match Standing::to_write(conn) {
+            Ok(standing) => standing,
+            Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_)) => return Ok(false),
+            Err(e) => return Err(e),
         };
-        let makers = Makers::of(&standing);
+        let makers = Makers::of(conn, &standing)?;
         let others = lists_held(conn, &standing, &identity.public_key())?;
         let mut lists = Lists::load(conn)?;
         let before = lists.list.clone();
@@ -1063,9 +1104,11 @@ pub fn holds(conn: &Connection) -> Result<Holds, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
         return Ok(Holds::default());
     };
-    let makers = Makers::of(&standing);
+    let makers = Makers::of(conn, &standing)?;
     let lists = Lists::load(conn)?;
-    let with = |maker: [u8; 32]| makers.maker(&maker);
+    // A device takes no act of a key it does not know, so its list holds
+    // none.
+    let with = |maker: [u8; 32]| makers.maker(&maker).unwrap_or(Maker::InNoList);
     Ok(Holds {
         filings: lists
             .list
@@ -1130,6 +1173,26 @@ pub fn ahead_of_this_clock(
         .collect())
 }
 
+/// Each other device of the person's whose list, as this device holds
+/// it, was first held less than 90 days before `now` and says a fetched
+/// time 90 days or more behind this device's clock, with that time: it is
+/// not fresh, so none of its acts are taken here, and one of the two
+/// clocks is off (§3.4, "a clock that is wrong").
+pub fn behind_this_clock(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<Vec<([u8; 32], u64)>, PersonError> {
+    let Ok(standing) = Standing::of(conn) else {
+        return Ok(Vec::new());
+    };
+    Ok(lists_held(conn, &standing, &identity.public_key())?
+        .into_iter()
+        .filter(|read| now - read.first_held < KEPT_SECS && !read.is_fresh(now))
+        .map(|read| (read.writer, read.list.fetched))
+        .collect())
+}
+
 /// What the person answered of a device at a recovery (decision
 /// 2026-10-04 §9, step 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1148,8 +1211,9 @@ pub enum Answered {
 /// act on each item among the lists that are fresh to it, each part kept
 /// within its bound, as the list of the new machine and what it leaves
 /// out. `maker` says what each maker is under the statement the recovery
-/// makes: a device answered `lost` or `hands` is a removed key, and one
-/// answered `have` is in no list.
+/// makes: a device answered `lost` or `hands` is a removed key, one
+/// answered `have` is in no list, and a key that is none of these is no
+/// maker whose acts are taken.
 ///
 /// A list is fresh to a recovery where its fetched time is less than 90
 /// days behind the newest fetched time among the lists it reads, each
@@ -1159,7 +1223,7 @@ pub enum Answered {
 /// device, the newest is theirs.
 pub fn recovered(
     lists: &[([u8; 32], Answered, SharedList)],
-    maker: impl Fn(&[u8; 32]) -> Maker,
+    maker: impl Fn(&[u8; 32]) -> Option<Maker>,
     now: i64,
 ) -> (SharedList, SharedList) {
     let at = |list: &SharedList| i64::try_from(list.fetched).unwrap_or(i64::MAX).min(now);
@@ -1178,7 +1242,8 @@ pub fn recovered(
         .iter()
         .filter(|(_, _, list)| newest - at(list) < KEPT_SECS)
         .flat_map(|(_, _, list)| acts_of(list));
-    let chosen = newest_of_each(fresh, &BTreeSet::new(), |_| None, &makers);
+    let checked = Checked::default();
+    let chosen = newest_of_each(fresh, &BTreeSet::new(), |_| None, &makers, &checked);
     let bounded = within_bounds(chosen, &makers);
     (list_of(bounded.list, 0), list_of(bounded.left_out, 0))
 }
@@ -1186,11 +1251,10 @@ pub fn recovered(
 impl Makers {
     /// The makers that `maker` says, for every maker of an act in `lists`.
     fn from_fn(
-        maker: impl Fn(&[u8; 32]) -> Maker,
+        maker: impl Fn(&[u8; 32]) -> Option<Maker>,
         lists: &[([u8; 32], Answered, SharedList)],
     ) -> Self {
-        let mut counting = Vec::new();
-        let mut removed = Vec::new();
+        let (mut counting, mut removed, mut left_out) = (Vec::new(), Vec::new(), Vec::new());
         let keys: BTreeSet<[u8; 32]> = lists
             .iter()
             .flat_map(|(_, _, list)| acts_of(list))
@@ -1198,14 +1262,16 @@ impl Makers {
             .collect();
         for key in keys {
             match maker(&key) {
-                Maker::Counts => counting.push(key),
-                Maker::Removed => removed.push(key),
-                Maker::InNoList => {}
+                Some(Maker::Counts) => counting.push(key),
+                Some(Maker::Removed) => removed.push(key),
+                Some(Maker::InNoList) => left_out.push(key),
+                None => {}
             }
         }
         Self {
             counting: Counting::of_devices(&counting),
             removed,
+            left_out,
         }
     }
 }
@@ -1631,18 +1697,11 @@ pub(crate) mod tests {
         assert!(fetch_from(&s, &[1], 0, now + 3));
         let held = kept(&s, 0);
         let keys: Vec<[u8; 32]> = held.labels.iter().map(|a| a.item.key).collect();
-        assert_eq!(keys, [[2; 32], [6; 32]]);
+        assert_eq!(keys, [[6; 32]]);
         assert_eq!(labelled(&s, 0, 6), Some(Some("six".into())));
-        assert_eq!(labelled(&s, 0, 2), None);
-        let holds = holds(&s[0].conn).unwrap();
-        let never_held = holds
-            .labels
-            .iter()
-            .find(|(a, _)| a.item.key == [2; 32])
-            .unwrap();
-        assert_eq!(never_held.1, Maker::InNoList);
-        assert_eq!(never_held.0, never);
-        for key in [1, 3, 4, 5, 8] {
+        assert!(!acts_of(&held).contains(&AnyAct::Label(never)));
+        assert!(holds(&s[0].conn).unwrap().left_out.is_empty());
+        for key in [1, 2, 3, 4, 5, 8] {
             assert_eq!(labelled(&s, 0, key), None, "{key}");
         }
     }
@@ -1691,7 +1750,13 @@ pub(crate) mod tests {
         s.add(0, 3);
         now = s.now + 1;
         fetch_from(&s, &[0, 1], 3, now);
-        for n in [0, 1, 3] {
+        // The tablet never counted the phone: the phone is no maker it
+        // knows, and it holds none of its acts.
+        fetch_from(&s, &[0, 1], 3, now + 1);
+        assert!(holds(&s[3].conn).unwrap().labels.is_empty());
+        assert!(holds(&s[3].conn).unwrap().subscriptions.is_empty());
+        assert!(!is_filed_under(&s[3].conn, "review").unwrap());
+        for n in [0, 1] {
             fetch_from(&s, &[0, 1, 3], n, now + 1);
             assert_eq!(labelled(&s, n, 9), None, "device {n}");
             assert_eq!(
@@ -1753,6 +1818,7 @@ pub(crate) mod tests {
         }
         let made = on(&s, 0, Do::Subscribe(subscription(1, "notes", true)), ahead);
         assert_eq!(at(&made[0]), ahead + 1);
+        fetch_from(&s, &[0], 2, now + 1);
         fetch_from(&s, &[0], 1, now + 1);
         assert_eq!(subscribes(&s, 1, 1, "notes"), Some(true));
         let undone = on(
@@ -2068,6 +2134,7 @@ pub(crate) mod tests {
         let ahead = now + 120 * DAY;
         fetch(&s, 0, ahead);
         on(&s, 0, Do::Subscribe(subscription(1, "notes", true)), ahead);
+        fetch_from(&s, &[0], 1, now + 9);
         on(
             &s,
             0,
@@ -2251,16 +2318,11 @@ pub(crate) mod tests {
             );
         }
         let t = now + 400;
-        for k in 0..20u8 {
-            on(
-                &s,
-                0,
-                Do::Subscribe(subscription(200, &format!("a{k:02}"), true)),
-                t + 200 + i64::from(k),
-            );
-        }
+        // The 13 the desktop undoes, each subscribed on both devices first:
+        // an undo is taken only of what a device holds or held.
         for k in 0..13u8 {
             let agent = format!("u{k:02}");
+            on(&s, 0, Do::Subscribe(subscription(200, &agent, true)), t);
             on(&s, 1, Do::Subscribe(subscription(200, &agent, true)), t);
             on(
                 &s,
@@ -2269,6 +2331,21 @@ pub(crate) mod tests {
                 t + 100 + i64::from(k),
             );
         }
+        // 19 more on the laptop, which fill its 32, and one on the desktop.
+        for k in 0..19u8 {
+            on(
+                &s,
+                0,
+                Do::Subscribe(subscription(200, &format!("a{k:02}"), true)),
+                t + 200 + i64::from(k),
+            );
+        }
+        on(
+            &s,
+            1,
+            Do::Subscribe(subscription(200, "a19", true)),
+            t + 250,
+        );
         // And 65 labels between them.
         let t = now + 700;
         for k in 0..65u8 {
@@ -3007,9 +3084,9 @@ pub(crate) mod tests {
         let tablet = list(vec![draft(3, label_at(5, at(301)))], now - 300 * DAY);
         let maker = |key: &[u8; 32]| {
             if *key == s.key(0) {
-                Maker::InNoList
+                Some(Maker::InNoList)
             } else {
-                Maker::Removed
+                Some(Maker::Removed)
             }
         };
         let lists = [
@@ -3099,7 +3176,7 @@ pub(crate) mod tests {
     #[test]
     fn two_acts_on_one_item_are_ordered_by_time_maker_count_key_and_bytes() {
         let s = person(3, 3);
-        let makers = Makers::of(&standing(&s, 0));
+        let makers = Makers::of(&s[0].conn, &standing(&s, 0)).unwrap();
         let stranger = NodeIdentity::from_seed([0x77; 32]).unwrap();
         let (high, low) = (&s[0].identity, &s[1].identity);
         assert!(high.public_key() > low.public_key());
@@ -3136,8 +3213,13 @@ pub(crate) mod tests {
     #[test]
     fn a_new_act_is_dated_above_what_the_device_holds() {
         let s = person(3, 3);
-        let makers = Makers::of(&standing(&s, 0));
+        // A key the last statement left out, which the device knows, and
+        // one it does not.
         let stranger = NodeIdentity::from_seed([0x77; 32]).unwrap();
+        let unknown = NodeIdentity::from_seed([0x66; 32]).unwrap();
+        cordelia_storage::acts::note_left_out(&s[0].conn, &stranger.public_key(), "phone", 1, 1)
+            .unwrap();
+        let makers = Makers::of(&s[0].conn, &standing(&s, 0)).unwrap();
         let now: i64 = 1_000_000_000;
         let clock = u64::try_from(now).unwrap();
         let ahead = u64::try_from(KEPT_SECS).unwrap();
@@ -3165,14 +3247,23 @@ pub(crate) mod tests {
             lists.freed.insert(key.clone(), freed);
             lists
         };
-        let dated_with =
-            |lists: &Lists, others: &[Read], key: &Key| dated(lists, others, &makers, key, now);
+        let dated_with = |lists: &Lists, others: &[Read], key: &Key| {
+            dated(lists, others, &makers, &Checked::default(), key, now)
+        };
 
         assert_eq!(dated_with(&Lists::default(), &[], &key), (clock + 1, 0));
-        // The item's own newest time, uncapped, of any maker.
+        // The item's own newest time, uncapped, of any maker it takes.
         let far = clock + 5 * ahead;
         let lists = with(vec![act_on(&stranger, 9, far, 0)]);
         assert_eq!(dated_with(&lists, &[], &key), (far + 1, 0));
+        // Not of a key it does not know, nor of an act that does not hold.
+        let lists = with(vec![act_on(&unknown, 9, far, 0)]);
+        assert_eq!(dated_with(&lists, &[], &key), (clock + 1, 0));
+        let mut forged = act_on(&s[1].identity, 9, far, 0);
+        if let AnyAct::Label(act) = &mut forged {
+            act.signature[0] ^= 1;
+        }
+        assert_eq!(dated_with(&with(vec![forged]), &[], &key), (clock + 1, 0));
         assert_eq!(dated_with(&lists, &[], &other_key), (clock + 1, 0));
         // An act freed on the item.
         assert_eq!(
@@ -3275,5 +3366,301 @@ pub(crate) mod tests {
         assert_eq!(kept(&s, 0).subscriptions.len(), 1);
         fetch(&s, 0, undone_at + 1 + KEPT_SECS);
         assert!(kept(&s, 0).subscriptions.is_empty());
+    }
+
+    // ── Makers the person never had, places, and undoes of nothing ──────
+
+    /// The acts of a key that was never a device of the person's, as the
+    /// device knows them, are not taken at all (decision 2026-10-10
+    /// §3.4): a drop of the person's channel signed by such a key, in a
+    /// list of a device that counts, undoes nothing, and 16 filings of it
+    /// take no place; nor does a removal of the device whose list held
+    /// them make them anything.
+    #[test]
+    fn an_act_of_a_key_the_person_never_had_undoes_nothing_and_takes_no_place() {
+        let mut s = person(3, 3);
+        let mut now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        on(&s, 0, Do::File(filing(1, "review")), now + 1);
+        let stranger = NodeIdentity::from_seed([0x55; 32]).unwrap();
+        let at = u64::try_from(now + 2).unwrap();
+        let mut acts = vec![AnyAct::Drop(
+            Act::make(
+                Dropped {
+                    channel: channel(1),
+                },
+                at,
+                0,
+                &stranger,
+                is_a_name,
+            )
+            .unwrap(),
+        )];
+        for seed in 100..116 {
+            let made = Act::make(filing(seed, "theirs"), at, 0, &stranger, is_a_name);
+            acts.push(AnyAct::Filing(made.unwrap()));
+        }
+        write_by_hand(&s, 1, &s.key(1), value_of(acts, at), now + 3);
+        fetch_from(&s, &[1], 0, now + 4);
+        assert_eq!(filed(&s, 0), ["review"]);
+        assert_eq!(acts_of(&kept(&s, 0)).len(), 1);
+        on(&s, 0, Do::File(filing(2, "design")), now + 5);
+        s.now = now + 6;
+        s.change(0, &[0, 2], &[1]);
+        now = s.now + 1;
+        give(&s, 0, 2, now);
+        for n in [0, 2] {
+            fetch_from(&s, &[0, 1, 2], n, now);
+            assert_eq!(filed(&s, n), ["design", "review"], "device {n}");
+        }
+    }
+
+    /// A place is taken by an item in force alone (decision 2026-10-10
+    /// §3.4): with 16 filings of a key a settlement left out, held and not
+    /// in force, the laptop files a channel, and holds it in force before
+    /// them. A rename of a filing that is left out takes a place as a new
+    /// filing does; a drop of it needs none.
+    #[test]
+    fn a_place_is_taken_only_by_an_item_in_force() {
+        let mut s = person(3, 3);
+        let mut now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        for seed in 100..116 {
+            on(&s, 2, Do::File(filing(seed, &format!("p{seed}"))), now + 1);
+        }
+        fetch_from(&s, &[2], 0, now + 2);
+        s.now = now + 3;
+        s.change(0, &[0, 1], &[]);
+        now = s.now + 1;
+        fetch(&s, 0, now);
+        assert!(filed(&s, 0).is_empty());
+        assert_eq!(kept(&s, 0).filings.len(), 16);
+        on(&s, 0, Do::File(filing(1, "review")), now + 1);
+        assert_eq!(filed(&s, 0), ["review"]);
+        let held = holds(&s[0].conn).unwrap();
+        assert_eq!(held.filings.len(), 16);
+        assert_eq!(held.left_out.len(), 1);
+        // The left-out filing, renamed, would be a new item in force.
+        for seed in 2..17 {
+            on(&s, 0, Do::File(filing(seed, &format!("c{seed}"))), now + 2);
+        }
+        let left = match &holds(&s[0].conn).unwrap().left_out[..] {
+            [(AnyAct::Filing(left), _), ..] => left.item.channel,
+            other => panic!("{other:?}"),
+        };
+        let rename = Filing {
+            channel: left,
+            ..filing(100, "renamed")
+        };
+        let rename = Filing {
+            card: holds(&s[0].conn)
+                .unwrap()
+                .left_out
+                .iter()
+                .find_map(|(act, _)| match act {
+                    AnyAct::Filing(a) if a.item.channel == left => Some(a.item.card.clone()),
+                    _ => None,
+                })
+                .unwrap(),
+            ..rename
+        };
+        assert_eq!(
+            refused(&s, 0, Do::File(rename), now + 3),
+            Refused::Full(Part::Channel)
+        );
+        on(&s, 0, Do::Drop(left), now + 3);
+    }
+
+    /// An unsubscription or a removed label is taken only of what this
+    /// device holds or held, or what a list it takes does (decision
+    /// 2026-10-10 §3.4): the desktop's list undoes a subscription and a
+    /// label that nobody made, and the laptop takes neither; it takes the
+    /// undoing of its own.
+    #[test]
+    fn an_undo_of_what_nobody_did_is_not_taken() {
+        let s = person(2, 2);
+        let now = s.now + 10;
+        for n in 0..2 {
+            fetch(&s, n, now);
+        }
+        on(
+            &s,
+            0,
+            Do::Subscribe(subscription(1, "notes", true)),
+            now + 1,
+        );
+        on(&s, 0, Do::Label(label(4, Some("bob"))), now + 1);
+        let at = u64::try_from(now + 50).unwrap();
+        let by = &s[1].identity;
+        let undo =
+            |sub: Subscription| AnyAct::Subscription(Act::make(sub, at, 0, by, is_a_name).unwrap());
+        let unlabel =
+            |key| AnyAct::Label(Act::make(label(key, None), at, 0, by, is_a_name).unwrap());
+        let mut acts: Vec<AnyAct> = (0..31)
+            .map(|k| undo(subscription(2, &format!("x{k:02}"), false)))
+            .collect();
+        acts.push(undo(subscription(1, "notes", false)));
+        acts.push(unlabel(5));
+        acts.push(unlabel(4));
+        write_by_hand(&s, 1, &s.key(1), value_of(acts, at), now + 3);
+        fetch_from(&s, &[1], 0, now + 4);
+        let held = kept(&s, 0);
+        assert_eq!(held.subscriptions.len(), 1);
+        assert_eq!(held.labels.len(), 1);
+        assert_eq!(subscribes(&s, 0, 1, "notes"), Some(false));
+        assert_eq!(labelled(&s, 0, 4), Some(None));
+        on(
+            &s,
+            0,
+            Do::Subscribe(subscription(3, "notes", true)),
+            now + 5,
+        );
+    }
+
+    /// Past a bound the makers that count come first, and then within
+    /// each the undone items (decision 2026-10-10 §3.4): a phone in
+    /// someone else's hands subscribes 32 agents and unsubscribes them,
+    /// and while it counts its undoes push the laptop's subscription out;
+    /// once it is removed, the laptop's own is back in force, and the
+    /// phone's undoes give way.
+    #[test]
+    fn past_a_bound_the_makers_that_count_come_before_a_removed_keys_undoes() {
+        let mut s = person(3, 3);
+        let mut now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        on(
+            &s,
+            0,
+            Do::Subscribe(subscription(1, "notes", true)),
+            now + 1,
+        );
+        for k in 0..32 {
+            let agent = format!("x{k:02}");
+            on(&s, 2, Do::Subscribe(subscription(2, &agent, true)), now + 2);
+        }
+        fetch_from(&s, &[2], 0, now + 3);
+        for k in 0..32 {
+            let agent = format!("x{k:02}");
+            on(
+                &s,
+                2,
+                Do::Subscribe(subscription(2, &agent, false)),
+                now + 4,
+            );
+        }
+        fetch_from(&s, &[2], 0, now + 5);
+        assert_eq!(subscribes(&s, 0, 1, "notes"), None);
+        s.now = now + 6;
+        s.change(0, &[0, 1], &[2]);
+        now = s.now + 1;
+        fetch(&s, 0, now);
+        assert_eq!(subscribes(&s, 0, 1, "notes"), Some(true));
+        let left = holds(&s[0].conn).unwrap().left_out;
+        assert_eq!(left.len(), 1);
+        assert!(
+            matches!(&left[0], (AnyAct::Subscription(a), Maker::Removed) if !a.item.subscribed)
+        );
+    }
+
+    /// A list whose fetched time is 90 days or more behind the reader's
+    /// clock, first held in the last 90 days, is not fresh, so none of its
+    /// acts are taken; the reader names it as of a device whose clock is
+    /// off, and that device names the reader's list as ahead of its own
+    /// (decision 2026-10-10 §3.4, "a clock that is wrong").
+    #[test]
+    fn a_list_whose_clock_is_90_days_behind_is_named_and_not_taken() {
+        let s = person(2, 2);
+        let now = s.now + 400 * DAY;
+        let behind = now - 100 * DAY;
+        fetch(&s, 0, now);
+        fetch(&s, 1, behind);
+        on(&s, 1, Do::Label(label(4, Some("bob"))), behind);
+        fetch_from(&s, &[1], 0, now);
+        assert_eq!(labelled(&s, 0, 4), None);
+        let named = behind_this_clock(&s[0].conn, &s[0].identity, now).unwrap();
+        assert_eq!(named, [(s.key(1), u64::try_from(behind).unwrap())]);
+        assert!(
+            behind_this_clock(&s[0].conn, &s[0].identity, now + KEPT_SECS)
+                .unwrap()
+                .is_empty()
+        );
+        let fresh_enough = now - KEPT_SECS + 1;
+        assert!(
+            behind_this_clock(&s[0].conn, &s[0].identity, fresh_enough)
+                .unwrap()
+                .is_empty()
+        );
+        on(&s, 0, Do::Label(label(5, Some("carol"))), now + 1);
+        give(&s, 0, 1, behind + 1);
+        let ahead = ahead_of_this_clock(&s[1].conn, &s[1].identity, behind + 1).unwrap();
+        assert_eq!(ahead.len(), 1);
+        assert_eq!(ahead[0].0, s.key(0));
+        // Its clock put right, the desktop's list is taken.
+        fetch(&s, 1, now + 2);
+        fetch_from(&s, &[1], 0, now + 3);
+        assert_eq!(labelled(&s, 0, 4), Some(Some("bob".into())));
+    }
+
+    /// A device that comes back takes out of what it left out past a
+    /// bound, as of its list, what the others have let go (decision
+    /// 2026-10-10 §3.4): the desktop takes the laptop's 15 filings, files
+    /// two of its own and leaves out the oldest; the laptop, which never
+    /// took the desktop's, drops that channel and frees the drop. The
+    /// desktop, back after 91 days, holds nothing of it, and it does not
+    /// come back when a place is freed.
+    #[test]
+    fn a_device_that_comes_back_takes_out_what_it_left_out_too() {
+        let s = person(3, 3);
+        let now = s.now + 10;
+        for n in 0..3 {
+            fetch(&s, n, now);
+        }
+        for seed in 0..15 {
+            on(
+                &s,
+                0,
+                Do::File(filing(seed, &format!("c{seed:02}"))),
+                now + 1,
+            );
+        }
+        fetch_from(&s, &[0], 1, now + 2);
+        on(&s, 1, Do::File(filing(15, "c15")), now + 100);
+        on(&s, 2, Do::File(filing(16, "c16")), now + 100);
+        fetch_from(&s, &[2], 1, now + 101);
+        let left = holds(&s[1].conn).unwrap().left_out;
+        assert!(matches!(&left[..], [(AnyAct::Filing(a), _)] if a.item.name == "c00"));
+        fetch(&s, 1, now + 101);
+        // The laptop drops it, and frees the drop after 90 days.
+        on(&s, 0, Do::Drop(channel(0)), now + 3);
+        for day in [30, 60, 91] {
+            fetch(&s, 0, now + day * DAY);
+        }
+        assert!(kept(&s, 0).drops.is_empty());
+        let back = now + 92 * DAY;
+        fetch_from(&s, &[0], 1, back);
+        assert!(holds(&s[1].conn).unwrap().left_out.is_empty());
+        on(&s, 1, Do::Drop(channel(1)), back + 1);
+        fetch(&s, 1, back + 2);
+        assert!(!filed(&s, 1).contains(&"c00".to_string()));
+        assert!(filed(&s, 1).len() < 16);
+    }
+
+    /// A whole fetch on a device whose database cannot be read is an
+    /// error, and not a fetch at which nothing was done.
+    #[test]
+    fn a_whole_fetch_that_cannot_read_the_database_says_so() {
+        let s = person(1, 1);
+        s[0].conn
+            .execute("DROP TABLE person_additions", [])
+            .unwrap();
+        assert!(fetched_whole(&s[0].conn, &s[0].identity, s.now + 1).is_err());
+        let alone = Several::new(1);
+        assert!(!fetched_whole(&alone[0].conn, &alone[0].identity, alone.now).unwrap());
     }
 }
