@@ -1494,10 +1494,13 @@ the bytes that a key and its address may be handed in a minute. A relay
 sizes a page of a channel so that this much is left in both allowances, and
 only the entry that answers a show may use it: a device that pulls at its
 full rate, or shares its address with one that does, is still told of a
-removal. A whole page can still be handed beside it: `protocol.rs` asserts
-that the room is less than half of a minute's allowance and that a full
-page is within the allowance, and the two together are 1,086,464 bytes of
-the 2,097,152.
+removal. A device keeps the same room back when it paces what it takes from
+a relay: it asks for no page that the relay would refuse for it, and a read
+that would have ended there waits for the minute instead (decision
+2026-10-17 §3.2). A whole page can still be handed beside it: `protocol.rs`
+asserts that the room is less than half of a minute's allowance and that a
+full page is within the allowance, and the two together are 1,086,464 bytes
+of the 2,097,152.
 
 **What is not defended:** whoever shows entries of its own from the same
 address can still use that room up (decision §2.5).
@@ -1632,10 +1635,15 @@ is slow. A recovery counts it in readings of `CARRY_READ_MAX_SECS`
 120 = 5.
 
 **Rationale:** How many readings a recovery makes of the personal channel
-of the change it recovers from, at most (decision 2026-10-17 §3.2). Each
-round is one, and so is each reading again of a relay whose connection
-changed. The bound is counted in readings and not in seconds since the
-first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
+of the change it recovers from at each relay, at most (decision 2026-10-17
+§3.2). Each reading of a relay is one of its own, whether it hands part
+of the channel or says its connection changed, so that what one relay does
+never costs another a reading; so there are five rounds at most. The first
+round is the read of today, which reads a relay whose connection changed
+again within it, `CARRY_PROOFS_MADE_AGAIN` times at most, each one of that
+relay's readings: so the whole read is up to seven readings long where a
+connection changes in the first round, and five where none does. The bound
+is counted in readings and not in seconds since the first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
 (a page in flight at its end, the handing of what it read to the command)
 never costs the fifth reading, which a channel at its cap needs: four
 readings of a relay that hands what it may come to about 15.5 MiB.
