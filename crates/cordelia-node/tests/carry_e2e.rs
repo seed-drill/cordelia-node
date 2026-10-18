@@ -927,8 +927,9 @@ fn lets_go_once_the_relay_is_read(laptop: &Node) -> String {
 
 /// The desktop alone syncs `lab`, writes two files, and is then off for
 /// good. The laptop renews, and holds nothing of the name in the new
-/// generation. Returns the relay, the laptop, and the desktop, stopped.
-fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node) {
+/// generation. Returns the relay, the laptop, the desktop, stopped, and
+/// the recovery phrase.
+fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node, String) {
     let relay = relay_started();
     let laptop = device_started("laptop", &relay);
     let mut desktop = device_started("desktop", &relay);
@@ -956,7 +957,7 @@ fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node) {
         180,
         || has_sent_everything(&laptop),
     );
-    (relay, laptop, desktop)
+    (relay, laptop, desktop, words)
 }
 
 /// **A carried name is not let go while no relay holds what it brought**
@@ -969,7 +970,7 @@ fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node) {
 /// the name is let go, saying that a relay held each version.
 #[test]
 fn a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought() {
-    let (mut relay, laptop, _desktop) = the_desktop_wrote_lab_and_left();
+    let (mut relay, laptop, _desktop, _) = the_desktop_wrote_lab_and_left();
     relay.stop();
     let used = relay_holds_bytes(&relay);
     cap_of(&relay, used);
@@ -1065,7 +1066,7 @@ fn a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought() {
 /// the name is not let go.
 #[test]
 fn a_relay_that_dropped_a_carried_channel_keeps_the_name_held() {
-    let (mut relay, laptop, _desktop) = the_desktop_wrote_lab_and_left();
+    let (mut relay, laptop, _desktop, _) = the_desktop_wrote_lab_and_left();
     let said = laptop.cli(&["sync", "carry", "lab"]);
     assert!(said.contains("lab: 2 versions brought in"), "{said}");
     wait_for(
@@ -1148,4 +1149,190 @@ fn a_relay_that_dropped_a_carried_channel_keeps_the_name_held() {
         "{said}"
     );
     assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+}
+
+/// The relay may hold what it holds and no more, and `cordelia sync carry`
+/// brings the desktop's files into `lab` on the laptop, in a new channel
+/// that the relay has no room for. Returns once the relay has refused it.
+fn lab_is_carried_where_no_relay_takes_it(relay: &mut Node, laptop: &Node) -> u64 {
+    relay.stop();
+    let used = relay_holds_bytes(relay);
+    cap_of(relay, used);
+    relay.start();
+    wait_for("relay healthy again", &[&*relay, laptop], 30, || {
+        healthy(relay)
+    });
+    wait_for(
+        "the laptop reaches the relay again",
+        &[&*relay, laptop],
+        60,
+        || has_hot_peer(laptop),
+    );
+    wait_for(
+        "the carry brings the files in",
+        &[&*relay, laptop],
+        120,
+        || {
+            let said = laptop.cli(&["sync", "carry", "lab"]);
+            said.contains("lab: 2 versions brought in").then_some(())
+        },
+    );
+    wait_for(
+        "the relay has refused the new channel",
+        &[&*relay, laptop],
+        120,
+        || {
+            let relays = person_of(laptop)["relays"].clone();
+            relays[0]["no_room_at"].as_i64().map(|_| ())
+        },
+    );
+    used
+}
+
+/// **A carried name that no relay takes is let go on a typed `discard`**
+/// (decision 2026-10-17 §5, §1 property 5). With no terminal, the word is
+/// never asked: the command is refused, and says to run it at a terminal.
+/// At a terminal, the command says how many versions no relay held,
+/// where they may still be (at the relays for as many days as the laptop
+/// holds the secret it left, and that what was written here goes from
+/// the channel for good), and asks for the word: `yes` keeps the name,
+/// and so does Enter. `discard` lets it go, with the 2 versions.
+#[test]
+fn a_carried_name_that_no_relay_takes_is_let_go_on_a_typed_discard() {
+    let (mut relay, laptop, _desktop, _) = the_desktop_wrote_lab_and_left();
+    lab_is_carried_where_no_relay_takes_it(&mut relay, &laptop);
+
+    let refused = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(
+        refused
+            .contains("To let it go now, with them, run `cordelia sync unmap lab` at a terminal."),
+        "{refused}"
+    );
+    assert!(!refused.contains("Type `discard`"), "{refused}");
+    assert_eq!(held(&laptop).len(), 2);
+
+    let asks = |at: &mut AtTerminal| {
+        at.says(
+            "lab is not let go: no relay that this device is set up with held 2 of its versions \
+             when it was read just now.",
+        )
+        .says("This device goes on sending them, and lab can be let go once a relay holds them.")
+        .says("Letting lab go now drops those 2 versions from this device.")
+        .says("in the channel it was carried from, for 90 more days at most")
+        .says("is on this device alone, and goes for good")
+        .says("Type `discard` to let lab go with them. Anything else keeps it:");
+    };
+    for not_the_word in ["yes", ""] {
+        let mut at = laptop.at_terminal(&["sync", "unmap", "lab"]);
+        asks(&mut at);
+        at.types(not_the_word);
+        let said = at.done();
+        assert!(
+            said.contains("lab is still held. Nothing was changed."),
+            "{said}"
+        );
+        assert!(!said.contains("To let it go now"), "{said}");
+        assert_eq!(held(&laptop).len(), 2, "{not_the_word:?}");
+    }
+    let mut at = laptop.at_terminal(&["sync", "unmap", "lab"]);
+    asks(&mut at);
+    at.types("discard");
+    let said = at.done();
+    assert!(
+        said.contains(
+            "This device holds lab no longer, and 2 versions that no relay held went with it."
+        ),
+        "{said}"
+    );
+    assert!(names_held(&laptop).is_empty(), "{:?}", names_held(&laptop));
+}
+
+/// **A removed device lets go of a carried name only on a typed
+/// `discard`** (decision 2026-10-17 §4.4, §5.3, §1 property 8). The laptop
+/// carries `lab` through a relay with no room, and is then off. The relay
+/// is given room, and the desktop removes the laptop; the relay is then
+/// held to what it holds again, so that what the laptop carried still
+/// finds no room. The laptop, started again, hears that it was removed.
+/// `cordelia sync unmap lab` there reads no relay: with no terminal it is
+/// refused, saying that it could not read the relays and what its own
+/// notes say; at a terminal it asks for the word, and `discard` lets the
+/// name go.
+#[test]
+fn a_removed_device_lets_go_of_a_carried_name_only_on_a_typed_discard() {
+    let (mut relay, mut laptop, mut desktop, words) = the_desktop_wrote_lab_and_left();
+    let used = lab_is_carried_where_no_relay_takes_it(&mut relay, &laptop);
+    let laptop_key = key_of(&laptop);
+    laptop.stop();
+
+    // The desktop removes the laptop, through a relay with room.
+    relay.stop();
+    cap_of(&relay, used + 4 * 1024 * 1024);
+    relay.start();
+    wait_for("relay healthy with room", &[&relay], 30, || healthy(&relay));
+    desktop.start();
+    wait_for("desktop healthy", &[&relay, &desktop], 30, || {
+        healthy(&desktop)
+    });
+    has_applied(&desktop, 2, &[&relay, &desktop]);
+    let mut at = removes(&desktop, &laptop_key, &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    wait_for(
+        "the relay holds the change",
+        &[&relay, &desktop],
+        180,
+        || has_sent_everything(&desktop),
+    );
+    desktop.stop();
+
+    // The relay holds what it holds, and no more; the laptop hears of
+    // the change.
+    relay.stop();
+    let now_used = relay_holds_bytes(&relay);
+    cap_of(&relay, now_used);
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    laptop.start();
+    wait_for("laptop healthy", &[&relay, &laptop], 30, || {
+        healthy(&laptop)
+    });
+    wait_for("the laptop was removed", &[&relay, &laptop], 120, || {
+        (person_of(&laptop)["state"] == "removed").then_some(())
+    });
+
+    let refused = laptop.refused(&["sync", "unmap", "lab"]);
+    assert!(
+        refused.contains(
+            "This device has stopped (it was removed), and sends nothing more. It cannot read the \
+             relays to learn whether they hold lab. Its own notes say that it sent 2 versions of \
+             lab, which it wrote or carried, to no relay. To let it go now, with them, run \
+             `cordelia sync unmap lab` at a terminal."
+        ),
+        "{refused}"
+    );
+    assert!(!refused.contains("added again"), "{refused}");
+    let of_lab = || laptop.post_told("/api/v1/channels/entries", &json!({ "channel": "lab" }));
+    let (status, entries) = of_lab();
+    assert_eq!(status, 200, "{entries}");
+    assert_eq!(
+        entries["entries"].as_array().map(Vec::len),
+        Some(2),
+        "{entries}"
+    );
+
+    let mut at = laptop.at_terminal(&["sync", "unmap", "lab"]);
+    at.says("It cannot read the relays to learn whether they hold lab.")
+        .says("Letting lab go now drops those 2 versions from this device.")
+        .says("Type `discard` to let lab go with them. Anything else keeps it:")
+        .types("discard");
+    let said = at.done();
+    assert!(
+        said.contains(
+            "This device holds lab no longer, and 2 versions that no relay held went with it."
+        ),
+        "{said}"
+    );
+    // The name is held no more: the node knows no such name.
+    let (status, entries) = of_lab();
+    assert_eq!(status, 404, "{entries}");
 }

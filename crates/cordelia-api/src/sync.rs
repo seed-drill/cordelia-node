@@ -3791,7 +3791,6 @@ mod tests {
         // A number that is not the one found; an ID the node does not
         // know; a word that is not the word: each is refused.
         let asked = asked_the_word(&node, "lab").await;
-        let read = word_read(&asked);
         let refused = unmapped(state, &the_word("lab", &asked, 2)).await;
         assert!(refused_so(&refused, &changed), "{:?}", refused.err());
         let unknown = SyncUnmapRequest {
@@ -3808,6 +3807,31 @@ mod tests {
         let refused = unmapped(state, &yes).await;
         assert!(matches!(refused, Err(ApiError::BadRequest(_))));
         assert!(still_holds(&node, "lab"));
+        // The name's channel is another since the read.
+        let asked_again = asked_the_word(&node, "lab").await;
+        {
+            let db = state.db.lock().unwrap();
+            let lab = cordelia_storage::person::channel_of_name(&db, "lab")
+                .unwrap()
+                .unwrap();
+            db.execute(
+                "UPDATE person_names SET channel = ?1 WHERE name = 'lab'",
+                [[8u8; 32].as_slice()],
+            )
+            .unwrap();
+            let read_again = word_read(&asked_again);
+            let now = std::time::Instant::now();
+            let wall = chrono::Utc::now().timestamp();
+            let refused = discard_a_carried_name(state, &db, "lab", &read_again, 1, now, wall);
+            assert!(refused_so(&refused, &changed), "{refused:?}");
+            db.execute(
+                "UPDATE person_names SET channel = ?1 WHERE name = 'lab'",
+                [lab.as_slice()],
+            )
+            .unwrap();
+        }
+        let asked = asked_the_word(&node, "lab").await;
+        let read = word_read(&asked);
         // In time on the monotonic clock, with the wall clock a day ahead:
         // the name goes, with the version, and the read with it.
         {
@@ -4035,6 +4059,8 @@ mod tests {
             let db = state.db.lock().unwrap();
             let left = chrono::Utc::now().timestamp() - 3600;
             cordelia_storage::person::keep_left_secret(&db, 9, &[9; 32], left).unwrap();
+            // A folder was mapped to it, and was unmapped since.
+            meta::set(&db, meta::PERSON_NAMES_BROUGHT_IN, r#"["lab"]"#).unwrap();
         }
         node.own_relays_are(vec![holding("relay-one", ONE, &secret, &[])]);
         let refused = lets_go(&node, "lab").await;
@@ -4058,6 +4084,10 @@ mod tests {
         );
         let held_for = asked["where"].as_str().unwrap();
         assert!(held_for.contains("for 90 more days at most"), "{held_for}");
+        assert!(
+            held_for.contains("A folder that was mapped to lab keeps its files"),
+            "{held_for}"
+        );
         assert_eq!(
             *why,
             format!(
@@ -4091,6 +4121,34 @@ mod tests {
             "{:?}",
             again.err()
         );
+    }
+
+    /// **The answer to a folder's unmapping that leaves a carried name held
+    /// says whether this device has stopped** (decision 2026-10-17 §4.6):
+    /// the command then says that nothing is sent again, and not that a
+    /// relay is waited for.
+    #[actix_web::test]
+    async fn test_the_answer_to_a_folders_unmapping_says_whether_the_device_has_stopped() {
+        for stopped in [false, true] {
+            let node = left_a_version_of_lab();
+            maps_lab(&node, std::path::Path::new("/home/sam"));
+            let done = crate::carrying::carry_name(&node.state, "lab", false)
+                .await
+                .unwrap();
+            assert_eq!(done.tally.carried, 1);
+            if stopped {
+                let db = node.state.db.lock().unwrap();
+                let removed = cordelia_storage::person::State::Removed;
+                cordelia_storage::person::set_state(&db, removed).unwrap();
+            }
+            let body = SyncUnmapRequest {
+                folder: "/home/sam/notes".into(),
+                ..Default::default()
+            };
+            let answer = unmapped(&node.state, &body).await.unwrap();
+            assert_eq!(answer.still_held.as_deref(), Some("lab"));
+            assert_eq!(answer.still_held_stopped, Some(stopped));
+        }
     }
 
     /// **A device that has stopped lets a carried name go at once where

@@ -2394,9 +2394,10 @@ mod tests {
             asked: 4,
             can_go: 196,
         };
-        // The phone, which added the tablet, may be in someone else's
-        // hands; the tablet's record does not count for another reason.
-        let answers = [Answer::Have, Answer::Have, Answer::OtherHands];
+        // The desktop and the phone, which added the tablet, may be in
+        // someone else's hands; the tablet's record does not count for
+        // another reason.
+        let answers = [Answer::Have, Answer::OtherHands, Answer::OtherHands];
         assert!(rows[3].no_room.is_empty() && !rows[3].counts);
         assert_eq!(recover::label_shown(&rows, &answers, &rows[3]), "");
         let AtARow::Said(says, _) = at_a_row(&rows, &answers, 3, 3, &[9; 32], &room, &|_| false)
@@ -2421,8 +2422,9 @@ mod tests {
             panic!("a record that does not count is not asked about");
         };
         assert!(says.contains("\"tablet\""), "{says}");
-        // A row that counts keeps its label: its own row says what was
-        // said of its adder.
+        // A row that counts keeps its label, though its adder, the
+        // desktop, may be in someone else's hands: its own row says what
+        // was said of it.
         assert_eq!(recover::label_shown(&rows, &answers, &rows[2]), "phone");
     }
 
