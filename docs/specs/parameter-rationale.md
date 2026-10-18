@@ -1643,6 +1643,20 @@ first round, so that what a reading takes beyond its `CARRY_READ_MAX_SECS`
 never costs the fifth reading, which a channel at its cap needs: four
 readings of a relay that hands what it may come to about 15.5 MiB.
 
+#### LEFT_REFUSED_IN_A_ROW_MAX = 2
+
+**Derivation:** `BAN_THRESHOLD` − 1.
+
+**Rationale:** How many pulls in a row, with no page between them, a read
+through the door for a carry lets a relay refuse for now before it ends its
+read there in part (decision 2026-10-17 §3.2). A relay that has no room to
+hand a page resets the pull with `ERR_RATE_LIMIT`, which is no breach, and
+the read waits and asks again. But a relay resets with the same code a
+request over its rate, which it counts as a breach, and it cuts an address
+off at `BAN_THRESHOLD` breaches: so the device asks again only while it
+stays below that. A relay that counts more than the device does (devices
+behind one address) still sees no more than this from one read in a row.
+
 #### CARRY_FROM_WORDS = 6
 
 **Rationale:** How many words of a key's fingerprint name a removed key at

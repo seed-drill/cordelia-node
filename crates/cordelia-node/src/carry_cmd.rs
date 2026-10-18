@@ -1781,6 +1781,95 @@ mod tests {
         assert_eq!(bytes_handed(&said("one", "part")), 0);
     }
 
+    /// **A round of a read on reads again only the relays whose
+    /// connection changed, from the places they had, and only while it
+    /// may** (decision 2026-10-17 §3.2). One reads in part, and two says
+    /// that its connection changed: the sessions are asked for again, and
+    /// two alone is read again, from its place. What one said stands, and
+    /// what both handed is kept, each entry once. Where it may not read
+    /// again, two is said as one whose connection changed.
+    #[test]
+    fn test_a_round_reads_again_only_the_relays_whose_connection_changed() {
+        use cordelia_crypto::entry::{Inside, Value as Held};
+        use std::cell::RefCell;
+        let author = NodeIdentity::generate().unwrap();
+        let entry = |n: u8| {
+            let inside = Inside {
+                name: format!("{n}.md"),
+                value: Held::Text("x".into()),
+                chain: Some(Vec::new()),
+            };
+            let sealed = Entry::seal(&[9; 32], &author, 1, &inside).unwrap();
+            sealed.check().unwrap()
+        };
+        let (first, second, third) = (entry(1), entry(2), entry(3));
+        let changed = cordelia_api::carrying::CONNECTION_CHANGED;
+        let set_up: Sessions = vec![("one".into(), [1; 32]), ("two".into(), [2; 32])];
+        let place = |relay: &str, at: u64| json!({ "relay": relay, "mark": "06", "place": at });
+        let from = [place("one", 4), place("two", 7)];
+        let run = |may: bool| {
+            let read: RefCell<Vec<(Vec<String>, Vec<Value>)>> = RefCell::new(Vec::new());
+            let asked = RefCell::new(0);
+            let mut sessions = set_up.clone();
+            let (entries, said) = round_again_where_changed(
+                &mut sessions,
+                None,
+                &from,
+                |of_those, places| {
+                    let relays = of_those.iter().map(|(relay, _)| relay.clone()).collect();
+                    read.borrow_mut().push((relays, places.to_vec()));
+                    Ok(match read.borrow().len() {
+                        1 => (
+                            vec![first.clone(), second.clone()],
+                            vec![
+                                json!({ "relay": "one", "read": "part", "entries": 2 }),
+                                json!({ "relay": "two", "read": changed, "entries": 0 }),
+                            ],
+                        ),
+                        _ => (
+                            vec![second.clone(), third.clone()],
+                            vec![json!({ "relay": "two", "read": "part", "entries": 2 })],
+                        ),
+                    })
+                },
+                || {
+                    *asked.borrow_mut() += 1;
+                    Ok(set_up.clone())
+                },
+                || may,
+            )
+            .unwrap();
+            let ids: Vec<[u8; 32]> = entries.iter().map(|entry| entry.id()).collect();
+            (ids, said, read.into_inner(), asked.into_inner())
+        };
+        let (ids, said, read, asked) = run(true);
+        assert_eq!(ids, [first.id(), second.id(), third.id()]);
+        assert_eq!(
+            said,
+            [
+                json!({ "relay": "one", "read": "part", "entries": 2 }),
+                json!({ "relay": "two", "read": "part", "entries": 2 }),
+            ]
+        );
+        let both = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(
+            read,
+            [
+                (both, from.to_vec()),
+                (vec!["two".to_string()], vec![place("two", 7)])
+            ]
+        );
+        assert_eq!(asked, 1);
+        // It may not read again: two is said as it was.
+        let (ids, said, read, asked) = run(false);
+        assert_eq!(ids, [first.id(), second.id()]);
+        assert_eq!(
+            said[1],
+            json!({ "relay": "two", "read": changed, "entries": 0 })
+        );
+        assert_eq!((read.len(), asked), (1, 0));
+    }
+
     /// **A read on asks only the relays it names** (decision 2026-10-17
     /// §3.2): it makes proofs for those alone, and what the node says of
     /// another relay, that its connection changed for want of a proof, is

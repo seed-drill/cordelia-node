@@ -231,6 +231,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
 | `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
 | `RECOVERY_READ_ON_MAX_SECS`, `RECOVERY_READ_ON_READS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more), 5 (derived: the readings that fit in it) | parameter-rationale.md §12.9 |
+| `LEFT_REFUSED_IN_A_ROW_MAX` | 2 (derived: one fewer than `BAN_THRESHOLD`; pulls refused for now in a row before a read through the carry door ends in part) | parameter-rationale.md §12.9 |
 | `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
 | `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
 | `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |

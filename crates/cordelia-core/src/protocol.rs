@@ -1733,6 +1733,14 @@ const _: () = assert!(RECOVERY_READ_ON_MAX_SECS > CARRY_READ_MAX_SECS);
 /// RECOVERY_READ_ON_MAX_SECS.
 pub const RECOVERY_READ_ON_READS: u64 = RECOVERY_READ_ON_MAX_SECS / CARRY_READ_MAX_SECS;
 
+/// How many pulls in a row, with no page between them, a read through the
+/// door for a carry lets a relay refuse for now before it ends its read
+/// there in part (decision 2026-10-17 §3.2). A relay resets with one code
+/// both a pull it has no room for, which is no breach, and a request over
+/// its rate, which is: so the device stays below the breaches that cut an
+/// address off. Derived: one fewer than BAN_THRESHOLD.
+pub const LEFT_REFUSED_IN_A_ROW_MAX: u32 = BAN_THRESHOLD - 1;
+
 /// How many words of a key's fingerprint name a removed key at `cordelia
 /// sync carry --from` (decision 2026-10-04 §7.3): the first six, which is
 /// 66 bits. A statement lists removed keys bare, so a machine that never
@@ -2810,6 +2818,9 @@ mod tests {
         // Five whole readings fit in it, and a sixth does not: five reach
         // a channel at its cap.
         assert_eq!(RECOVERY_READ_ON_READS, 5);
+        assert_eq!(LEFT_REFUSED_IN_A_ROW_MAX, 2);
+        const { assert!(LEFT_REFUSED_IN_A_ROW_MAX >= 1) };
+        const { assert!(LEFT_REFUSED_IN_A_ROW_MAX < BAN_THRESHOLD) };
         const { assert!(RECOVERY_READ_ON_READS * CARRY_READ_MAX_SECS <= RECOVERY_READ_ON_MAX_SECS) };
         const { assert!((RECOVERY_READ_ON_READS + 1) * CARRY_READ_MAX_SECS > RECOVERY_READ_ON_MAX_SECS) };
         let per_round =

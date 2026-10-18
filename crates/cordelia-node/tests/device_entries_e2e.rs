@@ -32,8 +32,9 @@ use cordelia_api::state::{
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
+    LEFT_REFUSED_IN_A_ROW_MAX, MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS,
+    OUTBOX_REFUSED_RETRY_MAX_SECS, OWN_ENTRY_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -5342,8 +5343,10 @@ async fn a_read_of_a_left_channel_goes_on_from_a_place() {
 /// the channel to its end, with nothing handed twice and the proof sent
 /// once, whether the pull refused was the first after the proof or a
 /// later one. A pull reset for another reason ends the read there, in
-/// part. A proof refused for now ends it with nothing read, and is said
-/// as a proof's.
+/// part. A pull refused for now so many times in a row, with no page
+/// between, ends the read there in part (LEFT_REFUSED_IN_A_ROW_MAX). A
+/// proof refused for now ends it with nothing read, and is said as a
+/// proof's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     let relay = StandIn::started().await;
@@ -5433,6 +5436,40 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
                 assert_eq!(ids(entries), ids(&held[..1]));
                 assert_eq!(*reached, LeftPlace { mark, next: 1 });
                 assert_eq!(asked(&relay), (1, vec![0, 1]));
+            }
+        }
+    }
+
+    // Refused for now twice in a row, with no page between: the read ends
+    // there in part, and asks no more, as a relay counts a request over
+    // its rate, reset with the same code, as a breach. Refused twice with
+    // a page between: it reads on to the channel's end.
+    assert_eq!(LEFT_REFUSED_IN_A_ROW_MAX, 2);
+    for refused in [vec![1, 2], vec![1, 3]] {
+        let pulls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&pulls);
+        let these = refused.clone();
+        relay.hook(move |request| match request {
+            WireMessage::EntryPull(_) => {
+                let n = counted.fetch_add(1, Ordering::SeqCst);
+                these.contains(&n).then_some(Say::NotNow)
+            }
+            _ => None,
+        });
+        let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
+        let LeftRead::Read { entries, whole, .. } = &read[0].read else {
+            panic!("{read:?}");
+        };
+        match refused[1] {
+            2 => {
+                assert!(!*whole, "{read:?}");
+                assert_eq!(ids(entries), ids(&held[..1]));
+                assert_eq!(asked(&relay), (1, vec![0, 1, 1]));
+            }
+            _ => {
+                assert!(*whole, "{read:?}");
+                assert_eq!(ids(entries), ids(&held));
+                assert_eq!(asked(&relay), (1, vec![0, 1, 1, 2, 2, 3]));
             }
         }
     }
