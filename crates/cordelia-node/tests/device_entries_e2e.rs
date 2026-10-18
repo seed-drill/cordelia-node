@@ -5883,7 +5883,12 @@ async fn a_proof_or_a_show_that_a_relay_refuses_for_now_counts_for_it() {
 /// now, not even a show made again: a short show refused for now is not
 /// followed by a whole one at the count, and where the shows are answered
 /// again, no show, proof or pull goes out until a refusal has left the
-/// window. The count never passes BAN_THRESHOLD - 1 through a read.
+/// window. A pass is not held back by the count: its pull reaches the
+/// relay. The count is of refusals already made, not of requests in
+/// flight: a read's request sent below the count can still be refused at
+/// the same moment as one from another door on the connection, and so be
+/// the relay's third in its window, which the record accepts (decision
+/// 2026-10-17 §11). This test does not send from two doors at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_sends_nothing_while_the_relay_is_at_its_count() {
     use cordelia_core::protocol::BAN_THRESHOLD;
@@ -5965,6 +5970,15 @@ async fn a_read_sends_nothing_while_the_relay_is_at_its_count() {
         assert_eq!(matches!(opened, Err(Refused::RefusedEnough)), !sent);
         assert_eq!(relay.seen().len(), usize::from(sent), "gated: {gated}");
     }
+    assert_eq!(refused(&device), (BAN_THRESHOLD - 1) as usize);
+
+    // A pass is not held back by the count: its pull reaches the relay.
+    device
+        .clock
+        .run_ahead(Duration::from_secs(SHOW_LEAVE_SECS + 1));
+    relay.requests();
+    device.passes().await;
+    assert!(!pulled_from(&relay.requests(), &notes).is_empty());
     assert_eq!(refused(&device), (BAN_THRESHOLD - 1) as usize);
 }
 

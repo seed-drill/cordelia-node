@@ -45,7 +45,16 @@
 //! held back: two of its pulls refused for room keep every read away from
 //! that relay for up to BAN_WINDOW_SECS, the read before a carried name is
 //! let go among them, and the let-go is then refused and the command says
-//! to run it again. Telling the two apart needs a code of the relay's own
+//! to run it again. The count is of refusals already made, not of
+//! requests in flight, and that window is accepted: a request already in
+//! flight from another door on the same connection (a pass, its shows,
+//! the door for a carry or for a typed key) can be refused at the same
+//! moment as a read's, so a read's request can be the relay's third
+//! refusal within its window. A relay's refusal for room is no breach; a
+//! breach comes only from the rate of requests, which the device's own
+//! pace keeps under; the worst is that one address is cut off for a
+//! while. If a cut-off is ever seen, counting the requests in flight with
+//! the refusals is the change to make. Telling the two apart needs a code of the relay's own
 //! (decision 2026-10-17 §11). **Every other failure ends the
 //! relay's read in that round as not reached:** no answer, a stream that
 //! times out or is reset otherwise, an answer that is not a page, a
