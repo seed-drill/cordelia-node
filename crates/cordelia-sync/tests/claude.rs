@@ -405,6 +405,7 @@ fn unmap(d: &Device, folder: &Path) {
     let request = cordelia_api::types::SyncUnmapRequest {
         folder: folder.display().to_string(),
         read: None,
+        ..Default::default()
     };
     let db = d.state.db.lock().unwrap();
     let before = mapped(&db);

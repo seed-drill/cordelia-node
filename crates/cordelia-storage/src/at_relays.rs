@@ -295,9 +295,22 @@ pub fn sent_to_no_relay(
     channel: &[u8; 32],
     own: &[u8; 32],
 ) -> Result<usize, CordeliaError> {
+    Ok(places_sent_to_no_relay(conn, channel, own)?.len())
+}
+
+/// The place in the store's order of each entry that
+/// [`sent_to_no_relay`] counts, in that order: what a device that has
+/// stopped lets go of on a `discard`, by its own notes (decision
+/// 2026-10-17 §4.4). Nothing is written.
+pub fn places_sent_to_no_relay(
+    conn: &Connection,
+    channel: &[u8; 32],
+    own: &[u8; 32],
+) -> Result<Vec<i64>, CordeliaError> {
     let carried_up_to = carried_up_to(conn)?;
-    conn.query_row(
-        "SELECT COUNT(*) FROM entries AS held
+    let mut stmt = conn
+        .prepare(
+            "SELECT held.seq FROM entries AS held
          WHERE held.channel_id = ?1 AND held.author = ?3
            AND NOT EXISTS (
                SELECT 1 FROM at_relays AS there
@@ -307,12 +320,17 @@ pub fn sent_to_no_relay(
                  AND NOT EXISTS (
                      SELECT 1 FROM at_relays_refused AS refused
                      WHERE refused.relay = there.relay AND refused.channel = ?1
-                       AND refused.seq = held.seq))",
-        params![channel.as_slice(), carried_up_to, own.as_slice()],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|waits| waits.max(0) as usize)
-    .map_err(storage)
+                       AND refused.seq = held.seq))
+         ORDER BY held.seq",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![channel.as_slice(), carried_up_to, own.as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
 /// The device is about to send `relay` something of `channel`: it keeps
@@ -840,6 +858,10 @@ mod tests {
         // it is counted as sent to no relay.
         entries::store(&conn, &made(1, 1, 6, "f.md"), 100).unwrap();
         assert_eq!(waits(&own), 2);
+        // The same entries, by their places: what a device that has
+        // stopped lets go of on a discard (decision 2026-10-17 §4.4).
+        let places = places_sent_to_no_relay(&conn, &channel(1), &own).unwrap();
+        assert_eq!(places, [3, 7]);
         // The relay was sent everything: none waits, of any author.
         sent(&conn, &RELAY, &channel(1), 7).unwrap();
         assert_eq!(waits(&own), 0);

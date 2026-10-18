@@ -444,13 +444,27 @@ pub struct SyncMapRequest {
     pub home: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct SyncUnmapRequest {
     pub folder: String,
     /// The read before a carried name is let go, where the command asks
     /// for its next round (decision 2026-10-17 §4.2): its ID, as hex.
     #[serde(default)]
     pub read: Option<String>,
+    /// Whether the command asks at a terminal (decision 2026-10-17
+    /// §5.2): where a carried name is let go only on the word `discard`,
+    /// the node then answers with what the command asks it by
+    /// (`not_let_go`), and not with its refusal.
+    #[serde(default)]
+    pub asks: bool,
+    /// The word that the person typed, which lets the name go with what
+    /// no relay holds: `discard`, sent with `read` and `versions`.
+    #[serde(default)]
+    pub word: Option<String>,
+    /// With `word`: how many versions the command said would go, as the
+    /// node found them.
+    #[serde(default)]
+    pub versions: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -537,6 +551,22 @@ pub struct SyncStatusResponse {
     /// `bytes`, counted as a relay counts against its cap).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading: Option<serde_json::Value>,
+    /// Where the command asks at a terminal and a carried name is let go
+    /// only on the word `discard` (decision 2026-10-17 §5.2): `read`, the
+    /// ID that the word is bound to, as hex; `versions`, how many versions
+    /// no relay held, or the notes of a device that has stopped say it
+    /// sent to none; `said`, what is said first; and `where`, where they
+    /// may still be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_let_go: Option<serde_json::Value>,
+    /// Beside `let_go`, where it was let go on the word `discard`: how
+    /// many versions that no relay held went with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub let_go_discarded: Option<usize>,
+    /// Beside `still_held`: whether this device has stopped, and sends
+    /// nothing more (decision 2026-10-17 §4.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub still_held_stopped: Option<bool>,
     /// The name that a folder was mapped to, where this device still
     /// holds it once the folder is unmapped (decision 2026-10-04 §16): a
     /// carry or a recovery brought it, and it is held as it was before
