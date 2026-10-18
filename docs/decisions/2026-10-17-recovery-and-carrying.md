@@ -1,7 +1,7 @@
 # Decision: four changes to recovery and carrying
 
 **Date**: 2026-10-17
-**Status**: Proposed. Not built. It changes [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) in sections 6, 9 and 16, and that record now says what this one decides.
+**Status**: Built. It changes [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) in sections 6, 9 and 16, and that record now says what this one decides.
 **Cited as**: code comments cite the sections of this record ("decision 2026-10-17 §3.2"), and the numbered properties ("§1, property 5"). The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
