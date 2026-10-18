@@ -296,10 +296,10 @@ MUTATIONS = [
     ("L44 an act is not written at once", LISTS,
      '''        write_list(conn, identity, &standing, &mut lists, fetched, now)?;
         lists.save(conn)?;
-        Ok(Done::Made(made))''',
+        // The table of shared channels follows the list''',
      '''        let _ = fetched;
         lists.save(conn)?;
-        Ok(Done::Made(made))''',
+        // The table of shared channels follows the list''',
      [WRITES, MAKER]),
     ("L45 an act is written with no fetched time", LISTS,
      '''            .map_or(lists.list.fetched, |at| u64::try_from(at).unwrap_or(0));''',
@@ -519,7 +519,7 @@ MUTATIONS = [
      [FORGETS]),
     # ── Step 20 ──
     ("S01 the schema is still at step 19", SCHEMA,
-     '''pub const SCHEMA_VERSION: u32 = 20;''',
+     '''pub const SCHEMA_VERSION: u32 = 21;''',
      '''pub const SCHEMA_VERSION: u32 = 19;''',
      [STEP]),
     ("S02 step 20 is not run", SCHEMA,
