@@ -5465,7 +5465,7 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
 
     // Refused for now twice within the window, with a page between: the
     // relay is at its count at the second, and the read ends there in
-    // part.
+    // part, with no wait.
     a.clock.run_ahead(window());
     let pulls = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&pulls);
@@ -5476,6 +5476,7 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
         }
         _ => None,
     });
+    let began = std::time::Instant::now();
     let read = reads_left_from(&a, old, by_secret(), None, HashMap::new(), soon()).await;
     let LeftRead::Read {
         entries,
@@ -5485,6 +5486,11 @@ async fn a_read_of_a_left_channel_waits_out_a_pull_refused_for_now() {
     else {
         panic!("{read:?}");
     };
+    // It waited out the first refusal, and not the second: at the count
+    // it ends at once.
+    let wait = Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS);
+    assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
+    assert!(began.elapsed() < wait * 7 / 4, "{:?}", began.elapsed());
     assert!(!*whole, "{read:?}");
     assert_eq!(ids(entries), ids(&held[..2]));
     assert_eq!(*reached, LeftPlace { mark, next: 2 });
