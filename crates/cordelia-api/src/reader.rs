@@ -244,6 +244,11 @@ pub fn hourly(
     if let Err(e) = in_one(conn, || crate::marks::hourly(conn, now)) {
         tracing::warn!(error = %e, "could not keep this device's marks");
     }
+    // The shared channels' part (decision 2026-10-10 §6.3), in writes of
+    // its own: an error there takes back nothing of the rest.
+    if let Err(e) = crate::shared::hourly(conn, now) {
+        tracing::warn!(error = %e, "could not keep this device's shared channels");
+    }
     // The checkpoint runs whether or not the drop, the marks' part or the
     // clearing could (§7.1).
     let cleared = match crate::sender::clear_expired(conn, identity, now, fetched) {
