@@ -34,6 +34,7 @@ def recover(test): return (API, "recover::tests::" + test)
 def main(test): return (BIN, "tests::" + test)
 def e2e(test): return (E2E, test)
 def core(test): return (CORE, "protocol::tests::" + test)
+def device_entries(test): return (("cordelia-node", ["--test", "device_entries_e2e"]), test)
 def commands_api(test): return (("cordelia-api", ["--test", "commands_api"]), test)
 
 HELD = sync("test_a_version_is_held_only_where_a_relay_read_after_the_ask_handed_it")
@@ -269,6 +270,14 @@ MUTATIONS = [
      '''        at.key = Some(link.relay().0);''',
      '''        at.key = None;''',
      [e2e("a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought")]),
+    ("S14 a let-go's read is not held to the relay's count", NODE_OWN_READ,
+     '''            gated: true,
+        };
+        at.key = Some(link.relay().0);''',
+     '''            gated: false,
+        };
+        at.key = Some(link.relay().0);''',
+     [device_entries("a_let_gos_read_asks_a_relay_at_its_count_nothing")]),
     # ── The list of 4.3 ──
     ("L1 a name with no folder is noted as brought in", NAMES,
      '''    if !has_folder(conn, name)? {
