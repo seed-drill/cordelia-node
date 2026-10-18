@@ -190,6 +190,11 @@ join the Hot set after connecting. Slow for legitimate peer discovery.
 warm peers with cold peers and rotates 1 hot peer. This forces topology
 exploration and prevents an attacker from maintaining a stable eclipse.
 
+**Not on a personal node's relays:** a personal node dials only the relays
+the person set it up with, so it has no other peers to explore. Churn
+closes none of its connections to them; it still rotates them between hot
+and warm (decision 2026-10-17 §2).
+
 **Reference:** Cardano churns on two timescales: normal (with 0-600s jitter)
 and bulk sync (with 0-60s jitter). We use a single interval with 300s jitter.
 
@@ -1324,6 +1329,12 @@ channels.
 that its personal channel lists. A person with more names than this is
 past what that keeps alive at a relay (decision §2.5).
 
+**After a statement:** a relay remembers a connection's proofs for as long
+as the connection lives, those of a generation the device has left among
+them. Where a channel the device proves finds no place, and channels it
+no longer proves hold places, the device has the connection made again: a
+new one starts with none (decision 2026-10-17 §4).
+
 #### MAX_SLOTS_SHOWN_ON_A_CONNECTION = 8
 
 **Rationale:** The most slots for which a relay remembers, for one
@@ -1467,9 +1478,17 @@ pull a look at its store.
 **Derivation:** It is sized for a device with 256 names, which is what an
 address may make a relay take in an hour: a pull of each every ten seconds,
 and of the personal channel and the messages channel (1,548 a minute; the
-messages channel is decision 2026-10-09 §2.1); its day's proofs in one
-burst, as many as a relay remembers for a connection (1,024); a show for
-each pass and each time it sends; and what it pushes.
+messages channel is decision 2026-10-09 §2.1); a show for each pass and
+each time it sends; and what it pushes. A device asks at three quarters of
+it (`OWN_ENTRY_REQUESTS_PER_MINUTE`, below), with its shows beside: so a
+relay is asked within it.
+
+**The minute of a day's proofs:** once a day on a connection, and when one
+is made, the device also proves as many channels as a relay remembers for
+a connection (1,024). With its pulls and pushes (1,608) that would be
+2,632 in the minute, 382 over its own pace. It holds those back to the
+next minute, which has room for them (642) beside its pulls and pushes
+(decision 2026-10-17 §3).
 
 #### OWN_ENTRY_REQUESTS_PER_MINUTE = 2250
 
@@ -1481,8 +1500,14 @@ quarters of what a relay allows.
 at most, on the streams that prove, pull and push. A device paces itself,
 so that it is never the one refused for going over: a request over a
 relay's count is a breach, and a few of those cut a device off. What it
-does not ask in one minute, it asks in the next. Its shows are not held
-back by this, and are few: a device must still hear of a removal.
+does not ask in one minute, it asks in the next: its pass at a relay stops
+where it is held, no place moves, and the next pass goes on from there.
+Its shows are not held back by this, and are few: a device must still
+hear of a removal.
+
+**What it costs:** a device with 256 names asks 1,608 in a minute without
+proofs, within this. In the minute of its day's proofs it would ask 2,632,
+and holds the 382 over back to the next minute (decision 2026-10-17 §3).
 
 #### SHOW_ANSWER_ROOM_BYTES = 66,560
 
@@ -1868,6 +1893,20 @@ is still made (decision §10.1). A try is made when a sync cycle would have
 run, and the first wait is a cycle long: without this, the timer's own
 jitter would put every try off by a whole cycle. `protocol.rs` asserts that
 it is less than the first wait.
+
+#### NODE_LOCK_WAIT_MS = 500
+
+**Rationale:** How long a node that finds the lock on its data directory
+held tries it again, every few milliseconds, before it says that another
+node is running there and stops (decision §10.1). A command that opens the
+database itself (`stats`, `channels`, `status`, `init`, `swarm-init`) asks
+the lock by taking it, and lets go of it at once: it holds it for a few
+microseconds. Without a wait, a node started by hand in that moment would
+stop, and one under its service would be started again only after the
+service's own pause. Half a second covers a command's hold many times over,
+and is less than a person notices at a start; a node that does hold the
+lock holds it for as long as it runs, so a second node still refuses, half a
+second later.
 
 ### 12.12 Messages Between Your Own Agents
 

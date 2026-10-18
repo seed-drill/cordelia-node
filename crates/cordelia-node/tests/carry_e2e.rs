@@ -714,6 +714,30 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
         !said.contains("Type your recovery phrase, one word at a time"),
         "{said}"
     );
+
+    // The new channel holds both of the removed key's versions: the list
+    // of the removed keys says that its work is brought back.
+    let signed = format!("({six_words}) \"desktop\": 2 entries");
+    let listed = laptop.cli(&["sync", "carry", "lab", "--from"]);
+    assert!(
+        listed.contains(&format!("{signed}, already brought back")),
+        "{listed}"
+    );
+    // The laptop writes over the desktop's last file. The removed key's
+    // version of it now lies under a later revision that the laptop
+    // wrote: it is not said to be brought back.
+    std::fs::write(l_mem.join("late.md"), "the laptop's words over it\n").unwrap();
+    wait_for("the laptop holds its edit", &all, 120, || {
+        held(&laptop)
+            .iter()
+            .any(|(key, _, text)| {
+                key == "late.md" && text.as_deref() == Some("the laptop's words over it\n")
+            })
+            .then_some(())
+    });
+    let listed = laptop.cli(&["sync", "carry", "lab", "--from"]);
+    assert!(listed.contains(&signed), "{listed}");
+    assert!(!listed.contains("already brought back"), "{listed}");
 }
 
 /// A generation whose secret a device never held is read with the

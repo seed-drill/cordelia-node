@@ -1491,10 +1491,13 @@ pub const RELAY_CHANNEL_PAGES_PER_PASS: usize = 10;
 ///
 /// It is sized for a device with 256 names, which is what an address may
 /// make a relay take in an hour: a pull of each every ten seconds, and of
-/// the personal channel and the messages channel (1,548 a minute); its
-/// day's proofs in one burst,
-/// as many as a relay remembers for a connection (1,024); a show for each
-/// pass and each time it sends; and what it pushes.
+/// the personal channel and the messages channel (1,548 a minute); a show
+/// for each pass and each time it sends; and what it pushes. A device asks
+/// at three quarters of it (OWN_ENTRY_REQUESTS_PER_MINUTE), and its shows
+/// beside. Its day's proofs, as many as a relay remembers for a
+/// connection (1,024), would take it over its own pace in the minute they
+/// come: it holds the rest back to the next minute (decision 2026-10-17
+/// §3).
 pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
 
 /// How many requests a device makes of one relay in a minute, at most, on
@@ -1505,8 +1508,9 @@ pub const ENTRY_REQUESTS_PER_PEER_PER_MINUTE: u32 = 3_000;
 /// allows. A device paces itself, so that it is never the one refused for
 /// going over: a request over a relay's count is a breach, and a few of
 /// those cut a device off. What it does not ask in one minute, it asks in
-/// the next. Its shows are not held back by this, and are few: a device
-/// must still hear of a removal.
+/// the next: so the minute of a day's proofs, at 256 names, holds some of
+/// its pulls and pushes back (decision 2026-10-17 §3). Its shows are not
+/// held back by this, and are few: a device must still hear of a removal.
 pub const OWN_ENTRY_REQUESTS_PER_MINUTE: u32 = ENTRY_REQUESTS_PER_PEER_PER_MINUTE / 4 * 3;
 
 /// The most slots for which a relay remembers, for one connection, the
@@ -1687,6 +1691,15 @@ pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
 /// sync cycle would have run, and the first wait is a cycle long: without
 /// this, the timer's own jitter would put every try off by a whole cycle.
 pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
+
+/// How long a node that finds the lock on its data directory held tries
+/// it again before it says that another node is running there (decision
+/// 2026-10-04 §10.1): half a second. A command that opens the database
+/// itself asks the lock by taking it, and lets go of it at once: a node
+/// started in that moment is not stopped by it. A node that holds the
+/// lock holds it for as long as it runs, and a second node still refuses
+/// within this.
+pub const NODE_LOCK_WAIT_MS: u64 = 500;
 
 // ── A carry that a person asks for, and a recovery ──────────────────
 
@@ -2877,6 +2890,7 @@ mod tests {
         assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
         assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
         const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
+        assert_eq!(NODE_LOCK_WAIT_MS, 500);
     }
 
     /// The value that a proof is made over is exported from a TLS session
@@ -2977,11 +2991,17 @@ mod tests {
         assert_eq!(RELAY_CHANNEL_PAGES_PER_PASS, 10);
     }
 
-    /// A connection may make 3,000 requests a minute on the streams of
-    /// entries. That is room for a device with 256 names: a pull of each,
-    /// of its personal channel and of its messages channel (decision
-    /// 2026-10-09 §12), every ten seconds; its day's proofs in one burst;
-    /// and a show and a push every two seconds besides.
+    /// What a device with 256 names asks of a relay in a minute, against
+    /// the pace it keeps (decision 2026-10-04 §16, decision 2026-10-17
+    /// §3): a pull of each name, of its personal channel and of its
+    /// messages channel (decision 2026-10-09 §12) every ten seconds, and a
+    /// push every two seconds, are 1,608, within its own 2,250. In the
+    /// minute of its day's proofs it would ask 1,024 more: 2,632, which is
+    /// 382 over. The device holds those back, and its pass at that relay
+    /// stops where it is held: no place moves, and nothing is lost. The
+    /// next minute has room for them beside its pulls and pushes (642),
+    /// so they are asked within it. A relay is asked at the device's pace
+    /// and the shows beside it, within its 3,000.
     #[test]
     fn test_requests_on_the_streams_of_entries_decision_2026_10_04_16() {
         assert_eq!(ENTRY_REQUESTS_PER_PEER_PER_MINUTE, 3_000);
@@ -2990,8 +3010,21 @@ mod tests {
         assert_eq!(pulls, 1_548);
         let proofs = MAX_CHANNELS_PROVED_ON_A_CONNECTION as u64;
         let sends = 2 * (60 / OUTBOX_FLUSH_INTERVAL_SECS);
+        let pace = u64::from(OWN_ENTRY_REQUESTS_PER_MINUTE);
+        // A minute with no proofs is within the device's own pace.
+        assert_eq!(pulls + sends, 1_608);
+        assert!(pulls + sends <= pace);
+        // The minute of the day's proofs is over it: what is over is
+        // held back.
         assert_eq!(pulls + proofs + sends, 2_632);
-        assert!(pulls + proofs + sends <= u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
+        let held_back = (pulls + proofs + sends).saturating_sub(pace);
+        assert_eq!(held_back, 382);
+        // And asked in the minute that follows, beside its pulls and
+        // pushes.
+        assert!(held_back <= pace - (pulls + sends));
+        // A relay never sees more than the device's pace on these
+        // streams.
+        assert!(pace < u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE));
     }
 
     /// A device's side of a relay: the leave that an answer to a show

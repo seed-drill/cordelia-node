@@ -32,6 +32,7 @@ use cordelia_core::protocol::{
 use cordelia_storage::first_start::{self, Copied, Done, Due, RoomThere};
 
 use crate::error::ApiError;
+use crate::look;
 use crate::state::{AppState, Held};
 
 /// The requests that a node whose first start is not done still answers,
@@ -153,6 +154,18 @@ pub fn take(state: &AppState, version: &str, room: RoomThere) -> bool {
     take_at(state, version, room, Instant::now())
 }
 
+/// What the node's log says, once, where its first start on this version
+/// copied the database and moved it on (decision 2026-10-04 §10.1): that,
+/// and then what the device's status says of itself ([`look::NOT_ADDED`]):
+/// that it is not added yet, and the three ways on, in their order (§5.2),
+/// on one line.
+pub fn moved_on_says() -> String {
+    format!(
+        "first start on this version: the database was copied and moved on; this device is {}",
+        look::NOT_ADDED.replace("\n  - ", " ")
+    )
+}
+
 /// Make the node's first start on this version, where it is still to be
 /// made (decision 2026-10-04 §10.1). `version` is the node's own, `room`
 /// how the free room on the volume is learned, and `now` the time on a
@@ -196,9 +209,8 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
                     tracing::info!(
                         copy = %copy.display(),
                         notice = notice.is_some(),
-                        "first start on this version: the database was copied and moved on; \
-                         this device follows no recovery phrase, and is added again with \
-                         `cordelia phrase` here or `cordelia accept`"
+                        "{}",
+                        moved_on_says()
                     );
                     // Folders stopped syncing with this step: it is said
                     // here, once, with how many. A status says it until a
@@ -332,6 +344,31 @@ mod tests {
 
     /// The version that makes the first start in these tests.
     const VERSION: &str = "0.2.0-test";
+
+    /// The log's line of a first start that moved the database on says
+    /// what the device's status says of itself: that it is not added
+    /// yet, and the three ways on, in the order in which they are always
+    /// said (decision 2026-10-04 §5.2), on one line. It names no two ways
+    /// of its own.
+    #[test]
+    fn the_line_of_a_first_start_names_the_ways_on_as_the_status_does() {
+        let says = moved_on_says();
+        assert!(!says.contains('\n'), "{says}");
+        assert_eq!(
+            says,
+            "first start on this version: the database was copied and moved on; this device \
+             is not added yet: this device has taken a version of Cordelia in which every \
+             device is added again, and memory stays on this machine until it is. No machine \
+             has a phrase yet: make it on the one whose memory is the most up to date \
+             (`cordelia phrase`). Another machine has the phrase: add this one from it \
+             (`cordelia add-device` there, `cordelia accept` here). Every device that has the \
+             phrase is lost: recover here with it (`cordelia recover`). Do not make a new \
+             phrase first."
+        );
+        let at = |way: &str| says.find(way).unwrap_or_else(|| panic!("{way}: {says}"));
+        assert!(at("(`cordelia phrase`)") < at("`cordelia accept` here"));
+        assert!(at("`cordelia accept` here") < at("(`cordelia recover`)"));
+    }
 
     /// A node's state over a database in `dir`, which is its folder.
     fn node_in(dir: &std::path::Path) -> AppState {

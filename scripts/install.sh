@@ -130,14 +130,36 @@ download_binary() {
 
 # ── Install ─────────────────────────────────────────────────────────
 
-# The data directory is its owner's alone (mode 700): it holds the
-# device's key, the node's token and the database. So is the configuration
-# file in it (mode 600), but one that is a symbolic link: that file is
-# kept elsewhere, and no mode is set through the link. Where either cannot
-# be set, the script says so and goes on: the node sets both when it
-# starts.
+# Whether others than its owner and its group may read, write or enter
+# what is at $1: everyone else's r, w or x. Where $1 is a symbolic link,
+# what it leads to is read, as the node reads it. The sticky bit alone
+# (T in the last place) lets nobody in.
+open_to_others() {
+    others=$(ls -ldL "$1" | cut -c8-10)
+    case "$others" in
+        r??|?w?|??x|??t) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The data directory holds the device's key, the node's token and the
+# database. One that this run makes is its owner's alone (mode 700), and
+# so is the configuration file in it (mode 600), but one that is a
+# symbolic link: that file is kept elsewhere, and no mode is set through
+# the link. One that was there before is set so only where others than
+# its owner and its group may read, write or enter it, as the node does
+# when it starts, and the script says so: a directory shared with its
+# group on purpose is left as it is. Where a mode cannot be set, the
+# script says so and goes on.
+MADE_DATA_DIR=""
 private_data_dir() {
-    mkdir -p "$DATA_DIR"
+    if [ ! -d "$DATA_DIR" ]; then
+        mkdir -p "$DATA_DIR"
+        MADE_DATA_DIR=yes
+    elif [ -z "$MADE_DATA_DIR" ]; then
+        open_to_others "$DATA_DIR" || return 0
+        echo "${DATA_DIR} could be read, written or entered by others than its owner and its group: setting it to its owner's alone (mode 700)."
+    fi
     chmod 700 "$DATA_DIR" 2>/dev/null \
         || echo "Warning: could not set ${DATA_DIR} to mode 700."
     if [ -f "${DATA_DIR}/config.toml" ] && [ ! -L "${DATA_DIR}/config.toml" ]; then

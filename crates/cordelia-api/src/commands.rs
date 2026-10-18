@@ -97,6 +97,38 @@ pub fn restart_command(os: &str) -> &'static str {
     }
 }
 
+/// The command that starts a node which runs as the service that the
+/// install script sets up, and is stopped, on the system named
+/// (`std::env::consts::OS`).
+pub fn start_command(os: &str) -> &'static str {
+    match os {
+        "macos" => "launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+        _ => "systemctl --user start cordelia",
+    }
+}
+
+/// The command that stops a node which runs as the service that the
+/// install script sets up, on the system named.
+pub fn stop_command(os: &str) -> &'static str {
+    match os {
+        "macos" => "launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+        _ => "systemctl --user stop cordelia",
+    }
+}
+
+/// The one sentence that says how a node that cannot be reached is
+/// started, on the system named: the command that starts the service
+/// there ([`start_command`]), and `cordelia start` for a node that does
+/// not run as that service. Every command that names a way to start the
+/// node says this.
+pub fn start_says(os: &str) -> String {
+    format!(
+        "Start it with `{}`, or with `cordelia start` where it does not run as the service \
+         that the install script set up.",
+        start_command(os)
+    )
+}
+
 /// How a node is restarted on the system named, in the lines that follow
 /// "restart the node:" (decision 2026-10-04 §5.2): the command that
 /// restarts the service, on a line of its own; `cordelia status` after
@@ -1511,6 +1543,32 @@ mod tests {
                 )
             );
             assert!(!says.contains("cordelia start"), "{says}");
+        }
+    }
+
+    /// The one sentence that says how a node that cannot be reached is
+    /// started names, on each system, the command that starts the service
+    /// that the install script sets up, and `cordelia start` only for a
+    /// node that does not run as that service.
+    #[test]
+    fn test_the_sentence_that_starts_a_node_names_the_service_of_each_system() {
+        let systems = [
+            ("linux", "systemctl --user start cordelia"),
+            (
+                "macos",
+                "launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+            ),
+        ];
+        for (os, start) in systems {
+            assert_eq!(start_command(os), start);
+            assert_eq!(
+                start_says(os),
+                format!(
+                    "Start it with `{start}`, or with `cordelia start` where it does not run \
+                     as the service that the install script set up."
+                )
+            );
+            assert!(!start_says(os).starts_with("Start it with `cordelia start`"));
         }
     }
 

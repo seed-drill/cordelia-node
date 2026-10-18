@@ -576,6 +576,17 @@ impl Node {
         std::fs::write(self.config(), config.replace(ticks, &ticks_now)).unwrap();
     }
 
+    /// How often this node's governor churns its peers, in seconds, with
+    /// no jitter: for before the node starts. A test of churn would
+    /// otherwise wait an hour.
+    pub fn churn_every_secs(&self, secs: u64) {
+        let config = std::fs::read_to_string(self.config()).unwrap();
+        let ticks = "tick_interval_secs = 2\n";
+        assert_eq!(config.matches(ticks).count(), 1, "{config}");
+        let churns = format!("{ticks}churn_interval_secs = {secs}\nchurn_jitter_secs = 0\n");
+        std::fs::write(self.config(), config.replace(ticks, &churns)).unwrap();
+    }
+
     /// The most channels whose keys one connection proves, for before
     /// the node starts: what a relay remembers for a connection, and what
     /// a device sends on one. A test gives a relay and its devices one

@@ -356,13 +356,14 @@ fn set_mode(path: &Path, mode: u32) {
 /// What a node's log says where it set its data directory to its owner's
 /// alone.
 #[cfg(unix)]
-const MADE_PRIVATE: &str = "could be read, written or entered by others: it is now its owner's \
-                            alone (mode 0700)";
+const MADE_PRIVATE: &str = "could be read, written or entered by others than its owner and its \
+                            group: it is now its owner's alone (mode 0700)";
 
 /// `cordelia init` makes the data directory its owner's alone. A node
 /// that is started on one that others can read, write or enter, as an
 /// earlier version made it, sets it to mode 0700 and says so once in its
 /// log: at its next start there is nothing to set, and nothing is said.
+/// One shared with its group, and with nobody else, is left as it is.
 /// The key, the token and the database are 0600 as they were, and the
 /// configuration file, which the harness keeps beside the data directory
 /// and not in it, is left as it is.
@@ -394,6 +395,22 @@ fn a_node_that_starts_makes_its_data_directory_its_owners_alone() {
     assert_eq!(mode_of(&data), 0o700);
     let log = std::fs::read_to_string(device.log()).unwrap();
     assert_eq!(log.matches(MADE_PRIVATE).count(), 0, "{log}");
+
+    // Shared with its group on purpose, and open to nobody else: it is
+    // left as it is, at every start, and nothing is said.
+    device.stop();
+    set_mode(&data, 0o750);
+    device.start();
+    wait_for("the device is up a third time", &[&device], 30, || {
+        healthy(&device)
+    });
+    assert_eq!(mode_of(&data), 0o750);
+    let log = std::fs::read_to_string(device.log()).unwrap();
+    assert_eq!(log.matches(MADE_PRIVATE).count(), 0, "{log}");
+    assert!(
+        !log.contains("could be read, written or entered by others"),
+        "{log}"
+    );
 }
 
 /// A node answers from the moment its port is bound, while the copy of
@@ -1076,6 +1093,115 @@ fn a_swarm_node_is_not_set_up_over_a_database_from_a_later_version() {
         std::fs::read(child.data_dir().join("cordelia.db")).unwrap(),
         database
     );
+}
+
+/// `cordelia swarm-init` makes the data directory that it is given at the
+/// mode the node keeps its data directory at, its owner's alone (0700),
+/// as `cordelia init` and the install script make it: here under a umask
+/// that would leave a directory open to everyone to read and enter.
+#[cfg(unix)]
+#[test]
+fn swarm_init_makes_its_data_directory_its_owners_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let lead = node("lead", "personal", None);
+    let child = node("child", "relay", None);
+    std::fs::remove_dir_all(child.data_dir()).unwrap();
+    let lead_key = lead.data_dir().join("identity.key").display().to_string();
+    let args = [
+        "swarm-init",
+        "--index",
+        "1",
+        "--lead-identity",
+        &lead_key,
+        "--lead-entity-id",
+        "lead",
+    ];
+    // The command as the harness gives it, run under umask 022.
+    let given = child.command_for(&[], &args);
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("umask 022 && exec \"$0\" \"$@\"")
+        .arg(given.get_program())
+        .args(given.get_args())
+        .env_clear();
+    for (name, value) in given.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    for (name, value) in std::env::vars_os() {
+        let set_or_taken = given.get_envs().any(|(given, _)| given == name.as_os_str());
+        if !set_or_taken {
+            command.env(name, value);
+        }
+    }
+    let out = command.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mode = std::fs::metadata(child.data_dir())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    assert!(child.data_dir().join("identity.key").exists());
+
+    // Over a directory that holds a key already, and is open to others,
+    // it refuses, and changes nothing: not the directory's mode either.
+    std::fs::set_permissions(child.data_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let refused = child.refused(&args);
+    assert!(refused.contains("Identity already exists"), "{refused}");
+    assert!(!refused.contains("could be read"), "{refused}");
+    let mode = std::fs::metadata(child.data_dir())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+}
+
+/// `cordelia swarm-init` opens no database, and writes nothing, where a
+/// node runs on its data directory (decision 2026-10-04 §10.1, rule 6):
+/// it asks the directory's lock, which the node holds, says so and names
+/// the command that stops the node. `cordelia stats` beside that node
+/// reads its database for reading only.
+#[test]
+fn swarm_init_writes_nothing_beside_a_node_that_runs_on_its_data_directory() {
+    let lead = node("lead", "personal", None);
+    let relay = relay_started();
+    let lead_key = lead.data_dir().join("identity.key").display().to_string();
+    let files = || names_in(&relay.data_dir());
+    let before = files();
+    let key = std::fs::read(relay.data_dir().join("identity.key")).unwrap();
+    let refused = relay.refused(&[
+        "swarm-init",
+        "--index",
+        "1",
+        "--lead-identity",
+        &lead_key,
+        "--lead-entity-id",
+        "lead",
+    ]);
+    assert!(
+        refused.contains(&format!(
+            "a node is running on the data directory {}, and this command opens the node's \
+             database itself: nothing was opened, and nothing was changed. Stop the node first \
+             (`{}`",
+            relay.data_dir().display(),
+            cordelia_api::commands::stop_command(std::env::consts::OS)
+        )),
+        "{refused}"
+    );
+    assert_eq!(files(), before);
+    assert_eq!(
+        std::fs::read(relay.data_dir().join("identity.key")).unwrap(),
+        key
+    );
+    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
+    assert_eq!(stats["items_stored"], 0, "{stats}");
 }
 
 /// A personal node carries no channel of the older kind, and the commands
