@@ -239,6 +239,7 @@ impl DeviceEntries {
             link,
             under: *under,
         };
+        at.key = Some(link.relay().0);
         if !matches!(self.prove(&asks, channel, false).await, Step::Done(true)) {
             at.not_reached();
             return at;

@@ -1111,7 +1111,7 @@ of the device's own. Nothing of the older kind is read.
 
 | Route | What it does |
 |-------|--------------|
-| `POST /api/v1/devices/list` | Everything `cordelia devices` and `cordelia status` say of this device and its person: where it stands (`state`: `no_phrase`, `applied`, `fork`, `removed`, `not_listed`, `not_opened`); the devices of the statement it has applied, each with whether it has applied the statement and sent what it carried; the devices added since, with who added each; the removed keys, each with the label that this device knew it by; the keys that are in neither list of the last change; the devices that have said they left; for each relay, whether it holds the latest change entry; the keys typed at `accept`; the notices that a person has not cleared; the names that no device lists yet; and what this device has still to send. Each device is shown with its label and the first four words of its key's fingerprint. What a status goes by for its level is here too: for each relay `holds_latest`, `heard_since_woke`, `connected_secs` (for how long the node has been connected to it, by the node's own clock) and `no_room_at` (when it last refused something for room, or for the address's allowance); `applied_at` (when this device applied the change) and `removed_a_key` (whether that change removed a key that the statement before had not); `names` (`sent`, `to_go`, and `to_go_since`, since when the first of them has waited); `not_reached` (the relays it is set up with and is not connected to); and `waiting` (for each connected relay, how many of the device's channels have something still to send there, with the address it is reached at as `relay` and, as `name`, the name that the configuration gives it, where it answers with that relay's key: `cordelia devices` lists a relay once, by its name, with both things said on its line); and, only where the request's body carries `"sent_to_no_relay": true`, `sent_to_no_relay` (`versions` and `names`: how many versions, of how many names, this device holds that it has sent to no relay, however the device stands). `cordelia phrase`, `cordelia init --new-key` and `cordelia accept` on a device alone under a phrase ask for it, and say it before their yes; a status does not ask, since it calls this route every few seconds and the count reads every entry of every name |
+| `POST /api/v1/devices/list` | Everything `cordelia devices` and `cordelia status` say of this device and its person: where it stands (`state`: `no_phrase`, `applied`, `fork`, `removed`, `not_listed`, `not_opened`); the devices of the statement it has applied, each with whether it has applied the statement and sent what it carried; the devices added since, with who added each; the removed keys, each with the label that this device knew it by; the keys that are in neither list of the last change; the devices that have said they left; for each relay, whether it holds the latest change entry; the keys typed at `accept`; the notices that a person has not cleared; the names that no device lists yet; and what this device has still to send. Each device is shown with its label and the first four words of its key's fingerprint. What a status goes by for its level is here too: for each relay `holds_latest`, `heard_since_woke`, `connected_secs` (for how long the node has been connected to it, by the node's own clock) and `no_room_at` (when it last refused something for room, or for the address's allowance); `applied_at` (when this device applied the change) and `removed_a_key` (whether that change removed a key that the statement before had not); `names` (`sent`, `to_go`, and `to_go_since`, since when the first of them has waited); `not_reached` (the relays it is set up with and is not connected to); and `waiting` (for each connected relay, how many of the device's channels have something still to send there, with the address it is reached at as `relay` and, as `name`, the name that the configuration gives it, where it answers with that relay's key: `cordelia devices` lists a relay once, by its name, with both things said on its line); and, only where the request's body carries `"sent_to_no_relay": true`, `sent_to_no_relay` (`versions` and `names`: how many versions, of how many names, this device holds that it signed and has sent to no relay, however the device stands; what another key signed came from a relay, and is not counted, decision 2026-10-17 §4.5). `cordelia phrase`, `cordelia init --new-key` and `cordelia accept` on a device alone under a phrase ask for it, and say it before their yes; a status does not ask, since it calls this route every few seconds and the count reads every entry of every name |
 | `POST /api/v1/devices/clear` | `{ "notice": "<hex>" }`: a person clears a notice on this device. `404` where it shows no such notice |
 | `POST /api/v1/devices/add/look` | `{ "device": "cordelia_pk1...", "label": "desktop" }`: what adding that key would do, with nothing written: `would` is `add`, or `hand_again` for a key that the statement already lists |
 | `POST /api/v1/devices/add` | The same body with `would`, which says what the yes was for. The device writes the hand-over in the pair channel and, where a record is made, the record in the personal channel. `409` where adding the key would by then do the other |
@@ -1199,11 +1199,24 @@ never held, comes in only under **a word that the phrase signed:**
   and has not yet sent is in `/devices/list` as `carried_to_go`, with
   `carried_to_go_since`.
 - **`POST /api/v1/sync/unmap`** with a name that no folder maps and that a carry
-  holds lets go of it, and answers `let_go`. It is refused with `409` while a
-  version of the name has been sent to no relay (a device that has stopped is
-  not refused). With a folder that was mapped to a name which a carry or a
-  recovery holds, the folder is unmapped and the name stays held: the answer
-  carries `still_held`, the name.
+  holds lets go of it, and answers `let_go`. On a device that sends, it first
+  reads the name's channel at each relay that the device is set up with
+  (decision 2026-10-17 §4.2), outside the database's lock, a round at each
+  request: where the read goes on, the answer carries `reading`, with `read`,
+  the read's ID as hex, and `relays`, each relay still read in part with the
+  `bytes` it has handed so far, and the command asks again with `"read":
+  "<hex>"` beside the name. Once the read has ended, the name is let go where a
+  relay handed each entry of the name that this device signed, or what moves
+  its slot on, and the answer carries `let_go_versions`, how many such entries
+  there were. It is refused with `409` where an entry is held by no relay
+  (saying, of each relay, how its read ended), where the store has taken
+  anything of the name's channel since the read ended, and where the node
+  keeps no read by that ID. A device that has stopped reads no relay, and is
+  not refused. With a folder that was mapped to a name which a carry or a
+  recovery holds, or into which a carry brought versions while the folder was
+  mapped (`person.names_brought_in`, decision 2026-10-17 §4.3), the folder is
+  unmapped and the name stays held: the answer carries `still_held`, the
+  name.
 
 ---
 

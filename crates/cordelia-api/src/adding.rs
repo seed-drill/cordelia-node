@@ -1255,6 +1255,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
     meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?;
     meta::remove(conn, meta::PERSON_NAMES_CARRIED)?;
+    meta::remove(conn, meta::PERSON_NAMES_BROUGHT_IN)?;
     meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;

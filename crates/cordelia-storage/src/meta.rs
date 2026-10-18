@@ -70,6 +70,15 @@ pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
 /// device leaves its phrase.
 pub const PERSON_NAMES_CARRIED: &str = "person.names_carried";
 
+/// JSON array of the names into which a carry by command, or the look of
+/// a recovery, brought a version while a folder of this device's was
+/// mapped to them (decision 2026-10-17 §4.3): such a name is a carried
+/// name, and a folder's unmapping does not let go of it. A name goes from
+/// the list when the device stops it, and the list goes when the device
+/// leaves its phrase. A name brought in under a folder before this list
+/// was kept is not in it.
+pub const PERSON_NAMES_BROUGHT_IN: &str = "person.names_brought_in";
+
 /// Whether the look of a recovery that was made on this machine has not
 /// ended (decision 2026-10-04 §8, §9): it is set where the recovery's
 /// statement is applied, and goes when the look has carried what it

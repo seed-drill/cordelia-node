@@ -116,6 +116,9 @@ pub enum Handed<'a> {
 pub struct OwnAt {
     /// The relay, by the name that the device's configuration gives it.
     pub relay: String,
+    /// The relay's node key, once a round has been to its connection: what
+    /// the device keeps of a relay is kept by its key.
+    pub key: Option<[u8; 32]>,
     pub read: ReadAt,
     /// The mark of the relay's holding and the place to ask after next,
     /// as a pull keeps them. The read's own: no place that the device
@@ -135,6 +138,7 @@ impl OwnAt {
     pub fn new(relay: &str) -> Self {
         Self {
             relay: relay.to_string(),
+            key: None,
             read: ReadAt::Reading,
             place: (NO_MARK, 0),
             bytes: 0,
@@ -214,6 +218,10 @@ pub struct OwnRead {
     /// Each relay that the device was set up with when the read began, in
     /// that order.
     pub at: Vec<OwnAt>,
+    /// When it began: the check before a let-go reads it on for
+    /// RECOVERY_READ_ON_MAX_SECS from then at most (decision 2026-10-17
+    /// §4.2 item 1).
+    pub begun: Instant,
     /// Whether a round of it is running.
     reading: bool,
     /// When its last round ended, or it began where none has: it stands
@@ -272,6 +280,7 @@ impl OwnReads {
             channel: *channel,
             under: *under,
             at: relays.iter().map(|relay| OwnAt::new(relay)).collect(),
+            begun: now,
             reading: false,
             ended: now,
         };
