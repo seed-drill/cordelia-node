@@ -343,6 +343,7 @@ pub fn set_claude(
             Some(dir) => Some(dir.clone()),
             None => meta::get(db, meta::SYNC_CLAUDE_LAST_DIR)?,
         };
+        let was = remembered.clone();
         let dir = match (&body.dir, remembered) {
             (Some(d), _) => d.clone(),
             (None, Some(d)) if !body.reset => d,
@@ -414,11 +415,15 @@ pub fn set_claude(
         // is started again for a new spelling of the same path, and
         // records what its folders agree under that.
         //
-        // Nothing is agreed while sync is off. Turning it off forgets, and
-        // so does turning it on, for whatever was left: an older version
-        // forgot only later, in its loop, and a write may have failed.
-        let dir_changed = stored.as_deref().is_some_and(|was| was != dir);
-        if dir_changed || stored.is_none() {
+        // Sync turned off and on again is a node stopped and started: a
+        // folder that stays mapped keeps what it agreed, so what was
+        // edited here meanwhile is sent, and this device's own last
+        // version is not taken for the other side of a conflict. Turned
+        // on at another directory than the one it was last on, or with
+        // none remembered, every folder forgets; at the same one, only
+        // what is not mapped, such as a folder unmapped while it was off.
+        let dir_changed = was.as_deref().is_none_or(|was| was != dir);
+        if dir_changed {
             let forgotten = sync_state::forget_folders_except(db, &[])?;
             if forgotten > 0 {
                 tracing::info!(
@@ -426,7 +431,7 @@ pub fn set_claude(
                     "sync: every folder forgot what it had agreed"
                 );
             }
-        } else if unmapped {
+        } else if unmapped || stored.is_none() {
             forget_what_is_not_mapped(db, &dir)?;
         }
 
@@ -441,8 +446,9 @@ pub fn set_claude(
             meta::set(db, meta::SYNC_CLAUDE_LAST_DIR, &dir)?;
         }
         meta::remove(db, meta::SYNC_CLAUDE_DIR)?;
-        // Nothing syncs now. Turned on again, every folder merges.
-        sync_state::forget_folders_except(db, &[])?;
+        // Nothing syncs now. A mapped folder keeps what it agreed, as it
+        // does while the node is stopped: turned on again, it goes on
+        // from there.
         tracing::info!("sync: turned off");
     }
     meta::remove(db, meta::SYNC_CLAUDE_REPORT)?;
@@ -2051,7 +2057,8 @@ mod tests {
     /// with its channel by the time the command answers, and the folders
     /// that stay mapped have not. So if it syncs again it merges: a file
     /// it lost in between is fetched back, and never sent as a delete,
-    /// whether or not a cycle ran in between.
+    /// whether or not a cycle ran in between. Turning sync off and on
+    /// again stops no mapped folder: it is a node stopped and started.
     #[test]
     fn test_a_folder_that_is_stopped_forgets_what_it_agreed() {
         let s = Settings::on();
@@ -2078,17 +2085,20 @@ mod tests {
         s.unmap("/home/sam/Work");
         assert_eq!(remembered(&s), [HOME]);
 
-        // Sync turned off: every folder.
+        // Sync turned off is a node stopped: the folders that stay mapped
+        // keep what they agreed, so that turned on again they go on from
+        // there, and what was edited here meanwhile is sent.
         s.map("/home/sam/notes", "lab");
         agree(&s);
         s.claude(serde_json::json!({ "enabled": false }));
-        assert_eq!(remembered(&s), Vec::<&str>::new());
+        let kept = remembered(&s);
+        assert!(kept.contains(&HOME) && kept.contains(&"/home/sam/notes"));
 
-        // And turned on: whatever was left agreed while it was off, as an
-        // older version could leave it.
-        agree(&s);
+        // Unmapped while sync is off, and turned on at the directory it
+        // was last on: what is not mapped forgets, and nothing else.
+        s.unmap("lab");
         s.claude(serde_json::json!({}));
-        assert_eq!(remembered(&s), Vec::<&str>::new());
+        assert_eq!(remembered(&s), [HOME]);
         // Run again while it is on, it forgets nothing.
         agree(&s);
         s.claude(serde_json::json!({}));
@@ -2274,6 +2284,27 @@ mod tests {
         s.agreed("/home/sam/notes");
         s.claude(serde_json::json!({ "dir": "/home/sam//.claude-other" }));
         assert!(!s.remembers("/home/sam/notes"));
+
+        // The same where sync was off between: turned on at another
+        // directory than the one it was last on, every folder forgets,
+        // the mapped folder's record under that directory too.
+        let agreed_there = |s: &Settings| {
+            let agreed = sync_state::Agreed {
+                hash: Some([7; 32]),
+                rev: 1,
+                signer: None,
+                chain: None,
+            };
+            sync_state::save(&s.db, &there, "grp_x", "notes.md", &agreed).unwrap();
+        };
+        s.claude(serde_json::json!({ "dir": DIR }));
+        s.agreed("/home/sam/notes");
+        agreed_there(&s);
+        s.claude(serde_json::json!({ "enabled": false }));
+        assert!(s.remembers("/home/sam/notes"));
+        s.claude(serde_json::json!({ "dir": other }));
+        assert!(!s.remembers("/home/sam/notes"));
+        assert!(sync_state::load(&s.db, &there, "grp_x").unwrap().is_empty());
     }
 
     /// Turning home memory off unmaps the home directory, so the node has
@@ -2494,9 +2525,10 @@ mod tests {
                 "{which}"
             );
         }
-        // Three of them also forget, later on, and the table of what
-        // folders agreed is gone: counted all the same.
-        for which in ["sync off", "home memory off", "an unmapping"] {
+        // Two of them also forget, later on, and the table of what
+        // folders agreed is gone: counted all the same. (Turning sync off
+        // forgets nothing: a mapped folder keeps what it agreed.)
+        for which in ["home memory off", "an unmapping"] {
             let s = Settings::on();
             s.map(HOME, "team");
             s.map("/home/sam/notes", "lab");
@@ -2648,7 +2680,9 @@ mod tests {
                 );
                 assert_eq!(everything(&s), before, "{with}, sync on: {sync_on}");
                 assert_eq!(s.control.generation(), count, "{with}");
-                assert_eq!(s.remembers("/home/sam/notes"), sync_on, "{with}");
+                // A mapped folder keeps what it agreed, with sync on or
+                // off, and a refused request forgets nothing of it.
+                assert!(s.remembers("/home/sam/notes"), "{with}");
             }
         }
 

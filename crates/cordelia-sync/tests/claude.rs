@@ -2191,7 +2191,8 @@ fn a_cycle_runs_only_for_the_directory_that_is_set() {
 
 /// Unmapped (or home memory turned off), emptied, and mapped again: the
 /// folder starts afresh. What it lost in between is not
-/// sent to the other devices as deletes.
+/// sent to the other devices as deletes. Sync turned off and on again
+/// stops no folder: it is a node stopped and started.
 #[test]
 fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     let (mut a, mut b) = paired_explicit();
@@ -2224,19 +2225,24 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
     assert_eq!(files(&a_mem), ["MEMORY.md", "one.md", "two.md"]);
 
-    // The same when sync is turned off altogether and on again, with no
-    // cycle in between: the handler that turned it off forgot.
+    // Sync turned off altogether and on again, with no cycle in between,
+    // is not that: the folder keeps what it agreed, as a node that is
+    // stopped and started does. A file deleted here meanwhile is sent as
+    // a delete, and one edited here is sent, with no conflict file.
     claude(&a, serde_json::json!({ "enabled": false }));
     std::fs::remove_file(a_mem.join("one.md")).unwrap();
+    let edited = "two, edited while sync was off\n";
+    std::fs::write(a_mem.join("two.md"), edited).unwrap();
     claude(&a, serde_json::json!({}));
     settle(&mut a, &mut b);
-    assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
-    assert_eq!(read(&a_mem, "one.md").as_deref(), Some("one\n"));
+    assert_eq!(files(&b_mem), ["MEMORY.md", "two.md"]);
+    assert_eq!(files(&a_mem), ["MEMORY.md", "two.md"]);
+    assert_eq!(read(&b_mem, "two.md").as_deref(), Some(edited));
 
     // A delete made while the folder syncs still reaches the other device.
     std::fs::remove_file(a_mem.join("two.md")).unwrap();
     settle(&mut a, &mut b);
-    assert_eq!(files(&b_mem), ["MEMORY.md", "one.md"]);
+    assert_eq!(files(&b_mem), ["MEMORY.md"]);
 }
 
 /// A mapped folder whose memory directory is gone (its disk is not
