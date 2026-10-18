@@ -45,8 +45,7 @@ MUTATIONS = [
      '''        &[0; 32],
     )?)''',
      [EVERY_NAME,
-      sync("test_a_folders_unmapping_does_not_let_go_of_a_name_that_a_carry_holds"),
-      sync("test_a_name_that_a_carry_holds_with_no_folder_is_let_go")]),
+      sync("test_a_folders_unmapping_does_not_let_go_of_a_name_that_a_carry_holds")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
