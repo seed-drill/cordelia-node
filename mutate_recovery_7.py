@@ -34,6 +34,7 @@ def recover(test): return (API, "recover::tests::" + test)
 def main(test): return (BIN, "tests::" + test)
 def e2e(test): return (E2E, test)
 def core(test): return (CORE, "protocol::tests::" + test)
+def device_entries(test): return (("cordelia-node", ["--test", "device_entries_e2e"]), test)
 def commands_api(test): return (("cordelia-api", ["--test", "commands_api"]), test)
 
 HELD = sync("test_a_version_is_held_only_where_a_relay_read_after_the_ask_handed_it")
@@ -271,6 +272,38 @@ MUTATIONS = [
      '''        at.key = Some(link.relay().0);''',
      '''        at.key = None;''',
      [e2e("a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought")]),
+    ("S14 a let-go's read is not held to the relay's count", NODE_OWN_READ,
+     '''            gated: true,
+        };
+        at.key = Some(link.relay().0);''',
+     '''            gated: false,
+        };
+        at.key = Some(link.relay().0);''',
+     [device_entries("a_let_gos_read_asks_a_relay_at_its_count_nothing")]),
+    ("F1 a folder mapped during the read does not keep the name", SYNC,
+     '''        if crate::names::has_folder(db, name).map_err(refused)? {
+            return Err(ApiError::Conflict(check::changed_since_says(name)));''',
+     '''        if crate::names::has_folder(db, name).map_err(refused)? && false {
+            return Err(ApiError::Conflict(check::changed_since_says(name)));''',
+     [sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")]),
+    ("F2 the refusal for a folder mapped during the read says another thing", LET_GO,
+     '''"{} is still held: what was read has changed since, or is too old. Run `cordelia sync \\''',
+     '''"{} is still held: the read is done. Run `cordelia sync \\''',
+     [sync("test_a_folder_mapped_while_the_relays_are_read_keeps_the_name")]),
+    ("F3 home memory is said by its name", LET_GO,
+     '''        true => "home memory".to_string(),''',
+     '''        true => name.to_string(),''',
+     [sync("test_what_the_node_says_of_a_let_go_names_home_memory_as_that")]),
+    ("F4 only the first relay is looked at", LET_GO,
+     '''        for at in &read.at {
+            let Some(handed) = at.handed.get(&slot) else {''',
+     '''        for at in read.at.iter().take(1) {
+            let Some(handed) = at.handed.get(&slot) else {''',
+     [HELD]),
+    ("F5 an entry that is no version is held by any version at its revision", LET_GO,
+     '''            .is_some_and(|mine| version.rev == mine.rev && version.value == mine.value)''',
+     '''            .map_or(true, |mine| version.rev == mine.rev && version.value == mine.value)''',
+     [let_go("test_an_own_entry_that_is_no_version_is_held_by_no_version_at_its_revision")]),
     # ── The list of 4.3 ──
     ("L1 a name with no folder is noted as brought in", NAMES,
      '''    if !has_folder(conn, name)? {
