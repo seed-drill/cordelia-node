@@ -119,7 +119,7 @@ MUTATIONS = [
      [THERE]),
     ("SF20 the summary's line to read one does not carry the folder", MSG,
      '''        Some(folder) => format!("cordelia msg read {} <id>", folder_arg(folder)),''',
-     '''        Some(_) => "cordelia msg read <id>".into(),''',
+     '''        Some(_) => String::from("cordelia msg read <id>"),''',
      [LINES, THERE]),
     ("SF21 the summary does not hand its folder to its header", MSG,
      '''    summary_for(&answer, given)''',
