@@ -1026,6 +1026,12 @@ impl Governor {
     /// passes, nothing is demoted: a demotion with no peer to take its
     /// place explores nothing and only shrinks the hot set, which step 4
     /// refills only below hot_min.
+    ///
+    /// A hot relay is not demoted where that would leave fewer than
+    /// hot_min_relays relays hot: step 4a would promote a warm relay at the
+    /// next tick, one more than the hot count was, and step 5 would then
+    /// demote a peer again. So churn leaves the hot count and the count of
+    /// hot relays as they were.
     fn churn_hot(&mut self, actions: &mut GovernorActions) {
         let (hot, _, _, _) = self.counts();
         if hot <= self.targets.hot_min {
@@ -1033,11 +1039,19 @@ impl Governor {
         }
 
         // Pick a random non-trusted hot peer to demote: a trusted peer and
-        // a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        // a swarm peer are exempt (network-protocol.md §5.4, step 6), and
+        // so is a relay while no more than hot_min_relays relays are hot.
+        let hot_relays = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && p.is_relay)
+            .count();
+        let relay_spared = hot_relays <= self.targets.hot_min_relays;
         let hot_peers: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
+            .filter(|p| !(relay_spared && p.is_relay))
             .map(|p| p.node_id.clone())
             .collect();
 
@@ -2347,6 +2361,54 @@ mod tests {
         assert_eq!(gov.peer_state(&demoted[0]), Some(&PeerState::Warm));
         assert_eq!(moved(&transitions, "warm", "hot"), vec![warm.clone()]);
         assert_eq!(gov.peer_state(&warm), Some(&PeerState::Hot));
+    }
+
+    /// Hot churn never leaves fewer hot relays than hot_min_relays
+    /// (network-protocol.md §5.4 steps 4a and 6): one relay and two other
+    /// peers are hot, at hot_max, and a peer that is not a relay has been
+    /// warm past its tenure. After a churn and through the five ticks
+    /// after it, one relay and three peers are hot, and no peer is
+    /// promoted and demoted in one tick. Made so again sixty times.
+    #[test]
+    fn test_churn_hot_leaves_hot_relays_and_the_hot_count_as_they_were() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            hot_max: 3,
+            hot_min_relays: 1,
+            churn_interval_secs: 3600,
+            ..hot_churn_targets()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+        let relay = make_node_id(1);
+        let others = [make_node_id(2), make_node_id(3)];
+        let warm = make_node_id(4);
+        gov.add_peer(relay.clone(), vec![], vec![]);
+        gov.set_peer_relay(&relay, true);
+        for _ in 0..60 {
+            for id in std::iter::once(&relay).chain(&others) {
+                set_hot(&mut gov, id);
+            }
+            set_warm_long(&mut gov, &warm);
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            for tick in 0..6 {
+                let transitions = gov.tick().transitions;
+                let up = moved(&transitions, "warm", "hot");
+                let down = moved(&transitions, "hot", "warm");
+                let hot_relays = gov
+                    .all_peers()
+                    .filter(|p| p.state == PeerState::Hot && p.is_relay)
+                    .count();
+                assert_eq!(hot_relays, 1, "tick {tick}: {transitions:?}");
+                assert_eq!(gov.counts().0, 3, "tick {tick}: {transitions:?}");
+                assert!(
+                    up.iter().all(|id| !down.contains(id)),
+                    "tick {tick}: {transitions:?}"
+                );
+                if tick == 0 {
+                    assert_eq!(up.len(), 1, "the churn swapped: {transitions:?}");
+                }
+            }
+        }
     }
 
     /// A clock that counts in microseconds: each reading is a microsecond
