@@ -2,8 +2,10 @@
 """Mutation checks for the restart of a node on macOS: the install script
 restarts a running node by launchctl bootout of the agent, then launchctl
 bootstrap of the plist it has just written (tried again within a bound,
-failed for good after it), and the node's own sentences name the same two
-commands (operations.md §7.1, §10.2). A part for each rule of the slice:
+stopped at once on 119 and 125, failed for good after it), only where the
+agent is in this login's GUI domain; and the line a person pastes, from
+the script and from the node, tries its bootstrap once more 30 seconds
+later (operations.md §7.1, §10.2). A part for each rule of the slice:
 put each fault in, and confirm the test named for it fails on an
 assertion. Run from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
@@ -24,38 +26,46 @@ def node(test): return (NODE, "tests::" + test)
 def case(name): return (SH, name)
 
 SCRIPT_PRINTS = api("test_the_restart_command_is_the_one_the_install_script_prints")
+RUNS = api("test_the_restart_on_macos_ends_and_tries_the_bootstrap_once_more")
 MACOS_SENTENCES = node("test_a_restart_on_macos_is_a_bootout_then_a_bootstrap")
+
+BOOTOUT = '''    launchctl bootout "$AGENT_TARGET" 2>/dev/null && booted_out=yes\n'''
+BOOTSTRAP = '''        launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err" && return 0'''
+RETRY = '''        [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ] && break'''
+RESTART_CMD = '''    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \\"${PLIST_FILE}\\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \\"${PLIST_FILE}\\")"'''
+PLIST = "~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
+NODE_LINE = '''        "macos" => {
+            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \\
+             gui/$(id -u) ''' + PLIST + ''' || (sleep 30; \\
+             launchctl bootstrap gui/$(id -u) ''' + PLIST + ''')"
+        }'''
+NODE_ALL = [SCRIPT_PRINTS, RUNS, MACOS_SENTENCES]
+ANOTHER = case("a-mac-agent-in-another-domain")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
 # then fail). The text to take out must occur exactly once in the file.
 # Two edits in one part: give two lists of the same length.
 MUTATIONS = [
+    # The installer's restart: bootout, then bootstrap of the plist just written.
     ("MR1 the agent is kickstarted again, not booted out and bootstrapped", INSTALL,
      '''        darwin) restart_agent ;;''',
      '''        darwin) launchctl kickstart -k "$AGENT_TARGET" ;;''',
      [case("a-running-node-on-a-mac")]),
-    ("MR2 no bootout before the bootstrap", INSTALL,
-     '''    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :\n''',
-     '''''',
+    ("MR2 no bootout before the bootstrap", INSTALL, BOOTOUT, '''''',
      [case("a-running-node-on-a-mac")]),
     ("MR3 the bootout comes after the bootstrap", INSTALL,
-     ['''    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :\n''',
-      '''    done\n}\n\n# Wait, for so many tries a second apart, until the node answers.'''],
-     ['''''',
-      '''    done\n    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :\n}\n\n# Wait, for so many tries a second apart, until the node answers.'''],
+     [BOOTOUT, BOOTSTRAP],
+     ['''''', BOOTSTRAP.replace("&& return 0", '&& { launchctl bootout "$AGENT_TARGET" 2>/dev/null; return 0; }')],
      [case("a-running-node-on-a-mac")]),
     ("MR4 a bootout of a job already gone ends the restart", INSTALL,
-     '''    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :''',
-     '''    launchctl bootout "$AGENT_TARGET" 2>/dev/null || return 1''',
+     BOOTOUT, BOOTOUT.replace("&& booted_out=yes", "&& booted_out=yes || return 1"),
      [case("a-mac-agent-that-is-gone-already")]),
     ("MR5 what a bootout of a job already gone said is printed", INSTALL,
-     '''    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :''',
-     '''    launchctl bootout "$AGENT_TARGET" || :''',
+     BOOTOUT, BOOTOUT.replace(" 2>/dev/null", ""),
      [case("a-mac-agent-that-is-gone-already")]),
     ("MR6 a bootstrap that fails is not tried again", INSTALL,
-     '''        if [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ]; then''',
-     '''        if :; then''',
+     RETRY, '''        break''',
      [case("a-mac-agent-that-is-still-going-once")]),
     ("MR7 the bound is a second longer than 30 seconds", INSTALL,
      '''BOOTSTRAP_WAIT_SECS=$(seconds_or "${CORDELIA_BOOTSTRAP_WAIT_SECS:-}" 30)''',
@@ -66,34 +76,42 @@ MUTATIONS = [
      '''BOOTSTRAP_WAIT_SECS=$(seconds_or "" 30)''',
      [case("a-mac-agent-that-does-not-bootstrap-in-a-wait-given")]),
     ("MR9 no wait between the tries of a bootstrap", INSTALL,
-     '''        sleep 1\n        waited=$((waited + 1))\n    done\n}\n\n# Wait, for so many tries a second apart, until the node answers.''',
-     '''        waited=$((waited + 1))\n    done\n}\n\n# Wait, for so many tries a second apart, until the node answers.''',
+     '''        sleep 1\n        waited=$((waited + 1))\n    done\n    sed''',
+     '''        waited=$((waited + 1))\n    done\n    sed''',
      [case("a-mac-agent-that-does-not-bootstrap"), case("a-mac-agent-that-is-still-going-once")]),
     ("MR10 a bootstrap that fails for good is taken as done", INSTALL,
-     '''            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true\n            return 1''',
-     '''            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true\n            return 0''',
+     '''    return 1\n}\n\n# Wait, for so many tries a second apart, until the node answers.''',
+     '''    return 0\n}\n\n# Wait, for so many tries a second apart, until the node answers.''',
      [case("a-mac-agent-that-does-not-bootstrap")]),
     ("MR11 what launchctl said of a bootstrap that failed for good is not printed", INSTALL,
-     '''            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true\n''',
+     '''    sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true\n''',
      '''''',
      [case("a-mac-agent-that-does-not-bootstrap")]),
     ("MR12 the bootstrap is of the job's label, not the domain", INSTALL,
-     '''    until launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE"''',
-     '''    until launchctl bootstrap "$AGENT_TARGET" "$PLIST_FILE"''',
+     BOOTSTRAP, BOOTSTRAP.replace('bootstrap "$AGENT_DOMAIN"', 'bootstrap "$AGENT_TARGET"'),
      [case("a-running-node-on-a-mac")]),
     ("MR13 the bootstrap is of a plist other than the one just written", INSTALL,
      '''        darwin) restart_agent ;;''',
      '''        darwin) PLIST_FILE="${PLIST_FILE}.old"; restart_agent ;;''',
      [case("a-running-node-on-a-mac")]),
-    ("MR14 the restart printed runs its second command only where the first found the job", INSTALL,
-     '''    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"''',
-     '''    RESTART_CMD="launchctl bootout ${AGENT_TARGET} && launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"''',
+    # The line the installer prints.
+    ("MR14 the restart printed runs its bootstrap only where the bootout found the job", INSTALL,
+     RESTART_CMD, RESTART_CMD.replace("${AGENT_TARGET}; launchctl", "${AGENT_TARGET} && launchctl"),
      [case("a-mac-agent-that-does-not-bootstrap"), case("a-mac-node-left-as-it-is-when-asked"),
       case("a-mac-node-that-does-not-answer"), SCRIPT_PRINTS]),
     ("MR15 the restart printed is the kickstart", INSTALL,
-     '''    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"''',
-     '''    RESTART_CMD="launchctl kickstart -k ${AGENT_TARGET}"''',
+     RESTART_CMD, '''    RESTART_CMD="launchctl kickstart -k ${AGENT_TARGET}"''',
      [case("a-mac-agent-that-does-not-bootstrap"), SCRIPT_PRINTS]),
+    ("MR19 the restart printed does not try its bootstrap again", INSTALL,
+     RESTART_CMD, RESTART_CMD.replace(''' || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \\"${PLIST_FILE}\\")''', ''),
+     [case("a-mac-restart-pasted"), SCRIPT_PRINTS]),
+    ("MR20 the restart printed waits 3 seconds, not 30", INSTALL,
+     RESTART_CMD, RESTART_CMD.replace("(sleep 30;", "(sleep 3;"),
+     [case("a-mac-restart-pasted"), SCRIPT_PRINTS]),
+    ("MR21 the restart printed does not quote the plist's path", INSTALL,
+     RESTART_CMD, RESTART_CMD.replace('''\\"${PLIST_FILE}\\"''', '''${PLIST_FILE}'''),
+     [case("a-mac-home with a space"), SCRIPT_PRINTS]),
+    # A first install, the start and the stop.
     ("MR16 a first install on a Mac restarts the agent", INSTALL,
      '''    echo "  Stop:   launchctl unload ${PLIST_FILE}"''',
      '''    echo "  Stop:   launchctl unload ${PLIST_FILE}"; restart_agent >/dev/null 2>&1 || :''',
@@ -106,33 +124,71 @@ MUTATIONS = [
      '''    echo "  Stop:   launchctl unload ${PLIST_FILE}"''',
      '''    echo "  Stop:   launchctl bootout ${AGENT_TARGET}"''',
      [case("a-first-install-on-a-mac")]),
+    # The domain the restart acts on.
+    ("MR22 a job in another domain is restarted all the same", INSTALL,
+     '''        if ! service_here; then''', '''        if false; then''',
+     [ANOTHER]),
+    ("MR23 the domain is asked of the domain, not of the job in it", INSTALL,
+     '''        darwin) launchctl print "$AGENT_TARGET" >/dev/null 2>&1 ;;''',
+     '''        darwin) launchctl print "$AGENT_DOMAIN" >/dev/null 2>&1 ;;''',
+     [case("a-running-node-on-a-mac")]),
+    ("MR24 a job in another domain ends the restart failed, not needed", INSTALL,
+     '''            RESTART="needed"\n            echo "The service is loaded, but not''',
+     '''            RESTART="failed"\n            echo "The service is loaded, but not''',
+     [ANOTHER]),
+    ("MR25 a job in another domain is not told how to restart it there", INSTALL,
+     '''            echo "  launchctl unload \\"${PLIST_FILE}\\"; launchctl load \\"${PLIST_FILE}\\""\n''',
+     '''''',
+     [ANOTHER]),
+    ("MR30 the service is found by the GUI domain, not by launchctl list", INSTALL,
+     '''        darwin) launchctl list 2>/dev/null | grep -q ai.seeddrill.cordelia ;;''',
+     '''        darwin) launchctl print "gui/$(id -u)/ai.seeddrill.cordelia" >/dev/null 2>&1 ;;''',
+     [ANOTHER]),
+    # Codes that no wait changes, and the node that is down.
+    ("MR26 a disabled service is tried again", INSTALL,
+     '''            119|125) break ;;''', '''            125) break ;;''',
+     [case("a-mac-agent-that-is-disabled")]),
+    ("MR27 a domain with no GUI login is tried again", INSTALL,
+     '''            119|125) break ;;''', '''            119) break ;;''',
+     [case("a-mac-domain-with-no-gui-login")]),
+    ("MR28 a bootout that took and a bootstrap that failed do not say the node is down", INSTALL,
+     '''        echo "The agent was booted out and is not loaded again: the node is not running."''',
+     '''        :''',
+     [case("a-mac-agent-that-does-not-bootstrap")]),
+    ("MR29 the node is said to be down where the bootout did not take", INSTALL,
+     '''    if [ -n "$booted_out" ]; then''', '''    if :; then''',
+     [case("a-mac-domain-with-no-gui-login")]),
+    # The node's line.
     ("MN1 the node names the kickstart on macOS", COMMANDS,
-     '''            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \\
-             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
-        }''',
-     '''            "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
-        }''',
-     [SCRIPT_PRINTS, MACOS_SENTENCES, api("test_a_node_under_the_old_key_names_the_command_that_restarts_it"),
+     NODE_LINE,
+     '''        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",''',
+     NODE_ALL + [api("test_a_node_under_the_old_key_names_the_command_that_restarts_it"),
       node("test_the_restart_command_is_the_systems_own"),
       node("test_a_port_that_is_taken_is_said_to_be_a_node_that_runs_already"),
       (NODE, "person_cmd::tests::a_new_key_ends_with_the_command_that_restarts_the_node"),
       (NODE, "person_cmd::tests::a_refusal_of_what_answered_names_the_command_that_restarts_the_node")]),
-    ("MN2 the node's second command runs only where the first found the job", COMMANDS,
-     '''        "macos" => {\n            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \\''',
-     '''        "macos" => {\n            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia && launchctl bootstrap \\''',
-     [SCRIPT_PRINTS, MACOS_SENTENCES]),
-    ("MN3 the node's two commands are on two lines", COMMANDS,
-     '''        "macos" => {\n            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \\''',
-     '''        "macos" => {\n            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia;\\nlaunchctl bootstrap \\''',
+    ("MN2 the node's bootstrap runs only where the bootout found the job", COMMANDS,
+     NODE_LINE, NODE_LINE.replace("cordelia; launchctl bootstrap", "cordelia && launchctl bootstrap"),
+     NODE_ALL),
+    ("MN3 the node's commands are on two lines", COMMANDS,
+     NODE_LINE, NODE_LINE.replace("cordelia; launchctl bootstrap", "cordelia;\\nlaunchctl bootstrap"),
      [SCRIPT_PRINTS, MACOS_SENTENCES]),
     ("MN4 the node bootstraps before it boots out", COMMANDS,
-     '''            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \\
-             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
-        }''',
-     '''            "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist; \\
+     NODE_LINE, '''        "macos" => {
+            "launchctl bootstrap gui/$(id -u) ''' + PLIST + '''; \\
              launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia"
         }''',
-     [SCRIPT_PRINTS, MACOS_SENTENCES]),
+     NODE_ALL),
+    ("MN8 the node's line does not try its bootstrap again", COMMANDS,
+     NODE_LINE, NODE_LINE.replace(''' || (sleep 30; \\
+             launchctl bootstrap gui/$(id -u) ''' + PLIST + ''')"''', '''"'''),
+     NODE_ALL),
+    ("MN9 the node's line waits 3 seconds, not 30", COMMANDS,
+     NODE_LINE, NODE_LINE.replace("(sleep 30;", "(sleep 3;"),
+     NODE_ALL),
+    ("MN10 the node's line tries its bootstrap twice more, not once", COMMANDS,
+     NODE_LINE, NODE_LINE.replace(PLIST + ''')"''', PLIST + ''' || (sleep 30; launchctl bootstrap gui/$(id -u) ''' + PLIST + '''))"'''),
+     NODE_ALL),
     ("MN5 the version check names the restart of the system it runs on, not the one named", MAIN,
      '''        restart_command(os)
     );
