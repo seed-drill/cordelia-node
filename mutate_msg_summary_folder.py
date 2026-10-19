@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Mutation checks for `cordelia msg summary --folder <dir>`, the folder a
-summary acts for where a session runs in another folder (decision
+"""Mutation checks for `--folder <dir>` of `cordelia msg summary`, `msg read`
+and `msg send`, the folder they act for where a session runs in another
+folder, and the lines the summary and `read` print with it (decision
 2026-10-09 §3.1, §4.1, §5). A part for each rule of the slice: put each
 fault in, and confirm the test named for it fails on an assertion. Run
 from the root of a checkout that nothing else edits."""
@@ -24,6 +25,9 @@ TILDE = unit("the_summarys_folder_takes_a_leading_tilde_as_home")
 HELP = main_test("the_summarys_help_says_when_to_give_its_folder")
 SHOWN = e2e("the_summarys_folder_comes_before_the_session_and_the_hooks")
 SILENT = e2e("the_summary_of_a_folder_given_that_does_not_sync_prints_nothing")
+THERE = e2e("a_message_the_summary_shows_by_its_folder_is_read_and_answered_there")
+LINES = unit("the_lines_to_read_and_to_answer_carry_the_folder_given")
+NOT_A_FOLDER = unit("a_word_after_the_summarys_folder_that_is_a_flag_or_not_text_is_no_folder")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -50,13 +54,14 @@ MUTATIONS = [
         return folder;''',
      [ORDER]),
     ("SF5 a leading ~/ is not the home directory", MSG,
-     '''home.join(&text[2..]),''',
-     '''PathBuf::from(text),''',
+     '''home.join(&given[2..]),''',
+     '''PathBuf::from(given),''',
      [TILDE, SHOWN]),
     ("SF6 the summary does not expand the folder it was given", MSG,
-     '''    let folder = folder.map(|given| folder_given(given, home));''',
-     '''    let _ = home;
-    let folder = folder.map(PathBuf::from);''',
+     '''    let folder = given.map(|given| folder_given(given, home()));
+    let dir = directory(folder, project_dir, || {''',
+     '''    let folder = given.map(PathBuf::from);
+    let dir = directory(folder, project_dir, || {''',
      [SHOWN]),
     ("SF7 --folder <dir> is not taken", MSG,
      '''            Some("--folder") if after_summary => {''',
@@ -71,7 +76,7 @@ MUTATIONS = [
      '''msg_cmd::summary(&asked.config, started, None, asked.others);''',
      [SHOWN]),
     ("SF10 a --folder with no folder, or an empty one, is taken", MSG,
-     '''(folders == 1 && folder.as_ref().is_none_or(|f| f.is_empty()))''',
+     '''(folders == 1 && folder.as_deref().is_none_or(str::is_empty))''',
      '''(folders == 1 && false)''',
      [ASKED]),
     ("SF11 a --folder given twice is taken", MSG,
@@ -90,6 +95,84 @@ MUTATIONS = [
      '''        /// "command": "cordelia msg summary --folder ~/notes"''',
      '''        /// "command": "cordelia msg summary"''',
      [HELP]),
+    ("SF15 read does not take its --folder", MSG,
+     '''folder_here(given, node.git_wait())''',
+     '''folder_here(None, node.git_wait())''',
+     [THERE]),
+    ("SF16 send does not take its --folder", MSG,
+     '''folder_here(flags.folder.as_deref(), node.git_wait())''',
+     '''folder_here(None, node.git_wait())''',
+     [THERE]),
+    ("SF17 Claude Code's variable comes before the --folder of read and send", MSG,
+     '''    let dir = directory(folder, std::env::var_os(PROJECT_DIR), || None)''',
+     '''    let dir = directory(folder.filter(|_| std::env::var_os(PROJECT_DIR).is_none()), std::env::var_os(PROJECT_DIR), || None)''',
+     [THERE]),
+    ("SF18 read and send do not take a leading ~ of --folder as home", MSG,
+     '''    let folder = given.map(|given| folder_given(given, home()));
+    let dir = directory(folder, std::env::var_os(PROJECT_DIR), || None)''',
+     '''    let folder = given.map(PathBuf::from);
+    let dir = directory(folder, std::env::var_os(PROJECT_DIR), || None)''',
+     [THERE]),
+    ("SF19 a --folder of read and send that is no folder is passed over", MSG,
+     '''    let dir = directory(folder, std::env::var_os(PROJECT_DIR), || None)''',
+     '''    let dir = directory(folder.filter(|dir| dir.is_dir()), std::env::var_os(PROJECT_DIR), || None)''',
+     [THERE]),
+    ("SF20 the summary's line to read one does not carry the folder", MSG,
+     '''        Some(folder) => format!("cordelia msg read {} <id>", folder_arg(folder)),''',
+     '''        Some(_) => "cordelia msg read <id>".into(),''',
+     [LINES, THERE]),
+    ("SF21 the summary does not hand its folder to its header", MSG,
+     '''    summary_for(&answer, given)''',
+     '''    summary_for(&answer, None)''',
+     [THERE]),
+    ("SF22 read's line to answer does not carry the folder", MSG,
+     '''                        "cordelia msg send",''',
+     '''                        "cordelia msg send --nothing",''',
+     [LINES, THERE]),
+    ("SF23 read does not hand its folder to its line to answer", MSG,
+     '''readout_for(&answer, &marker(), given)''',
+     '''readout_for(&answer, &marker(), None)''',
+     [THERE]),
+    ("SF24 a folder that begins with - is printed where it reads as a flag", MSG,
+     '''        true => format!("--folder={}", shell_quoted(folder)),''',
+     '''        true => format!("--folder {}", shell_quoted(folder)),''',
+     [LINES]),
+    ("SF25 main does not hand read its folder", MAIN,
+     '''msg_cmd::read(&cli.config, &id, folder.as_deref())''',
+     '''msg_cmd::read(&cli.config, &id, folder.as_deref().filter(|_| false))''',
+     [THERE]),
+    ("SF26 main does not hand send its folder", MAIN,
+     '''                    re,
+                    folder,
+                },''',
+     '''                    re,
+                    folder: folder.filter(|_| false),
+                },''',
+     [THERE]),
+    ("SF27 the help does not say where a --folder hook goes", MAIN,
+     '''        /// Put that hook in the settings of the project your session runs''',
+     '''        /// Put that hook where you like, in the settings of a project your session runs''',
+     [HELP]),
+    ("SF28 the help of read and send does not give their --folder", MAIN,
+     '''        /// Read as the agent of this folder, not of the one you run in:''',
+     '''        /// The agent of this folder, not of the one you run in:''',
+     [HELP]),
+    ("SF29 a flag after --folder is taken as the folder", MSG,
+     '''                    .filter(|next| !next.starts_with('-'))''',
+     '''                    .filter(|_| true)''',
+     [NOT_A_FOLDER]),
+    ("SF30 --folder <dir> takes a folder that is not UTF-8", MSG,
+     '''                    .and_then(|next| next.to_str())''',
+     '''                    .map(|next| next.to_string_lossy().into_owned())''',
+     [NOT_A_FOLDER]),
+    ("SF31 --folder=<dir> takes a folder that is not UTF-8", MSG,
+     '''            word => words.push(word),''',
+     '''            None if after_summary && arg.as_encoded_bytes().starts_with(b"--folder=") => {
+                folders += 1;
+                folder = Some(arg.to_string_lossy()["--folder=".len()..].to_string());
+            }
+            word => words.push(word),''',
+     [NOT_A_FOLDER]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
