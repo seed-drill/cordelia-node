@@ -25,6 +25,8 @@ STOPPED = api("test_a_folder_that_is_stopped_forgets_what_it_agreed")
 DIRECTORY = api("test_only_an_unmapping_and_a_change_of_directory_forget")
 ON_AGAIN = adapter("a_folder_turned_off_and_on_again_sends_what_was_edited_while_off")
 DELETED = integration("mapping_a_folder_again_does_not_replay_what_it_lost")
+REAL = (("cordelia-node", ["--test", "memory_e2e"]),
+        "an_edit_made_while_sync_was_off_is_sent_when_it_comes_back_with_no_conflict_file")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -48,6 +50,17 @@ MUTATIONS = [
      '''        let dir_changed = was.as_deref().is_none_or(|was| was != dir);''',
      '''        let dir_changed = stored.as_deref().is_some_and(|was| was != dir) || was.is_none();''',
      [DIRECTORY]),
+    ("SO5 with no directory remembered, turning sync on keeps what the mapped folders agreed", SYNC,
+     '''        let dir_changed = was.as_deref().is_none_or(|was| was != dir);''',
+     '''        let dir_changed = was.as_deref().is_some_and(|w| w != dir);''',
+     [DIRECTORY]),
+    ("SO6 the fix taken out: sync off forgets every folder, and sync on from off forgets again", SYNC,
+     ['''        // Nothing syncs now. A mapped folder keeps what it agreed, as it''',
+      '''        let dir_changed = was.as_deref().is_none_or(|was| was != dir);'''],
+     ['''        sync_state::forget_folders_except(db, &[])?;
+        // Nothing syncs now. A mapped folder keeps what it agreed, as it''',
+      '''        let dir_changed = stored.is_none() || was.as_deref().is_none_or(|was| was != dir);'''],
+     [REAL]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
