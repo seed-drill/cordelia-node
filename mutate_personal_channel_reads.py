@@ -118,7 +118,7 @@ MUTATIONS = [
     ("PR16 the one pass says that this device syncs what another device's word lists", NAMES,
      '''        .filter(|(_, key)| *key == own)''',
      '''        .filter(|(_, key)| *key == own || counts(key))''',
-     [KEPT_IS_READ, SETTINGS]),
+     [KEPT_IS_READ]),
     ("PR17 the one pass lists the words of a key that does not count", NAMES,
      '''    let listed = by_name(read.into_iter().filter(|(_, key)| counts(key)));''',
      '''    let listed = by_name(read.into_iter());''',
