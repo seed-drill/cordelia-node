@@ -296,6 +296,8 @@ struct Kept {
     found: HashMap<([u8; 32], [u8; 32]), (Entry, Found)>,
     /// How many entries were checked and opened by the reads with this.
     afresh: usize,
+    /// How many reads of the words used this.
+    reads: usize,
 }
 
 /// Where what is kept between reads is ([`Kept`]): of one channel, or of
@@ -363,6 +365,7 @@ fn words_kept(
     if kept.channel != channel {
         *kept = Kept::of(&channel);
     }
+    kept.reads += 1;
     let (mut names, mut not_names) = (Vec::new(), Vec::new());
     let mut found_now = HashMap::new();
     for held in entries::channel_stored(conn, &channel)? {
@@ -1941,14 +1944,26 @@ mod tests {
         slot.lock().unwrap().as_ref().map_or(0, |kept| kept.afresh)
     }
 
+    /// How many reads, and how many entries checked and opened, what
+    /// `slot` keeps of `channel` has been used for; none where it keeps
+    /// nothing of it.
+    fn used(slot: &Slot, channel: &[u8; 32]) -> (usize, usize) {
+        match &*slot.lock().unwrap() {
+            Some(kept) if kept.channel == *channel => (kept.reads, kept.afresh),
+            _ => (0, 0),
+        }
+    }
+
     /// A read of the words of every key, of the keys that count, and of
     /// the device's own, with what `slot` keeps, finds on `on` what a read
     /// of the whole channel finds. Returns how many entries the three
-    /// reads checked and opened.
+    /// reads checked and opened. What is kept is kept from one read to the
+    /// next: each of the three is counted in it.
     fn kept_is_afresh(on: &Machine, slot: &Slot) -> usize {
         let standing = Standing::of(&on.conn).unwrap();
         let own = on.key();
-        let before = afresh(slot);
+        let channel = derive::channel_id(&on.personal()).unwrap();
+        let (reads_before, before) = used(slot, &channel);
         let every = |_: &[u8; 32]| true;
         let counts = |key: &[u8; 32]| standing.counting.counts(key);
         let its_own = |key: &[u8; 32]| *key == own;
@@ -1965,7 +1980,9 @@ mod tests {
         assert_eq!(listed_now, listed(&on.conn).unwrap());
         let by_counted = words_afresh(&on.conn, &standing, counts);
         assert_eq!(listed_now, by_name(by_counted.names.into_iter()));
-        afresh(slot).saturating_sub(before)
+        let (reads_now, afresh_now) = used(slot, &channel);
+        assert_eq!(reads_now, reads_before + 3);
+        afresh_now - before
     }
 
     /// The device's own word of `name`, as its store holds it: its row.

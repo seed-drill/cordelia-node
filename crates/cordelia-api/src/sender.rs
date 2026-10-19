@@ -1120,6 +1120,21 @@ mod tests {
         crate::names::say(&s[1].conn, &s[1].identity, "garden", now).unwrap();
         s.pass(1, 0);
         sent(&s, 0, &to_garden, t + 1);
+        // A name whose word device 0 is first given as a delete, and then
+        // as a word again above it.
+        let to_shed = says("notes", "shed", "x");
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        crate::names::unsay(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(
+            refused(&s, 0, &to_shed, t + 2),
+            Refused::NoSuchName("shed".into())
+        );
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        s.pass(1, 0);
+        sent(&s, 0, &to_shed, t + 2);
     }
 
     // ── A relay, as its store takes what it is pushed ───────────────
