@@ -566,7 +566,14 @@ enum SyncCommand {
     },
     /// Turn sync off on this device
     ///
-    /// Files that have already synced stay where they are.
+    /// Files that have already synced stay where they are. When you turn
+    /// sync on again, what you changed or deleted here meanwhile goes to
+    /// your other devices.
+    ///
+    /// To change a folder on this machine only, unmap it (`cordelia sync
+    /// unmap <folder>`): then nothing you do to it is sent. If you map it
+    /// again, what you deleted comes back, and what you changed or added
+    /// goes to your other devices (a changed file as a conflict copy).
     Off,
     /// Show what syncs on this device and on your others
     ///
@@ -4666,6 +4673,11 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
         SyncCommand::Off => {
             set(serde_json::json!({ "enabled": false }))?;
             println!("Sync is off. Files already synced stay where they are.");
+            println!(
+                "When you turn sync on again, what you changed or deleted here meanwhile goes to \
+                 your other devices. To change a folder on this machine only, unmap it: \
+                 `cordelia sync unmap <folder>`."
+            );
             return Ok(());
         }
         SyncCommand::Status { seen } => {
