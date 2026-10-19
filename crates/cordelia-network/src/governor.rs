@@ -591,6 +591,16 @@ impl Governor {
         (hashed % len as u64) as usize
     }
 
+    /// The peers given, in a random order (Fisher-Yates, each swap drawn
+    /// from `random_index`): taking the first n of them picks n at random.
+    fn shuffled(&self, mut ids: Vec<NodeId>) -> Vec<NodeId> {
+        for i in (1..ids.len()).rev() {
+            let j = self.random_index(i + 1);
+            ids.swap(i, j);
+        }
+        ids
+    }
+
     /// Check if a peer is dialable under the current policy.
     fn is_dialable(&self, peer: &PeerInfo) -> bool {
         match &self.dial_policy {
@@ -846,12 +856,8 @@ impl Governor {
             return;
         }
 
-        // Shuffle eligible peers (Fisher-Yates)
-        let mut candidates = eligible;
-        for i in (1..candidates.len()).rev() {
-            let j = self.random_index(i + 1);
-            candidates.swap(i, j);
-        }
+        // Shuffle eligible peers
+        let candidates = self.shuffled(eligible);
 
         for id in candidates.into_iter().take(needed) {
             if let Some(peer) = self.peers.get_mut(&id) {
@@ -893,7 +899,7 @@ impl Governor {
             .map(|p| p.node_id.clone())
             .collect();
 
-        for id in warm_relays.into_iter().take(needed) {
+        for id in self.shuffled(warm_relays).into_iter().take(needed) {
             tracing::info!(
                 peer = %id,
                 hot_relays,
@@ -1004,8 +1010,12 @@ impl Governor {
             .peers
             .values()
             .filter(|p| p.state == PeerState::Warm && churned(p))
-            .take(churn_count)
             .map(|p| p.node_id.clone())
+            .collect();
+        let warm_ids: Vec<NodeId> = self
+            .shuffled(warm_ids)
+            .into_iter()
+            .take(churn_count)
             .collect();
 
         for id in &warm_ids {
@@ -1025,8 +1035,12 @@ impl Governor {
             .peers
             .values()
             .filter(|p| matches!(p.state, PeerState::Cold) && self.is_dialable(p))
-            .take(churn_count)
             .map(|p| p.node_id.clone())
+            .collect();
+        let cold_ids: Vec<NodeId> = self
+            .shuffled(cold_ids)
+            .into_iter()
+            .take(churn_count)
             .collect();
 
         for id in cold_ids {
@@ -2522,6 +2536,117 @@ mod tests {
             first.insert(churned_at.is_empty());
         }
         assert_eq!(first.len(), 2, "a churn ran every time or never: {first:?}");
+    }
+
+    /// The warm relay that step 4a promotes is random on a clock that
+    /// counts in microseconds (network-protocol.md §5.4 step 4a): one peer
+    /// that is not a relay is hot, at hot_min, and five relays are warm,
+    /// made so again after each tick. Over forty ticks more than one of
+    /// the five is promoted.
+    #[test]
+    fn test_step_4a_promotes_a_random_warm_relay_on_a_microsecond_clock() {
+        let targets = GovernorTargets {
+            hot_min_relays: 1,
+            churn_interval_secs: 99999,
+            ..hot_churn_targets()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let hot = make_node_id(1);
+        let relays: Vec<NodeId> = (2..=6u8).map(make_node_id).collect();
+        for id in &relays {
+            gov.add_peer(id.clone(), vec![], vec![]);
+            gov.set_peer_relay(id, true);
+        }
+        let mut promoted = std::collections::HashSet::new();
+        for _ in 0..40 {
+            set_hot(&mut gov, &hot);
+            for id in &relays {
+                set_warm_long(&mut gov, id);
+            }
+            let transitions = gov.tick().transitions;
+            let up = moved(&transitions, "warm", "hot");
+            assert_eq!(up.len(), 1, "{transitions:?}");
+            assert!(relays.contains(&up[0]), "{transitions:?}");
+            promoted.insert(up[0].clone());
+        }
+        assert!(promoted.len() > 1, "always {promoted:?}");
+    }
+
+    /// Targets for the tests of warm churn: no hot peer is wanted, so only
+    /// warm churn moves a peer, and a churn is due when a test says.
+    fn warm_churn_targets(warm_max: usize) -> GovernorTargets {
+        GovernorTargets {
+            hot_min: 0,
+            hot_max: 0,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max,
+            cold_max: 50,
+            churn_interval_secs: 3600,
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+        }
+    }
+
+    /// Make a peer cold, as a test sets one up.
+    fn set_cold(gov: &mut Governor, id: &NodeId) {
+        if !gov.peers.contains_key(id) {
+            gov.add_peer(id.clone(), vec![], vec![]);
+        }
+        gov.peers.get_mut(id).unwrap().set_state(PeerState::Cold);
+    }
+
+    /// The warm peer that warm churn closes is random on a clock that
+    /// counts in microseconds (network-protocol.md §5.4 step 7): five
+    /// peers are warm and one cold, made so again after each churn, and a
+    /// fifth of the five is one. Over forty churns more than one of the
+    /// five is closed.
+    #[test]
+    fn test_churn_warm_closes_a_random_warm_peer_on_a_microsecond_clock() {
+        let mut gov = Governor::new(warm_churn_targets(5), vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let warm: Vec<NodeId> = (1..=5u8).map(make_node_id).collect();
+        let cold = make_node_id(6);
+        let mut closed = std::collections::HashSet::new();
+        for _ in 0..40 {
+            for id in &warm {
+                set_warm_long(&mut gov, id);
+            }
+            set_cold(&mut gov, &cold);
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            let disconnect = gov.tick().disconnect;
+            assert_eq!(disconnect.len(), 1, "{disconnect:?}");
+            assert!(warm.contains(&disconnect[0]), "{disconnect:?}");
+            closed.insert(disconnect[0].clone());
+        }
+        assert!(closed.len() > 1, "always {closed:?}");
+    }
+
+    /// The cold peer that warm churn dials in the place of the one it
+    /// closes is random on a clock that counts in microseconds
+    /// (network-protocol.md §5.4 step 7): one peer is warm and five cold,
+    /// made so again after each churn. Over forty churns more than one
+    /// peer is dialled.
+    #[test]
+    fn test_churn_warm_dials_a_random_cold_peer_on_a_microsecond_clock() {
+        let mut gov = Governor::new(warm_churn_targets(1), vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let warm = make_node_id(1);
+        let cold: Vec<NodeId> = (2..=6u8).map(make_node_id).collect();
+        let mut dialled = std::collections::HashSet::new();
+        for _ in 0..40 {
+            set_warm_long(&mut gov, &warm);
+            for id in &cold {
+                set_cold(&mut gov, id);
+            }
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            let actions = gov.tick();
+            assert_eq!(actions.disconnect, vec![warm.clone()]);
+            assert_eq!(actions.connect.len(), 1, "{:?}", actions.connect);
+            dialled.insert(actions.connect[0].clone());
+        }
+        assert!(dialled.len() > 1, "always {dialled:?}");
     }
 
     /// Three peers hot, above hot_min, and one warm peer that churn may
