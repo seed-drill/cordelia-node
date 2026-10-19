@@ -200,7 +200,11 @@ machine and in a project folder on the other.
 - `cordelia sync unmap <folder or name>` stops syncing a folder from this
   device. Its files stay where they are. If you map the folder again, it
   merges with what your other devices have, and nothing is deleted.
-- `cordelia sync off` stops syncing.
+- `cordelia sync off` stops syncing. When you turn sync on again, what you
+  changed or deleted here meanwhile goes to your other devices. To change a
+  folder on this machine only, unmap it: then nothing you do to it is sent.
+  If you map it again, what you deleted comes back, and what you changed or
+  added goes to your other devices (a changed file as a conflict copy).
 
 **A memory file syncs if it fits in one entry.** An entry has room for
 60 KB: the text and the file's name together. A larger file, or one that is

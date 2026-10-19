@@ -1070,3 +1070,137 @@ fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
         assert!(!said.contains(&address), "{address}: {said}");
     }
 }
+
+/// What `n` holds under the name `name`, as [`held`] gives it for `lab`.
+fn held_under(n: &Node, name: &str) -> Vec<(String, u64, Option<String>)> {
+    let answer = n.post("/api/v1/channels/entries", json!({ "channel": name }));
+    answer["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["key"].as_str().unwrap_or_default().to_string(),
+                entry["rev"].as_u64().unwrap_or(0),
+                entry["content"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// The revision and the text that `n` holds of `key` under `name`.
+fn version_of(n: &Node, name: &str, key: &str) -> Option<(u64, Option<String>)> {
+    held_under(n, name)
+        .into_iter()
+        .find(|(held, _, _)| held == key)
+        .map(|(_, rev, text)| (rev, text))
+}
+
+/// **Sync turned off and on again is a node stopped and started**
+/// (decision 2026-09-30 §4.5). A device maps home memory, which no other
+/// device maps, and a project folder, which another device maps too.
+/// `cordelia sync off`; then a large file of home memory is replaced by
+/// a new one with a line added, as `sed -i` replaces a file, and the
+/// index and a file of the project are written over. `cordelia sync
+/// claude`: each edit is sent, over this device's own last version, and
+/// no conflict file is made anywhere. The other device takes the
+/// project's edit.
+#[test]
+fn an_edit_made_while_sync_was_off_is_sent_when_it_comes_back_with_no_conflict_file() {
+    let relay = relay_started();
+    let a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let all = [&relay, &a, &b];
+
+    let (a_notes, a_mem) = notes_of(&a);
+    let (b_notes, b_mem) = notes_of(&b);
+    let home_mem = claude_folder(&a.home(), &a.home());
+    let large = "a line of notes, as Claude Code writes them\n".repeat(900);
+    let index = "- [Notes](notes.md)\n";
+    std::fs::write(home_mem.join("notes.md"), &large).unwrap();
+    std::fs::write(home_mem.join("MEMORY.md"), index).unwrap();
+    std::fs::write(a_mem.join("plan.md"), "the plan\n").unwrap();
+
+    syncs_notes_as_lab(&a, &a_notes);
+    let out = a.cli(&["sync", "map", &path(&a.home()), "--home"]);
+    assert!(out.contains("Mapped ~ to home memory."), "{out}");
+    makes_a_phrase(&a, "desktop");
+    wait_for("a has published its folders", &all, 90, || {
+        (held_under(&a, "~").len() == 2 && held(&a).len() == 1).then_some(())
+    });
+    syncs_notes_as_lab(&b, &b_notes);
+    adds(&a, &b, "laptop");
+    has_applied(&b, 1, &all);
+    wait_for("b has the project's file", &all, 120, || {
+        (read(&b_mem.join("plan.md")).as_deref() == Some("the plan\n")).then_some(())
+    });
+    wait_for("a has sent what it holds", &all, 90, || {
+        has_sent_everything(&a)
+    });
+
+    // Sync off, and the edits.
+    let said = a.cli(&["sync", "off"]);
+    assert!(
+        said.contains(
+            "When you turn sync on again, what you changed or deleted here meanwhile goes to \
+             your other devices."
+        ),
+        "{said}"
+    );
+    let added = format!("{large}and a line added while sync was off\n");
+    let beside = home_mem.join("notes.md.sed-tmp");
+    std::fs::write(&beside, &added).unwrap();
+    std::fs::rename(&beside, home_mem.join("notes.md")).unwrap();
+    let index_added = format!("{index}- [Plan](plan.md)\n");
+    std::fs::write(home_mem.join("MEMORY.md"), &index_added).unwrap();
+    std::fs::write(
+        a_mem.join("plan.md"),
+        "the plan, changed while sync was off\n",
+    )
+    .unwrap();
+
+    // Sync on again: a cycle meets each file, and either sends it or
+    // keeps it beside the channel's version.
+    let out = a.cli(&["sync", "claude"]);
+    assert!(out.starts_with("Sync turned on.\n"), "{out}");
+    wait_for("a's first cycle after sync is on again", &all, 120, || {
+        let met = |name: &str, key: &str, mem: &Path| {
+            version_of(&a, name, key).is_some_and(|(rev, _)| rev >= 2)
+                || !conflict_files(mem).is_empty()
+        };
+        (met("~", "notes.md", &home_mem) && met("lab", "plan.md", &a_mem)).then_some(())
+    });
+    for mem in [&home_mem, &a_mem] {
+        assert_eq!(
+            conflict_files(mem),
+            Vec::<String>::new(),
+            "{}",
+            mem.display()
+        );
+    }
+    assert_eq!(read(&home_mem.join("notes.md")), Some(added.clone()));
+    assert_eq!(read(&home_mem.join("MEMORY.md")), Some(index_added.clone()));
+    let plan = "the plan, changed while sync was off\n".to_string();
+    assert_eq!(read(&a_mem.join("plan.md")), Some(plan.clone()));
+    wait_for("a has sent the index", &all, 60, || {
+        version_of(&a, "~", "MEMORY.md")
+            .is_some_and(|(rev, _)| rev >= 2)
+            .then_some(())
+    });
+    assert_eq!(version_of(&a, "~", "notes.md"), Some((2, Some(added))));
+    assert_eq!(
+        version_of(&a, "~", "MEMORY.md"),
+        Some((2, Some(index_added)))
+    );
+    assert_eq!(
+        version_of(&a, "lab", "plan.md"),
+        Some((2, Some(plan.clone())))
+    );
+
+    // Sent: the relay holds it, and the other device takes it.
+    wait_for("a has sent its edits", &all, 90, || has_sent_everything(&a));
+    wait_for("b takes the project's edit", &all, 120, || {
+        (read(&b_mem.join("plan.md")).as_ref() == Some(&plan)).then_some(())
+    });
+    assert_eq!(conflict_files(&b_mem), Vec::<String>::new());
+}

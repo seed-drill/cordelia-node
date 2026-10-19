@@ -948,9 +948,9 @@ fn store_activity(
 }
 
 /// Sync was turned off: this device says of no name that it syncs it
-/// (decision 2026-10-04 §16). (What its folders had agreed was forgotten
-/// by the handler that turned sync off, which also took the words back:
-/// this is for a word that could not be written then.)
+/// (decision 2026-10-04 §16). (The handler that turned sync off took the
+/// words back: this is for a word that could not be written then. What
+/// its mapped folders had agreed is kept, as while the node is stopped.)
 ///
 /// `generation` is the settings count read with the setting that says sync
 /// is off. Returns `false` if the settings have changed since: sync may be
@@ -7950,6 +7950,115 @@ mod tests {
         st.own_channels.forget_fetched(&id);
         let report = adapter.run_cycle(&st);
         assert!(!report.folders[0].waiting, "{report:?}");
+    }
+
+    /// Sync turned off and on again (`cordelia sync off`, then `cordelia
+    /// sync claude`) is to a folder that stays mapped what a node stopped
+    /// and started is (decision 2026-09-30 §4.5): the folder keeps what it
+    /// agreed. A file edited here while sync was off is sent when it comes
+    /// back, with no conflict file: this device's own earlier version is
+    /// not the other side of a conflict. That holds for a large file
+    /// replaced by a new one, as `sed -i` does, and for the index. A file
+    /// that another device edited meanwhile, and that is unchanged here,
+    /// is taken with nothing kept beside it; one edited on both is a
+    /// conflict between two devices, as it always was.
+    #[test]
+    fn a_folder_turned_off_and_on_again_sends_what_was_edited_while_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        let (claude, work) = (home.join(".claude"), home.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let memory = discover::claude_folder(&claude, &work)
+            .unwrap()
+            .join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        let large = "a line of notes, as Claude Code writes them\n".repeat(900);
+        let index = "- [Notes](notes.md)\n";
+        for (file, text) in [
+            ("notes.md", large.as_str()),
+            ("MEMORY.md", index),
+            ("theirs.md", "one\n"),
+            ("both.md", "one\n"),
+        ] {
+            std::fs::write(memory.join(file), text).unwrap();
+        }
+
+        let st = state(tmp.path());
+        let _ = person_of(&st, NAME);
+        let other = another_device(&st, &tmp.path().join("other"), NAME);
+        {
+            let db = st.db.lock().unwrap();
+            let mapped = vec![Mapping {
+                folder: work.display().to_string(),
+                name: NAME.to_string(),
+            }];
+            let mappings = serde_json::to_string(&mapped).unwrap();
+            meta::set(&db, meta::SYNC_CLAUDE_MAPPINGS, &mappings).unwrap();
+        }
+        let set = |body: serde_json::Value| {
+            let body = serde_json::from_value(body).unwrap();
+            let db = st.db.lock().unwrap();
+            cordelia_api::sync::set_claude(&st.sync_control, &db, &body, Some(&home)).unwrap();
+        };
+        let cycle = || {
+            // A new adapter each time sync is turned on, as the node makes.
+            let mut adapter =
+                ClaudeAdapter::new(claude.clone(), home.clone(), &st.identity.public_key());
+            let report = adapter.run_cycle(&st);
+            assert!(report.errors.is_empty(), "{report:?}");
+            report
+        };
+        let dir = claude.display().to_string();
+        set(serde_json::json!({ "enabled": true, "dir": dir }));
+        assert_eq!(cycle().folders[0].published, 4);
+        deliver(&st, &other, NAME);
+
+        // Sync off. While it is off the large file is replaced by a new
+        // one with a line added, and the index is written over; the other
+        // device edits one file, and one that is edited here too.
+        set(serde_json::json!({ "enabled": false }));
+        let added = format!("{large}and a line added while sync was off\n");
+        let beside = memory.join("notes.md.sed-tmp");
+        std::fs::write(&beside, &added).unwrap();
+        std::fs::rename(&beside, memory.join("notes.md")).unwrap();
+        let index_added = format!("{index}- [Theirs](theirs.md)\n");
+        std::fs::write(memory.join("MEMORY.md"), &index_added).unwrap();
+        std::fs::write(memory.join("both.md"), "mine\n").unwrap();
+        write(&other, NAME, "theirs.md", text("two\n"));
+        write(&other, NAME, "both.md", text("theirs\n"));
+        deliver(&other, &st, NAME);
+
+        // Sync on again, at the directory it was last on.
+        set(serde_json::json!({ "enabled": true }));
+        let report = cycle();
+        let [folder] = report.folders.as_slice() else {
+            panic!("{report:?}");
+        };
+        // The two edits made here are sent; both of the other's are taken.
+        assert_eq!((folder.published, folder.pulled), (2, 2), "{folder:?}");
+        let files = files_in(&memory);
+        let conflicts: Vec<&str> = files
+            .iter()
+            .map(|(file, _)| file.as_str())
+            .filter(|file| file.contains(".conflict-"))
+            .collect();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].starts_with("both.conflict-"), "{conflicts:?}");
+        let read = |file: &str| std::fs::read_to_string(memory.join(file)).unwrap();
+        assert_eq!(read("notes.md"), added);
+        assert_eq!(read("MEMORY.md"), index_added);
+        assert_eq!(read("theirs.md"), "two\n");
+        assert_eq!(read("both.md"), "theirs\n");
+        assert_eq!(read(conflicts[0]), "mine\n");
+        // Sent: the channel holds this device's edits, over its own last
+        // version, and the other device takes them.
+        deliver(&st, &other, NAME);
+        for (file, text) in [("notes.md", &added), ("MEMORY.md", &index_added)] {
+            let (_, rev, held) = version(&st, NAME, file).unwrap();
+            assert_eq!((rev, &held), (2, text), "{file}");
+            let (_, rev, there) = version(&other, NAME, file).unwrap();
+            assert_eq!((rev, &there), (2, text), "{file}");
+        }
     }
 
     /// The bound, at every bound together (decision 2026-10-04 §2.3). A
