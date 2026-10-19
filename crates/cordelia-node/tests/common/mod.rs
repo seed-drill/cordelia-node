@@ -1601,11 +1601,18 @@ pub fn a_phrase_of_words_that_nothing_else_says() -> String {
         .expect("one of these words ends a phrase that begins with those")
 }
 
+/// What crossed on each connection of a [`PassesOn`]: what was asked of
+/// the other port, and what it answered.
+type Crossed = std::sync::Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+
 /// Everything that is sent to a port on this machine is passed on to
-/// another, and kept: for a test that reads what a node was sent.
+/// another, and kept: for a test that reads what a node was sent, and
+/// what it answered.
 pub struct PassesOn {
     pub port: u16,
-    sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// What crossed on each connection, in the order the connections were
+    /// made: what was asked of the other port, and what it answered.
+    crossed: Crossed,
 }
 
 impl PassesOn {
@@ -1614,35 +1621,43 @@ impl PassesOn {
     }
 
     /// [`Self::to`], holding what the other port answers for `hold`
-    /// before it is passed back: a node that answers late.
+    /// before it is passed back: a node that answers late. What it
+    /// answered is kept when it answers, before the hold.
     pub fn holding(port: u16, hold: Duration) -> Self {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let crossed: Crossed = Default::default();
         let at = listener.local_addr().unwrap().port();
-        let kept = sent.clone();
+        let kept = crossed.clone();
         std::thread::spawn(move || {
             for from in listener.incoming().flatten() {
                 let Ok(to) = TcpStream::connect(("127.0.0.1", port)) else {
                     continue;
                 };
+                let k = {
+                    let mut kept = kept.lock().unwrap();
+                    kept.push((Vec::new(), Vec::new()));
+                    kept.len() - 1
+                };
                 let (mut asks, mut node) = (from.try_clone().unwrap(), to.try_clone().unwrap());
-                let kept = kept.clone();
+                let asked = kept.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 * 1024];
                     while let Ok(n) = asks.read(&mut buf) {
                         if n == 0 || node.write_all(&buf[..n]).is_err() {
                             break;
                         }
-                        kept.lock().unwrap().extend_from_slice(&buf[..n]);
+                        asked.lock().unwrap()[k].0.extend_from_slice(&buf[..n]);
                     }
                     let _ = node.shutdown(Shutdown::Write);
                 });
                 let (mut node, mut asks) = (to, from);
+                let answered = kept.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 * 1024];
                     while let Ok(n) = node.read(&mut buf) {
+                        answered.lock().unwrap()[k].1.extend_from_slice(&buf[..n]);
                         std::thread::sleep(hold);
                         if n == 0 || asks.write_all(&buf[..n]).is_err() {
                             break;
@@ -1652,35 +1667,68 @@ impl PassesOn {
                 });
             }
         });
-        Self { port: at, sent }
+        Self { port: at, crossed }
     }
 
     /// The body of each request that was POSTed to `path` through here,
     /// as JSON, in the order they were sent: what a program that sees
     /// the requests cross to the node has seen of them.
     pub fn bodies(&self, path: &str) -> Vec<serde_json::Value> {
-        let sent = self.sent();
-        let text = String::from_utf8_lossy(&sent).to_string();
-        let asked = format!("POST {path} HTTP/1.1\r\n");
-        let mut bodies = Vec::new();
-        for (at, _) in text.match_indices(&asked) {
-            let request = &text[at..];
-            let Some((head, rest)) = request.split_once("\r\n\r\n") else {
-                continue;
-            };
-            let length = head.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())?
-            });
-            let body = length.and_then(|length| rest.get(..length));
-            bodies.extend(body.and_then(|body| serde_json::from_str(body).ok()));
-        }
-        bodies
+        self.answered(path)
+            .into_iter()
+            .map(|(body, _)| body)
+            .collect()
     }
 
+    /// [`Self::bodies`], each with the status the other port answered it
+    /// with, or `None` where it has not answered it (yet).
+    pub fn answered(&self, path: &str) -> Vec<(serde_json::Value, Option<u16>)> {
+        let crossed = self.crossed.lock().unwrap().clone();
+        let asked = format!("POST {path} HTTP/1.1\r\n");
+        let mut found = Vec::new();
+        for (sent, back) in crossed {
+            let text = String::from_utf8_lossy(&sent).to_string();
+            let back = String::from_utf8_lossy(&back).to_string();
+            // Each request on a connection is answered in its order.
+            let requests: Vec<usize> = ["GET /", "POST /", "PUT /", "DELETE /"]
+                .iter()
+                .flat_map(|verb| text.match_indices(verb).map(|(at, _)| at))
+                .filter(|at| *at == 0 || text[..*at].ends_with("\r\n"))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let statuses: Vec<u16> = back
+                .match_indices("HTTP/1.1 ")
+                .filter(|(at, _)| *at == 0 || back[..*at].ends_with("\r\n"))
+                .filter_map(|(at, said)| back.get(at + said.len()..at + said.len() + 3))
+                .filter_map(|code| code.parse().ok())
+                .collect();
+            for (n, at) in requests.into_iter().enumerate() {
+                let request = &text[at..];
+                if !request.starts_with(&asked) {
+                    continue;
+                }
+                let Some((head, rest)) = request.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let length = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                });
+                let body = length.and_then(|length| rest.get(..length));
+                if let Some(body) = body.and_then(|body| serde_json::from_str(body).ok()) {
+                    found.push((body, statuses.get(n).copied()));
+                }
+            }
+        }
+        found
+    }
+
+    /// Everything that was sent through here, each connection's in turn.
     pub fn sent(&self) -> Vec<u8> {
-        self.sent.lock().unwrap().clone()
+        let crossed = self.crossed.lock().unwrap();
+        crossed.iter().flat_map(|(sent, _)| sent.clone()).collect()
     }
 }
 

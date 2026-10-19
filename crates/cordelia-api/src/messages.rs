@@ -17,7 +17,8 @@
 //! - **`summary`** ([`summary_of`], §4.1, C5, C20) reads only the index and
 //!   the marks: it opens no entry. It answers nothing where anything is
 //!   not as it should be, and nothing where it cannot have the store
-//!   within the time the command gives it.
+//!   within the time the command gives it. It marks nothing announced:
+//!   the command says which lines it printed ([`announced_of`]).
 //! - **`read`** ([`read_of`]) gives places, finds the one message an ID
 //!   names ([`named`]), and marks it read by the folder's agent.
 //! - **`send`** ([`send_of`]) gives [`sender::send`] what it needs, and the
@@ -277,12 +278,13 @@ pub struct Summary {
 }
 
 /// The summary of the agent of `folder` at `now` by the node's clock
-/// (decision 2026-10-09 §4.1, C5, C6), in one write: places are given,
-/// and each message whose line it answers is marked announced to that
-/// agent on this device. **It opens no entry:** it reads the index and
-/// the marks. `None` where it prints nothing: the folder is not mapped,
-/// sync is off, the device does not stand applied or has no place for
-/// messages, or nothing is unread.
+/// (decision 2026-10-09 §4.1, C5, C6), in one write: places are given.
+/// **It marks nothing announced:** the command prints only an answer that
+/// came within its time, so it is the command that says which lines it
+/// printed ([`announced_of`]). **It opens no entry:** it reads the index
+/// and the marks. `None` where it prints nothing: the folder is not
+/// mapped, sync is off, the device does not stand applied or has no place
+/// for messages, or nothing is unread.
 ///
 /// The lines are of messages to the agent's name, unread by an agent of
 /// that name (§7.2), not yet announced to it here, from a signer that
@@ -323,7 +325,6 @@ pub fn summary_of(
                 waiting.push(id);
                 continue;
             }
-            kept(held::announce(conn, &id, &name))?;
             let (subject, subject_cut) = subject_of(&message.body);
             lines.push(Line {
                 id,
@@ -342,6 +343,48 @@ pub fn summary_of(
             lines,
             waiting,
         }))
+    })
+}
+
+/// Marks announced to the agent of `folder` on this device each of `ids`
+/// that is a message `summary` could answer a line of: one to that agent's
+/// name, unread by it, from a signer that counts (decision 2026-10-09
+/// §4.1, §7.2, rule 14). The command says which lines it printed, after it
+/// printed them. Nothing where the folder is not mapped, sync is off, or
+/// the device does not stand applied or has no place for messages. How
+/// many it marked.
+pub fn announced_of(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    own_channels: &OwnChannels,
+    folder: &str,
+    ids: &[Id],
+    now: i64,
+) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let Some(name) = agent_of(conn, folder).map_err(said)? else {
+            return Ok(0);
+        };
+        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none()
+            || stands(conn)? != Stands::Applied
+            || own_channels.no_place()
+        {
+            return Ok(0);
+        }
+        let counting = who_counts(conn)?;
+        let mut marked = 0;
+        for message in marks::unread(conn, identity, &name, now, &counting)? {
+            let id = id_of(&message.id)?;
+            if message.to.is_none()
+                || !ids.contains(&id)
+                || !counting.counts(&key_of(&message.signer)?)
+            {
+                continue;
+            }
+            kept(held::announce(conn, &id, &name))?;
+            marked += 1;
+        }
+        Ok(marked)
     })
 }
 
@@ -450,6 +493,61 @@ pub async fn summary(
         Ok(Some(summary)) => Ok(HttpResponse::Ok().json(summary.answered())),
         _ => Ok(nothing()),
     }
+}
+
+#[derive(Deserialize)]
+pub struct AnnouncedRequest {
+    /// The directory the command worked out (§3.1).
+    pub folder: String,
+    /// The IDs of the lines the command printed, each whole.
+    pub ids: Vec<String>,
+    /// The command's version: a node of another marks nothing.
+    pub version: String,
+}
+
+// ── POST /api/v1/messages/announced ──────────────────────────────────
+
+/// What `cordelia msg summary` printed (decision 2026-10-09 §4.1, §7.2):
+/// the command says it after it printed the lines of an answer that came
+/// within its time, and the node marks them announced ([`announced_of`]).
+/// It answers nothing, whatever it marked: the command does not wait on
+/// it past its 100 ms, and prints nothing more. More IDs than a summary
+/// has lines, or one that is not an ID whole, mark nothing.
+pub async fn announced(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<AnnouncedRequest>,
+) -> Result<HttpResponse, ApiError> {
+    match asked(&req, &state) {
+        Ok(()) => {}
+        Err(ApiError::Unauthorized) => return Err(ApiError::Unauthorized),
+        Err(_) => return Ok(nothing()),
+    }
+    if body.version != env!("CARGO_PKG_VERSION") || body.ids.len() > AGENT_MESSAGE_SUMMARY_LINES {
+        return Ok(nothing());
+    }
+    let Some(ids) = body
+        .ids
+        .iter()
+        .map(|id| match id.len() == 2 * AGENT_MESSAGE_ID_BYTES {
+            true => hex::decode(id).ok()?.try_into().ok(),
+            false => None,
+        })
+        .collect::<Option<Vec<Id>>>()
+    else {
+        return Ok(nothing());
+    };
+    let now = state.sync_control.now();
+    let db = db_of(&state);
+    let _ = announced_of(
+        &db,
+        &state.identity,
+        &state.own_channels,
+        &body.folder,
+        &ids,
+        now,
+    );
+    Ok(nothing())
 }
 
 // ── read ─────────────────────────────────────────────────────────────
@@ -1817,6 +1915,29 @@ mod tests {
         .unwrap()
     }
 
+    /// Mark announced on device `n`, as the command does once it printed
+    /// them, `ids` for the agent of the folder `name`: how many were.
+    fn told_on(s: &Several, n: usize, name: &str, ids: &[Id], now: i64) -> usize {
+        announced_of(
+            &s[n].conn,
+            &s[n].identity,
+            &OwnChannels::default(),
+            &folder(name),
+            ids,
+            now,
+        )
+        .unwrap()
+    }
+
+    /// [`summary_on`], whose lines are then printed: the node is told them,
+    /// as the command tells it.
+    fn summary_told(s: &Several, n: usize, name: &str, now: i64) -> Option<Summary> {
+        let summary = summary_on(s, n, name, now)?;
+        let lines: Vec<Id> = summary.lines.iter().map(|line| line.id).collect();
+        assert_eq!(told_on(s, n, name, &lines, now), lines.len());
+        Some(summary)
+    }
+
     fn reads(s: &Several, n: usize, name: &str, id: &str, now: i64) -> Result<Readout, Refused> {
         match read_of(&s[n].conn, &s[n].identity, &folder(name), id, now, true) {
             Ok((readout, _)) => Ok(readout),
@@ -2117,7 +2238,7 @@ mod tests {
         s.pass(0, 1);
         let now = s.now + MINUTE;
 
-        let first = summary_on(&s, 1, "work", now).unwrap();
+        let first = summary_told(&s, 1, "work", now).unwrap();
         assert_eq!(first.name, "work");
         let lines: Vec<Id> = first.lines.iter().map(|line| line.id).collect();
         assert_eq!(lines, to_work[..5]);
@@ -2128,7 +2249,7 @@ mod tests {
         assert_eq!(first.lines[0].label.as_deref(), Some("device 0"));
 
         // Announced, each is counted after.
-        let second = summary_on(&s, 1, "work", now).unwrap();
+        let second = summary_told(&s, 1, "work", now).unwrap();
         assert_eq!(
             second.lines.iter().map(|line| line.id).collect::<Vec<_>>(),
             to_work[5..]
@@ -2150,6 +2271,65 @@ mod tests {
         let answered = third.answered();
         assert_eq!(answered["waiting"]["count"], 8);
         assert_eq!(answered["waiting"]["ids"].as_array().unwrap().len(), 5);
+    }
+
+    /// A summary answered marks nothing announced: its lines are answered
+    /// again until the node is told that they were printed, and then are
+    /// counted (decision 2026-10-09 §4.1, rule 14).
+    #[test]
+    fn a_summary_marks_nothing_until_it_is_told_what_was_printed() {
+        let mut s = devices(2);
+        // Sent before they are held, so each is shown from its `sent`.
+        let t = s.now - 10 * MINUTE;
+        let one = sent(&s, 0, &asking("notes", Some("work"), "one"), t);
+        let two = sent(&s, 0, &asking("notes", Some("work"), "two"), t + 1);
+        s.pass(0, 1);
+        let now = s.now + MINUTE;
+        let lines_of =
+            |summary: Summary| -> Vec<Id> { summary.lines.iter().map(|line| line.id).collect() };
+        // Answered, and not printed: answered again, line for line.
+        for _ in 0..2 {
+            let answered = summary_on(&s, 1, "work", now).unwrap();
+            assert!(answered.waiting.is_empty());
+            assert_eq!(lines_of(answered), [one, two]);
+            assert!(!held::is_announced(&s[1].conn, &one, "work").unwrap());
+        }
+        // Told that one was printed: that one only is counted after.
+        assert_eq!(told_on(&s, 1, "work", &[one], now), 1);
+        assert!(held::is_announced(&s[1].conn, &one, "work").unwrap());
+        let after = summary_on(&s, 1, "work", now).unwrap();
+        assert_eq!(after.waiting, [one]);
+        assert_eq!(lines_of(after), [two]);
+    }
+
+    /// The node marks announced only what a summary of that folder could
+    /// have printed as a line: a message to that agent's name, unread by
+    /// it. Not one to every name, to another name, read already, or none
+    /// it holds; and nothing for a folder that is not mapped (decision
+    /// 2026-10-09 §4.1, C5, C6).
+    #[test]
+    fn only_a_line_of_the_folders_agent_is_marked_announced() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        let to_work = sent(&s, 0, &asking("notes", Some("work"), "w"), t);
+        let to_all = sent(&s, 0, &asking("notes", None, "all"), t + 1);
+        let to_plans = sent(&s, 0, &asking("notes", Some("plans"), "p"), t + 2);
+        let was_read = sent(&s, 0, &asking("notes", Some("work"), "r"), t + 3);
+        s.pass(0, 1);
+        let now = s.now + MINUTE;
+        reads(&s, 1, "work", &hex::encode(was_read), now).unwrap();
+        let not_held = [0x5a; 16];
+        let given = [to_all, to_plans, was_read, not_held];
+        assert_eq!(told_on(&s, 1, "work", &given, now), 0);
+        assert_eq!(told_on(&s, 1, "unmapped", &[to_work], now), 0);
+        for id in [to_work, to_all, to_plans, was_read] {
+            assert!(!held::is_announced(&s[1].conn, &id, "work").unwrap());
+        }
+        // The plans line stays a line for plans.
+        let plans = summary_on(&s, 1, "plans", now).unwrap();
+        assert_eq!(plans.lines[0].id, to_plans);
+        assert_eq!(told_on(&s, 1, "work", &[to_work], now), 1);
+        assert!(held::is_announced(&s[1].conn, &to_work, "work").unwrap());
     }
 
     /// Two messages of one shown time stand by their IDs, and a message
@@ -2274,7 +2454,7 @@ mod tests {
             let given = hex::encode(&id[..4]);
             let other = sent(&s, 0, &asking("notes", Some("work"), "again"), t + 1);
             s.pass(0, 1);
-            assert!(summary_on(&s, 1, "work", now).is_some());
+            assert!(summary_told(&s, 1, "work", now).is_some());
             assert!(reads(&s, 1, "work", &given, now).is_ok());
             held_rows::set_state(&s[1].conn, state).unwrap();
             assert_eq!(summary_on(&s, 1, "work", now), None, "{state:?}");
@@ -3193,6 +3373,61 @@ mod tests {
         assert_eq!(said["lines"].as_array().unwrap().len(), 1);
     }
 
+    fn told_asked(name: &str, ids: &[String]) -> web::Json<AnnouncedRequest> {
+        web::Json(AnnouncedRequest {
+            folder: folder(name),
+            ids: ids.to_vec(),
+            version: env!("CARGO_PKG_VERSION").into(),
+        })
+    }
+
+    /// The route the command tells what it printed: a summary answered
+    /// over the route marks nothing; told the line's ID whole, the node
+    /// marks it announced and answers nothing; told by a command of
+    /// another version, or more IDs than a summary has lines, or an ID
+    /// not whole, it marks nothing (decision 2026-10-09 §4.1, §4.2).
+    #[actix_web::test]
+    async fn the_node_marks_announced_what_the_command_says_it_printed() {
+        let (state, id) = a_node_with_a_message();
+        let lines = |said: &Value| said["lines"].as_array().unwrap().len();
+        for _ in 0..2 {
+            let (status, said) =
+                answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
+            assert_eq!((status, lines(&said)), (200, 1), "{said}");
+        }
+        let whole = hex::encode(id);
+        let mut other = told_asked("work", std::slice::from_ref(&whole));
+        other.version = "0.0.0".into();
+        let too_many = vec![whole.clone(); AGENT_MESSAGE_SUMMARY_LINES + 1];
+        for wrong in [
+            other,
+            told_asked("work", &too_many),
+            told_asked("work", &[whole[..8].to_string()]),
+        ] {
+            let (status, _) = answer(announced(asked(), state.clone(), wrong).await).await;
+            assert_eq!(status, 204);
+            assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
+        }
+        let (status, _) = answer(
+            announced(
+                asked(),
+                state.clone(),
+                told_asked("work", std::slice::from_ref(&whole)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, 204);
+        assert!(held::is_announced(&db_of(&state), &id, "work").unwrap());
+        let (status, said) =
+            answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
+        assert_eq!((status, lines(&said)), (200, 0), "{said}");
+        assert_eq!(said["waiting"]["ids"], json!([whole]));
+        let (status, _) =
+            answer(announced(not_asked(), state.clone(), told_asked("work", &[])).await).await;
+        assert_eq!(status, 401);
+    }
+
     /// While a summary waits for the store's lock, the worker it runs on
     /// serves another request: the wait holds no thread (decision
     /// 2026-10-09 §4.1, C20).
@@ -3313,6 +3548,11 @@ mod tests {
                 "version": env!("CARGO_PKG_VERSION") }),
             ),
             (
+                "/api/v1/messages/announced",
+                json!({ "folder": folder("work"), "ids": [],
+                "version": env!("CARGO_PKG_VERSION") }),
+            ),
+            (
                 "/api/v1/messages/read",
                 json!({ "folder": folder("work"), "id": hex::encode(id) }),
             ),
@@ -3346,7 +3586,7 @@ mod tests {
                 .to_request();
             let status = test::call_service(&personal, with).await.status();
             assert!(
-                status.as_u16() == 200 || status.as_u16() == 409,
+                [200, 204, 409].contains(&status.as_u16()),
                 "{path}: {status}"
             );
         }

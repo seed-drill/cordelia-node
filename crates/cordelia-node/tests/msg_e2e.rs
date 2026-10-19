@@ -164,6 +164,74 @@ fn summary_with(all: &[&Node], n: &Node, name: &str, what: &str) -> String {
     })
 }
 
+/// The route by which `summary` tells the node the lines it printed.
+const ANNOUNCED: &str = "/api/v1/messages/announced";
+
+/// A configuration of `n`, written as `file` in its directory, whose API is
+/// at `port`: the port of a pass-through to the node.
+fn config_through(n: &Node, port: u16, file: &str) -> PathBuf {
+    let own = std::fs::read_to_string(n.config()).unwrap();
+    let through = own.replace(
+        &format!("http_port = {}", n.http),
+        &format!("http_port = {port}"),
+    );
+    assert_ne!(own, through);
+    let config = n.dir.path().join(file);
+    std::fs::write(&config, through).unwrap();
+    config
+}
+
+/// `summary` on `n` in the folder `name`, run through a pass-through that
+/// sees what crosses to the node, until it prints the line of `id` and
+/// the node answered its word that it printed it: what it printed then.
+/// Until then nothing is marked announced (rule 14), so each summary that
+/// shows `id` prints its line. One that printed the line and whose word
+/// did not reach the node within its 100 ms, as on a loaded machine, is
+/// the case in which a line is printed twice (decision 2026-10-09 §4.1),
+/// and the summary is run again.
+fn printed_and_told(all: &[&Node], n: &Node, name: &str, id: &str) -> String {
+    let through = PassesOn::to(n.http);
+    let config = config_through(n, through.port, "config-told.toml");
+    let told = || {
+        through.answered(ANNOUNCED).iter().any(|(body, status)| {
+            *status == Some(204)
+                && body["ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|i| i.as_str().unwrap().starts_with(id)))
+        })
+    };
+    wait_for(
+        "the summary prints the line and the node is told",
+        all,
+        120,
+        || {
+            assert!(!told(), "the node was told before it printed the line");
+            let said = msg_in(
+                n,
+                &folder(n, name),
+                &[],
+                &["--config", &path(&config), "summary"],
+                b"",
+            );
+            assert!(said.status.success(), "{}", err(&said));
+            let said = out(&said);
+            // A word that crossed to the node is answered once it is marked.
+            wait_for("each word that crossed is answered", all, 30, || {
+                let answered = through.answered(ANNOUNCED);
+                answered
+                    .iter()
+                    .all(|(_, status)| status.is_some())
+                    .then_some(())
+            });
+            if !said.contains(id) {
+                return None;
+            }
+            assert!(said.contains(&format!("\n  {id}  ")), "{said}");
+            told().then_some(said)
+        },
+    )
+}
+
 /// `cordelia msg read <id>` on `n` in the folder `name`.
 fn read(n: &Node, name: &str, id: &str) -> Output {
     msg_in(n, &folder(n, name), &[], &["read", id], b"")
@@ -268,7 +336,7 @@ fn a_message_from_one_device_is_announced_once_and_read_on_the_other() {
         &["--to", "work", "--ask"],
         "Look at the branch for the parser\nIt is ready for a review.\n",
     );
-    let first = summary_with(&two.all(), &two.desktop, "work", &id);
+    let first = printed_and_told(&two.all(), &two.desktop, "work", &id);
     let lines: Vec<&str> = first.lines().collect();
     assert_eq!(
         lines[0],
@@ -479,9 +547,10 @@ fn the_summary_prints_nothing_and_exits_0_on_any_error() {
 }
 
 /// With the node behind a pass-through that holds its answers for 200
-/// ms, `summary` prints nothing, exits 0, and ends within 300 ms; what
-/// the node announced in that answer is counted after, and not lost
-/// (decision 2026-10-09 §4.1, C20).
+/// ms, `summary` prints nothing, exits 0, and ends within 300 ms; it
+/// marks nothing, and does not tell the node of a line, so the next
+/// summary prints the line of what that answer held (decision 2026-10-09
+/// §4.1, C20, rule 14).
 #[test]
 fn the_summary_answers_within_its_time_or_prints_nothing() {
     let two = Two::new();
@@ -494,14 +563,7 @@ fn the_summary_answers_within_its_time_or_prints_nothing() {
     );
     let desktop = &two.desktop;
     let late = PassesOn::holding(desktop.http, Duration::from_millis(200));
-    let own = std::fs::read_to_string(desktop.config()).unwrap();
-    let through = own.replace(
-        &format!("http_port = {}", desktop.http),
-        &format!("http_port = {}", late.port),
-    );
-    assert_ne!(own, through);
-    let config = desktop.dir.path().join("config-late.toml");
-    std::fs::write(&config, through).unwrap();
+    let config = config_through(desktop, late.port, "config-late.toml");
     // It is held, so that the answer has something in it.
     holds_what_was_sent(&two);
     let began = Instant::now();
@@ -516,10 +578,66 @@ fn the_summary_answers_within_its_time_or_prints_nothing() {
     assert_eq!(said.status.code(), Some(0));
     assert_eq!(out(&said), "");
     assert!(took < Duration::from_millis(300), "{took:?}");
-    assert!(!late.bodies("/api/v1/messages/summary").is_empty());
-    // Not lost: it waits in the summary, announced or not.
-    let shown = summary(desktop, "work");
-    assert!(shown.contains(&id), "{shown}");
+    // The node answered, with what it holds, after the command's time.
+    wait_for("the node answers", &two.all(), 30, || {
+        let asked = late.answered("/api/v1/messages/summary");
+        assert_eq!(asked.len(), 1);
+        asked[0].1
+    });
+    assert_eq!(late.answered("/api/v1/messages/summary")[0].1, Some(200));
+    assert!(late.bodies(ANNOUNCED).is_empty());
+    // Not printed, it is not announced: the next summary prints its line.
+    let shown = summary_with(&two.all(), desktop, "work", &id);
+    assert!(shown.contains(&format!("\n  {id}  ")), "{shown}");
+    assert!(shown.ends_with(": late\n"), "{shown}");
+}
+
+/// A summary whose output is closed prints nothing, and tells the node
+/// nothing: the next summary prints the line (decision 2026-10-09 §4.1,
+/// rule 14).
+#[test]
+fn a_summary_that_could_not_print_its_line_marks_nothing() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "unseen\n",
+    );
+    let desktop = &two.desktop;
+    holds_what_was_sent(&two);
+    let through = PassesOn::to(desktop.http);
+    let config = config_through(desktop, through.port, "config-closed.toml");
+    // Run until the node has answered a summary with the line, whose
+    // output was closed before it was run.
+    wait_for(
+        "a summary is answered with the line",
+        &two.all(),
+        120,
+        || {
+            let (closed, output) = std::io::pipe().unwrap();
+            drop(closed);
+            let mut command =
+                desktop.command_for(&[], &["--config", &path(&config), "msg", "summary"]);
+            command
+                .current_dir(folder(desktop, "work"))
+                .stdin(Stdio::null())
+                .stdout(output)
+                .stderr(Stdio::piped());
+            let said = command.output().unwrap();
+            assert_eq!(said.status.code(), Some(0), "{}", err(&said));
+            through
+                .answered("/api/v1/messages/summary")
+                .iter()
+                .any(|(_, status)| *status == Some(200))
+                .then_some(())
+        },
+    );
+    assert!(through.bodies(ANNOUNCED).is_empty());
+    let shown = summary_with(&two.all(), desktop, "work", &id);
+    assert!(shown.contains(&format!("\n  {id}  ")), "{shown}");
+    assert!(shown.ends_with(": unseen\n"), "{shown}");
 }
 
 /// Seven unread: five lines, the oldest first, and a count line of the
@@ -576,7 +694,7 @@ fn the_summary_announces_a_message_once_and_then_counts_it() {
         &["--to", "work"],
         "once\n",
     );
-    let first = summary_with(&two.all(), &two.desktop, "work", &id);
+    let first = printed_and_told(&two.all(), &two.desktop, "work", &id);
     assert!(
         first.contains(&format!("  {id}  ")) && first.contains(": once\n"),
         "{first}"
