@@ -269,6 +269,9 @@ pub struct Governor {
     /// The time, in nanoseconds since the epoch, that a random pick is
     /// seeded with: the system's clock, or one a test gives.
     clock_nanos: fn() -> u128,
+    /// The jitter added to the interval before the next churn, in seconds:
+    /// drawn once for each churn and kept until it runs, or none yet.
+    churn_jitter: Option<u64>,
 }
 
 /// The system's time in nanoseconds since the epoch.
@@ -309,6 +312,7 @@ impl Governor {
             dial_policy,
             keeps_its_relays: false,
             clock_nanos: system_nanos,
+            churn_jitter: None,
         }
     }
 
@@ -939,18 +943,33 @@ impl Governor {
         }
     }
 
-    fn churn(&mut self, actions: &mut GovernorActions) {
-        // Add random jitter to prevent correlated churn across nodes
-        let jitter = if self.targets.churn_jitter_secs > 0 {
-            self.random_index(self.targets.churn_jitter_secs as usize) as u64
+    /// A jitter for the next churn, uniform from 0 to churn_jitter_secs.
+    fn draw_churn_jitter(&self) -> u64 {
+        if self.targets.churn_jitter_secs > 0 {
+            self.random_index(self.targets.churn_jitter_secs as usize + 1) as u64
         } else {
             0
+        }
+    }
+
+    fn churn(&mut self, actions: &mut GovernorActions) {
+        // Add random jitter to prevent correlated churn across nodes. It
+        // is drawn once for each churn and kept, so that the time of the
+        // churn is uniform over the jitter and not drawn again each tick.
+        let jitter = match self.churn_jitter {
+            Some(jitter) => jitter,
+            None => {
+                let jitter = self.draw_churn_jitter();
+                self.churn_jitter = Some(jitter);
+                jitter
+            }
         };
         let interval = self.targets.churn_interval_secs + jitter;
         if self.last_churn.elapsed() < Duration::from_secs(interval) {
             return;
         }
         self.last_churn = Instant::now();
+        self.churn_jitter = Some(self.draw_churn_jitter());
 
         self.churn_warm(actions);
         self.churn_hot(actions);
@@ -2470,31 +2489,39 @@ mod tests {
     }
 
     /// The churn's jitter is random on a clock that counts in
-    /// microseconds: with an interval of none, a jitter of up to 1000
-    /// seconds, and 500 seconds since the last churn, a churn runs at some
-    /// ticks and not at others.
+    /// microseconds, and drawn once for each churn: the interval is 100
+    /// seconds, the jitter up to 1000, and the last churn 600 seconds ago,
+    /// so a churn is due at once with a jitter below 500 and not for some
+    /// time with one above. A new governor ticks twenty times, forty
+    /// times over: a churn runs at the first tick or at none, and over
+    /// the forty both happen.
     #[test]
     fn test_churn_jitter_is_random_on_a_microsecond_clock() {
         let targets = GovernorTargets {
+            churn_interval_secs: 100,
             churn_jitter_secs: 1000,
             ..hot_churn_targets()
         };
-        let mut gov = Governor::new(targets, vec![]);
-        gov.clock_nanos = microsecond_clock;
-        let mut churned = std::collections::HashSet::new();
+        let mut first = std::collections::HashSet::new();
         for _ in 0..40 {
-            for i in 1..=2u8 {
-                set_hot(&mut gov, &make_node_id(i));
+            let mut gov = Governor::new(targets.clone(), vec![]);
+            gov.clock_nanos = microsecond_clock;
+            gov.last_churn = Instant::now() - Duration::from_secs(600);
+            let mut churned_at = Vec::new();
+            for tick in 0..20 {
+                let before = gov.last_churn;
+                gov.tick();
+                if gov.last_churn != before {
+                    churned_at.push(tick);
+                }
             }
-            set_warm_long(&mut gov, &make_node_id(3));
-            gov.last_churn = Instant::now() - Duration::from_secs(500);
-            churned.insert(!gov.tick().transitions.is_empty());
+            assert!(
+                churned_at.is_empty() || churned_at == [0],
+                "the jitter was drawn again: churns at ticks {churned_at:?}"
+            );
+            first.insert(churned_at.is_empty());
         }
-        assert_eq!(
-            churned.len(),
-            2,
-            "a churn ran at every tick or at none: {churned:?}"
-        );
+        assert_eq!(first.len(), 2, "a churn ran every time or never: {first:?}");
     }
 
     /// Three peers hot, above hot_min, and one warm peer that churn may
