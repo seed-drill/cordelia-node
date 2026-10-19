@@ -988,9 +988,14 @@ fn exchange_names(
 ) -> Result<Vec<String>, CordeliaError> {
     let me = state.identity.public_key();
     let now = state.sync_control.now();
+    // What was stored since the last read is checked and opened with the
+    // lock let go; under it, the words are read once, for both lists.
+    said_names::read_ahead(&state.db).map_err(of_person)?;
     let db = lock(state)?;
+    // A word that this device takes back below is its own: `others`
+    // reads only the words of other keys, which it does not change.
+    let (said, listed) = said_names::said_and_listed(&db, &state.identity).map_err(of_person)?;
     if state.sync_control.generation_under(&db) == generation {
-        let said = said_names::said_here(&db, &state.identity).map_err(of_person)?;
         // A name that the device holds by a carry that a person asked
         // for has no folder here, and is listed all the same (decision
         // 2026-10-04 §7.3, §9): it is not stopped for want of one.
@@ -1011,7 +1016,7 @@ fn exchange_names(
         }
     }
     let mut others: BTreeSet<String> = BTreeSet::new();
-    for listed in said_names::listed(&db).map_err(of_person)? {
+    for listed in listed {
         // Shown to the person, and inside a command to copy.
         let by_another = listed.by.iter().any(|key| *key != me);
         if by_another && cordelia_api::sync::valid_sync_name(&listed.name) {
@@ -2542,6 +2547,7 @@ mod tests {
     use cordelia_storage::person as held_rows;
 
     mod index_lines;
+    mod personal_reads;
 
     /// The name that a test's folder syncs.
     const NAME: &str = "x";

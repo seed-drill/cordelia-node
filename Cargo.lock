@@ -795,6 +795,7 @@ dependencies = [
 name = "cordelia-sync"
 version = "0.2.0-alpha.12"
 dependencies = [
+ "actix-web",
  "chrono",
  "cordelia-api",
  "cordelia-core",

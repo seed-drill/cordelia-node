@@ -19,3 +19,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The status route, asked in a test while cycles run. The API crate
+# already brings it: this adds no crate to the build.
+actix-web = { workspace = true }

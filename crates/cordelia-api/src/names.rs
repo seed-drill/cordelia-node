@@ -41,7 +41,7 @@
 //! Nothing here sends anything: what is written waits in the store, and
 //! the node sends it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::Connection;
 
@@ -218,34 +218,237 @@ struct Words {
 /// What comes after `name/` is read as a name only where it is one
 /// ([`is_a_name`]): a word that is not is counted for its key, and what
 /// it holds goes no further.
+///
+/// **What checking and opening an entry found is kept between reads**
+/// ([`Kept`]): only an entry that is stored as no entry read before was
+/// is checked and opened. What a word is read for (its signer, its band,
+/// whether it is a delete) is asked again at every read, of the stored
+/// row, under the statement and the keys that count then.
 fn words(
     conn: &Connection,
     standing: &Standing,
     of: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<Words, PersonError> {
+    words_in(conn, standing, of, &KEPT)
+}
+
+/// [`words`], with what is kept in `slot`.
+fn words_in(
+    conn: &Connection,
+    standing: &Standing,
+    of: impl Fn(&[u8; 32]) -> bool,
+    slot: &Slot,
+) -> Result<Words, PersonError> {
     let personal = derive::personal_secret(&standing.secret)?;
     let channel = derive::channel_id(&personal)?;
-    let (mut names, mut not_names) = (Vec::new(), Vec::new());
-    for slot in entries::channel_slots(conn, &channel)? {
-        for entry in entries::slot_entries(conn, &channel, &slot)? {
-            let read = of(&entry.author) && in_a_band_of(entry.rev, standing.number());
-            if entry.delete || !read {
-                continue;
-            }
-            let Ok(inside) = entry.open(&personal) else {
-                continue;
-            };
-            match inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
-                Some(name) if is_a_name(name) => names.push((name.to_string(), entry.author)),
-                Some(_) => not_names.push(entry.author),
-                None => {}
+    let mut kept = Kept::take(slot, &channel);
+    let words = words_kept(conn, &personal, standing.number(), of, &mut kept);
+    kept.put_back(slot);
+    words
+}
+
+/// What checking and opening one stored entry of the personal channel
+/// finds: why it does not pass the check, or, where it does, the name
+/// inside it where it is no delete and opens. It is the same for every
+/// reader and under every statement: it is worked out from the entry as
+/// it is stored and the personal secret, and nothing else.
+type Found = Result<Option<String>, String>;
+
+/// Check `entry` as it is stored, and open it with `personal` where it is
+/// no delete: what [`entries::slot_entries`] and the read of a word did
+/// with it each time.
+fn find(entry: Entry, personal: &[u8; 32]) -> Found {
+    match entry.check() {
+        Err(e) => Err(e.to_string()),
+        Ok(entry) if entry.delete => Ok(None),
+        Ok(entry) => Ok(entry.open(personal).ok().map(|inside| inside.name)),
+    }
+}
+
+/// What was found of each entry of one personal channel when it was last
+/// read ([`Found`]), with the entry as it was stored then, by its slot and
+/// its author: the store holds one entry at most for each.
+///
+/// A device reads its personal channel at each cycle of sync, and for a
+/// status and a message: it holds a word of each device for each name,
+/// and checking and opening each of them every time held the store for
+/// seconds at a few thousand. Kept so, an entry is checked and opened
+/// once, when it is first read as it is stored. **What is kept of an
+/// entry is used only where the entry is stored now as it was then, to
+/// the byte**: of every column that the check and the opening read. So a
+/// read finds what it found without this in every case: an entry stored,
+/// replaced or removed, a sweep, a word written again below a delete that
+/// went, a row changed where it lay, a restore, a statement applied, and
+/// a key that comes to count or stops counting. The first ones change
+/// what is stored, and so what is compared; a statement applied gives
+/// another channel, of which nothing is kept; and what a word is read for
+/// (its signer, its band, whether it is a delete) is asked again at
+/// every read ([`words`]).
+///
+/// One is kept, of the channel last read, in the process: a node reads
+/// the personal channel of the generation it has applied. Where several
+/// nodes read in one process, as in a test, one may find another's, or
+/// none: an entry stored the same is found the same in any store, and one
+/// that was not kept is checked and opened.
+#[derive(Default)]
+struct Kept {
+    channel: [u8; 32],
+    found: HashMap<([u8; 32], [u8; 32]), (Entry, Found)>,
+    /// How many entries were checked and opened by the reads with this.
+    afresh: usize,
+}
+
+/// Where what is kept between reads is ([`Kept`]): of one channel, or of
+/// none.
+type Slot = std::sync::Mutex<Option<Kept>>;
+
+/// What the process keeps between reads.
+static KEPT: Slot = std::sync::Mutex::new(None);
+
+impl Kept {
+    fn of(channel: &[u8; 32]) -> Self {
+        Kept {
+            channel: *channel,
+            ..Kept::default()
+        }
+    }
+
+    /// What is kept of `channel`, taken out while a read uses it; nothing
+    /// where nothing is kept of it.
+    fn take(slot: &Slot, channel: &[u8; 32]) -> Self {
+        let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
+        match kept.take() {
+            Some(found) if found.channel == *channel => found,
+            other => {
+                *kept = other;
+                Kept::of(channel)
             }
         }
     }
+
+    /// Keep this after a read, in the place of what is kept.
+    fn put_back(self, slot: &Slot) {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
+    }
+
+    /// What is kept of `entry`, where it is kept as it is stored now; it
+    /// is kept no longer.
+    fn of_entry(&mut self, entry: &Entry) -> Option<Found> {
+        match self.found.remove(&(entry.slot, entry.author)) {
+            Some((kept, found)) if kept == *entry => Some(found),
+            _ => None,
+        }
+    }
+
+    /// Whether `entry` is kept as it is stored now.
+    fn holds(&self, entry: &Entry) -> bool {
+        self.found
+            .get(&(entry.slot, entry.author))
+            .is_some_and(|(kept, _)| kept == entry)
+    }
+}
+
+/// [`words`], with what is kept from the reads before: of the personal
+/// channel whose secret is `personal`, under the statement numbered
+/// `number`. `kept` holds afterwards what this read found, and nothing
+/// of an entry that is no longer stored.
+fn words_kept(
+    conn: &Connection,
+    personal: &[u8; 32],
+    number: u64,
+    of: impl Fn(&[u8; 32]) -> bool,
+    kept: &mut Kept,
+) -> Result<Words, PersonError> {
+    let channel = derive::channel_id(personal)?;
+    if kept.channel != channel {
+        *kept = Kept::of(&channel);
+    }
+    let (mut names, mut not_names) = (Vec::new(), Vec::new());
+    let mut found_now = HashMap::new();
+    for held in entries::channel_stored(conn, &channel)? {
+        let (author, rev, delete) = (held.entry.author, held.entry.rev, held.entry.delete);
+        let found = match kept.of_entry(&held.entry) {
+            Some(found) => found,
+            None => {
+                kept.afresh += 1;
+                find(held.entry.clone(), personal)
+            }
+        };
+        match &found {
+            Err(e) => tracing::warn!(
+                seq = held.seq,
+                "a stored entry does not pass the check, and is left out: {e}"
+            ),
+            Ok(Some(inside)) if !delete && of(&author) && in_a_band_of(rev, number) => {
+                match inside.strip_prefix(PERSONAL_NAME_PREFIX) {
+                    Some(name) if is_a_name(name) => names.push((name.to_string(), author)),
+                    Some(_) => not_names.push(author),
+                    None => {}
+                }
+            }
+            Ok(_) => {}
+        }
+        found_now.insert((held.entry.slot, author), (held.entry, found));
+    }
+    kept.found = found_now;
     names.sort();
     names.dedup();
     not_names.sort();
     Ok(Words { names, not_names })
+}
+
+/// Check and open, with the database's lock let go, each entry of the
+/// personal channel that is stored as none that is kept ([`Kept`]), and
+/// keep what was found: the lock is held only to read the rows. A read
+/// of the words that follows then checks and opens only what was stored
+/// in between. None on a device that follows no phrase.
+///
+/// A cycle of sync does this before it reads the words under the lock:
+/// at the first cycle after a node starts, every entry is read afresh.
+pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> {
+    read_ahead_in(db, &KEPT)
+}
+
+/// [`read_ahead`], keeping what it finds in `slot`.
+fn read_ahead_in(db: &std::sync::Mutex<Connection>, slot: &Slot) -> Result<(), PersonError> {
+    let (personal, stored) = {
+        let conn = db
+            .lock()
+            .map_err(|e| PersonError::Held(format!("db lock: {e}")))?;
+        let Ok(standing) = Standing::of(&conn) else {
+            return Ok(());
+        };
+        let personal = derive::personal_secret(&standing.secret)?;
+        let channel = derive::channel_id(&personal)?;
+        (personal, entries::channel_stored(&conn, &channel)?)
+    };
+    let channel = derive::channel_id(&personal)?;
+    let new: Vec<Entry> = match &*slot.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(kept) if kept.channel == channel => stored
+            .into_iter()
+            .map(|held| held.entry)
+            .filter(|entry| !kept.holds(entry))
+            .collect(),
+        _ => stored.into_iter().map(|held| held.entry).collect(),
+    };
+    if new.is_empty() {
+        return Ok(());
+    }
+    let read: Vec<_> = new
+        .into_iter()
+        .map(|entry| {
+            let found = find(entry.clone(), &personal);
+            ((entry.slot, entry.author), (entry, found))
+        })
+        .collect();
+    let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let kept = match &mut *kept {
+        Some(kept) if kept.channel == channel => kept,
+        other => other.insert(Kept::of(&channel)),
+    };
+    kept.afresh += read.len();
+    kept.found.extend(read);
+    Ok(())
 }
 
 /// The names that this device says it syncs: those its own word lists.
@@ -260,6 +463,27 @@ pub fn said_here(
     let own = identity.public_key();
     let said = words(conn, &standing, |key| *key == own)?.names;
     Ok(said.into_iter().map(|(name, _)| name).collect())
+}
+
+/// [`said_here`] and [`listed`] together, from one read of the personal
+/// channel: what a cycle of sync asks.
+pub fn said_and_listed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+) -> Result<(BTreeSet<String>, Vec<Listed>), PersonError> {
+    let Ok(standing) = Standing::of(conn) else {
+        return Ok((BTreeSet::new(), Vec::new()));
+    };
+    let own = identity.public_key();
+    let counts = |key: &[u8; 32]| standing.counting.counts(key);
+    let read = words(conn, &standing, |key| *key == own || counts(key))?.names;
+    let said = read
+        .iter()
+        .filter(|(_, key)| *key == own)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let listed = by_name(read.into_iter().filter(|(_, key)| counts(key)));
+    Ok((said, listed))
 }
 
 /// A name that the personal channel lists, with each key that lists it.
@@ -279,6 +503,12 @@ pub fn listed(conn: &Connection) -> Result<Vec<Listed>, PersonError> {
         return Ok(Vec::new());
     };
     let said = words(conn, &standing, |key| standing.counting.counts(key))?.names;
+    Ok(by_name(said.into_iter()))
+}
+
+/// Words, each a name and a key in order, as names with every key that
+/// lists each.
+fn by_name(said: impl Iterator<Item = (String, [u8; 32])>) -> Vec<Listed> {
     let mut listed: Vec<Listed> = Vec::new();
     for (name, key) in said {
         match listed.last_mut() {
@@ -289,7 +519,7 @@ pub fn listed(conn: &Connection) -> Result<Vec<Listed>, PersonError> {
             }),
         }
     }
-    Ok(listed)
+    listed
 }
 
 /// The words of the personal channel of the generation applied that are
@@ -1665,5 +1895,412 @@ mod tests {
         // What a folder agreed there is kept by the channel as written.
         let written = encode_channel_id(&channel).unwrap();
         assert!(!sync_state::any(&s[0].conn, "/home/sam/memory", &written).unwrap());
+    }
+
+    // ── What is kept of the personal channel between reads ──────────
+
+    /// The words of the personal channel as they were read before
+    /// anything was kept: each entry of each slot checked again and
+    /// opened, at every read. What is kept must give what this gives.
+    fn words_afresh(
+        conn: &Connection,
+        standing: &Standing,
+        of: impl Fn(&[u8; 32]) -> bool,
+    ) -> Words {
+        let personal = derive::personal_secret(&standing.secret).unwrap();
+        let channel = derive::channel_id(&personal).unwrap();
+        let (mut names, mut not_names) = (Vec::new(), Vec::new());
+        for slot in entries::channel_slots(conn, &channel).unwrap() {
+            for entry in entries::slot_entries(conn, &channel, &slot).unwrap() {
+                let read = of(&entry.author) && in_a_band_of(entry.rev, standing.number());
+                if entry.delete || !read {
+                    continue;
+                }
+                let Ok(inside) = entry.open(&personal) else {
+                    continue;
+                };
+                match inside.name.strip_prefix(PERSONAL_NAME_PREFIX) {
+                    Some(name) if is_a_name(name) => names.push((name.to_string(), entry.author)),
+                    Some(_) => not_names.push(entry.author),
+                    None => {}
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        not_names.sort();
+        Words { names, not_names }
+    }
+
+    /// Whose words a read reads.
+    type Whose<'a> = &'a dyn Fn(&[u8; 32]) -> bool;
+
+    /// How many entries the reads with what `slot` keeps have checked and
+    /// opened.
+    fn afresh(slot: &Slot) -> usize {
+        slot.lock().unwrap().as_ref().map_or(0, |kept| kept.afresh)
+    }
+
+    /// A read of the words of every key, of the keys that count, and of
+    /// the device's own, with what `slot` keeps, finds on `on` what a read
+    /// of the whole channel finds. Returns how many entries the three
+    /// reads checked and opened.
+    fn kept_is_afresh(on: &Machine, slot: &Slot) -> usize {
+        let standing = Standing::of(&on.conn).unwrap();
+        let own = on.key();
+        let before = afresh(slot);
+        let every = |_: &[u8; 32]| true;
+        let counts = |key: &[u8; 32]| standing.counting.counts(key);
+        let its_own = |key: &[u8; 32]| *key == own;
+        let reads: [Whose; 3] = [&every, &counts, &its_own];
+        for of in reads {
+            let kept = words_in(&on.conn, &standing, of, slot).unwrap();
+            let fresh = words_afresh(&on.conn, &standing, of);
+            assert_eq!(kept.names, fresh.names);
+            assert_eq!(kept.not_names, fresh.not_names);
+        }
+        // And what the public reads give is the same.
+        let (said, listed_now) = said_and_listed(&on.conn, &on.identity).unwrap();
+        assert_eq!(said, said_here(&on.conn, &on.identity).unwrap());
+        assert_eq!(listed_now, listed(&on.conn).unwrap());
+        let by_counted = words_afresh(&on.conn, &standing, counts);
+        assert_eq!(listed_now, by_name(by_counted.names.into_iter()));
+        afresh(slot).saturating_sub(before)
+    }
+
+    /// The device's own word of `name`, as its store holds it: its row.
+    fn own_row(on: &Machine, name: &str) -> i64 {
+        let personal = on.personal();
+        let channel = derive::channel_id(&personal).unwrap();
+        let slot = slot_id(&derive::slot_key(&personal).unwrap(), &word_name(name));
+        entries::author_entry(&on.conn, &channel, &slot, &on.key())
+            .unwrap()
+            .unwrap()
+            .seq
+    }
+
+    /// What is kept of the personal channel between reads gives what a
+    /// read of the whole channel gives, in every case: an entry stored,
+    /// one that replaces another, a delete, a word that is no name, a
+    /// row changed where it lay or removed, a sweep, a word written again
+    /// below the delete that a sweep took, a key that comes to count, a
+    /// statement applied, a key that stops counting, and a store put back
+    /// as a copy of it was. Only an entry stored as none read before was
+    /// is checked and opened again.
+    #[test]
+    fn test_what_is_kept_of_the_personal_channel_is_what_a_read_of_it_finds() {
+        let mut s = Several::new(3);
+        s.make_phrase(0);
+        assert!(matches!(s.add(0, 1), crate::adding::Accepted::Joined(_)));
+        s.meet(&[0, 1]);
+        let slot = Slot::new(None);
+        kept_is_afresh(&s[0], &slot);
+        // Nothing changed: nothing is checked or opened.
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+
+        // A new entry: device 1 says that it syncs a name.
+        let now = s.tick();
+        say(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert_eq!(listed_on(&s, 0), [("lab".to_string(), vec![1])]);
+        // Its own words, one of which replaces another.
+        for name in ["own", "mine"] {
+            say(&s[0].conn, &s[0].identity, name, now).unwrap();
+        }
+        assert_eq!(kept_is_afresh(&s[0], &slot), 2);
+        let now = s.tick();
+        unsay(&s[0].conn, &s[0].identity, "mine", now).unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        let said: Vec<String> = said_here(&s[0].conn, &s[0].identity)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(said, ["own"]);
+
+        // A delete over device 1's word.
+        let now = s.tick();
+        unsay(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert!(listed_on(&s, 0).iter().all(|(name, _)| name != "lab"));
+        let now = s.tick();
+        say(&s[1].conn, &s[1].identity, "lab", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+
+        // Words that are no names.
+        let no_names = crate::several::writes_words_that_are_no_names(&mut s, 1, 0);
+        assert_eq!(kept_is_afresh(&s[0], &slot), no_names);
+        assert_eq!(not_names(&s[0].conn).unwrap(), [(s.key(1), no_names)]);
+
+        // A row changed where it lay: it passes the check no more, and is
+        // no word. Each column that the check reads, in turn.
+        let row = own_row(&s[0], "own");
+        let changes = [
+            "content = zeroblob(length(content))",
+            "rev = rev + 1",
+            "is_delete = 1",
+            "author_sig = zeroblob(64)",
+            "channel_sig = zeroblob(64)",
+        ];
+        for change in changes {
+            let original: (Vec<u8>, i64, bool, Vec<u8>, Vec<u8>) = s[0]
+                .conn
+                .query_row(
+                    "SELECT content, rev, is_delete, author_sig, channel_sig
+                     FROM entries WHERE seq = ?1",
+                    [row],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            let sql = format!("UPDATE entries SET {change} WHERE seq = ?1");
+            assert_eq!(s[0].conn.execute(&sql, [row]).unwrap(), 1);
+            assert_eq!(kept_is_afresh(&s[0], &slot), 1, "{change}");
+            assert!(said_here(&s[0].conn, &s[0].identity).unwrap().is_empty());
+            s[0].conn
+                .execute(
+                    "UPDATE entries SET content = ?2, rev = ?3, is_delete = ?4,
+                     author_sig = ?5, channel_sig = ?6 WHERE seq = ?1",
+                    rusqlite::params![
+                        row, original.0, original.1, original.2, original.3, original.4
+                    ],
+                )
+                .unwrap();
+            // As it was: what was found of it is kept no more, and it is
+            // read again.
+            assert_eq!(kept_is_afresh(&s[0], &slot), 1, "{change}");
+            assert_eq!(said_here(&s[0].conn, &s[0].identity).unwrap().len(), 1);
+        }
+        // The row is removed.
+        let copy = s[0].stored();
+        s[0].conn
+            .execute("DELETE FROM entries WHERE seq = ?1", [row])
+            .unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        assert!(said_here(&s[0].conn, &s[0].identity).unwrap().is_empty());
+
+        // A sweep takes device 0's delete of "mine", 90 days on; its word
+        // is written again then, at the first revision.
+        s.now += i64::from(cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS) * 86_400 + 1;
+        let swept = crate::swept::sweep_deletes(&s[0].conn, s.now).unwrap();
+        assert!(swept.entries >= 1, "{swept:?}");
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        let now = s.tick();
+        say(&s[0].conn, &s[0].identity, "mine", now).unwrap();
+        assert_eq!(word(&s[0], "mine").unwrap().0, 1);
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert!(
+            said_here(&s[0].conn, &s[0].identity)
+                .unwrap()
+                .contains("mine")
+        );
+
+        // A store put back as a copy of it was, before the sweep and the
+        // removal: the rows come back as they were stored then.
+        let personal = s[0].personal();
+        let channel = derive::channel_id(&personal).unwrap();
+        entries::remove_channel(&s[0].conn, &channel).unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        assert!(listed(&s[0].conn).unwrap().is_empty());
+        let put_back = copy.iter().filter(|entry| entry.channel == channel);
+        for entry in put_back.clone() {
+            entries::store(&s[0].conn, entry, now).unwrap();
+        }
+        // Nothing is kept of an entry once it is no longer stored: each
+        // that comes back is read afresh.
+        assert_eq!(kept_is_afresh(&s[0], &slot), put_back.count());
+        assert!(
+            said_here(&s[0].conn, &s[0].identity)
+                .unwrap()
+                .contains("own")
+        );
+
+        // A word of device 2's, before it counts: in the store, and no
+        // word. It comes to count when device 0 adds it.
+        let word_of_2 = entry_by(
+            &s[2].identity,
+            &personal,
+            1,
+            "name/theirs",
+            Value::Text(String::new()),
+            &[],
+        );
+        entries::store(&s[0].conn, &word_of_2, now).unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert!(listed_on(&s, 0).iter().all(|(name, _)| name != "theirs"));
+        // A device is added by a record, in the same channel: what was
+        // kept of its word is read for it now that it counts.
+        assert!(matches!(s.add(0, 2), crate::adding::Accepted::Joined(_)));
+        assert_eq!(s[0].personal(), personal);
+        assert!(s[0].counts(&s.key(2)));
+        kept_is_afresh(&s[0], &slot);
+        assert!(
+            listed_on(&s, 0)
+                .iter()
+                .any(|(name, by)| name == "theirs" && by == &[2])
+        );
+        s.meet(&[0, 1, 2]);
+        kept_is_afresh(&s[0], &slot);
+        // The key stops counting in the same channel, as where its record
+        // is judged as not counted: its word lists nothing, and nothing
+        // was checked or opened for that.
+        let key_2 = s.key(2);
+        let counted = |on: &Machine, counted: bool| {
+            on.conn
+                .execute(
+                    "UPDATE person_additions SET counted = ?2 WHERE key = ?1",
+                    rusqlite::params![&key_2[..], counted],
+                )
+                .unwrap()
+        };
+        assert_eq!(counted(&s[0], false), 1);
+        assert!(!s[0].counts(&s.key(2)));
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        assert!(listed_on(&s, 0).iter().all(|(name, _)| name != "theirs"));
+        assert_eq!(counted(&s[0], true), 1);
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        assert!(listed_on(&s, 0).iter().any(|(name, _)| name == "theirs"));
+        // On device 2, whose own key counts no more there: what it says
+        // it syncs is its own word, and the channel lists that word no
+        // longer.
+        let now = s.tick();
+        say(&s[2].conn, &s[2].identity, "its-own", now).unwrap();
+        kept_is_afresh(&s[2], &slot);
+        assert_eq!(counted(&s[2], false), 1);
+        assert!(!s[2].counts(&s.key(2)));
+        kept_is_afresh(&s[2], &slot);
+        assert!(
+            said_here(&s[2].conn, &s[2].identity)
+                .unwrap()
+                .contains("its-own")
+        );
+        assert!(
+            listed(&s[2].conn)
+                .unwrap()
+                .iter()
+                .all(|l| l.name != "its-own")
+        );
+        assert_eq!(counted(&s[2], true), 1);
+
+        // A statement is applied, and then one that removes device 2:
+        // its key counts no more, and its words list nothing.
+        let now = s.tick();
+        say(&s[2].conn, &s[2].identity, "tablet", now).unwrap();
+        s.pass(2, 0);
+        kept_is_afresh(&s[0], &slot);
+        assert!(
+            listed_on(&s, 0)
+                .iter()
+                .any(|(name, by)| name == "tablet" && by == &[2])
+        );
+        s.change(0, &[0, 1, 2], &[]);
+        assert_ne!(s[0].personal(), personal);
+        kept_is_afresh(&s[0], &slot);
+        s.meet(&[0, 1, 2]);
+        kept_is_afresh(&s[0], &slot);
+        let still = s[0].personal();
+        s.change(0, &[0, 1], &[2]);
+        assert_ne!(s[0].personal(), still);
+        assert!(!s[0].counts(&s.key(2)));
+        kept_is_afresh(&s[0], &slot);
+        assert!(listed_on(&s, 0).iter().all(|(_, by)| !by.contains(&2)));
+
+        // Another store of the same person, read with what this one's
+        // read kept: what it finds is its own.
+        s.pass(0, 1);
+        kept_is_afresh(&s[1], &slot);
+        kept_is_afresh(&s[0], &slot);
+    }
+
+    /// A word in a band above the statement's is no word with what is
+    /// kept either, read once or again; and a statement applied after it
+    /// reads its own channel: what is kept says nothing of the band.
+    #[test]
+    fn test_what_is_kept_says_nothing_of_the_band_of_a_word() {
+        use cordelia_core::protocol::REV_COUNT_BITS;
+        let mut s = Several::of_one_person(2);
+        let slot = Slot::new(None);
+        kept_is_afresh(&s[0], &slot);
+        let personal = s[0].personal();
+        let above = entry_by(
+            &s[1].identity,
+            &personal,
+            ((s[0].number() + 1) << REV_COUNT_BITS) + 1,
+            &word_name("later"),
+            Value::Text(String::new()),
+            &[],
+        );
+        entries::store(&s[0].conn, &above, s.now).unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert!(listed(&s[0].conn).unwrap().is_empty());
+        assert_eq!(kept_is_afresh(&s[0], &slot), 0);
+        assert!(listed(&s[0].conn).unwrap().is_empty());
+        // In its own band, by the same key and in the same slot, it is a
+        // word: another entry, read afresh.
+        let within = entry_by(
+            &s[1].identity,
+            &personal,
+            (s[0].number() << REV_COUNT_BITS) + 2,
+            &word_name("later"),
+            Value::Text(String::new()),
+            &[],
+        );
+        s[0].conn
+            .execute(
+                "DELETE FROM entries WHERE author = ?1 AND rev = ?2",
+                rusqlite::params![&s.key(1)[..], above.rev as i64],
+            )
+            .unwrap();
+        entries::store(&s[0].conn, &within, s.now).unwrap();
+        assert_eq!(kept_is_afresh(&s[0], &slot), 1);
+        assert_eq!(listed_on(&s, 0), [("later".to_string(), vec![1])]);
+        s.change(0, &[0, 1], &[]);
+        assert_ne!(s[0].personal(), personal);
+        kept_is_afresh(&s[0], &slot);
+    }
+
+    /// What a read ahead finds is what a read under the lock then uses:
+    /// with every entry read ahead, the read under the lock checks and
+    /// opens none, and finds what a read of the whole channel finds. One
+    /// stored in between is read under the lock.
+    #[test]
+    fn test_a_read_ahead_leaves_nothing_to_read_under_the_lock() {
+        let mut s = Several::of_one_person(2);
+        let now = s.tick();
+        for name in ["lab", "team", "notes"] {
+            say(&s[1].conn, &s[1].identity, name, now).unwrap();
+        }
+        s.pass(1, 0);
+        let slot = Slot::new(None);
+        let on = s.machines.remove(0);
+        let db = std::sync::Mutex::new(on.conn);
+        read_ahead_in(&db, &slot).unwrap();
+        let ahead = afresh(&slot);
+        assert!(ahead >= 3, "{ahead}");
+        let on = Machine {
+            conn: db.into_inner().unwrap(),
+            identity: on.identity,
+            label: on.label,
+        };
+        assert_eq!(kept_is_afresh(&on, &slot), 0);
+        // Read ahead again with nothing new: nothing.
+        let db = std::sync::Mutex::new(on.conn);
+        read_ahead_in(&db, &slot).unwrap();
+        assert_eq!(afresh(&slot), ahead);
+        let on = Machine {
+            conn: db.into_inner().unwrap(),
+            identity: on.identity,
+            label: on.label,
+        };
+        let now = now + 1;
+        say(&on.conn, &on.identity, "own", now).unwrap();
+        assert_eq!(kept_is_afresh(&on, &slot), 1);
+        // A device that follows no phrase reads nothing ahead.
+        let alone = Machine::new(7);
+        let db = std::sync::Mutex::new(alone.conn);
+        let empty = Slot::new(None);
+        read_ahead_in(&db, &empty).unwrap();
+        assert_eq!(afresh(&empty), 0);
     }
 }
