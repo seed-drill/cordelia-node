@@ -60,9 +60,9 @@ MUTATIONS = [
      [gov("test_churn_hot_demotes_none_where_no_warm_peer_may_take_its_place")]),
     ("CH7 hot churn may demote a trusted peer", GOVERNOR,
      '''            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
-            .map(|p| p.node_id.clone())''',
+            .filter(|p| !(relay_spared && p.is_relay))''',
      '''            .filter(|p| p.state == PeerState::Hot)
-            .map(|p| p.node_id.clone())''',
+            .filter(|p| !(relay_spared && p.is_relay))''',
      [gov("test_churn_hot_demotes_no_trusted_peer")]),
     ("CH8 hot churn promotes no trusted warm peer", GOVERNOR,
      '''            .filter(|p| self.may_be_made_hot(p) && Self::has_warm_tenure(p))''',
@@ -84,9 +84,36 @@ MUTATIONS = [
      '''            let j = (((self.clock_nanos)() as usize).wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);''',
      [gov("test_step_4_promotes_a_random_warm_peer_on_a_microsecond_clock")]),
     ("CH12 the churn's jitter is the time modulo the jitter", GOVERNOR,
-     '''            self.random_index(self.targets.churn_jitter_secs as usize) as u64''',
+     '''            self.random_index(self.targets.churn_jitter_secs as usize + 1) as u64''',
      '''            (self.clock_nanos)() as u64 % self.targets.churn_jitter_secs''',
      [gov("test_churn_jitter_is_random_on_a_microsecond_clock")]),
+    ("CH13 the churn's jitter is drawn again at every tick", GOVERNOR,
+     '''            Some(jitter) => jitter,''',
+     '''            Some(_) => self.draw_churn_jitter(),''',
+     [gov("test_churn_jitter_is_random_on_a_microsecond_clock")]),
+    ("CH14 hot churn may demote a relay while no more than hot_min_relays are hot", GOVERNOR,
+     '''            .filter(|p| !(relay_spared && p.is_relay))
+''',
+     '''''',
+     [gov("test_churn_hot_leaves_hot_relays_and_the_hot_count_as_they_were")]),
+    ("CH15 step 4a promotes warm relays in the map's order", GOVERNOR,
+     '''        for id in self.shuffled(warm_relays).into_iter().take(needed) {''',
+     '''        for id in warm_relays.into_iter().take(needed) {''',
+     [gov("test_step_4a_promotes_a_random_warm_relay_on_a_microsecond_clock")]),
+    ("CH16 warm churn closes warm peers in the map's order", GOVERNOR,
+     '''        let warm_ids: Vec<NodeId> = self
+            .shuffled(warm_ids)
+            .into_iter()''',
+     '''        let warm_ids: Vec<NodeId> = warm_ids
+            .into_iter()''',
+     [gov("test_churn_warm_closes_a_random_warm_peer_on_a_microsecond_clock")]),
+    ("CH17 warm churn dials cold peers in the map's order", GOVERNOR,
+     '''        let cold_ids: Vec<NodeId> = self
+            .shuffled(cold_ids)
+            .into_iter()''',
+     '''        let cold_ids: Vec<NodeId> = cold_ids
+            .into_iter()''',
+     [gov("test_churn_warm_dials_a_random_cold_peer_on_a_microsecond_clock")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
