@@ -716,7 +716,9 @@ fn refused_by(status: u16, answer: &Value, folder: &str, does: Does) -> String {
 /// 2. `msg summary` are the first two words that are not the
 /// configuration's flag; `--help` and `-h` are left to the parser, which
 /// prints the summary's help. `--folder <dir>` or `--folder=<dir>`, after
-/// `msg summary`, is taken once. What it asks for.
+/// `msg summary`, is taken once; a word after `--folder` that begins with
+/// `-` is no folder, and nor is one that is not UTF-8, in either form:
+/// each is an argument the summary does not take. What it asks for.
 pub fn summary_asked(args: &[OsString]) -> Option<SummaryAsked> {
     let mut config = None;
     let mut folder: Option<String> = None;
@@ -733,9 +735,12 @@ pub fn summary_asked(args: &[OsString]) -> Option<SummaryAsked> {
             Some("-h" | "--help") => return None,
             Some("--folder") if after_summary => {
                 folders += 1;
+                // Taken, so that a `-h` or a `--config` after it is not
+                // read as the parser's or the configuration's.
                 folder = given
                     .next()
                     .and_then(|next| next.to_str())
+                    .filter(|next| !next.starts_with('-'))
                     .map(String::from);
             }
             Some(text) if after_summary && text.starts_with("--folder=") => {
@@ -2942,6 +2947,46 @@ mod tests {
         assert_eq!(
             asked(&["cordelia", "--folder", "/a", "msg", "summary"]),
             None
+        );
+    }
+
+    /// A word after `--folder` that begins with `-` is no folder, and is
+    /// not the parser's help or the configuration's flag: it is an
+    /// argument the summary does not take. `--folder=-x` is a folder.
+    /// A folder that is not UTF-8 is no folder in either form (decision
+    /// 2026-10-09 §3.1, §4.1).
+    #[test]
+    fn a_word_after_the_summarys_folder_that_is_a_flag_or_not_text_is_no_folder() {
+        let asked = |args: &[OsString]| {
+            let args: Vec<OsString> =
+                [&["cordelia".into(), "msg".into(), "summary".into()], args].concat();
+            summary_asked(&args).map(|asked| (asked.folder, asked.others))
+        };
+        let words = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        for after in ["-h", "--help", "--config", "-", "--folder"] {
+            assert_eq!(
+                asked(&words(&["--folder", after])),
+                Some((None, true)),
+                "{after}"
+            );
+        }
+        let with_config = asked(&words(&["--folder", "--config", "/c.toml"]));
+        assert_eq!(with_config, Some((None, true)));
+        assert_eq!(
+            asked(&words(&["--folder=-x"])),
+            Some((Some("-x".into()), false))
+        );
+        use std::os::unix::ffi::OsStringExt;
+        let not_text = OsString::from_vec(b"/a\xff".to_vec());
+        let mut joined = b"--folder=".to_vec();
+        joined.extend_from_slice(b"/a\xff");
+        assert_eq!(
+            asked(&["--folder".into(), not_text]).map(|(_, others)| others),
+            Some(true)
+        );
+        assert_eq!(
+            asked(&[OsString::from_vec(joined)]).map(|(_, others)| others),
+            Some(true)
         );
     }
 
