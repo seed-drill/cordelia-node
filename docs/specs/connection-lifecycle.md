@@ -67,7 +67,7 @@ ALL four paths MUST execute this exact sequence:
 
 ### 1.2.1 Promotion Sequence (Warm -> Hot)
 
-When the governor promotes a peer from Warm to Hot (§5.4 step 4):
+When the governor promotes a peer from Warm to Hot (§5.4 step 4, or step 6 in churn):
 
 ```
 1. UPDATE governor state

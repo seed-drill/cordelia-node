@@ -266,6 +266,20 @@ pub struct Governor {
     /// Whether churn leaves the relays this node is set up with connected:
     /// so on a personal node (decision 2026-10-17 §2).
     keeps_its_relays: bool,
+    /// The time, in nanoseconds since the epoch, that a random pick is
+    /// seeded with: the system's clock, or one a test gives.
+    clock_nanos: fn() -> u128,
+    /// The jitter added to the interval before the next churn, in seconds:
+    /// drawn once for each churn and kept until it runs, or none yet.
+    churn_jitter: Option<u64>,
+}
+
+/// The system's time in nanoseconds since the epoch.
+fn system_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// Actions the governor wants the node to take after a tick.
@@ -297,6 +311,8 @@ impl Governor {
             last_churn: Instant::now(),
             dial_policy,
             keeps_its_relays: false,
+            clock_nanos: system_nanos,
+            churn_jitter: None,
         }
     }
 
@@ -544,6 +560,47 @@ impl Governor {
             || matches!(&self.dial_policy, DialPolicy::TrustedOnly(trusted) if trusted.contains(&peer.node_id))
     }
 
+    /// Whether a peer is warm and passes the guards of network-protocol.md
+    /// §5.4 step 4 that every promotion to hot keeps: it is not a bootnode
+    /// nor a swarm member (each is never made hot by these steps), and it
+    /// was not demoted within the hysteresis. A trusted peer may be.
+    fn may_be_made_hot(&self, peer: &PeerInfo) -> bool {
+        peer.state == PeerState::Warm
+            && !peer.is_bootnode
+            && !peer.is_swarm
+            && peer
+                .demoted_at
+                .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
+    }
+
+    /// Whether a warm peer has been warm for `min_warm_tenure_secs`, the
+    /// guard of step 4 that only the urgency of `hot < hot_min` bypasses.
+    fn has_warm_tenure(peer: &PeerInfo) -> bool {
+        peer.state_tenure() >= Duration::from_secs(protocol::MIN_WARM_TENURE_SECS)
+    }
+
+    /// A random index below `len`, which must not be 0: every random pick
+    /// of the governor draws from it. The time is hashed with keys of the
+    /// process's own, so the seed is not a multiple of the clock's step,
+    /// and a clock that counts in microseconds does not pick the same
+    /// index each time.
+    fn random_index(&self, len: usize) -> usize {
+        use std::hash::BuildHasher;
+        let seed = (self.clock_nanos)();
+        let hashed = std::collections::hash_map::RandomState::new().hash_one(seed);
+        (hashed % len as u64) as usize
+    }
+
+    /// The peers given, in a random order (Fisher-Yates, each swap drawn
+    /// from `random_index`): taking the first n of them picks n at random.
+    fn shuffled(&self, mut ids: Vec<NodeId>) -> Vec<NodeId> {
+        for i in (1..ids.len()).rev() {
+            let j = self.random_index(i + 1);
+            ids.swap(i, j);
+        }
+        ids
+    }
+
     /// Check if a peer is dialable under the current policy.
     fn is_dialable(&self, peer: &PeerInfo) -> bool {
         match &self.dial_policy {
@@ -765,13 +822,7 @@ impl Governor {
         let eligible: Vec<NodeId> = self
             .peers
             .values()
-            .filter(|p| {
-                p.state == PeerState::Warm
-                    && !p.is_bootnode
-                    && !p.is_swarm
-                    && p.demoted_at
-                        .is_none_or(|d| d.elapsed() > self.timeouts.dead_timeout)
-            })
+            .filter(|p| self.may_be_made_hot(p))
             .map(|p| p.node_id.clone())
             .collect();
 
@@ -793,33 +844,20 @@ impl Governor {
         }
 
         // Filter by min_warm_tenure unless in urgent mode (§5.4, parameter-rationale.md §3)
-        let min_tenure = Duration::from_secs(protocol::MIN_WARM_TENURE_SECS);
         let eligible: Vec<NodeId> = if urgent {
             eligible // Bypass tenure for bootstrap urgency
         } else {
             eligible
                 .into_iter()
-                .filter(|id| {
-                    self.peers
-                        .get(id)
-                        .is_some_and(|p| p.state_tenure() >= min_tenure)
-                })
+                .filter(|id| self.peers.get(id).is_some_and(Self::has_warm_tenure))
                 .collect()
         };
         if eligible.is_empty() {
             return;
         }
 
-        // Shuffle eligible peers using a simple deterministic shuffle
-        let mut candidates = eligible;
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as usize;
-        for i in (1..candidates.len()).rev() {
-            let j = (seed.wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);
-            candidates.swap(i, j);
-        }
+        // Shuffle eligible peers
+        let candidates = self.shuffled(eligible);
 
         for id in candidates.into_iter().take(needed) {
             if let Some(peer) = self.peers.get_mut(&id) {
@@ -861,7 +899,7 @@ impl Governor {
             .map(|p| p.node_id.clone())
             .collect();
 
-        for id in warm_relays.into_iter().take(needed) {
+        for id in self.shuffled(warm_relays).into_iter().take(needed) {
             tracing::info!(
                 peer = %id,
                 hot_relays,
@@ -911,19 +949,33 @@ impl Governor {
         }
     }
 
-    fn churn(&mut self, actions: &mut GovernorActions) {
-        // Add deterministic jitter to prevent correlated churn across nodes
-        let jitter = if self.targets.churn_jitter_secs > 0 {
-            let seed = self.last_churn.elapsed().as_nanos() as u64;
-            seed % self.targets.churn_jitter_secs
+    /// A jitter for the next churn, uniform from 0 to churn_jitter_secs.
+    fn draw_churn_jitter(&self) -> u64 {
+        if self.targets.churn_jitter_secs > 0 {
+            self.random_index(self.targets.churn_jitter_secs as usize + 1) as u64
         } else {
             0
+        }
+    }
+
+    fn churn(&mut self, actions: &mut GovernorActions) {
+        // Add random jitter to prevent correlated churn across nodes. It
+        // is drawn once for each churn and kept, so that the time of the
+        // churn is uniform over the jitter and not drawn again each tick.
+        let jitter = match self.churn_jitter {
+            Some(jitter) => jitter,
+            None => {
+                let jitter = self.draw_churn_jitter();
+                self.churn_jitter = Some(jitter);
+                jitter
+            }
         };
         let interval = self.targets.churn_interval_secs + jitter;
         if self.last_churn.elapsed() < Duration::from_secs(interval) {
             return;
         }
         self.last_churn = Instant::now();
+        self.churn_jitter = Some(self.draw_churn_jitter());
 
         self.churn_warm(actions);
         self.churn_hot(actions);
@@ -958,8 +1010,12 @@ impl Governor {
             .peers
             .values()
             .filter(|p| p.state == PeerState::Warm && churned(p))
-            .take(churn_count)
             .map(|p| p.node_id.clone())
+            .collect();
+        let warm_ids: Vec<NodeId> = self
+            .shuffled(warm_ids)
+            .into_iter()
+            .take(churn_count)
             .collect();
 
         for id in &warm_ids {
@@ -979,8 +1035,12 @@ impl Governor {
             .peers
             .values()
             .filter(|p| matches!(p.state, PeerState::Cold) && self.is_dialable(p))
-            .take(churn_count)
             .map(|p| p.node_id.clone())
+            .collect();
+        let cold_ids: Vec<NodeId> = self
+            .shuffled(cold_ids)
+            .into_iter()
+            .take(churn_count)
             .collect();
 
         for id in cold_ids {
@@ -988,7 +1048,23 @@ impl Governor {
         }
     }
 
-    /// Hot-tier churn: demote 1 random hot peer to warm (SS5.4 step 6).
+    /// Hot-tier churn (network-protocol.md §5.4 step 6): demote 1 random
+    /// hot peer to warm and promote 1 random warm peer to hot in its place,
+    /// so the hot count stays what it was.
+    ///
+    /// The promoted peer passes the guards of step 4 that are not bypassed
+    /// for urgency (hot is above hot_min here): the warm tenure and the
+    /// hysteresis of a recent demotion. It is chosen before the demotion,
+    /// so the peer demoted is never the one promoted. Where no warm peer
+    /// passes, nothing is demoted: a demotion with no peer to take its
+    /// place explores nothing and only shrinks the hot set, which step 4
+    /// refills only below hot_min.
+    ///
+    /// A hot relay is not demoted where that would leave fewer than
+    /// hot_min_relays relays hot: step 4a would promote a warm relay at the
+    /// next tick, one more than the hot count was, and step 5 would then
+    /// demote a peer again. So churn leaves the hot count and the count of
+    /// hot relays as they were.
     fn churn_hot(&mut self, actions: &mut GovernorActions) {
         let (hot, _, _, _) = self.counts();
         if hot <= self.targets.hot_min {
@@ -996,11 +1072,19 @@ impl Governor {
         }
 
         // Pick a random non-trusted hot peer to demote: a trusted peer and
-        // a swarm peer are exempt (network-protocol.md §5.4, step 6).
+        // a swarm peer are exempt (network-protocol.md §5.4, step 6), and
+        // so is a relay while no more than hot_min_relays relays are hot.
+        let hot_relays = self
+            .peers
+            .values()
+            .filter(|p| p.state == PeerState::Hot && p.is_relay)
+            .count();
+        let relay_spared = hot_relays <= self.targets.hot_min_relays;
         let hot_peers: Vec<NodeId> = self
             .peers
             .values()
             .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
+            .filter(|p| !(relay_spared && p.is_relay))
             .map(|p| p.node_id.clone())
             .collect();
 
@@ -1008,11 +1092,20 @@ impl Governor {
             return;
         }
 
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as usize;
-        let victim = &hot_peers[seed % hot_peers.len()];
+        // The warm peers that may take its place, among which the choice
+        // is random (anti-eclipse, §5.4 step 4). A trusted one may.
+        let warm_peers: Vec<NodeId> = self
+            .peers
+            .values()
+            .filter(|p| self.may_be_made_hot(p) && Self::has_warm_tenure(p))
+            .map(|p| p.node_id.clone())
+            .collect();
+
+        if warm_peers.is_empty() {
+            return;
+        }
+
+        let victim = &hot_peers[self.random_index(hot_peers.len())];
         if let Some(peer) = self.peers.get_mut(victim) {
             tracing::info!(peer = %victim, "gov: churn hot -> warm");
             peer.set_state(PeerState::Warm);
@@ -1021,6 +1114,13 @@ impl Governor {
                 .transitions
                 .push((victim.clone(), "hot".into(), "warm".into()));
         }
+
+        let promoted = &warm_peers[self.random_index(warm_peers.len())];
+        if let Some(peer) = self.peers.get_mut(promoted) {
+            tracing::info!(peer = %promoted, "gov: churn warm -> hot");
+            peer.disconnect_count = 0;
+        }
+        self.transition_peer(promoted, PeerState::Hot, actions, "warm", "hot");
     }
 
     fn evict_excess_cold(&mut self, _actions: &mut GovernorActions) {
@@ -1507,8 +1607,11 @@ mod tests {
         );
     }
 
+    /// Hot churn demotes no hot peer where no warm peer may take its place
+    /// (network-protocol.md §5.4 step 6): four peers are hot, above
+    /// hot_min, and none is warm. After a churn all four are still hot.
     #[test]
-    fn test_tick_hot_churn_demotes_one_hot() {
+    fn test_churn_hot_demotes_none_where_no_warm_peer_may_take_its_place() {
         let targets = GovernorTargets {
             hot_min: 2,
             hot_max: 5,
@@ -1535,23 +1638,8 @@ mod tests {
         gov.last_churn = Instant::now() - Duration::from_secs(3700);
         let actions = gov.tick();
 
-        let (hot_after, warm_after, _, _) = gov.counts();
-        // Hot churn should demote 1 (hot > hot_min)
-        assert!(
-            hot_after <= 3,
-            "hot churn should demote at least 1 hot peer, got hot={hot_after}"
-        );
-        assert!(
-            warm_after >= 1,
-            "demoted hot peer should be warm, got warm={warm_after}"
-        );
-        // Verify transition was recorded
-        let hot_to_warm = actions
-            .transitions
-            .iter()
-            .filter(|(_, from, to)| from == "hot" && to == "warm")
-            .count();
-        assert!(hot_to_warm >= 1, "should record hot->warm transition");
+        assert_eq!(gov.counts(), (4, 0, 0, 0), "{:?}", actions.transitions);
+        assert!(actions.transitions.is_empty(), "{:?}", actions.transitions);
     }
 
     #[test]
@@ -2120,42 +2208,41 @@ mod tests {
 
     /// Hot churn demotes no trusted peer (network-protocol.md §5.4, step
     /// 6): neither one of the trusted peers that a swarm node dials alone,
-    /// nor a swarm member. With one of each hot beside a peer that is
-    /// neither, churn after churn demotes only that one.
+    /// nor a swarm member. With one of each hot beside two peers that are
+    /// neither, and a warm peer that may take a place, churn after churn
+    /// demotes only peers that are neither. Each round the warm peers are
+    /// aged past the tenure and the hysteresis, so that every churn swaps.
     #[test]
     fn test_churn_hot_demotes_no_trusted_peer() {
-        let targets = GovernorTargets {
-            hot_min: 1,
-            hot_max: 3,
-            hot_min_relays: 0,
-            warm_min: 0,
-            warm_max: 10,
-            cold_max: 50,
-            churn_interval_secs: 0, // churn every tick
-            churn_jitter_secs: 0,
-            churn_fraction: 0.2,
-        };
-        let (trusted, swarm, other) = (make_node_id(1), make_node_id(2), make_node_id(3));
+        let (trusted, swarm) = (make_node_id(1), make_node_id(2));
+        let others = [make_node_id(3), make_node_id(4), make_node_id(5)];
         let policy = DialPolicy::TrustedOnly(vec![trusted.clone()]);
-        let mut gov = Governor::with_dial_policy(targets, vec![], policy);
-        for id in [&trusted, &swarm, &other] {
-            gov.add_peer(id.clone(), vec![], vec![]);
-            gov.peers.get_mut(id).unwrap().state = PeerState::Hot;
+        let mut gov = Governor::with_dial_policy(hot_churn_targets(), vec![], policy);
+        for id in [&trusted, &swarm, &others[0], &others[1]] {
+            set_hot(&mut gov, id);
         }
         gov.set_peer_swarm(&swarm);
+        set_warm_long(&mut gov, &others[2]);
         let mut demoted = Vec::new();
-        for _ in 0..10 {
-            gov.last_churn = Instant::now() - Duration::from_secs(1);
-            let actions = gov.tick();
-            demoted.extend(
-                actions
-                    .transitions
-                    .into_iter()
-                    .filter(|(_, from, to)| from == "hot" && to == "warm")
-                    .map(|(id, _, _)| id),
+        for _ in 0..20 {
+            let transitions = churn_once(&mut gov);
+            assert_eq!(
+                moved(&transitions, "warm", "hot").len(),
+                1,
+                "{transitions:?}"
             );
+            demoted.extend(moved(&transitions, "hot", "warm"));
+            let warm: Vec<NodeId> = gov
+                .all_peers()
+                .filter(|p| p.state == PeerState::Warm)
+                .map(|p| p.node_id.clone())
+                .collect();
+            for id in &warm {
+                set_warm_long(&mut gov, id);
+            }
         }
-        assert_eq!(demoted, std::slice::from_ref(&other));
+        assert_eq!(demoted.len(), 20);
+        assert!(demoted.iter().all(|id| others.contains(id)), "{demoted:?}");
         assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Hot));
         assert_eq!(gov.peer_state(&swarm), Some(&PeerState::Hot));
     }
@@ -2225,6 +2312,443 @@ mod tests {
         for id in &others {
             assert_eq!(gov.peer_state(id), Some(&PeerState::Warm), "{id}");
         }
+    }
+
+    /// Targets for the tests of hot churn: churn at every tick, room for
+    /// four hot peers, and no step of the tick but churn that moves one.
+    fn hot_churn_targets() -> GovernorTargets {
+        GovernorTargets {
+            hot_min: 1,
+            hot_max: 4,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max: 10,
+            cold_max: 50,
+            churn_interval_secs: 0, // churn every tick
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+        }
+    }
+
+    /// Make a peer hot, as a test sets one up.
+    fn set_hot(gov: &mut Governor, id: &NodeId) {
+        if !gov.peers.contains_key(id) {
+            gov.add_peer(id.clone(), vec![], vec![]);
+        }
+        gov.peers.get_mut(id).unwrap().set_state(PeerState::Hot);
+    }
+
+    /// Make a peer warm for longer than the warm tenure, and not demoted
+    /// lately: one that step 4 may make hot.
+    fn set_warm_long(gov: &mut Governor, id: &NodeId) {
+        if !gov.peers.contains_key(id) {
+            gov.add_peer(id.clone(), vec![], vec![]);
+        }
+        let peer = gov.peers.get_mut(id).unwrap();
+        peer.set_state(PeerState::Warm);
+        peer.state_changed_at =
+            Instant::now() - Duration::from_secs(protocol::MIN_WARM_TENURE_SECS + 1);
+        peer.demoted_at = None;
+    }
+
+    /// Run one churn, by a tick, and give its transitions.
+    fn churn_once(gov: &mut Governor) -> Vec<(NodeId, String, String)> {
+        gov.last_churn = Instant::now() - Duration::from_secs(1);
+        gov.tick().transitions
+    }
+
+    /// The peers that moved from one state to another in a churn.
+    fn moved(transitions: &[(NodeId, String, String)], from: &str, to: &str) -> Vec<NodeId> {
+        transitions
+            .iter()
+            .filter(|(_, f, t)| f == from && t == to)
+            .map(|(id, _, _)| id.clone())
+            .collect()
+    }
+
+    /// Hot churn moves one hot peer to warm and one warm peer to hot
+    /// (network-protocol.md §5.4 step 6): three peers are hot, above
+    /// hot_min, and a fourth has been warm past its tenure. After one
+    /// churn three are still hot, one of the three is warm, and the fourth
+    /// is hot in its place.
+    #[test]
+    fn test_churn_hot_promotes_a_warm_peer_in_the_place_of_the_one_it_demotes() {
+        let mut gov = Governor::new(hot_churn_targets(), vec![]);
+        let hot: Vec<NodeId> = (1..=3u8).map(make_node_id).collect();
+        for id in &hot {
+            set_hot(&mut gov, id);
+        }
+        let warm = make_node_id(4);
+        set_warm_long(&mut gov, &warm);
+
+        let transitions = churn_once(&mut gov);
+
+        assert_eq!(
+            gov.counts().0,
+            3,
+            "the hot count is what it was: {transitions:?}"
+        );
+        let demoted = moved(&transitions, "hot", "warm");
+        assert_eq!(demoted.len(), 1, "{transitions:?}");
+        assert!(hot.contains(&demoted[0]), "{transitions:?}");
+        assert_eq!(gov.peer_state(&demoted[0]), Some(&PeerState::Warm));
+        assert_eq!(moved(&transitions, "warm", "hot"), vec![warm.clone()]);
+        assert_eq!(gov.peer_state(&warm), Some(&PeerState::Hot));
+    }
+
+    /// Hot churn never leaves fewer hot relays than hot_min_relays
+    /// (network-protocol.md §5.4 steps 4a and 6): one relay and two other
+    /// peers are hot, at hot_max, and a peer that is not a relay has been
+    /// warm past its tenure. After a churn and through the five ticks
+    /// after it, one relay and three peers are hot, and no peer is
+    /// promoted and demoted in one tick. Made so again sixty times.
+    #[test]
+    fn test_churn_hot_leaves_hot_relays_and_the_hot_count_as_they_were() {
+        let targets = GovernorTargets {
+            hot_min: 1,
+            hot_max: 3,
+            hot_min_relays: 1,
+            churn_interval_secs: 3600,
+            ..hot_churn_targets()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+        let relay = make_node_id(1);
+        let others = [make_node_id(2), make_node_id(3)];
+        let warm = make_node_id(4);
+        gov.add_peer(relay.clone(), vec![], vec![]);
+        gov.set_peer_relay(&relay, true);
+        for _ in 0..60 {
+            for id in std::iter::once(&relay).chain(&others) {
+                set_hot(&mut gov, id);
+            }
+            set_warm_long(&mut gov, &warm);
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            for tick in 0..6 {
+                let transitions = gov.tick().transitions;
+                let up = moved(&transitions, "warm", "hot");
+                let down = moved(&transitions, "hot", "warm");
+                let hot_relays = gov
+                    .all_peers()
+                    .filter(|p| p.state == PeerState::Hot && p.is_relay)
+                    .count();
+                assert_eq!(hot_relays, 1, "tick {tick}: {transitions:?}");
+                assert_eq!(gov.counts().0, 3, "tick {tick}: {transitions:?}");
+                assert!(
+                    up.iter().all(|id| !down.contains(id)),
+                    "tick {tick}: {transitions:?}"
+                );
+                if tick == 0 {
+                    assert_eq!(up.len(), 1, "the churn swapped: {transitions:?}");
+                }
+            }
+        }
+    }
+
+    /// A clock that counts in microseconds: each reading is a microsecond
+    /// on from the last, so its nanoseconds are always a multiple of 1000.
+    fn microsecond_clock() -> u128 {
+        static READINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = READINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        1_790_000_000_000_000_000 + u128::from(n) * 1000
+    }
+
+    /// The hot peer that hot churn demotes is random on a clock that
+    /// counts in microseconds: two peers are hot and one warm, made so
+    /// again after each churn, and over forty churns each of the two is
+    /// demoted.
+    #[test]
+    fn test_churn_hot_demotes_a_random_hot_peer_on_a_microsecond_clock() {
+        let mut gov = Governor::new(hot_churn_targets(), vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let hot: Vec<NodeId> = (1..=2u8).map(make_node_id).collect();
+        let warm = make_node_id(3);
+        let mut demoted = std::collections::HashSet::new();
+        for _ in 0..40 {
+            for id in &hot {
+                set_hot(&mut gov, id);
+            }
+            set_warm_long(&mut gov, &warm);
+            let transitions = churn_once(&mut gov);
+            let down = moved(&transitions, "hot", "warm");
+            assert_eq!(down.len(), 1, "{transitions:?}");
+            demoted.insert(down[0].clone());
+        }
+        assert_eq!(demoted.len(), 2, "always {demoted:?}");
+    }
+
+    /// The warm peer that step 4 promotes is random on a clock that counts
+    /// in microseconds (anti-eclipse, network-protocol.md §5.4 step 4): no
+    /// peer is hot, hot_min is one, and five are warm, made so again after
+    /// each tick. Over forty ticks more than one of the five is promoted.
+    #[test]
+    fn test_step_4_promotes_a_random_warm_peer_on_a_microsecond_clock() {
+        let targets = GovernorTargets {
+            churn_interval_secs: 99999,
+            ..hot_churn_targets()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let warm: Vec<NodeId> = (1..=5u8).map(make_node_id).collect();
+        let mut promoted = std::collections::HashSet::new();
+        for _ in 0..40 {
+            for id in &warm {
+                set_warm_long(&mut gov, id);
+            }
+            let transitions = gov.tick().transitions;
+            let up = moved(&transitions, "warm", "hot");
+            assert_eq!(up.len(), 1, "{transitions:?}");
+            promoted.insert(up[0].clone());
+        }
+        assert!(promoted.len() > 1, "always {promoted:?}");
+    }
+
+    /// The churn's jitter is random on a clock that counts in
+    /// microseconds, and drawn once for each churn: the interval is 100
+    /// seconds, the jitter up to 1000, and the last churn 600 seconds ago,
+    /// so a churn is due at once with a jitter below 500 and not for some
+    /// time with one above. A new governor ticks twenty times, forty
+    /// times over: a churn runs at the first tick or at none, and over
+    /// the forty both happen.
+    #[test]
+    fn test_churn_jitter_is_random_on_a_microsecond_clock() {
+        let targets = GovernorTargets {
+            churn_interval_secs: 100,
+            churn_jitter_secs: 1000,
+            ..hot_churn_targets()
+        };
+        let mut first = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let mut gov = Governor::new(targets.clone(), vec![]);
+            gov.clock_nanos = microsecond_clock;
+            gov.last_churn = Instant::now() - Duration::from_secs(600);
+            let mut churned_at = Vec::new();
+            for tick in 0..20 {
+                let before = gov.last_churn;
+                gov.tick();
+                if gov.last_churn != before {
+                    churned_at.push(tick);
+                }
+            }
+            assert!(
+                churned_at.is_empty() || churned_at == [0],
+                "the jitter was drawn again: churns at ticks {churned_at:?}"
+            );
+            first.insert(churned_at.is_empty());
+        }
+        assert_eq!(first.len(), 2, "a churn ran every time or never: {first:?}");
+    }
+
+    /// The warm relay that step 4a promotes is random on a clock that
+    /// counts in microseconds (network-protocol.md §5.4 step 4a): one peer
+    /// that is not a relay is hot, at hot_min, and five relays are warm,
+    /// made so again after each tick. Over forty ticks more than one of
+    /// the five is promoted.
+    #[test]
+    fn test_step_4a_promotes_a_random_warm_relay_on_a_microsecond_clock() {
+        let targets = GovernorTargets {
+            hot_min_relays: 1,
+            churn_interval_secs: 99999,
+            ..hot_churn_targets()
+        };
+        let mut gov = Governor::new(targets, vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let hot = make_node_id(1);
+        let relays: Vec<NodeId> = (2..=6u8).map(make_node_id).collect();
+        for id in &relays {
+            gov.add_peer(id.clone(), vec![], vec![]);
+            gov.set_peer_relay(id, true);
+        }
+        let mut promoted = std::collections::HashSet::new();
+        for _ in 0..40 {
+            set_hot(&mut gov, &hot);
+            for id in &relays {
+                set_warm_long(&mut gov, id);
+            }
+            let transitions = gov.tick().transitions;
+            let up = moved(&transitions, "warm", "hot");
+            assert_eq!(up.len(), 1, "{transitions:?}");
+            assert!(relays.contains(&up[0]), "{transitions:?}");
+            promoted.insert(up[0].clone());
+        }
+        assert!(promoted.len() > 1, "always {promoted:?}");
+    }
+
+    /// Targets for the tests of warm churn: no hot peer is wanted, so only
+    /// warm churn moves a peer, and a churn is due when a test says.
+    fn warm_churn_targets(warm_max: usize) -> GovernorTargets {
+        GovernorTargets {
+            hot_min: 0,
+            hot_max: 0,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max,
+            cold_max: 50,
+            churn_interval_secs: 3600,
+            churn_jitter_secs: 0,
+            churn_fraction: 0.2,
+        }
+    }
+
+    /// Make a peer cold, as a test sets one up.
+    fn set_cold(gov: &mut Governor, id: &NodeId) {
+        if !gov.peers.contains_key(id) {
+            gov.add_peer(id.clone(), vec![], vec![]);
+        }
+        gov.peers.get_mut(id).unwrap().set_state(PeerState::Cold);
+    }
+
+    /// The warm peer that warm churn closes is random on a clock that
+    /// counts in microseconds (network-protocol.md §5.4 step 7): five
+    /// peers are warm and one cold, made so again after each churn, and a
+    /// fifth of the five is one. Over forty churns more than one of the
+    /// five is closed.
+    #[test]
+    fn test_churn_warm_closes_a_random_warm_peer_on_a_microsecond_clock() {
+        let mut gov = Governor::new(warm_churn_targets(5), vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let warm: Vec<NodeId> = (1..=5u8).map(make_node_id).collect();
+        let cold = make_node_id(6);
+        let mut closed = std::collections::HashSet::new();
+        for _ in 0..40 {
+            for id in &warm {
+                set_warm_long(&mut gov, id);
+            }
+            set_cold(&mut gov, &cold);
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            let disconnect = gov.tick().disconnect;
+            assert_eq!(disconnect.len(), 1, "{disconnect:?}");
+            assert!(warm.contains(&disconnect[0]), "{disconnect:?}");
+            closed.insert(disconnect[0].clone());
+        }
+        assert!(closed.len() > 1, "always {closed:?}");
+    }
+
+    /// The cold peer that warm churn dials in the place of the one it
+    /// closes is random on a clock that counts in microseconds
+    /// (network-protocol.md §5.4 step 7): one peer is warm and five cold,
+    /// made so again after each churn. Over forty churns more than one
+    /// peer is dialled.
+    #[test]
+    fn test_churn_warm_dials_a_random_cold_peer_on_a_microsecond_clock() {
+        let mut gov = Governor::new(warm_churn_targets(1), vec![]);
+        gov.clock_nanos = microsecond_clock;
+        let warm = make_node_id(1);
+        let cold: Vec<NodeId> = (2..=6u8).map(make_node_id).collect();
+        let mut dialled = std::collections::HashSet::new();
+        for _ in 0..40 {
+            set_warm_long(&mut gov, &warm);
+            for id in &cold {
+                set_cold(&mut gov, id);
+            }
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            let actions = gov.tick();
+            assert_eq!(actions.disconnect, vec![warm.clone()]);
+            assert_eq!(actions.connect.len(), 1, "{:?}", actions.connect);
+            dialled.insert(actions.connect[0].clone());
+        }
+        assert!(dialled.len() > 1, "always {dialled:?}");
+    }
+
+    /// Three peers hot, above hot_min, and one warm peer that churn may
+    /// not promote, set up by `make_ineligible`. A churn then moves no
+    /// peer: the warm one is not promoted, and so none is demoted.
+    fn assert_churn_hot_passes_over(make_ineligible: impl Fn(&mut PeerInfo)) {
+        let mut gov = Governor::new(hot_churn_targets(), vec![]);
+        for i in 1..=3u8 {
+            set_hot(&mut gov, &make_node_id(i));
+        }
+        let warm = make_node_id(4);
+        set_warm_long(&mut gov, &warm);
+        make_ineligible(gov.peers.get_mut(&warm).unwrap());
+
+        let transitions = churn_once(&mut gov);
+
+        assert!(transitions.is_empty(), "{transitions:?}");
+        assert_eq!(gov.peer_state(&warm), Some(&PeerState::Warm));
+        assert_eq!(gov.counts().0, 3);
+    }
+
+    /// The peer that hot churn promotes has been warm for
+    /// `min_warm_tenure_secs` (network-protocol.md §5.4 steps 4 and 6):
+    /// one warm for less is passed over.
+    #[test]
+    fn test_churn_hot_promotes_no_peer_warm_for_less_than_its_tenure() {
+        assert_churn_hot_passes_over(|p| {
+            p.state_changed_at = Instant::now()
+                - Duration::from_secs(protocol::MIN_WARM_TENURE_SECS)
+                + Duration::from_secs(30);
+        });
+    }
+
+    /// The peer that hot churn promotes was not demoted within the
+    /// hysteresis (network-protocol.md §5.4 steps 4 and 6): one warm past
+    /// its tenure but demoted lately is passed over.
+    #[test]
+    fn test_churn_hot_promotes_no_peer_demoted_lately() {
+        assert_churn_hot_passes_over(|p| {
+            p.demoted_at = Some(Instant::now() - Duration::from_secs(10));
+        });
+    }
+
+    /// Hot churn promotes no bootnode, as step 4 does not (network-protocol.md
+    /// §8.3): a bootnode is for discovery alone.
+    #[test]
+    fn test_churn_hot_promotes_no_bootnode() {
+        assert_churn_hot_passes_over(|p| p.is_bootnode = true);
+    }
+
+    /// Hot churn promotes no swarm member that is warm, as step 4 does
+    /// not: a swarm member is made hot when it is verified, and is not
+    /// counted against hot_max, so it would take the place of no peer.
+    #[test]
+    fn test_churn_hot_promotes_no_swarm_member() {
+        assert_churn_hot_passes_over(|p| p.is_swarm = true);
+    }
+
+    /// A trusted peer that is warm may be the one hot churn promotes
+    /// (network-protocol.md §5.3.1: always eligible for promotion).
+    #[test]
+    fn test_churn_hot_may_promote_a_trusted_peer() {
+        let trusted = make_node_id(4);
+        let policy = DialPolicy::TrustedOnly(vec![trusted.clone()]);
+        let mut gov = Governor::with_dial_policy(hot_churn_targets(), vec![], policy);
+        for i in 1..=3u8 {
+            set_hot(&mut gov, &make_node_id(i));
+        }
+        set_warm_long(&mut gov, &trusted);
+
+        let transitions = churn_once(&mut gov);
+
+        assert_eq!(moved(&transitions, "warm", "hot"), vec![trusted.clone()]);
+        assert_eq!(gov.peer_state(&trusted), Some(&PeerState::Hot));
+        assert_eq!(gov.counts().0, 3);
+    }
+
+    /// The peer that hot churn promotes is chosen at random among those
+    /// that may be (anti-eclipse, network-protocol.md §5.4 step 4), not
+    /// the first or the best scored. Two peers are hot and six warm, and
+    /// after each churn the same two are made hot and the same six warm
+    /// again: over forty churns more than one of the six is promoted.
+    #[test]
+    fn test_churn_hot_promotes_a_random_warm_peer() {
+        let mut gov = Governor::new(hot_churn_targets(), vec![]);
+        let hot: Vec<NodeId> = (1..=2u8).map(make_node_id).collect();
+        let warm: Vec<NodeId> = (3..=8u8).map(make_node_id).collect();
+        let mut promoted = std::collections::HashSet::new();
+        for _ in 0..40 {
+            for id in &hot {
+                set_hot(&mut gov, id);
+            }
+            for id in &warm {
+                set_warm_long(&mut gov, id);
+            }
+            let transitions = churn_once(&mut gov);
+            let up = moved(&transitions, "warm", "hot");
+            assert_eq!(up.len(), 1, "{transitions:?}");
+            assert!(warm.contains(&up[0]), "{transitions:?}");
+            promoted.insert(up[0].clone());
+        }
+        assert!(promoted.len() > 1, "always {promoted:?}");
     }
 
     #[test]

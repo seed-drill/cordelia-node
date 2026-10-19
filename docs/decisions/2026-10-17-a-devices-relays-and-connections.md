@@ -116,6 +116,6 @@ A trusted peer is never demoted and never evicted by churn, as `network-protocol
 
 **Why.** The governor picked from every hot peer in hot churn, and from every warm peer in warm churn, against the spec. Its demotion spared swarm members alone. A swarm member is meant to be always hot.
 
-**What does not change.** A personal node's relays are kept through churn as §2 says. A node with no trusted peer churns and demotes as before. Hot churn still promotes no warm peer in the place of the one it demotes, though §5.4 step 6 says it should: that is not changed here.
+**What does not change.** A personal node's relays are kept through churn as §2 says. A node with no trusted peer churns and demotes as before. Hot churn still promoted no warm peer in the place of the one it demoted, though §5.4 step 6 says it should: that was not changed here. It has been since: hot churn now promotes a warm peer in the place of the one it demotes, and demotes none where no warm peer may take its place (`network-protocol.md` §5.4 step 6).
 
-**The tests that hold it.** `crates/cordelia-network/src/governor.rs`: `test_churn_hot_demotes_no_trusted_peer` (a trusted peer, a swarm member and a third are hot; churn after churn demotes only the third), `test_churn_warm_closes_no_trusted_peer`, and `test_excess_hot_demotes_no_trusted_peer`.
+**The tests that hold it.** `crates/cordelia-network/src/governor.rs`: `test_churn_hot_demotes_no_trusted_peer` (a trusted peer, a swarm member and two others are hot, and one more is warm; churn after churn demotes only the others), `test_churn_warm_closes_no_trusted_peer`, and `test_excess_hot_demotes_no_trusted_peer`.
