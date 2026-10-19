@@ -1,4 +1,4 @@
-# Decision: a line on the personal channel, below a relay's room
+# Decision: a warning before the personal channel fills a relay's room
 
 **Date**: 2026-10-19
 **Status**: Proposed. Not built.
@@ -8,9 +8,8 @@ Words used throughout:
 
 - **The record of 2026-10-04** is [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md), and **the record of 2026-10-17** is [`2026-10-17-recovery-and-carrying.md`](2026-10-17-recovery-and-carrying.md).
 - **A word** is an entry that a device writes in the personal channel under `name/` and a name: a text where it syncs the name, a delete where it has stopped (the record of 2026-10-04, §2.2 and §16).
-- **A new word** is a word in a slot where this device has no entry of its own yet. Writing in a slot where it has one, a text or a delete, is **a rewrite**.
 - **The cap** is what one channel may hold at a relay, `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 16 MiB (16,777,216 bytes), counted as entries are counted (`entry_cost`: the content and 1,024 more).
-- **The channel's total, as this device reads it,** is the sum of `entry_cost` over every entry that this device's store holds of the personal channel of the statement it has applied: every author's, deletes included, its own that wait to be sent included.
+- **The channel's total** is the sum of `entry_cost` over every entry that this device's store holds of the personal channel of the statement it has applied: every author's, deletes included, its own that wait to be sent included.
 - **Alpha.12** is the release 0.2.0-alpha.12, and **this version** is the version of the node that first carries what is below.
 - Examples say laptop and desktop.
 
@@ -18,17 +17,32 @@ Words used throughout:
 
 ## 0. What this is
 
-The personal channel can outgrow what a relay holds of one channel. Each device writes one word for each name it syncs, and a relay counts each word at 1,280 bytes. 64 devices with 256 names each write 20 MiB against a cap of 16 MiB, and the relay refuses the last quarter. Nothing bounds the names today.
+The personal channel can outgrow what a relay holds of one channel. Each device writes one word for each name it syncs, and a relay counts each word at 1,280 bytes. 64 devices with 256 names each write 20 MiB against a cap of 16 MiB, and the relay refuses the last quarter. Nothing bounds the names.
 
-The exposure is small: the channel overflows near 50 devices at 256 names each, or 4 devices at 3,274 names each. So this record makes the least change that makes the record true and never stops a person in ordinary use. **A device writes no new word where it would take the channel's total, as the device reads it, past a line 1 MiB below the cap** (15 MiB, some 12,000 words between all the person's devices). The mebibyte below the cap is kept for what must always fit. A rewrite is never refused. Nothing on the wire changes, and no relay changes.
+The exposure is small: the channel fills near 50 devices at 256 names each, or 4 devices at 3,274 names each. Each refusal added to the paths that write words (a map, the sync cycle, joining, a recovery, a statement) brought faults of its own (§8). So this record refuses nothing. It changes three things:
+
+1. **A warning.** The status turns amber where the channel's total passes a line 4 MiB below the cap. The words say what fills it and what helps.
+2. **A true line for a refusal.** `cordelia devices` no longer says that a refused entry was for a new channel at a full relay.
+3. **A stated limit.** Nothing stops a new name. Past the cap the relay refuses what grows the channel, and the record says what a person then sees and can do.
+
+Nothing on the wire changes, and no relay changes.
 
 ## 1. What the code does today
 
-**A word is one entry for each device and each name it lists.** Its slot is the HMAC of `name/` and the name (`names::word_name`, `crates/cordelia-api/src/names.rs:77`), and the slot holds no key: every device that syncs a name writes in the same slot, each as its own author. Several folders mapped to one name on one device are one word. Every new word goes through one function, `names::say` (`names.rs:148`). It is called by `sync_name` (a map, through `/api/v1/sync/map`, which needs the node running), by `hold_mapped` (when the device comes to follow a phrase, `leaving.rs:337`; is accepted, `adding.rs:714`; or turns sync on, `sync.rs:507`), by `held_after_its_folder`, and by `hold_for_a_carry` (a carry, and a recovery at `recover.rs:1094`). At a statement a device carries its own words into the new channel by another path (`person.rs:1541`, `is_its_word_to_carry`), deletes included.
+**A word is one entry for each device and each name it lists.** Its slot is the HMAC of `name/` and the name (`names::word_name`, `crates/cordelia-api/src/names.rs:77`). The slot holds no key: every device that syncs a name writes in the same slot, each as its own author. Several folders mapped to one name on one device are one word.
 
-**A word is always counted at 1,280 bytes.** It says the name's length (2 bytes), `name/` and a name of at most 200 bytes (`sync::valid_sync_name`, `crates/cordelia-api/src/sync.rs:220`), the value's kind (1), an empty text's length (2) and an empty chain (2): at most 212 bytes, 240 with the nonce and the tag (`protocol.rs:330`). The content is padded to a power of two from 256 (`crates/cordelia-crypto/src/entry.rs:615`, `protocol.rs:950`), so every word, and every delete of one, is 256 bytes, and counted at 256 + 1,024 (`protocol.rs:341`, `entry_cost` at 347).
+**Where a word is written.** Every new word goes through `names::say` (`names.rs:148`):
 
-**The channel grows with names, not with changes.** A relay keeps the newest revision for each author in each slot, and a write that makes a channel hold no more is always taken (`crates/cordelia-storage/src/relay.rs:548` to `579`). A delete stays at the same size. A relay sweeps a slot only where every entry in it is a delete it has held 90 days, and a device sweeps the personal channel the same way: so a device's delete of a name stays for as long as any other device syncs that name, and 90 days after.
+- each sync cycle, for every mapped folder (`name_channel`, `crates/cordelia-sync/src/claude.rs:897`);
+- a map: the route stores the mapping (`sync.rs:1023`), then `names_follow` calls `hold_mapped` (`sync.rs:507`);
+- when a device comes to follow a phrase (`leaving.rs:337`) or is accepted (`adding.rs:714`), through `hold_mapped`, in the transaction that gives it the secret, before it has read the channel;
+- a carry, and a recovery (`hold_for_a_carry`, `recover.rs:1094`).
+
+At a statement a device carries its own words, deletes included, into the new channel by another path (`Carry::channel`, `person.rs:1541`), each stored at the time of the carry.
+
+**A word is always counted at 1,280 bytes.** It says the name's length (2 bytes), `name/` and a name of at most 200 bytes (`sync::valid_sync_name`, `crates/cordelia-api/src/sync.rs:220`), the value's kind (1), an empty text's length (2) and an empty chain (2): at most 212 bytes, 240 with the nonce and the tag (`protocol.rs:330`). The content is padded to a power of two from 256 (`crates/cordelia-crypto/src/entry.rs:615`, `protocol.rs:950`), so every word, and every delete of one, is 256 bytes, counted at 256 + 1,024 (`protocol.rs:341`, `entry_cost` at 347).
+
+**The channel grows with names, not with changes.** A relay keeps the newest revision for each author in each slot, and a write that makes a channel hold no more is always taken (`crates/cordelia-storage/src/relay.rs:548` to `579`). A delete keeps its size. A relay sweeps a slot only where every entry in it is a delete it has held 90 days, and a device sweeps the personal channel the same way. So a stopped name stays counted while any device syncs it, and for 90 days after. A statement re-stores each device's own deletes at the time of the carry, so their 90 days start again.
 
 **What else is written there, each as a relay counts it:**
 
@@ -43,111 +57,145 @@ Messages are in a channel of their own (asserted within the cap at `protocol.rs:
 
 D × N × 1,280 + D × 1,280 + (D − 1) × 1,536 ≤ 16,777,216
 
-**The limits at which the personal channel reaches the cap:**
+**The limits at which the personal channel reaches the cap, and the warning:**
 
-| Devices | Most names each that fit |
-|---|---|
-| 1 | 13,106 |
-| 4 | 3,274 |
-| 8 | 1,636 |
-| 16 | 817 |
-| 32 | 407 |
-| 50 | 259 |
-| 51 | 254 |
-| 64 | 202 |
+| Devices | Most names each that fit | Names each at the warning |
+|---|---|---|
+| 1 | 13,106 | 9,829 |
+| 4 | 3,274 | 2,455 |
+| 8 | 1,636 | 1,226 |
+| 16 | 817 | 612 |
+| 32 | 407 | 305 |
+| 50 | 259 | 194 |
+| 64 | 202 | 151 |
 
-A throwaway test against the relay's own store took 13,107 of the 16,448 entries that 64 devices write (each one's `applied/` word and 256 words), and refused from the 51st device's 244th word on. A delete over a word it held was still taken.
+A throwaway test against the relay's own store took 13,107 of the 16,448 entries that 64 devices write (each one's `applied/` word first, then 256 words each), and refused from the 51st device's 244th word on. A delete over a word it held was still taken.
 
-**Nothing bounds the names.** The record of 2026-10-04 sizes a request count for "a device with 256 names" (§16), which is a sizing assumption. A recovery carries 1,024 names at most (`RECOVERY_MAX_NAMES`).
+**Nothing bounds the names.** The record of 2026-10-04 bounds devices (64) and removed keys (256). Its request count is "sized for a device with 256 names" (§16), which is a sizing, not a bound. A recovery carries 1,024 names at most (`RECOVERY_MAX_NAMES`).
 
 **What happens today when a relay refuses an entry of the personal channel for room.**
 
-- The wire has one answer, `NoRoom`, for a relay that is full and a channel at its cap (`crates/cordelia-network/src/messages.rs:796`).
+- The wire has one answer, `NoRoom`, for a relay that is full and for a channel at its cap (`crates/cordelia-network/src/messages.rs:796`).
 - The device keeps the entry, offers it again after a wait that doubles up to ten minutes, and goes on past it (`at_relays.rs:1150`; `device_entries.rs:2315` to `2340`).
 - On a device that syncs a folder the status is amber, "memory: a relay has no room", for as long as it offers the entry again (`indicator.rs:479`, `NO_ROOM_STANDS_SECS`).
-- `cordelia devices` says "<relay> had no room for a new channel at <time> (it is full)" (`look.rs:1388`). Here both halves are wrong: the channel is not new, and the relay is not full.
-- `cordelia sync map` says nothing of it.
-- At the cap a relay refuses every entry that makes the channel larger: a new word, a device's first `applied/` word under a statement, a `left/` word, a record of an addition. A rewrite no larger is taken. So other devices do not see the name, a device's leave, or a device added since: the added device counts on no other device that reads at that relay (the record of 2026-10-17, §7). A recovery does not find a name whose every word was refused.
+- `cordelia devices` says "<relay> had no room for a new channel at <time> (it is full)" (`look.rs:1388`). For the personal channel both halves are wrong: the channel is not new, and the relay need not be full.
 
 ## 2. The rules
 
-1. **A device writes no new word that would take the channel's total, as it reads it, past the line** (`PERSONAL_NAMES_LINE_BYTES`, 15 MiB). The check is in `names::say`, so it holds for a map, for `hold_mapped`, for a carry and for a recovery.
-2. **A rewrite is never refused,** whatever the total: a name stopped and synced again, and a delete over a word. It takes no more room at a relay.
-3. **Nothing else a device writes in the personal channel is held to the line:** a word that it applied a statement, a word that it left, a record of an addition, and what it carries at a statement. These use the mebibyte kept below the cap. A statement's carry adds nothing that was not in the old channel: each device carries only its own entries, one for each slot it wrote, and records, `applied/` words and the removed devices' words are not carried. So the new channel holds no more than the old one did.
-4. **`cordelia sync map` refuses a new name at the line, and maps nothing.** It says:
-   > You can't sync another name. Your devices already list as many synced names as Cordelia can carry for you, counting names you stopped syncing lately. Nothing was mapped.
-   > To make room, stop syncing names you no longer need, on every device that syncs them. Each one's room comes back 90 days after the last device stops syncing it. Removing a device you no longer use frees its names at once.
-5. **`hold_mapped` lists folders in the order they were mapped, up to the line.** A folder past it stays mapped and is not synced. The status says so: "memory: <n> mapped folders are not synced: no room to list more names". `cordelia sync carry` refuses a name past the line with the words of rule 4, and a recovery names a name it could not list among the names it left.
-6. **Near the line the status turns amber,** on every device that syncs a folder, from 14 MiB (`PERSONAL_NAMES_NEAR_BYTES`): "memory: you are close to the most names Cordelia can carry for you".
-7. **What `cordelia devices` says of a refusal for room:** "<relay> had no room for what you sent at <time>: the relay is full, or your channel there is." A refusal of the change entry, and a refusal for the address's allowance, are said as today.
+1. **Each sync cycle sums the channel's total once,** at its end, and keeps it in the cycle's report (`CycleReport`): the total, the part that is words, and the author with the most bytes that are not words, with that author's bytes. It is one sum over the personal channel's rows, by channel. A second review measured such a sum at 20 to 30 ms, warm, over 16,448 rows beside 200,000 others. `/api/v1/sync/status` returns the report as it does today, and `cordelia status` reads it there. Nothing is summed on a status call, so the status keeps its time.
+2. **The status turns amber where the total passes the line,** `PERSONAL_CHANNEL_WARN_BYTES`, 12 MiB, on a device that syncs a folder, as the other memory lines do. It stays amber for as long as the last report's total is past the line.
+3. **What the warning says depends on what fills the channel.**
+   - Where words are half the total or more:
+     > memory: your devices sync nearly as many names as a relay can hold for you. Stop syncing names you no longer need, on every device that syncs them. Their room comes back slowly, at least 90 days after the last device stops.
+   - Otherwise, where one device signed more than half of what is not words:
+     > memory: the list your devices share at a relay is nearly full, mostly with entries from <label> (<first four words of its fingerprint>). If that device is not yours, or you no longer use it, remove it: cordelia remove-device.
+   - Otherwise:
+     > memory: the list your devices share at a relay is nearly full. Run cordelia devices to see what is in it.
+4. **`cordelia devices` says what a relay refused for room as either:**
+   > <relay> had no room for what you sent at <time>: the relay is full, or your list there is.
 
-**Why it fits.** Below the line, the mebibyte to the cap holds everything that rule 3 lets through: 64 `applied/` and 64 `left/` words (163,840 bytes) and 320 records of an addition (491,520 bytes), 640 KiB in all. That leaves 384 KiB, 307 words, for what the line does not see (below). 320 records is not a proved bound: it is what a reader counts and keeps (`MAX_COUNTED_DEVICES` and `MAX_NOT_COUNTED_RECORDS`). A person who keeps to the commands adds at most 63 devices under one statement before `add-device` refuses, and 320 is five times that.
+   A refusal of the change entry, and a refusal for the address's allowance, are said as today.
+5. **Nothing refuses a write.** A map, the sync cycle, joining, a carry, a recovery and a statement write as they do today.
 
-**What the line does not bound.** The relay's refusal is then the last guard, and the person sees what §1 says, with the line of rule 7.
+**Why 12 MiB.** The line is the cap less 4 MiB (`PERSONAL_CHANNEL_HEADROOM_BYTES`). The 4 MiB holds what can arrive at once, before a person can act on a warning:
 
-- **Devices that map while apart.** Each reads the total from what it holds. Two devices out of touch can each map up to the line, and together pass it. The 307 words cover a little of that; past them the relay refuses.
-- **A device's own deletes swept before a relay sweeps them.** A device counts a delete from when it stored it, and a relay from when it took it: later where the device was off, where a relay is new to the device or was down, or where a relay took the channel from another. In that gap the device counts less than the relay holds.
-- **Authors that do not count.** A store holds only entries whose signer counts (the record of 2026-10-04, §4.4). A key that holds the secret and does not count (one the 64 kept out) can still write at a relay, and a device that counts, in someone else's hands, can fill the channel with records (the record of 2026-10-17, §7). This record bounds what a person's own devices write, and nothing else.
-- **Alpha.12.** A device of alpha.12 holds to no line. A device of this version counts its words in the total, and refuses new words of its own past the line, but cannot stop it.
+- the entries that are written whatever the total: 64 `applied/` words and 64 `left/` words (163,840 bytes), and 320 records of an addition (491,520 bytes); 640 KiB in all. 320 is what a reader counts and keeps (`MAX_COUNTED_DEVICES` and `MAX_NOT_COUNTED_RECORDS`), not a proved bound;
+- a recovery's names on the new machine: 1,024 words (`RECOVERY_MAX_NAMES`), 1.25 MiB;
+- a device that joins with as many folders mapped, writing its words before it has read the channel: another 1.25 MiB.
 
-**What it costs.** A device sums the channel's entries before each new word: a sum over at most some 13,000 rows, once for each name a person maps. Two constants, one check, one status line, one refusal and one changed line of `cordelia devices`. A person who reaches the line waits 90 days for a stopped name's room, unless they remove a device.
+That is 3,276,800 bytes. Rounded up to 4 MiB, a quarter of the cap, it leaves 917,504 bytes more, 716 words, for names mapped after the warning. Any lower line would warn people who are far from the cap: at 4 devices the warning comes at 2,455 names each.
 
-## 3. Set aside
+**What it costs.** One sum at the end of each sync cycle, three fields in its report, one status line in three forms, and one changed line of `cordelia devices`. Two constants. No row, no stream, no check on a write.
 
-- **A bound on the names each device lists (192),** as the first draft of this record proposed. A slot's delete stays while any other device syncs the name, so a person who moves names from the laptop to the desktop never gets those places back on the laptop; the line promised a date it cannot know; a recovery that carries every device's names onto one machine would have been cut to 192; and a person with four devices would have been held to 192 names each when 3,000 fit. Its one strength, that it holds while devices are apart, buys little where the exposure is this small.
-- **A larger room at a relay.** A relay cannot tell the personal channel from another channel of the kind, so every channel's room goes up, at every relay; a channel filled by a device in someone else's hands takes twice as much; a recovery reads for 1,111 seconds rather than 615 (`RECOVERY_READ_ON_MAX_SECS` is derived from the cap). And names stay unbounded.
-- **A smaller word.** A word is in the smallest size class already, and the 1,024 that every entry is counted with beyond its content is 16 MiB by itself at 64 × 256. A smaller word needs a smaller count for every entry at every relay.
-- **A word that holds several names,** one entry for each device. It is the better form if names one day grow, but it is a new kind of entry, which a device of alpha.12 does not read: it would neither prove those channels, nor show those names at a removal, nor carry them at a recovery made with its command.
-- **Not carrying `name/` deletes at a statement,** so that a renewal frees stopped names. In a new channel no word and a delete say the same. It would be a way out at the line, but it changes the carry, and the line is reached by no ordinary use.
+## 3. The limit, stated
 
-## 4. On the wire, and beside alpha.12
+**Nothing refuses a new name.** A device writes every word as today. Where the channel reaches the cap at a relay, the relay refuses each entry that would grow it: a new word, a device's first `applied/` word under a statement, a `left/` word, a record of an addition. It takes each rewrite that is no larger. What follows:
 
-**Nothing on the wire changes.** No entry, stream, answer or statement changes form, and no relay changes. The line is a check that each device of this version makes on what it writes.
+- The device that sent the entry keeps it and offers it again. Its status is amber: "memory: a relay has no room". `cordelia devices` says so in the words of rule 4.
+- Every device past the line also shows the warning of rule 3.
+- Other devices that read at that relay do not see what was refused: a name is not listed there, a device's leave is not seen, and a device added since counts on no device that reads there (the record of 2026-10-17, §7). A recovery that reads there does not find a name whose every word was refused.
 
-**A person whose devices run alpha.12 and this version at once:** each reads every word the other writes, as today. A device of this version counts alpha.12's words in its total and refuses new words of its own past the line. A device of alpha.12 maps as today. Where the channel reaches the cap at a relay, the relay refuses, and devices of this version say so with the line of rule 7. A recovery is as today on both.
+**What a person can do then.**
 
-## 5. The constants
+- **Stop syncing names they no longer need, on every device that syncs them.** Each such name's room comes back when every device's delete of it has been held 90 days. That is slow, and it is at least 90 days.
+- **Remove a device they no longer use** (`cordelia remove-device`, with the phrase). The removed device's words and every record of an addition are not carried into the new channel, so the new channel starts smaller. But each remaining device carries its own deletes, re-stored at the time of the carry, so their 90 days start again.
+- **Set up a relay of their own** with a larger cap. The cap is a relay's, not the protocol's.
 
-- `PERSONAL_CHANNEL_KEPT_BYTES: u64 = 1 MiB`. Asserted in `protocol.rs`: no less than `2 × MAX_COUNTED_DEVICES × entry_cost(MIN_ENTRY_CONTENT_BYTES) + (MAX_COUNTED_DEVICES + MAX_NOT_COUNTED_RECORDS) × entry_cost(2 × MIN_ENTRY_CONTENT_BYTES)`, which is 655,360; and that the longest word, a text or a delete, is a content of `MIN_ENTRY_CONTENT_BYTES`.
-- `PERSONAL_NAMES_LINE_BYTES: u64 = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY − PERSONAL_CHANNEL_KEPT_BYTES`, that is 15 MiB.
-- `PERSONAL_NAMES_NEAR_BYTES: u64 = PERSONAL_NAMES_LINE_BYTES − PERSONAL_CHANNEL_KEPT_BYTES`, that is 14 MiB.
+**What a warning cannot see.** The total is what this device's store holds. A device that has just joined has read nothing yet, and two devices out of touch each see only their own part. A key that holds the secret and does not count can write at a relay, and its entries are in no store (the record of 2026-10-04, §4.4). And a device of alpha.12 shows no warning, though a device of this version counts alpha.12's entries in its total.
 
-For `parameter-rationale.md` §12.9: "**PERSONAL_NAMES_LINE_BYTES = 15 MiB.** A device writes no new word that a name is synced where it would take the personal channel's total, as its store reads it, past this (decision 2026-10-19). A word is counted at 1,280 bytes at a relay, whatever the name, and a relay holds 16 MiB of a channel: so some 12,000 words between all of a person's devices. The mebibyte below the cap (`PERSONAL_CHANNEL_KEPT_BYTES`) holds what is never refused: 64 words that a statement is applied, 64 that a device left, and 320 records of an addition, with 307 words over for what one device cannot see. `PERSONAL_NAMES_NEAR_BYTES`, a mebibyte lower, turns the status amber. What it costs: a person past the line maps no new name until a stopped name's room comes back, 90 days after no device syncs it, or a device is removed."
+## 4. Set aside
 
-## 6. Tests
+- **A bound on the names each device lists,** the first draft of this record. A stopped name's delete stays while any device syncs that name, so the bound could not be got back; a recovery carries every device's names onto one machine, and would have been cut; a person with four devices would have been held at 192 names each where 3,274 fit.
+- **A line on the total that refuses a new word,** the second draft. It needed a check on every path that writes a word, and each path brought a fault: a map stores the mapping before the word is written; the sync cycle would turn a refusal into an error on every cycle; a joining device writes before it has read; a recovery's statement would abort after the phrase signed. Each can be mended, at a cost in code and tests that a channel which fills only near 50 devices does not repay.
+- **A larger room at a relay.** A relay cannot tell the personal channel from another channel of its kind, so every channel's room would go up, at every relay; a recovery would read for 1,111 seconds rather than 615 (`RECOVERY_READ_ON_MAX_SECS` is derived from the cap). And names stay unbounded.
+- **A smaller word.** A word is in the smallest size class already, and the 1,024 that every entry is counted with beyond its content is 16 MiB by itself at 64 × 256.
+- **A word that holds several names,** one entry for each device. It is the better form if names one day grow, but a device of alpha.12 does not read it.
 
-Each would fail on an assertion with its rule taken out.
+## 5. On the wire, and beside alpha.12
 
-- `crates/cordelia-api/src/names.rs`: `a_new_word_past_the_line_is_refused` (the store holds the line less 1,279 bytes of other devices' words: `say` of a new name is refused with the error of the line, and stores nothing; one byte more room and it is taken). Rule 1.
-- `names.rs`: `a_rewrite_past_the_line_is_taken` (over the line, `unsay` of a word, and `say` again of a name this device has a delete for, are each taken). Rule 2.
-- `names.rs`: `hold_mapped_lists_folders_in_order_up_to_the_line` (three folders mapped and room for two: the first two have words and the third has none, and is reported as not synced). Rule 5.
-- `crates/cordelia-api/src/person.rs`: `a_statement_carries_no_more_than_the_channel_held` (three devices near the line, one removed: the two that stay each carry every word of their own, and the new personal channel's total is the old one's less the removed device's words, the records and the `applied/` words). Rule 3.
-- `crates/cordelia-api/tests/commands_api.rs`: `map_at_the_line_maps_nothing_and_says_why` (the route refuses, the configuration is unchanged, and the answer holds the words of rule 4); and `a_carry_at_the_line_is_refused`. Rules 4 and 5.
-- `crates/cordelia-node/src/indicator.rs`: `the_status_is_amber_near_the_line` (amber at `PERSONAL_NAMES_NEAR_BYTES`, none a byte below). Rule 6.
-- `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_refusal_for_room_is_said_as_either`. A device and a relay run as real processes, the relay with a small `max_storage_bytes`; the relay refuses for room, and `cordelia devices` shows the line of rule 7. Rule 7.
-- `crates/cordelia-storage/src/relay.rs`: `the_room_kept_below_the_line_holds_what_is_never_refused`. A channel holding the line in words takes 64 `applied/` and 64 `left/` words and 320 records of 512 bytes, then 307 words, and refuses the 308th. It holds the constants of §5 to the relay's own count.
+**Nothing on the wire changes.** No entry, stream, answer or statement changes form, and no relay changes. A relay of alpha.12 serves a device of this version, and the reverse.
 
-## 7. What other records would say
+**A person whose devices run alpha.12 and this version at once:** each writes as today. A device of this version shows the warning from what its store holds, alpha.12's entries included. A device of alpha.12 shows none, and says of a refusal for room what it says today.
+
+## 6. The constants
+
+- `PERSONAL_CHANNEL_HEADROOM_BYTES: u64 = 4 MiB`. Asserted in `protocol.rs` to be no less than `2 × MAX_COUNTED_DEVICES × entry_cost(MIN_ENTRY_CONTENT_BYTES) + (MAX_COUNTED_DEVICES + MAX_NOT_COUNTED_RECORDS) × entry_cost(2 × MIN_ENTRY_CONTENT_BYTES) + 2 × RECOVERY_MAX_NAMES × entry_cost(MIN_ENTRY_CONTENT_BYTES)`, which is 3,276,800; and that the longest word, a text or a delete, is a content of `MIN_ENTRY_CONTENT_BYTES`.
+- `PERSONAL_CHANNEL_WARN_BYTES: u64 = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY − PERSONAL_CHANNEL_HEADROOM_BYTES`, that is 12 MiB.
+
+For `parameter-rationale.md` §12.10: "**PERSONAL_CHANNEL_WARN_BYTES = 12 MiB.** The status turns amber where the personal channel, as this device's store holds it, passes this (decision 2026-10-19). A relay holds 16 MiB of one channel, and refuses what would grow it past that. The 4 MiB below the cap (`PERSONAL_CHANNEL_HEADROOM_BYTES`) holds what can arrive before a person acts on the warning: the entries that are written whatever the total (640 KiB), a recovery's 1,024 names, and a device that joins with as many folders mapped (1.25 MiB each), with 716 words more. Nothing is refused at the line. What it costs: one sum at the end of each sync cycle."
+
+## 7. Tests
+
+Each fails on an assertion with its rule taken out. Every total is a multiple of 256, since every entry is counted at 1,024 and a power of two from 256.
+
+- `crates/cordelia-api/src/names.rs`: `the_channels_total_counts_every_author_and_every_delete`. A store holds this device's two words and its delete of a third, another device's word, and a record of an addition: the total is 4 × 1,280 + 1,536 = 6,656 bytes, words 5,120, and the author with the most bytes that are not words is the record's signer, at 1,536. Rule 1.
+- `crates/cordelia-sync/src/claude.rs`: `a_cycles_report_carries_the_channels_total`. After a cycle the report holds the total of the store; a word written after the cycle does not change the status's total until the next cycle. Rule 1.
+- `crates/cordelia-node/src/indicator.rs`: `the_status_is_amber_past_the_line`. Amber at 12,583,168 bytes (the line and 256: the first total past it that a store can hold), and none at 12,582,912 (the line). Rule 2.
+- `indicator.rs`: `the_warning_says_what_fills_the_channel`. Words at half the total give the first form; words below half, with one author holding three quarters of the rest, give the second form with that device's label and fingerprint words; with no such author, the third. Rule 3.
+- `crates/cordelia-api/src/look.rs`: `a_refusal_for_room_is_said_as_either`, and `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_relays_refusal_for_room_is_said_as_either`. A device and a relay run as real processes, the relay with a `max_storage_bytes` that one entry fills; the relay refuses for room, and `cordelia devices` shows the words of rule 4 and not "a new channel". Rule 4.
+- `crates/cordelia-storage/src/relay.rs`: `the_headroom_holds_what_can_arrive_at_once`. A channel holding 12 MiB of words takes 64 `applied/` words, 64 `left/` words, 320 records of 512 bytes, 2,048 more words and then 716 words, and refuses the 717th. It holds the constants of §6 to the relay's own count.
+- `crates/cordelia-api/src/names.rs`: `a_map_past_the_line_is_written`. With the store past the line, `hold_mapped` writes a word for each mapped folder. Rule 5.
+
+## 8. What other records would say
 
 The change would alter these sentences, and no record is changed by this one:
 
-- The record of 2026-10-04, §2.2: "the names that exist and what each device syncs (`name/<the name>`)" gains "up to the line of decision 2026-10-19".
-- The record of 2026-10-04, §16: "a device's word that it syncs a name under `name/<the name>`, written when it maps the name and deleted when it unmaps it" gains "and no new word past the line of decision 2026-10-19"; "sized for a device with 256 names" stays.
-- The record of 2026-10-04, §9 and §13: a recovery names a name it could not list among those it left.
-- The record of 2026-10-17, §7: "On each such device `cordelia devices` names the relay and says that it is full (`look::relays`)" becomes the line of rule 7.
-- `parameter-rationale.md` §12.9: the three constants. §12.7 (`MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`): the line is derived from it.
-- `CLAUDE.md`, the table of constants: one line for the three.
+- The record of 2026-10-04, §2.2: "the names that exist and what each device syncs (`name/<the name>`)" gains "and nothing bounds them: a device warns before the channel fills a relay's room (decision 2026-10-19)".
+- The record of 2026-10-04, §4.1, the bounds: a line that names are not bounded, and that the personal channel fits a relay's room up to the table of decision 2026-10-19 §1.
+- The record of 2026-10-04, §16: "sized for a device with 256 names" gains "a sizing, not a bound: a device may sync more".
+- The record of 2026-10-17, §7: "On each such device `cordelia devices` names the relay and says that it is full (`look::relays`)" becomes the words of rule 4.
+- `parameter-rationale.md` §12.8: "It is sized for a device with 256 names" gains the same; §12.10: the two constants; §12.7 (`MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`): the line is derived from it.
+- `CLAUDE.md`, the table of constants: one line for the two.
 
-## 8. The review of the first draft, and where each finding stands
+## 9. The two reviews, and where each finding stands
+
+**The first review** (of the bound for each device, `bade123`):
 
 | Finding | Severity | Where it stands |
 |---|---|---|
-| 1. The bound cut a person's recovery to 192 names | High | Does not apply. There is no bound for each device, and a recovery carries 1,024 names as today, into a new channel where they take 1.3 MB at most. A name it cannot list is named (rule 5). |
-| 2. A stopped name can count for ever; the line promised a date and a way out that frees nothing | High | Settled in the rule. §1 says a delete stays while any device syncs the name and 90 days after. The words of rule 4 promise no date, and name the ways out that work: stopping a name on every device, and removing a device. The line is some 12,000 words, which no ordinary use reaches. |
-| 3. The relay test asserted a refusal at 193, which a correct relay takes | Medium | Settled. The test of §6 asserts 307 words taken past what is kept, and the 308th refused, from the record's own sum. |
-| 4. No "not running" branch exists, and `hold_mapped` was unbounded | Medium | Settled. The check is in `names::say`, which every path that writes a new word goes through (§1). `hold_mapped` goes in the order of mapping, and a folder past the line is said as mapped and not synced (rule 5). |
-| 5. The gap between a device's sweep and a relay's was understated | Medium | Settled as a stated limit. §2 names every case of a late take, and that the 307 words are all that covers it; past them the relay refuses. |
-| 6. Rule 5 kept an over-bound device over for ever; what fails at the cap was not said | Medium | Settled. No device keeps a grant over the line. §1 says what a relay refuses at the cap and what a person sees. A statement never grows the channel (rule 3). |
-| 7. The words a person reads | Low | Settled. Rules 4 to 7 address "you", in short sentences, and promise nothing that is not so. |
-| 8. Tests that pass with the rule taken out | Low | Settled. Each test of §6 names the rule it would fail without. |
-| 9. More than 64 authors; 320 records not proved; the total was not weighed | Low | The total is the rule. Authors that do not count are a stated limit (§2). 320 is said to be a sizing, not a bound. |
+| 1. The bound cut a recovery to 192 names | High | No longer applies: nothing is bounded, and a recovery carries 1,024 names as today. The headroom holds them (§2). |
+| 2. A stopped name can count for ever; the line promised a date | High | Settled in the words. §1 and §3 say a stopped name counts while any device syncs it, and 90 days after; the warning says "at least 90 days" and promises no date. |
+| 3. The relay test asserted a refusal at 193 | Medium | Settled. The relay test of §7 takes 716 words past the headroom's parts and refuses the 717th, from the record's own sum. |
+| 4. No "not running" branch; `hold_mapped` unbounded | Medium | No longer applies: no write path is checked. §1 lists every path that writes a word. |
+| 5. The sweep's gap was understated | Medium | No longer applies as a bound. A store that holds less than a relay is said in §3, "What a warning cannot see". |
+| 6. A device kept over the bound for ever; what fails at the cap unsaid | Medium | Settled. §3 says what a relay refuses at the cap and what each device shows. |
+| 7. The words a person reads | Low | Settled. Rules 3 and 4 say "you", in short sentences, and promise nothing that is not so. |
+| 8. Tests that pass with the rule taken out | Low | Settled. Each test of §7 names its rule and the sizes it asserts. |
+| 9. More than 64 authors; 320 records not proved; the total not weighed | Low | The total is what the warning reads. Authors that do not count are in §3; 320 is said to be a sizing. |
+
+**The second review** (of the line that refused a new word, `6a796c6`):
+
+| Finding | Severity | Where it stands |
+|---|---|---|
+| 1. A map stores the mapping before `say` runs, and swallows its error | High | No longer applies: nothing refuses. §1 now gives the map's path as it is. |
+| 2. The sync cycle's `name_channel` was missing, and a refusal there is an error each cycle | High | No longer applies: nothing refuses. §1 names `name_channel`; the cycle is where the total is summed (rule 1). |
+| 3. A joining device writes before it has read, and the 307 words did not bound it | Medium | Settled. The headroom holds a joining device with 1,024 folders mapped; past that the relay refuses, as §3 says. |
+| 4. A recovery breaks "the new channel holds no more than the old" | Medium | No longer applies: that sentence is gone. The headroom holds a recovery's 1,024 words. |
+| 5. A statement restarts the 90 days of deletes | Medium | Settled. §1 and §3 say so; the words promise no date, and say what a removal does to the 90 days. |
+| 6. A store total of the line less 1,279 cannot exist | Low | Settled. §7 says every total is a multiple of 256, and asserts totals a store can hold. |
+| 7. Tests that cannot fail; exempt entries and rule 5 untested | Low | Settled. With nothing refused, no entry is exempt; §7 tests that a map past the line is written, and each test names its rule. |
+| 8. The words blamed names when other entries fill the channel | Low | Settled. Rule 3 has three forms, and names a device only where it signed most of what is not words. |
+| 9. A refusal would abort a recovery's statement | Low | No longer applies: nothing refuses. |
+| 10. Where the sum is computed, and its cost | Low | Settled. Rule 1: once per sync cycle, kept in the report, read by the status from `/api/v1/sync/status`; never summed on a status call. |
+
+The second review also noted, as not of this record, that a mapped folder whose name is not in its one spelling fails in `name_channel` on every cycle and so stops `forget_other_folders` (`claude.rs:710`, `791`). This record does not touch it.
