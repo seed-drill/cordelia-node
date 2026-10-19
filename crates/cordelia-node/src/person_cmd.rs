@@ -4236,7 +4236,8 @@ mod tests {
             (
                 "macos",
                 "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
-                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+                 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)",
             ),
         ];
         for (os, restart) in systems {
@@ -4294,7 +4295,8 @@ mod tests {
             (
                 "macos",
                 "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
-                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+                 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)",
             ),
         ];
         for (os, restart) in systems {

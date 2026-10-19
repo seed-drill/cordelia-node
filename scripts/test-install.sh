@@ -159,19 +159,38 @@ cat > "$STUBS/launchctl" << 'STUB'
 case "$1" in
     list)      [ -f "$HOME/.fake/service" ] && echo "123 0 ai.seeddrill.cordelia" ;;
     kickstart) echo "kickstart $2 $3" >> "$HOME/.fake/calls"; restarted ;;
+    # The job is in this login's GUI domain, unless the test says that it
+    # was loaded in another.
+    print)
+        echo "print $2" >> "$HOME/.fake/calls"
+        if [ -f "$HOME/.fake/job_elsewhere" ]; then
+            echo "Could not find service \"ai.seeddrill.cordelia\" in domain for user gui: $(id -u)" >&2
+            exit 113
+        fi
+        echo "state = running"
+        ;;
     bootout)
         echo "bootout $2" >> "$HOME/.fake/calls"
         if [ -f "$HOME/.fake/job_gone" ]; then
             echo "Boot-out failed: 3: No such process" >&2
             exit 3
         fi
+        # The job is gone, and its node with it.
+        rm -f "$HOME/.fake/node_version"
         ;;
     bootstrap)
         echo "bootstrap $2 $3" >> "$HOME/.fake/calls"
         [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
+        # The code is the file's contents, 5 where it is empty.
         if [ -f "$HOME/.fake/bootstrap_fails" ]; then
-            echo "Bootstrap failed: 5: Input/output error" >&2
-            exit 5
+            code=$(cat "$HOME/.fake/bootstrap_fails"); code=${code:-5}
+            case "$code" in
+                119) why="Service is disabled" ;;
+                125) why="Domain does not support specified action" ;;
+                *)   why="Input/output error" ;;
+            esac
+            echo "Bootstrap failed: $code: $why" >&2
+            exit "$code"
         fi
         if [ -f "$HOME/.fake/still_going" ]; then
             left=$(cat "$HOME/.fake/still_going")
@@ -388,14 +407,14 @@ expect "installed=$NEW running=unknown restart=failed" 3 1
 # written, and not kickstarted.
 PLIST_OF() { echo "$1/Library/LaunchAgents/ai.seeddrill.cordelia.plist"; }
 MAC_RESTART() {
-    echo "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) $(PLIST_OF "$1")"
+    echo "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) \"$(PLIST_OF "$1")\" || (sleep 30; launchctl bootstrap gui/$(id -u) \"$(PLIST_OF "$1")\")"
 }
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-running-node-on-a-mac" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the agent is booted out, then bootstrapped from its plist" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 check "the plist bootstrapped names the binary installed" \
     "$(grep -c "<string>$HOME_DIR/.cordelia/bin/cordelia</string>" "$(PLIST_OF "$HOME_DIR")")" 1
 has "The node was restarted and is running $NEW."
@@ -407,7 +426,7 @@ run "a-mac-agent-that-is-gone-already" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the bootstrap after the bootout that failed" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 has_not "Boot-out failed"
 
 # A bootstrap that fails while the job booted out is still going is tried
@@ -420,9 +439,9 @@ run "a-mac-agent-that-is-still-going-once" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the bootstrap is tried again after a second" \
     "$(grep -v '^sleep 1$' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 check "the waits before the second bootstrap" \
-    "$(sed -n '3,4p' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
+    "$(sed -n '4,5p' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
     "sleep 1 bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") "
 has_not "Bootstrap failed"
 
@@ -434,14 +453,16 @@ setup() {
     touch "$HOME/.fake/bootstrap_fails" "$HOME/.fake/count_sleeps"
 }
 run "a-mac-agent-that-does-not-bootstrap" FAKE_OS=Darwin
-expect "installed=$NEW running=$OLD restart=failed" 3 0
+# The bootout took: no node answers, as on a Mac.
+expect "installed=$NEW running=unknown restart=failed" 3 0
+has "The agent was booted out and is not loaded again: the node is not running."
 check "bootouts" "$(grep -c '^bootout ' "$HOME_DIR/.fake/calls")" 1
 check "bootstraps, over 30 seconds" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 31
 check "waits between them" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 30
 has "The restart command failed."
 has "  Bootstrap failed: 5: Input/output error"
 check "the two commands, on a line of their own" \
-    "$(grep -c "^  $(MAC_RESTART "$HOME_DIR")\$" "$HOME_DIR/.fake/out")" 1
+    "$(grep -cFx "  $(MAC_RESTART "$HOME_DIR")" "$HOME_DIR/.fake/out")" 1
 
 # The wait is the one given, where one is.
 setup() {
@@ -449,8 +470,50 @@ setup() {
     touch "$HOME/.fake/bootstrap_fails" "$HOME/.fake/count_sleeps"
 }
 run "a-mac-agent-that-does-not-bootstrap-in-a-wait-given" FAKE_OS=Darwin CORDELIA_BOOTSTRAP_WAIT_SECS=2
-expect "installed=$NEW running=$OLD restart=failed" 3 0
+expect "installed=$NEW running=unknown restart=failed" 3 0
 check "bootstraps, over 2 seconds" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 3
+
+# A bootstrap refused for a reason no wait changes is not tried again: a
+# service that is disabled (119), a domain with no GUI login (125). Where
+# the bootout did not take, nothing is said of a node that is not running.
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"
+    echo 119 > "$HOME/.fake/bootstrap_fails"; touch "$HOME/.fake/count_sleeps"
+}
+run "a-mac-agent-that-is-disabled" FAKE_OS=Darwin
+expect "installed=$NEW running=unknown restart=failed" 3 0
+check "bootstraps" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 1
+check "waits" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 0
+has "  Bootstrap failed: 119: Service is disabled"
+has "The agent was booted out and is not loaded again: the node is not running."
+
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"; touch "$HOME/.fake/job_gone"
+    echo 125 > "$HOME/.fake/bootstrap_fails"; touch "$HOME/.fake/count_sleeps"
+}
+run "a-mac-domain-with-no-gui-login" FAKE_OS=Darwin
+expect "installed=$NEW running=$OLD restart=failed" 3 0
+check "bootstraps" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 1
+check "waits" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 0
+has "  Bootstrap failed: 125: Domain does not support specified action"
+has_not "The agent was booted out"
+
+# A job that is loaded, but not in this login's GUI domain (it was loaded
+# over ssh, say): nothing is booted out or bootstrapped, the restart is
+# needed, and the words say where the job is and what to do.
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; touch "$HOME/.fake/job_elsewhere"; }
+run "a-mac-agent-in-another-domain" FAKE_OS=Darwin
+expect "installed=$NEW running=$OLD restart=needed" 3 0
+check "the calls: the domain asked, and nothing changed" \
+    "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" "print gui/$(id -u)/ai.seeddrill.cordelia "
+check "what is said" "$(sed -n '/^The service is loaded, but not/,/^or run this installer/p' "$HOME_DIR/.fake/out")" \
+"The service is loaded, but not in the GUI domain of this login
+(gui/$(id -u)), where the restart acts: it was started from another
+session, such as over ssh. Nothing was restarted. In the session that
+started it, run:
+  launchctl unload \"$(PLIST_OF "$HOME_DIR")\"; launchctl load \"$(PLIST_OF "$HOME_DIR")\"
+or run this installer from a terminal of this Mac's own login."
+has_not "A node is running: restarting it"
 
 # Where the node is left as it is, or does not answer, the restart that
 # is named is the same two commands.
@@ -458,8 +521,43 @@ setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-mac-node-left-as-it-is-when-asked" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
 expect "installed=$NEW running=$OLD restart=needed" 0 0
 check "the two commands, on a line of their own" \
-    "$(grep -c "^  $(MAC_RESTART "$HOME_DIR")\$" "$HOME_DIR/.fake/out")" 1
+    "$(grep -cFx "  $(MAC_RESTART "$HOME_DIR")" "$HOME_DIR/.fake/out")" 1
 check "calls to launchctl that change anything" "$(cat "$HOME_DIR/.fake/calls")" ""
+
+# The line printed, pasted into a shell as it is: the bootstrap that fails
+# while the job booted out is still going is tried once more, 30 seconds
+# later, and the node runs. One that fails for good is tried twice, and
+# the line ends. A home whose name has a space is one path.
+pasted() {
+    sed -n 's/^  \(launchctl bootout .*\)$/\1/p' "$HOME_DIR/.fake/out" > "$HOME_DIR/.fake/line"
+    : > "$HOME_DIR/.fake/calls"
+    touch "$HOME_DIR/.fake/count_sleeps"
+    set +e
+    env HOME="$HOME_DIR" PATH="$STUBS:$PATH" FAKE_OS=Darwin sh -c "$(cat "$HOME_DIR/.fake/line")" \
+        > /dev/null 2>&1
+    PASTED=$?
+    set -e
+}
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
+run "a-mac-restart-pasted" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
+echo 1 > "$HOME_DIR/.fake/still_going"
+pasted
+check "the line pasted ends well" "$PASTED" 0
+check "the calls of the line pasted" "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
+    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") sleep 30 bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+check "the node runs" "$(cat "$HOME_DIR/.fake/node_version")" "$NEW"
+touch "$HOME_DIR/.fake/bootstrap_fails"
+pasted
+check "the line pasted ends, failed" "$PASTED" 5
+check "the calls of the line pasted that fails" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 2
+
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
+run "a-mac-home with a space" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
+expect "installed=$NEW running=$OLD restart=needed" 0 0
+pasted
+check "the line pasted in a home with a space ends well" "$PASTED" 0
+check "the plist bootstrapped in a home with a space" \
+    "$(grep -c "^bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR")\$" "$HOME_DIR/.fake/calls")" 1
 
 setup() { service; }
 run "a-mac-node-that-does-not-answer" FAKE_OS=Darwin

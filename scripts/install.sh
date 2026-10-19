@@ -250,6 +250,18 @@ running_version() {
     node_status | sed -n 's/.*"node_version":"\([^"]*\)".*/\1/p' | tr -cd '0-9A-Za-z.+-'
 }
 
+# Whether the service is in the domain that its restart acts on. On macOS
+# that is this login's GUI domain: `launchctl list` (service_running) sees
+# a job loaded in the caller's own domain, which over ssh is another one,
+# and a job there is not booted out from here, nor a second one
+# bootstrapped beside it.
+service_here() {
+    case "$PLATFORM" in
+        darwin) launchctl print "$AGENT_TARGET" >/dev/null 2>&1 ;;
+        *)      return 0 ;;
+    esac
+}
+
 restart_service() {
     case "$PLATFORM" in
         linux)  systemctl --user daemon-reload && systemctl --user restart cordelia ;;
@@ -270,19 +282,30 @@ restart_service() {
 # nothing to take out; or it is still there, and the bootstrap says so. A
 # bootstrap that fails is tried again, a second apart, for
 # BOOTSTRAP_WAIT_SECS: the job booted out may not have finished going.
-# One that still fails then has failed for good: what launchctl said is
-# printed, and the restart has failed.
+# Two codes that no wait changes end it at once: 119, the service is
+# disabled, and 125, the domain does not support the action (no GUI
+# login). Others are tried again, since launchctl gives the same code (5,
+# 37) for a job still going as for some that will not pass. One that
+# still fails then has failed for good: what launchctl said is printed,
+# and where the bootout took, that the node is not running.
 restart_agent() {
-    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :
+    booted_out=""
+    launchctl bootout "$AGENT_TARGET" 2>/dev/null && booted_out=yes
     waited=0
-    until launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err"; do
-        if [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ]; then
-            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
-            return 1
-        fi
+    while :; do
+        launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err" && return 0
+        case "$?" in
+            119|125) break ;;
+        esac
+        [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ] && break
         sleep 1
         waited=$((waited + 1))
     done
+    sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
+    if [ -n "$booted_out" ]; then
+        echo "The agent was booted out and is not loaded again: the node is not running."
+    fi
+    return 1
 }
 
 # Wait, for so many tries a second apart, until the node answers.
@@ -347,6 +370,16 @@ settle_running_node() {
         fi
         RUNNING=$(running_version)
         if [ "$RUNNING" = "$INSTALLED" ]; then
+            return
+        fi
+        if ! service_here; then
+            RESTART="needed"
+            echo "The service is loaded, but not in the GUI domain of this login"
+            echo "(${AGENT_DOMAIN}), where the restart acts: it was started from another"
+            echo "session, such as over ssh. Nothing was restarted. In the session that"
+            echo "started it, run:"
+            echo "  launchctl unload \"${PLIST_FILE}\"; launchctl load \"${PLIST_FILE}\""
+            echo "or run this installer from a terminal of this Mac's own login."
             return
         fi
         echo "A node is running: restarting it on ${INSTALLED}..."
@@ -481,9 +514,12 @@ PLIST
     AGENT_TARGET="${AGENT_DOMAIN}/ai.seeddrill.cordelia"
     START_CMD="launchctl load ${PLIST_FILE}"
     START_SAYS="                        # run the node as a background service"
-    # Two commands, on one line a person can paste: the second runs
-    # whether or not the first found the job (restart_agent).
-    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"
+    # Two commands, on one line a person can paste. The bootstrap runs
+    # whether or not the bootout found the job, and where it fails it is
+    # tried once more 30 seconds later: a bootout can return before the
+    # job has gone, and after 30 seconds it has (BOOTSTRAP_WAIT_SECS). The
+    # plist's path is quoted, for a home whose name has a space.
+    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\")"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"

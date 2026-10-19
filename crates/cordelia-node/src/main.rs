@@ -7011,7 +7011,8 @@ mod tests {
         assert_eq!(
             restart_command("macos"),
             "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
-             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
+             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)"
         );
     }
 
@@ -7024,8 +7025,11 @@ mod tests {
     /// new binary.
     #[test]
     fn test_a_restart_on_macos_is_a_bootout_then_a_bootstrap() {
-        let restart = "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl \
-                       bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist";
+        let plist = "~/Library/LaunchAgents/ai.seeddrill.cordelia.plist";
+        let restart = format!(
+            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+             gui/$(id -u) {plist} || (sleep 30; launchctl bootstrap gui/$(id -u) {plist})"
+        );
         let after = format!(
             "They should be the same: a node goes on running the version it was started as \
              until it is restarted. Where it runs as the service that the install script set \
@@ -7061,7 +7065,7 @@ mod tests {
         let listen = cannot_listen_says("127.0.0.1:9473", &taken, "macos");
         let read = not_read_beside_another_version(std::path::Path::new("/d"), 10, 19, "macos");
         for said in [&other, &older, &seen, &listen, &read] {
-            assert!(said.contains(restart), "{said}");
+            assert!(said.contains(&restart), "{said}");
             assert!(!said.contains("kickstart"), "{said}");
             let bootout = said.find("launchctl bootout").unwrap();
             let bootstrap = said.find("launchctl bootstrap").unwrap();
@@ -8514,7 +8518,8 @@ mod tests {
             (
                 "macos",
                 "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
-                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+                 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)",
             ),
         ];
         for (os, restart) in systems {
