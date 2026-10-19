@@ -2169,9 +2169,10 @@ fn a_recovery_reads_a_personal_channel_larger_than_one_read_to_its_end() {
 /// yes and to the look** (decision 2026-10-17 §3.2, §3.3; §1, properties
 /// 10 and 11). The relay holds some 7 MiB of the personal channel, and
 /// is stopped once the recovery says that it reads on: the relay is not
-/// reached at the round it was stopped in, or at the next, and is not
-/// asked again, so the reading ends there and not at the bound. The
-/// command says that it read the channel in part at that relay, and why;
+/// reached at the round it was stopped in, or at the next, or not read
+/// there where its connection still looked open, and is not asked again,
+/// so the reading ends there and not at the bound. The command says that
+/// it read the channel in part at that relay, and why;
 /// says before its yes what a read in part costs; and, the relay started
 /// again, takes the yes, and the look carries what was read.
 #[test]
@@ -2213,13 +2214,28 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
         .says("The look is made");
     let said = at.done();
     println!("{said}");
-    let in_part = format!(
-        "The personal channel of change 1 was read to its end at no relay: in part at {named} \
-         (it was not reached). Devices added since that change, and names, may be missing from \
-         what was read. A relay that hands it more slowly than a channel at its largest needs, or \
-         stops, leaves it in part."
+    // Why its reading stopped is one of the two that the record gives a
+    // relay stopped in a read (§3.3): where the node had seen its
+    // connection close when the next round began, it was not reached;
+    // where the connection still looked open, the round's first request
+    // failed, and it was not read, with why the request failed.
+    let at = format!(
+        "The personal channel of change 1 was read to its end at no relay: in part at {named} (it \
+         was "
     );
-    let warned = said.find(&in_part).unwrap_or_else(|| panic!("{said}"));
+    let warned = said.find(&at).unwrap_or_else(|| panic!("{said}"));
+    // Why a request failed may hold parentheses of its own ("closed by
+    // peer: shutdown (code 0)"): the reason ends where the line goes on.
+    let rest = &said[warned + at.len()..];
+    let goes_on = "). Devices added since that change, and names, may be missing from what was \
+                   read. A relay that hands it more slowly than a channel at its largest needs, \
+                   or stops, leaves it in part.";
+    let why = &rest[..rest.find(goes_on).unwrap_or_else(|| panic!("{said}"))];
+    let stopped_so = why == "not reached"
+        || (why.starts_with("not read: ")
+            && why != cordelia_api::carrying::CONNECTION_CHANGED
+            && why != "not read: the node is held up");
+    assert!(stopped_so, "{why}: {said}");
     let yes = said.find("Recover on this machine?").unwrap();
     assert!(warned < yes, "{said}");
     assert!(said.contains("1 name is carried: lab."), "{said}");
