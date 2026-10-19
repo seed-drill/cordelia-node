@@ -72,6 +72,20 @@ fn has_sent_everything(n: &Node) -> Option<()> {
         .then_some(())
 }
 
+/// [`has_sent_everything`], where `n` says so of `relay` itself: it lists
+/// `relay` among the relays it is connected to, and nothing waits there.
+/// Just after a connection is made the node already counts it, but lists
+/// the relays it is connected to only at its next tick: until then it
+/// lists none, and nothing waits at none of them.
+fn has_sent_everything_to(n: &Node, relay: &Node) -> Option<()> {
+    has_sent_everything(n)?;
+    let address = format!("127.0.0.1:{}", relay.p2p);
+    let seen = person_of(n);
+    let waiting = seen["waiting"].as_array()?;
+    let there = waiting.iter().find(|at| at["relay"] == address.as_str())?;
+    (there["waits"] == 0 && seen["names"]["to_go"].as_array()?.is_empty()).then_some(())
+}
+
 fn change_of(n: &Node) -> Value {
     person_of(n)["change"].clone()
 }
@@ -1068,7 +1082,7 @@ fn a_carried_name_is_not_let_go_while_no_relay_holds_what_it_brought() {
         "the laptop has sent what it carried",
         &[&relay, &laptop],
         660,
-        || has_sent_everything(&laptop),
+        || has_sent_everything_to(&laptop, &relay),
     );
     let said = lets_go_once_the_relay_is_read(&laptop);
     assert!(
