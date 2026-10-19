@@ -41,6 +41,13 @@ seconds_or() {
 # and for a node whose service is running to answer at all.
 RESTART_WAIT_SECS=$(seconds_or "${CORDELIA_RESTART_WAIT_SECS:-}" 60)
 ANSWER_WAIT_SECS=$(seconds_or "${CORDELIA_ANSWER_WAIT_SECS:-}" 10)
+# On macOS, how long a bootstrap of the agent is tried again, a second
+# apart, while the job that was booted out has not finished going. The
+# node stops within 30 seconds of being told to (NODE_STOP_TIMEOUT_SECS),
+# and launchd kills a job that has not exited 20 seconds after it was told
+# to stop (its default ExitTimeOut): a job still there after 30 seconds
+# does not go by waiting.
+BOOTSTRAP_WAIT_SECS=$(seconds_or "${CORDELIA_BOOTSTRAP_WAIT_SECS:-}" 30)
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -246,9 +253,36 @@ running_version() {
 restart_service() {
     case "$PLATFORM" in
         linux)  systemctl --user daemon-reload && systemctl --user restart cordelia ;;
-        darwin) launchctl kickstart -k "gui/$(id -u)/ai.seeddrill.cordelia" ;;
+        darwin) restart_agent ;;
         *)      return 1 ;;
     esac
+}
+
+# On macOS the agent is booted out and bootstrapped again from the plist
+# this script has just written. It is not kickstarted: a kickstart starts
+# the job as it was loaded, with the launch constraint macOS attached to it
+# then, and never reads the plist again; launchd may then refuse to start
+# a new binary that is signed ad hoc ("Unable to get updated LWCR", exit
+# 78), every ten seconds, and the node stays down. A job loaded afresh has
+# no such constraint.
+#
+# A bootout that fails is let go: the job is gone already, and there is
+# nothing to take out; or it is still there, and the bootstrap says so. A
+# bootstrap that fails is tried again, a second apart, for
+# BOOTSTRAP_WAIT_SECS: the job booted out may not have finished going.
+# One that still fails then has failed for good: what launchctl said is
+# printed, and the restart has failed.
+restart_agent() {
+    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :
+    waited=0
+    until launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err"; do
+        if [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ]; then
+            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
 }
 
 # Wait, for so many tries a second apart, until the node answers.
@@ -443,9 +477,13 @@ install_launchctl() {
 </plist>
 PLIST
 
+    AGENT_DOMAIN="gui/$(id -u)"
+    AGENT_TARGET="${AGENT_DOMAIN}/ai.seeddrill.cordelia"
     START_CMD="launchctl load ${PLIST_FILE}"
     START_SAYS="                        # run the node as a background service"
-    RESTART_CMD="launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
+    # Two commands, on one line a person can paste: the second runs
+    # whether or not the first found the job (restart_agent).
+    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"

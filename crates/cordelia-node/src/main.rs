@@ -3986,13 +3986,19 @@ pub(crate) fn note_another_version(config_path: &str) {
 /// What to say when the running node is not the version this command is
 /// (`own`). A node from before it reported its version reports none.
 fn version_note(node: Option<&str>, own: &str) -> Option<String> {
+    version_note_on(node, own, std::env::consts::OS)
+}
+
+/// [`version_note`], on the system named: the restart it names is that
+/// system's ([`restart_command`]).
+fn version_note_on(node: Option<&str>, own: &str, os: &str) -> Option<String> {
     // Which of the two is the older is not judged: version strings are
     // not compared, only found to differ.
     let after = format!(
         "They should be the same: a node goes on running the version it was started as \
          until it is restarted. Where it runs as the service that the install script \
          set up, restart it with `{}`; otherwise stop it and start it again.",
-        restart_command(std::env::consts::OS)
+        restart_command(os)
     );
     match node {
         Some(node) if node == own => None,
@@ -4769,11 +4775,16 @@ const NOTICE_SEEN: &str = "The notice of the folders that stopped syncing is put
 /// What `cordelia sync status --seen` says of a node that has no such
 /// request: it runs another version, and must be restarted first.
 fn seen_is_not_known() -> String {
+    seen_is_not_known_on(std::env::consts::OS)
+}
+
+/// [`seen_is_not_known`], on the system named.
+fn seen_is_not_known_on(os: &str) -> String {
     format!(
         "the running node has no such request: it is another version than this command, and \
          must be restarted first. Where it runs as the service that the install script set up, \
          restart it with `{}`; otherwise stop it and start it again.",
-        restart_command(std::env::consts::OS)
+        restart_command(os)
     )
 }
 
@@ -6999,7 +7010,75 @@ mod tests {
         );
         assert_eq!(
             restart_command("macos"),
-            "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
+            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
+        );
+    }
+
+    /// On macOS, the version check of a status and of the commands that
+    /// are refused until the node is restarted, and `cordelia sync status
+    /// --seen` beside a node of another version, name the restart as two
+    /// commands on one line, word for word: the agent booted out, then
+    /// bootstrapped from its plist. None names a kickstart, which starts
+    /// the job as it was loaded, and under which launchd may refuse the
+    /// new binary.
+    #[test]
+    fn test_a_restart_on_macos_is_a_bootout_then_a_bootstrap() {
+        let restart = "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl \
+                       bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist";
+        let after = format!(
+            "They should be the same: a node goes on running the version it was started as \
+             until it is restarted. Where it runs as the service that the install script set \
+             up, restart it with `{restart}`; otherwise stop it and start it again."
+        );
+        let other = version_note_on(Some("0.2.0-alpha.11"), "0.2.0-alpha.12", "macos").unwrap();
+        assert_eq!(
+            other,
+            format!(
+                "The running node is version 0.2.0-alpha.11 and this command is version \
+                 0.2.0-alpha.12. {after}"
+            )
+        );
+        let older = version_note_on(None, "0.2.0-alpha.12", "macos").unwrap();
+        assert_eq!(
+            older,
+            format!(
+                "The running node is from before nodes said their version, and this command \
+                 is version 0.2.0-alpha.12. {after}"
+            )
+        );
+        let seen = seen_is_not_known_on("macos");
+        assert_eq!(
+            seen,
+            format!(
+                "the running node has no such request: it is another version than this \
+                 command, and must be restarted first. Where it runs as the service that the \
+                 install script set up, restart it with `{restart}`; otherwise stop it and \
+                 start it again."
+            )
+        );
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let listen = cannot_listen_says("127.0.0.1:9473", &taken, "macos");
+        let read = not_read_beside_another_version(std::path::Path::new("/d"), 10, 19, "macos");
+        for said in [&other, &older, &seen, &listen, &read] {
+            assert!(said.contains(restart), "{said}");
+            assert!(!said.contains("kickstart"), "{said}");
+            let bootout = said.find("launchctl bootout").unwrap();
+            let bootstrap = said.find("launchctl bootstrap").unwrap();
+            assert!(bootout < bootstrap, "{said}");
+        }
+        // The same on the system the test runs on, as a command says it.
+        assert_eq!(
+            version_note(Some("0.2.0-alpha.11"), "0.2.0-alpha.12"),
+            version_note_on(
+                Some("0.2.0-alpha.11"),
+                "0.2.0-alpha.12",
+                std::env::consts::OS
+            )
+        );
+        assert_eq!(
+            seen_is_not_known(),
+            seen_is_not_known_on(std::env::consts::OS)
         );
     }
 
@@ -8434,7 +8513,8 @@ mod tests {
             ),
             (
                 "macos",
-                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+                "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
             ),
         ];
         for (os, restart) in systems {

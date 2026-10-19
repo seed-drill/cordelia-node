@@ -90,9 +90,19 @@ pub(crate) fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
 /// The command that restarts a node which runs as the service that the
 /// install script sets up, on the system named (`std::env::consts::OS`).
 /// The script prints the same one.
+///
+/// On macOS it is two commands on one line: the agent is booted out and
+/// bootstrapped again from its plist, and not kickstarted. A kickstart
+/// starts the job as it was loaded, with the launch constraint macOS
+/// attached to it then, and launchd may refuse to start a new binary that
+/// is signed ad hoc under it; the node then stays down. The second command
+/// runs whether or not the first found the job.
 pub fn restart_command(os: &str) -> &'static str {
     match os {
-        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+        "macos" => {
+            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
+        }
         _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
     }
 }
@@ -1527,7 +1537,8 @@ mod tests {
             ),
             (
                 "macos",
-                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+                "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
             ),
         ];
         for (os, restart) in systems {
@@ -1544,6 +1555,37 @@ mod tests {
             );
             assert!(!says.contains("cordelia start"), "{says}");
         }
+    }
+
+    /// The command that restarts the node on each system is the one the
+    /// install script prints, with the script's names for the user's ID
+    /// and the plist: on macOS the agent is booted out, then bootstrapped
+    /// from its plist, on one line, and never kickstarted.
+    #[test]
+    fn test_the_restart_command_is_the_one_the_install_script_prints() {
+        let script = include_str!("../../../scripts/install.sh");
+        for line in [
+            "    PLIST_FILE=\"${PLIST_DIR}/ai.seeddrill.cordelia.plist\"",
+            "    AGENT_DOMAIN=\"gui/$(id -u)\"",
+            "    AGENT_TARGET=\"${AGENT_DOMAIN}/ai.seeddrill.cordelia\"",
+            "    RESTART_CMD=\"launchctl bootout ${AGENT_TARGET}; launchctl bootstrap \
+             ${AGENT_DOMAIN} ${PLIST_FILE}\"",
+            "    PLIST_DIR=\"$HOME/Library/LaunchAgents\"",
+        ] {
+            assert_eq!(script.lines().filter(|l| *l == line).count(), 1, "{line}");
+        }
+        let printed = "launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \
+                       ${PLIST_FILE}"
+            .replace("${AGENT_TARGET}", "${AGENT_DOMAIN}/ai.seeddrill.cordelia")
+            .replace("${AGENT_DOMAIN}", "gui/$(id -u)")
+            .replace(
+                "${PLIST_FILE}",
+                "~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+            );
+        assert_eq!(restart_command("macos"), printed);
+        assert!(!restart_command("macos").contains('\n'));
+        assert!(!script.contains("launchctl kickstart"));
+        assert!(script.contains(&format!("    RESTART_CMD=\"{}\"", restart_command("linux"))));
     }
 
     /// The one sentence that says how a node that cannot be reached is
