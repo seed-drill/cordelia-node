@@ -1903,6 +1903,43 @@ fn status_of(n: &Node) -> serde_json::Value {
     serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
 }
 
+/// `said` with the words of each key it shows taken out: a key is shown by
+/// `FINGERPRINT_WORDS_SHOWN` words in brackets, drawn from a list that has
+/// "message" in it, so they say nothing of messages.
+fn without_key_words(said: &str) -> String {
+    let is_key_words = |inside: &str| {
+        let words: Vec<&str> = inside.split(' ').collect();
+        words.len() == cordelia_core::protocol::FINGERPRINT_WORDS_SHOWN
+            && words
+                .iter()
+                .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
+    };
+    let mut kept = String::new();
+    let mut rest = said;
+    while let Some(open) = rest.find('(') {
+        kept.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(')') {
+            Some(close) if is_key_words(&after[..close]) => rest = &after[close + 1..],
+            _ => {
+                kept.push('(');
+                rest = after;
+            }
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+#[test]
+fn the_words_of_a_key_are_taken_out_and_nothing_else() {
+    let said = "added from (message duty degree cliff) \"laptop\" (1 message waits)";
+    assert_eq!(
+        without_key_words(said),
+        "added from  \"laptop\" (1 message waits)"
+    );
+}
+
 /// The `messages` object that `cordelia status --json` carries, on a device
 /// that stands applied, with every field counted by its rule; nothing else
 /// that the status prints says anything of messages, and it is absent
@@ -1980,7 +2017,7 @@ fn the_status_carries_the_messages_object_in_json() {
         &["status", "--line"],
         &["status", "--waybar"],
     ] {
-        let said = two.desktop.cli(args).to_lowercase();
+        let said = without_key_words(&two.desktop.cli(args).to_lowercase());
         assert!(!said.contains("message"), "{args:?}: {said}");
         assert!(!said.contains("unread"), "{args:?}: {said}");
     }
