@@ -388,7 +388,16 @@ enum MsgCommand {
     /// prints a message's line, with the first line of its text, once,
     /// and after that only counts it.
     #[command(after_long_help = msg_cmd::SUMMARY_HELP)]
-    Summary,
+    Summary {
+        /// The folder whose agent's messages you want
+        ///
+        /// Use it when your session runs in one folder and the agent's
+        /// messages are for another: give that one. In your hook:
+        ///
+        /// "command": "cordelia msg summary --folder ~/notes"
+        #[arg(long, value_name = "DIR")]
+        folder: Option<std::ffi::OsString>,
+    },
     /// Print one message, between two lines that say whose it is
     ///
     /// It marks the message read by this folder's agent, on every device
@@ -611,8 +620,8 @@ fn main() -> anyhow::Result<()> {
     // before the command line is parsed (decision 2026-10-09 §4.1).
     let started = std::time::Instant::now();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some((config, others)) = msg_cmd::summary_asked(&args) {
-        msg_cmd::summary(&config, started, others);
+    if let Some(asked) = msg_cmd::summary_asked(&args) {
+        msg_cmd::summary(&asked.config, started, asked.folder, asked.others);
         return Ok(());
     }
     let cli = Cli::parse_from(args);
@@ -672,8 +681,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Msg { what }) => match what {
             // Read before the command line was parsed: here only where
             // the parser printed its help and stopped.
-            MsgCommand::Summary => {
-                msg_cmd::summary(&cli.config, started, false);
+            MsgCommand::Summary { folder } => {
+                msg_cmd::summary(&cli.config, started, folder, false);
                 Ok(())
             }
             MsgCommand::Read { id } => msg_cmd::read(&cli.config, &id),
@@ -8488,6 +8497,29 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
+    }
+
+    /// `cordelia msg summary --help` says when to give `--folder`, and
+    /// shows the hook's line with it (decision 2026-10-09 §3.1, §5).
+    #[test]
+    fn the_summarys_help_says_when_to_give_its_folder() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("msg")
+            .and_then(|msg| msg.find_subcommand_mut("summary"))
+            .expect("msg summary is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--folder <DIR>"), "{help}");
+        assert!(
+            help.contains("Use it when your session runs in one folder and the agent's messages are for another: give that one."),
+            "{help}"
+        );
+        assert!(
+            help.contains("\"command\": \"cordelia msg summary --folder ~/notes\""),
+            "{help}"
+        );
     }
 
     /// `cordelia msg log --help` gives the command's line of the record,

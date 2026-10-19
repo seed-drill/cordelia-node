@@ -257,18 +257,38 @@ fn time_of(unix: i64) -> String {
 // ── The folder a command is run in ───────────────────────────────────
 
 /// The directory a command acts in, before its real path is taken
-/// (decision 2026-10-09 §3.1): Claude Code's variable for the session's
-/// project directory where it names a directory; for `summary` alone, the
-/// `cwd` of the hook's input, where there is one; and the command's own
-/// working directory.
+/// (decision 2026-10-09 §3.1): for `summary` alone, the folder its
+/// `--folder` gives, where it was given, whatever it names; Claude Code's
+/// variable for the session's project directory where it names a
+/// directory; for `summary` alone, the `cwd` of the hook's input, where
+/// there is one; and the command's own working directory. `hook_cwd` is
+/// called only where it is needed, so the hook's input is not read where
+/// `--folder` or the variable gives the directory.
 fn directory(
+    folder: Option<PathBuf>,
     project_dir: Option<OsString>,
     hook_cwd: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
+    // Never passed over for the next: a folder that is not one gives no
+    // summary, rather than another folder's.
+    if folder.is_some() {
+        return folder;
+    }
     if let Some(dir) = project_dir.map(PathBuf::from).filter(|dir| dir.is_dir()) {
         return Some(dir);
     }
     hook_cwd().or_else(|| std::env::current_dir().ok())
+}
+
+/// The folder `summary --folder` was given (decision 2026-10-09 §3.1), a
+/// leading `~` taken as `home`, as the shell takes it, where it is
+/// `~` or begins with `~/`.
+fn folder_given(given: OsString, home: Option<PathBuf>) -> PathBuf {
+    match (given.to_str(), home) {
+        (Some("~"), Some(home)) => home,
+        (Some(text), Some(home)) if text.starts_with("~/") => home.join(&text[2..]),
+        _ => PathBuf::from(given),
+    }
 }
 
 /// The `cwd` of a hook's input (decision 2026-10-09 §5): `input` taken as
@@ -675,19 +695,30 @@ fn refused_by(status: u16, answer: &Value, folder: &str, does: Does) -> String {
 /// does not take prints nothing and exits 0, where the parser would exit
 /// 2. `msg summary` are the first two words that are not the
 /// configuration's flag; `--help` and `-h` are left to the parser, which
-/// prints the summary's help. The path of the configuration, and whether
-/// anything else was given.
-pub fn summary_asked(args: &[OsString]) -> Option<(String, bool)> {
+/// prints the summary's help. `--folder <dir>` or `--folder=<dir>`, after
+/// `msg summary`, is taken once. What it asks for.
+pub fn summary_asked(args: &[OsString]) -> Option<SummaryAsked> {
     let mut config = None;
+    let mut folder: Option<OsString> = None;
+    let mut folders = 0;
     let mut words: Vec<Option<&str>> = Vec::new();
     let mut given = args.iter().skip(1);
     while let Some(arg) = given.next() {
+        let after_summary = words.len() >= 2;
         match arg.to_str() {
             Some("--config") => config = given.next().map(|v| v.to_string_lossy().into_owned()),
             Some(text) if text.starts_with("--config=") => {
                 config = Some(text["--config=".len()..].to_string());
             }
             Some("-h" | "--help") => return None,
+            Some("--folder") if after_summary => {
+                folders += 1;
+                folder = given.next().cloned();
+            }
+            Some(text) if after_summary && text.starts_with("--folder=") => {
+                folders += 1;
+                folder = Some(text["--folder=".len()..].into());
+            }
             word => words.push(word),
         }
     }
@@ -697,19 +728,39 @@ pub fn summary_asked(args: &[OsString]) -> Option<(String, bool)> {
     let config = config
         .or_else(|| std::env::var("CORDELIA_CONFIG").ok())
         .unwrap_or_else(|| "~/.cordelia/config.toml".into());
-    Some((config, words.len() > 2))
+    // A `--folder` with no folder after it, or an empty one, or given
+    // twice, is an argument the summary does not take.
+    let folder_wrong =
+        folders > 1 || (folders == 1 && folder.as_ref().is_none_or(|f| f.is_empty()));
+    Some(SummaryAsked {
+        config,
+        folder,
+        others: words.len() > 2 || folder_wrong,
+    })
+}
+
+/// What `cordelia msg summary` was asked for on its command line.
+#[derive(Debug, PartialEq)]
+pub struct SummaryAsked {
+    /// The path of the configuration.
+    pub config: String,
+    /// The folder `--folder` gave, as it was given.
+    pub folder: Option<OsString>,
+    /// Whether anything it does not take was given.
+    pub others: bool,
 }
 
 /// `cordelia msg summary` (decision 2026-10-09 §4.1, C20): what it prints,
 /// where the node answered within 100 ms of `started`, which is when the
-/// process read its clock. Nothing at all on any error, a panic among
-/// them, and the process then exits 0.
-pub fn summary(config_path: &str, started: Instant, others: bool) {
+/// process read its clock, for the folder `folder` where `--folder` gave
+/// one. Nothing at all on any error, a panic among them, and the process
+/// then exits 0.
+pub fn summary(config_path: &str, started: Instant, folder: Option<OsString>, others: bool) {
     std::panic::set_hook(Box::new(|_| {}));
     if others {
         return;
     }
-    let said = std::panic::catch_unwind(|| summarised(config_path, started))
+    let said = std::panic::catch_unwind(|| summarised(config_path, started, folder))
         .ok()
         .flatten();
     if let Some(said) = said {
@@ -717,7 +768,7 @@ pub fn summary(config_path: &str, started: Instant, others: bool) {
     }
 }
 
-fn summarised(config_path: &str, started: Instant) -> Option<String> {
+fn summarised(config_path: &str, started: Instant, folder: Option<OsString>) -> Option<String> {
     let deadline = started + Duration::from_millis(AGENT_MESSAGE_SUMMARY_WAIT_MS);
     let node = Node::of(config_path).ok()?;
     // A file read is not bounded: the time is looked at after.
@@ -725,7 +776,9 @@ fn summarised(config_path: &str, started: Instant) -> Option<String> {
         return None;
     }
     let project_dir = std::env::var_os(PROJECT_DIR);
-    let dir = directory(project_dir, || {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let folder = folder.map(|given| folder_given(given, home));
+    let dir = directory(folder, project_dir, || {
         let input_until = (Instant::now()
             + Duration::from_millis(AGENT_MESSAGE_HOOK_INPUT_WAIT_MS))
         .min(deadline);
@@ -856,7 +909,7 @@ fn not_an_id(id: &str) -> String {
 /// and nothing falls back to the directory itself, which may be another
 /// agent's folder than the repository's.
 fn folder_here(git_wait: Duration) -> Option<(String, String)> {
-    let dir = directory(std::env::var_os(PROJECT_DIR), || None).unwrap_or_default();
+    let dir = directory(None, std::env::var_os(PROJECT_DIR), || None).unwrap_or_default();
     let Ok(real) = dir.canonicalize() else {
         return Some((String::new(), dir.display().to_string()));
     };
@@ -2701,7 +2754,7 @@ mod tests {
     fn the_summary_is_recognised_before_the_command_line_is_parsed() {
         let asked = |args: &[&str]| {
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            summary_asked(&args)
+            summary_asked(&args).map(|asked| (asked.config, asked.others))
         };
         let default =
             std::env::var("CORDELIA_CONFIG").unwrap_or_else(|_| "~/.cordelia/config.toml".into());
@@ -2768,21 +2821,126 @@ mod tests {
         let project = tmp.path().to_path_buf();
         let hook = || Some(PathBuf::from("/from/the/hook"));
         assert_eq!(
-            directory(Some(project.clone().into()), hook),
+            directory(None, Some(project.clone().into()), hook),
             Some(project.clone())
         );
         assert_eq!(
-            directory(Some(project.join("no-such").into()), hook),
+            directory(None, Some(project.join("no-such").into()), hook),
             Some(PathBuf::from("/from/the/hook"))
         );
-        assert_eq!(directory(None, hook), Some(PathBuf::from("/from/the/hook")));
-        assert_eq!(directory(None, || None), std::env::current_dir().ok());
+        assert_eq!(
+            directory(None, None, hook),
+            Some(PathBuf::from("/from/the/hook"))
+        );
+        assert_eq!(directory(None, None, || None), std::env::current_dir().ok());
         // The variable is not read where it names a file.
         let file = tmp.path().join("a-file");
         std::fs::write(&file, "x").unwrap();
         assert_eq!(
-            directory(Some(file.into()), || None),
+            directory(None, Some(file.into()), || None),
             std::env::current_dir().ok()
+        );
+    }
+
+    /// `summary --folder` is taken after `msg summary`, as `--folder <dir>`
+    /// or `--folder=<dir>`, once; with no folder, an empty one, or two, it
+    /// is an argument the summary does not take (decision 2026-10-09
+    /// §3.1, §4.1).
+    #[test]
+    fn the_summarys_folder_is_taken_from_its_command_line() {
+        let asked = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            summary_asked(&args).map(|asked| (asked.folder, asked.others))
+        };
+        let given = |dir: &str| Some((Some(OsString::from(dir)), false));
+        assert_eq!(asked(&["cordelia", "msg", "summary"]), Some((None, false)));
+        assert_eq!(
+            asked(&["cordelia", "msg", "summary", "--folder", "/a"]),
+            given("/a")
+        );
+        assert_eq!(
+            asked(&["cordelia", "msg", "summary", "--folder=~/a"]),
+            given("~/a")
+        );
+        assert_eq!(
+            asked(&[
+                "cordelia", "--config", "/c.toml", "msg", "summary", "--folder", "/a"
+            ]),
+            given("/a")
+        );
+        assert_eq!(
+            asked(&["cordelia", "msg", "summary", "--folder"]),
+            Some((None, true))
+        );
+        assert_eq!(
+            asked(&["cordelia", "msg", "summary", "--folder="]),
+            Some((Some(OsString::new()), true))
+        );
+        assert_eq!(
+            asked(&[
+                "cordelia", "msg", "summary", "--folder", "/a", "--folder", "/b"
+            ]),
+            Some((Some("/b".into()), true))
+        );
+        assert_eq!(
+            asked(&["cordelia", "msg", "summary", "--folder", "/a", "x"]),
+            Some((Some("/a".into()), true))
+        );
+        // Before `msg summary` it is not the summary's.
+        assert_eq!(
+            asked(&["cordelia", "--folder", "/a", "msg", "summary"]),
+            None
+        );
+    }
+
+    /// `--folder` comes before Claude Code's variable, which comes before
+    /// the hook's `cwd`, which comes before the command's own directory;
+    /// where `--folder` is given the hook's input is not read, and a
+    /// `--folder` that is no directory is still taken, not passed over
+    /// (decision 2026-10-09 §3.1, §5).
+    #[test]
+    fn the_summarys_folder_comes_before_claude_codes_variable_and_the_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().to_path_buf();
+        let given = Some(PathBuf::from("/given/by/folder"));
+        let hook = || Some(PathBuf::from("/from/the/hook"));
+        let hook_read = std::cell::Cell::new(false);
+        assert_eq!(
+            directory(given.clone(), Some(project.clone().into()), || {
+                hook_read.set(true);
+                hook()
+            }),
+            given
+        );
+        assert!(!hook_read.get(), "the hook's input was read");
+        assert_eq!(directory(given.clone(), None, hook), given);
+        assert_eq!(directory(given.clone(), None, || None), given);
+        assert_eq!(
+            directory(None, Some(project.clone().into()), hook),
+            Some(project.clone())
+        );
+        assert_eq!(
+            directory(None, None, hook),
+            Some(PathBuf::from("/from/the/hook"))
+        );
+        assert_eq!(directory(None, None, || None), std::env::current_dir().ok());
+    }
+
+    /// A leading `~` of `--folder` is the home directory, as the shell
+    /// takes it; anywhere else, or with no home, it is kept (decision
+    /// 2026-10-09 §3.1).
+    #[test]
+    fn the_summarys_folder_takes_a_leading_tilde_as_home() {
+        let home = Some(PathBuf::from("/home/sam"));
+        let taken = |given: &str| folder_given(given.into(), home.clone());
+        assert_eq!(taken("~"), PathBuf::from("/home/sam"));
+        assert_eq!(taken("~/notes"), PathBuf::from("/home/sam/notes"));
+        assert_eq!(taken("/srv/notes"), PathBuf::from("/srv/notes"));
+        assert_eq!(taken("notes/~/x"), PathBuf::from("notes/~/x"));
+        assert_eq!(taken("~sam/notes"), PathBuf::from("~sam/notes"));
+        assert_eq!(
+            folder_given("~/notes".into(), None),
+            PathBuf::from("~/notes")
         );
     }
 }

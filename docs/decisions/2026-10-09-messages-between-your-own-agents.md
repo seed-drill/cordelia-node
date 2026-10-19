@@ -216,7 +216,7 @@ Section 7.2 says what a reader does with another device's list, and what a devic
 
 **The command works out the directory, and the node compares (C19).** The command runs in the person's environment, where `git` is, and the node may not run as the person or see the same `PATH`. In order:
 
-1. **The directory.** The first of these that there is:
+1. **The directory.** Where `summary` is given `--folder <dir>`, it is that folder, a leading `~` taken as the home directory, before all three below and never passed over for them where it is no folder, and the hook's input is not read. The first of these that there is:
    1. **The session's project directory:** the environment variable that Claude Code sets, for the hooks of a session and not for the commands its agent runs, to the directory the session was started in (`CLAUDE_PROJECT_DIR`; its name and meaning are to be confirmed against Claude Code's documentation when this is built, as the hook's `cwd` is), where it is set and names a directory. An agent's shell that has changed directory does not change it.
    2. For `summary` alone, the `cwd` field of the JSON that an agent's hook gives it on standard input, where there is one (section 5).
    3. The command's own working directory (`std::env::current_dir`).
@@ -456,7 +456,7 @@ In the second `pair_held` line, `<other>` is the other side of the first held pa
 }
 ```
 
-**The hook's directory.** `summary` takes the directory from Claude Code's variable for the session's project directory where it is set (3.1), and otherwise from the `cwd` field of the JSON object that Claude Code gives a hook on standard input. The variable's name and meaning, the field's name and its meaning, and that a hook runs in the session's directory, are to be confirmed against Claude Code's documentation when this is built. Where neither is there, the command's own working directory is used.
+**The hook's directory.** `summary` takes the directory from Claude Code's variable for the session's project directory where it is set (3.1), and otherwise from the `cwd` field of the JSON object that Claude Code gives a hook on standard input. The variable's name and meaning, the field's name and its meaning, and that a hook runs in the session's directory, are to be confirmed against Claude Code's documentation when this is built. Where neither is there, the command's own working directory is used. A session that runs in one folder for an agent whose messages are for another folder gives that folder with `--folder` (`"command": "cordelia msg summary --folder ~/notes"`), which comes before both (3.1).
 
 **An agent without hooks** is given one line in its instructions file, exactly:
 

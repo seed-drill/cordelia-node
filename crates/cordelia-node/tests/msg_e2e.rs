@@ -735,6 +735,100 @@ fn a_command_takes_its_directory_from_claude_codes_variable_first() {
     );
 }
 
+/// Run in a folder that syncs under no name, with the hook's input and
+/// Claude Code's variable naming it, `summary --folder` shows what waits
+/// for the agent of the folder it names, given with a leading `~` or as
+/// its path; without `--folder` it prints nothing (decision 2026-10-09
+/// §3.1, §5).
+#[test]
+fn the_summarys_folder_comes_before_the_session_and_the_hooks() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "for the folder given\n",
+    );
+    let desktop = &two.desktop;
+    let session = desktop.home().join("assistant");
+    std::fs::create_dir_all(&session).unwrap();
+    let input = json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit",
+        "cwd": path(&session) })
+    .to_string();
+    let summary_of = |vars: &[(&str, &str)], args: &[&str]| {
+        let said = msg_in(desktop, &session, vars, args, input.as_bytes());
+        assert!(said.status.success(), "{}", err(&said));
+        assert_eq!(err(&said), "");
+        out(&said)
+    };
+    let said = wait_for("the folder given is shown it", &two.all(), 120, || {
+        let said = summary_of(&[], &["summary", "--folder", "~/work"]);
+        said.contains(&id).then_some(said)
+    });
+    assert!(said.contains("(work)"), "{said}");
+    let work = path(&folder(desktop, "work"));
+    let said = summary_of(&[], &["summary", &format!("--folder={work}")]);
+    assert!(said.contains(&id), "{said}");
+    let in_session = [(PROJECT_DIR, path(&session))];
+    let in_session = [(in_session[0].0, in_session[0].1.as_str())];
+    let said = summary_of(&in_session, &["summary", "--folder", &work]);
+    assert!(said.contains(&id), "{said}");
+    // Without it, the session's folder, which syncs under no name.
+    assert_eq!(summary_of(&[], &["summary"]), "");
+    assert_eq!(summary_of(&in_session, &["summary"]), "");
+}
+
+/// `summary --folder` naming a folder that does not sync, or no folder,
+/// prints nothing and exits 0, though the hook's input and Claude Code's
+/// variable name a folder for whose agent a message waits: it is not
+/// passed over for them (decision 2026-10-09 §3.1, §4.1).
+#[test]
+fn the_summary_of_a_folder_given_that_does_not_sync_prints_nothing() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "not for the folder given\n",
+    );
+    let desktop = &two.desktop;
+    let work = folder(desktop, "work");
+    let input = json!({ "session_id": "s", "cwd": path(&work) }).to_string();
+    let as_work = [(PROJECT_DIR, path(&work))];
+    let as_work = [(as_work[0].0, as_work[0].1.as_str())];
+    let shown = wait_for("work is shown it", &two.all(), 120, || {
+        let said = out(&msg_in(
+            desktop,
+            &work,
+            &as_work,
+            &["summary"],
+            input.as_bytes(),
+        ));
+        said.contains(&id).then_some(said)
+    });
+    assert!(shown.contains("(work)"), "{shown}");
+    let elsewhere = desktop.home().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    for given in [
+        path(&elsewhere),
+        "~/elsewhere".into(),
+        "/no/such/folder".into(),
+    ] {
+        let said = msg_in(
+            desktop,
+            &work,
+            &as_work,
+            &["summary", "--folder", &given],
+            input.as_bytes(),
+        );
+        assert!(said.status.success(), "{given}: {}", err(&said));
+        assert_eq!(out(&said), "", "{given}");
+        assert_eq!(err(&said), "", "{given}");
+    }
+}
+
 // ── read ─────────────────────────────────────────────────────────────
 
 /// A body that holds an end line with a made-up value, the line that
