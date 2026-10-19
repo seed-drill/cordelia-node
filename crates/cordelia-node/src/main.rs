@@ -395,8 +395,9 @@ enum MsgCommand {
         /// messages are for another: give that one. In your hook:
         ///
         /// "command": "cordelia msg summary --folder ~/notes"
+
         #[arg(long, value_name = "DIR")]
-        folder: Option<std::ffi::OsString>,
+        folder: Option<String>,
     },
     /// Print one message, between two lines that say whose it is
     ///
@@ -406,6 +407,10 @@ enum MsgCommand {
         /// 8 to 32 hex characters of the message's id, as `summary` shows
         /// it
         id: String,
+        /// Read as the agent of this folder, not of the one you run in:
+        /// give the folder you gave `msg summary --folder`
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
     },
     /// Send a message, as this folder's agent: its text on standard input
     ///
@@ -429,6 +434,10 @@ enum MsgCommand {
         /// A link to an issue or a pull request: owner/repo#number
         #[arg(long, value_name = "OWNER/REPO#N")]
         re: Option<String>,
+        /// Send as the agent of this folder, not of the one you run in:
+        /// give the folder you gave `msg summary --folder`
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
     },
     /// For a person at a terminal
     ///
@@ -685,13 +694,14 @@ fn main() -> anyhow::Result<()> {
                 msg_cmd::summary(&cli.config, started, folder, false);
                 Ok(())
             }
-            MsgCommand::Read { id } => msg_cmd::read(&cli.config, &id),
+            MsgCommand::Read { id, folder } => msg_cmd::read(&cli.config, &id, folder.as_deref()),
             MsgCommand::Send {
                 to,
                 all,
                 reply,
                 ask,
                 re,
+                folder,
             } => msg_cmd::send(
                 &cli.config,
                 &msg_cmd::SendFlags {
@@ -700,6 +710,7 @@ fn main() -> anyhow::Result<()> {
                     reply,
                     ask,
                     re,
+                    folder,
                 },
             ),
             MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
@@ -8520,6 +8531,22 @@ mod tests {
             help.contains("\"command\": \"cordelia msg summary --folder ~/notes\""),
             "{help}"
         );
+        // `read` and `send` take the same folder.
+        for (command, does) in [("read", "Read"), ("send", "Send")] {
+            let help = cli
+                .find_subcommand_mut("msg")
+                .and_then(|msg| msg.find_subcommand_mut(command))
+                .expect("a command of msg")
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains(&format!(
+                    "--folder <DIR>\n          {does} as the agent of this folder, not of the one \
+                     you run in: give the folder you gave `msg summary --folder`"
+                )),
+                "{help}"
+            );
+        }
     }
 
     /// `cordelia msg log --help` gives the command's line of the record,
