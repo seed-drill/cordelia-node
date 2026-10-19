@@ -735,6 +735,201 @@ fn a_command_takes_its_directory_from_claude_codes_variable_first() {
     );
 }
 
+/// Run in a folder that syncs under no name, with the hook's input and
+/// Claude Code's variable naming it, `summary --folder` shows what waits
+/// for the agent of the folder it names, given with a leading `~` or as
+/// its path; without `--folder` it prints nothing (decision 2026-10-09
+/// §3.1, §5).
+#[test]
+fn the_summarys_folder_comes_before_the_session_and_the_hooks() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "for the folder given\n",
+    );
+    let desktop = &two.desktop;
+    let session = desktop.home().join("assistant");
+    std::fs::create_dir_all(&session).unwrap();
+    let input = json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit",
+        "cwd": path(&session) })
+    .to_string();
+    let summary_of = |vars: &[(&str, &str)], args: &[&str]| {
+        let said = msg_in(desktop, &session, vars, args, input.as_bytes());
+        assert!(said.status.success(), "{}", err(&said));
+        assert_eq!(err(&said), "");
+        out(&said)
+    };
+    let said = wait_for("the folder given is shown it", &two.all(), 120, || {
+        let said = summary_of(&[], &["summary", "--folder", "~/work"]);
+        said.contains(&id).then_some(said)
+    });
+    assert!(said.contains("(work)"), "{said}");
+    let work = path(&folder(desktop, "work"));
+    let said = summary_of(&[], &["summary", &format!("--folder={work}")]);
+    assert!(said.contains(&id), "{said}");
+    let in_session = [(PROJECT_DIR, path(&session))];
+    let in_session = [(in_session[0].0, in_session[0].1.as_str())];
+    let said = summary_of(&in_session, &["summary", "--folder", &work]);
+    assert!(said.contains(&id), "{said}");
+    // Without it, the session's folder, which syncs under no name.
+    assert_eq!(summary_of(&[], &["summary"]), "");
+    assert_eq!(summary_of(&in_session, &["summary"]), "");
+}
+
+/// A summary given `--folder` in a session whose own folder is another
+/// agent's prints a line to read that works there: run as it was printed,
+/// `read` shows the message as the folder given's agent, its line to
+/// answer, run as printed, answers as that agent, and the next summary no
+/// longer counts it. `send --to` and `--all` take the same folder; `read`
+/// and `send` given a folder that does not sync are refused (decision
+/// 2026-10-09 §3.1).
+#[test]
+fn a_message_the_summary_shows_by_its_folder_is_read_and_answered_there() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work", "--ask"],
+        "read me where you are\n",
+    );
+    let desktop = &two.desktop;
+    // The session runs in notes, which is itself mapped.
+    let session = folder(desktop, "notes");
+    let as_notes = [(PROJECT_DIR, path(&session))];
+    let as_notes = [(as_notes[0].0, as_notes[0].1.as_str())];
+    let input = json!({ "session_id": "s", "cwd": path(&session) }).to_string();
+    let in_session =
+        |args: &[&str], input: &[u8]| msg_in(desktop, &session, &as_notes, args, input);
+    let said = wait_for("work is shown it", &two.all(), 120, || {
+        let said = out(&in_session(
+            &["summary", "--folder", "~/work"],
+            input.as_bytes(),
+        ));
+        said.contains(&id).then_some(said)
+    });
+    assert!(said.contains("messages for this agent (work)"), "{said}");
+    let header = said.lines().next().unwrap();
+    let read_line = header
+        .split("Read one with: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{header}"));
+    assert_eq!(read_line, "cordelia msg read --folder ~/work <id>");
+    let words = |line: &str| -> Vec<String> {
+        let words = shell_words(line);
+        assert_eq!(words[..2], ["cordelia", "msg"], "{line}");
+        words[2..].to_vec()
+    };
+    let read_args = words(&read_line.replace("<id>", &id));
+    let read_args: Vec<&str> = read_args.iter().map(String::as_str).collect();
+    let shown = in_session(&read_args, b"");
+    assert!(shown.status.success(), "{}", err(&shown));
+    let shown = out(&shown);
+    assert!(shown.contains("read me where you are"), "{shown}");
+    let answer_line = shown
+        .lines()
+        .find_map(|line| line.strip_prefix("It asks for an answer. To answer: "))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(
+        answer_line,
+        format!("cordelia msg send --folder ~/work --reply {id}")
+    );
+    let answer_args = words(answer_line);
+    let answer_args: Vec<&str> = answer_args.iter().map(String::as_str).collect();
+    let answering = in_session(&answer_args, b"done\n");
+    assert!(
+        out(&answering).ends_with(" to notes as work.\n"),
+        "{}{}",
+        out(&answering),
+        err(&answering)
+    );
+    // Read: neither announced nor counted again.
+    let after = out(&in_session(
+        &["summary", "--folder", "~/work"],
+        input.as_bytes(),
+    ));
+    assert!(!after.contains(&id), "{after}");
+    // `--to` and `--all` take it too.
+    let to = in_session(&["send", "--folder", "~/work", "--to", "plans"], b"x\n");
+    assert!(out(&to).ends_with(" to plans as work.\n"), "{}", err(&to));
+    let all = in_session(&["send", "--all", "--folder=~/work"], b"y\n");
+    assert!(out(&all).contains(" as work"), "{}{}", out(&all), err(&all));
+    // A folder that does not sync, or no folder: refused, by their own
+    // line, and the session's folder is not taken in its place.
+    let elsewhere = desktop.home().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    for (given, shown) in [
+        ("~/elsewhere", "~/elsewhere"),
+        ("/no/such/folder", "/no/such/folder"),
+    ] {
+        let not_mapped = format!(
+            "This folder is not mapped, so no agent of yours runs here, and nothing was done. Map \
+             it with: cordelia sync map {shown} <name>"
+        );
+        refused_with(
+            &in_session(&["read", "--folder", given, &id], b""),
+            &not_mapped,
+        );
+        refused_with(
+            &in_session(&["send", "--folder", given, "--to", "plans"], b"z\n"),
+            &not_mapped,
+        );
+    }
+}
+
+/// `summary --folder` naming a folder that does not sync, or no folder,
+/// prints nothing and exits 0, though the hook's input and Claude Code's
+/// variable name a folder for whose agent a message waits: it is not
+/// passed over for them (decision 2026-10-09 §3.1, §4.1).
+#[test]
+fn the_summary_of_a_folder_given_that_does_not_sync_prints_nothing() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "not for the folder given\n",
+    );
+    let desktop = &two.desktop;
+    let work = folder(desktop, "work");
+    let input = json!({ "session_id": "s", "cwd": path(&work) }).to_string();
+    let as_work = [(PROJECT_DIR, path(&work))];
+    let as_work = [(as_work[0].0, as_work[0].1.as_str())];
+    let shown = wait_for("work is shown it", &two.all(), 120, || {
+        let said = out(&msg_in(
+            desktop,
+            &work,
+            &as_work,
+            &["summary"],
+            input.as_bytes(),
+        ));
+        said.contains(&id).then_some(said)
+    });
+    assert!(shown.contains("(work)"), "{shown}");
+    let elsewhere = desktop.home().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    for given in [
+        path(&elsewhere),
+        "~/elsewhere".into(),
+        "/no/such/folder".into(),
+    ] {
+        let said = msg_in(
+            desktop,
+            &work,
+            &as_work,
+            &["summary", "--folder", &given],
+            input.as_bytes(),
+        );
+        assert!(said.status.success(), "{given}: {}", err(&said));
+        assert_eq!(out(&said), "", "{given}");
+        assert_eq!(err(&said), "", "{given}");
+    }
+}
+
 // ── read ─────────────────────────────────────────────────────────────
 
 /// A body that holds an end line with a made-up value, the line that

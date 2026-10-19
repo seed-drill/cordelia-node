@@ -388,7 +388,20 @@ enum MsgCommand {
     /// prints a message's line, with the first line of its text, once,
     /// and after that only counts it.
     #[command(after_long_help = msg_cmd::SUMMARY_HELP)]
-    Summary,
+    Summary {
+        /// The folder whose agent's messages you want
+        ///
+        /// Use it when your session runs in one folder and the agent's
+        /// messages are for another: give that one. In your hook:
+        ///
+        /// "command": "cordelia msg summary --folder ~/notes"
+        ///
+        /// Put that hook in the settings of the project your session runs
+        /// in (its .claude/settings.json), not in ~/.claude/settings.json,
+        /// which every session of yours reads.
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
+    },
     /// Print one message, between two lines that say whose it is
     ///
     /// It marks the message read by this folder's agent, on every device
@@ -397,6 +410,10 @@ enum MsgCommand {
         /// 8 to 32 hex characters of the message's id, as `summary` shows
         /// it
         id: String,
+        /// Read as the agent of this folder, not of the one you run in:
+        /// give the folder you gave `msg summary --folder`
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
     },
     /// Send a message, as this folder's agent: its text on standard input
     ///
@@ -420,6 +437,10 @@ enum MsgCommand {
         /// A link to an issue or a pull request: owner/repo#number
         #[arg(long, value_name = "OWNER/REPO#N")]
         re: Option<String>,
+        /// Send as the agent of this folder, not of the one you run in:
+        /// give the folder you gave `msg summary --folder`
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
     },
     /// For a person at a terminal
     ///
@@ -611,8 +632,8 @@ fn main() -> anyhow::Result<()> {
     // before the command line is parsed (decision 2026-10-09 §4.1).
     let started = std::time::Instant::now();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some((config, others)) = msg_cmd::summary_asked(&args) {
-        msg_cmd::summary(&config, started, others);
+    if let Some(asked) = msg_cmd::summary_asked(&args) {
+        msg_cmd::summary(&asked.config, started, asked.folder, asked.others);
         return Ok(());
     }
     let cli = Cli::parse_from(args);
@@ -672,17 +693,18 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Msg { what }) => match what {
             // Read before the command line was parsed: here only where
             // the parser printed its help and stopped.
-            MsgCommand::Summary => {
-                msg_cmd::summary(&cli.config, started, false);
+            MsgCommand::Summary { folder } => {
+                msg_cmd::summary(&cli.config, started, folder, false);
                 Ok(())
             }
-            MsgCommand::Read { id } => msg_cmd::read(&cli.config, &id),
+            MsgCommand::Read { id, folder } => msg_cmd::read(&cli.config, &id, folder.as_deref()),
             MsgCommand::Send {
                 to,
                 all,
                 reply,
                 ask,
                 re,
+                folder,
             } => msg_cmd::send(
                 &cli.config,
                 &msg_cmd::SendFlags {
@@ -691,6 +713,7 @@ fn main() -> anyhow::Result<()> {
                     reply,
                     ask,
                     re,
+                    folder,
                 },
             ),
             MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
@@ -8488,6 +8511,53 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
+    }
+
+    /// `cordelia msg summary --help` says when to give `--folder`, and
+    /// shows the hook's line with it (decision 2026-10-09 §3.1, §5).
+    #[test]
+    fn the_summarys_help_says_when_to_give_its_folder() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("msg")
+            .and_then(|msg| msg.find_subcommand_mut("summary"))
+            .expect("msg summary is a command")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--folder <DIR>"), "{help}");
+        assert!(
+            help.contains("Use it when your session runs in one folder and the agent's messages are for another: give that one."),
+            "{help}"
+        );
+        assert!(
+            help.contains("\"command\": \"cordelia msg summary --folder ~/notes\""),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "Put that hook in the settings of the project your session runs in (its \
+                 .claude/settings.json), not in ~/.claude/settings.json, which every session of \
+                 yours reads."
+            ),
+            "{help}"
+        );
+        // `read` and `send` take the same folder.
+        for (command, does) in [("read", "Read"), ("send", "Send")] {
+            let help = cli
+                .find_subcommand_mut("msg")
+                .and_then(|msg| msg.find_subcommand_mut(command))
+                .expect("a command of msg")
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains(&format!(
+                    "--folder <DIR>\n          {does} as the agent of this folder, not of the one \
+                     you run in: give the folder you gave `msg summary --folder`"
+                )),
+                "{help}"
+            );
+        }
     }
 
     /// `cordelia msg log --help` gives the command's line of the record,
