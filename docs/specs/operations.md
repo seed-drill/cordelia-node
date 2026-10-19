@@ -799,7 +799,7 @@ launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # start
 launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # stop
 cordelia status                                                        # check
 # restart, onto a version just installed (one line):
-launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist
+launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)
 ```
 
 A restart on macOS boots the agent out and bootstraps it again from its
@@ -808,7 +808,11 @@ loaded, with the launch constraint macOS attached to it then, and never
 reads the plist again: launchd may then refuse to start a new binary that
 is signed ad hoc ("Unable to get updated LWCR", last exit code 78), every
 ten seconds, and the node stays down. A job loaded afresh has no such
-constraint. The second command runs whether or not the first found the job.
+constraint. The bootstrap runs whether or not the bootout found the job.
+Where it fails it is tried once more, 30 seconds later, and no more: a
+bootout can return before the job has gone, and 30 seconds is as long as the
+install script waits for it (§10.2). The line ends either way, so a person
+who pastes it is never left at a loop.
 
 ### 7.2 Linux systemd Unit
 

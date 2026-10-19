@@ -481,9 +481,12 @@ PLIST
     AGENT_TARGET="${AGENT_DOMAIN}/ai.seeddrill.cordelia"
     START_CMD="launchctl load ${PLIST_FILE}"
     START_SAYS="                        # run the node as a background service"
-    # Two commands, on one line a person can paste: the second runs
-    # whether or not the first found the job (restart_agent).
-    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} ${PLIST_FILE}"
+    # Two commands, on one line a person can paste. The bootstrap runs
+    # whether or not the bootout found the job, and where it fails it is
+    # tried once more 30 seconds later: a bootout can return before the
+    # job has gone, and after 30 seconds it has (BOOTSTRAP_WAIT_SECS). The
+    # plist's path is quoted, for a home whose name has a space.
+    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\")"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"

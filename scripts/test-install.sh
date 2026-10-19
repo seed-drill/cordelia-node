@@ -388,7 +388,7 @@ expect "installed=$NEW running=unknown restart=failed" 3 1
 # written, and not kickstarted.
 PLIST_OF() { echo "$1/Library/LaunchAgents/ai.seeddrill.cordelia.plist"; }
 MAC_RESTART() {
-    echo "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) $(PLIST_OF "$1")"
+    echo "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) \"$(PLIST_OF "$1")\" || (sleep 30; launchctl bootstrap gui/$(id -u) \"$(PLIST_OF "$1")\")"
 }
 setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-running-node-on-a-mac" FAKE_OS=Darwin
@@ -441,7 +441,7 @@ check "waits between them" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 30
 has "The restart command failed."
 has "  Bootstrap failed: 5: Input/output error"
 check "the two commands, on a line of their own" \
-    "$(grep -c "^  $(MAC_RESTART "$HOME_DIR")\$" "$HOME_DIR/.fake/out")" 1
+    "$(grep -cFx "  $(MAC_RESTART "$HOME_DIR")" "$HOME_DIR/.fake/out")" 1
 
 # The wait is the one given, where one is.
 setup() {
@@ -458,8 +458,43 @@ setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
 run "a-mac-node-left-as-it-is-when-asked" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
 expect "installed=$NEW running=$OLD restart=needed" 0 0
 check "the two commands, on a line of their own" \
-    "$(grep -c "^  $(MAC_RESTART "$HOME_DIR")\$" "$HOME_DIR/.fake/out")" 1
+    "$(grep -cFx "  $(MAC_RESTART "$HOME_DIR")" "$HOME_DIR/.fake/out")" 1
 check "calls to launchctl that change anything" "$(cat "$HOME_DIR/.fake/calls")" ""
+
+# The line printed, pasted into a shell as it is: the bootstrap that fails
+# while the job booted out is still going is tried once more, 30 seconds
+# later, and the node runs. One that fails for good is tried twice, and
+# the line ends. A home whose name has a space is one path.
+pasted() {
+    sed -n 's/^  \(launchctl bootout .*\)$/\1/p' "$HOME_DIR/.fake/out" > "$HOME_DIR/.fake/line"
+    : > "$HOME_DIR/.fake/calls"
+    touch "$HOME_DIR/.fake/count_sleeps"
+    set +e
+    env HOME="$HOME_DIR" PATH="$STUBS:$PATH" FAKE_OS=Darwin sh -c "$(cat "$HOME_DIR/.fake/line")" \
+        > /dev/null 2>&1
+    PASTED=$?
+    set -e
+}
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
+run "a-mac-restart-pasted" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
+echo 1 > "$HOME_DIR/.fake/still_going"
+pasted
+check "the line pasted ends well" "$PASTED" 0
+check "the calls of the line pasted" "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
+    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") sleep 30 bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+check "the node runs" "$(cat "$HOME_DIR/.fake/node_version")" "$NEW"
+touch "$HOME_DIR/.fake/bootstrap_fails"
+pasted
+check "the line pasted ends, failed" "$PASTED" 5
+check "the calls of the line pasted that fails" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 2
+
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; }
+run "a-mac-home with a space" FAKE_OS=Darwin CORDELIA_NO_RESTART=1
+expect "installed=$NEW running=$OLD restart=needed" 0 0
+pasted
+check "the line pasted in a home with a space ends well" "$PASTED" 0
+check "the plist bootstrapped in a home with a space" \
+    "$(grep -c "^bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR")\$" "$HOME_DIR/.fake/calls")" 1
 
 setup() { service; }
 run "a-mac-node-that-does-not-answer" FAKE_OS=Darwin
