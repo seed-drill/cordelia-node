@@ -1020,7 +1020,15 @@ The install script detects an existing installation and performs an in-place bin
 The restart is the service manager's: `systemctl --user daemon-reload &&
 systemctl --user restart cordelia` on Linux; on macOS `launchctl bootout` of
 the agent, then `launchctl bootstrap` of the plist the script has just
-written (§7.1 says why it is no kickstart). A bootout that fails is let go:
+written (§7.1 says why it is no kickstart). Before it boots anything out, the
+script asks launchd whether the agent is in this login's GUI domain
+(`launchctl print gui/<uid>/ai.seeddrill.cordelia`), the domain that the
+restart acts on: a job loaded from another session, such as over ssh, is in
+another domain, and is neither booted out from here nor given a second job
+beside it. The script then restarts nothing, ends with `restart=needed`
+and exit code 3, and says to run `launchctl unload` then `launchctl load`
+of the plist in the session that started it, or the installer from a
+terminal of the Mac's own login. A bootout that fails is let go:
 the job is gone already, or the bootstrap says that it is still there. A
 bootstrap that fails is tried again a second apart for 30 seconds
 (`CORDELIA_BOOTSTRAP_WAIT_SECS`), since the job booted out may not have

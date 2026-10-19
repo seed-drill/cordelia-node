@@ -159,6 +159,16 @@ cat > "$STUBS/launchctl" << 'STUB'
 case "$1" in
     list)      [ -f "$HOME/.fake/service" ] && echo "123 0 ai.seeddrill.cordelia" ;;
     kickstart) echo "kickstart $2 $3" >> "$HOME/.fake/calls"; restarted ;;
+    # The job is in this login's GUI domain, unless the test says that it
+    # was loaded in another.
+    print)
+        echo "print $2" >> "$HOME/.fake/calls"
+        if [ -f "$HOME/.fake/job_elsewhere" ]; then
+            echo "Could not find service \"ai.seeddrill.cordelia\" in domain for user gui: $(id -u)" >&2
+            exit 113
+        fi
+        echo "state = running"
+        ;;
     bootout)
         echo "bootout $2" >> "$HOME/.fake/calls"
         if [ -f "$HOME/.fake/job_gone" ]; then
@@ -395,7 +405,7 @@ run "a-running-node-on-a-mac" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the agent is booted out, then bootstrapped from its plist" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 check "the plist bootstrapped names the binary installed" \
     "$(grep -c "<string>$HOME_DIR/.cordelia/bin/cordelia</string>" "$(PLIST_OF "$HOME_DIR")")" 1
 has "The node was restarted and is running $NEW."
@@ -407,7 +417,7 @@ run "a-mac-agent-that-is-gone-already" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the bootstrap after the bootout that failed" \
     "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 has_not "Boot-out failed"
 
 # A bootstrap that fails while the job booted out is still going is tried
@@ -420,9 +430,9 @@ run "a-mac-agent-that-is-still-going-once" FAKE_OS=Darwin
 expect "installed=$NEW running=$NEW restart=done" 0 1
 check "the bootstrap is tried again after a second" \
     "$(grep -v '^sleep 1$' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
-    "bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
+    "print gui/$(id -u)/ai.seeddrill.cordelia bootout gui/$(id -u)/ai.seeddrill.cordelia bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") restart "
 check "the waits before the second bootstrap" \
-    "$(sed -n '3,4p' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
+    "$(sed -n '4,5p' "$HOME_DIR/.fake/calls" | tr '\n' ' ')" \
     "sleep 1 bootstrap gui/$(id -u) $(PLIST_OF "$HOME_DIR") "
 has_not "Bootstrap failed"
 
@@ -451,6 +461,23 @@ setup() {
 run "a-mac-agent-that-does-not-bootstrap-in-a-wait-given" FAKE_OS=Darwin CORDELIA_BOOTSTRAP_WAIT_SECS=2
 expect "installed=$NEW running=$OLD restart=failed" 3 0
 check "bootstraps, over 2 seconds" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 3
+
+# A job that is loaded, but not in this login's GUI domain (it was loaded
+# over ssh, say): nothing is booted out or bootstrapped, the restart is
+# needed, and the words say where the job is and what to do.
+setup() { service; echo "$OLD" > "$HOME/.fake/node_version"; touch "$HOME/.fake/job_elsewhere"; }
+run "a-mac-agent-in-another-domain" FAKE_OS=Darwin
+expect "installed=$NEW running=$OLD restart=needed" 3 0
+check "the calls: the domain asked, and nothing changed" \
+    "$(tr '\n' ' ' < "$HOME_DIR/.fake/calls")" "print gui/$(id -u)/ai.seeddrill.cordelia "
+check "what is said" "$(sed -n '/^The service is loaded, but not/,/^or run this installer/p' "$HOME_DIR/.fake/out")" \
+"The service is loaded, but not in the GUI domain of this login
+(gui/$(id -u)), where the restart acts: it was started from another
+session, such as over ssh. Nothing was restarted. In the session that
+started it, run:
+  launchctl unload \"$(PLIST_OF "$HOME_DIR")\"; launchctl load \"$(PLIST_OF "$HOME_DIR")\"
+or run this installer from a terminal of this Mac's own login."
+has_not "A node is running: restarting it"
 
 # Where the node is left as it is, or does not answer, the restart that
 # is named is the same two commands.

@@ -250,6 +250,18 @@ running_version() {
     node_status | sed -n 's/.*"node_version":"\([^"]*\)".*/\1/p' | tr -cd '0-9A-Za-z.+-'
 }
 
+# Whether the service is in the domain that its restart acts on. On macOS
+# that is this login's GUI domain: `launchctl list` (service_running) sees
+# a job loaded in the caller's own domain, which over ssh is another one,
+# and a job there is not booted out from here, nor a second one
+# bootstrapped beside it.
+service_here() {
+    case "$PLATFORM" in
+        darwin) launchctl print "$AGENT_TARGET" >/dev/null 2>&1 ;;
+        *)      return 0 ;;
+    esac
+}
+
 restart_service() {
     case "$PLATFORM" in
         linux)  systemctl --user daemon-reload && systemctl --user restart cordelia ;;
@@ -347,6 +359,16 @@ settle_running_node() {
         fi
         RUNNING=$(running_version)
         if [ "$RUNNING" = "$INSTALLED" ]; then
+            return
+        fi
+        if ! service_here; then
+            RESTART="needed"
+            echo "The service is loaded, but not in the GUI domain of this login"
+            echo "(${AGENT_DOMAIN}), where the restart acts: it was started from another"
+            echo "session, such as over ssh. Nothing was restarted. In the session that"
+            echo "started it, run:"
+            echo "  launchctl unload \"${PLIST_FILE}\"; launchctl load \"${PLIST_FILE}\""
+            echo "or run this installer from a terminal of this Mac's own login."
             return
         fi
         echo "A node is running: restarting it on ${INSTALLED}..."
