@@ -175,13 +175,22 @@ case "$1" in
             echo "Boot-out failed: 3: No such process" >&2
             exit 3
         fi
+        # The job is gone, and its node with it.
+        rm -f "$HOME/.fake/node_version"
         ;;
     bootstrap)
         echo "bootstrap $2 $3" >> "$HOME/.fake/calls"
         [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
+        # The code is the file's contents, 5 where it is empty.
         if [ -f "$HOME/.fake/bootstrap_fails" ]; then
-            echo "Bootstrap failed: 5: Input/output error" >&2
-            exit 5
+            code=$(cat "$HOME/.fake/bootstrap_fails"); code=${code:-5}
+            case "$code" in
+                119) why="Service is disabled" ;;
+                125) why="Domain does not support specified action" ;;
+                *)   why="Input/output error" ;;
+            esac
+            echo "Bootstrap failed: $code: $why" >&2
+            exit "$code"
         fi
         if [ -f "$HOME/.fake/still_going" ]; then
             left=$(cat "$HOME/.fake/still_going")
@@ -444,7 +453,9 @@ setup() {
     touch "$HOME/.fake/bootstrap_fails" "$HOME/.fake/count_sleeps"
 }
 run "a-mac-agent-that-does-not-bootstrap" FAKE_OS=Darwin
-expect "installed=$NEW running=$OLD restart=failed" 3 0
+# The bootout took: no node answers, as on a Mac.
+expect "installed=$NEW running=unknown restart=failed" 3 0
+has "The agent was booted out and is not loaded again: the node is not running."
 check "bootouts" "$(grep -c '^bootout ' "$HOME_DIR/.fake/calls")" 1
 check "bootstraps, over 30 seconds" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 31
 check "waits between them" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 30
@@ -459,8 +470,33 @@ setup() {
     touch "$HOME/.fake/bootstrap_fails" "$HOME/.fake/count_sleeps"
 }
 run "a-mac-agent-that-does-not-bootstrap-in-a-wait-given" FAKE_OS=Darwin CORDELIA_BOOTSTRAP_WAIT_SECS=2
-expect "installed=$NEW running=$OLD restart=failed" 3 0
+expect "installed=$NEW running=unknown restart=failed" 3 0
 check "bootstraps, over 2 seconds" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 3
+
+# A bootstrap refused for a reason no wait changes is not tried again: a
+# service that is disabled (119), a domain with no GUI login (125). Where
+# the bootout did not take, nothing is said of a node that is not running.
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"
+    echo 119 > "$HOME/.fake/bootstrap_fails"; touch "$HOME/.fake/count_sleeps"
+}
+run "a-mac-agent-that-is-disabled" FAKE_OS=Darwin
+expect "installed=$NEW running=unknown restart=failed" 3 0
+check "bootstraps" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 1
+check "waits" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 0
+has "  Bootstrap failed: 119: Service is disabled"
+has "The agent was booted out and is not loaded again: the node is not running."
+
+setup() {
+    service; echo "$OLD" > "$HOME/.fake/node_version"; touch "$HOME/.fake/job_gone"
+    echo 125 > "$HOME/.fake/bootstrap_fails"; touch "$HOME/.fake/count_sleeps"
+}
+run "a-mac-domain-with-no-gui-login" FAKE_OS=Darwin
+expect "installed=$NEW running=$OLD restart=failed" 3 0
+check "bootstraps" "$(grep -c '^bootstrap ' "$HOME_DIR/.fake/calls")" 1
+check "waits" "$(grep -c '^sleep 1$' "$HOME_DIR/.fake/calls")" 0
+has "  Bootstrap failed: 125: Domain does not support specified action"
+has_not "The agent was booted out"
 
 # A job that is loaded, but not in this login's GUI domain (it was loaded
 # over ssh, say): nothing is booted out or bootstrapped, the restart is

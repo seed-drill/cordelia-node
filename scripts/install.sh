@@ -282,19 +282,30 @@ restart_service() {
 # nothing to take out; or it is still there, and the bootstrap says so. A
 # bootstrap that fails is tried again, a second apart, for
 # BOOTSTRAP_WAIT_SECS: the job booted out may not have finished going.
-# One that still fails then has failed for good: what launchctl said is
-# printed, and the restart has failed.
+# Two codes that no wait changes end it at once: 119, the service is
+# disabled, and 125, the domain does not support the action (no GUI
+# login). Others are tried again, since launchctl gives the same code (5,
+# 37) for a job still going as for some that will not pass. One that
+# still fails then has failed for good: what launchctl said is printed,
+# and where the bootout took, that the node is not running.
 restart_agent() {
-    launchctl bootout "$AGENT_TARGET" 2>/dev/null || :
+    booted_out=""
+    launchctl bootout "$AGENT_TARGET" 2>/dev/null && booted_out=yes
     waited=0
-    until launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err"; do
-        if [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ]; then
-            sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
-            return 1
-        fi
+    while :; do
+        launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err" && return 0
+        case "$?" in
+            119|125) break ;;
+        esac
+        [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ] && break
         sleep 1
         waited=$((waited + 1))
     done
+    sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
+    if [ -n "$booted_out" ]; then
+        echo "The agent was booted out and is not loaded again: the node is not running."
+    fi
+    return 1
 }
 
 # Wait, for so many tries a second apart, until the node answers.

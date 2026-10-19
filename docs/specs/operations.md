@@ -1034,9 +1034,13 @@ bootstrap that fails is tried again a second apart for 30 seconds
 (`CORDELIA_BOOTSTRAP_WAIT_SECS`), since the job booted out may not have
 finished going: the node stops within 30 seconds of being told to, and
 launchd kills a job that has not exited 20 seconds after it was told to
-stop. One that still fails then has failed for good: the script prints what
-launchctl said and the two commands to run by hand, on one line, and ends
-with `restart=failed` and exit code 3. The node's own sentences that say
+stop. Two codes that no wait changes end it at once: 119 (the service is
+disabled) and 125 (the domain does not support the action: no GUI login).
+Others are tried again, since launchctl gives the same code for a job still
+going as for some that will not pass. One that still fails then has failed
+for good: the script prints what launchctl said, that the node is not
+running where the bootout took, and the two commands to run by hand, on one
+line, and ends with `restart=failed` and exit code 3. The node's own sentences that say
 how to restart it (its version check, the commands it refuses until it is
 restarted) name the same commands.
 
