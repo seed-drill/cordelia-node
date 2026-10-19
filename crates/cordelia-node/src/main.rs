@@ -395,7 +395,10 @@ enum MsgCommand {
         /// messages are for another: give that one. In your hook:
         ///
         /// "command": "cordelia msg summary --folder ~/notes"
-
+        ///
+        /// Put that hook in the settings of the project your session runs
+        /// in (its .claude/settings.json), not in ~/.claude/settings.json,
+        /// which every session of yours reads.
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
     },
@@ -8529,6 +8532,14 @@ mod tests {
         );
         assert!(
             help.contains("\"command\": \"cordelia msg summary --folder ~/notes\""),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "Put that hook in the settings of the project your session runs in (its \
+                 .claude/settings.json), not in ~/.claude/settings.json, which every session of \
+                 yours reads."
+            ),
             "{help}"
         );
         // `read` and `send` take the same folder.
