@@ -51,12 +51,12 @@ MUTATIONS = [
         }
 
 ''',
-      '''        let promoted = &warm_peers[Self::random_index(warm_peers.len())];'''],
+      '''        let promoted = &warm_peers[self.random_index(warm_peers.len())];'''],
      ['''''',
       '''        if warm_peers.is_empty() {
             return;
         }
-        let promoted = &warm_peers[Self::random_index(warm_peers.len())];'''],
+        let promoted = &warm_peers[self.random_index(warm_peers.len())];'''],
      [gov("test_churn_hot_demotes_none_where_no_warm_peer_may_take_its_place")]),
     ("CH7 hot churn may demote a trusted peer", GOVERNOR,
      '''            .filter(|p| p.state == PeerState::Hot && !self.is_trusted(p))
@@ -69,9 +69,24 @@ MUTATIONS = [
      '''            .filter(|p| self.may_be_made_hot(p) && Self::has_warm_tenure(p) && !self.is_trusted(p))''',
      [gov("test_churn_hot_may_promote_a_trusted_peer")]),
     ("CH9 hot churn promotes the first warm peer, not a random one", GOVERNOR,
-     '''        let promoted = &warm_peers[Self::random_index(warm_peers.len())];''',
+     '''        let promoted = &warm_peers[self.random_index(warm_peers.len())];''',
      '''        let promoted = &warm_peers[0];''',
      [gov("test_churn_hot_promotes_a_random_warm_peer")]),
+    # The picks below go back to the time modulo the count, as they were,
+    # with the time from the governor's clock, which the tests make one
+    # that counts in microseconds.
+    ("CH10 the hot peer churn demotes is the time modulo the count", GOVERNOR,
+     '''        let victim = &hot_peers[self.random_index(hot_peers.len())];''',
+     '''        let victim = &hot_peers[(self.clock_nanos)() as usize % hot_peers.len()];''',
+     [gov("test_churn_hot_demotes_a_random_hot_peer_on_a_microsecond_clock")]),
+    ("CH11 step 4's shuffle is seeded by the time as it was", GOVERNOR,
+     '''            let j = self.random_index(i + 1);''',
+     '''            let j = (((self.clock_nanos)() as usize).wrapping_mul(i + 1).wrapping_add(7)) % (i + 1);''',
+     [gov("test_step_4_promotes_a_random_warm_peer_on_a_microsecond_clock")]),
+    ("CH12 the churn's jitter is the time modulo the jitter", GOVERNOR,
+     '''            self.random_index(self.targets.churn_jitter_secs as usize) as u64''',
+     '''            (self.clock_nanos)() as u64 % self.targets.churn_jitter_secs''',
+     [gov("test_churn_jitter_is_random_on_a_microsecond_clock")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
