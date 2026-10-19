@@ -2305,6 +2305,18 @@ mod tests {
         s.claude(serde_json::json!({ "dir": other }));
         assert!(!s.remembers("/home/sam/notes"));
         assert!(sync_state::load(&s.db, &there, "grp_x").unwrap().is_empty());
+
+        // With no directory remembered, neither the one in use nor the
+        // one sync was last on, every folder forgets when sync is turned
+        // on: a mapped folder's record too, whatever left it.
+        let s = Settings::on();
+        s.map("/home/sam/notes", "lab");
+        s.agreed("/home/sam/notes");
+        meta::remove(&s.db, meta::SYNC_CLAUDE_DIR).unwrap();
+        meta::remove(&s.db, meta::SYNC_CLAUDE_LAST_DIR).unwrap();
+        assert!(s.remembers("/home/sam/notes"));
+        s.claude(serde_json::json!({ "dir": DIR }));
+        assert!(!s.remembers("/home/sam/notes"));
     }
 
     /// Turning home memory off unmaps the home directory, so the node has

@@ -2245,6 +2245,55 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&b_mem), ["MEMORY.md"]);
 }
 
+/// What `cordelia sync off` tells a person to do to change a folder on
+/// this machine only: unmap it. While it is unmapped, nothing done to it
+/// is sent. Mapped again, it merges: a file deleted here comes back, a
+/// file added here is sent, and a file changed here takes the other
+/// devices' version, with this device's beside it as a conflict copy,
+/// which syncs as any file does.
+#[test]
+fn a_folder_changed_while_unmapped_is_sent_nowhere_until_mapped_again() {
+    let (mut a, mut b) = paired_explicit();
+    let a_notes = a.plain_dir("notes");
+    let a_mem = a.claude_folder(&a_notes);
+    let b_notes = b.plain_dir("notes");
+    let b_mem = b.claude_folder(&b_notes);
+    for (name, text) in [("one.md", "one\n"), ("two.md", "two\n")] {
+        std::fs::write(a_mem.join(name), text).unwrap();
+    }
+    map(&a, &a_notes, "lab-notes");
+    map(&b, &b_notes, "lab-notes");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["one.md", "two.md"]);
+
+    unmap(&a, &a_notes);
+    settle(&mut a, &mut b);
+    std::fs::remove_file(a_mem.join("one.md")).unwrap();
+    std::fs::write(a_mem.join("two.md"), "two, changed here only\n").unwrap();
+    std::fs::write(a_mem.join("three.md"), "three\n").unwrap();
+    settle(&mut a, &mut b);
+    // Sent nowhere.
+    assert_eq!(files(&b_mem), ["one.md", "two.md"]);
+    assert_eq!(read(&b_mem, "two.md").as_deref(), Some("two\n"));
+
+    // Mapped again: it merges.
+    map(&a, &a_notes, "lab-notes");
+    settle(&mut a, &mut b);
+    for mem in [&a_mem, &b_mem] {
+        let names = files(mem);
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(&names[0], "one.md");
+        assert_eq!(&names[1], "three.md");
+        assert!(names[2].starts_with("two.conflict-"), "{names:?}");
+        assert_eq!(&names[3], "two.md");
+        assert_eq!(read(mem, "two.md").as_deref(), Some("two\n"));
+        assert_eq!(
+            read(mem, &names[2]).as_deref(),
+            Some("two, changed here only\n")
+        );
+    }
+}
+
 /// A mapped folder whose memory directory is gone (its disk is not
 /// attached, or it was moved aside) is an error to show, never a reason to
 /// delete the memory everywhere else.
