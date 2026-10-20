@@ -3608,6 +3608,14 @@ mod tests {
     #[actix_web::test]
     async fn a_summary_of_another_version_or_while_held_up_is_nothing() {
         let (state, id) = a_node_with_a_message();
+        // A summary of this version gives the message its place, so that
+        // it is a line `announced` could mark, as it is in use.
+        let (status, said) =
+            answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
+        assert_eq!(
+            (status, said["lines"][0]["id"].clone()),
+            (200, json!(hex::encode(id)))
+        );
         let mut other = summary_asked("work", 100);
         other.version = "0.0.0".into();
         let (status, _) = answer(summary(asked(), state.clone(), other).await).await;
