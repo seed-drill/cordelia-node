@@ -651,6 +651,7 @@ mod tests {
                 "{relay:?}"
             );
         }
+        assert_eq!(read(&on.conn).unwrap().first_started, Some(START_OF_TEST));
         // Its first start then is no first start: it marks nothing more.
         let again = started(&on.conn, &set_up, START_OF_TEST + 5).unwrap();
         assert_eq!(
@@ -765,6 +766,21 @@ mod tests {
         note_answer(conn, &keyless, &kept, true, &OTHER_KEY, START_OF_TEST + 1).unwrap();
         assert_eq!(holds_now(conn, &keyless, Some(OTHER_KEY)), Holds::Holds);
         assert_eq!(holds_now(conn, &keyless, Some(BY)), Holds::Lacks);
+    }
+
+    /// A value that cannot be read is read as nothing known (decision
+    /// 2026-10-19 §1): every relay then lacks the change until it
+    /// answers, which errs the safe way.
+    #[test]
+    fn a_value_that_cannot_be_read_is_nothing_known() {
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        let a = relay("a.example:9474", Some(BY));
+        mark(&s[0].conn, std::slice::from_ref(&a), START_OF_TEST).unwrap();
+        assert_eq!(holds_now(&s[0].conn, &a, None), Holds::Neither);
+        meta::set(&s[0].conn, meta::PERSON_RELAYS_KNOWN, "{\"relays\": 7}").unwrap();
+        assert_eq!(read(&s[0].conn).unwrap(), Known::default());
+        assert_eq!(holds_now(&s[0].conn, &a, None), Holds::Lacks);
     }
 
     /// The two times (decision 2026-10-19 §1): when the kept entry came
