@@ -507,12 +507,20 @@ pub struct AnnouncedRequest {
 
 // ── POST /api/v1/messages/announced ──────────────────────────────────
 
+/// Whether `id` is a message's ID whole, as the command sends it: 32
+/// lower-case hex characters.
+fn is_whole(id: &str) -> bool {
+    id.len() == 2 * AGENT_MESSAGE_ID_BYTES
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// What `cordelia msg summary` printed (decision 2026-10-09 §4.1, §7.2):
 /// the command says it after it printed the lines of an answer that came
 /// within its time, and the node marks them announced ([`announced_of`]).
 /// It answers nothing, whatever it marked: the command does not wait on
 /// it past its 100 ms, and prints nothing more. More IDs than a summary
-/// has lines, or one that is not an ID whole, mark nothing. It tries the
+/// has lines, or one that is not an ID whole in lower-case hex, mark
+/// nothing. It tries the
 /// store's lock as `summary` does, without holding the worker, for at
 /// most the summary's 100 ms, and marks nothing where it did not have it
 /// (C20).
@@ -533,7 +541,7 @@ pub async fn announced(
     let Some(ids) = body
         .ids
         .iter()
-        .map(|id| match id.len() == 2 * AGENT_MESSAGE_ID_BYTES {
+        .map(|id| match is_whole(id) {
             true => hex::decode(id).ok()?.try_into().ok(),
             false => None,
         })
@@ -3451,10 +3459,13 @@ mod tests {
         let mut other = told_asked("work", std::slice::from_ref(&whole));
         other.version = "0.0.0".into();
         let too_many = vec![whole.clone(); AGENT_MESSAGE_SUMMARY_LINES + 1];
+        // Upper case is another form of the same ID.
+        assert_ne!(whole.to_ascii_uppercase(), whole);
         for wrong in [
             other,
             told_asked("work", &too_many),
             told_asked("work", &[whole[..8].to_string()]),
+            told_asked("work", &[whole.to_ascii_uppercase()]),
         ] {
             let (status, _) = answer(announced(asked(), state.clone(), wrong).await).await;
             assert_eq!(status, 204);
