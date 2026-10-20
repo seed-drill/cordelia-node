@@ -4361,6 +4361,7 @@ fn relay_snapshots(
                     unreachable_secs: None,
                     last_tried_secs: None,
                     error: Some(format!("the same relay as {}", set_up[first].host)),
+                    tried: Default::default(),
                 };
             }
             let found = resolved
@@ -4374,6 +4375,7 @@ fn relay_snapshots(
                     unreachable_secs: None,
                     last_tried_secs: None,
                     error: Some(NAME_DOES_NOT_RESOLVE.into()),
+                    tried: cordelia_api::state::Tried::LookedUp,
                 };
             };
             let tried = tries.get(&tried_relay(relay));
@@ -4403,6 +4405,12 @@ fn relay_snapshots(
                 error: failing
                     .and_then(|t| t.error.clone())
                     .or_else(|| wrong_key_at.then(|| ANOTHER_KEY_ANSWERED.to_string())),
+                // A relay with the wrong key, where another answers at its
+                // address, is not dialled (decision 2026-10-19 §5, S9).
+                tried: match wrong_key_at {
+                    true => cordelia_api::state::Tried::NotDialled,
+                    false => cordelia_api::state::Tried::Dialled,
+                },
             }
         })
         .collect()
@@ -5448,6 +5456,11 @@ mod tests {
         // Its key is said as any relay's is.
         let key = cordelia_crypto::bech32::encode_public_key(&[8; 32]).unwrap();
         assert_eq!(listed[1].key.as_deref(), Some(key.as_str()));
+        // The one whose name does not resolve is looked up; the others are
+        // dialled (decision 2026-10-19 §5, S9).
+        use cordelia_api::state::Tried;
+        let tried: Vec<Tried> = listed.iter().map(|relay| relay.tried).collect();
+        assert_eq!(tried, [Tried::Dialled, Tried::LookedUp, Tried::Dialled]);
         // With no name resolved, every relay is still listed.
         let none = relay_snapshots(&set_up, &[], &tries, &[], &|_| true);
         assert_eq!(none.len(), 3);
@@ -5783,10 +5796,17 @@ mod tests {
         let key = |k: [u8; 32]| cordelia_crypto::bech32::encode_public_key(&k).ok();
         assert_eq!(listed[0].key, key([7; 32]));
         assert_eq!(listed[1].key, key([8; 32]));
-        // And without what the connections say, by its tries alone.
+        // The one with the wrong key, where another answers at its
+        // address, is not dialled (decision 2026-10-19 §5, S9).
+        use cordelia_api::state::Tried;
+        assert_eq!(listed[0].tried, Tried::Dialled);
+        assert_eq!(listed[1].tried, Tried::NotDialled);
+        // And without what the connections say, by its tries alone: it
+        // was dialled, and another key answered.
         let itself = [OneRelay::Itself; 2];
         let listed = relay_snapshots(&set_up, &resolved, &tries, &itself, &connected);
         assert_eq!(listed[1].state, "wrong key");
+        assert_eq!(listed[1].tried, Tried::Dialled);
     }
 
     /// A device answers a request of the older kind with nothing, as a
