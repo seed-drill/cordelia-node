@@ -2930,6 +2930,67 @@ mod tests {
         assert_eq!(signed_on(&s, 0, &stranger.key()), (1_280, 2 * 1_280));
     }
 
+    /// The slots that tell a delete are worked out again when the keys
+    /// the device knows change (decision 2026-10-19 §2, rule 1): a delete
+    /// under `added/` and a key is a word while the key is unknown here,
+    /// and no word once a record that adds it counts.
+    #[test]
+    fn the_slots_are_worked_out_again_when_a_key_comes_to_count() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        let nine = Machine::new(9);
+        let added = crate::person::added_name(&nine.key()).unwrap();
+        let delete = entry_by(&s[0].identity, &personal, 2, &added, Value::Delete, &[]);
+        let now = s.tick();
+        entries::store(&s[0].conn, &delete, now).unwrap();
+        let before = signed_on(&s, 0, &s.key(0));
+        // Device 1 adds the ninth, and device 0 is given its record.
+        let by_one =
+            crate::adding::add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now)
+                .unwrap();
+        let now = s.tick();
+        take(&s[0].conn, &s[0].identity, &by_one.record.unwrap(), now).unwrap();
+        assert!(s[0].counts(&nine.key()));
+        let after = signed_on(&s, 0, &s.key(0));
+        assert_eq!(after, (before.0 - 1_280, before.1 + 1_280), "{before:?}");
+    }
+
+    /// A delete under `added/` and a key that the device keeps a record
+    /// of, though the record does not count, is no word (decision
+    /// 2026-10-19 §2, rule 1).
+    #[test]
+    fn a_delete_under_added_and_a_recorded_key_that_does_not_count_is_no_word() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        // Device 1 adds a ninth, which may not add: a record by the ninth
+        // is kept, and does not count.
+        let (nine, ten) = (Machine::new(9), Machine::new(10));
+        let now = s.tick();
+        let by_one =
+            crate::adding::add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now)
+                .unwrap();
+        take(&s[0].conn, &s[0].identity, &by_one.record.unwrap(), now).unwrap();
+        assert!(s[0].counts(&nine.key()));
+        let statement = &s[0].held().statement.statement;
+        let record = cordelia_crypto::addition::Addition::under(
+            statement,
+            cordelia_crypto::statement::Device::new(ten.key(), "device 10").unwrap(),
+            nine.key(),
+            now as u64,
+        )
+        .unwrap()
+        .sign(&nine.identity)
+        .unwrap();
+        crate::person::see_addition(&s[0].conn, &record, now).unwrap();
+        assert!(!s[0].counts(&ten.key()));
+        let added = crate::person::added_name(&ten.key()).unwrap();
+        let delete = entry_by(&s[0].identity, &personal, 2, &added, Value::Delete, &[]);
+        let before = signed_on(&s, 0, &s.key(0));
+        entries::store(&s[0].conn, &delete, now).unwrap();
+        let after = signed_on(&s, 0, &s.key(0));
+        assert_eq!(after, (before.0, before.1 + 1_280), "{before:?}");
+    }
+
     /// The content of the smallest entry: every word is one.
     const MIN_WORD: usize = cordelia_core::protocol::MIN_ENTRY_CONTENT_BYTES;
 }
