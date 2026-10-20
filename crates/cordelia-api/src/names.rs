@@ -454,12 +454,23 @@ pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> 
 /// read of its own, and nothing else needs it: every read keeps what it
 /// found, the entries stored after start are few between two cycles, and
 /// a node whose sync is off has no cycle and reads ahead only here.
-pub fn read_ahead_at_start(state: std::sync::Arc<AppState>) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+///
+/// Only a personal node (`personal`) that is not held up reads ahead: the
+/// thread it reads on, where it does. A relay holds no personal channel,
+/// and a node that is held up touches nothing until it may run. A device
+/// that has stopped reads ahead nothing ([`keeps_what_it_reads`]).
+pub fn read_ahead_at_start(
+    state: std::sync::Arc<AppState>,
+    personal: bool,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !personal || state.held.why().is_some() {
+        return None;
+    }
+    Some(std::thread::spawn(move || {
         if let Err(e) = read_ahead(&state.db) {
             tracing::warn!(error = %e, "the personal channel could not be read ahead at start");
         }
-    })
+    }))
 }
 
 /// How many entries of the personal channel a read of its words under

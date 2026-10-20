@@ -11,13 +11,14 @@ use std::sync::atomic::AtomicU64;
 
 use cordelia_api::names::{listed, not_read_ahead, read_ahead_at_start, say};
 use cordelia_api::person::{first_statement, hold_name};
-use cordelia_api::state::AppState;
+use cordelia_api::state::{AppState, Held};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::phrase::Phrase;
 
 /// After a node's read ahead at start, a read of the personal channel
 /// under the lock checks and opens none of the entries stored: every one
-/// is kept as it is stored. Before it, each would have been.
+/// is kept as it is stored. Before it, each would have been. A node that
+/// is not personal, or that is held up, reads nothing ahead.
 #[test]
 fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
     let conn = cordelia_storage::db::open_in_memory().unwrap();
@@ -53,7 +54,18 @@ fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
         held: Default::default(),
         history: Default::default(),
     });
-    read_ahead_at_start(state.clone()).join().unwrap();
+    // Neither a node of another role nor one that is held up reads
+    // ahead.
+    assert!(read_ahead_at_start(state.clone(), false).is_none());
+    state.held.hold(Held::FirstStart("a test".into()));
+    assert!(read_ahead_at_start(state.clone(), true).is_none());
+    assert_eq!(not_read_ahead(&state.db.lock().unwrap()).unwrap(), stored);
+    state.held.release();
+
+    read_ahead_at_start(state.clone(), true)
+        .expect("a personal node that is not held up reads ahead")
+        .join()
+        .unwrap();
 
     let conn = state.db.lock().unwrap();
     assert_eq!(not_read_ahead(&conn).unwrap(), 0);
