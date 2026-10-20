@@ -1095,6 +1095,48 @@ mod tests {
         .unwrap()
     }
 
+    /// Step 10 reads what the personal channel lists now, whatever a read
+    /// before it found and kept: a name that a device comes to list is
+    /// one to send to, and one that no device lists any longer is not.
+    #[test]
+    fn test_the_recipient_is_a_name_the_personal_channel_lists_now() {
+        let mut s = devices(2);
+        let t = s.now;
+        let to_garden = says("notes", "garden", "x");
+        let no_such = Refused::NoSuchName("garden".into());
+        assert_eq!(refused(&s, 0, &to_garden, t), no_such);
+        // Device 1 comes to sync the name, and device 0 is given its word.
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "garden", now).unwrap();
+        s.pass(1, 0);
+        sent(&s, 0, &to_garden, t);
+        // And syncs it no longer.
+        let now = s.tick();
+        crate::names::unsay(&s[1].conn, &s[1].identity, "garden", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(refused(&s, 0, &to_garden, t), no_such);
+        // And again: its word, above its delete.
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "garden", now).unwrap();
+        s.pass(1, 0);
+        sent(&s, 0, &to_garden, t + 1);
+        // A name whose word device 0 is first given as a delete, and then
+        // as a word again above it.
+        let to_shed = says("notes", "shed", "x");
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        crate::names::unsay(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        s.pass(1, 0);
+        assert_eq!(
+            refused(&s, 0, &to_shed, t + 2),
+            Refused::NoSuchName("shed".into())
+        );
+        let now = s.tick();
+        crate::names::say(&s[1].conn, &s[1].identity, "shed", now).unwrap();
+        s.pass(1, 0);
+        sent(&s, 0, &to_shed, t + 2);
+    }
+
     // ── A relay, as its store takes what it is pushed ───────────────
 
     /// A relay of a test: its own store, which takes what a device pushes

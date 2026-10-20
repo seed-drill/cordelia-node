@@ -184,6 +184,27 @@ pub fn slot_entries(
     Ok(entries)
 }
 
+/// Every entry that the store holds in a channel, as it is stored and
+/// unchecked, in the order this node stored them. Whoever reads them
+/// checks each, as [`slot_entries`] does: one that does not pass is no
+/// entry.
+pub fn channel_stored(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<StoredEntry>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM entries
+             WHERE channel_id = ?1
+             ORDER BY seq ASC"
+        ))
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], stored_entry_from_row)
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Every slot of a channel in which the store holds an entry, in the order
 /// in which each slot's oldest entry was stored. A device reads a whole
 /// channel of its own by its slots, to carry what it holds of it (decision
