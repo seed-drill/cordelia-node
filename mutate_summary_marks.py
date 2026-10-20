@@ -105,6 +105,91 @@ MUTATIONS = [
      '''        let _ = (&told, left);''',
      [e2e("the_summary_announces_a_message_once_and_then_counts_it"),
       e2e("a_message_from_one_device_is_announced_once_and_read_on_the_other")]),
+    ("SM11 the node marks a message from a signer that does not count", MESSAGES,
+     '''                || !counting.counts(&key_of(&message.signer)?)
+            {
+                continue;
+            }
+            kept(held::announce(conn, &id, &name))?;''',
+     '''            {
+                continue;
+            }
+            kept(held::announce(conn, &id, &name))?;''',
+     [api("only_a_line_of_the_folders_agent_is_marked_announced")]),
+    ("SM12 the node marks with sync off", MESSAGES,
+     '''        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none()
+            || stands(conn)? != Stands::Applied
+            || own_channels.no_place()
+        {
+            return Ok(0);
+        }''',
+     '''        if stands(conn)? != Stands::Applied || own_channels.no_place() {
+            return Ok(0);
+        }''',
+     [api("only_a_line_of_the_folders_agent_is_marked_announced")]),
+    ("SM13 the node marks on a device that does not stand applied", MESSAGES,
+     '''        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none()
+            || stands(conn)? != Stands::Applied
+            || own_channels.no_place()
+        {
+            return Ok(0);
+        }''',
+     '''        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none() || own_channels.no_place() {
+            return Ok(0);
+        }''',
+     [api("only_a_line_of_the_folders_agent_is_marked_announced")]),
+    ("SM14 the node marks on a device with no place for messages", MESSAGES,
+     '''        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none()
+            || stands(conn)? != Stands::Applied
+            || own_channels.no_place()
+        {
+            return Ok(0);
+        }''',
+     '''        if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none() || stands(conn)? != Stands::Applied
+        {
+            return Ok(0);
+        }''',
+     [api("only_a_line_of_the_folders_agent_is_marked_announced")]),
+    ("SM15 the route marks while the node is held up", MESSAGES,
+     '''        Err(_) => return Ok(nothing()),
+    }
+    if body.version != env!("CARGO_PKG_VERSION") || body.ids.len() > AGENT_MESSAGE_SUMMARY_LINES {''',
+     '''        Err(_) => {}
+    }
+    if body.version != env!("CARGO_PKG_VERSION") || body.ids.len() > AGENT_MESSAGE_SUMMARY_LINES {''',
+     [api("a_summary_of_another_version_or_while_held_up_is_nothing")]),
+    ("SM16 the route holds its worker while it waits for the store", MESSAGES,
+     '''    let Some(db) = db_by(&state, deadline).await else {
+        return Ok(nothing());
+    };
+    let now = state.sync_control.now();
+    let _ = announced_of(''',
+     '''    let _ = deadline;
+    let db = db_of(&state);
+    let now = state.sync_control.now();
+    let _ = announced_of(''',
+     [api("another_request_is_served_while_announced_waits_for_the_store")]),
+    ("SM17 the route waits for the store past the summary's 100 ms", MESSAGES,
+     '''    let Some(db) = db_by(&state, deadline).await else {
+        return Ok(nothing());
+    };
+    let now = state.sync_control.now();
+    let _ = announced_of(''',
+     '''    let Some(db) = db_by(&state, deadline + Duration::from_secs(5)).await else {
+        return Ok(nothing());
+    };
+    let now = state.sync_control.now();
+    let _ = announced_of(''',
+     [api("another_request_is_served_while_announced_waits_for_the_store")]),
+    ("SM18 the command's word of what it printed is not limited by the time left", MSG_CMD,
+     '''        node.post("/api/v1/messages/announced", &told, left);''',
+     '''        node.post("/api/v1/messages/announced", &told, Duration::from_secs(10));''',
+     [e2e("the_summarys_word_of_what_it_printed_is_limited_by_the_time_left")]),
+    ("SM19 the route takes an ID in upper case", MESSAGES,
+     '''    id.len() == 2 * AGENT_MESSAGE_ID_BYTES
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))''',
+     '''    id.len() == 2 * AGENT_MESSAGE_ID_BYTES''',
+     [api("the_node_marks_announced_what_the_command_says_it_printed")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
