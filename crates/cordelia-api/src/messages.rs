@@ -512,12 +512,16 @@ pub struct AnnouncedRequest {
 /// within its time, and the node marks them announced ([`announced_of`]).
 /// It answers nothing, whatever it marked: the command does not wait on
 /// it past its 100 ms, and prints nothing more. More IDs than a summary
-/// has lines, or one that is not an ID whole, mark nothing.
+/// has lines, or one that is not an ID whole, mark nothing. It tries the
+/// store's lock as `summary` does, without holding the worker, for at
+/// most the summary's 100 ms, and marks nothing where it did not have it
+/// (C20).
 pub async fn announced(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<AnnouncedRequest>,
 ) -> Result<HttpResponse, ApiError> {
+    let deadline = Instant::now() + summary_wait(AGENT_MESSAGE_SUMMARY_WAIT_MS);
     match asked(&req, &state) {
         Ok(()) => {}
         Err(ApiError::Unauthorized) => return Err(ApiError::Unauthorized),
@@ -537,8 +541,10 @@ pub async fn announced(
     else {
         return Ok(nothing());
     };
+    let Some(db) = db_by(&state, deadline).await else {
+        return Ok(nothing());
+    };
     let now = state.sync_control.now();
-    let db = db_of(&state);
     let _ = announced_of(
         &db,
         &state.identity,
@@ -3466,6 +3472,50 @@ mod tests {
             "the other request waited for the summary"
         );
         assert!(waited_until.duration_since(began) >= Duration::from_millis(100));
+    }
+
+    /// While `announced` waits for the store's lock, the worker it runs on
+    /// serves another request; it waits at most the summary's 100 ms, and
+    /// then marks nothing (decision 2026-10-09 §4.1, C20).
+    #[actix_web::test]
+    async fn another_request_is_served_while_announced_waits_for_the_store() {
+        let (state, id) = a_node_with_a_message();
+        let (holding, held) = std::sync::mpsc::channel();
+        let other = state.clone();
+        // Another holds the store's lock for 400 ms, longer than the wait.
+        let holder = std::thread::spawn(move || {
+            let _held = other.db.lock().unwrap();
+            holding.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        held.recv().unwrap();
+        let began = Instant::now();
+        let waits = async {
+            let told = told_asked("work", &[hex::encode(id)]);
+            let answered = announced(asked(), state.clone(), told).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        // Another request, sent once `announced` is waiting: of another
+        // version, which is answered without the store.
+        let another = async {
+            actix_web::rt::time::sleep(Duration::from_millis(10)).await;
+            let mut other = summary_asked("work", 100);
+            other.version = "0.0.0".into();
+            let answered = summary(asked(), state.clone(), other).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        let ((waited, waited_until), (served, served_at)) = tokio::join!(waits, another);
+        holder.join().unwrap();
+        assert_eq!((waited, served), (204, 204));
+        assert!(
+            served_at < waited_until,
+            "the other request waited for announced"
+        );
+        let waited = waited_until.duration_since(began);
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_millis(400), "{waited:?}");
+        // It gave up the lock it did not have, and marked nothing.
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
     }
 
     /// The node's status answers the `messages` object on a personal node
