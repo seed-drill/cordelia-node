@@ -230,7 +230,7 @@ fn words(
     standing: &Standing,
     of: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<Words, PersonError> {
-    words_in(conn, standing, of, &KEPT)
+    with_kept(|slot| words_in(conn, standing, of, slot))
 }
 
 /// [`words`], with what is kept in `slot`.
@@ -327,7 +327,29 @@ struct Kept {
 type Slot = std::sync::Mutex<Option<Kept>>;
 
 /// What the process keeps between reads.
+#[cfg(not(test))]
 static KEPT: Slot = std::sync::Mutex::new(None);
+
+// In this crate's unit tests, each test's thread keeps its own: a test
+// that asks what is kept finds only what it read, never what a test
+// beside it read. A test runs on a thread of its own, and what it reads
+// it reads on that thread.
+#[cfg(test)]
+thread_local! {
+    static KEPT: Slot = const { std::sync::Mutex::new(None) };
+}
+
+/// `f`, with what the process keeps between reads ([`KEPT`]).
+#[cfg(not(test))]
+fn with_kept<R>(f: impl FnOnce(&Slot) -> R) -> R {
+    f(&KEPT)
+}
+
+/// `f`, with what this test's thread keeps between reads ([`KEPT`]).
+#[cfg(test)]
+fn with_kept<R>(f: impl FnOnce(&Slot) -> R) -> R {
+    KEPT.with(f)
+}
 
 /// Keep nothing of any personal channel ([`Kept`]): what was found of
 /// each entry, its name among it, is let go. Done wherever a device no
@@ -335,8 +357,12 @@ static KEPT: Slot = std::sync::Mutex::new(None);
 /// when it moves under another phrase, and when it stops (it is removed,
 /// is not listed, or the change does not open for it). A read that comes
 /// after checks and opens afresh what the store holds then.
+///
+/// A device that comes into a fork keeps what it read, on purpose: it
+/// still stands in that channel, and reads it, until the two statements
+/// are settled ([`keeps_what_it_reads`]).
 pub(crate) fn forget_kept() {
-    *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    with_kept(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()) = None);
 }
 
 impl Kept {
@@ -443,7 +469,7 @@ fn words_kept(
 /// A cycle of sync does this before it reads the words under the lock:
 /// at the first cycle after a node starts, every entry is read afresh.
 pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> {
-    read_ahead_in(db, &KEPT)
+    with_kept(|slot| read_ahead_in(db, slot))
 }
 
 /// [`read_ahead`] once, on a thread of its own, as a node starts: what a
@@ -482,14 +508,15 @@ pub fn not_read_ahead(conn: &Connection) -> Result<usize, PersonError> {
     };
     let channel = derive::channel_id(&derive::personal_secret(&standing.secret)?)?;
     let stored = entries::channel_stored(conn, &channel)?;
-    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(match &*kept {
-        Some(kept) if kept.channel == channel => stored
-            .iter()
-            .filter(|held| !kept.holds(&held.entry))
-            .count(),
-        _ => stored.len(),
-    })
+    Ok(with_kept(|slot| {
+        match &*slot.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(kept) if kept.channel == channel => stored
+                .iter()
+                .filter(|held| !kept.holds(&held.entry))
+                .count(),
+            _ => stored.len(),
+        }
+    }))
 }
 
 /// [`read_ahead`], keeping what it finds in `slot`.
@@ -2405,20 +2432,22 @@ mod tests {
         kept_is_afresh(&s[0], &slot);
     }
 
-    /// Whether what the process keeps between reads ([`KEPT`]) holds
-    /// anything of the channel `channel`.
+    /// Whether what this test's thread keeps between reads ([`KEPT`])
+    /// holds anything of the channel `channel`.
     fn kept_of(channel: &[u8; 32]) -> bool {
-        KEPT.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|kept| kept.channel == *channel && !kept.found.is_empty())
+        with_kept(|slot| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|kept| kept.channel == *channel && !kept.found.is_empty())
+        })
     }
 
     /// A device that forgets what it held of its person keeps nothing in
     /// memory of its personal channel, and nor does one that is removed:
     /// what was found of each entry, the names among it, is let go with
-    /// the secrets. (What is kept is the process's: a test that runs
-    /// beside this one keeps its own channel, never this one's.)
+    /// the secrets. What is kept is this test's thread's alone, so what
+    /// it finds kept, or not kept, no other test put there or took away.
     #[test]
     fn test_a_device_that_forgets_or_is_removed_keeps_nothing_of_the_channel_it_read() {
         let mut s = Several::of_one_person(3);
@@ -2432,6 +2461,7 @@ mod tests {
         // Device 2 reads its channel, and is then removed.
         let channel = derive::channel_id(&s[2].personal()).unwrap();
         assert_eq!(listed(&s[2].conn).unwrap().len(), 2);
+        assert!(kept_of(&channel), "the read kept nothing to let go");
         s.change(0, &[0, 1], &[2]);
         assert_eq!(s.pass(0, 2)[0], Taken::Shown(crate::person::Shown::Removed));
         assert!(!kept_of(&channel), "a removed device keeps what it read");
@@ -2450,6 +2480,7 @@ mod tests {
         // Device 1 reads its channel, and forgets: as `init --new-key`.
         let channel = derive::channel_id(&s[1].personal()).unwrap();
         assert_eq!(listed(&s[1].conn).unwrap().len(), 2);
+        assert!(kept_of(&channel), "the read kept nothing to let go");
         let now = s.tick();
         assert!(crate::leaving::forget(&s[1].conn, &s[1].identity, false, now).unwrap());
         assert!(
