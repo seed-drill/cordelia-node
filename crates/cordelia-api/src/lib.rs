@@ -139,6 +139,7 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1/messages")
             .route("/summary", web::post().to(messages::summary))
+            .route("/announced", web::post().to(messages::announced))
             .route("/read", web::post().to(messages::read))
             .route("/send", web::post().to(messages::send))
             .route("/log", web::post().to(messages::log)),

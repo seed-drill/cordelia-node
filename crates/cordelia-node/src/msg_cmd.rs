@@ -546,10 +546,10 @@ fn not_connected(e: &ureq::Error) -> bool {
 /// Write `text` on standard output, where it can be: an output that is
 /// closed is no error of the command's, which has done what it did. (`print!`
 /// would panic there, and the process exit 101.)
-fn written(text: &str) {
+/// Print `text` on standard output: whether all of it was written.
+fn written(text: &str) -> bool {
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+    out.write_all(text.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
 /// The address of the node's API, written as the rest of the binary
@@ -787,15 +787,15 @@ pub fn summary(config_path: &str, started: Instant, folder: Option<String>, othe
     if others {
         return;
     }
-    let said = std::panic::catch_unwind(|| summarised(config_path, started, folder.as_deref()))
-        .ok()
-        .flatten();
-    if let Some(said) = said {
-        written(&said);
-    }
+    let _ = std::panic::catch_unwind(|| summarised(config_path, started, folder.as_deref()));
 }
 
-fn summarised(config_path: &str, started: Instant, given: Option<&str>) -> Option<String> {
+/// The summary, printed where the node answered in time; and then, within
+/// what is left of the 100 ms, the node is told the lines it printed, so
+/// that it marks them announced (rule 14). A line is marked only once it
+/// is printed: where the answer came late nothing is printed or marked,
+/// and the next summary prints the line.
+fn summarised(config_path: &str, started: Instant, given: Option<&str>) -> Option<()> {
     let deadline = started + Duration::from_millis(AGENT_MESSAGE_SUMMARY_WAIT_MS);
     let node = Node::of(config_path).ok()?;
     // A file read is not bounded: the time is looked at after.
@@ -825,7 +825,32 @@ fn summarised(config_path: &str, started: Instant, given: Option<&str>) -> Optio
     if status != 200 || Instant::now() >= deadline {
         return None;
     }
-    summary_for(&answer, given)
+    let said = summary_for(&answer, given)?;
+    if !written(&said) {
+        return None;
+    }
+    let ids = printed_ids(&answer);
+    let left = deadline.checked_duration_since(Instant::now())?;
+    if !ids.is_empty() {
+        let told = json!({
+            "folder": folder.display().to_string(),
+            "ids": ids,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        node.post("/api/v1/messages/announced", &told, left);
+    }
+    Some(())
+}
+
+/// The IDs of the lines that [`summary_for`] prints of `answer`, each
+/// whole: what the node is told was printed. Not those of the count line.
+pub fn printed_ids(answer: &Value) -> Vec<String> {
+    answer["lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| line["id"].as_str().map(String::from))
+        .collect()
 }
 
 /// The hook's input (decision 2026-10-09 §5): what is on standard input,
@@ -1557,6 +1582,45 @@ mod tests {
             })
             .collect();
         json!({ "name": name, "lines": lines, "waiting": { "count": count, "ids": waiting } })
+    }
+
+    /// The node is told the IDs of the lines the summary printed, each
+    /// whole, and none of those it only counted (decision 2026-10-09
+    /// §4.1, rule 14).
+    #[test]
+    fn the_node_is_told_the_lines_printed_and_not_the_count() {
+        let answer = summarised(
+            "work",
+            &[
+                (
+                    "0123456789abcdef0123456789abcdef",
+                    "notes",
+                    None,
+                    "a",
+                    false,
+                ),
+                (
+                    "abcdef0123456789abcdef0123456789",
+                    "plans",
+                    None,
+                    "b",
+                    false,
+                ),
+            ],
+            &["11111111111111111111111111111111"],
+            1,
+        );
+        assert!(summary_says(&answer).is_some());
+        assert_eq!(
+            printed_ids(&answer),
+            [
+                "0123456789abcdef0123456789abcdef",
+                "abcdef0123456789abcdef0123456789"
+            ]
+        );
+        let counted = summarised("work", &[], &["11111111111111111111111111111111"], 1);
+        assert!(summary_says(&counted).is_some());
+        assert!(printed_ids(&counted).is_empty());
     }
 
     // ── The words ────────────────────────────────────────────────────
