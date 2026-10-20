@@ -74,8 +74,8 @@ jobs:
   # made longer, and is run here, on every pull request, beside it. They
   # are the ignored tests of cordelia-node's test files, and only those:
   # the other crates' ignored tests are timed for a release build, or are
-  # no part of this. Each runs whatever another fails. About fourteen
-  # minutes of tests after the build.
+  # no part of this. Each runs whatever another fails. About half an hour
+  # of tests after the build.
   out-of-reach:
     name: out of reach
     runs-on: ubuntu-latest

@@ -1179,6 +1179,12 @@ mod tests {
         assert_eq!(class_of(Scenario::OutLacking), Some(Class::OutLacking));
         assert_eq!(class_of(Scenario::Dialling), None);
         assert_eq!(class_of(Scenario::KeylessGone), Some(Class::OutLacking));
+        // Since when a relay that is STUCK has refused what waits, by the
+        // time of day; none where nothing waits.
+        let of = |scenario: Scenario| &states.iter().find(|(s, _)| *s == scenario).unwrap().1;
+        assert!(of(Scenario::Stuck).refusing_waits_since.is_some());
+        assert_eq!(of(Scenario::Ok).refusing_waits_since, None);
+        assert_eq!(of(Scenario::Moving).refusing_waits_since, None);
         let mut ends = [0usize; 3];
         let mut check = |relays: &[(Scenario, Reached)]| {
             let lacks = relays.iter().any(|(_, reach)| reach.holds != Holds::Holds);
@@ -1232,6 +1238,30 @@ mod tests {
             assert_eq!(end, Some(End::Warned), "{word:?}");
             let (_, _, end) = end_of_look(&look_at(&relays, word, true), 3, &own);
             assert_eq!(end, None, "{word:?}");
+        }
+        // Every relay OK: end 1 waits for `sent`, which is to come.
+        let ok = [
+            (Scenario::Ok, reached(Scenario::Ok)),
+            (Scenario::Ok, reached(Scenario::Ok)),
+        ];
+        let (_, _, end) = end_of_look(&look_at(&ok, OwnWord::Carried, true), 3, &own);
+        assert_eq!(end, None);
+        let (_, _, end) = end_of_look(&look_at(&ok, OwnWord::Sent, false), 3, &own);
+        assert_eq!(end, Some(End::Done));
+        // A relay in the third state is not taken to hold the change.
+        let mut seen = look_at(&relays, OwnWord::Sent, false);
+        seen["relays"][1]["reach"]["holds"] = "neither".into();
+        let read = relays_of(&seen);
+        assert!(read[0].holds() && !read[1].holds());
+        // How the node tries each relay is read from the look.
+        for (said, dial) in [
+            ("connected", Dial::Connected),
+            ("dialled", Dial::Dialled),
+            ("looked_up", Dial::LookedUp),
+            ("not_dialled", Dial::NotDialled),
+        ] {
+            seen["relays"][0]["dial"] = said.into();
+            assert_eq!(relays_of(&seen)[0].dial, dial);
         }
         // A look that does not say it is read as no word to come.
         let mut seen = look_at(&relays, OwnWord::Carried, true);
