@@ -1682,7 +1682,10 @@ pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
 /// keeps. A wake for any other reason does not move it. The command after
 /// a change ends without success only once each relay that lacks the
 /// change has been out of reach for this long since the change, or has
-/// refused the change for this long.
+/// refused the change for this long. A dial, or a connection that waits
+/// for a show, that has been in flight for this long is taken to have
+/// failed: a result that was lost holds no relay up for good, and a dial
+/// that is answered at all is answered well within it.
 pub const OUT_OF_REACH_SECS: u64 = STATUS_AMBER_WAIT_SECS;
 
 // A device that wakes has heard from its relays, or given them up, well

@@ -1277,7 +1277,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     // What it knew of which relay holds which change was of entries of
     // the phrase it leaves (decision 2026-10-19 §1).
-    meta::remove(conn, meta::PERSON_RELAYS_KNOWN)?;
+    crate::at_relays::known::forget(conn)?;
     // Nor does it keep in memory what it read of the personal channel.
     crate::names::forget_kept();
     Ok(())

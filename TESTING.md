@@ -52,12 +52,13 @@ and log), and prints where.
 
 **Tests that wait out a relay's five minutes out of reach,** or a dial's
 wait growing to its cap (decision 2026-10-19 §11), are marked `#[ignore]`
-with the reason, so that `cargo test --all` does not take longer. The CI job
-"out of reach" in `ci.yml` runs them on every pull request. To run them
-here:
+with the reason, so that `cargo test --all` does not take longer. They are
+the only ignored tests of cordelia-node's test files. The CI job "out of
+reach" in `ci.yml` runs them, and no other crate's ignored tests, on every
+pull request: about fourteen minutes after the build. To run them here:
 
 ```bash
-cargo test --all -- --ignored
+cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
 ```
 
 `CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before

@@ -24,9 +24,10 @@
 //! ([`note_kept`]), and when this version first started on this database.
 //!
 //! **Whether a relay holds the change** is a plain function of what is
-//! kept ([`holds`]). The key goes when the device leaves its phrase
-//! (`crate::adding::leave`), and what is kept of a relay goes when the
-//! device is no longer set up with it ([`started`]).
+//! kept ([`holds`]). What the key holds goes when the device leaves its
+//! phrase (`crate::adding::leave`, [`forget`]), but for when this version
+//! first started, which is of the database; and what is kept of a relay
+//! goes when the device is no longer set up with it ([`started`]).
 //!
 //! A value that cannot be read is read as nothing known: every relay then
 //! lacks the change until it answers, which errs the safe way.
@@ -309,6 +310,9 @@ pub fn started(conn: &Connection, relays: &[RelayId], now: i64) -> Result<Starte
         known.keeps(kept.map(|(id, _)| id), now);
         known.relays.retain(|of| relays.contains(&of.relay));
         let mut marked = false;
+        // A value that could not be read kept a time that is lost: this
+        // start is the earliest this version is known to have started.
+        known.first_started.get_or_insert(now);
         if first {
             known.first_started = Some(now);
             if let Some((entry, 1)) = kept {
@@ -321,6 +325,24 @@ pub fn started(conn: &Connection, relays: &[RelayId], now: i64) -> Result<Starte
         write(conn, &known)?;
         Ok(Started { first, marked })
     })
+}
+
+/// The device leaves its phrase (`crate::adding::leave`): what it knew of
+/// its relays was of entries of that phrase, and goes (decision 2026-10-19
+/// §1). When this version first started on this database is no part of
+/// the phrase, and is kept.
+pub fn forget(conn: &Connection) -> Result<(), PersonError> {
+    let first_started = read(conn)?.first_started;
+    match first_started {
+        Some(first_started) => write(
+            conn,
+            &Known {
+                first_started: Some(first_started),
+                ..Known::default()
+            },
+        ),
+        None => Ok(meta::remove(conn, meta::PERSON_RELAYS_KNOWN)?),
+    }
 }
 
 /// A key in hex, or null.
@@ -481,7 +503,8 @@ mod tests {
     /// removes, and `cordelia init --new-key`, a removal of this device
     /// followed by it, and `cordelia phrase` on a device of several each
     /// leave nothing of what was known; `cordelia phrase` then writes only
-    /// its own mark.
+    /// its own mark. When this version first started on the database is
+    /// kept: it is no part of the phrase.
     #[test]
     fn adding_leave_forgets_it() {
         let a = relay("a.example:9474", Some(BY));
@@ -517,8 +540,10 @@ mod tests {
             None
         );
 
-        // `cordelia phrase` on a device of several.
+        // `cordelia phrase` on a device of several, which started on this
+        // version before.
         let mut s = Several::of_one_person(2);
+        started(&s[0].conn, std::slice::from_ref(&a), START_OF_TEST - 50).unwrap();
         answered(&s, 0);
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         let made = first_entry(&other, &s.key(0), "device 0").unwrap();
@@ -544,6 +569,7 @@ mod tests {
             "the answer about the phrase it left is gone"
         );
         assert_eq!(of.mark, Some(made.entry.id()));
+        assert_eq!(known.first_started, Some(START_OF_TEST - 50));
     }
 
     /// The mark is written at three moments, and at no other (decision
@@ -801,6 +827,15 @@ mod tests {
         meta::set(&s[0].conn, meta::PERSON_RELAYS_KNOWN, "{\"relays\": 7}").unwrap();
         assert_eq!(read(&s[0].conn).unwrap(), Known::default());
         assert_eq!(holds_now(&s[0].conn, &a, None), Holds::Lacks);
+        // The next start keeps the times anew, from itself: no time is
+        // left unknown.
+        let at = START_OF_TEST + 60;
+        let again = started(&s[0].conn, std::slice::from_ref(&a), at).unwrap();
+        assert!(!again.first);
+        let known = read(&s[0].conn).unwrap();
+        assert_eq!(known.first_started, Some(at));
+        let entry = s[0].latest().id();
+        assert_eq!(known.kept, Some(KeptSince { entry, since: at }));
     }
 
     /// The two times (decision 2026-10-19 §1): when the kept entry came

@@ -9893,3 +9893,35 @@ async fn a_relay_that_refuses_what_waits_for_five_minutes_is_stuck() {
     );
     assert_eq!(reach.class, None);
 }
+
+/// An answer that the relay does not hold the change is believed though
+/// it could not be written down (decision 2026-10-19 §1): where the
+/// database takes no write, a relay that held the entry and now answers
+/// "no room" lacks it, and is not taken to hold it by what was written
+/// before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_it_lacks_the_change_is_believed_though_it_was_not_written() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    let no_room = Say::Answer(ShowAnswer::Refused(EntryRefused::NoRoom));
+    relay.says(no_room.clone(), no_room);
+    device.db().execute_batch("PRAGMA query_only = ON").unwrap();
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+    device.passes().await;
+    let reach = device.at("relay").reach;
+    device
+        .db()
+        .execute_batch("PRAGMA query_only = OFF")
+        .unwrap();
+    assert!(
+        answer_of(&device, "relay").unwrap().holds,
+        "not written down"
+    );
+    assert_eq!(reach.holds, Holds::Lacks, "{reach:?}");
+}
