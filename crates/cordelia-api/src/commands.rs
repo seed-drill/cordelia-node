@@ -90,9 +90,25 @@ pub(crate) fn asked(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
 /// The command that restarts a node which runs as the service that the
 /// install script sets up, on the system named (`std::env::consts::OS`).
 /// The script prints the same one.
+///
+/// On macOS it is two commands on one line: the agent is booted out and
+/// bootstrapped again from its plist, and not kickstarted. A kickstart
+/// starts the job as it was loaded, with the launch constraint macOS
+/// attached to it then, and launchd may refuse to start a new binary that
+/// is signed ad hoc under it; the node then stays down. The bootstrap runs
+/// whether or not the bootout found the job, and where it fails it is
+/// tried once more 30 seconds later: a bootout can return before the job
+/// has gone, and 30 seconds is as long as the install script waits for it
+/// (its `BOOTSTRAP_WAIT_SECS`): the node stops within 30 seconds of being
+/// told to, and launchd kills a job 20 seconds after it was told to stop.
+/// One try more, and no loop: a line a person pastes ends.
 pub fn restart_command(os: &str) -> &'static str {
     match os {
-        "macos" => "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+        "macos" => {
+            "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+             gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)"
+        }
         _ => "systemctl --user daemon-reload && systemctl --user restart cordelia",
     }
 }
@@ -1527,7 +1543,9 @@ mod tests {
             ),
             (
                 "macos",
-                "launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia",
+                "launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap \
+                 gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; \
+                 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)",
             ),
         ];
         for (os, restart) in systems {
@@ -1543,6 +1561,125 @@ mod tests {
                 )
             );
             assert!(!says.contains("cordelia start"), "{says}");
+        }
+    }
+
+    /// The command that restarts the node on each system is the one the
+    /// install script prints, with the script's names for the user's ID
+    /// and the plist: on macOS the agent is booted out, then bootstrapped
+    /// from its plist, and bootstrapped once more 30 seconds later where
+    /// that fails, on one line; never kickstarted. The script quotes the
+    /// plist's absolute path; the node's `~` is the same path, unquoted so
+    /// that the shell expands it.
+    #[test]
+    fn test_the_restart_command_is_the_one_the_install_script_prints() {
+        let script = include_str!("../../../scripts/install.sh");
+        let restart = r#"    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\")""#;
+        for line in [
+            "    PLIST_FILE=\"${PLIST_DIR}/ai.seeddrill.cordelia.plist\"",
+            "    AGENT_DOMAIN=\"gui/$(id -u)\"",
+            "    AGENT_TARGET=\"${AGENT_DOMAIN}/ai.seeddrill.cordelia\"",
+            restart,
+            "    PLIST_DIR=\"$HOME/Library/LaunchAgents\"",
+        ] {
+            assert_eq!(script.lines().filter(|l| *l == line).count(), 1, "{line}");
+        }
+        let printed = restart
+            .trim_start()
+            .trim_start_matches("RESTART_CMD=\"")
+            .trim_end_matches('"')
+            .replace("${AGENT_TARGET}", "${AGENT_DOMAIN}/ai.seeddrill.cordelia")
+            .replace("${AGENT_DOMAIN}", "gui/$(id -u)")
+            .replace(
+                r#"\"${PLIST_FILE}\""#,
+                "~/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+            );
+        assert_eq!(restart_command("macos"), printed);
+        assert!(!restart_command("macos").contains('\n'));
+        assert!(!script.contains("launchctl kickstart"));
+        assert!(script.contains(&format!("    RESTART_CMD=\"{}\"", restart_command("linux"))));
+    }
+
+    /// The node's restart on macOS, pasted into a shell, does what it says
+    /// and ends: with a stand-in launchctl that records each call, and a
+    /// stand-in sleep. A bootstrap that works at once is not tried again;
+    /// one that fails once is tried again after 30 seconds, and works; one
+    /// that fails for good is tried twice, and the line ends, failed; a
+    /// bootout that finds no job is followed by the bootstrap all the same.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_restart_on_macos_ends_and_tries_the_bootstrap_once_more() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // (bootstraps that fail first, whether the bootout fails, the calls,
+        // whether the line ends well)
+        let bootout = format!("bootout gui/{uid}/ai.seeddrill.cordelia");
+        let cases = [
+            (0, false, 0, true),
+            (1, false, 1, true),
+            (9, false, 1, false),
+            (0, true, 0, true),
+        ];
+        for (fails, bootout_fails, sleeps, ends_well) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let stubs = home.path().join("stubs");
+            std::fs::create_dir(&stubs).unwrap();
+            let calls = home.path().join("calls");
+            let stub = |name: &str, body: &str| {
+                let path = stubs.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            stub(
+                "launchctl",
+                r#"echo "$*" >> "$HOME/calls"
+case "$1" in
+    bootout) [ -f "$HOME/bootout_fails" ] && exit 3 ;;
+    bootstrap)
+        left=$(cat "$HOME/fails")
+        if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$HOME/fails"; exit 5; fi ;;
+esac
+exit 0"#,
+            );
+            stub("sleep", r#"echo "sleep $*" >> "$HOME/calls""#);
+            std::fs::write(home.path().join("fails"), fails.to_string()).unwrap();
+            if bootout_fails {
+                std::fs::write(home.path().join("bootout_fails"), "").unwrap();
+            }
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(restart_command("macos"))
+                .env("HOME", home.path())
+                .env(
+                    "PATH",
+                    format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+                )
+                .status()
+                .unwrap();
+            let bootstrap = format!(
+                "bootstrap gui/{uid} {}/Library/LaunchAgents/ai.seeddrill.cordelia.plist",
+                home.path().display()
+            );
+            let mut want = vec![bootout.clone(), bootstrap.clone()];
+            if sleeps == 1 {
+                want.extend(["sleep 30".to_string(), bootstrap.clone()]);
+            }
+            let got = std::fs::read_to_string(&calls).unwrap();
+            assert_eq!(
+                got.lines().collect::<Vec<_>>(),
+                want,
+                "{fails} {bootout_fails}"
+            );
+            assert_eq!(status.success(), ends_well, "{fails} {bootout_fails}");
         }
     }
 

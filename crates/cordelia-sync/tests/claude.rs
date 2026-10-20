@@ -2191,7 +2191,8 @@ fn a_cycle_runs_only_for_the_directory_that_is_set() {
 
 /// Unmapped (or home memory turned off), emptied, and mapped again: the
 /// folder starts afresh. What it lost in between is not
-/// sent to the other devices as deletes.
+/// sent to the other devices as deletes. Sync turned off and on again
+/// stops no folder: it is a node stopped and started.
 #[test]
 fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     let (mut a, mut b) = paired_explicit();
@@ -2224,19 +2225,73 @@ fn mapping_a_folder_again_does_not_replay_what_it_lost() {
     assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
     assert_eq!(files(&a_mem), ["MEMORY.md", "one.md", "two.md"]);
 
-    // The same when sync is turned off altogether and on again, with no
-    // cycle in between: the handler that turned it off forgot.
+    // Sync turned off altogether and on again, with no cycle in between,
+    // is not that: the folder keeps what it agreed, as a node that is
+    // stopped and started does. A file deleted here meanwhile is sent as
+    // a delete, and one edited here is sent, with no conflict file.
     claude(&a, serde_json::json!({ "enabled": false }));
     std::fs::remove_file(a_mem.join("one.md")).unwrap();
+    let edited = "two, edited while sync was off\n";
+    std::fs::write(a_mem.join("two.md"), edited).unwrap();
     claude(&a, serde_json::json!({}));
     settle(&mut a, &mut b);
-    assert_eq!(files(&b_mem), ["MEMORY.md", "one.md", "two.md"]);
-    assert_eq!(read(&a_mem, "one.md").as_deref(), Some("one\n"));
+    assert_eq!(files(&b_mem), ["MEMORY.md", "two.md"]);
+    assert_eq!(files(&a_mem), ["MEMORY.md", "two.md"]);
+    assert_eq!(read(&b_mem, "two.md").as_deref(), Some(edited));
 
     // A delete made while the folder syncs still reaches the other device.
     std::fs::remove_file(a_mem.join("two.md")).unwrap();
     settle(&mut a, &mut b);
-    assert_eq!(files(&b_mem), ["MEMORY.md", "one.md"]);
+    assert_eq!(files(&b_mem), ["MEMORY.md"]);
+}
+
+/// What `cordelia sync off` tells a person to do to change a folder on
+/// this machine only: unmap it. While it is unmapped, nothing done to it
+/// is sent. Mapped again, it merges: a file deleted here comes back, a
+/// file added here is sent, and a file changed here takes the other
+/// devices' version, with this device's beside it as a conflict copy,
+/// which syncs as any file does.
+#[test]
+fn a_folder_changed_while_unmapped_is_sent_nowhere_until_mapped_again() {
+    let (mut a, mut b) = paired_explicit();
+    let a_notes = a.plain_dir("notes");
+    let a_mem = a.claude_folder(&a_notes);
+    let b_notes = b.plain_dir("notes");
+    let b_mem = b.claude_folder(&b_notes);
+    for (name, text) in [("one.md", "one\n"), ("two.md", "two\n")] {
+        std::fs::write(a_mem.join(name), text).unwrap();
+    }
+    map(&a, &a_notes, "lab-notes");
+    map(&b, &b_notes, "lab-notes");
+    settle(&mut a, &mut b);
+    assert_eq!(files(&b_mem), ["one.md", "two.md"]);
+
+    unmap(&a, &a_notes);
+    settle(&mut a, &mut b);
+    std::fs::remove_file(a_mem.join("one.md")).unwrap();
+    std::fs::write(a_mem.join("two.md"), "two, changed here only\n").unwrap();
+    std::fs::write(a_mem.join("three.md"), "three\n").unwrap();
+    settle(&mut a, &mut b);
+    // Sent nowhere.
+    assert_eq!(files(&b_mem), ["one.md", "two.md"]);
+    assert_eq!(read(&b_mem, "two.md").as_deref(), Some("two\n"));
+
+    // Mapped again: it merges.
+    map(&a, &a_notes, "lab-notes");
+    settle(&mut a, &mut b);
+    for mem in [&a_mem, &b_mem] {
+        let names = files(mem);
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(&names[0], "one.md");
+        assert_eq!(&names[1], "three.md");
+        assert!(names[2].starts_with("two.conflict-"), "{names:?}");
+        assert_eq!(&names[3], "two.md");
+        assert_eq!(read(mem, "two.md").as_deref(), Some("two\n"));
+        assert_eq!(
+            read(mem, &names[2]).as_deref(),
+            Some("two, changed here only\n")
+        );
+    }
 }
 
 /// A mapped folder whose memory directory is gone (its disk is not

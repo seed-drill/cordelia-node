@@ -16,11 +16,11 @@ a device that is lost and brings your memory back to a new machine.
 
 **Pre-release (October 2026).** v1 is built and tested. The tests include
 end-to-end runs with real processes over QUIC through a relay. Two relays
-are running. The current pre-release is `v0.2.0-alpha.11`, for macOS and
+are running. The current pre-release is `v0.2.0-alpha.12`, for macOS and
 Linux. To install it, run:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.11 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.12 sh
 ```
 
 To upgrade, run the same command with a later version. The script then:
@@ -200,7 +200,11 @@ machine and in a project folder on the other.
 - `cordelia sync unmap <folder or name>` stops syncing a folder from this
   device. Its files stay where they are. If you map the folder again, it
   merges with what your other devices have, and nothing is deleted.
-- `cordelia sync off` stops syncing.
+- `cordelia sync off` stops syncing. When you turn sync on again, what you
+  changed or deleted here meanwhile goes to your other devices. To change a
+  folder on this machine only, unmap it: then nothing you do to it is sent.
+  If you map it again, what you deleted comes back, and what you changed or
+  added goes to your other devices (a changed file as a conflict copy).
 
 **A memory file syncs if it fits in one entry.** An entry has room for
 60 KB: the text and the file's name together. A larger file, or one that is

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cordelia install script
 # Usage: curl -fsSL https://github.com/seed-drill/cordelia-node/releases/latest/download/install.sh | sh
-#        Pre-release: CORDELIA_VERSION=v0.2.0-alpha.11 sh install.sh
+#        Pre-release: CORDELIA_VERSION=v0.2.0-alpha.12 sh install.sh
 #
 # Detects platform/architecture, downloads binary from GitHub Releases,
 # verifies SHA-256 checksum, installs to ~/.cordelia/bin/, sets up
@@ -41,6 +41,13 @@ seconds_or() {
 # and for a node whose service is running to answer at all.
 RESTART_WAIT_SECS=$(seconds_or "${CORDELIA_RESTART_WAIT_SECS:-}" 60)
 ANSWER_WAIT_SECS=$(seconds_or "${CORDELIA_ANSWER_WAIT_SECS:-}" 10)
+# On macOS, how long a bootstrap of the agent is tried again, a second
+# apart, while the job that was booted out has not finished going. The
+# node stops within 30 seconds of being told to (NODE_STOP_TIMEOUT_SECS),
+# and launchd kills a job that has not exited 20 seconds after it was told
+# to stop (its default ExitTimeOut): a job still there after 30 seconds
+# does not go by waiting.
+BOOTSTRAP_WAIT_SECS=$(seconds_or "${CORDELIA_BOOTSTRAP_WAIT_SECS:-}" 30)
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -79,7 +86,7 @@ resolve_version() {
             | grep '"tag_name"' | head -1 | cut -d'"' -f4) || true
         if [ -z "$VERSION" ]; then
             echo "Error: could not determine the latest release of ${REPO}."
-            echo "  If only pre-releases exist, pin one: CORDELIA_VERSION=v0.2.0-alpha.11 sh install.sh"
+            echo "  If only pre-releases exist, pin one: CORDELIA_VERSION=v0.2.0-alpha.12 sh install.sh"
             echo "  Releases: https://github.com/${REPO}/releases"
             exit 1
         fi
@@ -243,12 +250,62 @@ running_version() {
     node_status | sed -n 's/.*"node_version":"\([^"]*\)".*/\1/p' | tr -cd '0-9A-Za-z.+-'
 }
 
+# Whether the service is in the domain that its restart acts on. On macOS
+# that is this login's GUI domain: `launchctl list` (service_running) sees
+# a job loaded in the caller's own domain, which over ssh is another one,
+# and a job there is not booted out from here, nor a second one
+# bootstrapped beside it.
+service_here() {
+    case "$PLATFORM" in
+        darwin) launchctl print "$AGENT_TARGET" >/dev/null 2>&1 ;;
+        *)      return 0 ;;
+    esac
+}
+
 restart_service() {
     case "$PLATFORM" in
         linux)  systemctl --user daemon-reload && systemctl --user restart cordelia ;;
-        darwin) launchctl kickstart -k "gui/$(id -u)/ai.seeddrill.cordelia" ;;
+        darwin) restart_agent ;;
         *)      return 1 ;;
     esac
+}
+
+# On macOS the agent is booted out and bootstrapped again from the plist
+# this script has just written. It is not kickstarted: a kickstart starts
+# the job as it was loaded, with the launch constraint macOS attached to it
+# then, and never reads the plist again; launchd may then refuse to start
+# a new binary that is signed ad hoc ("Unable to get updated LWCR", exit
+# 78), every ten seconds, and the node stays down. A job loaded afresh has
+# no such constraint.
+#
+# A bootout that fails is let go: the job is gone already, and there is
+# nothing to take out; or it is still there, and the bootstrap says so. A
+# bootstrap that fails is tried again, a second apart, for
+# BOOTSTRAP_WAIT_SECS: the job booted out may not have finished going.
+# Two codes that no wait changes end it at once: 119, the service is
+# disabled, and 125, the domain does not support the action (no GUI
+# login). Others are tried again, since launchctl gives the same code (5,
+# 37) for a job still going as for some that will not pass. One that
+# still fails then has failed for good: what launchctl said is printed,
+# and where the bootout took, that the node is not running.
+restart_agent() {
+    booted_out=""
+    launchctl bootout "$AGENT_TARGET" 2>/dev/null && booted_out=yes
+    waited=0
+    while :; do
+        launchctl bootstrap "$AGENT_DOMAIN" "$PLIST_FILE" 2>"${TMPDIR}/bootstrap.err" && return 0
+        case "$?" in
+            119|125) break ;;
+        esac
+        [ "$waited" -ge "$BOOTSTRAP_WAIT_SECS" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    sed 's/^/  /' "${TMPDIR}/bootstrap.err" 2>/dev/null || true
+    if [ -n "$booted_out" ]; then
+        echo "The agent was booted out and is not loaded again: the node is not running."
+    fi
+    return 1
 }
 
 # Wait, for so many tries a second apart, until the node answers.
@@ -313,6 +370,16 @@ settle_running_node() {
         fi
         RUNNING=$(running_version)
         if [ "$RUNNING" = "$INSTALLED" ]; then
+            return
+        fi
+        if ! service_here; then
+            RESTART="needed"
+            echo "The service is loaded, but not in the GUI domain of this login"
+            echo "(${AGENT_DOMAIN}), where the restart acts: it was started from another"
+            echo "session, such as over ssh. Nothing was restarted. In the session that"
+            echo "started it, run:"
+            echo "  launchctl unload \"${PLIST_FILE}\"; launchctl load \"${PLIST_FILE}\""
+            echo "or run this installer from a terminal of this Mac's own login."
             return
         fi
         echo "A node is running: restarting it on ${INSTALLED}..."
@@ -443,9 +510,16 @@ install_launchctl() {
 </plist>
 PLIST
 
+    AGENT_DOMAIN="gui/$(id -u)"
+    AGENT_TARGET="${AGENT_DOMAIN}/ai.seeddrill.cordelia"
     START_CMD="launchctl load ${PLIST_FILE}"
     START_SAYS="                        # run the node as a background service"
-    RESTART_CMD="launchctl kickstart -k gui/$(id -u)/ai.seeddrill.cordelia"
+    # Two commands, on one line a person can paste. The bootstrap runs
+    # whether or not the bootout found the job, and where it fails it is
+    # tried once more 30 seconds later: a bootout can return before the
+    # job has gone, and after 30 seconds it has (BOOTSTRAP_WAIT_SECS). The
+    # plist's path is quoted, for a home whose name has a space.
+    RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\")"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
     echo "LaunchAgent installed: ${PLIST_FILE}"
     echo "  Start:  ${START_CMD}"

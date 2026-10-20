@@ -26,7 +26,7 @@ A common misunderstanding is that Warm means "recently seen but currently offlin
 | Transition | Trigger | Cost | What Happens |
 |-----------|---------|------|-------------|
 | Cold -> Warm | Governor step 3 (`warm < warm_min`) | QUIC handshake (~1-2 RTT, TLS 1.3) | New connection opened. Handshake protocol runs. Keep-Alive starts. |
-| Warm -> Hot | Governor step 4 (`hot < hot_min`, random) | ~0 (start streams on existing connection) | Data protocols begin. Push/sync target this peer. |
+| Warm -> Hot | Governor step 4 (`hot < hot_min`, random) or step 6 (churn, random, in the place of the peer it demotes) | ~0 (start streams on existing connection) | Data protocols begin. Push/sync target this peer. |
 | Hot -> Warm | Governor step 5 (demotion) or step 6 (churn) | ~0 (stop data streams, keep connection) | Data protocols stop. Connection stays open for keepalive. Peer remains a failover target. |
 | Warm -> Cold | Dead detection (keepalive timeout) | Connection closed | Peer returns to address book only. |
 | Cold -> evicted | Governor step 7 (excess cold) | None | Address removed from peer table. |

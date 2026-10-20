@@ -798,7 +798,21 @@ Control:
 launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # start
 launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # stop
 cordelia status                                                        # check
+# restart, onto a version just installed (one line):
+launchctl bootout gui/$(id -u)/ai.seeddrill.cordelia; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist || (sleep 30; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist)
 ```
+
+A restart on macOS boots the agent out and bootstraps it again from its
+plist; it does not kickstart it. A kickstart starts the job as it was
+loaded, with the launch constraint macOS attached to it then, and never
+reads the plist again: launchd may then refuse to start a new binary that
+is signed ad hoc ("Unable to get updated LWCR", last exit code 78), every
+ten seconds, and the node stays down. A job loaded afresh has no such
+constraint. The bootstrap runs whether or not the bootout found the job.
+Where it fails it is tried once more, 30 seconds later, and no more: a
+bootout can return before the job has gone, and 30 seconds is as long as the
+install script waits for it (§10.2). The line ends either way, so a person
+who pastes it is never left at a loop.
 
 ### 7.2 Linux systemd Unit
 
@@ -1002,6 +1016,33 @@ cordelia status                                  # verify
 ```
 
 The install script detects an existing installation and performs an in-place binary replacement. Configuration and data are preserved. The node is not stopped first: the script puts the new binary beside the old one, renames it into place, and restarts a node that runs as the service it set up.
+
+The restart is the service manager's: `systemctl --user daemon-reload &&
+systemctl --user restart cordelia` on Linux; on macOS `launchctl bootout` of
+the agent, then `launchctl bootstrap` of the plist the script has just
+written (§7.1 says why it is no kickstart). Before it boots anything out, the
+script asks launchd whether the agent is in this login's GUI domain
+(`launchctl print gui/<uid>/ai.seeddrill.cordelia`), the domain that the
+restart acts on: a job loaded from another session, such as over ssh, is in
+another domain, and is neither booted out from here nor given a second job
+beside it. The script then restarts nothing, ends with `restart=needed`
+and exit code 3, and says to run `launchctl unload` then `launchctl load`
+of the plist in the session that started it, or the installer from a
+terminal of the Mac's own login. A bootout that fails is let go:
+the job is gone already, or the bootstrap says that it is still there. A
+bootstrap that fails is tried again a second apart for 30 seconds
+(`CORDELIA_BOOTSTRAP_WAIT_SECS`), since the job booted out may not have
+finished going: the node stops within 30 seconds of being told to, and
+launchd kills a job that has not exited 20 seconds after it was told to
+stop. Two codes that no wait changes end it at once: 119 (the service is
+disabled) and 125 (the domain does not support the action: no GUI login).
+Others are tried again, since launchctl gives the same code for a job still
+going as for some that will not pass. One that still fails then has failed
+for good: the script prints what launchctl said, that the node is not
+running where the bootout took, and the two commands to run by hand, on one
+line, and ends with `restart=failed` and exit code 3. The node's own sentences that say
+how to restart it (its version check, the commands it refuses until it is
+restarted) name the same commands.
 
 ### 10.3 Version Compatibility
 
