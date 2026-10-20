@@ -5891,6 +5891,10 @@ mod tests {
         ]);
         let (known, reach) = (&*reach, Some(&*reach));
         let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        // The dials are a while after the start, so that a dial left in
+        // flight would be in flight still when the five minutes are over.
+        let second = std::time::Duration::from_secs(1);
+        clock.run_ahead(100 * second);
         for _ in 0..40 {
             for relay in [&lacks, &holds, &third] {
                 known.dial_begins(&reach_id(relay));
@@ -5904,9 +5908,9 @@ mod tests {
             }
             assert!(wait_after(&tries[&lacks]) <= BACKOFF_BASE_SECS);
         }
-        // Each dial was an attempt, and failed: none is in flight.
-        let clock_ran = std::time::Duration::from_secs(cordelia_core::protocol::OUT_OF_REACH_SECS);
-        clock.run_ahead(clock_ran);
+        // Each dial was an attempt, and failed: none is in flight five
+        // minutes after the start.
+        clock.run_ahead(200 * second);
         assert!(known.is_out_of_reach(&reach_id(&lacks)));
         assert_eq!(wait_after(&tries[&lacks]), BACKOFF_BASE_SECS);
         assert_eq!(wait_after(&tries[&holds]), BACKOFF_MAX_SECS);
