@@ -243,6 +243,62 @@ pub struct CycleReport {
     /// The next cycle starts from the new settings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// What the personal channel holds, as this device's store held it at
+    /// the last cycle that read it (decision 2026-10-19 §2, rule 2): a
+    /// cycle that ends before it reads the channel carries forward what
+    /// the last one found, with that cycle's time. A status reads it
+    /// here, and nothing is summed for a status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_channel: Option<PersonalChannel>,
+}
+
+/// What the personal channel holds, as a relay counts it, as one cycle
+/// read it (decision 2026-10-19 §2, rules 1 and 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersonalChannel {
+    /// The channel's total, in bytes.
+    pub total: u64,
+    /// Of it, the bytes that are words.
+    pub words: u64,
+    /// Each key that signed an entry, in order of key.
+    pub by: Vec<SignedBy>,
+    /// When the cycle that read it ran (RFC 3339).
+    pub at: String,
+}
+
+/// What one key signed of the personal channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SignedBy {
+    /// The key, as a device's key is written.
+    pub key: String,
+    /// Its bytes of words.
+    pub words: u64,
+    /// Its bytes of what is not a word.
+    pub not_words: u64,
+}
+
+impl PersonalChannel {
+    /// What a read of the channel found, at `at`.
+    fn of(fill: said_names::Fill, at: String) -> Result<Self, CordeliaError> {
+        let by = fill
+            .by
+            .into_iter()
+            .map(|signed| {
+                Ok(SignedBy {
+                    key: cordelia_crypto::bech32::encode_public_key(&signed.key)
+                        .map_err(|e| CordeliaError::Crypto(e.to_string()))?,
+                    words: signed.words,
+                    not_words: signed.not_words,
+                })
+            })
+            .collect::<Result<_, CordeliaError>>()?;
+        Ok(Self {
+            total: fill.total,
+            words: fill.words,
+            by,
+            at,
+        })
+    }
 }
 
 /// A declared mapping: Claude's memory for sessions started in `folder`
@@ -375,6 +431,9 @@ pub struct ClaudeAdapter {
     /// Per mapped directory: when it was checked, and where Claude Code
     /// keeps its memory now if that is no longer the directory itself.
     moved: HashMap<String, (Instant, Option<PathBuf>)>,
+    /// What the last cycle that read the personal channel found of it
+    /// (decision 2026-10-19 §2, rule 2).
+    personal_channel: Option<PersonalChannel>,
 }
 
 impl ClaudeAdapter {
@@ -386,6 +445,7 @@ impl ClaudeAdapter {
             device_tag: hex::encode(&device_key[..4]),
             seen: HashMap::new(),
             moved: HashMap::new(),
+            personal_channel: None,
         }
     }
 
@@ -533,12 +593,34 @@ impl ClaudeAdapter {
     pub fn run_cycle(&mut self, state: &AppState) -> CycleReport {
         match Settings::load(state) {
             Ok(settings) => self.run_cycle_under(state, settings),
-            Err(e) => CycleReport {
-                generation: state.sync_control.generation(),
-                errors: vec![format!("settings: {e}")],
-                ..Default::default()
-            },
+            Err(e) => {
+                let report = CycleReport {
+                    generation: state.sync_control.generation(),
+                    errors: vec![format!("settings: {e}")],
+                    ..Default::default()
+                };
+                self.carried_forward(state, report)
+            }
         }
+    }
+
+    /// `report`, with what the personal channel holds: what this cycle
+    /// read, which is kept for the next; or, where it ended before it read
+    /// the channel, what the last cycle that read it found, with that
+    /// cycle's time (decision 2026-10-19 §2, rule 2), so that a short
+    /// cycle does not clear the warning. The last is kept here, and after
+    /// a start it is the one in the report that the node stored.
+    fn carried_forward(&mut self, state: &AppState, mut report: CycleReport) -> CycleReport {
+        match &report.personal_channel {
+            Some(read) => self.personal_channel = Some(read.clone()),
+            None => {
+                if self.personal_channel.is_none() {
+                    self.personal_channel = stored_personal_channel(state);
+                }
+                report.personal_channel = self.personal_channel.clone();
+            }
+        }
+        report
     }
 
     /// Run one sync cycle under `settings`, as they were read. If they have
@@ -550,6 +632,7 @@ impl ClaudeAdapter {
         // taken only inside it.
         let _turn = state.history.turn();
         let report = self.cycle_in_turn(state, settings);
+        let report = self.carried_forward(state, report);
         // What the cycle kept may have taken local history over its size.
         state.history.sweep_if_grown(chrono::Utc::now());
         report
@@ -801,11 +884,27 @@ impl ClaudeAdapter {
         }
 
         match exchange_names(state, &wanted, generation) {
-            Ok(available) => report.available = available,
+            Ok((available, fill)) => {
+                report.available = available;
+                let at = chrono::Utc::now().to_rfc3339();
+                match fill.map(|fill| PersonalChannel::of(fill, at)).transpose() {
+                    Ok(read) => report.personal_channel = read,
+                    Err(e) => report.errors.push(format!("names: {e}")),
+                }
+            }
             Err(e) => report.errors.push(format!("names: {e}")),
         }
         report
     }
+}
+
+/// What the personal channel held in the report that the node stored
+/// last, where it holds it: what a cycle carries forward after a start
+/// (decision 2026-10-19 §2, rule 2).
+fn stored_personal_channel(state: &AppState) -> Option<PersonalChannel> {
+    let stored = meta::get(&*lock(state).ok()?, meta::SYNC_CLAUDE_REPORT).ok()??;
+    let report: serde_json::Value = serde_json::from_str(&stored).ok()?;
+    serde_json::from_value(report.get("personal_channel")?.clone()).ok()
 }
 
 /// Why a device that stands so publishes nothing and takes nothing into
@@ -985,7 +1084,7 @@ fn exchange_names(
     state: &AppState,
     wanted: &BTreeSet<String>,
     generation: u64,
-) -> Result<Vec<String>, CordeliaError> {
+) -> Result<(Vec<String>, Option<said_names::Fill>), CordeliaError> {
     let me = state.identity.public_key();
     let now = state.sync_control.now();
     // What was stored since the last read is checked and opened with the
@@ -994,7 +1093,10 @@ fn exchange_names(
     let db = lock(state)?;
     // A word that this device takes back below is its own: `others`
     // reads only the words of other keys, which it does not change.
-    let (said, listed) = said_names::said_and_listed(&db, &state.identity).map_err(of_person)?;
+    // What the channel holds is summed in the same read (decision
+    // 2026-10-19 §2, rule 1).
+    let (said, listed, fill) =
+        said_names::said_and_listed(&db, &state.identity).map_err(of_person)?;
     if state.sync_control.generation_under(&db) == generation {
         // A name that the device holds by a carry that a person asked
         // for has no folder here, and is listed all the same (decision
@@ -1023,7 +1125,7 @@ fn exchange_names(
             others.insert(listed.name);
         }
     }
-    Ok(others.difference(wanted).cloned().collect())
+    Ok((others.difference(wanted).cloned().collect(), fill))
 }
 
 fn lock(
@@ -6458,7 +6560,7 @@ mod tests {
         st.sync_control.changed(&st.db.lock().unwrap());
         // Nor is the device offered the name, which only it lists: what
         // is offered is what another device syncs.
-        let offered = exchange_names(&st, &nothing, started).unwrap();
+        let (offered, _) = exchange_names(&st, &nothing, started).unwrap();
         assert!(offered.is_empty(), "{offered:?}");
         forget_other_folders(&st, &[], started).unwrap();
         assert_eq!((said(&st).len(), agreed(&st)), (1, 1));
@@ -7956,6 +8058,126 @@ mod tests {
         st.own_channels.forget_fetched(&id);
         let report = adapter.run_cycle(&st);
         assert!(!report.folders[0].waiting, "{report:?}");
+    }
+
+    /// A cycle keeps in its report what the personal channel holds, as
+    /// this device's store holds it (decision 2026-10-19 §2, rule 2): the
+    /// total of every entry stored, the bytes that are words, and each
+    /// key's. A word written after the cycle does not change what a
+    /// status reads until the next cycle. A cycle that ends before it
+    /// reads the channel (here the device was removed) carries forward
+    /// what the last one that read it found, with that cycle's time; and
+    /// so does the first such cycle after a start, from the stored report.
+    #[test]
+    fn a_cycles_report_carries_the_channels_total() {
+        use cordelia_core::protocol::entry_cost;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        let (claude, work) = (home.join(".claude"), home.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let memory = discover::claude_folder(&claude, &work)
+            .unwrap()
+            .join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("notes.md"), "mine\n").unwrap();
+        let st = state(tmp.path());
+        let (_, phrase) = person_of(&st, NAME);
+        let other = another_device(&st, &tmp.path().join("other"), NAME);
+        deliver(&other, &st, NAME);
+        {
+            let db = st.db.lock().unwrap();
+            let mapped = vec![Mapping {
+                folder: work.display().to_string(),
+                name: NAME.to_string(),
+            }];
+            let mappings = serde_json::to_string(&mapped).unwrap();
+            meta::set(&db, meta::SYNC_CLAUDE_MAPPINGS, &mappings).unwrap();
+            meta::set(&db, meta::SYNC_CLAUDE_DIR, &claude.display().to_string()).unwrap();
+        }
+        // What the store holds of the personal channel, summed here as a
+        // relay counts it.
+        let personal = {
+            let db = st.db.lock().unwrap();
+            let person = held_rows::applied_secret(&db).unwrap().unwrap();
+            derive::channel_id(&derive::personal_secret(&person.secret).unwrap()).unwrap()
+        };
+        let stored_total = || -> u64 {
+            let db = st.db.lock().unwrap();
+            stored::channel_stored(&db, &personal)
+                .unwrap()
+                .iter()
+                .map(|held| entry_cost(held.entry.content.len()))
+                .sum()
+        };
+        // The report as the node stores it, and what a status then reads.
+        let store = |report: &CycleReport| {
+            let json = serde_json::to_string(report).unwrap();
+            meta::set(&st.db.lock().unwrap(), meta::SYNC_CLAUDE_REPORT, &json).unwrap();
+        };
+        let status_total = || stored_personal_channel(&st).map(|read| read.total);
+        let mut adapter =
+            ClaudeAdapter::new(claude.clone(), home.clone(), &st.identity.public_key());
+
+        let report = adapter.run_cycle(&st);
+        assert!(report.errors.is_empty(), "{report:?}");
+        let read = report.personal_channel.clone().unwrap();
+        // The cycle's own word of its name is among what it read.
+        assert_eq!(read.total, stored_total());
+        assert!(read.total > 0);
+        let own = cordelia_crypto::bech32::encode_public_key(&st.identity.public_key()).unwrap();
+        let theirs =
+            cordelia_crypto::bech32::encode_public_key(&other.identity.public_key()).unwrap();
+        let of = |key: &str| {
+            read.by
+                .iter()
+                .find(|signed| signed.key == key)
+                .cloned()
+                .unwrap()
+        };
+        // Each device signed its word of the name, its `applied/` word,
+        // and the record that added the second is the first's.
+        assert_eq!(of(&own).words, 1_280);
+        assert_eq!(of(&theirs).words, 0);
+        assert_eq!(read.words, 1_280);
+        assert_eq!(
+            read.by.iter().map(|s| s.words + s.not_words).sum::<u64>(),
+            read.total
+        );
+        store(&report);
+        assert_eq!(status_total(), Some(read.total));
+
+        // A word written after the cycle: the status's total stands
+        // until the next cycle.
+        {
+            let db = st.db.lock().unwrap();
+            let now = st.sync_control.now();
+            assert!(said_names::say(&db, &st.identity, "another", now).unwrap());
+        }
+        assert_eq!(stored_total(), read.total + 1_280);
+        assert_eq!(status_total(), Some(read.total));
+        let report = adapter.run_cycle(&st);
+        let later = report.personal_channel.clone().unwrap();
+        assert_eq!(later.total, read.total + 1_280);
+        store(&report);
+        assert_eq!(status_total(), Some(later.total));
+
+        // The other device removes this one, which applies the change: a
+        // cycle now ends before it reads the channel, and carries forward
+        // the last total, with the time of the cycle that read it.
+        let removal = removes(&other, &phrase, &st.identity.public_key());
+        {
+            let db = st.db.lock().unwrap();
+            take::take(&db, &st.identity, &removal, now()).unwrap();
+            assert_ne!(at_relays::stands(&db).unwrap(), Stands::Applied);
+        }
+        let report = adapter.run_cycle(&st);
+        assert!(report.publishes_nothing.is_some(), "{report:?}");
+        assert_eq!(report.personal_channel.as_ref(), Some(&later));
+        store(&report);
+        // After a start, from the report that the node stored.
+        let mut started = ClaudeAdapter::new(claude, home, &st.identity.public_key());
+        let report = started.run_cycle(&st);
+        assert_eq!(report.personal_channel, Some(later));
     }
 
     /// Sync turned off and on again (`cordelia sync off`, then `cordelia

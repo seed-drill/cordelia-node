@@ -3186,7 +3186,7 @@ mod tests {
                 no_room: Some(crate::state::NoRoom {
                     at: wall - 150,
                     over_allowance: false,
-                    of_the_change: false,
+                    of: crate::state::RefusedOf::Personal,
                 }),
                 another_form: 0,
                 refuses: None,

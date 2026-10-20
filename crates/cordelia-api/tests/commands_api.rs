@@ -971,7 +971,7 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
     let refused = NoRoom {
         at: 1_790_000_000,
         over_allowance: true,
-        of_the_change: false,
+        of: cordelia_api::state::RefusedOf::Personal,
     };
     state.own_channels.say(AtRelays {
         relays: vec![
@@ -1303,4 +1303,38 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
             "{device}: {metrics}"
         );
     }
+}
+
+/// What `cordelia devices` shows of what the person's devices keep at a
+/// relay comes from the report of the last sync cycle that the node
+/// stored (decision 2026-10-19 §2, rule 5): the look carries it as it is,
+/// and sums nothing. With no report it carries none.
+#[actix_web::test]
+async fn test_a_look_carries_what_the_personal_channel_holds_from_the_report() {
+    use cordelia_storage::meta;
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_device_routes),
+    )
+    .await;
+    let (status, _) = makes_the_phrase!(app, state);
+    assert_eq!(status, 200);
+    let (status, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(status, 200, "{seen}");
+    assert!(seen["personal_channel"].is_null(), "{seen}");
+    let filled = json!({ "total": 13_000_000_u64, "words": 12_000_000_u64,
+        "by": [{ "key": another_key(), "words": 12_000_000_u64, "not_words": 1_000_000_u64 }],
+        "at": "2026-10-19T10:00:00Z" });
+    let report = json!({ "folders": [], "generation": 0, "personal_channel": filled });
+    meta::set(
+        &state.db.lock().unwrap(),
+        meta::SYNC_CLAUDE_REPORT,
+        &report.to_string(),
+    )
+    .unwrap();
+    let (status, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["personal_channel"], filled);
 }

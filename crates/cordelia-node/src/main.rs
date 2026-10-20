@@ -1707,7 +1707,58 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.devices = devices_facts(&person, chrono::Utc::now().timestamp());
         out.person = Some(person);
     }
+    if let Some(sync) = &out.sync {
+        let person = out.person.as_ref().unwrap_or(&serde_json::Value::Null);
+        out.facts.channel = channel_facts(&sync["report"], person, out.device.as_deref());
+    }
     out
+}
+
+/// What the personal channel holds, from the last cycle's report, with
+/// each key that signed part of it named as the node's look at the
+/// person's devices names it (decision 2026-10-19 §2, rules 3 to 5).
+/// `this_device` is this device's key. `None` where the report holds
+/// none: nothing is summed here.
+fn channel_facts(
+    report: &serde_json::Value,
+    person: &serde_json::Value,
+    this_device: Option<&str>,
+) -> Option<indicator::Channel> {
+    let read = report.get("personal_channel")?;
+    let named = |key: &str| {
+        let listed = person["devices"].as_array().into_iter().flatten();
+        let added = person["added"].as_array().into_iter().flatten();
+        listed
+            .chain(added)
+            .find(|device| device["key"] == key)
+            .and_then(|device| device["label"].as_str())
+            .map(history_cmd::printable)
+            .unwrap_or_default()
+    };
+    let by = read["by"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|signed| {
+            let key = signed["key"].as_str()?;
+            let words_of_key = cordelia_crypto::bech32::decode_public_key(key)
+                .ok()
+                .map(|key| cordelia_crypto::fingerprint::shown(&key))?;
+            Some(indicator::Signer {
+                key: key.to_string(),
+                this_device: Some(key) == this_device,
+                label: named(key),
+                words_of_key,
+                words: signed["words"].as_u64().unwrap_or(0),
+                not_words: signed["not_words"].as_u64().unwrap_or(0),
+            })
+        })
+        .collect();
+    Some(indicator::Channel {
+        total: read["total"].as_u64()?,
+        words: read["words"].as_u64().unwrap_or(0),
+        by,
+    })
 }
 
 /// What a status goes by of a person's devices, from the node's look at
@@ -6719,6 +6770,78 @@ mod tests {
         assert!(
             said.contains(restart_command(std::env::consts::OS)),
             "{said}"
+        );
+    }
+
+    /// What a status goes by of the personal channel (decision 2026-10-19
+    /// §2, rules 2 to 4): what the last cycle's report holds, each key
+    /// that signed part of it named as the look names its devices, with
+    /// the words of its key and whether it is this device's. Nothing
+    /// where the report holds none.
+    #[test]
+    fn the_status_reads_the_personal_channel_from_the_report() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        let report = serde_json::json!({ "personal_channel": {
+            "total": 13_000_000_u64, "words": 9_000_000_u64, "at": "2026-10-19T10:00:00Z",
+            "by": [
+                { "key": written(1), "words": 9_000_000_u64, "not_words": 1_000 },
+                { "key": written(2), "words": 0, "not_words": 3_999_000_u64 },
+                { "key": written(3), "words": 0, "not_words": 0 },
+            ],
+        }});
+        let person = serde_json::json!({
+            "devices": [{ "key": written(1), "label": "laptop" }],
+            "added": [{ "key": written(2), "label": "desk\u{1b}[2Jtop" }],
+        });
+        let own = written(1);
+        let channel = channel_facts(&report, &person, Some(&own)).unwrap();
+        assert_eq!((channel.total, channel.words), (13_000_000, 9_000_000));
+        let by: Vec<(bool, &str, &str, u64, u64)> = channel
+            .by
+            .iter()
+            .map(|s| {
+                (
+                    s.this_device,
+                    s.key.as_str(),
+                    s.label.as_str(),
+                    s.words,
+                    s.not_words,
+                )
+            })
+            .collect();
+        assert_eq!(
+            by,
+            [
+                (true, own.as_str(), "laptop", 9_000_000, 1_000),
+                (
+                    false,
+                    written(2).as_str(),
+                    "desk\\u{1b}[2Jtop",
+                    0,
+                    3_999_000
+                ),
+                (false, written(3).as_str(), "", 0, 0),
+            ]
+        );
+        assert_eq!(
+            channel.by[1].words_of_key,
+            cordelia_crypto::fingerprint::shown(&key(2))
+        );
+        // The status names the device that filled it.
+        assert!(
+            channel.warning().starts_with("memory: desk"),
+            "{}",
+            channel.warning()
+        );
+        assert!(
+            channel.warning().ends_with(&written(2)),
+            "{}",
+            channel.warning()
+        );
+        assert_eq!(
+            channel_facts(&serde_json::json!({}), &person, Some(&own)),
+            None
         );
     }
 

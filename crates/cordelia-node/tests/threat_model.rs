@@ -1814,7 +1814,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
     assert_eq!(refused["holds_latest"], false, "{refused}");
     let why = refused["no_room"].as_str().unwrap_or_default();
     assert!(
-        why.contains("had no room for") && why.contains("it is full"),
+        why.contains("had no room for") && why.contains("is full"),
         "{refused}"
     );
     assert!(status(&a)["outbox_waiting"].as_u64().unwrap() >= 1);

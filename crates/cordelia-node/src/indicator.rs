@@ -105,6 +105,90 @@ pub struct Facts {
     pub other_version: bool,
     /// What the node says of this person's devices.
     pub devices: Devices,
+    /// What the personal channel holds, from the last report that read
+    /// it, with the device that signed each part where the node names it
+    /// (decision 2026-10-19 §2). `None` where the report holds none.
+    pub channel: Option<Channel>,
+}
+
+/// What the personal channel holds, as a relay counts it, as the last
+/// cycle that read it found (decision 2026-10-19 §2, rules 2 to 4).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Channel {
+    /// The channel's total, in bytes.
+    pub total: u64,
+    /// Of it, the bytes that are words.
+    pub words: u64,
+    /// Each key that signed an entry of it.
+    pub by: Vec<Signer>,
+}
+
+/// A key that signed part of the personal channel, as a status names it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Signer {
+    /// The key, as a device's key is written.
+    pub key: String,
+    /// Whether it is this device's.
+    pub this_device: bool,
+    /// The label it is known by, made printable; empty where the node
+    /// knows none.
+    pub label: String,
+    /// The first four words of its key's fingerprint.
+    pub words_of_key: String,
+    /// Its bytes of words.
+    pub words: u64,
+    /// Its bytes of what is not a word.
+    pub not_words: u64,
+}
+
+impl Channel {
+    /// Whether the channel is past the line (decision 2026-10-19 §2, rule
+    /// 3): what the warning and the sizes of `cordelia devices` turn on.
+    pub fn past_the_line(&self) -> bool {
+        self.total > cordelia_core::protocol::PERSONAL_CHANNEL_WARN_BYTES
+    }
+
+    /// What the warning says (decision 2026-10-19 §2, rule 4): the first
+    /// of its four forms that holds. A key has filled most of the channel
+    /// where it signed more than half of what is not words, and what it
+    /// signed that is not words is more than a quarter of the total; in
+    /// honest use what is not a word is far less than a quarter of the
+    /// line, so only the third form shows.
+    pub fn warning(&self) -> String {
+        let not_words = self.total.saturating_sub(self.words);
+        let filled = |signer: &&Signer| {
+            signer.not_words.saturating_mul(2) > not_words
+                && signer.not_words.saturating_mul(4) > self.total
+        };
+        let other = self.by.iter().filter(|s| !s.this_device).find(filled);
+        if let Some(other) = other {
+            let label = match other.label.is_empty() {
+                true => "a device",
+                false => other.label.as_str(),
+            };
+            return format!(
+                "memory: {label} ({}) has filled most of what your devices keep at a relay. If it \
+                 is not yours, or you no longer use it, remove it: cordelia remove-device {}",
+                other.words_of_key, other.key
+            );
+        }
+        if self.by.iter().filter(|s| s.this_device).any(|s| filled(&s)) {
+            return "memory: this device has filled most of what your devices keep at a relay. \
+                    If you no longer use it, remove it from another of your devices."
+                .into();
+        }
+        if self.words.saturating_mul(2) >= self.total {
+            return "memory: you sync nearly as many names as a relay can keep for your devices. \
+                    A name you add now may not reach your other devices. Stop syncing names you \
+                    no longer need, on every device that syncs them: their room comes back \
+                    slowly, at least 90 days later. Or remove a device you no longer use: its \
+                    room comes back at once."
+                .into();
+        }
+        "memory: what your devices keep at a relay is nearly full. Run cordelia devices to see \
+         how much each device keeps there."
+            .into()
+    }
 }
 
 /// What a status goes by of a person's devices (decision 2026-10-04 §8,
@@ -313,11 +397,14 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 8. files too large;
 /// 9. folders that stopped syncing.
 ///
-/// **Amber,** in this order. What is about folders (1 to 3, and 8 to 10)
+/// **Amber,** in this order. What is about folders (0 to 3, and 8 to 10)
 /// holds only with sync on, something mapped and a report: with none of
 /// them, nothing would move anyway. What is about a person's devices (4
 /// to 7) holds wherever this device follows a phrase, with sync on or
 /// off, and with or without a folder mapped.
+/// 0. the personal channel past the line, as the last report that read
+///    it found (decision 2026-10-19 §2, rule 3): first, above every line
+///    that the overflow itself can cause;
 /// 1. no relay connected for more than five minutes, by the node's own
 ///    clock;
 /// 2. entries that relays keep refusing;
@@ -414,6 +501,12 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     let long = |secs: &u64| *secs > AMBER_WAIT_SECS;
     let d = &f.devices;
     if of_folders {
+        // First among the amber memory lines, above every line that the
+        // overflow itself can cause, so that the line a person sees names
+        // the cause (decision 2026-10-19 §2, rule 3).
+        if let Some(channel) = f.channel.as_ref().filter(|c| c.past_the_line()) {
+            amber("channel_nearly_full", channel.warning());
+        }
         if let Some(secs) = f.no_relay_secs.filter(long) {
             amber(
                 "no_relay",
@@ -1161,6 +1254,183 @@ mod tests {
             all_amber.holds.last().unwrap().says,
             "memory: 2 names not yet listed by a device"
         );
+    }
+
+    // ── The personal channel near a relay's room (decision 2026-10-19) ─
+
+    /// The four forms of the warning, word for word (decision 2026-10-19
+    /// §2, rule 4).
+    const ANOTHER_FILLED: &str = "memory: laptop (able bake cold dune) has filled most of what \
+        your devices keep at a relay. If it is not yours, or you no longer use it, remove it: \
+        cordelia remove-device cordelia1laptopkey";
+    const THIS_FILLED: &str = "memory: this device has filled most of what your devices keep \
+        at a relay. If you no longer use it, remove it from another of your devices.";
+    const NAMES_FILL: &str = "memory: you sync nearly as many names as a relay can keep for \
+        your devices. A name you add now may not reach your other devices. Stop syncing names \
+        you no longer need, on every device that syncs them: their room comes back slowly, at \
+        least 90 days later. Or remove a device you no longer use: its room comes back at once.";
+    const NEARLY_FULL: &str = "memory: what your devices keep at a relay is nearly full. Run \
+        cordelia devices to see how much each device keeps there.";
+
+    /// What one word is counted as.
+    const WORD: u64 = 1_280;
+
+    /// A channel of `words` bytes of words, whose bytes that are not
+    /// words are signed by this device (`this`) and by the laptop
+    /// (`laptop`).
+    fn channel_of(words: u64, this: u64, laptop: u64) -> Channel {
+        Channel {
+            total: words + this + laptop,
+            words,
+            by: vec![
+                Signer {
+                    key: "cordelia1thiskey".into(),
+                    this_device: true,
+                    label: "desktop".into(),
+                    words_of_key: "acid baby cage dart".into(),
+                    words: words / 2,
+                    not_words: this,
+                },
+                Signer {
+                    key: "cordelia1laptopkey".into(),
+                    this_device: false,
+                    label: "laptop".into(),
+                    words_of_key: "able bake cold dune".into(),
+                    words: words - words / 2,
+                    not_words: laptop,
+                },
+            ],
+        }
+    }
+
+    /// The status turns amber where the personal channel passes the line,
+    /// 12 MiB, and not at it (decision 2026-10-19 §2, rule 3): 12,583,168
+    /// bytes is the first total past it that a store can hold (every
+    /// total is a multiple of 256). Like the other memory lines it shows
+    /// with sync on and a folder mapped, and not otherwise.
+    #[test]
+    fn the_status_is_amber_past_the_line() {
+        let line = cordelia_core::protocol::PERSONAL_CHANNEL_WARN_BYTES;
+        assert_eq!(line, 12_582_912);
+        let at = |total: u64| {
+            move |f: &mut Facts| {
+                f.channel = Some(Channel {
+                    total,
+                    words: total,
+                    by: Vec::new(),
+                })
+            }
+        };
+        let past = with(&at(line + 256));
+        assert_eq!(past.level, Some(Level::Amber));
+        assert_eq!(whats(&past), ["channel_nearly_full"]);
+        assert_eq!(past.summary, NAMES_FILL);
+        let on_it = with(&at(line));
+        assert_eq!(on_it.level, None);
+        assert!(on_it.holds.is_empty());
+        assert_eq!(on_it.summary, "memory synced");
+        // None with sync off, and none with no folder mapped.
+        let off = with(&|f| {
+            at(line + 256)(f);
+            f.sync_enabled = false;
+        });
+        assert!(!whats(&off).contains(&"channel_nearly_full"), "{off:?}");
+        let nothing_mapped = with(&|f| {
+            at(line + 256)(f);
+            f.mapped = 0;
+            f.folders = 0;
+        });
+        assert!(nothing_mapped.holds.is_empty(), "{nothing_mapped:?}");
+        // Nor with no report that read the channel.
+        assert!(with(&|f| f.channel = None).holds.is_empty());
+    }
+
+    /// The warning is first among the amber memory lines (decision
+    /// 2026-10-19 §2, rule 3): with the channel past the line, each of the
+    /// eleven lines that the overflow itself can cause is made to hold in
+    /// turn, and the line shown is the warning each time, with the other
+    /// line after it.
+    #[test]
+    fn the_warning_is_shown_before_every_other_amber_memory_line() {
+        assert_eq!(AMBER.len(), 11);
+        let past = channel_of(12 * 1024 * 1024, 0, WORD);
+        assert!(past.past_the_line());
+        for (edit, what, says) in AMBER {
+            let shown = with(&|f| {
+                f.channel = Some(past.clone());
+                edit(f);
+            });
+            assert_eq!(shown.level, Some(Level::Amber), "{what}");
+            assert_eq!(shown.summary, NAMES_FILL, "with {what}");
+            assert_eq!(whats(&shown), ["channel_nearly_full", what]);
+            assert_eq!(shown.holds[1].says, says);
+        }
+        // Everything amber at once: the warning first.
+        let all = with(&|f| {
+            f.channel = Some(past.clone());
+            for (edit, _, _) in AMBER {
+                edit(f);
+            }
+        });
+        assert_eq!(whats(&all)[0], "channel_nearly_full");
+        assert_eq!(all.summary, NAMES_FILL);
+    }
+
+    /// What the warning says depends on what fills the channel (decision
+    /// 2026-10-19 §2, rule 4): the first form that holds. Another device
+    /// with more than half of what is not words, and more than a quarter
+    /// of the total, is named, with the command that removes it; at
+    /// exactly half, or at exactly a quarter, it is not. This device in
+    /// its place has a form of its own. Words at half the total or more
+    /// give the form of names; and below half, with no device past half
+    /// of the rest, the last form.
+    #[test]
+    fn the_warning_says_what_fills_the_channel() {
+        let half_of_not_words = 4_000 * WORD;
+        // Words below half the total in each of these.
+        let words = 2_000 * WORD;
+        // Another device with half of what is not words and one entry
+        // more, and more than a quarter of the total.
+        let another = channel_of(words, half_of_not_words - WORD, half_of_not_words + WORD);
+        assert!(another.past_the_line());
+        assert!(4 * (half_of_not_words + WORD) > another.total);
+        assert_eq!(another.warning(), ANOTHER_FILLED);
+        // At exactly half of what is not words: not named.
+        let at_half = channel_of(words, half_of_not_words, half_of_not_words);
+        assert_eq!(at_half.warning(), NEARLY_FULL);
+        // At exactly a quarter of the total, though past half of what is
+        // not words: not named. The words are then past half the total.
+        let quarter = 2_500 * WORD;
+        let at_a_quarter = channel_of(5_500 * WORD, 2_000 * WORD, quarter);
+        assert_eq!(4 * quarter, at_a_quarter.total);
+        assert!(2 * quarter > at_a_quarter.total - at_a_quarter.words);
+        assert_eq!(at_a_quarter.warning(), NAMES_FILL);
+        // One entry over the quarter, of the same total: named.
+        let over_a_quarter = channel_of(5_499 * WORD, 2_000 * WORD, quarter + WORD);
+        assert_eq!(over_a_quarter.total, at_a_quarter.total);
+        assert_eq!(over_a_quarter.warning(), ANOTHER_FILLED);
+        // This device in its place.
+        let this = channel_of(words, half_of_not_words + WORD, half_of_not_words - WORD);
+        assert_eq!(this.warning(), THIS_FILLED);
+        // Words at exactly half the total, what is not words shared.
+        let names = channel_of(8_000 * WORD, 4_000 * WORD, 4_000 * WORD);
+        assert_eq!(2 * names.words, names.total);
+        assert_eq!(names.warning(), NAMES_FILL);
+        // Words below half, with two devices each at half of the rest.
+        let neither = channel_of(8_000 * WORD - WORD, 4_000 * WORD, 4_000 * WORD);
+        assert!(2 * neither.words < neither.total);
+        assert_eq!(neither.warning(), NEARLY_FULL);
+        // A device with no label is named by the words of its key.
+        let mut no_label = another.clone();
+        no_label.by[1].label.clear();
+        assert!(
+            no_label
+                .warning()
+                .starts_with("memory: a device (able bake cold dune) has")
+        );
+        // And the status says it.
+        let shown = with(&|f| f.channel = Some(another.clone()));
+        assert_eq!(shown.summary, ANOTHER_FILLED);
     }
 
     /// The level is the gravest that holds, and the line shows the first

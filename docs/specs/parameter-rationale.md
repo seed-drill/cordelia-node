@@ -1387,6 +1387,10 @@ against a cap of its own.
 **What it costs:** an entry is padded to a power of two, so a name with
 more than about half of a channel's cap in text may not fit (decision §10).
 
+**What is derived from it:** the line past which a device warns that its
+personal channel nears this cap, `PERSONAL_CHANNEL_WARN_BYTES` (§12.10,
+decision 2026-10-19).
+
 #### NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR = 256
 
 **Rationale:** How many channels from their secrets one address may make a
@@ -1475,7 +1479,8 @@ refused, and is a breach. All the connections from one address share
 without end: every proof is a signature for the relay to check, and every
 pull a look at its store.
 
-**Derivation:** It is sized for a device with 256 names, which is what an
+**Derivation:** It is sized for a device with 256 names (a sizing, not a
+bound: a device may sync more; decision 2026-10-19), which is what an
 address may make a relay take in an hour: a pull of each every ten seconds,
 and of the personal channel and the messages channel (1,548 a minute; the
 messages channel is decision 2026-10-09 §2.1); a show for each pass and
@@ -1870,6 +1875,32 @@ and offers again what was refused after a wait that doubles up to
 `OUTBOX_REFUSED_RETRY_MAX_SECS`. So a relay that still refuses has refused
 again within twice that, and one that has not has taken what it was offered,
 or was offered nothing more.
+
+#### PERSONAL_CHANNEL_WARN_BYTES = 12 MiB
+
+**Derivation:** `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` −
+`PERSONAL_CHANNEL_HEADROOM_BYTES` (4 MiB).
+
+**Rationale:** The status turns amber where the personal channel, as this
+device's store holds it, passes this (decision 2026-10-19). A relay holds
+16 MiB of one channel, and refuses what would grow it past that. Nothing
+but a removal frees room in under 90 days, so the 4 MiB below the cap
+(`PERSONAL_CHANNEL_HEADROOM_BYTES`) is the budget left after the warning:
+the entries that are written whatever the total (640 KiB), a recovery's
+1,024 names and a device that joins with as many folders mapped (1.25 MiB
+each), and 716 words for names added meanwhile. Nothing is refused at the
+line. What it costs: a sum in the read of the personal channel that each
+sync cycle makes, about 1 ms at the cap's size.
+
+#### PERSONAL_CHANNEL_HEADROOM_BYTES = 4 MiB
+
+**Rationale:** The room left below a relay's cap of one channel once the
+warning shows (decision 2026-10-19 §2): the budget above. `protocol.rs`
+asserts that it is no less than 2 × `MAX_COUNTED_DEVICES` words, and
+`MAX_COUNTED_DEVICES` + `MAX_NOT_COUNTED_RECORDS` records of an addition,
+and 2 × `RECOVERY_MAX_NAMES` words (3,276,800 bytes); and that the longest
+word, a text or a delete, is an entry of `MIN_ENTRY_CONTENT_BYTES`, so that
+every word is counted at 1,280 bytes.
 
 ### 12.11 The First Start
 

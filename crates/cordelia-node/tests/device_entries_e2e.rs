@@ -28,7 +28,7 @@ use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::sender::{self, At, NotSent, Request, Sent};
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, OwnAsk,
-    ProofMade, ProvedBy,
+    ProofMade, ProvedBy, RefusedOf,
 };
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
@@ -1431,7 +1431,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     let status = device.at("relay");
     assert_eq!(status.holds_latest, Some(false));
     let no_room = status.no_room.expect("the refusal is kept");
-    assert!(no_room.of_the_change && !no_room.over_allowance);
+    assert!(no_room.of.is_the_change() && !no_room.over_allowance);
     assert!((at..at + 5).contains(&no_room.at));
     // Refused for the address's allowance: the same.
     later();
@@ -1439,7 +1439,7 @@ async fn only_an_answer_that_says_no_later_change_is_held_gives_leave() {
     device.passes().await;
     assert_eq!(device.has_leave("relay"), Ok(()));
     let no_room = device.at("relay").no_room.unwrap();
-    assert!(no_room.of_the_change && no_room.over_allowance);
+    assert!(no_room.of.is_the_change() && no_room.over_allowance);
     // Refused as not signed as it must be: that says nothing of what the
     // relay holds. No leave.
     later();
@@ -3965,6 +3965,87 @@ async fn an_entry_reaches_a_second_relay_through_a_device_that_is_connected_to_b
     assert_eq!(held[0].author, writer.key());
 }
 
+/// What a relay refused for room is said as what it is (decision
+/// 2026-10-19 §2, rule 6), in the lines that `cordelia devices` prints
+/// (the look's). The relay has room for the change entry and the
+/// device's `applied/` word, and for nothing more. In one pass it refuses
+/// the device's new word in the personal channel, and the words for the
+/// personal channel are said. In a later pass, while that word waits to
+/// be sent again, it refuses an entry of a name's channel, and the words
+/// for that channel are said. Neither says "a new channel". This is a
+/// full relay; a channel at its cap is answered the same on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relays_refusal_for_room_is_said_as_what_it_is() {
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    let cost = |entry: &Entry| entry_cost(entry.content.len());
+    let personal = device.personal();
+    let applied: u64 = entries::channel_entries_after(&device.db(), &personal, 0, 100)
+        .unwrap()
+        .iter()
+        .map(|held| cost(&held.entry))
+        .sum();
+    let relay = relay_started("relay", Some(cost(&device.latest()) + applied));
+    device.says_it_syncs("lab");
+    device.connects("relay", &relay).await;
+    // What `cordelia devices` says of the relay.
+    let said = |device: &Device| -> String {
+        let look = cordelia_api::look::look(
+            &device.db(),
+            &device.state.identity,
+            &device.status(),
+            device.now(),
+        )
+        .unwrap();
+        let of_relay: Vec<&String> = look
+            .says
+            .iter()
+            .filter(|line| line.contains("no room"))
+            .collect();
+        let [line] = of_relay.as_slice() else {
+            panic!("{:?}", look.says);
+        };
+        (*line).clone()
+    };
+
+    // One pass: the personal channel's new word is refused.
+    device.passes().await;
+    let no_room = device.at("relay").no_room.expect("the refusal is kept");
+    assert_eq!(no_room.of, RefusedOf::Personal);
+    assert!(!no_room.over_allowance);
+    let line = said(&device);
+    assert!(
+        line.starts_with("relay had no room for what you sent at "),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(": the relay is full, or what your devices keep there is."),
+        "{line}"
+    );
+    assert!(!line.contains("a new channel"), "{line}");
+
+    // A later pass, while that word waits: an entry of a name's channel
+    // is refused, and is the refusal kept.
+    device.holds("notes");
+    let refused = device.writes("notes", "a.md", "no room for this");
+    device.passes().await;
+    assert!(!holds_at(&relay, &device.channel("notes"), &refused.id()));
+    let no_room = device.at("relay").no_room.expect("the refusal is kept");
+    assert_eq!(no_room.of, RefusedOf::Name("notes".into()));
+    let line = said(&device);
+    assert!(
+        line.starts_with("relay had no room for what you sent at "),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(
+            ": the relay is full, or your memory of notes there is as large as a relay keeps."
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("a new channel"), "{line}");
+}
+
 /// A relay with no room for an entry: the entry is kept, and sent again
 /// later, a little later each time, and the refusal is in what a status
 /// reads. What the relay did take is not sent again.
@@ -3997,7 +4078,8 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
     let status = device.at("relay");
     assert_eq!(status.holds_latest, Some(true));
     let no_room = status.no_room.expect("the refusal is kept for the status");
-    assert!(!no_room.of_the_change && !no_room.over_allowance);
+    assert_eq!(no_room.of, RefusedOf::Name("notes".into()));
+    assert!(!no_room.over_allowance);
     assert!((at..at + 5).contains(&no_room.at));
     // Its word that it has sent what it carried is written by that pass
     // (decision 2026-10-04 §8), over its word in the personal channel,
@@ -4188,7 +4270,8 @@ async fn a_channel_that_a_relay_will_not_begin_is_left_whole_until_the_wait_has_
     device.passes().await;
     assert_eq!(pushed_of_notes(&relay), std::slice::from_ref(&both));
     let no_room = device.at("relay").no_room.expect("the refusal is kept");
-    assert!(no_room.over_allowance && !no_room.of_the_change);
+    assert!(no_room.over_allowance);
+    assert_eq!(no_room.of, RefusedOf::Name("notes".into()));
 
     // While the wait lasts nothing of the channel goes, what is written
     // meanwhile among it.
