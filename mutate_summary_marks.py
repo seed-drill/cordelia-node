@@ -59,12 +59,15 @@ MUTATIONS = [
      '''    if body.version != env!("CARGO_PKG_VERSION") || body.ids.len() > AGENT_MESSAGE_SUMMARY_LINES {''',
      '''    if body.ids.len() > AGENT_MESSAGE_SUMMARY_LINES {''',
      [api("the_node_marks_announced_what_the_command_says_it_printed")]),
-    ("SM7 the command tells the node the lines of an answer that came late", MSG_CMD,
-     '''    if status != 200 || Instant::now() >= deadline {
+    ("SM7 the command waits past its deadline and tells the node the lines of an answer that came late", MSG_CMD,
+     ['''    let Posted::Answered(status, answer) = node.post("/api/v1/messages/summary", &request, left)''',
+      '''    if status != 200 || Instant::now() >= deadline {
         return None;
     }
-    let said = summary_for(&answer, given)?;''',
-     '''    if status != 200 {
+    let said = summary_for(&answer, given)?;'''],
+     ['''    let Posted::Answered(status, answer) =
+        node.post("/api/v1/messages/summary", &request, Duration::from_secs(2))''',
+      '''    if status != 200 {
         return None;
     }
     if Instant::now() >= deadline {
@@ -76,7 +79,7 @@ MUTATIONS = [
         node.post("/api/v1/messages/announced", &told, Duration::from_millis(20));
         return None;
     }
-    let said = summary_for(&answer, given)?;''',
+    let said = summary_for(&answer, given)?;'''],
      [e2e("the_summary_answers_within_its_time_or_prints_nothing")]),
     ("SM8 the command tells the node lines it could not write", MSG_CMD,
      '''    if !written(&said) {
