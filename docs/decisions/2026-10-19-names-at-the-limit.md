@@ -1,7 +1,7 @@
 # Decision: a warning before the personal channel fills a relay's room
 
 **Date**: 2026-10-19
-**Status**: Proposed. Not built.
+**Status**: Built.
 **Cited as**: code comments will cite this record as "decision 2026-10-19", and its rules as "§2, rule 3". The numbers do not change.
 
 Words used throughout:
