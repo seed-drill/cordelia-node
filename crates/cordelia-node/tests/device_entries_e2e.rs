@@ -9984,3 +9984,18 @@ async fn a_pass_writes_the_carried_word_where_the_other_relay_is_out_of_reach() 
     device.passes().await;
     assert_eq!(device.at("b").key, Some(b.key));
 }
+
+/// A relay that the device is connected to is known by the key of that
+/// connection before it has answered anything (decision 2026-10-19, rule
+/// 6): its rows of what was sent are kept by that key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_is_known_by_the_key_of_its_connection_before_it_answers() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    relay.says(Say::Reset, Say::Reset);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(answer_of(&device, "relay"), None);
+    assert_eq!(device.at("relay").key, Some(relay.key));
+}
