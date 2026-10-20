@@ -60,6 +60,7 @@ use cordelia_storage::sync_state;
 
 use crate::person::{Counting, PersonError, hold_name, in_one};
 use crate::publish::Standing;
+use crate::state::AppState;
 
 /// Whether `name` is a name as this version would itself map one: of the
 /// characters that a name may have, no longer than a name may be, and in
@@ -421,6 +422,41 @@ fn words_kept(
 /// at the first cycle after a node starts, every entry is read afresh.
 pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> {
     read_ahead_in(db, &KEPT)
+}
+
+/// [`read_ahead`] once, on a thread of its own, as a node starts: what a
+/// node reads of its personal channel under the lock (`msg summary`,
+/// `msg send`, the look) then checks and opens only what was stored
+/// since, and not every entry stored, as the first read after a start did
+/// until a cycle of sync had read ahead. A cycle reads ahead before each
+/// read of its own, and nothing else needs it: every read keeps what it
+/// found, the entries stored after start are few between two cycles, and
+/// a node whose sync is off has no cycle and reads ahead only here.
+pub fn read_ahead_at_start(state: std::sync::Arc<AppState>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Err(e) = read_ahead(&state.db) {
+            tracing::warn!(error = %e, "the personal channel could not be read ahead at start");
+        }
+    })
+}
+
+/// How many entries of the personal channel a read of its words under
+/// the lock would check and open now: those stored as nothing that is
+/// kept holds ([`Kept`]). None on a device that follows no phrase.
+pub fn not_read_ahead(conn: &Connection) -> Result<usize, PersonError> {
+    let Ok(standing) = Standing::of(conn) else {
+        return Ok(0);
+    };
+    let channel = derive::channel_id(&derive::personal_secret(&standing.secret)?)?;
+    let stored = entries::channel_stored(conn, &channel)?;
+    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(match &*kept {
+        Some(kept) if kept.channel == channel => stored
+            .iter()
+            .filter(|held| !kept.holds(&held.entry))
+            .count(),
+        _ => stored.len(),
+    })
 }
 
 /// [`read_ahead`], keeping what it finds in `slot`.

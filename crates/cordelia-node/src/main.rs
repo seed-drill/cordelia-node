@@ -2104,6 +2104,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         start_history(&state, &config.history);
     }
 
+    // A personal node checks and opens what its store holds of its
+    // personal channel once, with the lock let go, on a thread of its
+    // own: a read of it under the lock then checks only what was stored
+    // since, from the first one after start. A node that is held up
+    // reads nothing ahead; its first cycle does, once it may run.
+    if personal && state.held.why().is_none() {
+        cordelia_api::names::read_ahead_at_start(state.clone().into_inner());
+    }
+
     // Start the tokio/actix runtime with graceful shutdown
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
