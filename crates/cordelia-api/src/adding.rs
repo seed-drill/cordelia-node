@@ -1260,6 +1260,8 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
+    // Nor does it keep in memory what it read of the personal channel.
+    crate::names::forget_kept();
     Ok(())
 }
 

@@ -1029,6 +1029,9 @@ fn stop(conn: &Connection, state: State, entry: &CheckedEntry) -> Result<(), Per
     held_rows::set_state(conn, state)?;
     held_rows::keep_change_entry(conn, Kept::Latest, entry)?;
     held_rows::drop_change_entry(conn, Kept::Apart)?;
+    // A device that has stopped keeps nothing in memory of what it read
+    // of its personal channel.
+    crate::names::forget_kept();
     Ok(())
 }
 
