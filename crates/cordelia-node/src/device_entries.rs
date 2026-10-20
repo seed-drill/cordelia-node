@@ -124,8 +124,8 @@ use cordelia_api::at_relays::{
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, NoRoom,
-    ProvedBy,
+    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, Holds, LeftAt, LeftPlace, LeftRead,
+    NoRoom, ProvedBy,
 };
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
@@ -1056,6 +1056,8 @@ impl DeviceEntries {
         let ids: Vec<RelayId> = relays.iter().map(Relay::id).collect();
         *lock(&self.set_up) = ids.clone();
         let now = self.unix();
+        // What a show that ends while this reads says stands over it.
+        let shows_ended = self.reach.shows_ended();
         let read = {
             let db = lock(&self.state.db);
             if !self.started.swap(true, Ordering::SeqCst) {
@@ -1100,7 +1102,7 @@ impl DeviceEntries {
                 (id, holds, answered)
             })
             .collect();
-        self.reach.observe(kept, shows, &each);
+        self.reach.observe_as_read(shows_ended, kept, shows, &each);
     }
 
     /// The relay that `link` is a connection to, by its name and key
@@ -1519,7 +1521,11 @@ impl DeviceEntries {
     fn round_ended(&self, link: &Link, round: &Round) {
         let relay = self.id_of(link);
         let said = round.said.unwrap_or(Said::Neither);
-        let holds = {
+        // An answer that it does not hold the entry is believed though it
+        // could not be written down.
+        let holds = if said == Said::Lacks {
+            Holds::Lacks
+        } else {
             let db = lock(&self.state.db);
             let kept = at_relays::kept_id(&db).ok().flatten();
             let known = known::read(&db).unwrap_or_default();
@@ -2490,14 +2496,13 @@ impl DeviceEntries {
             // What of the device's own a relay takes, or refuses at each
             // offer, says whether it refuses what waits there (decision
             // 2026-10-19 §1).
-            if channel.kind != Kind::Messages {
-                let relay = self.id_of(link);
-                if done.held > 0 {
-                    self.reach.took_what_waits(&relay);
-                }
-                if stopped || done.no_room > 0 {
-                    self.reach.refused_what_waits(&relay);
-                }
+            let (took, refused) = what_waits_heard(&channel.kind, &done);
+            let relay = self.id_of(link);
+            if took {
+                self.reach.took_what_waits(&relay);
+            }
+            if refused {
+                self.reach.refused_what_waits(&relay);
             }
             if stopped || done.no_room > 0 {
                 // A relay with no room for the messages channel sets no
@@ -2820,6 +2825,18 @@ struct PageSeen {
     stale: bool,
 }
 
+/// What the answer `done` to a push of a channel of `kind` says of what of
+/// the device's own waits at the relay (decision 2026-10-19 §1): whether
+/// the relay took something of it, and whether it refused something, for
+/// room or for the address's allowance. The messages channel says neither:
+/// what waits there makes no relay STUCK (decision 2026-10-09 §8).
+fn what_waits_heard(kind: &Kind, done: &Sent) -> (bool, bool) {
+    if *kind == Kind::Messages {
+        return (false, false);
+    }
+    (done.held > 0, done.refused.is_some() || done.no_room > 0)
+}
+
 /// Whether a pull got somewhere by a page: it was `asked` from a mark and
 /// a place, the page says the mark and the place to ask from next
 /// (`told`), and `each` is what became of its entries.
@@ -3106,6 +3123,36 @@ mod tests {
             256 + 1024
         );
         assert_eq!(counted_as_handed(3), entry_cost(0));
+    }
+
+    /// What a push's answer says of what waits at a relay (decision
+    /// 2026-10-19 §1): something taken, and something refused for room or
+    /// for the allowance, of a channel of the device's memory; and nothing
+    /// of the messages channel, whatever its answer.
+    #[test]
+    fn what_waits_is_heard_of_memory_and_not_of_messages() {
+        let took = Sent {
+            held: 1,
+            ..Sent::default()
+        };
+        let no_room = Sent {
+            no_room: 1,
+            ..Sent::default()
+        };
+        let over = Sent {
+            refused: Some(Pushed::OverAllowance),
+            ..Sent::default()
+        };
+        let name = Kind::Name("notes".into());
+        for kind in [Kind::Personal, name.clone()] {
+            assert_eq!(what_waits_heard(&kind, &took), (true, false));
+            assert_eq!(what_waits_heard(&kind, &no_room), (false, true));
+            assert_eq!(what_waits_heard(&kind, &over), (false, true));
+            assert_eq!(what_waits_heard(&kind, &Sent::default()), (false, false));
+        }
+        for done in [&took, &no_room, &over] {
+            assert_eq!(what_waits_heard(&Kind::Messages, done), (false, false));
+        }
     }
 
     /// Each answer to a push says one of six things for sending: the
