@@ -1223,6 +1223,16 @@ mod tests {
             }
         }
         assert_eq!(states, 96, "the model's states of one relay");
+        // A relay in the third state, which the model does not carry, is
+        // in no class, whatever else is so of it.
+        for (reached, out) in [(true, false), (false, true), (false, false)] {
+            for waits in [None, Some(Waits::Nothing), Some(Waits::Refused)] {
+                for refused_long in [true, false] {
+                    let got = class(Holds::Neither, reached, out, waits, refused_long);
+                    assert_eq!(got, None, "reached {reached}, out {out}, {waits:?}");
+                }
+            }
+        }
     }
 
     /// A relay that comes to lack the change is told the dial loop once,

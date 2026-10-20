@@ -608,6 +608,26 @@ mod tests {
             meta::get(&s[2].conn, meta::PERSON_RELAYS_KNOWN).unwrap(),
             None
         );
+        // Nor where the device keeps a change entry: a hand-over to a
+        // device that counts already brings nothing, and marks nothing.
+        let mut s = Several::of_one_person(2);
+        let added = s.hand(0, 1);
+        let now = s.tick();
+        let on = &s[1];
+        type_key(&on.conn, &on.identity, &s.key(0), Row::Several, false, now).unwrap();
+        let typed = acts::typed_key(&on.conn, &s.key(0)).unwrap().unwrap();
+        let given = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            &set_up,
+            now,
+        )
+        .unwrap();
+        assert!(matches!(given, Some(Accepted::Refused(_))), "{given:?}");
+        assert_eq!(holds_now(&s[1].conn, &a, None), Holds::Lacks);
 
         // A change since: the mark is of the entry before, and the relay
         // lacks the change. A relay set up later has no mark.
