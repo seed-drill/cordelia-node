@@ -1932,7 +1932,11 @@ reached, or until its reference moves: a start, a sleep, or a change of the
 change entry the device keeps. A wake for any other reason does not move
 it. The command after a change ends without success only once each relay
 that lacks the change has been out of reach for this long since the change,
-or has refused the change for this long. `protocol.rs` asserts that it is
+or has refused the change for this long. A dial, or a connection that
+waits for a show, that has been in flight for this long is taken to have
+failed: a result that was lost holds no relay up for good, and a dial that
+is answered at all is answered well within it (a connection's time-out and
+its handshake's). `protocol.rs` asserts that it is
 more than twice `WAKE_WAIT_SECS` (a device that wakes has heard from its
 relays, or given them up, well within it), and more than
 `BOOTNODE_RESOLVE_RETRY_SECS` and `BACKOFF_BASE_SECS` (a relay that lacks

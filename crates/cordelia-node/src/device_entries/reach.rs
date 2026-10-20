@@ -18,7 +18,10 @@
 //!   connection; and each tick of the dial loop that passes it over
 //!   because another relay answers at its address, an attempt begun and
 //!   failed at once. A dial that connects is not ended until a show on
-//!   that connection says something, or the connection closes first;
+//!   that connection says something, or the connection closes first. A
+//!   dial, or a connection that waits for a show, is taken to have failed
+//!   once it has been in flight for OUT_OF_REACH_SECS: a result that is
+//!   lost holds no relay up for good;
 //! - **whether it is out of reach, and since when.** It becomes so at the
 //!   first moment that it has not been reached since its reference, which
 //!   is OUT_OF_REACH_SECS or more before now; at least one attempt at it
@@ -102,11 +105,14 @@ struct Of {
     /// The connection on which it is reached, where it is.
     reached: Option<LinkId>,
     last_reached: Option<Moment>,
-    /// The attempts in flight: dials, shows, and a dial that connected
-    /// and waits for a show on its connection to say something.
-    dials: u32,
+    /// The attempts in flight: dials, each by when it began; shows; and a
+    /// dial that connected and waits for a show on its connection to say
+    /// something, by when it connected.
+    dials: Vec<Instant>,
     shows: u32,
-    awaiting: bool,
+    awaiting: Option<Instant>,
+    /// The number of the last show that ended here ([`Inner::shown`]).
+    shown: u64,
     /// When the latest attempt began that began after the reference.
     last_begun: Option<Instant>,
     /// When this relay's state was last looked at.
@@ -130,9 +136,10 @@ impl Of {
             holds: None,
             reached: None,
             last_reached: None,
-            dials: 0,
+            dials: Vec::new(),
             shows: 0,
-            awaiting: false,
+            awaiting: None,
+            shown: 0,
             last_begun: None,
             looked: now.at,
             out_since: None,
@@ -161,7 +168,22 @@ impl Of {
 
     /// Whether an attempt is in flight.
     fn in_flight(&self) -> bool {
-        self.dials > 0 || self.shows > 0 || self.awaiting
+        !self.dials.is_empty() || self.shows > 0 || self.awaiting.is_some()
+    }
+
+    /// The dials, and the connection that waits for a show, that have
+    /// been in flight for OUT_OF_REACH_SECS by `now` are taken to have
+    /// failed: a result that was lost holds nothing up for good. Returns
+    /// when the last of them ended so, where any did.
+    fn give_up(&mut self, now: Instant) -> Option<Instant> {
+        let ends = |begun: &Instant| *begun + OUT_OF_REACH;
+        let mut ended = self.dials.iter().map(ends).filter(|end| *end <= now).max();
+        self.dials.retain(|begun| ends(begun) > now);
+        if let Some(end) = self.awaiting.as_ref().map(ends).filter(|end| *end <= now) {
+            ended = ended.max(Some(end));
+            self.awaiting = None;
+        }
+        ended
     }
 
     /// Bring the state up to `now`: where it was out of reach at any
@@ -173,13 +195,16 @@ impl Of {
     fn settle(&mut self, common: Moment, now: Moment) {
         let since = self.looked;
         self.looked = now.at.max(since);
+        let given_up = self.give_up(now.at);
         if self.out_since.is_some() || self.reached.is_some() || self.in_flight() {
             return;
         }
         let Some(begun) = self.last_begun else {
             return;
         };
-        let from = since.max(self.reference(common).at + OUT_OF_REACH);
+        let from = since
+            .max(self.reference(common).at + OUT_OF_REACH)
+            .max(given_up.unwrap_or(since));
         let until = now.at.min(begun + OUT_OF_REACH);
         if from <= until {
             self.out_since = Some(Moment::back_from(now, from));
@@ -217,6 +242,9 @@ struct Inner {
     /// The relays that came to lack the change since the dial loop last
     /// asked.
     came_to_lack: HashSet<RelayId>,
+    /// How many shows have ended: a pass that read the database before a
+    /// show ended does not write what it read over what the show said.
+    shown: u64,
 }
 
 impl Inner {
@@ -258,6 +286,7 @@ impl Reach {
                 shows: false,
                 relays: HashMap::new(),
                 came_to_lack: HashSet::new(),
+                shown: 0,
             }),
             lookups: tokio::sync::Notify::new(),
         })
@@ -299,6 +328,31 @@ impl Reach {
         shows: bool,
         each: &[(RelayId, Holds, Option<i64>)],
     ) {
+        let read = self.shows_ended();
+        self.observe_as_read(read, kept, shows, each);
+    }
+
+    /// How many shows have ended by now: what a pass takes before it reads
+    /// the database, for [`Self::observe_as_read`].
+    pub fn shows_ended(&self) -> u64 {
+        lock(&self.inner).shown
+    }
+
+    /// [`Self::observe`], for what was read from the database when
+    /// `read` shows had ended ([`Self::shows_ended`]). What a show that
+    /// ended since then said of a relay stands: it is later than what was
+    /// read.
+    ///
+    /// **A relay reached on an answer about the entry kept before is
+    /// reached no more**: it is reached by an answer about the kept entry
+    /// (decision 2026-10-19 §1).
+    pub fn observe_as_read(
+        &self,
+        read: u64,
+        kept: Option<[u8; 32]>,
+        shows: bool,
+        each: &[(RelayId, Holds, Option<i64>)],
+    ) {
         let now = self.now();
         let mut inner = lock(&self.inner);
         if inner.kept.is_some_and(|was| was != kept) {
@@ -307,6 +361,9 @@ impl Reach {
                 of.starts_again(now);
                 of.lacking_since = None;
                 of.holds = None;
+                if of.reached.take().is_some() {
+                    of.last_reached = Some(now);
+                }
             }
         }
         inner.kept = Some(kept);
@@ -318,6 +375,9 @@ impl Reach {
         for (relay, holds, answered_at) in each {
             let common = inner.common;
             let of = inner.of(relay, now);
+            if of.shown > read && of.holds.is_some() {
+                continue;
+            }
             // A relay not seen since the start, or since the kept entry
             // changed, has lacked the change since then: the node knows
             // nothing from before.
@@ -367,9 +427,15 @@ impl Reach {
     /// makes the relay reached on that connection; one that says neither
     /// is a failed attempt, and the relay is reached there no more.
     pub fn show_ends(&self, relay: &RelayId, link: LinkId, said: Said, holds: Holds) {
+        let shown = {
+            let mut inner = lock(&self.inner);
+            inner.shown += 1;
+            inner.shown
+        };
         let woke = self.with(relay, |of, _, now| {
             of.shows = of.shows.saturating_sub(1);
-            of.awaiting = false;
+            of.awaiting = None;
+            of.shown = shown;
             match said {
                 Said::Holds | Said::Lacks => {
                     of.reached = Some(link);
@@ -389,10 +455,16 @@ impl Reach {
             }
         });
         if woke {
-            let mut inner = lock(&self.inner);
-            if inner.shows {
-                inner.came_to_lack.insert(relay.clone());
-            }
+            self.came_to_lack_now(relay);
+        }
+    }
+
+    /// `relay` came to lack the change: the dial loop is told, where the
+    /// device has a change to show.
+    fn came_to_lack_now(&self, relay: &RelayId) {
+        let mut inner = lock(&self.inner);
+        if inner.shows {
+            inner.came_to_lack.insert(relay.clone());
         }
     }
 
@@ -425,7 +497,7 @@ impl Reach {
     /// A dial of `relay` begins.
     pub fn dial_begins(&self, relay: &RelayId) {
         self.with(relay, |of, _, now| {
-            of.dials = of.dials.saturating_add(1);
+            of.dials.push(now.at);
             of.last_begun = Some(now.at);
         });
     }
@@ -435,11 +507,15 @@ impl Reach {
     /// its address for another, is an attempt begun and ended now.
     pub fn dial_ends(&self, relay: &RelayId, connected: bool) {
         self.with(relay, |of, _, now| {
-            match of.dials {
-                0 => of.last_begun = Some(now.at),
-                _ => of.dials -= 1,
+            match of.dials.is_empty() {
+                true => of.last_begun = Some(now.at),
+                false => {
+                    of.dials.remove(0);
+                }
             }
-            of.awaiting |= connected;
+            if connected {
+                of.awaiting = Some(now.at);
+            }
         });
     }
 
@@ -450,33 +526,29 @@ impl Reach {
         self.with(relay, |of, _, now| of.last_begun = Some(now.at));
     }
 
-    /// No connection to `relay` is open: a dial that connected and was
-    /// waiting for a show has failed, and the relay is reached no more.
-    pub fn connection_gone(&self, relay: &RelayId) {
-        self.with(relay, |of, _, now| {
-            of.awaiting = false;
-            if of.reached.take().is_some() {
-                of.last_reached = Some(now);
-                of.starts_again(now);
-            }
-        });
-    }
-
     /// The connection to `relay` that is open now, where one is: where
     /// none is, or another than the one it was reached on, a dial that
     /// connected and waited for a show has failed, and the relay is
-    /// reached no more.
+    /// reached no more. A relay given no key holds the change only while
+    /// the device is connected to it (decision 2026-10-19 §1): with no
+    /// connection it lacks it, from now on, and not from the next pass.
     pub fn connection(&self, relay: &RelayId, open: Option<LinkId>) {
-        self.with(relay, |of, _, now| {
-            if open.is_none() {
-                of.awaiting = false;
-            }
+        let keyless = relay.key.is_none();
+        let woke = self.with(relay, |of, _, now| {
             if of.reached.is_some() && of.reached != open {
                 of.reached = None;
                 of.last_reached = Some(now);
                 of.starts_again(now);
             }
+            if open.is_some() {
+                return false;
+            }
+            of.awaiting = None;
+            keyless && of.holds == Some(Holds::Holds) && of.holds_now(Holds::Lacks, now)
         });
+        if woke {
+            self.came_to_lack_now(relay);
+        }
     }
 
     /// Whether `relay` lacks the change while the device has one to show:
@@ -760,14 +832,14 @@ mod tests {
             "tried only before the reference"
         );
         assert_eq!(reach.of(&b).class, None);
-        // A dial that began more than five minutes before it failed: no
+        // A show that began more than five minutes before it failed: no
         // attempt was begun within the five minutes.
         let d = relay("d");
         observe(&reach, LATER, &[(&d, Holds::Lacks)]);
         at.to(3610);
-        reach.dial_begins(&d);
+        reach.show_begins(&d);
         at.to(4000);
-        reach.dial_ends(&d, false);
+        reach.show_ends(&d, link(4), Said::Neither, Holds::Lacks);
         at.to(5000);
         assert!(
             !reach.is_out_of_reach(&d),
@@ -1147,8 +1219,10 @@ mod tests {
     /// over every state of one relay that it enumerates (decision
     /// 2026-10-19 §1, appendix A): 96 states, each put in its class by
     /// the node's own functions, what is known of the relay first
-    /// ([`known::holds`]) and then [`class`]. A relay given no key holds
-    /// the change only while connected.
+    /// ([`known::holds`]) and then [`class`]; and again by a [`Reach`]
+    /// that is told the events that put the relay in that state, over the
+    /// clock, and gives its class ([`Reach::of`]). A relay given no key
+    /// holds the change only while connected.
     #[test]
     fn the_classes_agree_with_the_model_over_every_relay_state() {
         const ANSWERS: [&str; 6] = ["none", "held", "took", "noroom", "over", "another"];
@@ -1211,10 +1285,20 @@ mod tests {
                                     };
                                     let waits = reached.then_some(waits);
                                     let node = class(holds, reached, out, waits, refused_long);
-                                    assert_eq!(
-                                        node, model,
+                                    let said = format!(
                                         "keyed {keyed}, connected {connected}, reached {reached}, out {out}, {answer}, {waits:?}, refused {refused_long}"
                                     );
+                                    assert_eq!(node, model, "{said}");
+                                    let state = State {
+                                        relay: of.relay.clone(),
+                                        holds,
+                                        connected,
+                                        reached,
+                                        out,
+                                        waits,
+                                        refused_long,
+                                    };
+                                    assert_eq!(driven_into(&state), model, "driven: {said}");
                                 }
                             }
                         }
@@ -1233,6 +1317,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A state of one relay of the model of appendix A.
+    struct State {
+        relay: RelayId,
+        holds: Holds,
+        connected: bool,
+        reached: bool,
+        out: bool,
+        waits: Option<Waits>,
+        refused_long: bool,
+    }
+
+    /// The class that a [`Reach`] gives a relay that it is told the events
+    /// of `state` of: what the pass finds of it, its connection, a show
+    /// that says whether it holds the change where it is reached, what
+    /// waits there, and failed attempts and five minutes where it is out
+    /// of reach, has refused for five minutes, or refuses what waits.
+    fn driven_into(state: &State) -> Option<Class> {
+        let r = &state.relay;
+        let (reach, clock) = started(&[(r, state.holds)]);
+        reach.connection(r, state.connected.then_some(link(1)));
+        let holds = state.holds == Holds::Holds;
+        let mut five_minutes = state.refused_long;
+        if state.reached {
+            let said = if holds { Said::Holds } else { Said::Lacks };
+            shown(&reach, r, link(1), said, state.holds);
+            match state.waits {
+                Some(Waits::Nothing) | None => reach.waits(r, false),
+                Some(Waits::Moving) => reach.waits(r, true),
+                Some(Waits::Refused) => {
+                    reach.waits(r, true);
+                    reach.refused_what_waits(r);
+                    five_minutes |= holds;
+                }
+            }
+        } else if state.out {
+            reach.failed(r);
+            five_minutes = true;
+        }
+        if five_minutes {
+            clock.run_ahead(OUT_OF_REACH);
+        }
+        reach.of(r).class
     }
 
     /// A relay that comes to lack the change is told the dial loop once,
@@ -1270,6 +1398,115 @@ mod tests {
         reach.observe(Some([3; 32]), false, &each);
         assert!(!reach.lacks(&a) && !reach.lacks(&b));
         assert!(reach.came_to_lack().is_empty());
+    }
+
+    /// A dial whose result is lost holds no relay up for good (decision
+    /// 2026-10-19 §1): it is taken to have failed once it has been in
+    /// flight for five minutes, and the relay is out of reach from then,
+    /// where its other attempts failed. So is a dial that connected and
+    /// waits for a show that never comes.
+    #[test]
+    fn a_dial_whose_result_is_lost_is_given_up_after_five_minutes() {
+        let (b, c) = (relay("b"), relay("c"));
+        let (reach, clock) = started(&[(&b, Holds::Lacks), (&c, Holds::Lacks)]);
+        let start = reach.of(&b).reference;
+        let mut at = At::new(&clock);
+        at.to(10);
+        reach.dial_begins(&b);
+        reach.dial_begins(&c);
+        reach.dial_ends(&c, true);
+        for secs in (40..=3600).step_by(30) {
+            at.to(secs);
+            reach.failed(&b);
+            reach.failed(&c);
+            let out = secs >= 310;
+            assert_eq!(reach.is_out_of_reach(&b), out, "{secs}");
+            assert_eq!(reach.is_out_of_reach(&c), out, "{secs}");
+        }
+        let since = out_since(&reach, &b, start).unwrap();
+        assert!((309..=310).contains(&since), "{since}");
+        assert_eq!(reach.of(&b).class, Some(Class::OutLacking));
+    }
+
+    /// A relay is reached by an answer about the kept entry (decision
+    /// 2026-10-19 §1): when the device comes to keep another, a relay
+    /// reached on an answer about the one before is reached no more, so
+    /// it is never REFUSING without being shown the new one, and can be
+    /// out of reach.
+    #[test]
+    fn a_new_kept_entry_ends_reached() {
+        let a = relay("a");
+        let (reach, clock) = started(&[(&a, Holds::Lacks)]);
+        let mut at = At::new(&clock);
+        at.to(10);
+        shown(&reach, &a, link(1), Said::Holds, Holds::Holds);
+        assert!(reach.is_reached(&a));
+        at.to(20);
+        observe(&reach, LATER, &[(&a, Holds::Lacks)]);
+        assert!(!reach.is_reached(&a));
+        at.to(400);
+        let of = reach.of(&a);
+        assert_eq!(of.class, None, "{of:?}");
+        assert_eq!(of.refused_since, None);
+        // Its shows of the new entry fail: it is out of reach five
+        // minutes after the change.
+        at.to(500);
+        shown(&reach, &a, link(1), Said::Neither, Holds::Lacks);
+        assert_eq!(reach.of(&a).class, Some(Class::OutLacking));
+    }
+
+    /// A relay given no key lacks the change once no connection to it is
+    /// open (decision 2026-10-19 §1), from that moment and not from the
+    /// next pass: out of reach, it is OUT and lacking, never OUT and
+    /// holding. One given a key still holds it.
+    #[test]
+    fn a_relay_given_no_key_lacks_the_change_once_its_connection_is_gone() {
+        let keyless = RelayId {
+            name: "b".into(),
+            key: None,
+        };
+        let keyed = relay("a");
+        let (reach, clock) = started(&[(&keyless, Holds::Holds), (&keyed, Holds::Holds)]);
+        let mut at = At::new(&clock);
+        assert!(reach.came_to_lack().is_empty());
+        reach.connection(&keyless, Some(link(1)));
+        assert_eq!(reach.of(&keyless).holds, Holds::Holds);
+        reach.connection(&keyless, None);
+        reach.connection(&keyed, None);
+        assert_eq!(reach.of(&keyless).holds, Holds::Lacks);
+        assert_eq!(reach.of(&keyed).holds, Holds::Holds);
+        assert_eq!(reach.came_to_lack(), vec![keyless.clone()]);
+        at.to(10);
+        dial_fails(&reach, &keyless);
+        dial_fails(&reach, &keyed);
+        at.to(300);
+        assert_eq!(reach.of(&keyless).class, Some(Class::OutLacking));
+        assert_eq!(reach.of(&keyed).class, Some(Class::OutHolding));
+    }
+
+    /// What a pass read of the database before a show ended does not
+    /// overwrite what the show said (decision 2026-10-19 §1): the relay
+    /// that answered "no room" meanwhile lacks the change, and the five
+    /// minutes of its refusal are not started again.
+    #[test]
+    fn a_show_that_ends_while_a_pass_reads_stands_over_what_it_read() {
+        let a = relay("a");
+        let (reach, clock) = started(&[(&a, Holds::Holds)]);
+        let mut at = At::new(&clock);
+        shown(&reach, &a, link(1), Said::Holds, Holds::Holds);
+        at.to(10);
+        shown(&reach, &a, link(1), Said::Lacks, Holds::Lacks);
+        // A pass read the database before that show ended.
+        at.to(100);
+        let read = reach.shows_ended() - 1;
+        let each = [(a.clone(), Holds::Holds, None)];
+        reach.observe_as_read(read, Some(KEPT), true, &each);
+        assert_eq!(reach.of(&a).holds, Holds::Lacks);
+        at.to(310);
+        assert_eq!(reach.of(&a).class, Some(Class::Refusing));
+        // What a pass reads after it stands.
+        reach.observe(Some(KEPT), true, &each);
+        assert_eq!(reach.of(&a).holds, Holds::Holds);
     }
 
     /// A relay that never held the change has lacked it since the start,

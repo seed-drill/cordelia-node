@@ -91,9 +91,9 @@ pub const PERSON_LOOK_PENDING: &str = "person.look_pending";
 /// (decision 2026-10-19 §1, rule 2): for each relay, by its name and its
 /// key, the latest answer that said whether it holds the change entry
 /// shown, and its mark; and when the kept change entry came to be kept,
-/// and when the version that keeps this first started. It goes when the
-/// device leaves its phrase. A version that does not know it reads
-/// nothing of it.
+/// and when the version that keeps this first started. All but that last
+/// time goes when the device leaves its phrase. A version that does not
+/// know it reads nothing of it.
 pub const PERSON_RELAYS_KNOWN: &str = "person.relays_known";
 
 /// JSON object of what this device called each key that a statement it

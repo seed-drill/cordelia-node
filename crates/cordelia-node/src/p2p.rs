@@ -2381,6 +2381,8 @@ pub async fn p2p_loop(
     relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut relay_tries: std::collections::HashMap<TriedRelay, RelayTry> =
         std::collections::HashMap::new();
+    // The relays that each dial in flight was begun for.
+    let mut dialling: Dialling = Default::default();
 
     // Peer-share has two independent concerns:
     // (a) Request addresses from peers (subject to per-peer cooldown for rate limits)
@@ -2500,38 +2502,18 @@ pub async fn p2p_loop(
                                 .read()
                                 .map(|relays| relays.clone())
                                 .unwrap_or_default();
-                            let (answers, refused) = answered_at(&dialled, addr, &outcome.node_id.0);
-                            if !answers.is_empty() || !refused.is_empty() {
-                                let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                                for relay in &refused {
-                                    tracing::warn!(
-                                        relay = %relay.host,
-                                        answered = %outcome.node_id,
-                                        "another key answered at a relay's address; refusing it for that relay"
-                                    );
-                                    dial_failed(
-                                        &mut relay_tries,
-                                        tried_relay(relay),
-                                        ANOTHER_KEY_ANSWERED.into(),
-                                        (true, p2p_gov_tick_secs, any_connected),
-                                        reach.as_deref(),
-                                    );
-                                }
-                                if answers.is_empty() {
-                                    outcome.conn.close(0u32.into(), b"not the relay");
-                                    continue;
-                                }
-                                // Keep the count of failures until the
-                                // connection has lasted (see the relay
-                                // tick), so a relay that accepts and drops
-                                // at once is not redialled every second.
-                                for relay in &answers {
-                                    relay_tries.entry(tried_relay(relay)).or_default().connected_at =
-                                        Some(std::time::Instant::now());
-                                    if let Some(reach) = &reach {
-                                        reach.dial_ends(&reach_id(&tried_relay(relay)), true);
-                                    }
-                                }
+                            let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
+                            let (answers, refused) = dial_answered(
+                                &mut relay_tries,
+                                &mut dialling,
+                                &dialled,
+                                (addr, &outcome.node_id.0),
+                                (p2p_gov_tick_secs, any_connected),
+                                reach.as_deref(),
+                            );
+                            if answers.is_empty() && !refused.is_empty() {
+                                outcome.conn.close(0u32.into(), b"not the relay");
+                                continue;
                             }
                         }
 
@@ -2652,23 +2634,19 @@ pub async fn p2p_loop(
                             governor.mark_dial_failed(&nid);
                         }
                         tracing::debug!(addr = %addr, error = %error, "outbound connect failed");
-                        // Every configured relay at this address failed.
-                        let dialled: Vec<TriedRelay> = relay_addrs
+                        let dialled = relay_addrs
                             .read()
-                            .map(|relays| {
-                                relays.iter().filter(|r| r.addr == addr).map(tried_relay).collect()
-                            })
+                            .map(|relays| relays.clone())
                             .unwrap_or_default();
                         let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
-                        for tried in dialled {
-                            dial_failed(
-                                &mut relay_tries,
-                                tried,
-                                error.clone(),
-                                (false, p2p_gov_tick_secs, any_connected),
-                                reach.as_deref(),
-                            );
-                        }
+                        dial_errored(
+                            &mut relay_tries,
+                            &mut dialling,
+                            &dialled,
+                            (addr, error),
+                            (p2p_gov_tick_secs, any_connected),
+                            reach.as_deref(),
+                        );
                     }
                 }
             }
@@ -2707,37 +2685,26 @@ pub async fn p2p_loop(
                         }
                         continue;
                     }
-                    // Another relay is connected at this address, and it
-                    // is not dialled.
-                    if passed_over(&relays, relay, &|other| relay_connected(&conn_mgr, other), reach.as_deref()) {
+                    let tick = Tick {
+                        now,
+                        settled,
+                        secs: p2p_gov_tick_secs,
+                        any_connected,
+                        busy: in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT,
+                    };
+                    let connected = |other: &cordelia_network::bootstrap::RelayAddr| {
+                        relay_connected(&conn_mgr, other)
+                    };
+                    let dials = relay_tick(
+                        &mut relay_tries,
+                        &mut dialling,
+                        (&relays, relay),
+                        &connected,
+                        tick,
+                        reach.as_deref(),
+                    );
+                    if !dials {
                         continue;
-                    }
-                    if let Some(reach) = &reach {
-                        reach.connection(&reach_id(&tried_relay(relay)), None);
-                    }
-                    if in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT {
-                        continue;
-                    }
-                    let another = paced_with_another(any_connected, reach.as_deref(), &tried_relay(relay));
-                    let tried = relay_tries.entry(tried_relay(relay)).or_default();
-                    if let Some(at) = tried.connected_at.take()
-                        && at.elapsed() < settled
-                    {
-                        // It connected and was gone again at once: a failure
-                        // like any other, so the pace keeps slowing.
-                        tried.failed(
-                            "the relay closed the connection at once".into(),
-                            false,
-                            p2p_gov_tick_secs,
-                            another,
-                        );
-                    }
-                    if tried.next_try.is_some_and(|at| now < at) {
-                        continue;
-                    }
-                    tried.last_tried = Some(now);
-                    if let Some(reach) = &reach {
-                        reach.dial_begins(&reach_id(&tried_relay(relay)));
                     }
                     in_flight.insert(relay.addr);
                     let ctx = connect_ctx.clone();
@@ -3797,6 +3764,170 @@ fn dial_failed(
     }
     let tried = tries.entry(relay).or_default();
     tried.failed(error, wrong_key, tick_secs, another);
+}
+
+/// The configured relays that a dial at each address was begun for, as the
+/// list stood when it began: a lookup that moves an address, or drops it,
+/// while the dial is in flight changes nothing of whom the dial ends for.
+type Dialling = std::collections::HashMap<std::net::SocketAddr, Vec<TriedRelay>>;
+
+/// What a tick of the dial loop goes by.
+#[derive(Debug, Clone, Copy)]
+struct Tick {
+    now: std::time::Instant,
+    /// How long a connection lasts before its failures are forgotten.
+    settled: std::time::Duration,
+    /// The governor's tick, in seconds, which the waits start from.
+    secs: u64,
+    /// Whether any relay is connected.
+    any_connected: bool,
+    /// Whether no dial can be begun at the relay's address now: one is in
+    /// flight there, or as many as may be anywhere.
+    busy: bool,
+}
+
+/// One tick of the dial loop for `relay`, which is not connected, among
+/// `relays`, the relays as their names resolve now. Returns whether it is
+/// dialled now: where it is, the dial has begun, and is kept in `dialling`
+/// for every relay at that address.
+///
+/// - A relay that another relay answers for at its address is passed
+///   over, which is an attempt at it ([`passed_over`]).
+/// - With no connection, a dial that connected and waited for a show has
+///   failed (decision 2026-10-19 §1).
+/// - A connection that was gone again at once is a failure, paced as
+///   [`paced_with_another`] says (rule 3).
+fn relay_tick(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    dialling: &mut Dialling,
+    (relays, relay): (
+        &[cordelia_network::bootstrap::RelayAddr],
+        &cordelia_network::bootstrap::RelayAddr,
+    ),
+    connected: &dyn Fn(&cordelia_network::bootstrap::RelayAddr) -> bool,
+    tick: Tick,
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) -> bool {
+    if passed_over(relays, relay, connected, reach) {
+        return false;
+    }
+    let id = tried_relay(relay);
+    if let Some(reach) = reach {
+        reach.connection(&reach_id(&id), None);
+    }
+    if tick.busy {
+        return false;
+    }
+    let another = paced_with_another(tick.any_connected, reach, &id);
+    let tried = tries.entry(id.clone()).or_default();
+    if let Some(at) = tried.connected_at.take()
+        && tick.now.saturating_duration_since(at) < tick.settled
+    {
+        // It connected and was gone again at once: a failure like any
+        // other, so the pace keeps slowing.
+        let closed = "the relay closed the connection at once".into();
+        tried.failed(closed, false, tick.secs, another);
+    }
+    if tried.next_try.is_some_and(|at| tick.now < at) {
+        return false;
+    }
+    tried.last_tried = Some(tick.now);
+    if let Some(reach) = reach {
+        reach.dial_begins(&reach_id(&id));
+    }
+    let at_its_address = relays.iter().filter(|other| other.addr == relay.addr);
+    dialling.insert(relay.addr, at_its_address.map(tried_relay).collect());
+    true
+}
+
+/// A dial at `addr` was answered by the key `answered`: each configured
+/// relay at that address, among `relays` as their names resolve now, is
+/// judged by it (decision 2026-10-17 §1). Returns the relays that it
+/// reaches, and those that another key answered for.
+///
+/// Each relay that the dial was begun for ([`Dialling`]) and that is no
+/// longer at that address is a dial that failed: its address moved, or
+/// its name stopped resolving, while the dial was in flight.
+fn dial_answered(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    dialling: &mut Dialling,
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    (addr, answered): (std::net::SocketAddr, &[u8; 32]),
+    (tick_secs, any_connected): (u64, bool),
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) -> (
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+    Vec<cordelia_network::bootstrap::RelayAddr>,
+) {
+    let begun = dialling.remove(&addr).unwrap_or_default();
+    let (answers, refused) = answered_at(relays, addr, answered);
+    for relay in &refused {
+        tracing::warn!(
+            relay = %relay.host,
+            "another key answered at a relay's address; refusing it for that relay"
+        );
+        let wrong_key = (true, tick_secs, any_connected);
+        dial_failed(
+            tries,
+            tried_relay(relay),
+            ANOTHER_KEY_ANSWERED.into(),
+            wrong_key,
+            reach,
+        );
+    }
+    // Keep the count of failures until the connection has lasted (see the
+    // relay tick), so a relay that accepts and drops at once is not
+    // redialled every second.
+    for relay in &answers {
+        tries.entry(tried_relay(relay)).or_default().connected_at = Some(std::time::Instant::now());
+        if let Some(reach) = reach {
+            reach.dial_ends(&reach_id(&tried_relay(relay)), true);
+        }
+    }
+    let judged: Vec<TriedRelay> = answers.iter().chain(&refused).map(tried_relay).collect();
+    for moved in begun.into_iter().filter(|tried| !judged.contains(tried)) {
+        let moved_away = "its address changed while it was dialled".into();
+        dial_failed(
+            tries,
+            moved,
+            moved_away,
+            (false, tick_secs, any_connected),
+            reach,
+        );
+    }
+    (answers, refused)
+}
+
+/// A dial at `addr` failed with `error`: each configured relay at that
+/// address, among `relays` as their names resolve now, and each that the
+/// dial was begun for ([`Dialling`]), wherever its name resolves now.
+fn dial_errored(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    dialling: &mut Dialling,
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    (addr, error): (std::net::SocketAddr, String),
+    (tick_secs, any_connected): (u64, bool),
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) {
+    let mut failed: Vec<TriedRelay> = relays
+        .iter()
+        .filter(|relay| relay.addr == addr)
+        .map(tried_relay)
+        .collect();
+    for begun in dialling.remove(&addr).unwrap_or_default() {
+        if !failed.contains(&begun) {
+            failed.push(begun);
+        }
+    }
+    for tried in failed {
+        dial_failed(
+            tries,
+            tried,
+            error.clone(),
+            (false, tick_secs, any_connected),
+            reach,
+        );
+    }
 }
 
 /// Cut the wait already set to dial each of `came`, the relays that came
@@ -5760,6 +5891,10 @@ mod tests {
         ]);
         let (known, reach) = (&*reach, Some(&*reach));
         let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        // The dials are a while after the start, so that a dial left in
+        // flight would be in flight still when the five minutes are over.
+        let second = std::time::Duration::from_secs(1);
+        clock.run_ahead(100 * second);
         for _ in 0..40 {
             for relay in [&lacks, &holds, &third] {
                 known.dial_begins(&reach_id(relay));
@@ -5773,9 +5908,9 @@ mod tests {
             }
             assert!(wait_after(&tries[&lacks]) <= BACKOFF_BASE_SECS);
         }
-        // Each dial was an attempt, and failed: none is in flight.
-        let clock_ran = std::time::Duration::from_secs(cordelia_core::protocol::OUT_OF_REACH_SECS);
-        clock.run_ahead(clock_ran);
+        // Each dial was an attempt, and failed: none is in flight five
+        // minutes after the start.
+        clock.run_ahead(200 * second);
         assert!(known.is_out_of_reach(&reach_id(&lacks)));
         assert_eq!(wait_after(&tries[&lacks]), BACKOFF_BASE_SECS);
         assert_eq!(wait_after(&tries[&holds]), BACKOFF_MAX_SECS);
@@ -5975,6 +6110,195 @@ mod tests {
         assert!(!reach.is_out_of_reach(&reach_id(&c)));
         // With nothing connected there, it is dialled.
         assert!(!passed_over(&relays, &relays[1], &|_| false, Some(&reach)));
+    }
+
+    /// A configured relay at `addr`, with the key `key`.
+    fn relay_at(host: &str, addr: &str, key: u8) -> cordelia_network::bootstrap::RelayAddr {
+        cordelia_network::bootstrap::RelayAddr {
+            host: host.into(),
+            addr: addr.parse().unwrap(),
+            key: Some([key; 32]),
+        }
+    }
+
+    /// A tick of the dial loop at `now`, with no other relay connected
+    /// unless `any_connected`, and room for a dial.
+    fn tick_at(now: std::time::Instant, any_connected: bool) -> Tick {
+        Tick {
+            now,
+            settled: std::time::Duration::from_secs(10),
+            secs: 10,
+            any_connected,
+            busy: false,
+        }
+    }
+
+    /// A dial ends for the relays it was begun for, whatever the lookups
+    /// did to the list of addresses meanwhile (decision 2026-10-19 §1): a
+    /// relay whose address moved, or whose name stopped resolving, while
+    /// its dial was in flight is a dial that failed, ended once, and it
+    /// comes to a class: out of reach, five minutes on.
+    #[test]
+    fn a_dial_ends_for_the_relays_it_was_begun_for() {
+        use cordelia_api::state::{Class, Holds};
+        let b = relay_at("b.example:9474", "127.0.0.1:9474", 2);
+        let tried = tried_relay(&b);
+        for (answered, moved) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (reach, clock) = reach_of(&[(&tried, Holds::Lacks)]);
+            let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+            let mut dialling = Dialling::default();
+            let now = std::time::Instant::now();
+            let dials = relay_tick(
+                &mut tries,
+                &mut dialling,
+                (std::slice::from_ref(&b), &b),
+                &|_| false,
+                tick_at(now, false),
+                Some(&reach),
+            );
+            assert!(dials);
+            assert_eq!(dialling[&b.addr], vec![tried.clone()]);
+            // A lookup moves its address, or drops its name.
+            let now_listed = match moved {
+                true => vec![relay_at("b.example:9474", "127.0.0.1:9475", 2)],
+                false => Vec::new(),
+            };
+            match answered {
+                true => {
+                    let (answers, refused) = dial_answered(
+                        &mut tries,
+                        &mut dialling,
+                        &now_listed,
+                        (b.addr, &[2; 32]),
+                        (10, false),
+                        Some(&reach),
+                    );
+                    assert!(answers.is_empty() && refused.is_empty());
+                }
+                false => dial_errored(
+                    &mut tries,
+                    &mut dialling,
+                    &now_listed,
+                    (b.addr, "timed out".into()),
+                    (10, false),
+                    Some(&reach),
+                ),
+            }
+            assert!(dialling.is_empty());
+            assert_eq!(tries[&tried].failures, 1, "ended once");
+            clock.run_ahead(std::time::Duration::from_secs(
+                cordelia_core::protocol::OUT_OF_REACH_SECS,
+            ));
+            reach.failed(&reach_id(&tried));
+            let of = reach.of(&reach_id(&tried));
+            assert_eq!(of.class, Some(Class::OutLacking), "{answered} {moved}");
+        }
+    }
+
+    /// The dial loop's tick begins an attempt at a relay where it dials
+    /// it (decision 2026-10-19 §1): while that dial is in flight the
+    /// relay is not out of reach, though its five minutes are over.
+    #[test]
+    fn a_dial_that_the_loop_begins_is_in_flight() {
+        use cordelia_api::state::Holds;
+        let b = relay_at("b.example:9474", "127.0.0.1:9474", 2);
+        let tried = tried_relay(&b);
+        let (reach, clock) = reach_of(&[(&tried, Holds::Lacks)]);
+        reach.failed(&reach_id(&tried));
+        clock.run_ahead(std::time::Duration::from_secs(100));
+        let (mut tries, mut dialling) = (Default::default(), Dialling::default());
+        let now = std::time::Instant::now();
+        let relays = std::slice::from_ref(&b);
+        let tick = tick_at(now, false);
+        assert!(relay_tick(
+            &mut tries,
+            &mut dialling,
+            (relays, &b),
+            &|_| false,
+            tick,
+            Some(&reach)
+        ));
+        clock.run_ahead(std::time::Duration::from_secs(200));
+        assert!(
+            !reach.is_out_of_reach(&reach_id(&tried)),
+            "its dial is in flight"
+        );
+    }
+
+    /// A dial that connected waits for a show on its connection, and a
+    /// connection gone before one ends it as failed (decision 2026-10-19
+    /// §1): the next tick of the loop finds it not connected, and the
+    /// relay is out of reach five minutes after its reference.
+    #[test]
+    fn a_dial_that_connected_ends_when_its_connection_goes_before_a_show() {
+        use cordelia_api::state::Holds;
+        let b = relay_at("b.example:9474", "127.0.0.1:9474", 2);
+        let tried = tried_relay(&b);
+        let (reach, clock) = reach_of(&[(&tried, Holds::Lacks)]);
+        let (mut tries, mut dialling) = (Default::default(), Dialling::default());
+        let relays = std::slice::from_ref(&b);
+        let now = std::time::Instant::now();
+        clock.run_ahead(std::time::Duration::from_secs(100));
+        let tick = tick_at(now, false);
+        assert!(relay_tick(
+            &mut tries,
+            &mut dialling,
+            (relays, &b),
+            &|_| false,
+            tick,
+            Some(&reach)
+        ));
+        let (answers, _) = dial_answered(
+            &mut tries,
+            &mut dialling,
+            relays,
+            (b.addr, &[2; 32]),
+            (10, false),
+            Some(&reach),
+        );
+        assert_eq!(answers, vec![b.clone()]);
+        // It closes at once: the next tick finds it not connected.
+        let tick = tick_at(now + std::time::Duration::from_secs(1), false);
+        relay_tick(
+            &mut tries,
+            &mut dialling,
+            (relays, &b),
+            &|_| false,
+            tick,
+            Some(&reach),
+        );
+        clock.run_ahead(std::time::Duration::from_secs(200));
+        assert!(reach.is_out_of_reach(&reach_id(&tried)));
+    }
+
+    /// A relay that lacks the change and closed its connection at once is
+    /// paced as a node that is cut off, with another relay connected
+    /// (decision 2026-10-19, rule 3): its next dial is within 30 s.
+    #[test]
+    fn a_relay_that_lacks_the_change_and_closed_at_once_is_dialled_within_half_a_minute() {
+        use cordelia_api::state::Holds;
+        use cordelia_core::protocol::BACKOFF_BASE_SECS;
+        let b = relay_at("b.example:9474", "127.0.0.1:9474", 2);
+        let tried = tried_relay(&b);
+        let (reach, _clock) = reach_of(&[(&tried, Holds::Lacks)]);
+        let now = std::time::Instant::now();
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        let earlier = tries.entry(tried.clone()).or_default();
+        earlier.failures = 20;
+        earlier.connected_at = Some(now);
+        let mut dialling = Dialling::default();
+        let relays = std::slice::from_ref(&b);
+        let tick = tick_at(now, true);
+        relay_tick(
+            &mut tries,
+            &mut dialling,
+            (relays, &b),
+            &|_| false,
+            tick,
+            Some(&reach),
+        );
+        assert_eq!(tries[&tried].failures, 21);
+        assert!(wait_after(&tries[&tried]) <= BACKOFF_BASE_SECS);
     }
 
     /// A relay listed as "same relay" is not one (decision 2026-10-19 §1,
