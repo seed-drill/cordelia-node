@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Mutation checks for three small faults: what a device keeps in memory
-of its personal channel is let go when it leaves or stops (decision
-2026-10-04 §5.2), a node reads that channel ahead once as it starts, and
-the bearer token of the local API is compared in constant time. A part
+of its personal channel is let go when it leaves or stops, and a stopped
+device keeps nothing of what it reads (decision 2026-10-04 §5.2); a
+personal node that is not held up reads that channel ahead once as it
+starts; and the bearer token of the local API is compared in constant
+time. A part
 for each rule of the slice: put each fault in, and confirm the test named
 for it fails on an assertion. Run from the root of a checkout that
 nothing else edits."""
@@ -23,7 +25,7 @@ def auth(test): return (API, "auth::tests::" + test)
 def at_start(test): return (AT_START, test)
 
 FORGETS = names("test_a_device_that_forgets_or_is_removed_keeps_nothing_of_the_channel_it_read")
-FORGET_IN_A_READ = names("test_a_read_ahead_that_a_forget_comes_into_keeps_nothing")
+FORGET_IN_A_READ = names("test_a_read_ahead_that_a_forget_or_a_stop_comes_into_keeps_nothing")
 AFTER_START = at_start("test_after_start_a_read_under_the_lock_checks_nothing_again")
 TOKEN = auth("test_a_token_of_another_length_or_that_differs_in_its_last_byte_is_refused")
 
@@ -34,7 +36,7 @@ TOKEN = auth("test_a_token_of_another_length_or_that_differs_in_its_last_byte_is
 MUTATIONS = [
     ("TL1 letting go of what is kept lets go of nothing", NAMES,
      '''pub(crate) fn forget_kept() {
-    *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    with_kept(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()) = None);
 }''',
      '''pub(crate) fn forget_kept() {}''',
      [FORGETS]),
@@ -75,6 +77,29 @@ MUTATIONS = [
      '''    if !is_the_token(token, &state.bearer_token) {''',
      '''    if token.is_empty() && !is_the_token(token, &state.bearer_token) {''',
      [TOKEN]),
+    ("TL9 a stopped device keeps what it reads of its channel", NAMES,
+     '''    if !keeps_what_it_reads(standing) {''',
+     '''    if false && !keeps_what_it_reads(standing) {''',
+     [FORGETS]),
+    ("TL10 a stopped device reads its channel ahead", NAMES,
+     '''        if !keeps_what_it_reads(&standing) {
+            return Ok(None);''',
+     '''        if false && !keeps_what_it_reads(&standing) {
+            return Ok(None);''',
+     [FORGET_IN_A_READ]),
+    ("TL11 a read ahead keeps what it found for a device that stopped meanwhile", NAMES,
+     '''        .filter(keeps_what_it_reads)
+''',
+     '''''',
+     [FORGET_IN_A_READ]),
+    ("TL12 a node that is held up reads ahead at start", NAMES,
+     '''    if !personal || state.held.why().is_some() {''',
+     '''    if !personal {''',
+     [AFTER_START]),
+    ("TL13 a node that is not personal reads ahead at start", NAMES,
+     '''    if !personal || state.held.why().is_some() {''',
+     '''    if state.held.why().is_some() {''',
+     [AFTER_START]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
