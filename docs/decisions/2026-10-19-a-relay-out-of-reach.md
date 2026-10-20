@@ -1,7 +1,7 @@
 # Decision: a relay out of reach
 
 **Date**: 2026-10-19
-**Status**: Proposed. Not built. It is the third form of "a relay that stays out of reach", revised three times after its own reviews (section 13). Its ends were checked over every state the node keeps, for two and three relays (appendix A). The first two forms were reviewed and found not sound to build from. Nothing here is built before this form passes a review.
+**Status**: Proposed. Not built. It is the third form of "a relay that stays out of reach", revised three times after its own reviews (section 13). Its ends were checked over every combination of the classes of each relay, for two and three relays (appendix A); that every state comes to a class rests on section 1 and its event-sequence tests. The first two forms were reviewed and found not sound to build from. Nothing here is built before this form passes a review.
 **Cited as**: "decision 2026-10-19 §4, rule 7". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -31,7 +31,7 @@ On a build machine at a site that cannot reach relay B, two more things were see
 **How the ruling is kept exact.**
 
 - **The warnings** are the carried word (rule 4), what other devices say of it (rule 6), the second end of the wait (rule 8, end 2), and the amber line of a relay out of reach (rule 11). Each is said only where at least one relay is reached: one connection.
-- **No security property rests on a warning.** What guards the change is "known to hold" (section 1), the third end of the wait and its status 3 (rule 8), and the amber line of a relay not known to hold the latest change (rule 11). None of them reads the carried word, or is relaxed by a relay being out of reach.
+- **No security property rests on a warning.** What guards the change is what each relay is known to hold (section 1), the third end of the wait and its status 3 (rule 8), and the amber line of a relay not known to hold the latest change (rule 11). None of them reads the carried word, or is relaxed by a relay being out of reach.
 - **With no relay reached nothing is relaxed:** the wait ends only at end 3, with status 3, and says to keep the machine on.
 
 What this form adds to the second:
@@ -57,7 +57,7 @@ Each is used in the rules below only as defined here.
 
 - **The answers to a show.** Every answer that the code can give a show of the kept entry is one of three kinds (`device_entries.rs:1445-1497`, `leave.rs:635-679`, `messages.rs:497-520`):
   - **it says that the relay holds the entry:** `Held`, `Taken`;
-  - **it says that the relay does not:** `Refused(NoRoom)`, `Refused(OverLimit)`, `Other` (to a short show: it holds another), and `Another` (it holds another, here it is), whether or not what it hands is an entry;
+  - **it says that the relay does not:** `Refused(NoRoom)`, `Refused(OverLimit)`, `Other` (it holds another; to a short show or to a whole one, `device_entries.rs:1468-1477`), and `Another` (it holds another, here it is), whether or not what it hands is an entry;
   - **it says neither:** `Refused(NotSigned)`; `Whole` to a whole show; a reply that is not `EntryShown` ("a show was not answered as one"); a stream that is reset ("not now"), that times out, or that fails; a short show not answered and then a whole one not answered; and a round of shows that runs out (`SHOWS_IN_A_PASS`) with no answer of the first two kinds. **Each of these is a failed attempt** (below).
   - `Whole` to a short show is no answer: the device shows the entry whole, and the answer to that is what counts.
 - **The latest answer.** For each relay, the device keeps the latest answer of the first two kinds that the relay gave to a show of the kept entry: the entry's ID, whether it says that the relay holds it or does not, the key that gave it, and the wall-clock time.
@@ -114,7 +114,7 @@ Each is used in the rules below only as defined here.
   - every attempt begun after the reference has failed, and none is in flight.
 
   **It stays out of reach until** it is reached, or its reference moves. So it is a state with a start and an end, not a window that slides. A relay that is connected and whose shows get no answer of the first two kinds can be out of reach: "cannot be reached" in what a person reads covers both.
-- **A relay refuses the change** where it is reached, and its latest answer to a show of the kept entry is no room, over the allowance, or another change that this device does not take. **It has refused for five minutes** where every show of the kept entry answered on any connection to it in the five minutes after the change was applied, and since, has had one of those answers.
+- **A relay refuses the change** where it is reached, and its latest answer to a show of the kept entry is no room, over the allowance, or another change that this device does not take. **It has refused for five minutes** where it has lacked the change for five minutes, and every show answered on it since it last held it, or since the change if it never did, got one of those answers.
 - **A relay refuses what waits** where it is reached, holds the change, and something of the device's own waits to be sent there that the relay has refused, for room or for the address's allowance, at each offer for five minutes (the refusal of today's status, `no_room`, kept for that long). A relay full for good, and an address over its allowance of new channels after a change makes every channel new, are the cases.
 - **The classes.** Each relay, in the wait after a change, is in one of these, or in none while time can still move it:
   - **OK:** reached, holds the change, and nothing waits there;
@@ -125,7 +125,7 @@ Each is used in the rules below only as defined here.
 
   **Every state comes to a class.** A relay in none of them is in one of these, and each ends by itself:
   - not reached and not yet out of reach: each attempt is reached or fails; rule 3 makes one at least every 30 s for a relay that lacks the change, and the dial pace makes one within 900 s for one that holds it. Only the four moments of its reference start its five minutes again, and none of them comes by itself;
-  - connected, and its shows get answers of the third kind: each is a failed attempt, made at every pass;
+  - connected, and its shows get answers of the third kind: each is a failed attempt. A reset or a time-out is shown again at the next pass. "Not signed" or "show it whole" to a whole show starts the wait that doubles after an answer (`device_entries.rs:1360-1375`), so the show is made again at most every ten minutes, and the relay is out of reach within fifteen minutes of its reference;
   - reached and lacking for less than five minutes: the five minutes pass, or it takes the change;
   - reached, holding, and something waits that it has not refused for five minutes: it takes it, or refuses it for five minutes.
 
@@ -258,8 +258,8 @@ Nothing about the word `"<n> sent"` under `applied/` changes: its writer, its co
 
 **In the database:** each relay's latest answer, and its mark (section 1).
 
-- **The latest answer is written** by the pass, in the one transaction that notes the answer, for each of the five answers that section 1 names. An answer that repeats what is kept writes nothing.
-- **The mark is written** in the transaction that takes a hand-over, and at no other time.
+- **The latest answer is written** by the pass, in the one transaction that notes the answer, for each answer of the first two kinds that section 1 names. An answer that repeats what is kept writes nothing.
+- **The mark is written** at the three moments of section 1, in the transaction of each (taking a hand-over; `cordelia phrase`; the first start on this version under statement 1), and at no other time.
 
 **In memory,** by the relay's name and key together:
 
@@ -274,9 +274,9 @@ The state in memory follows each relay's reference (section 1): it starts again 
 - **Why five minutes:** a relay that restarts, and a machine that wakes, are each through it in less (parameter-rationale §12.10). The second form's one minute was shorter than a relay's restart.
 - **Why the latest answer is in the database:** without it, every relay after every start is "not known" to hold anything. A relay that cannot be reached from this site would then lack the change for good, and be amber and dialled every 30 seconds for good, whether or not a change was ever made (this record's first review, finding 5).
 - **Why the latest answer, not the last "held":** a relay that held the entry can lose the phrase's channel and have no room to take it again (the record of 2026-10-04, property 4). Its answer then says so, and the device must believe it.
-- **Why the mark comes only from a hand-over:** a hand-over is the one moment this version knows that the entry it keeps is not new to the relays: the device that added it kept and showed it before. At the first start on this version the device knows nothing of what its relays got while it ran alpha.12, so it marks nothing (this record's second review, finding 3).
+- **Why the mark comes only from those three moments:** at a hand-over the device that added this one kept and showed the entry before; at `cordelia phrase`, and at a first start under statement 1, the entry removes no key and renews nothing, so a relay that lacks it puts nobody in reach of a removed device. At a first start under a later statement the device knows nothing of what its relays got while it ran alpha.12, so it marks nothing (this record's second review, finding 3; the fourth check, finding 3).
 - **What it costs:**
-  - one key of `node_meta`, of a few hundred bytes, written at each answer that changes what is kept of a relay, and at a hand-over;
+  - one key of `node_meta`, of a few hundred bytes, written at each answer that changes what is kept of a relay, and at the three moments of a mark;
   - a relay that comes back while it is out of reach is taken for out of reach until the next attempt at it. With rule 3 that is 30 seconds at most for a relay that lacks the change. For one that holds it, it is up to 900 seconds; only the carried word and the status say so meanwhile.
 - **Set aside:**
   - **"Lacks" as "has not answered since the wake"** (this record's first revision). It made a relay that is never reachable from a site lack the change for good, with no change made.
@@ -333,7 +333,7 @@ A device writes, in the personal channel of the generation it has applied, under
   - one entry for each device that has a relay out of reach after a change, a content of 512 bytes, and its delete;
   - every device of the person learns the keys of the relays to which each other device sent what it carried. For the default relays those keys are in the program already.
 - **Set aside:**
-  - **The names of the relays out of reach** (the second form). They are addresses, and a reader can do nothing with them but repeat them (the second review, M7). The count says enough: "not to every relay it is set up with".
+  - **The names of the relays out of reach** (the second form). They are addresses, and a reader can do nothing with them but repeat them (the second review, M7). The count says enough: "not yet to <k> other relays".
   - **Changing `sent` to mean this.** See rule 1.
 
 ### Rule 5. How the carried word is read
@@ -369,12 +369,12 @@ In place of "is still sending what it held", and of nothing else (D1, S5). A rel
 
 ### Rule 8. The wait after a change ends in one of three ways
 
-It looks every second, as today, and says each line as it comes (S2 to S5). Its ends are stated over the classes of section 1, and were checked over every state the node keeps, for two and three relays (appendix A). It ends at the first of these that holds.
+It looks every second, as today, and says each line as it comes (S2 to S5). Its ends are stated over the classes of section 1, and were checked over every combination of those classes, for two and three relays (appendix A). It ends at the first of these that holds.
 
 **Two properties hold, and the model of appendix A checks both:**
 
 - **Safety:** ends 1 and 2 need every relay to hold the change. So the wait never says that the machine may be closed, and never ends with status 0, while a relay lacks the change.
-- **Liveness:** in every state in which each relay is in a class, and the device's own word is one that the node will not write over (below), one end holds. Every other state is one that time moves (rules 2 and 3).
+- **Liveness:** in every state in which each relay is in a class, and the device's own word is one that the node will not write over (below), one end holds. Every other state is one that time moves (section 1, rules 2 and 3). That part rests on section 1 and the event-sequence tests of `reach.rs`, not on the model.
 
 **The device's own word** is none, the carried word, or `sent`. **The node will write over it** where `sent` can be written (every relay OK) or the carried word can (rule 4). A word is otherwise as the node leaves it. That covers a recovery's look that stays pending, under which neither is written.
 
@@ -420,7 +420,7 @@ It looks every second, as today, and says each line as it comes (S2 to S5). Its 
 | B is given no key, answered "took" from one host, and its name now resolves to another, which cannot be reached | B lacks the change while not connected to the key that answered (section 1); B OUT, lacking | 3 |
 | A answers with a later change, which the device applies | the kept entry is no longer this command's change: the wait ends at "This device has since applied another change", as today | 3 (below) |
 
-While no end holds, the wait goes on and says what is missing, as today. Each relay comes to a class within five minutes and the time of an attempt, or a show of five minutes' refusals; the word is written at the next whole pass.
+While no end holds, the wait goes on and says what is missing, as today. Each relay comes to a class within five minutes and the time of an attempt, or a show of five minutes' refusals: within fifteen minutes where its whole shows are answered "not signed" or "show it whole" (section 1). The word is written at the next whole pass.
 
 **The statuses after a change is made:**
 
@@ -454,7 +454,7 @@ The three lines on relays go from that list (section 3). Then:
   - **every relay holds the change:** R1, and status 0;
   - **not done for a recovery** (status 3): some relay lacks the change, and each relay that lacks it is OUT and lacking, or REFUSING (section 1). It says S8 for each such relay, then S9 where a relay is reached, then S10 or S11.
 - **There is no condition on what waits, nor on the machine's own word.** Its look may stay pending until the next statement (section 2), and then neither `sent` nor the carried word is written. Its one-shot lines have said what is still to send.
-- **Both properties hold** (appendix A): neither end with status 0 holds while a relay lacks the change, and where each relay either holds the change or is OUT and lacking or REFUSING, one end holds.
+- **Both properties hold** over given classes (appendix A): neither end with status 0 holds while a relay lacks the change, and where each relay either holds the change or is OUT and lacking or REFUSING, one end holds.
 - **The statuses** are as rule 8 gives them: 0 only where every relay holds the change, and 3 otherwise once the recovery is made. That includes the path where the look cannot be waited for (`recover_cmd.rs:1993-1998`), and an error during the wait.
 - **It never says that the machine may be closed,** as today.
 - **Why:** today a recovery prints "keep this machine on: <relay> does not hold the change yet" once and ends with 0. A device that reaches only that relay has not heard that it stopped, and goes on writing where a device that the person said is gone can read (the first review, M9).
@@ -483,7 +483,7 @@ The look itself is not changed by any of the four: what it takes was never decid
 
 **"memory: a relay not known to hold the latest change"** (or "memory: <n> relays not known to hold the latest change"), amber.
 
-- **For each relay that lacks the change** (section 1), once it has lacked it for more than five minutes by the node's own clock. The five minutes are counted from the later of when the kept entry last changed and the device's last wake.
+- **For each relay that lacks the change** (section 1), once it has lacked it for more than five minutes by the node's own clock. The five minutes are counted from the later of when the kept entry last changed, the node's start, and a sleep (section 1). A wake after no connection does not restart them (fourth check, finding 2).
 - **Connected or not, with sync on or off, and with or without a folder mapped:** wherever the device follows a phrase, as the other amber of a person's devices. It is no longer among the amber of folders.
 - **For seven days** (`REMOVAL_NOT_APPLIED_SHOWN_DAYS`), as "a removal not yet applied by every device" is, from the later of when this device came to keep the entry and when this version first started on it. So after the upgrade a removal made on alpha.12 that a relay never got is amber for seven days, however old the removal. After that it is in `cordelia devices` only (D4).
 - **Its place:** after "names carried, not yet sent" (item 7 of `indicator.rs:316-342`), and so after every other amber of a person's devices, and before the amber of folders. A device added since, or one that left, is not hidden by it. "A relay has no room" is hidden by it, as any later amber is by an earlier one; the tooltip says both.
@@ -498,7 +498,7 @@ The look itself is not changed by any of the four: what it takes was never decid
 **"memory: no relay for <n> minutes"** stays as it is. Where no relay is connected it is said, and the out-of-reach line is not. "a relay not known to hold the latest change" is said all the same.
 
 - **Why:** the second review (H2) showed that once the command has ended, nothing standing said that a relay lacks a removal. Not where the relay is not connected; not with sync off; not on a machine that has just recovered and maps nothing.
-- **Why seven days, and the words "not known to hold":** this record's review (finding 5). A relay that cannot be reached from a site, after a change, lacks it as far as that machine can ever know. Another device may have given it the change. "Does not hold" would then be untrue, and amber for good would hide what comes after it for good.
+- **Why seven days, and the words "not known to hold":** this record's first review (finding 5). A relay that cannot be reached from a site, after a change, lacks it as far as that machine can ever know. Another device may have given it the change. "Does not hold" would then be untrue, and amber for good would hide what comes after it for good.
 - **What it costs:** after seven days a relay that still lacks a removal is amber no more. `cordelia devices` still says so, as it does of a device that has not applied a removal.
 
 ### Rule 12. `cordelia devices`, of each relay
@@ -528,7 +528,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 - `<when>` is as section 1 defines it.
 - `<since>` is one of two phrases:
   - "has not been reached from here since <when>", where the relay was reached since the device last woke, at the moment it was last reached;
-  - "has not answered since this device started or woke at <when>", where it was not, at the moment of the wake.
+  - "has not answered since <when>", where it was not, at the relay's reference (section 1): the start, the sleep, or the change of the kept entry, whichever was latest. A wake after no connection does not move it (fourth check, finding 7).
 - `<minutes>` is whole minutes. A list of relays is joined with ", " and " and ".
 - **`<held>` and `<not yet>` come from two sets that never overlap** (this record's third review, finding 4):
   - of this device's own: `<held>` is each relay at which nothing that it carried waits, by its rows of what it sent, reached or not; `<not yet>` is every other relay;
@@ -569,7 +569,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
   - for relays OUT and lacking: "<relays> take<s> the change from a device that has applied it and reaches <it | them>, this one included, and from a relay that works with <it | them>."
   - for those of them not connected, with a name that resolves: "While this machine is on it dials <it | them> every 30 seconds."
   - for those whose name does not resolve: "It looks <its | their> name<s> up every 30 seconds."
-  - for those connected whose shows get no answer of the first two kinds: "It shows <it | them> the change on every pass."
+  - for those connected whose shows get no answer of the first two kinds: "It shows <it | them> the change again at most every ten minutes."
   - for a relay with the wrong key at an address where another relay is connected: "It cannot dial <relay> while another relay answers at its address."
   - for relays REFUSING: "<relays> refuse<s> the change. A device that reaches <it | them> hears of it only once <it takes | they take> it, or from another relay."
 - **S10,** end 3, last, where a relay is reached and some relay lacks the change (status 3): "The change is not known to be at <relays>. This command ends here, with status 3. It does not say that you may close this machine. `cordelia devices`, here or on a device of yours that reaches <it | them>, says when <it holds | they hold> the latest change."
@@ -630,7 +630,7 @@ The wait does not save it there. What the third form adds there is the faster di
 **The build machine, before any change and after one.**
 
 - **Added on this version, or its phrase made here, or first started on this version under statement 1, with no change since:** B is in the third state of section 1 (its mark is the kept entry). It is not dialled faster, not amber, and its line is D2, then D3.
-- **Upgraded from alpha.12, or after a change made or applied here:** B lacks the change, as far as this machine can know: it has no answer about the entry kept. It is dialled every 30 seconds, and is amber for seven days (rules 3 and 11). For a machine that came by the upgrade that holds until B answers from it, which at such a site is never. The way out is to take B out of the configuration of that one machine, where it is of no use. This is not D4's case: B is not gone, it is only out of this site's reach, and D4's advice to take a relay out of every device is for a relay gone for good.
+- **Upgraded from alpha.12 under a statement after statement 1, or after a change made or applied here:** B lacks the change, as far as this machine can know: it has no answer about the entry kept. It is dialled every 30 seconds, and is amber for seven days (rules 3 and 11). For a machine that came by the upgrade that holds until B answers from it, which at such a site is never. The way out is to take B out of the configuration of that one machine, where it is of no use. This is not D4's case: B is not gone, it is only out of this site's reach, and D4's advice to take a relay out of every device is for a relay gone for good.
 
 **The sentence changes.** "has not answered since this device woke: a change made while it was off may not have reached it" is read as saying that the relay was off. It says the device woke.
 
@@ -668,8 +668,8 @@ The wait does not save it there. What the third form adds there is the faster di
 - **One more entry, and its delete,** in the personal channel for each device that has a relay out of reach after a change.
 - **One key of `node_meta`,** of a few hundred bytes, written at each answer that changes what is kept of a relay: after a change, once or twice for each relay.
 - **Every device learns the keys of the relays** to which each other device sent what it carried, and how many relays each is set up with.
-- **Dials every 30 seconds** of a relay that lacks a change, for as long as it does as far as this machine knows. That can be for good at a site that cannot reach it, and it is so from the first start on this version for every relay that does not answer from there.
-- **After the upgrade every relay lacks the change** until it answers a show from this device. A relay that answers within the wake is never amber; one that does not is amber for seven days (rule 11).
+- **Dials every 30 seconds** of a relay that lacks a change, for as long as it does as far as this machine knows. That can be for good at a site that cannot reach it, and it is so from the first start on this version, under a statement after statement 1, for every relay that does not answer from there.
+- **After the upgrade under a statement after statement 1, every relay lacks the change** until it answers a show from this device. A relay that answers within the wake is never amber; one that does not is amber for seven days (rule 11).
 - **A wait that ends with status 0 though a relay refuses what is carried** (end 2, a relay STUCK), where another relay holds it whole. The status line says "a relay has no room" for as long as the refusal stands.
 - **The amber of a relay not known to hold the latest change lasts seven days,** and is then in `cordelia devices` only.
 - **A recovery's command can stay** for five minutes and more after its look, where a relay lacks the change. Today it ends at once.
@@ -689,7 +689,7 @@ The wait does not save it there. What the third form adds there is the faster di
 - **"Lacks" as "not heard since the wake"** (this record's first revision), and **"holds" in memory only.** Rule 2.
 - **A schema step for what each relay is known to hold.** Rule 2.
 - **The amber of a relay not known to hold the change, for good.** At a site that cannot reach a relay it would be amber after every change, and hide what comes after it, for good (rule 11).
-- **A mark at the first entry a device keeps, or at the first start on this version** (this record's first revision). It can be untrue: a removal made on alpha.12 that a relay never got would have been its mark, and nothing would have said that the relay lacks it (this record's second review, finding 3).
+- **A mark at the first entry a device keeps whatever it is, or at a first start on this version under a later statement** (this record's first revision). It can be untrue: a removal made on alpha.12 that a relay never got would have been its mark, and nothing would have said that the relay lacks it (this record's second review, finding 3).
 - **"Known to hold" as the last "held", which a refusal does not clear** (this record's first revision). A relay that lost the phrase's channel would have counted as holding the change (this record's second review, finding 2).
 
 ## 10. Constants
@@ -716,7 +716,7 @@ In `crates/cordelia-core/src/protocol.rs`, each with its line for `docs/specs/pa
 
 - `BACKOFF_BASE_SECS` (parameter-rationale §3): "It is also the most that a relay that lacks the change the device keeps waits to be dialled again, whether or not another relay is connected; a longer wait already set is cut to it when the relay comes to lack the change (decision 2026-10-19, rule 3)."
 - `BOOTNODE_RESOLVE_RETRY_SECS`: "It is also how often names are looked up while a relay that lacks the change has a name that does not resolve (decision 2026-10-19, rule 3)."
-- `STATUS_AMBER_WAIT_SECS` (§12.10): "a relay that is not known to hold the latest change, connected or not", in place of "a relay that is connected and does not hold the latest change". And: "It is the time a relay takes to be out of reach (`OUT_OF_REACH_SECS`)."
+- `STATUS_AMBER_WAIT_SECS` (§12.10): "a relay that is not known to hold the latest change, connected or not, counted from the later of the change of the kept entry, the node's start and a sleep, and not from a wake after no connection", in place of "a relay that is connected and does not hold the latest change". And: "It is the time a relay takes to be out of reach (`OUT_OF_REACH_SECS`)."
 - `REMOVAL_NOT_APPLIED_SHOWN_DAYS` (§12.10): "A relay not known to hold the latest change is shown for as long (decision 2026-10-19, rule 11)."
 
 **Not a protocol constant:** the exit status 3. It is the command's, beside `STAYS_COMMAND` in `person_cmd.rs`, as `NOT_AT_EVERY_RELAY_STATUS`. `recover_cmd.rs` uses the same.
@@ -748,24 +748,25 @@ Each test fails on an assertion if its rule is taken out.
   - `not_while_an_attempt_is_in_flight`;
   - `not_with_no_attempt_in_the_five_minutes`;
   - `a_lookup_that_resolves_is_no_attempt` (first review, finding 3);
-  - `a_wake_or_a_new_kept_entry_starts_the_five_minutes_again`;
+  - `a_new_kept_entry_starts_the_five_minutes_again`;
   - `being_reached_ends_it_at_once`;
   - `a_connected_relay_whose_shows_go_unanswered_is_out_of_reach`;
   - `another_key_and_a_name_that_does_not_resolve_are_failed_attempts`;
-  - `each_answer_of_the_third_kind_is_a_failed_attempt`: "not signed", "show it whole" to a whole show, a reply that is not `EntryShown`, a reset, a time-out, and a round that runs out, each at every pass for five minutes, on a connection that stays open: the relay is out of reach (third review, finding 1);
+  - `each_answer_of_the_third_kind_is_a_failed_attempt`: "not signed", "show it whole" to a whole show, a reply that is not `EntryShown`, a reset, a time-out, and a round that runs out, on a connection that stays open: the relay is out of reach. A reset or a time-out is shown again at each pass; "not signed" and "show it whole" to a whole show at the pace of the wait that doubles, so out of reach comes within fifteen minutes (third review, finding 1; fourth check, finding 4);
   - `whole_to_a_short_show_is_no_answer`: the whole show that follows is what counts;
   - `a_wake_after_no_connection_does_not_move_another_relays_reference`: B down; A drops and comes back every three minutes; B is out of reach five minutes after the change (third review, finding 2);
   - `a_start_a_sleep_a_new_kept_entry_and_being_reached_each_move_the_reference`;
   - `an_attempt_must_be_in_the_last_five_minutes_and_after_the_reference`: a relay whose first attempt after the reference comes at minute nine becomes out of reach at minute nine (third review, finding 7);
   - `a_relay_with_the_wrong_key_where_another_is_connected_is_out_of_reach_with_no_dial` (first review, finding 2), with an attempt counted at each tick that passes it over (second review, finding 6);
-  - `a_same_relay_name_is_never_one`.
-- **Every state comes to a class** (third review, findings 1 and 2; event sequences over the clock and the answers, in `reach.rs`): `every_unclassed_state_ends_in_a_class`. From each kind of state that section 1 lists as in no class, a sequence of answers, failed attempts and clock steps that the node can meet is run, and the relay is in a class within five minutes and the time of an attempt. The enumeration over the classifier's inputs cannot show this: it takes the classes as given.
+  - `a_same_relay_name_is_never_one`;
+  - `a_relay_that_held_and_then_refuses_is_refusing_five_minutes_on`: it answers `Taken`, then `NoRoom` at every show; five minutes after its first `NoRoom` it is REFUSING, and the wait ends at end 3 (fourth check, finding 1).
+- **Every state comes to a class** (third review, findings 1 and 2; event sequences over the clock and the answers, in `reach.rs`): `every_unclassed_state_ends_in_a_class`. From each kind of state that section 1 lists as in no class, a sequence of answers, failed attempts and clock steps that the node can meet is run, and the relay is in a class within five minutes and the time of an attempt, or within fifteen where its whole shows are answered "not signed" or "show it whole". A relay that held the change and then answers "no room" at every show is REFUSING five minutes after it came to lack it (fourth check, finding 1). The enumeration over the classifier's inputs cannot show this: it takes the classes as given.
 - **The latest answer, and the mark:**
   - `the_latest_answer_writes_over_the_one_before`: "held" then "no room" about the same entry is "lacks", and so are "over the allowance" and "another"; "no room" then "took" is "holds" (second review, finding 2);
   - `show_whole_not_signed_a_reset_and_a_time_out_write_nothing` (first review, finding 10);
   - `what_is_kept_survives_a_restart_and_goes_with_the_relay`;
   - `adding_leave_forgets_it`: the key is in the list that `adding::leave` removes, and `cordelia phrase` on a device of several, `cordelia init --new-key` and a removal of this device each leave nothing of it (second review, finding 8);
-  - `the_mark_is_written_only_at_a_hand_over`: none at the first start on this version, none for a relay set up later, none after `cordelia phrase` or `cordelia recover` (second review, finding 3);
+  - `the_mark_is_written_only_at_its_three_moments`: none at the first start on this version under a later statement, none for a relay set up later, none after `cordelia recover` (second review, finding 3; fourth check, finding 3);
   - `a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade`: a database in alpha.12's form, whose kept entry is a removal, is started on this version with one relay that answers and one that does not. The second lacks the change and is amber; the first holds it after its answer (second review, finding 3);
   - `a_relay_in_the_third_state_neither_holds_nor_lacks` (first review, finding 5);
   - `the_mark_is_written_at_phrase_and_at_a_first_start_under_statement_1` (third review, finding 5);
@@ -866,6 +867,7 @@ Each test fails on an assertion if its rule is taken out.
 - `for_seven_days_and_then_not`.
 - `a_relay_in_the_third_state_is_not_amber` (finding 5).
 - `its_place_is_after_names_carried`.
+- `a_wake_after_no_connection_does_not_restart_the_ambers_five_minutes`: B lacks the change; A drops and comes back every three minutes; the line is amber five minutes after the change (fourth check, finding 2).
 - `a_relay_out_of_reach_is_amber_last_only_with_folders_and_only_with_one_reached`.
 
 **Constants** (`protocol.rs`):
@@ -886,7 +888,7 @@ None is changed until this record is built.
 
 **The record of 2026-10-04:**
 
-- **Property 1, second case:** "says that the machine may be closed only when all of them do". Add: "and, where one that is not known to hold it cannot be reached for five minutes, ends without saying so, with status 3 (decision 2026-10-19)".
+- **Property 1, second case:** "says that the machine may be closed only when all of them do". Add: "and, where one that is not known to hold it cannot be reached, or refuses it, for five minutes, ends without saying so, with status 3 (decision 2026-10-19)".
 - **4.6, "A device that wakes asks every relay first":** "A relay that was not reached is named in its status: 'has not heard from <relay> since it woke: a change made while it was off may not have reached it'". Becomes T1.
 - **4.6, the cost line:** stands.
 - **7.1, step 4:**
@@ -926,24 +928,24 @@ None is changed until this record is built.
 | **2 MEDIUM:** a relay with the wrong key at an address another relay uses is never dialled, so it is never out of reach | Section 1: while that connection is open it counts as an attempt at that relay that has failed. Rule 3 and S9 say that it is not dialled | `a_relay_with_the_wrong_key_where_another_is_connected_is_out_of_reach_with_no_dial`; `a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_address` |
 | **3 MEDIUM:** a lookup that resolves is an attempt that did not fail | Section 1: a lookup that resolves is part of the dial that follows it, and no attempt by itself. A lookup that does not resolve is a failed attempt | `a_lookup_that_resolves_is_no_attempt` |
 | **4 MEDIUM:** rule 3 does not cut a wait already set, nor wake the lookups | Rule 3: when a relay comes to lack the change its next dial is set to no later than 30 s on, and the lookup loop is woken. Compile-time checks that a lacking relay has an attempt in five minutes | `a_wait_already_set_is_cut_when_the_relay_comes_to_lack_the_change`; real processes, `a_relay_that_lacks_the_change_is_dialled_every_half_minute`, with B down ten minutes before the change |
-| **5 MEDIUM:** "lacks" meant "not heard since the wake": amber and dials every 30 s for good at a site, with no change made; D5, T3, S3 and end 2 unreachable after a restart | The latest answer is kept in the database. A relay lacks the change where it has no answer and no mark, where its answer or mark is about another entry than the kept one, or where it answered that it lacks it (as revised after the second review). A relay never known to hold one, with no change since, is in a third state that nothing acts on. The line says "not known to hold", for seven days, after the amber of devices. **Chosen:** both of the review's ways together, since the second needs the first to survive a start. A key of `node_meta`, not a schema step, so that alpha.12 still opens the database | `a_relay_in_the_third_state_neither_holds_nor_lacks`; `the_mark_is_written_only_at_a_hand_over` (the mark of this revision: see the second review's finding 3); `what_is_kept_survives_a_restart_and_goes_with_the_relay`; real processes, `a_relay_unreachable_from_here_is_dialled_as_today_until_a_change`, and the restart in `..._ends_at_end_two` (D5 after a restart) |
+| **5 MEDIUM:** "lacks" meant "not heard since the wake": amber and dials every 30 s for good at a site, with no change made; D5, T3, S3 and end 2 unreachable after a restart | The latest answer is kept in the database. A relay lacks the change where it has no answer and no mark, where its answer or mark is about another entry than the kept one, or where it answered that it lacks it (as revised after the second review). A relay never known to hold one, with no change since, is in a third state that nothing acts on. The line says "not known to hold", for seven days, after the amber of devices. **Chosen:** both of the review's ways together, since the second needs the first to survive a start. A key of `node_meta`, not a schema step, so that alpha.12 still opens the database | `a_relay_in_the_third_state_neither_holds_nor_lacks`; `the_mark_is_written_only_at_its_three_moments` (the mark of this revision: see the second review's finding 3); `what_is_kept_survives_a_restart_and_goes_with_the_relay`; real processes, `a_relay_unreachable_from_here_is_dialled_as_today_until_a_change`, and the restart in `..._ends_at_end_two` (D5 after a restart) |
 | **6 MEDIUM:** a recovery whose look stays pending waits for ever; "for the change only" undefined | Rule 9 states its end: each relay that lacks the change is out of reach, with an attempt after the change, or has refused it for five minutes. There is no condition on what waits or on the own word | `a_recovery_whose_look_stays_pending_ends_at_3`; real processes, `a_recovery_ends_not_done_where_a_relay_lacks_the_change` |
 | **7 LOW/MEDIUM:** the wait that cannot start returns 0; an error in the wait returns 1, though the change was made | Both give 3, with the error on standard error. 1 is given only before the change is known to be made. Rule 9 does the same for a recovery | `the_statuses`; real processes, `the_wait_that_cannot_start_ends_with_3` |
 | **8 LOW:** "since <time>" is untrue or ambiguous; S8 says "does not hold"; S9's 30 seconds untrue of a connected relay and of the wrong-key relay | `<since>` has two forms; `<when>` has a date where it is not today, and is the wall-clock time noted. S8, S2, T2 and D4 say "not known to hold". S9 says 30 s only of relays not connected, and says that a wrong-key relay cannot be dialled | `each_line_word_for_word` |
 | **9 LOW:** R2 and R3 cannot be followed in the case they are for | Two endings: "make sure this machine can reach <relay>" where it is set up here, and "set up the relay of that device's configuration whose key is <key>" where not | `r0_to_r3_word_for_word`; real processes, `a_recovery_says_before_its_yes...`, both endings |
-| **10 LOW:** "holds" in memory survives a wake, and "heard" is set by any answer | The latest answer is written only by the five answers about the kept entry; "show it whole", "not signed", a reset and a time-out write nothing. "Reached" needs an answer that says whether it holds it. End 1 uses both | `show_whole_not_signed_a_reset_and_a_time_out_write_nothing` |
-| **11 LOW:** the reader's bounds on the carried word | Rule 5: one to 8 keys, none twice; the third field 0 unless 8 keys; the fourth at least 1; each count at most 256 (`REACHED_WORD_MAX_COUNT`) | `the_carried_word_is_read_only_from_its_own_key_under_the_applied_number` |
+| **10 LOW:** "holds" in memory survives a wake, and "heard" is set by any answer | The latest answer is written only by the answers of the first two kinds about the kept entry; "show it whole", "not signed", a reset and a time-out write nothing. "Reached" needs an answer that says whether it holds it. End 1 uses both | `show_whole_not_signed_a_reset_and_a_time_out_write_nothing` |
+| **11 LOW:** the reader's bounds on the carried word | Rule 5: one to 8 keys, none twice; the third field 0 unless 8 keys; each count at most 256 (`REACHED_WORD_MAX_COUNT`). (The floor of 1 on the fourth field was dropped after the third review, finding 4: field 4 no longer overlaps field 2.) | `the_carried_word_is_read_only_from_its_own_key_under_the_applied_number` |
 | **12 LOW:** help of `settle` and `recover`; no "stopping it" line in the recovery's wait; a script may run a recovery again on 3 | H1 for `settle` too; H2 for `recover`, which says that 3 means the recovery is made; R0 has "Stopping it stops nothing" | `each_line_word_for_word` |
 | **13 LOW:** missing tests; six long tests in `cargo test --all` | The tests of findings 2, 4, 5 and 7 are added. Tests that wait the five minutes are `#[ignore]`d, and run in a CI job of their own on every pull request | Section 11 |
 | **Not of this record:** a relay given no key is "same relay" wherever one connection answers for it, so end 1 can say "may be closed" without the relay that its name really names | **Left:** it is a rule of the record of relays, §1, and changing which relays count is beyond this record. It is named in section 14 | none here |
 
-**This record's third review** (of the third revision, 197db5e). The model reproduced; its faults were in what the model took as given. Section 1 was settled first, the model extended where it can see the faults, and event-sequence tests named where it cannot.
+**This record's third review** (of the third revision, 197db5e). The model reproduced; its faults were in what the model took as given. Section 1 was settled first, and event-sequence tests named. **The model checks only the ends over given classes.** Mediums 1 to 3 below rest on the event-sequence tests of `reach.rs` and on the keyless test alone, not on the model (fourth check, finding 5).
 
 | Finding | How this revision settles it | The test that shows it |
 |---|---|---|
-| **1 MEDIUM:** a relay whose shows get "not signed", or "show it whole" to the whole entry, is in no class for ever | Section 1 lists every answer the code can give, in three kinds. Every answer of the third kind (it says neither) is a failed attempt: "not signed", "show it whole" to a whole show, a reply that is not `EntryShown`, a reset, a time-out, a failure, and a round that runs out. Section 1 then lists each kind of state in no class and what ends it. The model has a relay that is connected and not reached, which can be out of reach | `each_answer_of_the_third_kind_is_a_failed_attempt`; `whole_to_a_short_show_is_no_answer`; `every_unclassed_state_ends_in_a_class` (event sequences, `reach.rs`) |
-| **2 MEDIUM:** the five minutes restart at every wake, and a pass with no connection causes one | A relay's reference moves only at a start, a sleep, a change of the kept entry, or that relay being reached. A wake after no connection still makes the wake rule wait, but moves no reference. The model cannot see time; the event-sequence test can | `a_wake_after_no_connection_does_not_move_another_relays_reference`; `a_start_a_sleep_a_new_kept_entry_and_being_reached_each_move_the_reference` |
-| **3 MEDIUM:** for a relay given no key, a stored answer outlives the host its name named | Such a relay holds the change only while the device is connected to it with the key that gave the answer; otherwise it lacks it. The model has keyed and keyless relays, and checks that no end with status 0 holds with a keyless relay that is not connected; taking the rule out makes that check fail | `a_relay_given_no_key_holds_only_while_connected_to_the_key_that_answered`; the model |
+| **1 MEDIUM:** a relay whose shows get "not signed", or "show it whole" to the whole entry, is in no class for ever | Section 1 lists every answer the code can give, in three kinds. Every answer of the third kind (it says neither) is a failed attempt: "not signed", "show it whole" to a whole show, a reply that is not `EntryShown`, a reset, a time-out, a failure, and a round that runs out. Section 1 then lists each kind of state in no class and what ends it. The model does not show this: it checks only the ends over given classes (fourth check, finding 5) | `each_answer_of_the_third_kind_is_a_failed_attempt`; `whole_to_a_short_show_is_no_answer`; `every_unclassed_state_ends_in_a_class` (event sequences, `reach.rs`) |
+| **2 MEDIUM:** the five minutes restart at every wake, and a pass with no connection causes one | A relay's reference moves only at a start, a sleep, a change of the kept entry, or that relay being reached. A wake after no connection still makes the wake rule wait, but moves no reference; nor does it restart the amber's five minutes (rule 11). The model cannot see time; only the event-sequence tests show this | `a_wake_after_no_connection_does_not_move_another_relays_reference`; `a_start_a_sleep_a_new_kept_entry_and_being_reached_each_move_the_reference` |
+| **3 MEDIUM:** for a relay given no key, a stored answer outlives the host its name named | Such a relay holds the change only while the device is connected to it with the key that gave the answer; otherwise it lacks it. The model's check of a keyless relay restates the rule, and does not show it: nothing in the model stands for the host a name now names (fourth check, finding 5) | `a_relay_given_no_key_holds_only_while_connected_to_the_key_that_answered` |
 | **4 LOW-MEDIUM:** sentences untrue where field 2 and field 4 overlap; S1, R0, S7; the subject | Field 4 now counts only relays not in field 2 (it can be 0). Every line takes `<held>` and `<not yet>` from two sets that never overlap. S6 and S7 say what is so on the `sent` path. S1 names the end where no relay that this machine reaches has what was carried. R0 says "cannot be reached, or refuses it, for five minutes". A subject rule: "you" where the line tells you what to do. Sentences are split to say one thing each. Section 6 and D4 now name their two different cases | `held_and_not_yet_never_overlap`; `each_line_word_for_word`; the end-two test's lines on the `sent` path |
 | **5 LOW:** "as today" before any change is false for most machines | The mark is also written at `cordelia phrase` and at the first start on this version where the kept statement is statement 1: both remove no key and renew nothing. Rule 3 and rule 11 now say "a relay in the third state" rather than "before any change". Not taken: a mark at the first start for any statement that removed no key, since the node does not keep what kind of change a statement was | `the_mark_is_written_at_phrase_and_at_a_first_start_under_statement_1` |
 | **6 LOW:** end 3 waits on the carried word, which needs a whole pass, and the command would work out the node's conditions | End 3 asks nothing of the word where a relay lacks the change. Where none does, the node's look says `word_to_come`, worked out by the function that writes the word; the command never works it out | `end_three_does_not_wait_on_the_word_where_a_relay_lacks_the_change`; `the_command_reads_word_to_come_from_the_node`; the model checks that end 3 holds wherever every relay is in a class and one lacks the change |
@@ -959,7 +961,7 @@ None is changed until this record is built.
 |---|---|---|
 | **1 HIGH:** the wait never ends once `sent` is written and a relay that holds the change is lost; nor where a relay out of reach took everything (the word's fourth field would be 0) | End 2 accepts `sent` beside the carried word, or a word that the node will not write. The fourth field counted relays out of reach or refusing what waits. (Revised after the third review, finding 4: it now counts only relays not named in field 2, and can be 0.) The model finds an end in every state that time does not move | `the_ends_are_safe_and_live_over_every_state`; `a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two` (the `sent` path, with no window to hit); `the_carried_word_counts_a_relay_out_of_reach_that_took_everything` |
 | **2 HIGH:** a later refusal never clears "holds", so end 1 can give 0 while a relay lacks the change | "Holds" is the latest answer about the kept entry's ID; "no room", "over the allowance" or "another" about that ID writes over "held", in the same transaction (section 1, rule 2) | `the_latest_answer_writes_over_the_one_before`; the model's safety check |
-| **3 MEDIUM:** the mark cannot be worked out, and at the first start it hides a removal made on alpha.12 | The mark is written only where this device takes a hand-over, as the handed entry, for each relay with no answer yet. There is no mark otherwise: not at the first start on this version, not for a relay set up later. So the case that was seen ends with that relay lacking the change, amber for seven days from the upgrade | `the_mark_is_written_only_at_a_hand_over`; `a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade` |
+| **3 MEDIUM:** the mark cannot be worked out, and at the first start it hides a removal made on alpha.12 | The mark is written only where this device takes a hand-over, as the handed entry, for each relay with no answer yet. There is no mark otherwise: not at the first start on this version, not for a relay set up later. So the case that was seen ends with that relay lacking the change, amber for seven days from the upgrade. (Widened after the third review: also at `cordelia phrase` and at a first start under statement 1, section 1.) | `the_mark_is_written_only_at_its_three_moments`; `a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade` |
 | **4 MEDIUM:** no end where a relay holds the change and refuses what is carried for room | A class of its own, STUCK. End 2 takes it where another relay is OK (with S6b); end 3 where none is (S10b). The rule 4 word is written beside it, and counts it | the model; `a_relay_that_holds_the_change_and_refuses_what_is_carried_ends_at_end_two`, both ways |
 | **5 MEDIUM:** "a relay that this machine reached in this recovery" is undefined | Rule 10: a relay at which the recovery read the personal channel to its end before its yes, by the key of that connection. No show is needed | `a_recovery_reads_the_carried_word_of_the_one_device`; the real-process test of R2, both endings |
 | **6 LOW:** a wrong-key relay's failed attempt had no start | Each tick of the dial loop that passes it over is an attempt begun and failed at that tick. End 3 no longer asks for an attempt after the change apart: out of reach counts its five minutes from the change | `..._wrong_key_where_another_is_connected_is_out_of_reach_with_no_dial`; `a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_address` |
@@ -1012,12 +1014,12 @@ None is changed until this record is built.
 
 The weakest points, as this record sees them:
 
-1. **The model is only as true as its classes.** Appendix A checks the ends over the classes of section 1, and now sees a relay that is connected and not reached, and a relay given no key. It does not see time. That every state not in a class comes to one is argued in section 1, case by case, and held by event-sequence tests over the clock and the answers in `reach.rs`, not by the enumeration. A kind of answer or event that section 1 does not list would escape both: attack the list of answers against `device_entries.rs` and `leave.rs` as they will be when this is built.
+1. **The model is only as true as its classes.** Appendix A checks the ends over the classes of section 1, and nothing else. It carries a relay that is connected and not reached, and a relay given no key, but checks neither: taking either out still passes. It does not see time. That every state not in a class comes to one is argued in section 1, case by case, and held by event-sequence tests over the clock and the answers in `reach.rs`, not by the enumeration. A kind of answer or event that section 1 does not list would escape both: attack the list of answers against `device_entries.rs` and `leave.rs` as they will be when this is built.
 2. **The latest answer is kept across starts.**
    - End 2 says "may be closed" with a relay out of reach, on an answer kept in the database. That answer can only have been given after the change, since the kept entry is the change.
    - A relay that answered so and then lost its store, or a hostile relay that lied, is believed until it answers otherwise. One that answers "no room" about the entry is believed at once.
    - Is that weaker than end 1, which believes the same answer from a relay that is connected?
-3. **The mark.** A relay with no answer, whose mark is the handed entry, is acted on by nothing until a change. A device added on this version while relay B was unreachable from its site has B in that state.
+3. **The mark.** A relay with no answer, whose mark is the kept entry, is acted on by nothing until a change. It is written at a hand-over, at `cordelia phrase`, and at a first start under statement 1. A device added on this version while relay B was unreachable from its site has B in that state.
    - If B lacks the statement that this device was added under, and some other device reaches only B, nothing here says so. Today nothing does either.
    - The device that added it kept and showed that entry, but perhaps never to B.
 4. **End 2 with a relay STUCK.** Status 0 is given while a relay holds the change and refuses what this device carried, since another relay holds it whole. Only the carried half rests on that; check that nothing of the change half does.
@@ -1027,7 +1029,7 @@ The weakest points, as this record sees them:
 6. **Seven days of amber.** After them a relay that lacks a removal is said only in `cordelia devices`. At a site that can never reach B, that is the right end. Elsewhere it is a removal that may still not be at B, and no line says so.
 7. **Out of reach at a pace of 900 seconds,** for a relay that holds the change. It is out of reach until the next attempt, up to 15 minutes after it came back. Only the carried word and the status rest on it. Check that nothing of the change half does.
 8. **A connected relay whose shows fail** counts as out of reach. A removed device at the same address that uses up the address's bytes ("not now") can so make a relay out of reach at will, and end a command at end 3. That gives it nothing it lacks today (the relay lacks the change either way), and the status is 3. But it ends a command that today would wait.
-9. **Rule 3 at a site that never reaches B:** every 30 seconds, for good, after each change, and from the upgrade on for a machine that came by it. Is a failed dial every 30 seconds an acceptable cost on a machine that will never reach B, where the person's only way out is to take B out of that machine's configuration?
+9. **Rule 3 at a site that never reaches B:** every 30 seconds, for good, after each change, and from the upgrade on for a machine that came by it under a statement after statement 1. Is a failed dial every 30 seconds an acceptable cost on a machine that will never reach B, where the person's only way out is to take B out of that machine's configuration?
 10. **Rule 10, case 2:** a relay that the word names was read by the recovery, so it is "not cut short". The relay may since have dropped the names' channels. `sent` has the same staleness over every relay; this has it over fewer.
 11. **The carried word is the device's own claim.** As with `sent`, a device that counts can write a false one about itself. No other key's word is read. Can it make a recovery that was cut short pass as whole? It can do the same with `sent` today.
 12. **Rule 9 changes a recovery's end** from a print-once to a wait of five minutes and more, where a relay is slow after the change.
@@ -1037,7 +1039,7 @@ The weakest points, as this record sees them:
 
 ## Appendix A. The model of the ends
 
-Before rules 4, 8 and 9 were written down, their ends were checked by the script below, over every state the node keeps. It was extended after this record's third review.
+Before rules 4, 8 and 9 were written down, their ends were checked by the script below, over every combination of the classes of each relay. It was extended after this record's third review. It checks only the ends over given classes (below).
 
 **What it enumerates.** For each relay:
 
@@ -1065,10 +1067,11 @@ A relay given no key holds the change only while connected. That is 96 states of
 3 relays: 96 relay states, 3538944 states, 489120 that time does not move: both hold
 ```
 
-**It has teeth.**
+**What it checks, and what it does not.** It checks only the ends over given classes. It does not check that the node puts a relay in the right class, that a state in no class comes to one, or that a relay given no key names the host it did. So the third review's mediums 1 to 3 rest on the event-sequence tests of `reach.rs` and on the keyless test (section 11) alone, not on this model. Taking out the connected relay that is not reached, or the rule for a relay given no key together with its check, still passes (fourth check, finding 5).
+
+**Where it has teeth.**
 
 - The ends of this record's second revision (263ade8) leave 216 states of two relays with no end (the second review's findings 1 and 4).
-- With the rule for a relay given no key taken out, the check of safety fails (the third review's finding 3).
 - With end 3 asking for the word where a relay lacks the change, the check that end 3 holds there fails (the third review's finding 6).
 
 The test `the_ends_are_safe_and_live_over_every_state` (section 11) is this check in Rust, over the node's own functions.
