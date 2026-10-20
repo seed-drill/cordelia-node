@@ -1924,10 +1924,22 @@ mod tests {
     /// Mark announced on device `n`, as the command does once it printed
     /// them, `ids` for the agent of the folder `name`: how many were.
     fn told_on(s: &Several, n: usize, name: &str, ids: &[Id], now: i64) -> usize {
+        told_with(s, n, name, ids, now, &OwnChannels::default())
+    }
+
+    /// [`told_on`], with the device's own channels as `own_channels`.
+    fn told_with(
+        s: &Several,
+        n: usize,
+        name: &str,
+        ids: &[Id],
+        now: i64,
+        own_channels: &OwnChannels,
+    ) -> usize {
         announced_of(
             &s[n].conn,
             &s[n].identity,
-            &OwnChannels::default(),
+            own_channels,
             &folder(name),
             ids,
             now,
@@ -2334,6 +2346,40 @@ mod tests {
         // The plans line stays a line for plans.
         let plans = summary_on(&s, 1, "plans", now).unwrap();
         assert_eq!(plans.lines[0].id, to_plans);
+
+        // A message from a signer that does not count is no line, and is
+        // not marked.
+        let not_counted = [0x99; 16];
+        held_as(
+            &s,
+            1,
+            not_counted,
+            [9; 32],
+            "notes",
+            Some("work"),
+            false,
+            (now, now),
+            1,
+        );
+        assert_eq!(told_on(&s, 1, "work", &[not_counted], now), 0);
+        assert!(!held::is_announced(&s[1].conn, &not_counted, "work").unwrap());
+
+        // Where `summary` would answer nothing, nothing is marked: sync
+        // off, the device not standing applied, no place for messages.
+        let sync_dir = meta::get(&s[1].conn, meta::SYNC_CLAUDE_DIR)
+            .unwrap()
+            .unwrap();
+        meta::remove(&s[1].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(told_on(&s, 1, "work", &[to_work], now), 0);
+        meta::set(&s[1].conn, meta::SYNC_CLAUDE_DIR, &sync_dir).unwrap();
+        held_rows::set_state(&s[1].conn, State::Fork).unwrap();
+        assert_eq!(told_on(&s, 1, "work", &[to_work], now), 0);
+        held_rows::set_state(&s[1].conn, State::Applied).unwrap();
+        let no_place = OwnChannels::default();
+        no_place.say_no_place(true);
+        assert_eq!(told_with(&s, 1, "work", &[to_work], now, &no_place), 0);
+        assert!(!held::is_announced(&s[1].conn, &to_work, "work").unwrap());
+
         assert_eq!(told_on(&s, 1, "work", &[to_work], now), 1);
         assert!(held::is_announced(&s[1].conn, &to_work, "work").unwrap());
     }
@@ -3555,10 +3601,22 @@ mod tests {
         other.version = "0.0.0".into();
         let (status, _) = answer(summary(asked(), state.clone(), other).await).await;
         assert_eq!(status, 204);
+        // Nor is anything marked by `announced` of another version, or
+        // while the node is held up.
+        let whole = hex::encode(id);
+        let mut other = told_asked("work", std::slice::from_ref(&whole));
+        other.version = "0.0.0".into();
+        let (status, _) = answer(announced(asked(), state.clone(), other).await).await;
+        assert_eq!(status, 204);
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
         state.held.hold(Held::FirstStart("a copy failed".into()));
         let (status, _) =
             answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
         assert_eq!(status, 204);
+        let told = told_asked("work", std::slice::from_ref(&whole));
+        let (status, _) = answer(announced(asked(), state.clone(), told).await).await;
+        assert_eq!(status, 204);
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
         let read_asked = web::Json(ReadRequest {
             folder: folder("work"),
             id: hex::encode(id),
