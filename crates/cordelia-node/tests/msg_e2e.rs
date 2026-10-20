@@ -577,7 +577,6 @@ fn the_summary_answers_within_its_time_or_prints_nothing() {
     let took = began.elapsed();
     assert_eq!(said.status.code(), Some(0));
     assert_eq!(out(&said), "");
-    assert!(took < Duration::from_millis(300), "{took:?}");
     // The node answered, with what it holds, after the command's time.
     wait_for("the node answers", &two.all(), 30, || {
         let asked = late.answered("/api/v1/messages/summary");
@@ -585,7 +584,10 @@ fn the_summary_answers_within_its_time_or_prints_nothing() {
         asked[0].1
     });
     assert_eq!(late.answered("/api/v1/messages/summary")[0].1, Some(200));
+    // The node was told nothing of an answer that came late; whatever
+    // the command waited, that is checked first.
     assert!(late.bodies(ANNOUNCED).is_empty());
+    assert!(took < Duration::from_millis(300), "{took:?}");
     // Not printed, it is not announced: the next summary prints its line.
     let shown = summary_with(&two.all(), desktop, "work", &id);
     assert!(shown.contains(&format!("\n  {id}  ")), "{shown}");
