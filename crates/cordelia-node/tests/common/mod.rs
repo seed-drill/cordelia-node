@@ -1624,12 +1624,19 @@ impl PassesOn {
     /// before it is passed back: a node that answers late. What it
     /// answered is kept when it answers, before the hold.
     pub fn holding(port: u16, hold: Duration) -> Self {
+        Self::holding_answers_to(port, None, hold)
+    }
+
+    /// [`Self::holding`], holding only the answers to requests POSTed to
+    /// `path`, where it is given: a node that answers one route late.
+    pub fn holding_answers_to(port: u16, path: Option<&str>, hold: Duration) -> Self {
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let crossed: Crossed = Default::default();
         let at = listener.local_addr().unwrap().port();
         let kept = crossed.clone();
+        let held = path.map(|path| format!("POST {path} HTTP/1.1\r\n"));
         std::thread::spawn(move || {
             for from in listener.incoming().flatten() {
                 let Ok(to) = TcpStream::connect(("127.0.0.1", port)) else {
@@ -1654,11 +1661,19 @@ impl PassesOn {
                 });
                 let (mut node, mut asks) = (to, from);
                 let answered = kept.clone();
+                let held = held.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 * 1024];
                     while let Ok(n) = node.read(&mut buf) {
-                        answered.lock().unwrap()[k].1.extend_from_slice(&buf[..n]);
-                        std::thread::sleep(hold);
+                        let holds = {
+                            let mut crossed = answered.lock().unwrap();
+                            crossed[k].1.extend_from_slice(&buf[..n]);
+                            held.as_ref()
+                                .is_none_or(|held| crossed[k].0.starts_with(held.as_bytes()))
+                        };
+                        if holds {
+                            std::thread::sleep(hold);
+                        }
                         if n == 0 || asks.write_all(&buf[..n]).is_err() {
                             break;
                         }

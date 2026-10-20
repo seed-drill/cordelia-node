@@ -594,6 +594,49 @@ fn the_summary_answers_within_its_time_or_prints_nothing() {
     assert!(shown.ends_with(": late\n"), "{shown}");
 }
 
+/// With the node's answers to the command's word of what it printed held
+/// for 5 s, `summary` prints the line, and ends with its 100 ms all the
+/// same: its second request is limited by the time left (decision
+/// 2026-10-09 §4.1, C20).
+#[test]
+fn the_summarys_word_of_what_it_printed_is_limited_by_the_time_left() {
+    let two = Two::new();
+    let id = sent(
+        &two.all(),
+        &two.laptop,
+        "notes",
+        &["--to", "work"],
+        "in time\n",
+    );
+    let desktop = &two.desktop;
+    holds_what_was_sent(&two);
+    let slow = PassesOn::holding_answers_to(desktop.http, Some(ANNOUNCED), Duration::from_secs(5));
+    let config = config_through(desktop, slow.port, "config-slow.toml");
+    // Run until one prints the line and its word crosses to the node.
+    let took = wait_for(
+        "the summary prints the line and tells the node",
+        &two.all(),
+        120,
+        || {
+            let began = Instant::now();
+            let said = msg_in(
+                desktop,
+                &folder(desktop, "work"),
+                &[],
+                &["--config", &path(&config), "summary"],
+                b"",
+            );
+            let took = began.elapsed();
+            assert_eq!(said.status.code(), Some(0));
+            let printed = out(&said);
+            (printed.contains(&format!("\n  {id}  ")) && !slow.bodies(ANNOUNCED).is_empty())
+                .then_some(took)
+        },
+    );
+    // The process ended with its 100 ms, not with the node's 5 s.
+    assert!(took < Duration::from_millis(2_500), "{took:?}");
+}
+
 /// A summary whose output is closed prints nothing, and tells the node
 /// nothing: the next summary prints the line (decision 2026-10-09 §4.1,
 /// rule 14).

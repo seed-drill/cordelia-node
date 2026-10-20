@@ -507,17 +507,29 @@ pub struct AnnouncedRequest {
 
 // ── POST /api/v1/messages/announced ──────────────────────────────────
 
+/// Whether `id` is a message's ID whole, as the command sends it: 32
+/// lower-case hex characters.
+fn is_whole(id: &str) -> bool {
+    id.len() == 2 * AGENT_MESSAGE_ID_BYTES
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// What `cordelia msg summary` printed (decision 2026-10-09 §4.1, §7.2):
 /// the command says it after it printed the lines of an answer that came
 /// within its time, and the node marks them announced ([`announced_of`]).
 /// It answers nothing, whatever it marked: the command does not wait on
 /// it past its 100 ms, and prints nothing more. More IDs than a summary
-/// has lines, or one that is not an ID whole, mark nothing.
+/// has lines, or one that is not an ID whole in lower-case hex, mark
+/// nothing. It tries the
+/// store's lock as `summary` does, without holding the worker, for at
+/// most the summary's 100 ms, and marks nothing where it did not have it
+/// (C20).
 pub async fn announced(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<AnnouncedRequest>,
 ) -> Result<HttpResponse, ApiError> {
+    let deadline = Instant::now() + summary_wait(AGENT_MESSAGE_SUMMARY_WAIT_MS);
     match asked(&req, &state) {
         Ok(()) => {}
         Err(ApiError::Unauthorized) => return Err(ApiError::Unauthorized),
@@ -529,7 +541,7 @@ pub async fn announced(
     let Some(ids) = body
         .ids
         .iter()
-        .map(|id| match id.len() == 2 * AGENT_MESSAGE_ID_BYTES {
+        .map(|id| match is_whole(id) {
             true => hex::decode(id).ok()?.try_into().ok(),
             false => None,
         })
@@ -537,8 +549,10 @@ pub async fn announced(
     else {
         return Ok(nothing());
     };
+    let Some(db) = db_by(&state, deadline).await else {
+        return Ok(nothing());
+    };
     let now = state.sync_control.now();
-    let db = db_of(&state);
     let _ = announced_of(
         &db,
         &state.identity,
@@ -1918,10 +1932,22 @@ mod tests {
     /// Mark announced on device `n`, as the command does once it printed
     /// them, `ids` for the agent of the folder `name`: how many were.
     fn told_on(s: &Several, n: usize, name: &str, ids: &[Id], now: i64) -> usize {
+        told_with(s, n, name, ids, now, &OwnChannels::default())
+    }
+
+    /// [`told_on`], with the device's own channels as `own_channels`.
+    fn told_with(
+        s: &Several,
+        n: usize,
+        name: &str,
+        ids: &[Id],
+        now: i64,
+        own_channels: &OwnChannels,
+    ) -> usize {
         announced_of(
             &s[n].conn,
             &s[n].identity,
-            &OwnChannels::default(),
+            own_channels,
             &folder(name),
             ids,
             now,
@@ -2328,6 +2354,40 @@ mod tests {
         // The plans line stays a line for plans.
         let plans = summary_on(&s, 1, "plans", now).unwrap();
         assert_eq!(plans.lines[0].id, to_plans);
+
+        // A message from a signer that does not count is no line, and is
+        // not marked.
+        let not_counted = [0x99; 16];
+        held_as(
+            &s,
+            1,
+            not_counted,
+            [9; 32],
+            "notes",
+            Some("work"),
+            false,
+            (now, now),
+            1,
+        );
+        assert_eq!(told_on(&s, 1, "work", &[not_counted], now), 0);
+        assert!(!held::is_announced(&s[1].conn, &not_counted, "work").unwrap());
+
+        // Where `summary` would answer nothing, nothing is marked: sync
+        // off, the device not standing applied, no place for messages.
+        let sync_dir = meta::get(&s[1].conn, meta::SYNC_CLAUDE_DIR)
+            .unwrap()
+            .unwrap();
+        meta::remove(&s[1].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(told_on(&s, 1, "work", &[to_work], now), 0);
+        meta::set(&s[1].conn, meta::SYNC_CLAUDE_DIR, &sync_dir).unwrap();
+        held_rows::set_state(&s[1].conn, State::Fork).unwrap();
+        assert_eq!(told_on(&s, 1, "work", &[to_work], now), 0);
+        held_rows::set_state(&s[1].conn, State::Applied).unwrap();
+        let no_place = OwnChannels::default();
+        no_place.say_no_place(true);
+        assert_eq!(told_with(&s, 1, "work", &[to_work], now, &no_place), 0);
+        assert!(!held::is_announced(&s[1].conn, &to_work, "work").unwrap());
+
         assert_eq!(told_on(&s, 1, "work", &[to_work], now), 1);
         assert!(held::is_announced(&s[1].conn, &to_work, "work").unwrap());
     }
@@ -3399,10 +3459,13 @@ mod tests {
         let mut other = told_asked("work", std::slice::from_ref(&whole));
         other.version = "0.0.0".into();
         let too_many = vec![whole.clone(); AGENT_MESSAGE_SUMMARY_LINES + 1];
+        // Upper case is another form of the same ID.
+        assert_ne!(whole.to_ascii_uppercase(), whole);
         for wrong in [
             other,
             told_asked("work", &too_many),
             told_asked("work", &[whole[..8].to_string()]),
+            told_asked("work", &[whole.to_ascii_uppercase()]),
         ] {
             let (status, _) = answer(announced(asked(), state.clone(), wrong).await).await;
             assert_eq!(status, 204);
@@ -3468,6 +3531,50 @@ mod tests {
         assert!(waited_until.duration_since(began) >= Duration::from_millis(100));
     }
 
+    /// While `announced` waits for the store's lock, the worker it runs on
+    /// serves another request; it waits at most the summary's 100 ms, and
+    /// then marks nothing (decision 2026-10-09 §4.1, C20).
+    #[actix_web::test]
+    async fn another_request_is_served_while_announced_waits_for_the_store() {
+        let (state, id) = a_node_with_a_message();
+        let (holding, held) = std::sync::mpsc::channel();
+        let other = state.clone();
+        // Another holds the store's lock for 400 ms, longer than the wait.
+        let holder = std::thread::spawn(move || {
+            let _held = other.db.lock().unwrap();
+            holding.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        held.recv().unwrap();
+        let began = Instant::now();
+        let waits = async {
+            let told = told_asked("work", &[hex::encode(id)]);
+            let answered = announced(asked(), state.clone(), told).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        // Another request, sent once `announced` is waiting: of another
+        // version, which is answered without the store.
+        let another = async {
+            actix_web::rt::time::sleep(Duration::from_millis(10)).await;
+            let mut other = summary_asked("work", 100);
+            other.version = "0.0.0".into();
+            let answered = summary(asked(), state.clone(), other).await;
+            (answer(answered).await.0, Instant::now())
+        };
+        let ((waited, waited_until), (served, served_at)) = tokio::join!(waits, another);
+        holder.join().unwrap();
+        assert_eq!((waited, served), (204, 204));
+        assert!(
+            served_at < waited_until,
+            "the other request waited for announced"
+        );
+        let waited = waited_until.duration_since(began);
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_millis(400), "{waited:?}");
+        // It gave up the lock it did not have, and marked nothing.
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
+    }
+
     /// The node's status answers the `messages` object on a personal node
     /// that stands applied, and none on a relay's, and none while the node
     /// is held up, which reads nothing of its database (decision 2026-10-09
@@ -3505,10 +3612,22 @@ mod tests {
         other.version = "0.0.0".into();
         let (status, _) = answer(summary(asked(), state.clone(), other).await).await;
         assert_eq!(status, 204);
+        // Nor is anything marked by `announced` of another version, or
+        // while the node is held up.
+        let whole = hex::encode(id);
+        let mut other = told_asked("work", std::slice::from_ref(&whole));
+        other.version = "0.0.0".into();
+        let (status, _) = answer(announced(asked(), state.clone(), other).await).await;
+        assert_eq!(status, 204);
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
         state.held.hold(Held::FirstStart("a copy failed".into()));
         let (status, _) =
             answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
         assert_eq!(status, 204);
+        let told = told_asked("work", std::slice::from_ref(&whole));
+        let (status, _) = answer(announced(asked(), state.clone(), told).await).await;
+        assert_eq!(status, 204);
+        assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
         let read_asked = web::Json(ReadRequest {
             folder: folder("work"),
             id: hex::encode(id),
