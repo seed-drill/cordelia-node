@@ -532,8 +532,9 @@ impl Leave {
     /// leave it was given is dropped. What is kept of a connection that
     /// is gone is forgotten.
     ///
-    /// It is called at each pass, and the two clocks are read here.
-    pub fn reaches(&self, set_up_with: &[String], reached: &[&Link]) {
+    /// It is called at each pass, and the two clocks are read here. Says
+    /// whether the machine slept since the pass before.
+    pub fn reaches(&self, set_up_with: &[String], reached: &[&Link]) -> bool {
         let now = self.clock.now();
         let read = (now, self.clock.wall_ms());
         let mut inner = lock(&self.inner);
@@ -546,7 +547,8 @@ impl Leave {
         // The lid was closed, and is open: the connections still look
         // open, and a leave still looks young, by a clock that stood
         // still. Every relay is asked first, as when the node starts.
-        if inner.last.is_some_and(|before| slept_between(before, read)) {
+        let slept = inner.last.is_some_and(|before| slept_between(before, read));
+        if slept {
             inner.given.clear();
             inner.woke = None;
         }
@@ -560,6 +562,7 @@ impl Leave {
                 awake: false,
             });
         }
+        slept
     }
 
     /// Whether the node is still waking.
@@ -852,6 +855,7 @@ impl Leave {
             .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
             .filter(|entry| entry.channel == channel && entry.author == typed.key)
             .collect();
+        let set_up = state.own_channels.relays_set_up_as();
         let mut read = Vec::new();
         for entry in &handed {
             let now = unix();
@@ -863,7 +867,8 @@ impl Leave {
             let (accepted, _) = state.as_a_change_where(
                 |conn| {
                     at_relays::telling_a_change(conn, |conn| {
-                        adding::accept_typed(conn, identity, typed, sync_on(conn), entry, now)
+                        let sync_on = sync_on(conn);
+                        adding::accept_typed(conn, identity, typed, sync_on, entry, &set_up, now)
                     })
                 },
                 |(accepted, changed)| match accepted {

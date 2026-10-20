@@ -2172,6 +2172,7 @@ mod tests {
             no_room,
             another_form: 0,
             refuses: None,
+            reach: Default::default(),
         };
         let full = NoRoom {
             at: 1_800_000_000,

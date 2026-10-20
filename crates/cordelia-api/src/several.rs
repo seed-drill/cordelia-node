@@ -2586,6 +2586,7 @@ mod tests {
             crate::leaving::Among::NoPhrase,
             &made.entry,
             &made.statement_key,
+            &[],
             now,
         )
         .unwrap();

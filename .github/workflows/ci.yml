@@ -68,6 +68,40 @@ jobs:
       - name: Install script
         run: sh scripts/test-install.sh
 
+  # The real-process tests that wait out a relay's five minutes out of
+  # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
+  # each is ignored in `cargo test --all`, so that the job above is not
+  # made longer, and is run here, on every pull request, beside it. They
+  # are the ignored tests of cordelia-node's test files, and only those:
+  # the other crates' ignored tests are timed for a release build, or are
+  # no part of this. Each runs whatever another fails. About fourteen
+  # minutes of tests after the build.
+  out-of-reach:
+    name: out of reach
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: The tests of a relay out of reach, ignored for their length
+        run: cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
+
   coverage:
     runs-on: ubuntu-latest
     # The test job runs every test; this one only measures. Two hours is
