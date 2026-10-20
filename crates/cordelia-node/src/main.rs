@@ -218,6 +218,10 @@ enum Commands {
     /// phrase.
     ///
     /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     ///
     /// You cannot remove the device you are on. Remove it from another
     /// one.
@@ -242,9 +246,19 @@ enum Commands {
     /// list that you have checked.
     ///
     /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     Renew,
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
+    ///
+    /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     Settle,
     /// Recover on a new machine when you have no device you trust
     ///
@@ -264,6 +278,12 @@ enum Commands {
     /// one you type `have`, `lost` or `hands` (it may be in someone
     /// else's hands). Then the command shows the change it will make and
     /// asks you to type yes.
+    ///
+    /// After the look the command waits for every relay to hold the
+    /// change. Where one that is not known to hold it cannot be reached,
+    /// or refuses it, the command says so and ends with status 3. Any
+    /// status other than 0, 1 and 2 means that the recovery is made: do
+    /// not run it again. Keep this machine on.
     Recover {
         /// A name for this machine, such as "laptop" (default: the
         /// machine's name)
@@ -665,7 +685,11 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
-        Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
+        // Its own exit status: 3 where the change is made and not known
+        // to be at every relay (decision 2026-10-19 §4, rule 8).
+        Some(Commands::ChangeMade { number }) => {
+            std::process::exit(person_cmd::change_made(&cli.config, number))
+        }
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
         Some(Commands::RecoverMade {
             number,
