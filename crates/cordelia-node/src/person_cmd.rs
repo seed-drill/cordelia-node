@@ -46,7 +46,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use cordelia_api::change::{Prepared, prepare_change, prepare_settlement};
-use cordelia_api::look::lists_of;
+use cordelia_api::look::{CarriedWordLook, held_named, joined, lists_of};
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
 use cordelia_core::protocol::{
@@ -277,6 +277,71 @@ pub(crate) fn named(label: &str, key: &[u8; 32]) -> String {
 /// A device that the node shows, as [`named`] says it.
 fn shown(device: &Value) -> String {
     words_then(text(device, "words"), text(device, "label"))
+}
+
+// ── The carried word (decision 2026-10-19 §4, rules 6 and 7) ────────
+
+/// The relays that a look lists, each by the name that this device's
+/// configuration gives it and with its key where the device knows one:
+/// what another device's carried word names a relay by (rule 6).
+fn relays_known(seen: &Value) -> Vec<(String, Option<String>)> {
+    list(seen, "relays")
+        .map(|relay| {
+            let key = relay["key"].as_str().map(str::to_string);
+            (text(relay, "relay").to_string(), key)
+        })
+        .collect()
+}
+
+/// The carried word of a device that a look shows, where it is read
+/// (rule 5: the node reads it, and never beside `sent`).
+fn carried_word_of(device: &Value) -> Option<CarriedWordLook> {
+    serde_json::from_value(device["carried_word"].clone()).ok()
+}
+
+/// What another device's carried word says, as a line says it: the
+/// relays that hold what it carried (`<held>`), and how many may still
+/// lack it (`<not yet>`). The two never overlap.
+fn held_by_another(word: &CarriedWordLook, seen: &Value) -> (String, u64) {
+    let known = relays_known(seen);
+    let known: Vec<(&str, Option<&str>)> = known
+        .iter()
+        .map(|(name, key)| (name.as_str(), key.as_deref()))
+        .collect();
+    (held_named(word, &known), word.not_yet)
+}
+
+/// `<n> other relay` or `<n> other relays`.
+fn other_relays(n: u64) -> String {
+    match n {
+        1 => "1 other relay".into(),
+        n => format!("{n} other relays"),
+    }
+}
+
+/// This device's own line where its own word is the carried word (rule
+/// 7; decision 2026-10-19 §5, S4): `<held>` is each relay at which
+/// nothing that it carried waits, by its rows of what it sent, reached or
+/// not; `<not yet>` is every other relay. `None` where the look names no
+/// relay as holding what it carried.
+fn own_carried_line(seen: &Value) -> Option<String> {
+    let mut held: Vec<String> = Vec::new();
+    let mut not_yet: Vec<String> = Vec::new();
+    for relay in list(seen, "relays") {
+        let name = text(relay, "relay").to_string();
+        match relay["has_what_was_carried"] == true {
+            true => held.push(name),
+            false => not_yet.push(name),
+        }
+    }
+    if held.is_empty() {
+        return None;
+    }
+    let mut line = format!("this device has sent what it carried to {}", joined(&held));
+    if !not_yet.is_empty() {
+        line.push_str(&format!("; not yet to {}", joined(&not_yet)));
+    }
+    Some(line)
 }
 
 /// The words of a key's fingerprint, and then its label, quoted.
@@ -971,6 +1036,22 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         // (§8): it says so itself, once it has.
         Some(number) if number == change => match device["sent"] == true {
             true => format!("has applied change {change}, and has sent what it held"),
+            // Its carried word (decision 2026-10-19, rule 6, D1): what it
+            // held is at the relays it names, and only there if it is lost
+            // now.
+            false if let Some(word) = carried_word_of(device) => {
+                let (held, not_yet) = held_by_another(&word, seen);
+                let mut said =
+                    format!("has applied change {change}, and has sent what it held to {held}");
+                if not_yet > 0 {
+                    said.push_str(&format!(
+                        "; not yet to {} that it is set up with (if it is lost now, what it held \
+                         is at {held} alone)",
+                        other_relays(not_yet)
+                    ));
+                }
+                said
+            }
             // A device that is lost in that state has left what it had
             // not sent: what it had sent before comes in by command
             // (§7.3, §8).
@@ -2315,11 +2396,22 @@ fn after_a_change(seen: &Value, number: u64, own: &[u8; 32]) -> (Vec<String>, us
     let said_sent = list(seen, "devices")
         .filter(|device| is_own(device, own))
         .any(|device| device["applied"].as_u64() == Some(number) && device["sent"] == true);
+    // Its carried word under this change (decision 2026-10-19, rule 7,
+    // S4): where it sent what it carried, and where not yet.
+    let own_word = list(seen, "devices")
+        .chain(list(seen, "added"))
+        .filter(|device| is_own(device, own))
+        .any(|device| {
+            device["applied"].as_u64() == Some(number) && carried_word_of(device).is_some()
+        });
     if !said_sent {
         missing += 1;
-        now.push(
-            "keep this machine on: this device has not yet sent every relay what it carried".into(),
-        );
+        now.push(match own_word.then(|| own_carried_line(seen)).flatten() {
+            Some(line) => line,
+            None => "keep this machine on: this device has not yet sent every relay what it \
+                     carried"
+                .into(),
+        });
     }
     for device in list(seen, "devices").filter(|device| !is_own(device, own)) {
         let applied = device["applied"].as_u64() == Some(number);
@@ -2328,6 +2420,18 @@ fn after_a_change(seen: &Value, number: u64, own: &[u8; 32]) -> (Vec<String>, us
                 "{} has applied the change, and has sent what it held",
                 shown(device)
             ),
+            // Its carried word (decision 2026-10-19, rule 6, S5).
+            (true, false) if let Some(word) = carried_word_of(device) => {
+                let (held, not_yet) = held_by_another(&word, seen);
+                let mut said = format!(
+                    "{} has applied the change, and has sent what it held to {held}",
+                    shown(device)
+                );
+                if not_yet > 0 {
+                    said.push_str(&format!("; not yet to {}", other_relays(not_yet)));
+                }
+                said
+            }
             (true, false) => format!(
                 "{} has applied the change, and is still sending what it held",
                 shown(device)
@@ -4337,5 +4441,207 @@ mod tests {
         for among in ["alone", "several", "stopped"] {
             assert_eq!(phrase_opening(among), format!("{WHOSE_WORDS}\n"), "{among}");
         }
+    }
+
+    // ── The carried word (decision 2026-10-19 §4, rules 6 and 7) ────
+
+    /// A look after change 3 on device 1, set up with three relays: A and B
+    /// with keys it knows, C with none. Device 2's row has `other`, device
+    /// 1's own row `own`, each a carried word or null.
+    fn look_with_words(own: Value, other: Value, held: [Option<bool>; 3]) -> Value {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        json!({
+            "this_device": written(1),
+            "change": 3,
+            "relays": [
+                { "relay": "a.example:9474", "key": written(10), "holds_latest": true,
+                  "heard_since_woke": true, "has_what_was_carried": held[0] },
+                { "relay": "b.example:9474", "key": written(11), "holds_latest": true,
+                  "heard_since_woke": true, "has_what_was_carried": held[1] },
+                { "relay": "c.example:9474", "key": null, "holds_latest": true,
+                  "heard_since_woke": true, "has_what_was_carried": held[2] },
+            ],
+            "devices": [
+                { "key": written(1), "label": "laptop", "words": "w1", "applied": 3,
+                  "sent": false, "carried_word": own },
+                { "key": written(2), "label": "desktop", "words": "w2", "applied": 3,
+                  "sent": false, "carried_word": other },
+            ],
+        })
+    }
+
+    fn word_naming(keys: &[String], more: u64, not_yet: u64) -> Value {
+        json!({ "keys": keys, "more": more, "not_yet": not_yet })
+    }
+
+    fn written_key(n: u8) -> String {
+        encode_public_key(&NodeIdentity::from_seed([n; 32]).unwrap().public_key()).unwrap()
+    }
+
+    /// The lines of the carried word, word for word (decision 2026-10-19
+    /// §5): D1 in `cordelia devices` and S5 in the wait after a change, of
+    /// another device whose carried word is read, each with and without
+    /// `<not yet>`; and S4, of this device's own word.
+    #[test]
+    fn each_line_of_the_carried_word_word_for_word() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let (a, b, unknown) = (written_key(10), written_key(11), written_key(12));
+        let row_of_2 = |seen: &Value| {
+            let lines = devices_lines_at(seen, &own, 0, &LOOKED_UP);
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with("  (w2)"))
+                .unwrap();
+            lines[at].clone()
+        };
+        let waited = |seen: &Value| after_a_change(seen, 3, &own).0;
+
+        // Not yet at one relay, which it does not name.
+        let seen = look_with_words(
+            Value::Null,
+            word_naming(&[a.clone(), unknown.clone()], 0, 1),
+            [None; 3],
+        );
+        assert_eq!(
+            row_of_2(&seen),
+            format!(
+                "  (w2) \"desktop\": has applied change 3, and has sent what it held to \
+                 a.example:9474 and the relay whose key is {unknown}; not yet to 1 other relay \
+                 that it is set up with (if it is lost now, what it held is at a.example:9474 \
+                 and the relay whose key is {unknown} alone)"
+            )
+        );
+        assert!(waited(&seen).contains(&format!(
+            "(w2) \"desktop\" has applied the change, and has sent what it held to \
+             a.example:9474 and the relay whose key is {unknown}; not yet to 1 other relay"
+        )));
+        // At every relay it is set up with: no `<not yet>`. Two not yet,
+        // and more counted.
+        let seen = look_with_words(
+            Value::Null,
+            word_naming(std::slice::from_ref(&b), 0, 0),
+            [None; 3],
+        );
+        assert_eq!(
+            row_of_2(&seen),
+            "  (w2) \"desktop\": has applied change 3, and has sent what it held to b.example:9474"
+        );
+        assert!(
+            waited(&seen).contains(
+                &"(w2) \"desktop\" has applied the change, and has sent what it held to \
+              b.example:9474"
+                    .to_string()
+            )
+        );
+        let eight: Vec<String> = (0..8)
+            .map(|n| {
+                if n == 0 {
+                    a.clone()
+                } else {
+                    written_key(20 + n)
+                }
+            })
+            .collect();
+        let seen = look_with_words(Value::Null, word_naming(&eight, 2, 2), [None; 3]);
+        let row = row_of_2(&seen);
+        assert!(
+            row.contains(" and 2 more; not yet to 2 other relays that it is set up with"),
+            "{row}"
+        );
+        assert!(
+            row.contains("has sent what it held to a.example:9474, the relay whose key is"),
+            "{row}"
+        );
+
+        // Its own word: S4, in place of the line that it has not yet sent.
+        let seen = look_with_words(
+            word_naming(std::slice::from_ref(&a), 0, 2),
+            Value::Null,
+            [Some(true), Some(false), None],
+        );
+        let lines = waited(&seen);
+        assert!(lines.contains(
+            &"this device has sent what it carried to a.example:9474; not yet to b.example:9474 \
+              and c.example:9474"
+                .to_string()
+        ), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("has not yet sent every relay"))
+        );
+        // Every relay holds it: no `<not yet>`.
+        let seen = look_with_words(
+            word_naming(&[a.clone(), b.clone()], 0, 0),
+            Value::Null,
+            [Some(true), Some(true), Some(true)],
+        );
+        assert!(
+            waited(&seen).contains(
+                &"this device has sent what it carried to a.example:9474, b.example:9474 and \
+              c.example:9474"
+                    .to_string()
+            )
+        );
+        // Without its own carried word, the line of today.
+        let seen = look_with_words(Value::Null, Value::Null, [Some(true), None, None]);
+        assert!(
+            waited(&seen).contains(
+                &"keep this machine on: this device has not yet sent every relay what it carried"
+                    .to_string()
+            )
+        );
+        // Without the word of the other device, the line of today too.
+        assert!(
+            waited(&seen).contains(
+                &"(w2) \"desktop\" has applied the change, and is still sending what it held"
+                    .to_string()
+            )
+        );
+        assert!(row_of_2(&seen).contains("is still sending what it held"));
+    }
+
+    /// `<held>` and `<not yet>` come from two sets that never overlap
+    /// (decision 2026-10-19 §5): a relay that a line names as holding
+    /// what was carried is never one it counts or names as not yet.
+    #[test]
+    fn held_and_not_yet_never_overlap() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let names = ["a.example:9474", "b.example:9474", "c.example:9474"];
+        for held in [
+            [Some(true), Some(false), None],
+            [Some(true), Some(true), None],
+            [Some(false), Some(true), Some(true)],
+            [Some(true), Some(true), Some(true)],
+        ] {
+            let seen = look_with_words(word_naming(&[written_key(10)], 0, 0), Value::Null, held);
+            let line = own_carried_line(&seen).unwrap();
+            let (sent_to, not_yet) = match line.split_once("; not yet to ") {
+                Some((sent_to, not_yet)) => (sent_to, not_yet),
+                None => (line.as_str(), ""),
+            };
+            for (name, has) in names.iter().zip(held) {
+                assert_eq!(sent_to.contains(name), has == Some(true), "{line}");
+                assert_eq!(not_yet.contains(name), has != Some(true), "{line}");
+            }
+        }
+        // None holds what was carried, by the look: no line of the word.
+        let seen = look_with_words(
+            word_naming(&[written_key(10)], 0, 0),
+            Value::Null,
+            [None; 3],
+        );
+        assert_eq!(own_carried_line(&seen), None);
+        // Another device's word: `<not yet>` is its fourth field, and its
+        // keys are named; a relay named is never counted.
+        let seen = look_with_words(
+            Value::Null,
+            word_naming(&[written_key(10), written_key(11)], 0, 0),
+            [None; 3],
+        );
+        let lines = after_a_change(&seen, 3, &own).0;
+        let line = lines.iter().find(|line| line.starts_with("(w2)")).unwrap();
+        assert!(!line.contains("not yet"), "{line}");
     }
 }

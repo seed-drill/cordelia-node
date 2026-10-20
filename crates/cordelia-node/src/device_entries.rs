@@ -118,9 +118,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
-use cordelia_api::at_relays::known::{self, RelayId};
+use cordelia_api::at_relays::known::{self, Known, RelayId};
 use cordelia_api::at_relays::{
-    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands, Which,
+    self, Answered, Batch, Found, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands,
+    Which,
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
@@ -1038,8 +1039,11 @@ impl DeviceEntries {
         while let Some(turn) = turns.join_next().await {
             read_all &= turn.unwrap_or(false);
         }
-        if whole {
-            self.say_sent(relays);
+        // Where it does not say that it has sent what it carried, it may
+        // say that what it carried is at the relays it reaches (decision
+        // 2026-10-19 §4, rule 4, condition 4).
+        if whole && !self.say_sent(relays) {
+            self.say_reached(relays);
         }
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
@@ -1124,9 +1128,11 @@ impl DeviceEntries {
     /// otherwise: nothing is said then, as nothing is forgotten
     /// ([`Self::forget_done`]). The word waits in the store, and the pass
     /// that sends is woken for it.
-    fn say_sent(&self, relays: &[Relay]) {
+    ///
+    /// Says whether the word was written.
+    fn say_sent(&self, relays: &[Relay]) -> bool {
         let Some(set_up) = self.set_up_by_key(relays) else {
-            return;
+            return false;
         };
         let said = {
             let db = lock(&self.state.db);
@@ -1136,9 +1142,95 @@ impl DeviceEntries {
             Ok(true) => {
                 tracing::info!("this device has sent what it carried, and says so");
                 self.state.own_channels.written();
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not say that what was carried is sent");
+                false
+            }
+        }
+    }
+
+    /// Write this device's carried word, where it has one to write
+    /// (decision 2026-10-19 §4, rule 4; [`at_relays::say_reached`]): at
+    /// the end of a whole pass that did not write `sent`, from each
+    /// relay's class and the rows of what was sent to it. The word waits
+    /// in the store, and the pass that sends is woken for it.
+    fn say_reached(&self, relays: &[Relay]) {
+        let said = {
+            let db = lock(&self.state.db);
+            // What waits at each relay that is reached says whether it is
+            // in a class.
+            self.note_waits(&db, relays);
+            let Some(found) = self.found(&db, relays) else {
+                return;
+            };
+            at_relays::say_reached(&db, &self.state.identity, &found, self.unix())
+        };
+        match said {
+            Ok(true) => {
+                tracing::info!(
+                    "this device says that what it carried is at the relays it reaches: the others cannot be reached"
+                );
+                self.state.own_channels.written();
             }
             Ok(false) => {}
-            Err(e) => tracing::debug!(error = %e, "could not say that what was carried is sent"),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not say where what was carried is");
+            }
+        }
+    }
+
+    /// Each relay of `relays`, as the carried word is written from it
+    /// (decision 2026-10-19 §4, rule 4): its key, where the device knows
+    /// one ([`Self::key_of`]), and its class, as the classes stand: what
+    /// waits at each relay that is reached is noted before
+    /// ([`Self::note_waits`]). `None` where `relays` are not as many as the
+    /// node said it is configured with: whoever gives fewer is not
+    /// believed.
+    fn found(&self, db: &Connection, relays: &[Relay]) -> Option<Vec<Found>> {
+        if Some(relays.len()) != self.state.own_channels.relays_set_up() {
+            return None;
+        }
+        let known = known::read(db).unwrap_or_default();
+        let found = relays
+            .iter()
+            .map(|relay| Found {
+                key: Self::key_of(relay, &known),
+                class: self.reach.of(&relay.id()).class,
+            })
+            .collect();
+        Some(found)
+    }
+
+    /// The node key of `relay`, where the device knows one: the key its
+    /// configuration gives it, the key of the connection open to it, or
+    /// the key that gave its latest answer to a show. Rows of what was
+    /// sent to a relay are kept by its key.
+    fn key_of(relay: &Relay, known: &Known) -> Option<[u8; 32]> {
+        let open = relay.link.as_ref().filter(|link| link.is_open());
+        relay
+            .key
+            .or(open.map(|link| link.relay().0))
+            .or_else(|| known.of(&relay.id())?.answer.map(|answer| answer.by))
+    }
+
+    /// Note what waits at each relay of `relays` that is reached: whether
+    /// it is in a class goes by it (decision 2026-10-19 §1).
+    fn note_waits(&self, db: &Connection, relays: &[Relay]) {
+        for relay in relays {
+            let (id, link) = (relay.id(), relay.link.as_ref());
+            let Some(link) = link.filter(|link| link.is_open()) else {
+                continue;
+            };
+            if self.reach.is_reached(&id) {
+                let waits =
+                    cordelia_api::leaving::waits_at(db, &self.state.identity, &link.relay().0);
+                if let Ok(waits) = waits {
+                    self.reach.waits(&id, waits > 0);
+                }
+            }
         }
     }
 
@@ -2735,29 +2827,29 @@ impl DeviceEntries {
                 .flat_map(|of| of.another_form.iter().copied())
                 .collect()
         };
-        let (latest, gone) = {
+        let (latest, gone, keys, word_to_come) = {
             let db = lock(&self.state.db);
             // What waits at each relay that is reached says whether it is
             // in a class (decision 2026-10-19 §1).
-            for relay in relays {
-                let (id, link) = (relay.id(), relay.link.as_ref());
-                let Some(link) = link.filter(|link| link.is_open()) else {
-                    continue;
-                };
-                if self.reach.is_reached(&id) {
-                    let waits =
-                        cordelia_api::leaving::waits_at(&db, &self.state.identity, &link.relay().0);
-                    if let Ok(waits) = waits {
-                        self.reach.waits(&id, waits > 0);
-                    }
-                }
-            }
+            self.note_waits(&db, relays);
             let latest = at_relays::kept_id(&db).ok().flatten();
             let gone: HashSet<([u8; 32], i64)> = said
                 .into_iter()
                 .filter(|(channel, seq)| matches!(entries::holds_at(&db, channel, *seq), Ok(false)))
                 .collect();
-            (latest, gone)
+            let known = known::read(&db).unwrap_or_default();
+            let keys: Vec<Option<[u8; 32]>> = relays
+                .iter()
+                .map(|relay| Self::key_of(relay, &known))
+                .collect();
+            // Whether the next whole pass would write either word, by the
+            // functions that write them (decision 2026-10-19 §4, rule 8).
+            let by_key = self.set_up_by_key(relays);
+            let found = self.found(&db, relays);
+            let identity = &self.state.identity;
+            let to_come =
+                at_relays::word_to_come(&db, identity, by_key.as_deref(), found.as_deref());
+            (latest, gone, keys, to_come.unwrap_or(false))
         };
         let mut kept = lock(&self.kept);
         for of in kept.relays.values_mut() {
@@ -2766,7 +2858,8 @@ impl DeviceEntries {
         let kept = kept;
         let relays = relays
             .iter()
-            .map(|relay| {
+            .zip(keys)
+            .map(|(relay, key)| {
                 let of = kept.relays.get(&relay.name);
                 AtRelay {
                     relay: relay.name.clone(),
@@ -2781,6 +2874,7 @@ impl DeviceEntries {
                     another_form: of.map_or(0, |of| of.another_form.len()),
                     refuses: of.and_then(|of| of.refuses.clone()),
                     reach: self.reach.of(&relay.id()),
+                    key,
                 }
             })
             .collect();
@@ -2802,6 +2896,7 @@ impl DeviceEntries {
         self.state.own_channels.say(AtRelays {
             relays,
             cannot_go_on,
+            word_to_come,
         });
     }
 }
