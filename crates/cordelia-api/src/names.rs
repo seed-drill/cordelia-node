@@ -283,6 +283,11 @@ enum SlotIs {
 struct Slots {
     keys: Vec<[u8; 32]>,
     of: HashMap<[u8; 32], SlotIs>,
+    /// The key the slots are worked out under.
+    slot_key: [u8; 32],
+    /// The slots of the `applied/` and `left/` words of each author of a
+    /// delete that is not among `keys`, worked out once for each.
+    own_of: HashMap<[u8; 32], [[u8; 32]; 2]>,
 }
 
 impl Slots {
@@ -297,19 +302,44 @@ impl Slots {
             of.insert(slot(crate::leaving::left_name(key)?), SlotIs::OwnOf(*key));
             of.insert(slot(crate::person::added_name(key)?), SlotIs::Added);
         }
-        Ok(Self { keys, of })
+        Ok(Self {
+            keys,
+            of,
+            slot_key,
+            own_of: HashMap::new(),
+        })
     }
 
     /// Whether a delete in `slot` that `author` signed is a word: every
     /// delete is, but one in the slot of `applied/` or `left/` and its
-    /// own author's key, and one in the slot of `added/` and a key that
-    /// the device knows.
-    fn delete_is_a_word(&self, slot: &[u8; 32], author: &[u8; 32]) -> bool {
+    /// own author's key, whoever the author is, and one in the slot of
+    /// `added/` and a key that the device knows (decision 2026-10-19 §2,
+    /// rule 1). The slots of an author the device does not know are
+    /// worked out the first time one of its deletes is read.
+    fn delete_is_a_word(&mut self, slot: &[u8; 32], author: &[u8; 32]) -> bool {
         match self.of.get(slot) {
-            Some(SlotIs::OwnOf(key)) => key != author,
-            Some(SlotIs::Added) => false,
-            None => true,
+            Some(SlotIs::OwnOf(key)) if key == author => return false,
+            Some(SlotIs::Added) => return false,
+            Some(SlotIs::OwnOf(_)) => return true,
+            None => {}
         }
+        if self.keys.binary_search(author).is_ok() {
+            return true;
+        }
+        let slot_key = self.slot_key;
+        let own = match self.own_of.entry(*author) {
+            std::collections::hash_map::Entry::Occupied(own) => *own.get(),
+            std::collections::hash_map::Entry::Vacant(at) => {
+                let (Ok(applied), Ok(left)) = (
+                    crate::person::applied_name(author),
+                    crate::leaving::left_name(author),
+                ) else {
+                    return true;
+                };
+                *at.insert([slot_id(&slot_key, &applied), slot_id(&slot_key, &left)])
+            }
+        };
+        !own.contains(slot)
     }
 }
 
@@ -2863,6 +2893,41 @@ mod tests {
             said_and_listed(&alone.conn, &alone.identity).unwrap().2,
             None
         );
+    }
+
+    /// What `key` signed of the personal channel on device `n` of `s`,
+    /// as a read of the words sums it: its bytes of words, and of what is
+    /// not a word.
+    fn signed_on(s: &Several, n: usize, key: &[u8; 32]) -> (u64, u64) {
+        let (_, _, fill) = said_and_listed(&s[n].conn, &s[n].identity).unwrap();
+        let fill = fill.unwrap();
+        fill.by
+            .iter()
+            .find(|signed| signed.key == *key)
+            .map_or((0, 0), |signed| (signed.words, signed.not_words))
+    }
+
+    /// A delete in the `applied/` or `left/` slot of its own author's key
+    /// is no word, whoever the author is (decision 2026-10-19 §2, rule
+    /// 1): a key that this device neither counts nor keeps a record of
+    /// too. Its delete in another key's `left/` slot is a word.
+    #[test]
+    fn a_delete_in_its_own_authors_slot_is_no_word_whoever_the_author() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        let stranger = Machine::new(9);
+        assert!(!s[0].counts(&stranger.key()));
+        let delete =
+            |name: String| entry_by(&stranger.identity, &personal, 2, &name, Value::Delete, &[]);
+        let now = s.tick();
+        for entry in [
+            delete(crate::leaving::left_name(&stranger.key()).unwrap()),
+            delete(crate::person::applied_name(&stranger.key()).unwrap()),
+            delete(crate::leaving::left_name(&s.key(1)).unwrap()),
+        ] {
+            entries::store(&s[0].conn, &entry, now).unwrap();
+        }
+        assert_eq!(signed_on(&s, 0, &stranger.key()), (1_280, 2 * 1_280));
     }
 
     /// The content of the smallest entry: every word is one.
