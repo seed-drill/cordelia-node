@@ -48,8 +48,7 @@ MUTATIONS = [
     ("K2 an answer that says it does not hold it holds it", KNOWN,
      '''            match answer.entry == kept && answer.holds && by_its_key {''',
      '''            match answer.entry == kept && by_its_key {''',
-     [known("the_latest_answer_writes_over_the_one_before"),
-      e2e("each_answer_that_says_writes_over_the_one_before")]),
+     [known("the_latest_answer_writes_over_the_one_before")]),
     ("K3 a relay given no key holds the change though not connected to the key that answered", KNOWN,
      '''            let by_its_key = of.relay.key.is_some() || connected_by == Some(answer.by);''',
      '''            let by_its_key = true;''',
@@ -103,7 +102,8 @@ MUTATIONS = [
      '''            Some(entry) if held.is_none() => {''',
      [known("the_two_times_are_kept")]),
     ("K13 a mark does not keep when this version first started", KNOWN,
-     '''        known.first_started.get_or_insert(now);''',
+     '''        // written by this version, which runs now.
+        known.first_started.get_or_insert(now);''',
      '''''',
      [known("the_mark_is_written_at_phrase_and_at_a_first_start_under_statement_1")]),
     ("K14 a value that cannot be read is no error", KNOWN,
@@ -111,7 +111,7 @@ MUTATIONS = [
      '''    Ok(serde_json::from_str(&value).unwrap())''',
      [known("a_value_that_cannot_be_read_is_nothing_known")]),
     ("K15 leaving a phrase keeps what was known", ADDING,
-     '''    meta::remove(conn, meta::PERSON_RELAYS_KNOWN)?;''',
+     '''    crate::at_relays::known::forget(conn)?;''',
      '''''',
      [known("adding_leave_forgets_it")]),
     ("K16 a hand-over taken writes no mark", ADDING,
@@ -140,8 +140,8 @@ MUTATIONS = [
      '''const OUT_OF_REACH: Duration = Duration::from_secs(OUT_OF_REACH_SECS - 1);''',
      [reach("a_relay_is_out_of_reach_after_five_minutes_of_failed_attempts")]),
     ("R2 the reference's five minutes are not waited for", REACH,
-     '''        let from = since.max(self.reference(common).at + OUT_OF_REACH);''',
-     '''        let from = since;''',
+     '''            .max(self.reference(common).at + OUT_OF_REACH)''',
+     '''            .max(since)''',
      [reach("a_relay_is_out_of_reach_after_five_minutes_of_failed_attempts")]),
     ("R3 an attempt need not be within the last five minutes", REACH,
      '''        let until = now.at.min(begun + OUT_OF_REACH);''',
@@ -191,18 +191,20 @@ MUTATIONS = [
      '''            if false {''',
      [reach("a_start_a_sleep_a_new_kept_entry_and_being_reached_each_move_the_reference")]),
     ("R13 a dial that connected waits for a show though its connection closed", REACH,
-     '''            if open.is_none() {
-                of.awaiting = false;
+     '''            of.awaiting = None;
+            keyless''',
+     '''            keyless''',
+     [reach("not_while_an_attempt_is_in_flight"),
+      p2p("a_dial_that_connected_ends_when_its_connection_goes_before_a_show")]),
+    ("R14 a dial that connected is not in flight", REACH,
+     '''            if connected {
+                of.awaiting = Some(now.at);
             }''',
      '''''',
      [reach("not_while_an_attempt_is_in_flight")]),
-    ("R14 a dial that connected is not in flight", REACH,
-     '''            of.awaiting |= connected;''',
-     '''''',
-     [reach("not_while_an_attempt_is_in_flight")]),
     ("R15 a dial at its address for another relay is no attempt", REACH,
-     '''                0 => of.last_begun = Some(now.at),''',
-     '''                0 => {}''',
+     '''                true => of.last_begun = Some(now.at),''',
+     '''                true => {}''',
      [reach("another_key_and_a_name_that_does_not_resolve_are_failed_attempts")]),
     ("R16 a failed lookup or wrong-key tick is no attempt", REACH,
      '''        self.with(relay, |of, _, now| of.last_begun = Some(now.at));''',
@@ -394,15 +396,15 @@ MUTATIONS = [
      '''            if let Err(e) = Ok::<bool, cordelia_api::person::PersonError>(now > 0) {''',
      [e2e("a_relay_lacks_the_change_only_where_the_device_has_one_to_show")]),
     ("D17 a relay that takes what waits is not told", DEVICE,
-     '''                if done.held > 0 {
-                    self.reach.took_what_waits(&relay);
-                }''',
+     '''            if took {
+                self.reach.took_what_waits(&relay);
+            }''',
      '''''',
      [e2e("a_relay_that_refuses_what_waits_for_five_minutes_is_stuck")]),
     ("D18 a relay that refuses what waits is not told", DEVICE,
-     '''                if stopped || done.no_room > 0 {
-                    self.reach.refused_what_waits(&relay);
-                }''',
+     '''            if refused {
+                self.reach.refused_what_waits(&relay);
+            }''',
      '''''',
      [e2e("a_relay_that_refuses_what_waits_for_five_minutes_is_stuck")]),
     ("D19 what waits at a relay that is reached is not told", DEVICE,
@@ -458,6 +460,86 @@ MUTATIONS = [
      '''                key: None,
                 link,''',
      [p2p("a_same_relay_name_is_never_one")]),
+    # ── The review's fixes: a dial ended for the relays it was begun
+    # for, and bounded; the wiring of the dial loop ────────────────────
+    ("F1 a dial lost is never given up", REACH,
+     '''        let mut ended = self.dials.iter().map(ends).filter(|end| *end <= now).max();
+        self.dials.retain(|begun| ends(begun) > now);''',
+     '''        let mut ended = None;''',
+     [reach("a_dial_whose_result_is_lost_is_given_up_after_five_minutes")]),
+    ("F2 a connection that waits for a show is never given up", REACH,
+     '''        if let Some(end) = self.awaiting.as_ref().map(ends).filter(|end| *end <= now) {''',
+     '''        if let Some(end) = None::<Instant> {''',
+     [reach("a_dial_whose_result_is_lost_is_given_up_after_five_minutes")]),
+    ("F3 a relay is out of reach before its lost dial is given up", REACH,
+     '''            .max(given_up.unwrap_or(since));''',
+     '''            .max(since);
+        let _ = given_up;''',
+     [reach("a_dial_whose_result_is_lost_is_given_up_after_five_minutes")]),
+    ("F4 a relay whose address moved is not ended when its dial is answered", P2P,
+     '''    for moved in begun.into_iter().filter(|tried| !judged.contains(tried)) {''',
+     '''    for moved in begun.into_iter().filter(|_| false) {''',
+     [p2p("a_dial_ends_for_the_relays_it_was_begun_for")]),
+    ("F5 a relay whose address moved is not ended when its dial fails", P2P,
+     '''    for begun in dialling.remove(&addr).unwrap_or_default() {''',
+     '''    for begun in Vec::<TriedRelay>::new() {''',
+     [p2p("a_dial_ends_for_the_relays_it_was_begun_for")]),
+    ("F6 a dial does not keep the relays it was begun for", P2P,
+     '''    dialling.insert(relay.addr, at_its_address.map(tried_relay).collect());''',
+     '''    let _ = at_its_address;''',
+     [p2p("a_dial_ends_for_the_relays_it_was_begun_for")]),
+    ("M1 the dial loop begins no attempt where it dials", P2P,
+     '''        reach.dial_begins(&reach_id(&id));''',
+     '''        let _ = (reach, &id);''',
+     [p2p("a_dial_that_the_loop_begins_is_in_flight")]),
+    ("M2 a dial that connected is not ended", P2P,
+     '''            reach.dial_ends(&reach_id(&tried_relay(relay)), true);''',
+     '''            let _ = (reach, relay);''',
+     [p2p("a_dial_that_connected_ends_when_its_connection_goes_before_a_show")]),
+    ("M3 the dial loop does not see a connection gone", P2P,
+     '''        reach.connection(&reach_id(&id), None);''',
+     '''        let _ = (reach, &id);''',
+     [p2p("a_dial_that_connected_ends_when_its_connection_goes_before_a_show")]),
+    ("M5 a relay that closed at once is paced as with another connected", P2P,
+     '''    let another = paced_with_another(tick.any_connected, reach, &id);''',
+     '''    let another = tick.any_connected;''',
+     [p2p("a_relay_that_lacks_the_change_and_closed_at_once_is_dialled_within_half_a_minute")]),
+    ("M6 a refusal of the messages channel counts as one of what waits", DEVICE,
+     '''    if *kind == Kind::Messages {
+        return (false, false);
+    }''',
+     '''''',
+     [(NODE, "device_entries::tests::what_waits_is_heard_of_memory_and_not_of_messages")]),
+    ("F7 a new kept entry leaves a relay reached", REACH,
+     '''                if of.reached.take().is_some() {
+                    of.last_reached = Some(now);
+                }''',
+     '''''',
+     [reach("a_new_kept_entry_ends_reached")]),
+    ("L1 a relay given no key holds the change with no connection until the next pass", REACH,
+     '''            keyless && of.holds == Some(Holds::Holds) && of.holds_now(Holds::Lacks, now)''',
+     '''            let _ = (keyless, now);
+            false''',
+     [reach("a_relay_given_no_key_lacks_the_change_once_its_connection_is_gone")]),
+    ("L2 an answer that it lacks the change is not believed unwritten", DEVICE,
+     '''        let holds = if said == Said::Lacks {''',
+     '''        let holds = if false {''',
+     [e2e("an_answer_that_it_lacks_the_change_is_believed_though_it_was_not_written")]),
+    ("L3 a pass's stale read is written over what a show said", REACH,
+     '''            if of.shown > read && of.holds.is_some() {
+                continue;
+            }''',
+     '''''',
+     [reach("a_show_that_ends_while_a_pass_reads_stands_over_what_it_read")]),
+    ("L4 a start after an unreadable value keeps no first start", KNOWN,
+     '''        // start is the earliest this version is known to have started.
+        known.first_started.get_or_insert(now);''',
+     '''''',
+     [known("a_value_that_cannot_be_read_is_nothing_known")]),
+    ("L7 leaving a phrase forgets when this version first started", KNOWN,
+     '''    let first_started = read(conn)?.first_started;''',
+     '''    let first_started: Option<i64> = None;''',
+     [known("adding_leave_forgets_it")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
