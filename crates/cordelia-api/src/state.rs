@@ -220,6 +220,10 @@ pub struct OwnChannels {
     /// How many relays the node is configured with, and one more: 0
     /// where it has not said.
     set_up_with: AtomicU64,
+    /// The relays the node is configured with, each once, by name and
+    /// key, as it last said: the relays that a mark is written for
+    /// (decision 2026-10-19 §1).
+    set_up_as: Mutex<Vec<crate::at_relays::known::RelayId>>,
     written: tokio::sync::Notify,
     asked: tokio::sync::Notify,
     /// How many whole passes the node has begun, and the number of the
@@ -471,6 +475,20 @@ impl OwnChannels {
     pub fn relays_set_up(&self) -> Option<usize> {
         let said = self.set_up_with.load(Ordering::SeqCst);
         said.checked_sub(1).map(|relays| relays as usize)
+    }
+
+    /// The node is configured with `relays`, each once, by name and key.
+    pub fn set_up_as(&self, relays: Vec<crate::at_relays::known::RelayId>) {
+        *self.set_up_as.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+    }
+
+    /// The relays the node is configured with, each once, by name and
+    /// key, as it last said: none where it has not.
+    pub fn relays_set_up_as(&self) -> Vec<crate::at_relays::known::RelayId> {
+        self.set_up_as
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Something was written in a channel of the device's own: the node
@@ -894,6 +912,90 @@ pub struct AtRelay {
     /// secret already applied). It gives no leave for as long as it
     /// does.
     pub refuses: Option<String>,
+    /// What the device knows of the relay's reach, and of whether it
+    /// holds the change (decision 2026-10-19 §1).
+    pub reach: Reach,
+}
+
+/// Whether a relay holds the change entry that the device keeps, as far as
+/// the device knows (decision 2026-10-19 §1): by its latest answer about
+/// that entry, kept across starts, or by its mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Holds {
+    /// Its latest answer is about the kept entry and says that it holds
+    /// it (and, for a relay given no key, the device is connected to it
+    /// with the key that gave that answer).
+    Holds,
+    /// It does not hold it, as far as the device knows.
+    #[default]
+    Lacks,
+    /// The third state: no latest answer, and its mark is the kept entry.
+    /// Nothing acts on it.
+    Neither,
+}
+
+/// What of the device's own waits to be sent to a relay that is reached
+/// (decision 2026-10-19 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waits {
+    /// Nothing.
+    Nothing,
+    /// Something, which the relay has not refused at each offer for five
+    /// minutes.
+    Moving,
+    /// Something, which the relay has refused, for room or for the
+    /// address's allowance, at each offer for five minutes.
+    Refused,
+}
+
+/// The class of a relay in the wait after a change (decision 2026-10-19
+/// §1). A relay in none of them is in a state that time moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Reached, holds the change, and nothing waits there.
+    Ok,
+    /// Reached, holds the change, and refuses what waits.
+    Stuck,
+    /// Out of reach, and holds the change.
+    OutHolding,
+    /// Out of reach, and lacks the change.
+    OutLacking,
+    /// Reached, lacks the change, and has refused it for five minutes.
+    Refusing,
+}
+
+/// What the device knows of one relay's reach (decision 2026-10-19 §1):
+/// what the node keeps of it, in its database and in memory. Each time is
+/// by the time of day, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reach {
+    /// The key that the configuration gives the relay, where it gives one.
+    pub key: Option<[u8; 32]>,
+    /// Whether it holds the change entry that the device keeps.
+    pub holds: Holds,
+    /// Whether it is reached: a connection to it is open, and the latest
+    /// show of the kept entry on it got an answer that says whether it
+    /// holds it.
+    pub reached: bool,
+    /// Since when it is out of reach, where it is.
+    pub out_of_reach_since: Option<i64>,
+    /// Its reference: the latest of the node's start, a sleep that the
+    /// device woke from, the moment the kept entry last changed, and the
+    /// moment the relay was last reached.
+    pub reference: i64,
+    /// When it was last reached, where it was since the node started.
+    pub last_reached: Option<i64>,
+    /// Since when it has lacked the change, with every show answered on
+    /// it since saying that it does not hold it, where it is reached and
+    /// lacks it.
+    pub refused_since: Option<i64>,
+    /// What waits there, where it is reached.
+    pub waits: Option<Waits>,
+    /// When it gave its latest answer about the kept entry, where it gave
+    /// one.
+    pub answered_at: Option<i64>,
+    /// Its class, where it is in one.
+    pub class: Option<Class>,
 }
 
 /// A relay's refusal of something that it would have taken.

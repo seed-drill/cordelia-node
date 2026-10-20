@@ -229,6 +229,22 @@ demoted during inactive periods. Too aggressive.
 **If you increase to 7200s (2 hours):** Useless peers stay Hot for too
 long, wasting push bandwidth.
 
+### backoff_base = 30s (`BACKOFF_BASE_SECS`)
+
+**Derivation:** one `PING_INTERVAL_SECS`.
+
+**Rationale:** The most that a configured relay waits to be dialled again
+while the node has no relay connected: the wait after each failure doubles
+from one governor tick up to it. While another relay is connected the wait
+grows to `BACKOFF_MAX_SECS` (900 s), since nothing waits on this one.
+
+It is also the most that a relay that lacks the change the device keeps
+waits to be dialled again, whether or not another relay is connected; a
+longer wait already set is cut to it when the relay comes to lack the
+change (decision 2026-10-19, rule 3). A relay that lacks a removal is where
+a device that has not heard of it goes on writing for the removed device
+to read, and a relay can be out of reach only where attempts are made.
+
 ---
 
 ## 4. Protocol Rate Limits
@@ -705,6 +721,9 @@ typically because it started before its network was up (a laptop at
 login). It then finds its relays within half a minute of the network
 coming up; one DNS query per name every 30 s is negligible. It must be
 shorter than the interval (`protocol.rs` asserts this).
+
+It is also how often names are looked up while a relay that lacks the
+change has a name that does not resolve (decision 2026-10-19, rule 3).
 
 ## 9. Usage Count Parameters
 
@@ -1845,6 +1864,8 @@ node's own clock, which does not run while the machine sleeps. `protocol.rs`
 asserts that a device that wakes has heard from its relays, or given them
 up, well within it (twice `WAKE_WAIT_SECS`).
 
+It is the time a relay takes to be out of reach (`OUT_OF_REACH_SECS`).
+
 #### REMOVAL_NOT_APPLIED_SHOWN_DAYS = 7
 
 **Rationale:** For how many days after a device applied a removal the status
@@ -1870,6 +1891,25 @@ and offers again what was refused after a wait that doubles up to
 `OUTBOX_REFUSED_RETRY_MAX_SECS`. So a relay that still refuses has refused
 again within twice that, and one that has not has taken what it was offered,
 or was offered nothing more.
+
+#### OUT_OF_REACH_SECS = 300
+
+**Derivation:** `STATUS_AMBER_WAIT_SECS`.
+
+**Rationale:** How long a relay that the device is set up with has not been
+reached, with every attempt at it in that time failed, before it is out of
+reach (decision 2026-10-19 §1). It is the time after which the status line
+shows what passes by itself: a relay's restart, and a machine that wakes,
+are each through it in less. A relay stays out of reach until it is
+reached, or until its reference moves: a start, a sleep, or a change of the
+change entry the device keeps. A wake for any other reason does not move
+it. The command after a change ends without success only once each relay
+that lacks the change has been out of reach for this long since the change,
+or has refused the change for this long. `protocol.rs` asserts that it is
+more than twice `WAKE_WAIT_SECS` (a device that wakes has heard from its
+relays, or given them up, well within it), and more than
+`BOOTNODE_RESOLVE_RETRY_SECS` and `BACKOFF_BASE_SECS` (a relay that lacks
+the change has an attempt in its five minutes).
 
 ### 12.11 The First Start
 

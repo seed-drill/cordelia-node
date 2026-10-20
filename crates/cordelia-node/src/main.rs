@@ -2217,12 +2217,17 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // The relays as the configuration names them, whether or not a
         // name resolves: what the node is set up with.
         let relays_set_up = relays.clone();
+        // Whether each relay can be reached, on a device (decision
+        // 2026-10-19 §1): shared by its passes, its dials and the
+        // lookups of its relays' names.
+        let reach = (config.network.role == "personal")
+            .then(|| cordelia_node::device_entries::Reach::new(cordelia_node::device_entries::Clock::system()));
         if !relays.is_empty() {
-            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone()));
+            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone(), reach.clone()));
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection()).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection(), reach).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────

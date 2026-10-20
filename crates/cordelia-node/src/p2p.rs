@@ -2112,6 +2112,7 @@ pub async fn p2p_loop(
     max_storage_bytes: u64,
     relay_ask_again: std::time::Duration,
     most_proved: usize,
+    reach: Option<std::sync::Arc<cordelia_node::device_entries::Reach>>,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -2229,12 +2230,21 @@ pub async fn p2p_loop(
     // passes that prove, pull and push. Only a personal node has one, and
     // it does nothing on a device that follows no phrase.
     let device_entries = (node_role == "personal").then(|| {
-        cordelia_node::device_entries::DeviceEntries::proving_at_most(
+        let clock = cordelia_node::device_entries::Clock::system();
+        let reach = reach
+            .clone()
+            .unwrap_or_else(|| cordelia_node::device_entries::Reach::new(clock.clone()));
+        cordelia_node::device_entries::DeviceEntries::reaching(
             state.clone().into_inner(),
-            cordelia_node::device_entries::Clock::system(),
+            clock,
             most_proved,
+            reach,
         )
     });
+    // Whether each relay can be reached (decision 2026-10-19 §1): the
+    // dial loop says when it dials, and a relay that lacks the change is
+    // dialled at the pace of a node that is cut off (rule 3).
+    let reach = device_entries.as_ref().map(|device| device.reach().clone());
 
     // Register bootstrap peers using canonical sequence
     for peer_id in conn_mgr.connected_peers() {
@@ -2499,11 +2509,12 @@ pub async fn p2p_loop(
                                         answered = %outcome.node_id,
                                         "another key answered at a relay's address; refusing it for that relay"
                                     );
-                                    relay_tries.entry(tried_relay(relay)).or_default().failed(
+                                    dial_failed(
+                                        &mut relay_tries,
+                                        tried_relay(relay),
                                         ANOTHER_KEY_ANSWERED.into(),
-                                        true,
-                                        p2p_gov_tick_secs,
-                                        any_connected,
+                                        (true, p2p_gov_tick_secs, any_connected),
+                                        reach.as_deref(),
                                     );
                                 }
                                 if answers.is_empty() {
@@ -2517,6 +2528,9 @@ pub async fn p2p_loop(
                                 for relay in &answers {
                                     relay_tries.entry(tried_relay(relay)).or_default().connected_at =
                                         Some(std::time::Instant::now());
+                                    if let Some(reach) = &reach {
+                                        reach.dial_ends(&reach_id(&tried_relay(relay)), true);
+                                    }
                                 }
                             }
                         }
@@ -2647,11 +2661,12 @@ pub async fn p2p_loop(
                             .unwrap_or_default();
                         let any_connected = any_relay_connected(&relay_addrs, &conn_mgr);
                         for tried in dialled {
-                            relay_tries.entry(tried).or_default().failed(
+                            dial_failed(
+                                &mut relay_tries,
+                                tried,
                                 error.clone(),
-                                false,
-                                p2p_gov_tick_secs,
-                                any_connected,
+                                (false, p2p_gov_tick_secs, any_connected),
+                                reach.as_deref(),
                             );
                         }
                     }
@@ -2676,6 +2691,11 @@ pub async fn p2p_loop(
                 let now = std::time::Instant::now();
                 let settled = std::time::Duration::from_secs(p2p_gov_tick_secs.max(1));
                 let any_connected = relays.iter().any(|r| relay_connected(&conn_mgr, r));
+                // A relay that came to lack the change is dialled within
+                // BACKOFF_BASE_SECS, whatever wait was set (rule 3).
+                if let Some(reach) = &reach {
+                    cut_waits(&mut relay_tries, &reach.came_to_lack(), now);
+                }
                 for relay in &relays {
                     if relay_connected(&conn_mgr, relay) {
                         // Forget earlier failures once the connection has lasted.
@@ -2687,17 +2707,18 @@ pub async fn p2p_loop(
                         }
                         continue;
                     }
-                    // Another relay is connected at this address: only one
-                    // key answers at one, and it is not this relay's. It
-                    // stands as its last dial left it, and is not dialled:
-                    // a second connection to that relay would only replace
-                    // the first (decision 2026-10-17 §1).
-                    if relays.iter().any(|other| other.addr == relay.addr && relay_connected(&conn_mgr, other)) {
+                    // Another relay is connected at this address, and it
+                    // is not dialled.
+                    if passed_over(&relays, relay, &|other| relay_connected(&conn_mgr, other), reach.as_deref()) {
                         continue;
+                    }
+                    if let Some(reach) = &reach {
+                        reach.connection(&reach_id(&tried_relay(relay)), None);
                     }
                     if in_flight.contains(&relay.addr) || in_flight.len() >= MAX_IN_FLIGHT {
                         continue;
                     }
+                    let another = paced_with_another(any_connected, reach.as_deref(), &tried_relay(relay));
                     let tried = relay_tries.entry(tried_relay(relay)).or_default();
                     if let Some(at) = tried.connected_at.take()
                         && at.elapsed() < settled
@@ -2708,13 +2729,16 @@ pub async fn p2p_loop(
                             "the relay closed the connection at once".into(),
                             false,
                             p2p_gov_tick_secs,
-                            any_connected,
+                            another,
                         );
                     }
                     if tried.next_try.is_some_and(|at| now < at) {
                         continue;
                     }
                     tried.last_tried = Some(now);
+                    if let Some(reach) = &reach {
+                        reach.dial_begins(&reach_id(&tried_relay(relay)));
+                    }
                     in_flight.insert(relay.addr);
                     let ctx = connect_ctx.clone();
                     let tx = connect_tx.clone();
@@ -3578,11 +3602,17 @@ pub type RelayAddrs =
 /// addresses, are the configuration: a node that started offline, or whose
 /// relay changed address, still reaches it. The last good list is kept
 /// while lookups fail.
+///
+/// **On a device, each name that does not resolve is a failed attempt at
+/// its relay** (decision 2026-10-19 §1), and while a relay that lacks the
+/// change has a name that does not resolve, the names are looked up every
+/// `BOOTNODE_RESOLVE_RETRY_SECS`. A relay that comes to lack the change
+/// has them looked up at once (rule 3).
 pub async fn keep_relays_resolved(
     relays: Vec<cordelia_network::bootstrap::Relay>,
     addrs: RelayAddrs,
+    reach: Option<std::sync::Arc<cordelia_node::device_entries::Reach>>,
 ) {
-    use cordelia_core::protocol::{BOOTNODE_RESOLVE_INTERVAL_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
     loop {
         let resolved = cordelia_network::bootstrap::resolve_relays(&relays).await;
         let have_any = if resolved.is_empty() {
@@ -3605,17 +3635,51 @@ pub async fn keep_relays_resolved(
                         "two relays this node is set up with resolve to one address: only one key can answer there, and a relay given another key is shown with the wrong key"
                     );
                 }
-                *current = resolved;
+                *current = resolved.clone();
             }
             true
         };
-        let wait = if have_any {
-            BOOTNODE_RESOLVE_INTERVAL_SECS
-        } else {
-            BOOTNODE_RESOLVE_RETRY_SECS
-        };
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        let wait = after_lookup(&relays, &resolved, have_any, reach.as_deref());
+        match &reach {
+            Some(reach) => tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = reach.lookups().notified() => {}
+            },
+            None => tokio::time::sleep(wait).await,
+        }
     }
+}
+
+/// What a lookup of the names of `relays` that found `resolved` says, and
+/// how long to wait before the next (decision 2026-10-19 §1, rule 3):
+/// each relay whose name did not resolve is a failed attempt at it, in
+/// `reach`. The wait is `BOOTNODE_RESOLVE_INTERVAL_SECS` while some name
+/// resolves (`have_any`), and `BOOTNODE_RESOLVE_RETRY_SECS` while none
+/// does, or while a relay that lacks the change has a name that does not.
+fn after_lookup(
+    relays: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    have_any: bool,
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) -> std::time::Duration {
+    use cordelia_core::protocol::{BOOTNODE_RESOLVE_INTERVAL_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
+    let mut lacking = false;
+    for relay in relays {
+        let found = resolved
+            .iter()
+            .any(|resolved| resolved.host == relay.host && resolved.key == relay.key);
+        if let (false, Some(reach)) = (found, reach) {
+            let relay = reach_id(&(relay.host.clone(), relay.key));
+            reach.failed(&relay);
+            lacking |= reach.lacks(&relay);
+        }
+    }
+    let wait = if have_any && !lacking {
+        BOOTNODE_RESOLVE_INTERVAL_SECS
+    } else {
+        BOOTNODE_RESOLVE_RETRY_SECS
+    };
+    std::time::Duration::from_secs(wait)
 }
 
 /// Where a node stands with one configured relay that is not connected.
@@ -3667,6 +3731,89 @@ fn relay_backoff(failures: u32, tick_secs: u64, another_connected: bool) -> std:
         .max(1)
         .saturating_mul(1u64 << failures.saturating_sub(1).min(16));
     std::time::Duration::from_secs(doubled.min(cap).max(1))
+}
+
+/// A relay that the node is set up with, as what is known of its reach is
+/// kept: by its name and key together, as its tries are.
+fn reach_id(tried: &TriedRelay) -> cordelia_api::at_relays::known::RelayId {
+    cordelia_api::at_relays::known::RelayId {
+        name: tried.0.clone(),
+        key: tried.1,
+    }
+}
+
+/// Whether the dials of `relay` are paced as those of a node that has
+/// another relay connected: only where another is, and the relay does
+/// not lack the change the device keeps (decision 2026-10-19, rule 3).
+/// A relay that lacks it is dialled at the pace of a node that is cut
+/// off, whether or not another is connected.
+fn paced_with_another(
+    any_connected: bool,
+    reach: Option<&cordelia_node::device_entries::Reach>,
+    relay: &TriedRelay,
+) -> bool {
+    any_connected && !reach.is_some_and(|reach| reach.lacks(&reach_id(relay)))
+}
+
+/// Whether the dial loop passes `relay`, which is not connected, over at
+/// this tick: another relay of `relays` is connected at its address, where
+/// only one key answers, and it is not this relay's (decision 2026-10-17
+/// §1). It stands as its last dial left it, and is not dialled: a second
+/// connection to that relay would only replace the first. **Each tick that
+/// passes it over is an attempt at it in `reach`, begun and failed at
+/// once** (decision 2026-10-19 §1): so it can be out of reach though it is
+/// never dialled.
+fn passed_over(
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    relay: &cordelia_network::bootstrap::RelayAddr,
+    connected: &dyn Fn(&cordelia_network::bootstrap::RelayAddr) -> bool,
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) -> bool {
+    let over = relays
+        .iter()
+        .any(|other| other.addr == relay.addr && connected(other));
+    if let (true, Some(reach)) = (over, reach) {
+        reach.failed(&reach_id(&tried_relay(relay)));
+    }
+    over
+}
+
+/// A dial of `relay` failed with `error`: by another key answering at its
+/// address (`wrong_key`), or otherwise. Its next dial waits as
+/// [`relay_backoff`] says for `tick_secs`, paced as a node that has
+/// another relay connected only where [`paced_with_another`] says
+/// (decision 2026-10-19, rule 3), and the dial is an attempt at it that
+/// failed, in `reach`.
+fn dial_failed(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    relay: TriedRelay,
+    error: String,
+    (wrong_key, tick_secs, any_connected): (bool, u64, bool),
+    reach: Option<&cordelia_node::device_entries::Reach>,
+) {
+    let another = paced_with_another(any_connected, reach, &relay);
+    if let Some(reach) = reach {
+        reach.dial_ends(&reach_id(&relay), false);
+    }
+    let tried = tries.entry(relay).or_default();
+    tried.failed(error, wrong_key, tick_secs, another);
+}
+
+/// Cut the wait already set to dial each of `came`, the relays that came
+/// to lack the change, to no later than BACKOFF_BASE_SECS from `now`
+/// (decision 2026-10-19, rule 3). The failures they counted stand.
+fn cut_waits(
+    tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
+    came: &[cordelia_api::at_relays::known::RelayId],
+    now: std::time::Instant,
+) {
+    let latest = now + std::time::Duration::from_secs(cordelia_core::protocol::BACKOFF_BASE_SECS);
+    for relay in came {
+        let tried = tries.get_mut(&(relay.name.clone(), relay.key));
+        if let Some(next) = tried.and_then(|tried| tried.next_try.as_mut()) {
+            *next = (*next).min(latest);
+        }
+    }
 }
 
 /// The connection that an asking to make one again names (decision
@@ -3825,11 +3972,13 @@ fn relays_with_links(
             });
             Relay {
                 name: relay.host.clone(),
+                key: relay.key,
                 link,
             }
         })
         .collect();
     own.set_up_with(relays.len());
+    own.set_up_as(relays.iter().map(Relay::id).collect());
     relays
 }
 
@@ -5283,6 +5432,7 @@ mod tests {
         // Listed under another name now, or under none.
         let listed = [Relay {
             name: "keyless.example:9474".into(),
+            key: None,
             link: None,
         }];
         for relays in [&listed[..], &[]] {
@@ -5547,6 +5697,329 @@ mod tests {
         for role in ["relay", "bootnode", "keeper"] {
             assert!(carries_older_kind(role), "{role}");
         }
+    }
+
+    // ── A relay out of reach (decision 2026-10-19) ──────────────────
+
+    /// What a device knows of whether it can reach `relays`, each with
+    /// whether it holds the change entry it keeps, on a clock that the
+    /// test moves.
+    fn reach_of(
+        relays: &[(&TriedRelay, cordelia_api::state::Holds)],
+    ) -> (
+        std::sync::Arc<cordelia_node::device_entries::Reach>,
+        cordelia_node::device_entries::Clock,
+    ) {
+        let clock = cordelia_node::device_entries::Clock::system();
+        let reach = cordelia_node::device_entries::Reach::new(clock.clone());
+        knows(&reach, [1; 32], relays);
+        (reach, clock)
+    }
+
+    /// The device keeps the change entry `kept`, and each of `relays`
+    /// holds it as said.
+    fn knows(
+        reach: &cordelia_node::device_entries::Reach,
+        kept: [u8; 32],
+        relays: &[(&TriedRelay, cordelia_api::state::Holds)],
+    ) {
+        let each: Vec<_> = relays
+            .iter()
+            .map(|(relay, holds)| (reach_id(relay), *holds, None))
+            .collect();
+        reach.observe(Some(kept), true, &each);
+    }
+
+    /// The wait before the next dial that a failure leaves.
+    fn wait_after(tried: &RelayTry) -> u64 {
+        let next = tried.next_try.unwrap();
+        next.saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64()
+            .round() as u64
+    }
+
+    /// A relay that lacks the change is dialled at the pace of a node that
+    /// is cut off (decision 2026-10-19, rule 3): with another relay
+    /// connected its wait doubles up to 30 s, not 900 s. Once it holds
+    /// the change its next wait is as before, at the cap, with the
+    /// failures it counted. A relay in the third state, and every relay
+    /// of a node that keeps nothing of reach, is dialled as before.
+    #[test]
+    fn a_relay_that_lacks_the_change_is_dialled_at_the_pace_of_a_node_cut_off() {
+        use cordelia_api::state::Holds;
+        use cordelia_core::protocol::{BACKOFF_BASE_SECS, BACKOFF_MAX_SECS};
+        let (lacks, holds, third) = (
+            ("b.example:9474".to_string(), Some([2; 32])),
+            ("a.example:9474".to_string(), Some([1; 32])),
+            ("c.example:9474".to_string(), None),
+        );
+        let (reach, clock) = reach_of(&[
+            (&lacks, Holds::Lacks),
+            (&holds, Holds::Holds),
+            (&third, Holds::Neither),
+        ]);
+        let (known, reach) = (&*reach, Some(&*reach));
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        for _ in 0..40 {
+            for relay in [&lacks, &holds, &third] {
+                known.dial_begins(&reach_id(relay));
+                dial_failed(
+                    &mut tries,
+                    relay.clone(),
+                    "down".into(),
+                    (false, 10, true),
+                    reach,
+                );
+            }
+            assert!(wait_after(&tries[&lacks]) <= BACKOFF_BASE_SECS);
+        }
+        // Each dial was an attempt, and failed: none is in flight.
+        let clock_ran = std::time::Duration::from_secs(cordelia_core::protocol::OUT_OF_REACH_SECS);
+        clock.run_ahead(clock_ran);
+        assert!(known.is_out_of_reach(&reach_id(&lacks)));
+        assert_eq!(wait_after(&tries[&lacks]), BACKOFF_BASE_SECS);
+        assert_eq!(wait_after(&tries[&holds]), BACKOFF_MAX_SECS);
+        assert_eq!(wait_after(&tries[&third]), BACKOFF_MAX_SECS);
+        // It takes the change: the next wait is at the cap, with the
+        // failures it counted.
+        knows(
+            known,
+            [1; 32],
+            &[(&lacks, Holds::Holds), (&holds, Holds::Holds)],
+        );
+        dial_failed(
+            &mut tries,
+            lacks.clone(),
+            "down".into(),
+            (false, 10, true),
+            reach,
+        );
+        assert_eq!(tries[&lacks].failures, 41);
+        assert_eq!(wait_after(&tries[&lacks]), BACKOFF_MAX_SECS);
+        // With no relay connected, every relay is paced as cut off.
+        assert!(!paced_with_another(false, reach, &holds));
+        // A node that keeps nothing of reach: as before.
+        assert!(paced_with_another(true, None, &lacks));
+    }
+
+    /// A wait already set is cut when the relay comes to lack the change
+    /// (decision 2026-10-19, rule 3): a next try 900 s ahead becomes 30 s
+    /// ahead, a shorter one stands, the failures counted stand, and the
+    /// lookups of names are woken.
+    #[tokio::test]
+    async fn a_wait_already_set_is_cut_when_the_relay_comes_to_lack_the_change() {
+        use cordelia_api::state::Holds;
+        use cordelia_core::protocol::{BACKOFF_BASE_SECS, BACKOFF_MAX_SECS};
+        let (far, near) = (
+            ("b.example:9474".to_string(), Some([2; 32])),
+            ("a.example:9474".to_string(), None),
+        );
+        let (reach, _clock) = reach_of(&[(&far, Holds::Holds), (&near, Holds::Holds)]);
+        let now = std::time::Instant::now();
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        for (relay, wait) in [(&far, BACKOFF_MAX_SECS), (&near, 5)] {
+            let tried = tries.entry(relay.clone()).or_default();
+            tried.failures = 9;
+            tried.next_try = Some(now + std::time::Duration::from_secs(wait));
+        }
+        // Nothing has come to lack the change: nothing is cut.
+        cut_waits(&mut tries, &reach.came_to_lack(), now);
+        assert_eq!(wait_after(&tries[&far]), BACKOFF_MAX_SECS);
+        // A new kept entry, which both lack.
+        knows(
+            &reach,
+            [3; 32],
+            &[(&far, Holds::Lacks), (&near, Holds::Lacks)],
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reach.lookups().notified(),
+        )
+        .await
+        .expect("the lookups are woken");
+        cut_waits(&mut tries, &reach.came_to_lack(), now);
+        assert_eq!(wait_after(&tries[&far]), BACKOFF_BASE_SECS);
+        assert_eq!(wait_after(&tries[&near]), 5);
+        assert_eq!((tries[&far].failures, tries[&near].failures), (9, 9));
+    }
+
+    /// While a relay that lacks the change has a name that does not
+    /// resolve, the names are looked up every half minute (decision
+    /// 2026-10-19, rule 3); otherwise every five minutes while some name
+    /// resolves, as before.
+    #[test]
+    fn names_are_looked_up_every_half_minute_while_a_relay_that_lacks_the_change_does_not_resolve()
+    {
+        use cordelia_api::state::Holds;
+        use cordelia_core::protocol::{
+            BOOTNODE_RESOLVE_INTERVAL_SECS, BOOTNODE_RESOLVE_RETRY_SECS,
+        };
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let set_up = [
+            Relay {
+                host: "a.example:9474".into(),
+                key: None,
+            },
+            Relay {
+                host: "b.example:9474".into(),
+                key: Some([2; 32]),
+            },
+        ];
+        let resolved = [RelayAddr {
+            host: "a.example:9474".into(),
+            addr: "127.0.0.1:9474".parse().unwrap(),
+            key: None,
+        }];
+        let b = ("b.example:9474".to_string(), Some([2; 32]));
+        let a = ("a.example:9474".to_string(), None);
+        let wait = |reach: Option<&cordelia_node::device_entries::Reach>, have_any| {
+            after_lookup(&set_up, &resolved, have_any, reach).as_secs()
+        };
+        let (reach, _clock) = reach_of(&[(&a, Holds::Holds), (&b, Holds::Holds)]);
+        assert_eq!(wait(Some(&reach), true), BOOTNODE_RESOLVE_INTERVAL_SECS);
+        assert_eq!(wait(None, true), BOOTNODE_RESOLVE_INTERVAL_SECS);
+        assert_eq!(wait(Some(&reach), false), BOOTNODE_RESOLVE_RETRY_SECS);
+        knows(&reach, [3; 32], &[(&a, Holds::Holds), (&b, Holds::Lacks)]);
+        assert_eq!(wait(Some(&reach), true), BOOTNODE_RESOLVE_RETRY_SECS);
+        // A relay that lacks it and resolves does not make the lookups
+        // faster.
+        knows(&reach, [3; 32], &[(&a, Holds::Lacks), (&b, Holds::Holds)]);
+        assert_eq!(wait(Some(&reach), true), BOOTNODE_RESOLVE_INTERVAL_SECS);
+    }
+
+    /// A lookup of a relay's name that resolves is no attempt by itself,
+    /// and one that does not is a failed attempt (decision 2026-10-19
+    /// §1): over ten minutes of lookups every half minute, the relay whose
+    /// name does not resolve is out of reach after five, and the one whose
+    /// name resolves, and that is not dialled, is not.
+    #[test]
+    fn a_lookup_that_resolves_is_no_attempt() {
+        use cordelia_api::state::Holds;
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let set_up = [
+            Relay {
+                host: "a.example:9474".into(),
+                key: None,
+            },
+            Relay {
+                host: "b.example:9474".into(),
+                key: None,
+            },
+        ];
+        let resolved = [RelayAddr {
+            host: "a.example:9474".into(),
+            addr: "127.0.0.1:9474".parse().unwrap(),
+            key: None,
+        }];
+        let (a, b) = (
+            ("a.example:9474".to_string(), None),
+            ("b.example:9474".to_string(), None),
+        );
+        let (reach, clock) = reach_of(&[(&a, Holds::Lacks), (&b, Holds::Lacks)]);
+        for half_minute in 0..=20 {
+            if half_minute > 0 {
+                clock.run_ahead(std::time::Duration::from_secs(30));
+            }
+            after_lookup(&set_up, &resolved, true, Some(&reach));
+            let out = half_minute >= 10;
+            assert_eq!(reach.is_out_of_reach(&reach_id(&b)), out, "{half_minute}");
+            assert!(!reach.is_out_of_reach(&reach_id(&a)), "{half_minute}");
+        }
+    }
+
+    /// A relay given another key, at the address where another relay is
+    /// connected, is not dialled: each tick of the dial loop that passes it
+    /// over is a failed attempt at it, so it is out of reach after five
+    /// minutes with no dial (decision 2026-10-19 §1). The relay that is
+    /// connected there is not.
+    #[test]
+    fn a_relay_with_the_wrong_key_where_another_is_connected_is_out_of_reach_with_no_dial() {
+        use cordelia_api::state::Holds;
+        use cordelia_network::bootstrap::RelayAddr;
+        let at: std::net::SocketAddr = "127.0.0.1:9474".parse().unwrap();
+        let relays = [
+            RelayAddr {
+                host: "a.example:9474".into(),
+                addr: at,
+                key: Some([1; 32]),
+            },
+            RelayAddr {
+                host: "b.example:9474".into(),
+                addr: at,
+                key: Some([2; 32]),
+            },
+            RelayAddr {
+                host: "c.example:9474".into(),
+                addr: "127.0.0.1:9475".parse().unwrap(),
+                key: Some([3; 32]),
+            },
+        ];
+        let connected = |relay: &RelayAddr| relay.key == Some([1; 32]);
+        let (a, b, c) = (
+            tried_relay(&relays[0]),
+            tried_relay(&relays[1]),
+            tried_relay(&relays[2]),
+        );
+        let (reach, clock) =
+            reach_of(&[(&a, Holds::Holds), (&b, Holds::Lacks), (&c, Holds::Lacks)]);
+        for tick in 0..=300 {
+            if tick > 0 {
+                clock.run_ahead(std::time::Duration::from_secs(1));
+            }
+            assert!(passed_over(&relays, &relays[1], &connected, Some(&reach)));
+            assert!(!passed_over(&relays, &relays[2], &connected, Some(&reach)));
+            assert_eq!(reach.is_out_of_reach(&reach_id(&b)), tick >= 300, "{tick}");
+        }
+        // The relay at another address is not passed over, and with no
+        // attempt is not out of reach.
+        assert!(!reach.is_out_of_reach(&reach_id(&c)));
+        // With nothing connected there, it is dialled.
+        assert!(!passed_over(&relays, &relays[1], &|_| false, Some(&reach)));
+    }
+
+    /// A relay listed as "same relay" is not one (decision 2026-10-19 §1,
+    /// decision 2026-10-17 §1): it is not among the relays a pass is
+    /// given, nor among those a mark is written for. A relay whose name
+    /// does not resolve is one.
+    #[tokio::test]
+    async fn a_same_relay_name_is_never_one() {
+        use cordelia_network::bootstrap::Relay;
+        use cordelia_network::transport;
+        let identity = std::sync::Arc::new(
+            cordelia_crypto::identity::NodeIdentity::from_seed([1; 32]).unwrap(),
+        );
+        let end = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let conn_mgr = cordelia_network::connection::ConnectionManager::new(
+            identity,
+            end,
+            vec![],
+            vec![],
+            9474,
+        );
+        let set_up = [
+            Relay {
+                host: "a.example:9474".into(),
+                key: Some([7; 32]),
+            },
+            Relay {
+                host: "a-again.example:9474".into(),
+                key: Some([7; 32]),
+            },
+            Relay {
+                host: "b.example:9474".into(),
+                key: None,
+            },
+        ];
+        let own = cordelia_api::state::OwnChannels::default();
+        let relays = relays_with_links(&set_up, &Default::default(), &conn_mgr, &own);
+        let names: Vec<&str> = relays.iter().map(|relay| relay.name.as_str()).collect();
+        assert_eq!(names, ["a.example:9474", "b.example:9474"]);
+        let ids = own.relays_set_up_as();
+        assert_eq!(
+            ids,
+            relays.iter().map(|relay| relay.id()).collect::<Vec<_>>()
+        );
+        assert_eq!(ids[0].key, Some([7; 32]));
     }
 
     /// A relay that keeps failing is dialled less and less often: up to a

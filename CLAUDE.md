@@ -61,7 +61,8 @@ cordelia-node/
                          #   exports the session's value for a proof
     cordelia-api/        # REST API (actix-web). A device: person (applying a statement, who
                          #   counts, carrying), adding, change, leaving, look, names, publish,
-                         #   take (the one door for an entry), at_relays, local (the local
+                         #   take (the one door for an entry), at_relays (and known: what a
+                         #   device knows of which relay holds which change), local (the local
                          #   API for the names a device holds), commands (the routes behind
                          #   the device commands), carry and carrying (a carry that a person
                          #   asks for, and the phrase's word for it), recover, swept (old
@@ -97,7 +98,8 @@ cordelia-node/
                          #   log's question),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, and leave), indicator (the
+                         #   device_entries (a device's passes, and leave; reach: whether
+                         #   each relay can be reached, and its class), indicator (the
                          #   state and the level of a status)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
@@ -249,6 +251,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
+| `OUT_OF_REACH_SECS` | 300s (derived: `STATUS_AMBER_WAIT_SECS`; a relay not reached, with every attempt at it failed, for this long since its reference is out of reach) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
 | `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |
 

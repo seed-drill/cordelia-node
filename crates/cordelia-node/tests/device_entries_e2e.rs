@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cordelia_api::adding::{Accepted, accept, add_device};
+use cordelia_api::at_relays::known::{self, RelayId};
 use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::change::make_change;
 use cordelia_api::marks;
@@ -27,8 +28,8 @@ use cordelia_api::person::{Shown, first_statement, held, hold_name, shown};
 use cordelia_api::publish::{PlannedAgainst, Published, Write, publish, read};
 use cordelia_api::sender::{self, At, NotSent, Request, Sent};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, OwnAsk,
-    ProofMade, ProvedBy,
+    AppState, AtRelay, AtRelays, CannotGoOn, Class, DoorAsk, Holds, LeftAt, LeftPlace, LeftRead,
+    OwnAsk, ProofMade, ProvedBy,
 };
 use cordelia_api::take::take;
 use cordelia_core::protocol::{
@@ -171,6 +172,7 @@ impl Device {
         if !self.relays.iter().any(|relay| relay.name == name) {
             self.relays.push(Relay {
                 name: name.to_string(),
+                key: None,
                 link: None,
             });
         }
@@ -667,6 +669,8 @@ enum Say {
     Nothing,
     /// It answers a proof as it would, once the test says so.
     AnswerWhen(Arc<tokio::sync::Notify>),
+    /// It answers a show with what is no answer to one.
+    NotAShow,
 }
 
 /// What a test has a stand-in do as each request arrives, before it is
@@ -799,6 +803,9 @@ impl StandIn {
                         Say::Answer(answer) => {
                             Ok(Some(WireMessage::EntryShown(EntryShown { answer })))
                         }
+                        Say::NotAShow => Ok(Some(WireMessage::ChannelProved(ChannelProved {
+                            proved: false,
+                        }))),
                         Say::Reset => Ok(None),
                         Say::NotNow => {
                             not_now = true;
@@ -4496,6 +4503,7 @@ async fn what_is_kept_of_a_relay_that_is_set_up_no_longer_is_forgotten() {
     assert!(keeps(&device, &goes.key));
     device.relays.push(Relay {
         name: "goes".into(),
+        key: None,
         link: Some(link),
     });
 
@@ -9364,4 +9372,524 @@ async fn a_list_that_a_relay_holds_another_of_is_written_again_above_it() {
             .collect();
         assert_eq!(pushed, revs, "{answer:?}");
     }
+}
+
+// ── A relay out of reach (decision 2026-10-19) ───────────────────────────
+
+/// The relay that the device calls `name`, as what is known of it is kept:
+/// the devices of these tests give their relays no key.
+fn relay_id(name: &str) -> RelayId {
+    RelayId {
+        name: name.into(),
+        key: None,
+    }
+}
+
+/// The device's node first started on this version before it was set up
+/// with any relay: its first pass is no first start, and marks no relay,
+/// so each relay lacks the change until it answers (decision 2026-10-19
+/// §1).
+fn started_before_its_relays(device: &Device) {
+    let first = known::started(&device.db(), &[], device.now()).unwrap();
+    assert!(first.first);
+}
+
+/// What the database keeps of the latest answer of the relay `name`.
+fn answer_of(device: &Device, name: &str) -> Option<known::Answer> {
+    let known = known::read(&device.db()).unwrap();
+    known.of(&relay_id(name)).and_then(|of| of.answer)
+}
+
+/// Each answer to a show that says whether the relay holds the change
+/// writes over the one before, through the pass (decision 2026-10-19 §1,
+/// rule 2): "took" and "held" say that it holds it; "no room", "over the
+/// allowance", word of another, and another that it hands, that it does
+/// not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_answer_that_says_writes_over_the_one_before() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    let later = || {
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS))
+    };
+    let kept = device.latest().id();
+    let says = |answer: ShowAnswer| Say::Answer(answer);
+    let other = says(ShowAnswer::Other {
+        rev: 9,
+        id: [7; 32],
+    });
+    let cases = [
+        (
+            says(ShowAnswer::Taken),
+            says(ShowAnswer::Taken),
+            Holds::Holds,
+        ),
+        (
+            says(ShowAnswer::Refused(EntryRefused::NoRoom)),
+            says(ShowAnswer::Refused(EntryRefused::NoRoom)),
+            Holds::Lacks,
+        ),
+        (says(ShowAnswer::Held), says(ShowAnswer::Held), Holds::Holds),
+        (
+            says(ShowAnswer::Refused(EntryRefused::OverLimit)),
+            says(ShowAnswer::Refused(EntryRefused::OverLimit)),
+            Holds::Lacks,
+        ),
+        (says(ShowAnswer::Held), says(ShowAnswer::Held), Holds::Holds),
+        (other.clone(), other, Holds::Lacks),
+        (says(ShowAnswer::Held), says(ShowAnswer::Held), Holds::Holds),
+        (
+            says(ShowAnswer::Whole),
+            says(ShowAnswer::Another(vec![1, 2, 3])),
+            Holds::Lacks,
+        ),
+    ];
+    for (short, whole, holds) in cases {
+        relay.says(short.clone(), whole.clone());
+        later();
+        device.passes().await;
+        let answer = answer_of(&device, "relay").expect("an answer is kept");
+        assert_eq!(answer.entry, kept);
+        assert_eq!(answer.holds, holds == Holds::Holds, "{short:?} {whole:?}");
+        assert_eq!(answer.by, relay.key);
+        let reach = device.at("relay").reach;
+        assert_eq!(reach.holds, holds, "{short:?} {whole:?}");
+        assert!(reach.reached, "{short:?} {whole:?}");
+    }
+}
+
+/// "Show it whole" to a whole show, "not signed", a reset, a time-out and
+/// a reply that is no answer to a show write nothing of what is kept of
+/// the relay (decision 2026-10-19 §1): its latest answer stands. And the
+/// relay is reached no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_whole_not_signed_a_reset_and_a_time_out_write_nothing() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    let later = || {
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS))
+    };
+    device.passes().await;
+    let held = answer_of(&device, "relay").expect("held is kept");
+    assert!(held.holds);
+    let neither = [
+        Say::Answer(ShowAnswer::Whole),
+        Say::Answer(ShowAnswer::Refused(EntryRefused::NotSigned)),
+        Say::Reset,
+        Say::NotAShow,
+        Say::Nothing,
+    ];
+    for says in neither {
+        relay.says(says.clone(), says.clone());
+        later();
+        device.passes().await;
+        assert_eq!(answer_of(&device, "relay"), Some(held), "{says:?}");
+        let reach = device.at("relay").reach;
+        assert!(!reach.reached, "{says:?}");
+        assert_eq!(reach.holds, Holds::Holds, "{says:?}: what it said stands");
+        // It is reached again by an answer that says.
+        relay.says(Say::Answer(ShowAnswer::Held), Say::Answer(ShowAnswer::Held));
+        later();
+        device.passes().await;
+        assert!(device.at("relay").reach.reached, "{says:?}");
+    }
+}
+
+/// Each answer that says neither that the relay holds the entry nor that
+/// it does not is a failed attempt (decision 2026-10-19 §1): on a
+/// connection that stays open, a relay whose shows get only such answers
+/// is out of reach five minutes on, and lacks the change, having said
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_answer_of_the_third_kind_is_a_failed_attempt() {
+    let neither = [
+        Say::Answer(ShowAnswer::Refused(EntryRefused::NotSigned)),
+        Say::Answer(ShowAnswer::Whole),
+        Say::NotAShow,
+        Say::Reset,
+        Say::Nothing,
+    ];
+    for says in neither {
+        let relay = StandIn::started().await;
+        let mut device = Device::new("laptop");
+        started_before_its_relays(&device);
+        device.makes_the_phrase(&phrase());
+        device.connects_to("relay", relay.port, relay.key).await;
+        relay.says(says.clone(), says.clone());
+        device.passes().await;
+        assert!(relay.seen().contains(&Seen::Whole), "{says:?}: shown");
+        let reach = device.at("relay").reach;
+        assert!(
+            !reach.reached && reach.out_of_reach_since.is_none(),
+            "{says:?}"
+        );
+        device.clock.run_ahead(Duration::from_secs(
+            cordelia_core::protocol::OUT_OF_REACH_SECS,
+        ));
+        device.passes().await;
+        let reach = device.at("relay").reach;
+        assert!(reach.out_of_reach_since.is_some(), "{says:?}");
+        assert_eq!(reach.class, Some(Class::OutLacking), "{says:?}");
+        assert!(
+            device.link("relay").is_open(),
+            "{says:?}: the connection stays"
+        );
+    }
+}
+
+/// "Show it whole" to a short show is no answer: the device shows the
+/// entry whole, and the answer to that is what counts (decision
+/// 2026-10-19 §1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whole_to_a_short_show_is_no_answer() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    let later = || {
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS))
+    };
+    let whole = Say::Answer(ShowAnswer::Whole);
+    // First shown whole on the connection; then in short.
+    device.passes().await;
+    relay.seen();
+    relay.says(whole.clone(), Say::Answer(ShowAnswer::Taken));
+    later();
+    device.passes().await;
+    assert_eq!(relay.seen()[..2], [Seen::Short, Seen::Whole]);
+    assert!(device.at("relay").reach.reached);
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    // "Show it whole", and then "not signed" to the whole entry: no
+    // answer that says, and nothing is written over what was kept.
+    let before = answer_of(&device, "relay");
+    relay.says(
+        whole,
+        Say::Answer(ShowAnswer::Refused(EntryRefused::NotSigned)),
+    );
+    later();
+    device.passes().await;
+    assert_eq!(relay.seen()[..2], [Seen::Short, Seen::Whole]);
+    assert!(!device.at("relay").reach.reached);
+    assert_eq!(answer_of(&device, "relay"), before);
+}
+
+/// A wake after no connection does not move another relay's reference
+/// (decision 2026-10-19 §1): relay B is down and fails each dial; relay A
+/// drops and comes back every three minutes, and each return makes the
+/// device wake. B is out of reach five minutes after the start all the
+/// same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_after_no_connection_does_not_move_another_relays_reference() {
+    let a = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    started_before_its_relays(&device);
+    device.makes_the_phrase(&phrase());
+    device.set_up_with("b");
+    device.connects_to("a", a.port, a.key).await;
+    device.passes().await;
+    let start = device.at("b").reach.reference;
+    let b = relay_id("b");
+    let mut secs = 0;
+    while secs < 330 {
+        device.clock.run_ahead(Duration::from_secs(30));
+        secs += 30;
+        // The dial loop's attempt at B, which fails.
+        device.engine.reach().dial_begins(&b);
+        device.engine.reach().dial_ends(&b, false);
+        if secs % 180 == 0 {
+            // A drops: a pass finds no connection, and the device wakes
+            // when A is back.
+            device.disconnects("a");
+            device.passes().await;
+            device.connects_to("a", a.port, a.key).await;
+        }
+        device.passes().await;
+        assert_eq!(device.at("b").reach.reference, start, "at {secs} s");
+        let out = device.at("b").reach.out_of_reach_since.is_some();
+        assert_eq!(out, secs >= 300, "at {secs} s");
+    }
+    assert_eq!(device.at("b").reach.class, Some(Class::OutLacking));
+    // A sleep, which the pass finds, moves it: B is out of reach no more.
+    device.clock.slept(Duration::from_secs(3600));
+    device.passes().await;
+    let reach = device.at("b").reach;
+    assert!(reach.reference >= start + 3600, "{reach:?}");
+    assert_eq!(reach.out_of_reach_since, None);
+}
+
+/// A relay given no key holds the change only while the device is
+/// connected to it with the key that answered (decision 2026-10-19 §1):
+/// its name may name another host now. Connected again to that key, it
+/// holds the change; to another key, it lacks it until that key answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_given_no_key_holds_only_while_connected_to_the_key_that_answered() {
+    let (first, second) = (StandIn::started().await, StandIn::started().await);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", first.port, first.key).await;
+    first.says(
+        Say::Answer(ShowAnswer::Taken),
+        Say::Answer(ShowAnswer::Taken),
+    );
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    // Its name now names a host where nothing answers.
+    device.disconnects("relay");
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Lacks);
+    // Another key answers there, and says nothing yet.
+    second.says(Say::Reset, Say::Reset);
+    device.connects_to("relay", second.port, second.key).await;
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Lacks);
+    // The key that answered, again: it holds the change, by its answer.
+    first.says(Say::Reset, Say::Reset);
+    device.connects_to("relay", first.port, first.key).await;
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    // The other key, once it says that it holds it.
+    second.says(Say::Answer(ShowAnswer::Held), Say::Answer(ShowAnswer::Held));
+    device.connects_to("relay", second.port, second.key).await;
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    assert_eq!(answer_of(&device, "relay").unwrap().by, second.key);
+}
+
+/// A relay that held the change and then answers "no room" at every show
+/// is REFUSING five minutes after it came to lack it (decision 2026-10-19
+/// §1), through the pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_held_and_then_refuses_is_refusing_five_minutes_on() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    relay.says(
+        Say::Answer(ShowAnswer::Taken),
+        Say::Answer(ShowAnswer::Taken),
+    );
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+    let no_room = Say::Answer(ShowAnswer::Refused(EntryRefused::NoRoom));
+    relay.says(no_room.clone(), no_room);
+    for minute in 1..=5 {
+        device.clock.run_ahead(Duration::from_secs(60));
+        device.passes().await;
+        let reach = device.at("relay").reach;
+        assert!(reach.reached, "{minute}");
+        assert_eq!(reach.holds, Holds::Lacks, "{minute}");
+        // It came to lack it at the first "no room", a minute in: five
+        // minutes have not gone by since.
+        assert_eq!(reach.class, None, "{minute}");
+    }
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.passes().await;
+    assert_eq!(device.at("relay").reach.class, Some(Class::Refusing));
+}
+
+/// What the node at `device` lists of the relay it dials at `host`
+/// (`/api/v1/peers`).
+fn relay_listed(device: &Node, host: &str) -> Option<serde_json::Value> {
+    let listed = device.get("/api/v1/peers")?;
+    let relays = listed["relays"].as_array()?;
+    relays.iter().find(|relay| relay["host"] == host).cloned()
+}
+
+/// Whether the relay that `device` dials at `host` holds the latest
+/// change that it keeps, as `POST /api/v1/devices/list` says.
+fn holds_the_change(device: &Node, host: &str) -> Option<()> {
+    let seen = person_of(device);
+    let relays = seen["relays"].as_array()?;
+    let relay = relays.iter().find(|relay| relay["relay"] == host)?;
+    (relay["holds_latest"] == true).then_some(())
+}
+
+/// A relay that lacks the change is dialled every half minute (decision
+/// 2026-10-19, rule 3), with real processes. A laptop has relays A and B.
+/// B is stopped, and stays down long enough that its wait is at the cap
+/// of a node that has another relay connected. A change is made: within
+/// 40 seconds B's "last tried" moves, and from then on is never more than
+/// 40 seconds old while A is connected. B is started again: within 40
+/// seconds it holds the change.
+#[test]
+#[ignore = "it waits for a relay's wait to grow to the cap: about thirteen minutes"]
+fn a_relay_that_lacks_the_change_is_dialled_every_half_minute() {
+    let mut a = node("relay-a", "relay", None);
+    let mut b = node("relay-b", "relay", None);
+    a.start();
+    b.start();
+    wait_for("the relays are healthy", &[&a, &b], 30, || {
+        healthy(&a)?;
+        healthy(&b)
+    });
+    let (at_a, at_b) = (
+        format!("127.0.0.1:{}", a.p2p),
+        format!("127.0.0.1:{}", b.p2p),
+    );
+    let id = |relay: &Node| relay.cli(&["id"]).trim().to_string();
+    let relays = [(at_a.clone(), Some(id(&a))), (at_b.clone(), Some(id(&b)))];
+    let mut laptop = node_with_relays("laptop", "personal", &relays);
+    laptop.start();
+    let all = [&a, &b, &laptop];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    let words = makes_a_phrase(&laptop, "laptop");
+    wait_for("both relays hold the first change", &all, 120, || {
+        holds_the_change(&laptop, &at_a)?;
+        holds_the_change(&laptop, &at_b)
+    });
+
+    // B goes down, and stays down until its dials are a quarter of an
+    // hour apart: its last dial is then a minute old, and the next one
+    // far off.
+    b.stop();
+    let all = [&a, &laptop];
+    let tried = |relay: &str| {
+        relay_listed(&laptop, relay).and_then(|listed| listed["last_tried_secs"].as_u64())
+    };
+    std::thread::sleep(Duration::from_secs(640));
+    wait_for("B's last dial is a minute old", &all, 300, || {
+        tried(&at_b).filter(|secs| *secs >= 60).map(|_| ())
+    });
+
+    // A change: B lacks it, and is dialled within 40 seconds.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made");
+    wait_for("B is dialled again", &all, 40, || {
+        tried(&at_b).filter(|secs| *secs < 40).map(|_| ())
+    });
+    // And from then on at least every 40 seconds, while A is connected.
+    for _ in 0..120 {
+        std::thread::sleep(Duration::from_secs(1));
+        let listed = relay_listed(&laptop, &at_a).unwrap();
+        assert_eq!(listed["state"], "connected", "{listed}");
+        let secs = tried(&at_b).expect("B is listed as tried");
+        assert!(secs <= 40, "B was last dialled {secs} s ago");
+    }
+
+    // B is back: it is dialled, shown the change, and holds it.
+    b.start();
+    wait_for("B holds the change", &[&a, &b, &laptop], 40, || {
+        holds_the_change(&laptop, &at_b)
+    });
+    drop(at);
+}
+
+/// A relay given a key in the configuration is known by its name and key
+/// together (decision 2026-10-19 §1): its answer is kept under both, and
+/// another relay under the same name with no key has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_given_a_key_is_known_by_its_name_and_its_key() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.relay_mut("relay").key = Some(relay.key);
+    relay.says(
+        Say::Answer(ShowAnswer::Taken),
+        Say::Answer(ShowAnswer::Taken),
+    );
+    device.passes().await;
+    let known = known::read(&device.db()).unwrap();
+    let keyed = RelayId {
+        name: "relay".into(),
+        key: Some(relay.key),
+    };
+    assert!(known.of(&keyed).and_then(|of| of.answer).is_some());
+    assert_eq!(known.of(&relay_id("relay")).and_then(|of| of.answer), None);
+    assert_eq!(device.at("relay").reach.key, Some(relay.key));
+    assert_eq!(device.at("relay").reach.holds, Holds::Holds);
+}
+
+/// A relay lacks the change, for the pace of its dials, only while the
+/// device has a change entry to show (decision 2026-10-19, rule 3): not
+/// while it follows no phrase. And the pass notes when the kept change
+/// entry came to be kept, as the device comes to keep another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_lacks_the_change_only_where_the_device_has_one_to_show() {
+    let mut device = Device::new("laptop");
+    started_before_its_relays(&device);
+    device.set_up_with("relay");
+    device.passes().await;
+    assert!(!device.engine.reach().lacks(&relay_id("relay")));
+    device.makes_the_phrase(&phrase());
+    device.passes().await;
+    assert!(device.engine.reach().lacks(&relay_id("relay")));
+    let first = device.latest().id();
+    let kept = known::read(&device.db()).unwrap().kept.unwrap();
+    assert_eq!(kept.entry, first);
+    let second = device.changes(&phrase(), &[&device], &[]);
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.passes().await;
+    let kept = known::read(&device.db()).unwrap().kept.unwrap();
+    assert_eq!(kept.entry, second.id());
+    assert!(
+        device
+            .engine
+            .reach()
+            .came_to_lack()
+            .contains(&relay_id("relay"))
+    );
+}
+
+/// A relay that holds the change and refuses, for room, what of the
+/// device's own waits there at each offer for five minutes is STUCK
+/// (decision 2026-10-19 §1), through the pass; one at which nothing waits
+/// is OK; and one that takes some of what is offered starts the five
+/// minutes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_refuses_what_waits_for_five_minutes_is_stuck() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    relay.holds_what_is_proved(true);
+    device.passes().await;
+    device.passes().await;
+    let reach = device.at("relay").reach;
+    assert_eq!(reach.class, Some(Class::Ok), "{reach:?}");
+    let first = device.writes("notes", "a.md", "the first");
+    device.writes("notes", "b.md", "the second");
+    let refused = PushAnswer::Refused(EntryRefused::NoRoom);
+    relay.pushes(move |_| refused);
+    device.passes().await;
+    assert_eq!(
+        device.at("relay").reach.waits,
+        Some(cordelia_api::state::Waits::Moving)
+    );
+    for _ in 0..5 {
+        device.clock.run_ahead(Duration::from_secs(61));
+        device.passes().await;
+    }
+    assert_eq!(device.at("relay").reach.class, Some(Class::Stuck));
+    // It takes the first file and refuses the second: not stuck.
+    let slot = first.slot;
+    relay.pushes(move |entry| match entry.slot == slot {
+        true => PushAnswer::Stored,
+        false => PushAnswer::Refused(EntryRefused::NoRoom),
+    });
+    device
+        .clock
+        .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+    device.passes().await;
+    let reach = device.at("relay").reach;
+    assert_eq!(
+        reach.waits,
+        Some(cordelia_api::state::Waits::Moving),
+        "{reach:?}"
+    );
+    assert_eq!(reach.class, None);
 }

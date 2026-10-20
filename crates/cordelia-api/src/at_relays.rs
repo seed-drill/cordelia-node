@@ -73,6 +73,8 @@
 //! whatever comes back. The delete goes only to a relay that was sent
 //! something of that channel: any other has nothing to write over.
 
+pub mod known;
+
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{ENTRY_WIRE_OVERHEAD_BYTES, PERSONAL_NAME_PREFIX};

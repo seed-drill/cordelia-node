@@ -68,6 +68,36 @@ jobs:
       - name: Install script
         run: sh scripts/test-install.sh
 
+  # The real-process tests that wait out a relay's five minutes out of
+  # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
+  # each is ignored in `cargo test --all`, so that the job above is not
+  # made longer, and is run here, on every pull request, beside it.
+  out-of-reach:
+    name: out of reach
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: The tests that are ignored for their length
+        run: cargo test --all -- --ignored
+
   coverage:
     runs-on: ubuntu-latest
     steps:

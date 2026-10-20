@@ -204,6 +204,11 @@ pub const BAN_WINDOW_SECS: u64 = 10 * RATE_WINDOW_SECS;
 /// Reconnect backoff base duration in seconds (parameter-rationale.md §3).
 /// Derived: start at 1 ping interval. If we can't connect in the time
 /// it takes to send one ping, back off.
+///
+/// It is also the most that a relay that lacks the change the device
+/// keeps waits to be dialled again, whether or not another relay is
+/// connected; a longer wait already set is cut to it when the relay comes
+/// to lack the change (decision 2026-10-19, rule 3).
 pub const BACKOFF_BASE_SECS: u64 = PING_INTERVAL_SECS;
 
 /// Delay before clearing failure state in seconds (configuration.md §3).
@@ -814,7 +819,9 @@ pub const SIGHTING_REFRESH_SECS: u64 = 300;
 pub const SIGHTING_RETENTION_DAYS: i64 = 8;
 
 /// How often it tries instead while none of the names resolves: a node
-/// started before its network was up finds its relays soon after.
+/// started before its network was up finds its relays soon after. It is
+/// also how often names are looked up while a relay that lacks the change
+/// has a name that does not resolve (decision 2026-10-19, rule 3).
 pub const BOOTNODE_RESOLVE_RETRY_SECS: u64 = 30;
 
 // ── PSK exchange reasons (network-protocol.md §4.7) ──────────────────
@@ -1664,6 +1671,28 @@ pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
 /// refuses has refused again within twice that, and one that has not has
 /// taken what it was offered, or was offered nothing more.
 pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// How long a relay that the device is set up with has not been reached,
+/// with every attempt at it in that time failed, before it is out of
+/// reach (decision 2026-10-19 §1). It is the time after which the status
+/// line shows what passes by itself (STATUS_AMBER_WAIT_SECS): a relay's
+/// restart, and a machine that wakes, are each through it in less. A
+/// relay stays out of reach until it is reached, or until its reference
+/// moves: a start, a sleep, or a change of the change entry the device
+/// keeps. A wake for any other reason does not move it. The command after
+/// a change ends without success only once each relay that lacks the
+/// change has been out of reach for this long since the change, or has
+/// refused the change for this long.
+pub const OUT_OF_REACH_SECS: u64 = STATUS_AMBER_WAIT_SECS;
+
+// A device that wakes has heard from its relays, or given them up, well
+// within the five minutes (decision 2026-10-19 §10).
+const _: () = assert!(OUT_OF_REACH_SECS > 2 * WAKE_WAIT_SECS);
+// A relay that lacks the change has an attempt in its five minutes: a
+// lookup of a name that does not resolve, and a dial, each come at least
+// this often (rule 3).
+const _: () = assert!(OUT_OF_REACH_SECS > BOOTNODE_RESOLVE_RETRY_SECS);
+const _: () = assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS);
 
 /// The most characters of a file's name that a command prints, and that
 /// the node puts in a line of its status (decision 2026-10-04 §16):
@@ -2879,6 +2908,19 @@ mod tests {
         // A removal is shown for less long than the secret it left is
         // kept, so the time that it was applied is still known.
         const { assert!(REMOVAL_NOT_APPLIED_SHOWN_DAYS < LEFT_SECRET_KEPT_DAYS) };
+    }
+
+    /// How long a relay has failed before it is out of reach (decision
+    /// 2026-10-19 §1, §10): the five minutes of the status line, which a
+    /// wake, a lookup that does not resolve and a dial of a relay that
+    /// lacks the change each fit within.
+    #[test]
+    fn test_out_of_reach_is_the_five_minutes_of_the_status_line_decision_2026_10_19_10() {
+        assert_eq!(OUT_OF_REACH_SECS, STATUS_AMBER_WAIT_SECS);
+        assert_eq!(OUT_OF_REACH_SECS, 300);
+        const { assert!(OUT_OF_REACH_SECS > 2 * WAKE_WAIT_SECS) };
+        const { assert!(OUT_OF_REACH_SECS > BOOTNODE_RESOLVE_RETRY_SECS) };
+        const { assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS) };
     }
 
     /// The waits between the tries at a first start that keeps failing

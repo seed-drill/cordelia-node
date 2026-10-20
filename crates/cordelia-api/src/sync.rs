@@ -3190,6 +3190,7 @@ mod tests {
                 }),
                 another_form: 0,
                 refuses: None,
+                reach: Default::default(),
             }],
             cannot_go_on: None,
         });

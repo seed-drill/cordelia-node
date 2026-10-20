@@ -967,6 +967,7 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
         no_room,
         another_form: 0,
         refuses: None,
+        reach: Default::default(),
     };
     let refused = NoRoom {
         at: 1_790_000_000,

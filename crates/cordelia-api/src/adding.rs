@@ -790,6 +790,12 @@ pub fn keys_that_read(conn: &Connection, now: i64) -> Result<Vec<TypedKey>, Pers
 /// other key that was typed**: none of them is spent under what the
 /// device has become.
 ///
+/// **Where the hand-over was taken, the handed change entry is the mark
+/// of each of `set_up`** (decision 2026-10-19 §1), the relays that the
+/// device is set up with, of which it has no latest answer, in this
+/// transaction. The mark trusts the relays of the device that added this
+/// one: that device kept the entry and showed it to its relays.
+///
 /// `None` where the key reads nothing now: a person typed it again since,
 /// it is spent, or its hour has gone. Nothing was given to [`accept`].
 pub fn accept_typed(
@@ -798,6 +804,7 @@ pub fn accept_typed(
     typed: &TypedKey,
     sync_on: bool,
     entry: &CheckedEntry,
+    set_up: &[crate::at_relays::known::RelayId],
     now: i64,
 ) -> Result<Option<Accepted>, PersonError> {
     in_one(conn, || {
@@ -842,6 +849,14 @@ pub fn accept_typed(
         // key that was typed is forgotten.
         if matches!(&accepted, Accepted::Joined(_) | Accepted::Moved(_)) {
             acts::forget_other_typed_keys(conn, &typed.key)?;
+        }
+        // It keeps the handed change entry now: each relay of which it has
+        // no answer is marked with it.
+        if matches!(
+            &accepted,
+            Accepted::Joined(_) | Accepted::Moved(_) | Accepted::Applied(_)
+        ) {
+            crate::at_relays::known::mark(conn, set_up, now)?;
         }
         Ok(Some(accepted))
     })
@@ -1260,6 +1275,9 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
+    // What it knew of which relay holds which change was of entries of
+    // the phrase it leaves (decision 2026-10-19 §1).
+    meta::remove(conn, meta::PERSON_RELAYS_KNOWN)?;
     // Nor does it keep in memory what it read of the personal channel.
     crate::names::forget_kept();
     Ok(())
@@ -1885,9 +1903,17 @@ mod tests {
         assert!(keys_that_read(&on.conn, now + HOUR).unwrap().is_empty());
         assert!(keys_that_read(&on.conn, now - 1).unwrap().is_empty());
 
-        let accepted = accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now)
-            .unwrap()
-            .expect("the key reads");
+        let accepted = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            &[],
+            now,
+        )
+        .unwrap()
+        .expect("the key reads");
         assert!(matches!(accepted, Accepted::Joined(_)));
         assert!(on.follows_a_phrase());
         let spent = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
@@ -1908,6 +1934,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 2,
         );
         assert_eq!(again.unwrap(), None);
@@ -1922,6 +1949,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 3,
         )
         .unwrap();
@@ -2043,6 +2071,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 5,
         )
         .unwrap();
@@ -2074,6 +2103,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 6,
         )
         .unwrap();
@@ -2088,8 +2118,16 @@ mod tests {
         let (on, adder) = (&s[1], s.key(0));
         acts::type_key(&on.conn, &adder, "", now).unwrap();
         let typed = acts::typed_key(&on.conn, &adder).unwrap().unwrap();
-        let given =
-            accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now).unwrap();
+        let given = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            &[],
+            now,
+        )
+        .unwrap();
         let refused = Accepted::Refused(NotAccepted::StoodElsewhere {
             typed: None,
             now: Some(Row::NoPhrase),
@@ -2120,8 +2158,16 @@ mod tests {
             type_key(&on.conn, &on.identity, &key, Row::NoPhrase, false, now).unwrap();
         }
         let typed = acts::typed_key(&on.conn, &s.key(0)).unwrap().unwrap();
-        let given =
-            accept_typed(&on.conn, &on.identity, &typed, false, &added.hand_over, now).unwrap();
+        let given = accept_typed(
+            &on.conn,
+            &on.identity,
+            &typed,
+            false,
+            &added.hand_over,
+            &[],
+            now,
+        )
+        .unwrap();
         assert!(matches!(given, Some(Accepted::Joined(_))), "{given:?}");
         let kept = acts::typed_keys(&on.conn).unwrap();
         assert_eq!(kept.len(), 1);
@@ -2139,6 +2185,7 @@ mod tests {
             Among::NoPhrase,
             &made.entry,
             &made.statement_key,
+            &[],
             now,
         )
         .unwrap();
@@ -2154,6 +2201,7 @@ mod tests {
             Among::Alone,
             &made.entry,
             &made.statement_key,
+            &[],
             now + 1,
         )
         .unwrap();
@@ -2257,6 +2305,7 @@ mod tests {
             &typed,
             false,
             &for_another.hand_over,
+            &[],
             now,
         )
         .unwrap()
@@ -2275,6 +2324,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + HOUR,
         );
         assert_eq!(late.unwrap(), None);
@@ -2287,6 +2337,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 11,
         );
         assert_eq!(old.unwrap(), None);
@@ -2299,6 +2350,7 @@ mod tests {
             &typed,
             false,
             &added.hand_over,
+            &[],
             now + 11,
         );
         assert!(matches!(taken.unwrap(), Some(Accepted::Joined(_))));

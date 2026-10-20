@@ -740,10 +740,12 @@ pub async fn phrase_make(
     // began before is published or recorded after (§4.2, §5.2). Where a
     // phrase was replaced the device has left one: the node keeps no
     // note of which relays had handed its channels.
+    let set_up = state.own_channels.relays_set_up_as();
     let applied = state
         .as_a_leaving(
             |conn| {
-                leaving::start_again(conn, &state.identity, shown, &entry, &statement_key, now())
+                let key = &statement_key;
+                leaving::start_again(conn, &state.identity, shown, &entry, key, &set_up, now())
             },
             |applied| applied.is_ok(),
         )
@@ -1775,6 +1777,7 @@ exit 0"#,
             no_room: None,
             another_form: 0,
             refuses: None,
+            reach: Default::default(),
         };
         let set_up = AtRelays {
             relays: vec![at("one.example:9474"), at("two.example:9474")],
