@@ -60,6 +60,7 @@ use cordelia_storage::sync_state;
 
 use crate::person::{Counting, PersonError, hold_name, in_one};
 use crate::publish::Standing;
+use crate::state::AppState;
 
 /// Whether `name` is a name as this version would itself map one: of the
 /// characters that a name may have, no longer than a name may be, and in
@@ -229,7 +230,7 @@ fn words(
     standing: &Standing,
     of: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<Words, PersonError> {
-    words_in(conn, standing, of, &KEPT)
+    with_kept(|slot| words_in(conn, standing, of, slot))
 }
 
 /// [`words`], with what is kept in `slot`.
@@ -241,10 +242,31 @@ fn words_in(
 ) -> Result<Words, PersonError> {
     let personal = derive::personal_secret(&standing.secret)?;
     let channel = derive::channel_id(&personal)?;
+    if !keeps_what_it_reads(standing) {
+        // A device that has stopped reads each entry afresh, and keeps
+        // nothing of what it found.
+        return words_kept(
+            conn,
+            &personal,
+            standing.number(),
+            of,
+            &mut Kept::of(&channel),
+        );
+    }
     let mut kept = Kept::take(slot, &channel);
     let words = words_kept(conn, &personal, standing.number(), of, &mut kept);
     kept.put_back(slot);
     words
+}
+
+/// Whether a device that stands so keeps in memory what it reads of its
+/// personal channel ([`Kept`]): one that has applied a statement does, and
+/// so does one in a fork, which still stands in that channel until the
+/// two are settled. One that has stopped (it is removed, is not listed,
+/// or the change did not open for it) keeps nothing: what it reads is
+/// checked and opened afresh, and let go.
+fn keeps_what_it_reads(standing: &Standing) -> bool {
+    matches!(standing.held.state, State::Applied | State::Fork)
 }
 
 /// What checking and opening one stored entry of the personal channel
@@ -305,7 +327,43 @@ struct Kept {
 type Slot = std::sync::Mutex<Option<Kept>>;
 
 /// What the process keeps between reads.
+#[cfg(not(test))]
 static KEPT: Slot = std::sync::Mutex::new(None);
+
+// In this crate's unit tests, each test's thread keeps its own: a test
+// that asks what is kept finds only what it read, never what a test
+// beside it read. A test runs on a thread of its own, and what it reads
+// it reads on that thread.
+#[cfg(test)]
+thread_local! {
+    static KEPT: Slot = const { std::sync::Mutex::new(None) };
+}
+
+/// `f`, with what the process keeps between reads ([`KEPT`]).
+#[cfg(not(test))]
+fn with_kept<R>(f: impl FnOnce(&Slot) -> R) -> R {
+    f(&KEPT)
+}
+
+/// `f`, with what this test's thread keeps between reads ([`KEPT`]).
+#[cfg(test)]
+fn with_kept<R>(f: impl FnOnce(&Slot) -> R) -> R {
+    KEPT.with(f)
+}
+
+/// Keep nothing of any personal channel ([`Kept`]): what was found of
+/// each entry, its name among it, is let go. Done wherever a device no
+/// longer stands where it did in a phrase: when it forgets what it held,
+/// when it moves under another phrase, and when it stops (it is removed,
+/// is not listed, or the change does not open for it). A read that comes
+/// after checks and opens afresh what the store holds then.
+///
+/// A device that comes into a fork keeps what it read, on purpose: it
+/// still stands in that channel, and reads it, until the two statements
+/// are settled ([`keeps_what_it_reads`]).
+pub(crate) fn forget_kept() {
+    with_kept(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()) = None);
+}
 
 impl Kept {
     fn of(channel: &[u8; 32]) -> Self {
@@ -402,25 +460,96 @@ fn words_kept(
 
 /// Check and open, with the database's lock let go, each entry of the
 /// personal channel that is stored as none that is kept ([`Kept`]), and
-/// keep what was found: the lock is held only to read the rows. A read
-/// of the words that follows then checks and opens only what was stored
-/// in between. None on a device that follows no phrase.
+/// keep what was found: the lock is held only to read the rows, and then
+/// to keep what was found where the device stands in that channel still.
+/// A read of the words that follows then checks and opens only what was
+/// stored in between. None on a device that follows no phrase, or that
+/// has stopped ([`keeps_what_it_reads`]).
 ///
 /// A cycle of sync does this before it reads the words under the lock:
 /// at the first cycle after a node starts, every entry is read afresh.
 pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> {
-    read_ahead_in(db, &KEPT)
+    with_kept(|slot| read_ahead_in(db, slot))
+}
+
+/// [`read_ahead`] once, on a thread of its own, as a node starts: what a
+/// node reads of its personal channel under the lock (`msg summary`,
+/// `msg send`, the look) then checks and opens only what was stored
+/// since, and not every entry stored, as the first read after a start did
+/// until a cycle of sync had read ahead. A cycle reads ahead before each
+/// read of its own, and nothing else needs it: every read keeps what it
+/// found, the entries stored after start are few between two cycles, and
+/// a node whose sync is off has no cycle and reads ahead only here.
+///
+/// Only a personal node (`personal`) that is not held up reads ahead: the
+/// thread it reads on, where it does. A relay holds no personal channel,
+/// and a node that is held up touches nothing until it may run. A device
+/// that has stopped reads ahead nothing ([`keeps_what_it_reads`]).
+pub fn read_ahead_at_start(
+    state: std::sync::Arc<AppState>,
+    personal: bool,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !personal || state.held.why().is_some() {
+        return None;
+    }
+    Some(std::thread::spawn(move || {
+        if let Err(e) = read_ahead(&state.db) {
+            tracing::warn!(error = %e, "the personal channel could not be read ahead at start");
+        }
+    }))
+}
+
+/// How many entries of the personal channel a read of its words under
+/// the lock would check and open now: those stored as nothing that is
+/// kept holds ([`Kept`]). None on a device that follows no phrase.
+pub fn not_read_ahead(conn: &Connection) -> Result<usize, PersonError> {
+    let Ok(standing) = Standing::of(conn) else {
+        return Ok(0);
+    };
+    let channel = derive::channel_id(&derive::personal_secret(&standing.secret)?)?;
+    let stored = entries::channel_stored(conn, &channel)?;
+    Ok(with_kept(|slot| {
+        match &*slot.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(kept) if kept.channel == channel => stored
+                .iter()
+                .filter(|held| !kept.holds(&held.entry))
+                .count(),
+            _ => stored.len(),
+        }
+    }))
 }
 
 /// [`read_ahead`], keeping what it finds in `slot`.
 fn read_ahead_in(db: &std::sync::Mutex<Connection>, slot: &Slot) -> Result<(), PersonError> {
+    match found_ahead(db, slot)? {
+        Some((channel, read)) => keep_ahead(db, slot, &channel, read),
+        None => Ok(()),
+    }
+}
+
+/// What a read ahead found of each entry that it checked and opened, by
+/// its slot and its author, with the entry as it was stored.
+type FoundAhead = Vec<(([u8; 32], [u8; 32]), (Entry, Found))>;
+
+/// The first half of [`read_ahead_in`]: the rows of the personal channel
+/// read under the lock, and each that `slot` does not keep checked and
+/// opened with the lock let go. The channel, and what was found; none
+/// where there was nothing to check, or the device follows no phrase, or
+/// keeps nothing of what it reads ([`keeps_what_it_reads`]).
+fn found_ahead(
+    db: &std::sync::Mutex<Connection>,
+    slot: &Slot,
+) -> Result<Option<([u8; 32], FoundAhead)>, PersonError> {
     let (personal, stored) = {
         let conn = db
             .lock()
             .map_err(|e| PersonError::Held(format!("db lock: {e}")))?;
         let Ok(standing) = Standing::of(&conn) else {
-            return Ok(());
+            return Ok(None);
         };
+        if !keeps_what_it_reads(&standing) {
+            return Ok(None);
+        }
         let personal = derive::personal_secret(&standing.secret)?;
         let channel = derive::channel_id(&personal)?;
         (personal, entries::channel_stored(&conn, &channel)?)
@@ -435,19 +564,45 @@ fn read_ahead_in(db: &std::sync::Mutex<Connection>, slot: &Slot) -> Result<(), P
         _ => stored.into_iter().map(|held| held.entry).collect(),
     };
     if new.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let read: Vec<_> = new
+    let read = new
         .into_iter()
         .map(|entry| {
             let found = find(entry.clone(), &personal);
             ((entry.slot, entry.author), (entry, found))
         })
         .collect();
+    Ok(Some((channel, read)))
+}
+
+/// The second half of [`read_ahead_in`]: what was found of `channel` is
+/// kept in `slot` only where the device stands in that channel still, and
+/// keeps what it reads ([`keeps_what_it_reads`]). One that forgot
+/// ([`forget_kept`]), or stopped, while the read went on keeps nothing of
+/// it. The lock is taken again for this, as a read of the words takes the
+/// two, in the same order.
+fn keep_ahead(
+    db: &std::sync::Mutex<Connection>,
+    slot: &Slot,
+    channel: &[u8; 32],
+    read: FoundAhead,
+) -> Result<(), PersonError> {
+    let conn = db
+        .lock()
+        .map_err(|e| PersonError::Held(format!("db lock: {e}")))?;
+    let stands_in = Standing::of(&conn)
+        .ok()
+        .filter(keeps_what_it_reads)
+        .and_then(|standing| derive::personal_secret(&standing.secret).ok())
+        .and_then(|now| derive::channel_id(&now).ok());
+    if stands_in != Some(*channel) {
+        return Ok(());
+    }
     let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
     let kept = match &mut *kept {
-        Some(kept) if kept.channel == channel => kept,
-        other => other.insert(Kept::of(&channel)),
+        Some(kept) if kept.channel == *channel => kept,
+        other => other.insert(Kept::of(channel)),
     };
     kept.afresh += read.len();
     kept.found.extend(read);
@@ -2275,6 +2430,125 @@ mod tests {
         s.change(0, &[0, 1], &[]);
         assert_ne!(s[0].personal(), personal);
         kept_is_afresh(&s[0], &slot);
+    }
+
+    /// Whether what this test's thread keeps between reads ([`KEPT`])
+    /// holds anything of the channel `channel`.
+    fn kept_of(channel: &[u8; 32]) -> bool {
+        with_kept(|slot| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|kept| kept.channel == *channel && !kept.found.is_empty())
+        })
+    }
+
+    /// A device that forgets what it held of its person keeps nothing in
+    /// memory of its personal channel, and nor does one that is removed:
+    /// what was found of each entry, the names among it, is let go with
+    /// the secrets. What is kept is this test's thread's alone, so what
+    /// it finds kept, or not kept, no other test put there or took away.
+    #[test]
+    fn test_a_device_that_forgets_or_is_removed_keeps_nothing_of_the_channel_it_read() {
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        for name in ["lab", "team"] {
+            say(&s[1].conn, &s[1].identity, name, now).unwrap();
+        }
+        s.pass(1, 0);
+        s.pass(1, 2);
+
+        // Device 2 reads its channel, and is then removed.
+        let channel = derive::channel_id(&s[2].personal()).unwrap();
+        assert_eq!(listed(&s[2].conn).unwrap().len(), 2);
+        assert!(kept_of(&channel), "the read kept nothing to let go");
+        s.change(0, &[0, 1], &[2]);
+        assert_eq!(s.pass(0, 2)[0], Taken::Shown(crate::person::Shown::Removed));
+        assert!(!kept_of(&channel), "a removed device keeps what it read");
+        // What it reads after keeps nothing either: a read of its words,
+        // and a read ahead.
+        assert_eq!(listed(&s[2].conn).unwrap().len(), 2);
+        assert!(!kept_of(&channel), "a read on a removed device kept it");
+        let removed = s.machines.remove(2);
+        let db = std::sync::Mutex::new(removed.conn);
+        read_ahead(&db).unwrap();
+        assert!(
+            !kept_of(&channel),
+            "a read ahead on a removed device kept it"
+        );
+
+        // Device 1 reads its channel, and forgets: as `init --new-key`.
+        let channel = derive::channel_id(&s[1].personal()).unwrap();
+        assert_eq!(listed(&s[1].conn).unwrap().len(), 2);
+        assert!(kept_of(&channel), "the read kept nothing to let go");
+        let now = s.tick();
+        assert!(crate::leaving::forget(&s[1].conn, &s[1].identity, false, now).unwrap());
+        assert!(
+            !kept_of(&channel),
+            "a device that forgot keeps what it read"
+        );
+        // And a read ahead after reads nothing back in.
+        let on = s.machines.remove(1);
+        let db = std::sync::Mutex::new(on.conn);
+        read_ahead(&db).unwrap();
+        assert!(!kept_of(&channel));
+    }
+
+    /// A read ahead that a forget, or a stop, comes in the middle of keeps
+    /// nothing of the channel it read: what it found is kept only where
+    /// the device stands in that channel still, and has not stopped. The
+    /// control: with neither, it is kept.
+    #[test]
+    fn test_a_read_ahead_that_a_forget_or_a_stop_comes_into_keeps_nothing() {
+        let mut s = Several::of_one_person(3);
+        let now = s.tick();
+        for name in ["lab", "team"] {
+            say(&s[1].conn, &s[1].identity, name, now).unwrap();
+        }
+        s.pass(1, 2);
+
+        // Device 2 reads ahead, and is removed before it keeps what it
+        // found.
+        let on = s.machines.remove(2);
+        let channel = derive::channel_id(&on.personal()).unwrap();
+        let db = std::sync::Mutex::new(on.conn);
+        let control = Slot::new(None);
+        let (read_of, read) = found_ahead(&db, &control).unwrap().unwrap();
+        assert_eq!(read_of, channel);
+        keep_ahead(&db, &control, &read_of, read).unwrap();
+        assert!(used(&control, &channel).1 >= 2);
+        let slot = Slot::new(None);
+        let (read_of, read) = found_ahead(&db, &slot).unwrap().unwrap();
+        s.machines.push(Machine {
+            conn: db.into_inner().unwrap(),
+            identity: on.identity,
+            label: on.label,
+        });
+        s.change(0, &[0, 1], &[2]);
+        assert_eq!(s.pass(0, 2)[0], Taken::Shown(crate::person::Shown::Removed));
+        let on = s.machines.remove(2);
+        let db = std::sync::Mutex::new(on.conn);
+        keep_ahead(&db, &slot, &read_of, read).unwrap();
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the read ahead kept the channel of a device removed"
+        );
+        // And a removed device reads nothing ahead.
+        assert!(found_ahead(&db, &slot).unwrap().is_none());
+
+        // Device 1 reads ahead, and forgets before it keeps what it found.
+        let on = s.machines.remove(1);
+        let db = std::sync::Mutex::new(on.conn);
+        let slot = Slot::new(None);
+        let (read_of, read) = found_ahead(&db, &slot).unwrap().unwrap();
+        let conn = db.lock().unwrap();
+        crate::leaving::forget(&conn, &on.identity, false, now).unwrap();
+        drop(conn);
+        keep_ahead(&db, &slot, &read_of, read).unwrap();
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the read ahead kept the channel left"
+        );
     }
 
     /// What a read ahead finds is what a read under the lock then uses:

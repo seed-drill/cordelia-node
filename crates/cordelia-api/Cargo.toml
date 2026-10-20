@@ -25,6 +25,9 @@ zeroize = { workspace = true }
 # The seven categories of characters that the messages' commands take out
 # of a name, a label, a subject or a link, and escape in a body.
 unicode-general-category = { workspace = true }
+# The node's token is compared in constant time. The crypto crates
+# already bring it: this adds no crate to the build.
+subtle = "2.6.1"
 
 [target.'cfg(unix)'.dependencies]
 # To kill git's process group at its deadline. Tokio already brings it:
