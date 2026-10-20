@@ -968,6 +968,7 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
         another_form: 0,
         refuses: None,
         reach: Default::default(),
+        key: None,
     };
     let refused = NoRoom {
         at: 1_790_000_000,
@@ -980,6 +981,7 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
             at("other.example:9474", None),
         ],
         cannot_go_on: None,
+        word_to_come: false,
     });
     let now = std::time::Instant::now();
     let earlier = now.checked_sub(Duration::from_secs(400)).unwrap();

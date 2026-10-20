@@ -1275,4 +1275,39 @@ mod tests {
         let slot = s[0].slot("notes", "c.md");
         assert_eq!((slot.current, slot.next), (None, Some(at(1, 2))));
     }
+
+    /// A device of the version before this one beside one of this version
+    /// (decision 2026-10-19 §7): an entry under `reached/` is taken by the
+    /// one door where its signer counts, and stored; and the paths that
+    /// version has, which this one keeps, read nothing of it. It is no
+    /// record of an addition, counts no key, and leaves the word under
+    /// `applied/` as it was.
+    #[test]
+    fn an_entry_under_reached_is_stored_and_read_as_nothing_by_the_older_paths() {
+        let s = two();
+        let key = s[0].key();
+        let word = cordelia_crypto::reached::CarriedWord {
+            number: s[1].number(),
+            keys: vec![[0xa1; 32]],
+            more: 0,
+            not_yet: 1,
+        };
+        let entry = entry_by(
+            &s[0].identity,
+            &s[1].personal(),
+            1,
+            &crate::person::reached_name(&key).unwrap(),
+            Value::Other(word.to_value().unwrap()),
+            &[],
+        );
+        let applied_before = s[1].word_of(&key);
+        assert_eq!(given(&s, 1, &entry), STORED);
+        assert!(s[1].stored().contains(&entry));
+        assert_eq!(s[1].word_of(&key), applied_before);
+        let applied = applied_before.map(|value| match value {
+            Value::Text(word) => crate::person::read_applied_word(&word),
+            _ => None,
+        });
+        assert_eq!(applied, Some(Some((s[1].number(), false))));
+    }
 }

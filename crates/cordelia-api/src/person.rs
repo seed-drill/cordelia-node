@@ -59,7 +59,7 @@ use zeroize::{Zeroize, Zeroizing};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX, PERSONAL_APPLIED_PREFIX,
-    PERSONAL_APPLIED_SENT, RECOVERY_MAX_LEFT_SECRETS,
+    PERSONAL_APPLIED_SENT, PERSONAL_REACHED_PREFIX, RECOVERY_MAX_LEFT_SECRETS,
 };
 use cordelia_core::revision::lifted;
 use cordelia_crypto::CryptoError;
@@ -755,6 +755,17 @@ pub fn hold_name(conn: &Connection, name: &str, now: i64) -> Result<[u8; 32], Pe
 pub fn applied_name(device: &[u8; 32]) -> Result<String, PersonError> {
     Ok(format!(
         "{PERSONAL_APPLIED_PREFIX}{}",
+        encode_public_key(device)?
+    ))
+}
+
+/// The name, in the personal channel, of the carried word of the device
+/// whose key is `device` (decision 2026-10-19 §4, rule 4): `reached/` and
+/// the device's key, as a device's key is written. Only that device's own
+/// entry there is its word.
+pub fn reached_name(device: &[u8; 32]) -> Result<String, PersonError> {
+    Ok(format!(
+        "{PERSONAL_REACHED_PREFIX}{}",
         encode_public_key(device)?
     ))
 }
@@ -1870,12 +1881,15 @@ pub(crate) fn carried_entry(
 }
 
 /// Whether an entry of this device's own in the personal channel is
-/// carried: it is neither a record of an addition nor a word that a
-/// statement is applied. The next statement's own list is what stands,
-/// and the device writes that it has applied the next statement.
+/// carried: it is neither a record of an addition, nor a word that a
+/// statement is applied, nor its carried word or that word's delete
+/// (decision 2026-10-19 §4, rule 4). The next statement's own list is
+/// what stands, and the device writes its own words under the next
+/// statement.
 fn is_its_word_to_carry(version: &Version) -> bool {
     !version.name.starts_with(PERSONAL_ADDED_PREFIX)
         && !version.name.starts_with(PERSONAL_APPLIED_PREFIX)
+        && !version.name.starts_with(PERSONAL_REACHED_PREFIX)
 }
 
 /// The device writes, in the personal channel of the generation it has
@@ -6037,6 +6051,35 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A device's carried word is not carried to the next statement, and
+    /// nor is its delete (decision 2026-10-19 §4, rule 4): the next
+    /// statement's own words are what stand. What it wrote beside them is
+    /// carried as before.
+    #[test]
+    fn the_carried_word_and_its_delete_are_not_carried() {
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        let old = personal(2);
+        let reached = reached_name(&key(1)).unwrap();
+        for (rev, word) in [(5, Value::Other(vec![1; 45])), (6, Value::Delete)] {
+            let conn = device_at(1, 2);
+            put(&conn, &old, 1, rev, &reached, word.clone(), &[]);
+            put(&conn, &old, 1, 4, "syncing/one", text("team"), &[]);
+            assert_eq!(
+                read(&conn, &old, 2, &reached, &[1]).current.unwrap().value,
+                word
+            );
+            let entry = change(&phrase, &three, secret(3));
+            assert!(matches!(
+                shown(&conn, &device(1), &entry, NOW).unwrap(),
+                Shown::Applied(Applied { carried: 1, .. })
+            ));
+            let new = personal(3);
+            assert!(carried(&conn, &new, &reached).is_none(), "{word:?}");
+            assert_eq!(carried(&conn, &new, "syncing/one").unwrap().rev, 4);
+        }
     }
 
     /// The secret of a generation that was left is kept, with the time it

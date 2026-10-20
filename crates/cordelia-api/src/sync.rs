@@ -3191,8 +3191,10 @@ mod tests {
                 another_form: 0,
                 refuses: None,
                 reach: Default::default(),
+                key: None,
             }],
             cannot_go_on: None,
+            word_to_come: false,
         });
         let (read, found) = read_at(
             &state,
