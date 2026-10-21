@@ -62,7 +62,7 @@ use cordelia_crypto::statement::{Device, SignedStatement, Statement, StatementEr
 
 use crate::terminal::{Terminal, TypedBack};
 
-mod wait;
+pub(crate) mod wait;
 use crate::{
     Told, api_post, api_post_told, note_another_version, refuse_another_version,
     refuse_before_a_phrase,

@@ -305,6 +305,13 @@ enum Commands {
         /// that was recovered from was read at the relays
         #[arg(long, value_enum, default_value_t = recover_cmd::ChannelRead::Whole)]
         channel_read: recover_cmd::ChannelRead,
+        /// With `--cut-short`: the relays that its carried word names,
+        /// where this recovery read none of them, as they are shown
+        #[arg(long)]
+        carried_to: Option<String>,
+        /// With `--carried-to`: how many relays that is
+        #[arg(long, default_value_t = 1)]
+        carried_relays: u64,
     },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
@@ -695,9 +702,12 @@ fn main() -> anyhow::Result<()> {
             number,
             cut_short,
             channel_read,
+            carried_to,
+            carried_relays,
         }) => {
-            let cut_short = recover_cmd::CutShort::handed(cut_short, channel_read);
-            recover_cmd::recover_made(&cli.config, number, cut_short)
+            let cut_short =
+                recover_cmd::CutShort::handed(cut_short, channel_read, carried_to, carried_relays);
+            std::process::exit(recover_cmd::recover_made(&cli.config, number, cut_short))
         }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
@@ -8053,15 +8063,27 @@ mod tests {
     /// device that was recovered from, where its word that it had sent
     /// what it carried was not read, and how the channel that the word
     /// is written in was read at the relays, which is one of three
-    /// things.
+    /// things; and, where its carried word names none of the relays that
+    /// the recovery read, those relays (decision 2026-10-19 §4, rule 10).
     #[test]
     fn test_what_a_recovery_hands_the_process_that_waits_is_read_there() {
         use clap::Parser;
         use recover_cmd::ChannelRead::{HeldByNone, InPart, Whole};
-        for read in [Whole, InPart, HeldByNone] {
+        let carried = recover_cmd::CarriedTo {
+            held: "a.example:9474 and b.example:9474".to_string(),
+            relays: 2,
+        };
+        for (read, carried_to) in [
+            (Whole, None),
+            (InPart, None),
+            (HeldByNone, None),
+            (Whole, Some(carried.clone())),
+            (InPart, Some(carried)),
+        ] {
             let handed = recover_cmd::CutShort {
                 device: "(w1 w2 w3 w4) \"laptop\"".to_string(),
                 read,
+                carried_to,
             };
             let mut line = vec!["cordelia".to_string()];
             line.extend([recover_cmd::MADE_COMMAND.to_string(), "3".to_string()]);
@@ -8071,15 +8093,25 @@ mod tests {
                     number,
                     cut_short,
                     channel_read,
+                    carried_to,
+                    carried_relays,
                 }) => {
                     assert_eq!(number, 3);
-                    let read = recover_cmd::CutShort::handed(cut_short, channel_read);
+                    let read = recover_cmd::CutShort::handed(
+                        cut_short,
+                        channel_read,
+                        carried_to,
+                        carried_relays,
+                    );
                     assert_eq!(read, Some(handed));
                 }
                 _ => panic!("what was handed is not read as that command"),
             }
         }
-        assert_eq!(recover_cmd::CutShort::handed(None, InPart), None);
+        assert_eq!(
+            recover_cmd::CutShort::handed(None, InPart, Some("a.example:9474".into()), 1),
+            None
+        );
         // With no such device, as it was.
         let line = ["cordelia", recover_cmd::MADE_COMMAND, "3"];
         match super::Cli::parse_from(line).command {
@@ -8087,6 +8119,8 @@ mod tests {
                 number: 3,
                 cut_short: None,
                 channel_read: Whole,
+                carried_to: None,
+                carried_relays: 1,
             }) => {}
             _ => panic!("that is not read as the command"),
         }

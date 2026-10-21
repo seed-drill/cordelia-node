@@ -684,6 +684,21 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     );
     second.stop();
     at.says("The look is made: 1 name read, and 2 versions carried, in 1 name.");
+    // Where the node has seen the second relay's connection close, it
+    // is not known to hold the change, and the command waits for it there
+    // (decision 2026-10-19 §4, rule 9); where not yet, it still holds it.
+    // It comes back, is shown the change again, and the wait ends.
+    let waits = at.says_one_of(&[
+        "Every relay holds the change.",
+        "This command stays until every relay holds the change.",
+    ]);
+    second.start();
+    wait_for("the second relay is up again", &[&second], 30, || {
+        healthy(&second)
+    });
+    if waits == 1 {
+        at.says("Every relay holds the change.");
+    }
     let said = at.done();
     println!("{said}");
     assert!(said.contains("removed keys (1):"), "{said}");
@@ -718,10 +733,6 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     // The desktop comes back, with only the relay in reach that was
     // stopped during the look: it is answered with the change.
     first.stop();
-    second.start();
-    wait_for("the second relay is up again", &[&second], 30, || {
-        healthy(&second)
-    });
     two.desktop.start();
     let with_it = [&second, &two.desktop];
     wait_for("the desktop is up again", &with_it, 30, || {
@@ -1764,6 +1775,14 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     let mut at = recovers(&new, None, &two.words, &["lost", "lost"]);
     at.says("The change is made (change 3)")
         .says("The look is made");
+    // The second relay is not reached: the command waits for the change
+    // there (decision 2026-10-19 §4, rule 9), until it comes back.
+    at.says("This command stays until every relay holds the change.");
+    second.start();
+    wait_for("the second relay is up again", &[&second], 30, || {
+        healthy(&second)
+    });
+    at.says("Every relay holds the change.");
     let said = at.done();
     println!("{said}");
     assert!(said.contains("Recovering from change 2."), "{said}");
@@ -2241,4 +2260,353 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
     assert!(said.contains("1 name is carried: lab."), "{said}");
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
     assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
+}
+
+/// How long a test waits for a recovery's wait that waits out a relay's
+/// five minutes out of reach to end.
+const OUT_OF_REACH_WAITED: Duration = Duration::from_secs(600);
+
+/// What no line of a recovery's wait says: that the machine may be
+/// closed (decision 2026-10-19 §4, rule 9).
+fn says_not_that_it_may_be_closed(said: &str) {
+    assert!(!said.contains("may be closed"), "{said}");
+    assert!(!said.contains("You may close this machine"), "{said}");
+}
+
+/// **A recovery ends not done where a relay lacks the change** (decision
+/// 2026-10-19 §4, rule 9). The new machine is set up with a relay that
+/// answers and with one whose name does not resolve. After the look it
+/// says R0, waits, says S2, then S8, S9 and S10, and ends with status 3,
+/// some five minutes after the change. It never says that the machine
+/// may be closed. Set up with the relay alone, a recovery ends at R1, with
+/// status 0.
+#[test]
+#[ignore = "it waits out a relay's five minutes out of reach: about seven minutes"]
+fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
+    use std::time::Instant;
+    let relay = relay_started();
+    let mut two = two_devices(&[&relay], None);
+    two.laptop.stop();
+    two.desktop.stop();
+    let reached = format!("127.0.0.1:{}", relay.p2p);
+    let mut new = node_with_relays(
+        "new",
+        "personal",
+        &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
+    );
+    new.start();
+    wait_for("device healthy", &[&new], 30, || healthy(&new));
+    wait_for(
+        "the new machine reaches the relay",
+        &[&relay, &new],
+        90,
+        || {
+            let connected = |at: &Value| at["state"] == "connected";
+            relays_of(&new).iter().any(connected).then_some(())
+        },
+    );
+    let mut at = recovers(&new, None, &two.words, &["lost", "lost"]);
+    at.says("The change is made (change 2)")
+        .says("The look is made");
+    let made = Instant::now();
+    at.says(
+        "This command stays until every relay holds the change. It ends sooner, with status 3, \
+         once each relay that is not known to hold it cannot be reached, or refuses it, for five \
+         minutes. Stopping it stops nothing: the node goes on, and the recovery stays made.",
+    );
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    println!("{said}");
+    assert!(
+        made.elapsed() >= Duration::from_secs(240),
+        "it ended after {:?}:\n{said}",
+        made.elapsed()
+    );
+    assert_eq!(status, Some(3), "{said}");
+    for line in [
+        format!(
+            "keep this machine on: {NO_SUCH_NAME} is not known to hold the change yet, and has \
+             not answered since"
+        ),
+        format!("  {NO_SUCH_NAME} is not known to hold the change, and has not answered since"),
+        format!(
+            "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
+        ),
+        "It looks its name up every 30 seconds.".to_string(),
+        format!(
+            "The change is not known to be at {NO_SUCH_NAME}. This command ends here, with status \
+             3. It does not say that you may close this machine."
+        ),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+    }
+    // The relay that holds the change has no line of S8.
+    assert!(
+        !said.contains(&format!("  {reached} holds the change")),
+        "{said}"
+    );
+    says_not_that_it_may_be_closed(&said);
+    new.stop();
+
+    // Set up with the relay alone: every relay holds the change, R1, and
+    // status 0, with no wait.
+    let alone = device_at("alone", &[&relay]);
+    let mut at = recovers(&alone, None, &two.words, &["lost"]);
+    at.says("The change is made (change 3)")
+        .says("The look is made");
+    let (status, said) = at.ends_with_status_within(Duration::from_secs(180));
+    println!("{said}");
+    assert_eq!(status, Some(0), "{said}");
+    assert!(said.contains("Every relay holds the change."), "{said}");
+    assert!(
+        !said.contains("This command stays until every relay holds the change."),
+        "{said}"
+    );
+    says_not_that_it_may_be_closed(&said);
+}
+
+/// How many entries the store of `relay` holds, of channels from their
+/// secrets.
+fn entries_at(relay: &Node) -> i64 {
+    store_of(relay)
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .unwrap_or(0)
+}
+
+/// **A recovery says before its yes where what was carried is at a relay
+/// that it did not read** (decision 2026-10-19 §4, rule 10, case 3). A
+/// laptop with relays A and B, which their operator lists together,
+/// removes the desktop while B is down: once B is out of reach, it writes
+/// the carried word, naming A. It is lost, and B, started again, pulls
+/// what A holds. A new machine set up with B alone reads the laptop's
+/// personal channel there, and says R2 with its second ending before its
+/// yes: it is not set up with A. Set up with A and B where A is down, it
+/// says R2 with its first ending: reach A. Each answers no, and nothing
+/// is made.
+#[test]
+#[ignore = "it waits out a relay's five minutes out of reach: about nine minutes"]
+fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_not_reach() {
+    let id_of = |n: &Node| n.cli(&["id"]).trim().to_string();
+    let mut a = node("relay-a", "relay", None);
+    let mut b = node_with_relays(
+        "relay-b",
+        "relay",
+        &[(format!("localhost:{}", a.p2p), Some(id_of(&a)))],
+    );
+    a.add_relay(&format!("localhost:{}", b.p2p), Some(&id_of(&b)));
+    a.start();
+    b.start();
+    wait_for("both relays healthy", &[&a, &b], 30, || {
+        healthy(&a).and(healthy(&b))
+    });
+    let (a_key, a_named) = (id_of(&a), format!("127.0.0.1:{}", a.p2p));
+    let mut two = two_devices(&[&a, &b], None);
+    two.desktop.stop();
+    b.stop();
+
+    // The laptop removes the desktop while B is down. Its wait ends not
+    // done once B is out of reach, and it writes that what it carried is
+    // at A.
+    let mut at = renews(&two.laptop, &["removed"], &two.words);
+    at.says("The change is made (change 2).");
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    assert_eq!(status, Some(3), "{said}");
+    let own = key_of(&two.laptop);
+    let word = wait_for(
+        "the laptop writes its carried word",
+        &[&a, &two.laptop],
+        180,
+        || {
+            let seen = person_of(&two.laptop);
+            let row = seen["devices"]
+                .as_array()?
+                .iter()
+                .find(|d| d["key"] == own)?;
+            row["carried_word"]
+                .is_object()
+                .then(|| row["carried_word"].clone())
+        },
+    );
+    assert_eq!(word["keys"], json!([a_key]), "{word}");
+    assert_eq!(word["not_yet"], 1, "{word}");
+    two.laptop.stop();
+
+    // B, started again, pulls what A holds.
+    b.start();
+    wait_for("relay B healthy again", &[&b], 30, || healthy(&b));
+    wait_for("B holds what A holds", &[&a, &b], 180, || {
+        let (at_a, at_b) = (entries_at(&a), entries_at(&b));
+        (at_a > 0 && at_a == at_b && holds_the_change(&b, &two.laptop, 2)).then_some(())
+    });
+
+    let refused_by_no = |new: &Node| -> String {
+        let mut at = new.at_terminal(&["recover", "--name", new.name]);
+        at.says("Type your recovery phrase, one word at a time")
+            .types(&two.words);
+        answers_and(&mut at, &["lost"], "no");
+        let (status, said) = at.ends_with_status_within(Duration::from_secs(120));
+        assert_eq!(status, Some(0), "{said}");
+        // Nothing was made.
+        assert!(!said.contains("The change is made"), "{said}");
+        said
+    };
+    let carried = |said: &str, to: &str| {
+        let first = format!(
+            "wrote that it had sent what it carried to {to}. It had not yet sent it to 1 other \
+             relay that it was set up with. This machine has read none of it. The look of this \
+             recovery is made once, so what that device carried may be only there."
+        );
+        let at = said
+            .find(&first)
+            .unwrap_or_else(|| panic!("{first}\n{said}"));
+        let yes = said.find("Recover on this machine?").unwrap();
+        assert!(at < yes, "{said}");
+    };
+
+    // Set up with B alone: not set up with A, which the word names by its
+    // key.
+    let new = device_at("new", &[&b]);
+    let said = refused_by_no(&new);
+    println!("{said}");
+    carried(&said, &format!("the relay whose key is {a_key}"));
+    assert!(
+        said.contains(&format!(
+            "To bring it in by this recovery, answer no. On this machine, set up the relay whose \
+             key is {a_key}: the configuration of that device (its `[[network.bootnodes]]`) names \
+             it. Then run `cordelia recover` again. If you answer yes, it comes in later only by \
+             `cordelia sync carry <name> --from <device>`, with the phrase, once this machine \
+             reaches that relay."
+        )),
+        "{said}"
+    );
+    drop(new);
+
+    // Set up with A, by its key, and B, where A is down: reach A.
+    a.stop();
+    let mut again = node_with_relays(
+        "again",
+        "personal",
+        &[
+            (a_named.clone(), Some(a_key.clone())),
+            (format!("127.0.0.1:{}", b.p2p), None),
+        ],
+    );
+    again.start();
+    wait_for("device healthy", &[&again], 30, || healthy(&again));
+    wait_for("the machine reaches B", &[&b, &again], 90, || {
+        let connected = |at: &Value| at["state"] == "connected";
+        relays_of(&again).iter().any(connected).then_some(())
+    });
+    let said = refused_by_no(&again);
+    println!("{said}");
+    carried(&said, &a_named);
+    assert!(
+        said.contains(&format!(
+            "To bring it in by this recovery, answer no. Make sure this machine can reach \
+             {a_named}, and run `cordelia recover` again. If you answer yes, it comes in later \
+             only by `cordelia sync carry <name> --from <device>`, with the phrase, once this \
+             machine reaches {a_named}."
+        )),
+        "{said}"
+    );
+    again.stop();
+}
+
+/// **A recovery ends with status 3 where its look cannot be waited for,
+/// where the device has since applied another change, and on an error
+/// during the wait** (decision 2026-10-19 §4, rule 9): the recovery is
+/// made, and is not known to be at every relay. The program is taken away
+/// before the change is made, so that it cannot be run again for the
+/// wait: the command says where to look, and that the machine is to be
+/// kept on. The error is said on standard error, with that the change is
+/// made and is not to be made again. So it ends where a node of another
+/// version is in this one's place during the wait, and where the look
+/// says of a relay what the command cannot read.
+#[test]
+fn a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    wait_for("the relay holds the change", &[&relay, &laptop], 60, || {
+        holds_the_change(&relay, &laptop, 1).then_some(())
+    });
+    laptop.stop();
+
+    let mut new = device_started("new", &relay);
+    let away = new.home().join("taken-away");
+    std::fs::create_dir_all(&away).unwrap();
+    let program = away.join("cordelia");
+    std::fs::copy(common::BIN, &program).unwrap();
+    new.bin = Some(program.clone());
+    let mut at = new.at_terminal(&["recover", "--name", "new"]);
+    new.bin = None;
+    at.says("Type your recovery phrase, one word at a time");
+    std::fs::remove_file(&program).unwrap();
+    at.types(&words);
+    answers_and_yes(&mut at, &["lost"]);
+    at.says("The change is made (change 2)");
+    let (status, said) = at.ends_with_status_within(Duration::from_secs(60));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains("This command could not go on to say what the look found"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Keep this machine on until nothing is left to send."),
+        "{said}"
+    );
+    assert_eq!(person_of(&new)["change"], 2);
+
+    // The device has since applied another change than the one waited for.
+    let out = new.command(&["recover-made", "7"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{said}");
+    assert!(
+        said.contains("This device has since applied another change: `cordelia devices` says."),
+        "{said}"
+    );
+    // A node of another version in this one's place during the wait, and
+    // a look of which a relay's reach cannot be read: each ends the wait
+    // as an error, with status 3, and not by waiting for ever (decision
+    // 2026-10-19 §4, rule 9).
+    let other_version = Answers::in_the_place_of(&new, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.1-another".into();
+        }
+    });
+    let unreadable = Answers::in_the_place_of(&new, |path, answer| {
+        if path == "/api/v1/devices/list" {
+            for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+                relay.as_object_mut().unwrap().remove("reach");
+            }
+        }
+    });
+    for (through, why) in [
+        (&other_version, "0.0.1-another"),
+        (&unreadable, "what this command cannot read"),
+    ] {
+        let at = new.at_terminal_through(through.port, &["recover-made", "2"]);
+        let (status, said) = at.ends_with_status_within(Duration::from_secs(60));
+        assert_eq!(status, Some(3), "{said}");
+        assert!(
+            said.contains("The change is made (change 2). This command could not go on: "),
+            "{said}"
+        );
+        assert!(said.contains(why), "{said}");
+        assert!(!said.contains("Every relay holds the change."), "{said}");
+    }
+    // The node cannot be asked.
+    new.stop();
+    let out = new.command(&["recover-made", "2"]);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{error}");
+    assert!(
+        error.contains("The change is made (change 2). This command could not go on: "),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Do not make the change again. `cordelia devices` shows whether each relay holds it."
+        ),
+        "{error}"
+    );
 }

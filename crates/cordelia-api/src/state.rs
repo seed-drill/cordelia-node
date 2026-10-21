@@ -356,6 +356,10 @@ impl LeftPlace {
 pub struct LeftAt {
     pub relay: String,
     pub read: LeftRead,
+    /// The node key of the connection that it was read on, where a read
+    /// was asked of one: a recovery judges the device it recovers from by
+    /// the keys of the relays it read (decision 2026-10-19 §4, rule 10).
+    pub key: Option<[u8; 32]>,
 }
 
 /// What a command's work asks of the node through the door for a carry

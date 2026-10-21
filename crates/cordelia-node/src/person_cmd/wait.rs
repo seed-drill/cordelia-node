@@ -267,6 +267,116 @@ pub(crate) fn end_of_look(
     Ok((relays, word, end))
 }
 
+// ── A recovery's wait ───────────────────────────────────────────────
+
+/// How a recovery's wait for the change at each relay ends (decision
+/// 2026-10-19 §4, rule 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryEnd {
+    /// Every relay holds the change: R1, and status 0.
+    Recovered,
+    /// Not done for a recovery, status 3: some relay lacks the change, and
+    /// each relay that lacks it is OUT and lacking, or REFUSING.
+    NotDone,
+}
+
+impl RecoveryEnd {
+    /// The exit status of the recovery that ends so.
+    pub fn status(self) -> i32 {
+        match self {
+            RecoveryEnd::Recovered => 0,
+            RecoveryEnd::NotDone => NOT_AT_EVERY_RELAY_STATUS,
+        }
+    }
+}
+
+/// A recovery's end with status 0: every relay holds the change. There is
+/// no condition on what waits, nor on the machine's own word: its look may
+/// stay pending until the next statement, and then neither word is
+/// written.
+pub(crate) fn ends_recovered(relays: &[Classed]) -> bool {
+    !relays.is_empty() && relays.iter().all(|(_, holds)| *holds)
+}
+
+/// Not done for a recovery: some relay lacks the change, and each relay
+/// that lacks it is OUT and lacking, or REFUSING. A relay that holds the
+/// change is asked nothing: what waits there is said by the lines that
+/// came before the wait. With no relay it does not hold, as end 3 does
+/// not: the node has not yet said where it stands at its relays.
+pub(crate) fn ends_recovery_not_done(relays: &[Classed]) -> bool {
+    let lacking = || relays.iter().filter(|(_, holds)| !holds);
+    let each_settled =
+        lacking().all(|(class, _)| matches!(class, Some(Class::OutLacking | Class::Refusing)));
+    lacking().next().is_some() && each_settled
+}
+
+/// The first of a recovery's two ends that holds, or none while time can
+/// still move a relay that lacks the change (decision 2026-10-19 §4, rule
+/// 9).
+pub(crate) fn recovery_end_of(relays: &[Classed]) -> Option<RecoveryEnd> {
+    if ends_recovered(relays) {
+        Some(RecoveryEnd::Recovered)
+    } else if ends_recovery_not_done(relays) {
+        Some(RecoveryEnd::NotDone)
+    } else {
+        None
+    }
+}
+
+/// What a look after a recovery says of its end: its relays, and the end
+/// that holds, where one does. Each relay's class is read from the look,
+/// as the node gives it.
+///
+/// **No end holds while what is known of a relay is about another entry
+/// than the recovery's change** (decision 2026-10-19 §4, rule 9, as rule
+/// 8 has it): the classes come from the node's last pass, which may have
+/// been before the change was kept. Each relay's reach names the entry
+/// it is about, and that must be the kept entry that the look names. A
+/// look that says of a relay what cannot be read is an error, and so the
+/// end of the wait with status 3.
+pub(crate) fn recovery_end_of_look(
+    seen: &Value,
+) -> anyhow::Result<(Vec<RelayAt>, Option<RecoveryEnd>)> {
+    let relays = relays_of(seen)?;
+    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, None));
+    }
+    let classes: Vec<Classed> = relays
+        .iter()
+        .map(|relay| (relay.class(), relay.holds()))
+        .collect();
+    let end = recovery_end_of(&classes);
+    Ok((relays, end))
+}
+
+/// R0: what a recovery says where a relay does not hold the change when
+/// its look has ended (decision 2026-10-19 §5).
+pub(crate) fn recovery_first_line() -> String {
+    format!(
+        "This command stays until every relay holds the change. It ends sooner, with status \
+         {NOT_AT_EVERY_RELAY_STATUS}, once each relay that is not known to hold it cannot be \
+         reached, or refuses it, for five minutes. Stopping it stops nothing: the node goes on, \
+         and the recovery stays made."
+    )
+}
+
+/// What a recovery's wait says at its end (decision 2026-10-19 §5): R1;
+/// or S8 for each relay that lacks the change, in the order of the
+/// configuration, then S9 where a relay is reached, then S10 or S11. It
+/// never says that the machine may be closed.
+pub(crate) fn recovery_end_lines(end: RecoveryEnd, relays: &[RelayAt], now: i64) -> Vec<String> {
+    match end {
+        RecoveryEnd::Recovered => vec!["Every relay holds the change.".into()],
+        RecoveryEnd::NotDone => {
+            let lacking: Vec<&RelayAt> = relays.iter().filter(|relay| !relay.holds()).collect();
+            not_done_lines(relays, &lacking, now)
+        }
+    }
+}
+
 // ── The words ───────────────────────────────────────────────────────
 
 /// A moment that the node noted by the wall clock, as a person reads it
@@ -385,7 +495,13 @@ pub(crate) fn end_lines(end: End, relays: &[RelayAt], word: OwnWord, now: i64) -
                 .into(),
         ],
         End::Warned => warned_lines(relays, word, now),
-        End::NotDone => not_done_lines(relays, now),
+        End::NotDone => {
+            let not_ok: Vec<&RelayAt> = relays
+                .iter()
+                .filter(|relay| relay.class() != Some(Class::Ok))
+                .collect();
+            not_done_lines(relays, &not_ok, now)
+        }
     }
 }
 
@@ -476,12 +592,14 @@ fn refusing_line(relay: &RelayAt, now: i64) -> String {
     }
 }
 
-/// End 3: S8 for each relay that is not OK, in the order of the
-/// configuration; then S9 where a relay is reached; then S10, S10b or
-/// S11. It never says that the machine may be closed.
-fn not_done_lines(relays: &[RelayAt], now: i64) -> Vec<String> {
+/// End 3: S8 for each relay of `said_of`, in the order of the
+/// configuration (at end 3 of the wait after a change, each that is not
+/// OK; at a recovery's, each that lacks the change); then S9 where a relay
+/// is reached; then S10, S10b or S11. It never says that the machine may
+/// be closed.
+fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<String> {
     let mut lines = Vec::new();
-    for relay in relays {
+    for relay in said_of {
         match relay.class() {
             Some(Class::OutLacking) => lines.push(format!(
                 "  {} is not known to hold the change, and {}.",
@@ -640,7 +758,7 @@ pub(crate) fn could_not_go_on(number: u64, error: &anyhow::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cordelia_api::at_relays::known::{self, Answer, OfRelay, RelayId};
     use cordelia_api::look::relays as looked;
@@ -786,6 +904,11 @@ mod tests {
     ///   the node will not write over the device's word, one end holds;
     ///   and wherever each relay is in a class and one lacks the change,
     ///   end 3 holds, whatever the word.
+    /// - **The same for a recovery's wait** (rule 9): neither end with
+    ///   status 0 holds while a relay lacks the change, nor while a relay
+    ///   given no key is not connected; its two ends never hold together;
+    ///   and wherever each relay holds the change, or is OUT and lacking,
+    ///   or REFUSING, one of them holds, whatever the word.
     ///
     /// The counts are appendix A's.
     #[test]
@@ -798,7 +921,7 @@ mod tests {
             (OwnWord::Carried, false),
             (OwnWord::Sent, false),
         ];
-        let check = |relays: &[OneRelay], counts: &mut (usize, usize)| {
+        let check = |relays: &[OneRelay], counts: &mut (usize, usize, usize)| {
             let classed: Vec<Classed> = relays.iter().map(|r| (r.class, r.holds)).collect();
             let lacks = relays.iter().any(|r| !r.holds);
             let every_classed = relays.iter().all(|r| r.class.is_some());
@@ -827,15 +950,34 @@ mod tests {
                     assert!(e3, "end 3 waits on the word: {relays:?} {word:?}");
                 }
             }
+            // A recovery's wait asks nothing of the word.
+            let recovered = ends_recovered(&classed);
+            let not_done = ends_recovery_not_done(&classed);
+            assert!(!(recovered && lacks), "SAFETY of a recovery {relays:?}");
+            assert!(
+                !(recovered && relays.iter().any(|r| !r.keyed && !r.connected)),
+                "{relays:?}"
+            );
+            assert!(!(recovered && not_done), "{relays:?}");
+            let end = recovery_end_of(&classed);
+            assert_eq!(end.is_some(), recovered || not_done);
+            assert_eq!(end.is_some_and(|end| end.status() == 0), recovered);
+            let stable = relays
+                .iter()
+                .all(|r| r.holds || matches!(r.class, Some(Class::OutLacking | Class::Refusing)));
+            if stable {
+                counts.2 += 1;
+                assert!(recovered || not_done, "LIVENESS of a recovery {relays:?}");
+            }
         };
-        let mut two = (0, 0);
+        let mut two = (0, 0, 0);
         for a in &one {
             for b in &one {
                 check(&[*a, *b], &mut two);
             }
         }
-        assert_eq!(two, (36_864, 9_744));
-        let mut three = (0, 0);
+        assert_eq!((two.0, two.1), (36_864, 9_744));
+        let mut three = (0, 0, 0);
         for a in &one {
             for b in &one {
                 for c in &one {
@@ -843,7 +985,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(three, (3_538_944, 489_120));
+        assert_eq!((three.0, three.1), (3_538_944, 489_120));
+        // Of each relay state, how many a recovery's wait has an end in.
+        let stable = one
+            .iter()
+            .filter(|r| r.holds || matches!(r.class, Some(Class::OutLacking | Class::Refusing)))
+            .count();
+        assert_eq!(two.2, stable.pow(2));
+        assert_eq!(three.2, stable.pow(3));
     }
 
     /// End 3 asks nothing of the device's own word where a relay lacks the
@@ -1074,11 +1223,46 @@ mod tests {
         );
     }
 
+    /// A recovery's wait ends by the relays that lack the change
+    /// (decision 2026-10-19 §4, rule 9): at R1, with status 0, where every
+    /// relay holds it, whatever its class; not done, with status 3, where
+    /// each relay that lacks it is OUT and lacking, or REFUSING; and at
+    /// neither while a relay that lacks it is in no class. A look that
+    /// lists no relay ends nothing.
+    #[test]
+    fn a_recovery_ends_by_the_relays_that_lack_the_change() {
+        let ok = (Some(Class::Ok), true);
+        let stuck = (Some(Class::Stuck), true);
+        let moving = (None, true);
+        let out_holding = (Some(Class::OutHolding), true);
+        let out_lacking = (Some(Class::OutLacking), false);
+        let refusing = (Some(Class::Refusing), false);
+        let lacks_for_now = (None, false);
+        for holding in [vec![ok], vec![stuck, moving], vec![out_holding, ok]] {
+            assert_eq!(recovery_end_of(&holding), Some(RecoveryEnd::Recovered));
+            // Where no relay lacks the change, a recovery is not "not done".
+            assert!(!ends_recovery_not_done(&holding), "{holding:?}");
+        }
+        for lacking in [
+            vec![ok, out_lacking],
+            vec![refusing],
+            vec![moving, out_lacking, refusing],
+        ] {
+            assert_eq!(recovery_end_of(&lacking), Some(RecoveryEnd::NotDone));
+        }
+        for waits in [vec![ok, lacks_for_now], vec![lacks_for_now, out_lacking]] {
+            assert_eq!(recovery_end_of(&waits), None);
+        }
+        assert_eq!(recovery_end_of(&[]), None);
+        assert_eq!(RecoveryEnd::Recovered.status(), 0);
+        assert_eq!(RecoveryEnd::NotDone.status(), 3);
+    }
+
     // ── The looks, as the node gives them ───────────────────────────
 
     /// What a relay is, by the events that the node meets.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Scenario {
+    pub(crate) enum Scenario {
         Ok,
         Moving,
         Stuck,
@@ -1105,7 +1289,7 @@ mod tests {
     /// What the node knows of a relay's reach once it has met the events
     /// of `scenario`, by its own [`Reach`], with a clock that the test
     /// runs ahead.
-    fn reached(scenario: Scenario) -> Reached {
+    pub(crate) fn reached(scenario: Scenario) -> Reached {
         let clock = Clock::system();
         let reach = Reach::new(clock.clone());
         let key = (scenario != Scenario::KeylessGone).then_some(BY);
@@ -1170,7 +1354,7 @@ mod tests {
     /// A look after change 3, built by the node's own function from where
     /// the device stands at each relay (`cordelia_api::look::relays`), with
     /// this device's own word and the node's `word_to_come`.
-    fn look_at(relays: &[(Scenario, Reached)], word: OwnWord, to_come: bool) -> Value {
+    pub(crate) fn look_at(relays: &[(Scenario, Reached)], word: OwnWord, to_come: bool) -> Value {
         let at = AtRelays {
             relays: relays
                 .iter()
@@ -1355,6 +1539,45 @@ mod tests {
         assert_eq!(end, None);
         let (_, _, end) = end_of_look_ok(&look_at(&stuck, OwnWord::None, false), 3, &own);
         assert_eq!(end, Some(End::NotDone));
+    }
+
+    /// A recovery's wait gives no end on what the node knows of its relays
+    /// from before the change (decision 2026-10-19 §4, rule 9, as rule 8
+    /// has it): a look whose relays' reach is about another entry than the
+    /// kept entry it names, or that names none, gives no R1 and no status
+    /// 0, and no end at all. Once every relay's reach is about the kept
+    /// entry, the end holds. A relay whose reach cannot be read is an
+    /// error.
+    #[test]
+    fn a_recoverys_look_whose_classes_are_about_the_entry_before_ends_nothing() {
+        let ok = (Scenario::Ok, reached(Scenario::Ok));
+        let out = (Scenario::OutHolding, reached(Scenario::OutHolding));
+        let lacking = (Scenario::OutLacking, reached(Scenario::OutLacking));
+        for (relays, end) in [
+            (vec![ok.clone(), out.clone()], RecoveryEnd::Recovered),
+            (vec![ok.clone(), lacking.clone()], RecoveryEnd::NotDone),
+        ] {
+            let seen = look_at(&relays, OwnWord::None, false);
+            assert_eq!(recovery_end_of_look(&seen).unwrap().1, Some(end));
+            let mut before = seen.clone();
+            before["latest"] = hex::encode(BEFORE).into();
+            assert_eq!(recovery_end_of_look(&before).unwrap().1, None, "{end:?}");
+            let mut one = seen.clone();
+            one["relays"][1]["reach"]["about"] = hex::encode(BEFORE).into();
+            assert_eq!(recovery_end_of_look(&one).unwrap().1, None, "{end:?}");
+            let mut none = seen.clone();
+            none.as_object_mut().unwrap().remove("latest");
+            assert_eq!(recovery_end_of_look(&none).unwrap().1, None, "{end:?}");
+            let mut unread = seen.clone();
+            unread["relays"][0]["reach"] = "what this command cannot read".into();
+            assert!(recovery_end_of_look(&unread).is_err(), "{end:?}");
+            let mut missing = seen.clone();
+            missing["relays"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("reach");
+            assert!(recovery_end_of_look(&missing).is_err(), "{end:?}");
+        }
     }
 
     /// No end holds on what the node knows of its relays from before the
