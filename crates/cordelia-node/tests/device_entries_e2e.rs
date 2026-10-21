@@ -9894,6 +9894,112 @@ async fn a_relay_that_refuses_what_waits_for_five_minutes_is_stuck() {
     assert_eq!(reach.class, None);
 }
 
+/// This device's own entry in the slot of its carried word, as its store
+/// holds it (decision 2026-10-19 §4, rule 4): the word, or its delete.
+fn carried_word_of(device: &Device) -> Option<Value> {
+    let secret = device.personal_secret();
+    let name = cordelia_api::person::reached_name(&device.key()).unwrap();
+    let slot = slot_id(&derive::slot_key(&secret).unwrap(), &name);
+    let (personal, key) = (device.personal(), device.key());
+    let held = entries::author_entry(&device.db(), &personal, &slot, &key).unwrap()?;
+    Some(held.entry.check().unwrap().open(&secret).unwrap().value)
+}
+
+/// A whole pass writes the carried word where one relay is OK and the
+/// other is out of reach (decision 2026-10-19 §4, rule 4), and writes
+/// `sent`, deleting the word, once every relay is connected and nothing
+/// that was carried waits at either. The status says whether the next
+/// whole pass would write either word, and each relay's key where the
+/// device knows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_writes_the_carried_word_where_the_other_relay_is_out_of_reach() {
+    let (a, b) = (StandIn::started().await, StandIn::started().await);
+    a.holds_what_is_proved(true);
+    b.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    started_before_its_relays(&device);
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.writes("notes", "a.md", "one");
+    device.set_up_with("b");
+    device.connects_to("a", a.port, a.key).await;
+    // A change: what the device holds is carried into the new channels.
+    device.changes(&phrase(), &[&device], &[]);
+    let b_id = relay_id("b");
+    let mut secs = 0;
+    while secs < 300 {
+        device.passes().await;
+        assert_eq!(carried_word_of(&device), None, "at {secs} s");
+        assert!(!device.status().word_to_come, "at {secs} s");
+        device.clock.run_ahead(Duration::from_secs(30));
+        secs += 30;
+        device.engine.reach().dial_begins(&b_id);
+        device.engine.reach().dial_ends(&b_id, false);
+    }
+    assert!(!says_sent(&device));
+    // B is out of reach and lacks the change; A is OK. A pass that only
+    // sends writes no word, and says that the next whole pass would.
+    device.sends().await;
+    assert_eq!(device.at("b").reach.class, Some(Class::OutLacking));
+    assert_eq!(device.at("a").reach.class, Some(Class::Ok));
+    assert!(device.status().word_to_come);
+    assert_eq!(carried_word_of(&device), None);
+    // A pass given fewer relays than the node is configured with is not
+    // believed: it writes no word.
+    device.state.own_channels.set_up_with(3);
+    device.passes().await;
+    assert_eq!(carried_word_of(&device), None);
+    assert!(!device.status().word_to_come);
+    device.state.own_channels.set_up_with(2);
+    device.passes().await;
+    let word = carried_word_of(&device).expect("the carried word is written");
+    assert_eq!(
+        cordelia_crypto::reached::CarriedWord::from_value(&word),
+        Ok(cordelia_crypto::reached::CarriedWord {
+            number: 2,
+            keys: vec![a.key],
+            more: 0,
+            not_yet: 1,
+        })
+    );
+    assert!(!says_sent(&device));
+    assert!(!device.status().word_to_come);
+    assert_eq!(device.at("a").key, Some(a.key));
+    assert_eq!(device.at("b").key, None);
+
+    // B is reached, and takes everything: `sent`, and the word deleted.
+    device.connects_to("b", b.port, b.key).await;
+    for _ in 0..3 {
+        device
+            .clock
+            .run_ahead(Duration::from_secs(OUTBOX_REFUSED_RETRY_MAX_SECS));
+        device.passes().await;
+    }
+    assert!(says_sent(&device));
+    assert_eq!(carried_word_of(&device), Some(Value::Delete));
+    assert_eq!(device.at("b").key, Some(b.key));
+    assert!(!device.status().word_to_come);
+    // Not connected, B is known by the key that gave its latest answer.
+    device.disconnects("b");
+    device.passes().await;
+    assert_eq!(device.at("b").key, Some(b.key));
+}
+
+/// A relay that the device is connected to is known by the key of that
+/// connection before it has answered anything (decision 2026-10-19, rule
+/// 6): its rows of what was sent are kept by that key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_is_known_by_the_key_of_its_connection_before_it_answers() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    relay.says(Say::Reset, Say::Reset);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    assert_eq!(answer_of(&device, "relay"), None);
+    assert_eq!(device.at("relay").key, Some(relay.key));
+}
+
 /// An answer that the relay does not hold the change is believed though
 /// it could not be written down (decision 2026-10-19 §1): where the
 /// database takes no write, a relay that held the entry and now answers

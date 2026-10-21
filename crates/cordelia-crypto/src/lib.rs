@@ -19,7 +19,9 @@
 //! channel's key with a signature of its own ([`proof`]). A key is shown
 //! to a person beside the first words of its fingerprint ([`fingerprint`]).
 //! The value of a message between a person's own agents, and its place in
-//! the messages channel, are in [`message`] (decision 2026-10-09).
+//! the messages channel, are in [`message`] (decision 2026-10-09). The
+//! value of a device's word that it has sent what it carried to the relays
+//! it reaches is in [`reached`] (decision 2026-10-19).
 
 pub mod addition;
 pub mod aes_gcm;
@@ -37,6 +39,7 @@ pub mod message;
 pub mod phrase;
 pub mod proof;
 pub mod psk_envelope;
+pub mod reached;
 pub mod signing;
 pub mod slots;
 pub mod statement;

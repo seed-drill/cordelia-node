@@ -41,7 +41,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use cordelia_core::protocol::{
-    MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS, STATEMENTS_LEFT_SAID_BELOW,
+    FALLBACK_PEER_KEYS, FALLBACK_PEERS, MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS,
+    STATEMENTS_LEFT_SAID_BELOW,
 };
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
@@ -50,6 +51,7 @@ use cordelia_crypto::derive;
 use cordelia_crypto::entry::Value;
 use cordelia_crypto::fingerprint;
 use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::reached::CarriedWord;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::Statement;
 use cordelia_crypto::version;
@@ -64,7 +66,7 @@ use crate::leaving::{Among, among, left_name};
 use crate::names;
 use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
-    kept_entry, latest_entry, read_applied_word,
+    kept_entry, latest_entry, reached_name, read_applied_word,
 };
 use crate::state::{AtRelays, CannotGoOn};
 
@@ -118,8 +120,37 @@ pub struct Listed {
     /// Whether it says that it has sent what it carried when it applied
     /// the statement that this device has applied.
     pub sent: bool,
+    /// Its carried word under that statement, where it is read (decision
+    /// 2026-10-19 §4, rule 5): never beside `sent`.
+    pub carried_word: Option<CarriedWordLook>,
     /// Whether it has said that it left.
     pub left: bool,
+}
+
+/// A device's carried word, as a look shows it (decision 2026-10-19 §4,
+/// rules 4 to 6): what it carried is at the relays whose keys it names,
+/// and more; it may still wait at `not_yet` other relays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CarriedWordLook {
+    /// The relays' node keys, as a key is written, in the order of that
+    /// device's configuration.
+    pub keys: Vec<String>,
+    /// How many more relays hold what it carried: 0 unless it names 8.
+    pub more: u64,
+    /// At how many relays that it is set up with what it carried may still
+    /// wait.
+    pub not_yet: u64,
+}
+
+impl CarriedWordLook {
+    fn of(word: &CarriedWord) -> Result<Self, PersonError> {
+        let keys = word.keys.iter().map(encode_public_key);
+        Ok(Self {
+            keys: keys.collect::<Result<_, _>>()?,
+            more: word.more,
+            not_yet: word.not_yet,
+        })
+    }
 }
 
 /// A device added since the statement, or a record that is not counted.
@@ -139,6 +170,8 @@ pub struct AddedSince {
     pub applied: Option<u64>,
     /// As [`Listed::sent`].
     pub sent: bool,
+    /// As [`Listed::carried_word`].
+    pub carried_word: Option<CarriedWordLook>,
     pub left: bool,
 }
 
@@ -246,6 +279,14 @@ pub struct AtRelayLook {
     /// Why this device refuses the change that the relay holds, where it
     /// does.
     pub refuses: Option<String>,
+    /// Its node key, as a key is written, where the device knows one:
+    /// what another device's carried word names it by (decision
+    /// 2026-10-19, rule 6).
+    pub key: Option<String>,
+    /// Whether nothing that this device carried waits there, by its rows
+    /// of what it sent, reached or not: given where its own carried word
+    /// is read and the relay's key is known (decision 2026-10-19, rule 7).
+    pub has_what_was_carried: Option<bool>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -459,6 +500,7 @@ pub fn look(
             Some(held) => {
                 of_its_person(conn, identity, &held, at_relays, &mut look)?;
                 of_its_names(conn, &held, now, &mut look)?;
+                what_was_carried_at(conn, identity, at_relays, &mut look)?;
             }
         }
         for notice in &look.notices {
@@ -535,6 +577,7 @@ fn of_its_person(
             maker: device.key == statement.maker,
             applied: reader.applied(conn, &device.key)?,
             sent: reader.sent(conn, &device.key)?,
+            carried_word: reader.carried_word(conn, &device.key, &counting)?,
             left: reader.left(conn, &device.key)?.is_some() || kept_left.contains(&device.key),
         });
     }
@@ -576,6 +619,7 @@ fn of_its_person(
             why_not,
             applied: reader.applied(conn, &shown.key)?,
             sent: reader.sent(conn, &shown.key)?,
+            carried_word: reader.carried_word(conn, &shown.key, &counting)?,
             left: reader.left(conn, &shown.key)?.is_some(),
         });
     }
@@ -1037,6 +1081,31 @@ impl Reader {
         Ok(self.applied_word(conn, key)? == Some((self.number, true)))
     }
 
+    /// The device's carried word, where it is read (decision 2026-10-19 §4,
+    /// rule 5): the current version of its slot among the entries that
+    /// the key in the name signed, and no delete; signed by a key that
+    /// counts; of the statement that this device has applied; beside a
+    /// word under `applied/` of that number without ` sent`, since where a
+    /// device has both, `sent` counts; and well formed. Any other word is
+    /// no word.
+    fn carried_word(
+        &self,
+        conn: &Connection,
+        key: &[u8; 32],
+        counting: &Counting,
+    ) -> Result<Option<CarriedWordLook>, PersonError> {
+        if !counting.counts(key) || self.applied_word(conn, key)? != Some((self.number, false)) {
+            return Ok(None);
+        }
+        let Some((_, value)) = self.word(conn, key, &reached_name(key)?)? else {
+            return Ok(None);
+        };
+        match CarriedWord::from_value(&value) {
+            Ok(word) if word.number == self.number => Ok(Some(CarriedWordLook::of(&word)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// The device's word that it has applied a statement: the number, and
     /// whether it has sent what it carried.
     fn applied_word(
@@ -1404,8 +1473,84 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             connected_secs: None,
             another_form: relay.another_form,
             refuses: relay.refuses.clone(),
+            key: relay.key.and_then(|key| encode_public_key(&key).ok()),
+            has_what_was_carried: None,
         })
         .collect()
+}
+
+/// Where this device's own carried word is read, whether nothing that it
+/// carried waits at each relay whose key it knows (decision 2026-10-19,
+/// rule 7): by its rows of what it sent, which are kept by key, whether
+/// or not the relay is reached now. The relays that a line about its word
+/// names as holding what it carried, and the others, never overlap.
+fn what_was_carried_at(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    at_relays: &AtRelays,
+    look: &mut Look,
+) -> Result<(), PersonError> {
+    let own = look
+        .devices
+        .iter()
+        .map(|device| (device.this_device, &device.carried_word));
+    let added = look
+        .added
+        .iter()
+        .map(|device| (device.this_device, &device.carried_word));
+    if !own.chain(added).any(|(this, word)| this && word.is_some()) {
+        return Ok(());
+    }
+    for (relay, at) in look.relays.iter_mut().zip(&at_relays.relays) {
+        if let Some(key) = at.key {
+            let waits = crate::at_relays::carried_waits_at(conn, identity, &key)?;
+            relay.has_what_was_carried = Some(!waits);
+        }
+    }
+    Ok(())
+}
+
+/// A relay that another device's carried word names by its node key
+/// `key`, as a key is written, as this device names it (decision
+/// 2026-10-19, rule 6): by the name that its own configuration gives it,
+/// where it knows that relay's key (`relays`: each relay that it is set up
+/// with, by name, with its key where it knows one); else, for a default
+/// relay, by its name in the program; else by its key, written whole.
+pub fn relay_named(key: &str, relays: &[(&str, Option<&str>)]) -> String {
+    if let Some((name, _)) = relays.iter().find(|(_, known)| *known == Some(key)) {
+        return name.to_string();
+    }
+    match FALLBACK_PEER_KEYS
+        .iter()
+        .position(|default| *default == key)
+    {
+        Some(at) => FALLBACK_PEERS[at].to_string(),
+        None => format!("the relay whose key is {key}"),
+    }
+}
+
+/// Things in a sentence: "A", "A and B", "A, B and C".
+pub fn joined(things: &[String]) -> String {
+    match things {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    }
+}
+
+/// The relays that a device's carried word names as holding what it
+/// carried, in a sentence (decision 2026-10-19 §5, `<held>`): each named
+/// as [`relay_named`] names it, and "and <m> more" where it counts more.
+pub fn held_named(word: &CarriedWordLook, relays: &[(&str, Option<&str>)]) -> String {
+    let named: Vec<String> = word
+        .keys
+        .iter()
+        .map(|key| relay_named(key, relays))
+        .collect();
+    match word.more {
+        0 => joined(&named),
+        more => format!("{} and {more} more", named.join(", ")),
+    }
 }
 
 impl AtRelayLook {
@@ -2173,6 +2318,7 @@ mod tests {
             another_form: 0,
             refuses: None,
             reach: Default::default(),
+            key: None,
         };
         let full = NoRoom {
             at: 1_800_000_000,
@@ -2186,6 +2332,7 @@ mod tests {
                 relay("three.example:1", Some(false), true, Some(full)),
             ],
             cannot_go_on: None,
+            word_to_come: false,
         };
         let seen_at =
             |s: &Several, at: &AtRelays| look(&s[0].conn, &s[0].identity, at, s.now).unwrap();
@@ -2406,5 +2553,200 @@ mod tests {
             .expect("the look says what was not carried");
         assert!(line.contains(&format!("{just}... in lab")), "{line}");
         assert!(!line.contains("x.md"), "{line}");
+    }
+
+    // ── The carried word (decision 2026-10-19 §4, rules 5 and 6) ────
+
+    /// Device 1's look at device 0, after a change under which both
+    /// applied statement 2, once device 1 is given what device 0 holds.
+    fn after_a_change() -> Several {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        s.write(0, "lab", "notes.md", "one");
+        s.meet(&[0, 1]);
+        let change = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        s.pass(0, 1);
+        s
+    }
+
+    /// Device `signer` writes `value` under `name` in the personal channel
+    /// at `rev`, and device 1 takes it through the one door.
+    fn written(s: &mut Several, signer: usize, rev: u64, name: &str, value: Value) {
+        let personal = s[1].personal();
+        let entry = crate::several::entry_by(&s[signer].identity, &personal, rev, name, value, &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &entry, now).unwrap();
+    }
+
+    /// What device 1's look reads of device 0's carried word.
+    fn read_of_0(s: &Several) -> Option<CarriedWordLook> {
+        let seen = look(
+            &s[1].conn,
+            &s[1].identity,
+            &AtRelays::default(),
+            crate::several::START,
+        )
+        .unwrap();
+        let key = encode_public_key(&s.key(0)).unwrap();
+        let device = seen.devices.iter().find(|device| device.device.key == key);
+        device.unwrap().carried_word.clone()
+    }
+
+    /// The bytes of a word, put together by hand: the number, the count of
+    /// keys and the keys, and the two counts.
+    fn bytes_of(number: u64, keys: &[[u8; 32]], more: u16, not_yet: u16) -> Value {
+        let mut bytes = number.to_be_bytes().to_vec();
+        bytes.push(keys.len() as u8);
+        for key in keys {
+            bytes.extend_from_slice(key);
+        }
+        bytes.extend_from_slice(&more.to_be_bytes());
+        bytes.extend_from_slice(&not_yet.to_be_bytes());
+        Value::Other(bytes)
+    }
+
+    /// A device reads a carried word only from the key in its slot's
+    /// name, signed by a key that counts, under the statement it has
+    /// applied, beside that device's word under `applied/` of that number
+    /// without ` sent`, and well formed (decision 2026-10-19 §4, rule 5).
+    /// Where `sent` is there too, `sent` is what is read.
+    #[test]
+    fn the_carried_word_is_read_only_from_its_own_key_under_the_applied_number() {
+        let mut s = after_a_change();
+        let reached = reached_name(&s.key(0)).unwrap();
+        let (a, b) = ([0xa1; 32], [0xa2; 32]);
+        let looked = |keys: &[[u8; 32]], more: u64, not_yet: u64| CarriedWordLook {
+            keys: keys
+                .iter()
+                .map(|key| encode_public_key(key).unwrap())
+                .collect(),
+            more,
+            not_yet,
+        };
+        assert_eq!(read_of_0(&s), None);
+        // Another device signed the slot: not read.
+        written(&mut s, 1, 10, &reached, bytes_of(2, &[a], 0, 1));
+        assert_eq!(read_of_0(&s), None);
+        // Its own, well formed: read, a fourth field of 0 among them.
+        written(&mut s, 0, 11, &reached, bytes_of(2, &[a, b], 0, 0));
+        assert_eq!(read_of_0(&s), Some(looked(&[a, b], 0, 0)));
+        // Each malformed word is no word, and the next good one is read.
+        let nine: Vec<[u8; 32]> = (1..=9).map(|n| [n; 32]).collect();
+        let eight = &nine[..8];
+        let mut rev = 12;
+        for (bad, why) in [
+            (bytes_of(3, &[a], 0, 1), "of another number"),
+            (bytes_of(2, &nine, 0, 0), "nine keys"),
+            (bytes_of(2, &[], 0, 2), "no key"),
+            (bytes_of(2, &[a, a], 0, 0), "a key twice"),
+            (
+                bytes_of(2, &[a], 1, 0),
+                "a third field with fewer than eight keys",
+            ),
+            (bytes_of(2, eight, 257, 0), "a count over 256"),
+            (bytes_of(2, &[a], 0, 257), "a count over 256"),
+            (Value::Other(vec![0; 3]), "malformed"),
+            (Value::Text("2".into()), "a text"),
+            (Value::Delete, "a delete"),
+        ] {
+            written(&mut s, 0, rev, &reached, bad);
+            assert_eq!(read_of_0(&s), None, "{why}");
+            written(&mut s, 0, rev + 1, &reached, bytes_of(2, &[a], 0, 1));
+            assert_eq!(read_of_0(&s), Some(looked(&[a], 0, 1)), "after {why}");
+            rev += 2;
+        }
+        // Eight keys, and more counted, at the bounds.
+        written(&mut s, 0, rev, &reached, bytes_of(2, eight, 256, 256));
+        assert_eq!(read_of_0(&s), Some(looked(eight, 256, 256)));
+        rev += 1;
+        written(&mut s, 0, rev, &reached, bytes_of(2, &[a], 0, 1));
+
+        // The key does not count: by a counting in which it is not.
+        let held = held(&s[1].conn).unwrap().unwrap();
+        let statement = &held.statement.statement;
+        let kept = held_rows::additions(&s[1].conn).unwrap();
+        let reader = Reader::of(&s[1].conn, statement, &kept).unwrap();
+        let counts = Counting::of(statement, &kept);
+        let key = s.key(0);
+        let word = reader.carried_word(&s[1].conn, &key, &counts).unwrap();
+        assert_eq!(word, Some(looked(&[a], 0, 1)));
+        let mut alone = statement.clone();
+        alone.devices.retain(|device| device.key != key);
+        let not = Counting::of(&alone, &[]);
+        assert!(!not.counts(&key));
+        let word = reader.carried_word(&s[1].conn, &key, &not).unwrap();
+        assert_eq!(word, None);
+
+        // Its word under `applied/` is of another number.
+        let applied = applied_name(&s.key(0)).unwrap();
+        written(&mut s, 0, 50, &applied, Value::Text("3".into()));
+        assert_eq!(read_of_0(&s), None);
+        // Of this number, and sent: `sent` is read, and not this.
+        written(&mut s, 0, 51, &applied, Value::Text("2 sent".into()));
+        assert_eq!(read_of_0(&s), None);
+        let seen = look(
+            &s[1].conn,
+            &s[1].identity,
+            &AtRelays::default(),
+            crate::several::START,
+        )
+        .unwrap();
+        assert!(
+            seen.devices
+                .iter()
+                .any(|device| !device.this_device && device.sent)
+        );
+        // Of this number alone: read again.
+        written(&mut s, 0, 52, &applied, Value::Text("2".into()));
+        assert_eq!(read_of_0(&s), Some(looked(&[a], 0, 1)));
+    }
+
+    /// A relay that another device's carried word names is shown three
+    /// ways (decision 2026-10-19, rule 6): by the name that this device's
+    /// configuration gives it, where it knows its key; else, for a default
+    /// relay, by its name in the program; else by its key, written whole.
+    #[test]
+    fn a_relay_is_named_three_ways() {
+        let laptop_relay = encode_public_key(&[0xa1; 32]).unwrap();
+        let unknown = encode_public_key(&[0xa3; 32]).unwrap();
+        let relays = [
+            ("relay-a.example:9474", Some(laptop_relay.as_str())),
+            ("relay-b.example:9474", None),
+        ];
+        assert_eq!(relay_named(&laptop_relay, &relays), "relay-a.example:9474");
+        assert_eq!(
+            relay_named(FALLBACK_PEER_KEYS[1], &relays),
+            FALLBACK_PEERS[1]
+        );
+        assert_eq!(
+            relay_named(&unknown, &relays),
+            format!("the relay whose key is {unknown}")
+        );
+        // A default relay set up under a name of this device's own goes by
+        // that name.
+        let renamed = [("my-relay:9474", Some(FALLBACK_PEER_KEYS[0]))];
+        assert_eq!(
+            relay_named(FALLBACK_PEER_KEYS[0], &renamed),
+            "my-relay:9474"
+        );
+        // With more counted.
+        let word = CarriedWordLook {
+            keys: vec![laptop_relay.clone(), unknown.clone()],
+            more: 0,
+            not_yet: 1,
+        };
+        assert_eq!(
+            held_named(&word, &relays),
+            format!("relay-a.example:9474 and the relay whose key is {unknown}")
+        );
+        let more = CarriedWordLook { more: 3, ..word };
+        assert_eq!(
+            held_named(&more, &relays),
+            format!("relay-a.example:9474, the relay whose key is {unknown} and 3 more")
+        );
+        assert_eq!(joined(&["a".into(), "b".into(), "c".into()]), "a, b and c");
+        assert_eq!(joined(&["a".into()]), "a");
     }
 }

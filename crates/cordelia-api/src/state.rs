@@ -883,6 +883,12 @@ pub struct AtRelays {
     pub relays: Vec<AtRelay>,
     /// Why the device cannot go on, where it cannot.
     pub cannot_go_on: Option<CannotGoOn>,
+    /// Whether the next whole pass would write that this device has sent
+    /// what it carried, or its carried word, by their own conditions, as
+    /// the relays stand now (decision 2026-10-19 §4, rule 8): worked out by
+    /// the functions that write them
+    /// ([`crate::at_relays::word_to_come`]).
+    pub word_to_come: bool,
 }
 
 /// Where a device stands at one relay.
@@ -915,6 +921,11 @@ pub struct AtRelay {
     /// What the device knows of the relay's reach, and of whether it
     /// holds the change (decision 2026-10-19 §1).
     pub reach: Reach,
+    /// Its node key, where the device knows one: the key its
+    /// configuration gives it, the key of the connection open to it, or
+    /// the key that gave its latest answer to a show. What another
+    /// device's carried word names it by (decision 2026-10-19, rule 6).
+    pub key: Option<[u8; 32]>,
 }
 
 /// Whether a relay holds the change entry that the device keeps, as far as

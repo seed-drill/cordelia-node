@@ -1317,6 +1317,33 @@ device has a slot of its own and only its own entry there is its word. A
 word that a device has applied a statement is the number alone until it has
 sent what it carried, and the number and ` sent` after (decision §8).
 
+#### PERSONAL_REACHED_PREFIX = "reached/"
+
+**Rationale:** The first part of the name of a device's word that it has
+sent what it carried to the relays it reaches, where the others are out of
+reach (decision 2026-10-19 §4, rule 4). The device's key follows it. It is
+no prefix of another, and none is of it. A slot of its own, and not a new
+meaning of ` sent`: a device of the version before reads any other word
+under `applied/` as no word.
+
+#### REACHED_WORD_MAX_RELAYS = 8
+
+**Rationale:** The most relays that the carried word names by key, and the
+most that a reader reads from one (decision 2026-10-19, rules 4 and 5). A
+device is set up with two relays by default; eight is four times that, and
+keeps the word one content of 512 bytes. A device set up with more names the
+first eight in the order of its configuration, and says how many more.
+Checked at compile time: the word at its bound, with its name and the seal,
+is one content of 512 bytes.
+
+#### REACHED_WORD_MAX_COUNT = 256
+
+**Rationale:** The most that either count of the carried word may say
+(decision 2026-10-19, rule 5): how many more relays hold what a device
+carried, and at how many it may still wait. A word written by another
+device is read only within it, so that no line says a number that no
+configuration holds. A device whose counts would be over it writes no word.
+
 ### 12.7 The Streams, and a Relay
 
 #### PROTOCOL_ENTRY_SHOW = 0x10, PROTOCOL_CHANNEL_PROVE = 0x11, PROTOCOL_ENTRY_PULL = 0x12, PROTOCOL_ENTRY_PUSH = 0x13, PROTOCOL_RELAY_ENTRIES = 0x14

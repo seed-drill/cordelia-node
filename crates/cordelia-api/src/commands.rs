@@ -1778,10 +1778,12 @@ exit 0"#,
             another_form: 0,
             refuses: None,
             reach: Default::default(),
+            key: None,
         };
         let set_up = AtRelays {
             relays: vec![at("one.example:9474"), at("two.example:9474")],
             cannot_go_on: None,
+            word_to_come: false,
         };
         let known = |name: &str, stands: &str| RelaySnapshot {
             host: name.into(),
