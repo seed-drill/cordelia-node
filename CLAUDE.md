@@ -42,6 +42,7 @@ cordelia-node/
                          #   chain and version (what an entry was written after; a slot's
                          #   current version), addition, hand_over, proof, fingerprint;
                          #   message (the value of a message, its ID and the ring);
+                         #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
     cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
@@ -61,7 +62,8 @@ cordelia-node/
                          #   exports the session's value for a proof
     cordelia-api/        # REST API (actix-web). A device: person (applying a statement, who
                          #   counts, carrying), adding, change, leaving, look, names, publish,
-                         #   take (the one door for an entry), at_relays, local (the local
+                         #   take (the one door for an entry), at_relays (and known: what a
+                         #   device knows of which relay holds which change), local (the local
                          #   API for the names a device holds), commands (the routes behind
                          #   the device commands), carry and carrying (a carry that a person
                          #   asks for, and the phrase's word for it), recover, swept (old
@@ -97,7 +99,8 @@ cordelia-node/
                          #   log's question),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, and leave), indicator (the
+                         #   device_entries (a device's passes, and leave; reach: whether
+                         #   each relay can be reached, and its class), indicator (the
                          #   state and the level of a status)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
@@ -218,6 +221,8 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
+| `PERSONAL_REACHED_PREFIX` | `reached/` (the carried word: what a device carried is at the relays it reaches, decision 2026-10-19 rule 4) | parameter-rationale.md §12.6 |
+| `REACHED_WORD_MAX_RELAYS`, `REACHED_WORD_MAX_COUNT` | 8 (keys the carried word names; at its bound one content of 512 bytes), 256 (either count) | parameter-rationale.md §12.6 |
 | `PROTOCOL_ENTRY_SHOW`, `PROTOCOL_CHANNEL_PROVE`, `PROTOCOL_ENTRY_PULL`, `PROTOCOL_ENTRY_PUSH`, `PROTOCOL_RELAY_ENTRIES` | 0x10, 0x11, 0x12, 0x13, 0x14 | network-protocol.md §4.9 |
 | `SESSION_VALUE_BYTES` | 32 | parameter-rationale.md §12.7 |
 | `MAX_CHANNELS_PROVED_ON_A_CONNECTION`, `MAX_SLOTS_SHOWN_ON_A_CONNECTION` | 1024 (derived), 8 | parameter-rationale.md §12.7 |
@@ -249,6 +254,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
+| `OUT_OF_REACH_SECS` | 300s (derived: `STATUS_AMBER_WAIT_SECS`; a relay not reached, with every attempt at it failed, for this long since its reference is out of reach) | parameter-rationale.md §12.10 |
 | `PERSONAL_CHANNEL_HEADROOM_BYTES`, `PERSONAL_CHANNEL_WARN_BYTES` | 4 MiB, 12 MiB (derived: the status warns past it, decision 2026-10-19; nothing is refused) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
 | `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |

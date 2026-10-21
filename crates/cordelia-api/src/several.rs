@@ -656,6 +656,7 @@ impl Node {
                         let _ = answer.send(vec![LeftAt {
                             relay: "relay".into(),
                             read: LeftRead::NoRoom,
+                            key: None,
                         }]);
                     }
                     // Proofs that were made over another session than
@@ -674,6 +675,7 @@ impl Node {
                         let _ = answer.send(vec![LeftAt {
                             relay: "relay".into(),
                             read: LeftRead::Changed,
+                            key: None,
                         }]);
                     }
                     DoorAsk::Read {
@@ -720,6 +722,7 @@ impl Node {
                         let _ = answer.send(vec![LeftAt {
                             relay: "relay".into(),
                             read,
+                            key: None,
                         }]);
                     }
                 }
@@ -2586,6 +2589,7 @@ mod tests {
             crate::leaving::Among::NoPhrase,
             &made.entry,
             &made.statement_key,
+            &[],
             now,
         )
         .unwrap();

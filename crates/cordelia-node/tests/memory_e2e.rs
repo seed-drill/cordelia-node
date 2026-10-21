@@ -945,8 +945,13 @@ fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_
 /// Here a device carries more than it sends one relay in a minute. A
 /// device is removed: the relay takes the change, and is stopped before
 /// the names have gone. The command does not say that the machine may be
-/// closed, and says what is missing.
+/// closed, and says what is missing. Five minutes after the relay was
+/// lost it is out of reach, and no relay is reached: the command ends at
+/// end 3 (decision 2026-10-19 §4, rule 8), with S8 and S11, and status 3.
+/// The relay is given no key, so it holds the change only while the device
+/// is connected to it (§1): out of reach, it is not known to hold it.
 #[test]
+#[ignore = "it waits out a relay's five minutes out of reach: about seven minutes"]
 fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     use cordelia_core::protocol::OUTBOX_BYTES_PER_MINUTE;
     let mut relay = relay_started();
@@ -1008,6 +1013,29 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
         ),
         "{said}"
     );
+    let name = person_of(&a)["relays"][0]["relay"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(600));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains(&format!(
+            "  {name} is not known to hold the change, and has not been reached from here since"
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "No relay can be reached from here. None is known to hold the change. No other \
+             device of yours can hear of it until one does. This command ends here, with status \
+             3. It does not say that you may close this machine. Keep it on, on a network from \
+             which a relay can be reached. `cordelia devices` says what is missing."
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("this machine may be closed"), "{said}");
+    assert!(!said.contains("You may close this machine."), "{said}");
 }
 
 /// A relay that is set up with no key, by a name, is one line in

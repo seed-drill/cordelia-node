@@ -664,10 +664,12 @@ pub const NOWHERE: &str = "127.0.0.1:9";
 
 /// A relay's name under which nothing can be looked up, on any machine:
 /// it has no port, and a name with none is refused where it is read,
-/// before any lookup is made. A test gives a node this relay where it
-/// needs one whose name does not resolve: the node is set up with it, and
-/// dials nothing for it.
-pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve";
+/// before any lookup is made; and should it ever be looked up, it is under
+/// `.invalid`, which no resolver answers (RFC 2606), whatever search
+/// domains the machine is set up with. A test gives a node this relay
+/// where it needs one whose name does not resolve: the node is set up
+/// with it, and dials nothing for it.
+pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve.invalid";
 
 /// A test node dials nothing that is not on this machine, whatever a test
 /// gives it: a loopback address with its port, read as the node first
@@ -1115,19 +1117,27 @@ impl AtTerminal {
     /// was typed there and is still waiting, unread, for whoever reads
     /// the terminal next, as a shell does once a command has ended.
     pub fn ends_and_leaves(mut self) -> (bool, String, String) {
-        let (success, said) = self.has_ended_within(Duration::from_secs(300));
+        let (status, said) = self.has_ended_within(Duration::from_secs(300));
         // The terminal is there for as long as the test holds its end.
-        (success, said, left_typed_at(&self.theirs))
+        (status.success(), said, left_typed_at(&self.theirs))
     }
 
     /// [`Self::ends`], for a command that must end within `long`.
     pub fn ends_within(mut self, long: Duration) -> (bool, String) {
-        self.has_ended_within(long)
+        let (status, said) = self.has_ended_within(long);
+        (status.success(), said)
     }
 
-    /// Wait for the command to end, within `long`: whether it succeeded,
-    /// and everything that its terminal showed.
-    fn has_ended_within(&mut self, long: Duration) -> (bool, String) {
+    /// [`Self::ends_within`], with the command's exit status in place of
+    /// whether it succeeded: `None` where a signal ended it.
+    pub fn ends_with_status_within(mut self, long: Duration) -> (Option<i32>, String) {
+        let (status, said) = self.has_ended_within(long);
+        (status.code(), said)
+    }
+
+    /// Wait for the command to end, within `long`: how it ended, and
+    /// everything that its terminal showed.
+    fn has_ended_within(&mut self, long: Duration) -> (std::process::ExitStatus, String) {
         let deadline = Instant::now() + long;
         let status = loop {
             let heard = self.hears(Duration::from_millis(100));
@@ -1164,7 +1174,7 @@ impl AtTerminal {
                 );
             }
         }
-        (status.success(), std::mem::take(&mut self.said))
+        (status, std::mem::take(&mut self.said))
     }
 
     /// [`Self::ends`], for a command that must succeed: what it said.
@@ -1790,4 +1800,127 @@ pub fn two_words_in_a_row(bytes: &[u8], phrase: &[&str]) -> Option<(String, Stri
                 .any(|two| two[0] == pair[0] && two[1] == pair[1])
         })
         .map(|pair| (pair[0].clone(), pair[1].clone()))
+}
+
+// ── What answers at the node's address ───────────────────────────────
+
+/// A stand-in at a port of this machine for the node at `port`: each
+/// request is passed on to the node, and the node's answer is handed back
+/// as `changed` leaves it. It is what a program that answers at the
+/// node's address could say to a command.
+pub struct Answers {
+    pub port: u16,
+    /// Each request that a command made here, in their order.
+    asked: std::sync::Arc<std::sync::Mutex<Vec<Asked>>>,
+}
+
+/// A request that a command made: its path, and its body.
+pub type Asked = (String, Vec<u8>);
+
+impl Answers {
+    pub fn in_the_place_of(
+        node: &Node,
+        changed: impl Fn(&str, &mut serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        Self::losing(node, changed, |_| None)
+    }
+
+    /// [`Self::in_the_place_of`], where the answer to some requests is
+    /// lost: `lost` says of a request's path whether its answer is lost
+    /// once the node has done what was asked (`Some(true)`), or the
+    /// request is lost before it reaches the node (`Some(false)`). The
+    /// command is then answered nothing, and its connection is closed.
+    pub fn losing(
+        node: &Node,
+        changed: impl Fn(&str, &mut serde_json::Value) + Send + Sync + 'static,
+        lost: impl Fn(&str) -> Option<bool> + Send + Sync + 'static,
+    ) -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap().port();
+        let (node_port, token) = (node.http, node.token());
+        let changed = std::sync::Arc::new(changed);
+        let lost = std::sync::Arc::new(lost);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = asked.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let (changed, token) = (changed.clone(), token.clone());
+                let (lost, kept) = (lost.clone(), kept.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let mut length = 0usize;
+                    loop {
+                        let mut header = String::new();
+                        let read = reader.read_line(&mut header).unwrap_or(0);
+                        if read == 0 || header == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = header.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    if reader.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    kept.lock().unwrap().push((path.clone(), body.clone()));
+                    let loses = lost(&path);
+                    if loses == Some(false) {
+                        return;
+                    }
+                    let url = format!("http://127.0.0.1:{node_port}{path}");
+                    let agent: ureq::Agent = ureq::Agent::config_builder()
+                        .proxy(None)
+                        .http_status_as_error(false)
+                        .build()
+                        .into();
+                    let auth = format!("Bearer {token}");
+                    let answered = match method.as_str() {
+                        "GET" => agent.get(&url).header("Authorization", &auth).call(),
+                        _ => agent
+                            .post(&url)
+                            .header("Authorization", &auth)
+                            .header("Content-Type", "application/json")
+                            .send(&body[..]),
+                    };
+                    let Ok(mut answered) = answered else {
+                        return;
+                    };
+                    if loses == Some(true) {
+                        return;
+                    }
+                    let status = answered.status().as_u16();
+                    let mut answer: serde_json::Value = answered
+                        .body_mut()
+                        .read_json()
+                        .unwrap_or(serde_json::Value::Null);
+                    changed(&path, &mut answer);
+                    let out = answer.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                        out.len()
+                    );
+                });
+            }
+        });
+        Self { port: at, asked }
+    }
+
+    /// Every request that a command has made here: its path, and its
+    /// body.
+    pub fn asked(&self) -> Vec<Asked> {
+        self.asked.lock().unwrap().clone()
+    }
 }

@@ -204,6 +204,11 @@ pub const BAN_WINDOW_SECS: u64 = 10 * RATE_WINDOW_SECS;
 /// Reconnect backoff base duration in seconds (parameter-rationale.md §3).
 /// Derived: start at 1 ping interval. If we can't connect in the time
 /// it takes to send one ping, back off.
+///
+/// It is also the most that a relay that lacks the change the device
+/// keeps waits to be dialled again, whether or not another relay is
+/// connected; a longer wait already set is cut to it when the relay comes
+/// to lack the change (decision 2026-10-19, rule 3).
 pub const BACKOFF_BASE_SECS: u64 = PING_INTERVAL_SECS;
 
 /// Delay before clearing failure state in seconds (configuration.md §3).
@@ -814,7 +819,9 @@ pub const SIGHTING_REFRESH_SECS: u64 = 300;
 pub const SIGHTING_RETENTION_DAYS: i64 = 8;
 
 /// How often it tries instead while none of the names resolves: a node
-/// started before its network was up finds its relays soon after.
+/// started before its network was up finds its relays soon after. It is
+/// also how often names are looked up while a relay that lacks the change
+/// has a name that does not resolve (decision 2026-10-19, rule 3).
 pub const BOOTNODE_RESOLVE_RETRY_SECS: u64 = 30;
 
 // ── PSK exchange reasons (network-protocol.md §4.7) ──────────────────
@@ -1622,6 +1629,48 @@ pub const FIRST_FETCH_WAIT_SECS: u64 = WAKE_WAIT_SECS;
 /// generation, so it cannot be claimed for it.
 pub const PERSONAL_APPLIED_SENT: &str = " sent";
 
+/// The first part of the name, in the personal channel, of a device's word
+/// that it has sent what it carried to the relays it reaches, where the
+/// others are out of reach (decision 2026-10-19 §4, rule 4). The device's
+/// key follows it. It is no prefix of another, and none is of it.
+pub const PERSONAL_REACHED_PREFIX: &str = "reached/";
+
+/// The most relays that the carried word names by key, and the most that a
+/// reader reads from one (decision 2026-10-19, rules 4 and 5). A device is
+/// set up with two relays by default; eight is four times that, and keeps
+/// the word one content of 512 bytes. A device set up with more names the
+/// first eight in the order of its configuration, and says how many more.
+pub const REACHED_WORD_MAX_RELAYS: usize = 8;
+
+/// The most that either count of the carried word may say (decision
+/// 2026-10-19, rule 5): how many more relays hold what a device carried,
+/// and at how many it may still wait. A word written by another device is
+/// read only within it, so that no line says a number that no
+/// configuration holds.
+pub const REACHED_WORD_MAX_COUNT: u64 = 256;
+
+// The carried word at its bound is one content of 512 bytes (decision
+// 2026-10-19 §10): the seal, the 7 bytes of an entry's form around its
+// name and value, the name (the prefix and a key as it is written, 70
+// bytes), and the value: the statement's number (8 bytes), the count of
+// keys (1) and the keys, and the two counts (2 bytes each).
+const _: () = assert!(
+    (ITEM_SEAL_OVERHEAD_BYTES
+        + 7
+        + PERSONAL_REACHED_PREFIX.len()
+        + 70
+        + 8
+        + 1
+        + 32 * REACHED_WORD_MAX_RELAYS
+        + 2
+        + 2)
+    .next_power_of_two()
+        == 512
+);
+// Either count fits its two bytes.
+const _: () = assert!(REACHED_WORD_MAX_COUNT <= u16::MAX as u64);
+const _: () = assert!(REACHED_WORD_MAX_RELAYS <= u8::MAX as usize);
+
 /// The two spans of time, in seconds, over which a command that removes a
 /// device says how much that device wrote that this one received
 /// (decision 2026-10-04 §7.1): the last day, and the last week. Both are
@@ -1664,6 +1713,31 @@ pub const REMOVAL_NOT_APPLIED_SHOWN_DAYS: u32 = 7;
 /// refuses has refused again within twice that, and one that has not has
 /// taken what it was offered, or was offered nothing more.
 pub const NO_ROOM_STANDS_SECS: u64 = 2 * OUTBOX_REFUSED_RETRY_MAX_SECS;
+
+/// How long a relay that the device is set up with has not been reached,
+/// with every attempt at it in that time failed, before it is out of
+/// reach (decision 2026-10-19 §1). It is the time after which the status
+/// line shows what passes by itself (STATUS_AMBER_WAIT_SECS): a relay's
+/// restart, and a machine that wakes, are each through it in less. A
+/// relay stays out of reach until it is reached, or until its reference
+/// moves: a start, a sleep, or a change of the change entry the device
+/// keeps. A wake for any other reason does not move it. The command after
+/// a change ends without success only once each relay that lacks the
+/// change has been out of reach for this long since the change, or has
+/// refused the change for this long. A dial, or a connection that waits
+/// for a show, that has been in flight for this long is taken to have
+/// failed: a result that was lost holds no relay up for good, and a dial
+/// that is answered at all is answered well within it.
+pub const OUT_OF_REACH_SECS: u64 = STATUS_AMBER_WAIT_SECS;
+
+// A device that wakes has heard from its relays, or given them up, well
+// within the five minutes (decision 2026-10-19 §10).
+const _: () = assert!(OUT_OF_REACH_SECS > 2 * WAKE_WAIT_SECS);
+// A relay that lacks the change has an attempt in its five minutes: a
+// lookup of a name that does not resolve, and a dial, each come at least
+// this often (rule 3).
+const _: () = assert!(OUT_OF_REACH_SECS > BOOTNODE_RESOLVE_RETRY_SECS);
+const _: () = assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS);
 
 /// The room left below what a relay holds of one channel once the status
 /// warns that the personal channel nears it, in bytes as entries are
@@ -2918,6 +2992,56 @@ mod tests {
         // A removal is shown for less long than the secret it left is
         // kept, so the time that it was applied is still known.
         const { assert!(REMOVAL_NOT_APPLIED_SHOWN_DAYS < LEFT_SECRET_KEPT_DAYS) };
+    }
+
+    /// The carried word (decision 2026-10-19 §4, rules 4 and 5; §10): its
+    /// prefix is no prefix of another name in a channel of the person's,
+    /// and none is of it; it names at most eight keys; and at its bound it
+    /// is one content of 512 bytes.
+    #[test]
+    fn test_the_carried_word_decision_2026_10_19_10() {
+        assert_eq!(PERSONAL_REACHED_PREFIX, "reached/");
+        for other in [
+            PERSONAL_APPLIED_PREFIX,
+            PERSONAL_ADDED_PREFIX,
+            PERSONAL_NAME_PREFIX,
+            PERSONAL_LEFT_PREFIX,
+            AGENT_MESSAGE_PREFIX,
+            AGENT_MESSAGE_READ_PREFIX,
+        ] {
+            assert!(!PERSONAL_REACHED_PREFIX.starts_with(other), "{other}");
+            assert!(!other.starts_with(PERSONAL_REACHED_PREFIX), "{other}");
+        }
+        assert_eq!(REACHED_WORD_MAX_RELAYS, 8);
+        assert_eq!(REACHED_WORD_MAX_COUNT, 256);
+        // At its bound the word seals in 512 bytes, and one key fewer is
+        // still more than 256: every word of eight keys is one size.
+        let said = |keys: usize| {
+            ITEM_SEAL_OVERHEAD_BYTES
+                + 7
+                + PERSONAL_REACHED_PREFIX.len()
+                + 70
+                + 8
+                + 1
+                + 32 * keys
+                + 4
+        };
+        assert_eq!(said(REACHED_WORD_MAX_RELAYS).next_power_of_two(), 512);
+        assert!(said(REACHED_WORD_MAX_RELAYS) > MIN_ENTRY_CONTENT_BYTES);
+        const { assert!(REACHED_WORD_MAX_COUNT <= u16::MAX as u64) };
+    }
+
+    /// How long a relay has failed before it is out of reach (decision
+    /// 2026-10-19 §1, §10): the five minutes of the status line, which a
+    /// wake, a lookup that does not resolve and a dial of a relay that
+    /// lacks the change each fit within.
+    #[test]
+    fn test_out_of_reach_is_the_five_minutes_of_the_status_line_decision_2026_10_19_10() {
+        assert_eq!(OUT_OF_REACH_SECS, STATUS_AMBER_WAIT_SECS);
+        assert_eq!(OUT_OF_REACH_SECS, 300);
+        const { assert!(OUT_OF_REACH_SECS > 2 * WAKE_WAIT_SECS) };
+        const { assert!(OUT_OF_REACH_SECS > BOOTNODE_RESOLVE_RETRY_SECS) };
+        const { assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS) };
     }
 
     /// The waits between the tries at a first start that keeps failing

@@ -229,6 +229,22 @@ demoted during inactive periods. Too aggressive.
 **If you increase to 7200s (2 hours):** Useless peers stay Hot for too
 long, wasting push bandwidth.
 
+### backoff_base = 30s (`BACKOFF_BASE_SECS`)
+
+**Derivation:** one `PING_INTERVAL_SECS`.
+
+**Rationale:** The most that a configured relay waits to be dialled again
+while the node has no relay connected: the wait after each failure doubles
+from one governor tick up to it. While another relay is connected the wait
+grows to `BACKOFF_MAX_SECS` (900 s), since nothing waits on this one.
+
+It is also the most that a relay that lacks the change the device keeps
+waits to be dialled again, whether or not another relay is connected; a
+longer wait already set is cut to it when the relay comes to lack the
+change (decision 2026-10-19, rule 3). A relay that lacks a removal is where
+a device that has not heard of it goes on writing for the removed device
+to read, and a relay can be out of reach only where attempts are made.
+
 ---
 
 ## 4. Protocol Rate Limits
@@ -705,6 +721,9 @@ typically because it started before its network was up (a laptop at
 login). It then finds its relays within half a minute of the network
 coming up; one DNS query per name every 30 s is negligible. It must be
 shorter than the interval (`protocol.rs` asserts this).
+
+It is also how often names are looked up while a relay that lacks the
+change has a name that does not resolve (decision 2026-10-19, rule 3).
 
 ## 9. Usage Count Parameters
 
@@ -1298,6 +1317,33 @@ device has a slot of its own and only its own entry there is its word. A
 word that a device has applied a statement is the number alone until it has
 sent what it carried, and the number and ` sent` after (decision §8).
 
+#### PERSONAL_REACHED_PREFIX = "reached/"
+
+**Rationale:** The first part of the name of a device's word that it has
+sent what it carried to the relays it reaches, where the others are out of
+reach (decision 2026-10-19 §4, rule 4). The device's key follows it. It is
+no prefix of another, and none is of it. A slot of its own, and not a new
+meaning of ` sent`: a device of the version before reads any other word
+under `applied/` as no word.
+
+#### REACHED_WORD_MAX_RELAYS = 8
+
+**Rationale:** The most relays that the carried word names by key, and the
+most that a reader reads from one (decision 2026-10-19, rules 4 and 5). A
+device is set up with two relays by default; eight is four times that, and
+keeps the word one content of 512 bytes. A device set up with more names the
+first eight in the order of its configuration, and says how many more.
+Checked at compile time: the word at its bound, with its name and the seal,
+is one content of 512 bytes.
+
+#### REACHED_WORD_MAX_COUNT = 256
+
+**Rationale:** The most that either count of the carried word may say
+(decision 2026-10-19, rule 5): how many more relays hold what a device
+carried, and at how many it may still wait. A word written by another
+device is read only within it, so that no line says a number that no
+configuration holds. A device whose counts would be over it writes no word.
+
 ### 12.7 The Streams, and a Relay
 
 #### PROTOCOL_ENTRY_SHOW = 0x10, PROTOCOL_CHANNEL_PROVE = 0x11, PROTOCOL_ENTRY_PULL = 0x12, PROTOCOL_ENTRY_PUSH = 0x13, PROTOCOL_RELAY_ENTRIES = 0x14
@@ -1836,8 +1882,10 @@ alone.
 
 **Rationale:** How long a thing that will pass by itself has lasted before
 the status line shows it as amber (decision §10.1): no relay connected; a
-relay that is connected and does not hold the latest change; and, after a
-change, names that are not yet in the new generation or not yet sent. It is
+relay that is not known to hold the latest change, connected or not, counted
+from the later of the change of the kept entry, the node's start and a
+sleep, and not from a wake after no connection (decision 2026-10-19, rule
+11); and, after a change, names that are not yet in the new generation or not yet sent. It is
 also for how long, after a device joined or another was added, `cordelia
 devices` says of a device that it has not heard from only "not heard from
 yet", and advises nothing (decision §8): after that it says that the device
@@ -1850,13 +1898,19 @@ node's own clock, which does not run while the machine sleeps. `protocol.rs`
 asserts that a device that wakes has heard from its relays, or given them
 up, well within it (twice `WAKE_WAIT_SECS`).
 
+It is the time a relay takes to be out of reach (`OUT_OF_REACH_SECS`).
+
 #### REMOVAL_NOT_APPLIED_SHOWN_DAYS = 7
 
 **Rationale:** For how many days after a device applied a removal the status
 line shows as amber that some device has not applied it (decision §8,
 §10.1). After that it is said in `cordelia devices` only: a device that lies
 in a drawer does not keep every status line amber for good. Names that no
-device lists yet in the new generation are shown for as long. `protocol.rs`
+device lists yet in the new generation are shown for as long. A relay not
+known to hold the latest change is shown for as long (decision 2026-10-19,
+rule 11), from the latest of when the device came to keep the change entry,
+when this version first started on it, and that relay's latest answer about
+the entry. `protocol.rs`
 asserts that it is shorter than a left secret is kept
 (`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
 known.
@@ -1875,6 +1929,29 @@ and offers again what was refused after a wait that doubles up to
 `OUTBOX_REFUSED_RETRY_MAX_SECS`. So a relay that still refuses has refused
 again within twice that, and one that has not has taken what it was offered,
 or was offered nothing more.
+
+#### OUT_OF_REACH_SECS = 300
+
+**Derivation:** `STATUS_AMBER_WAIT_SECS`.
+
+**Rationale:** How long a relay that the device is set up with has not been
+reached, with every attempt at it in that time failed, before it is out of
+reach (decision 2026-10-19 §1). It is the time after which the status line
+shows what passes by itself: a relay's restart, and a machine that wakes,
+are each through it in less. A relay stays out of reach until it is
+reached, or until its reference moves: a start, a sleep, or a change of the
+change entry the device keeps. A wake for any other reason does not move
+it. The command after a change ends without success only once each relay
+that lacks the change has been out of reach for this long since the change,
+or has refused the change for this long. A dial, or a connection that
+waits for a show, that has been in flight for this long is taken to have
+failed: a result that was lost holds no relay up for good, and a dial that
+is answered at all is answered well within it (a connection's time-out and
+its handshake's). `protocol.rs` asserts that it is
+more than twice `WAKE_WAIT_SECS` (a device that wakes has heard from its
+relays, or given them up, well within it), and more than
+`BOOTNODE_RESOLVE_RETRY_SECS` and `BACKOFF_BASE_SECS` (a relay that lacks
+the change has an attempt in its five minutes).
 
 #### PERSONAL_CHANNEL_WARN_BYTES = 12 MiB
 

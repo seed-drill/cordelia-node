@@ -209,10 +209,21 @@ pub struct Devices {
     pub added_not_cleared: usize,
     /// How many devices have said that they left.
     pub said_left: usize,
-    /// For each relay that does not hold the latest change and is
-    /// connected: for how long it has been connected, in seconds, by the
-    /// node's own clock.
-    pub without_latest_secs: Vec<u64>,
+    /// Each relay that is not known to hold the latest change (decision
+    /// 2026-10-19 §1), connected or not. A relay in the third state is not
+    /// among them.
+    pub not_known_to_hold: Vec<NotKnown>,
+    /// How long ago, in seconds, the later of when this device came to
+    /// keep the change entry it keeps and when this version first started
+    /// on its database: a relay not known to hold the latest change is
+    /// amber for seven days from it. `None` where the node did not say.
+    pub known_since_secs: Option<u64>,
+    /// For each relay that holds the latest change and is out of reach:
+    /// for how long it has been out of reach, in seconds.
+    pub out_of_reach_secs: Vec<u64>,
+    /// Whether a relay is reached: a connection to it is open, and it
+    /// answered the latest show of the kept entry on it.
+    pub one_reached: bool,
     /// For each relay that has refused something for room, or for the
     /// address's allowance: how long ago it last did, in seconds.
     pub no_room_secs: Vec<u64>,
@@ -234,6 +245,20 @@ pub struct Devices {
     pub carried_to_go: usize,
     /// For how long the first of those has waited, in seconds.
     pub carried_to_go_secs: Option<u64>,
+}
+
+/// A relay that is not known to hold the latest change, as a status goes
+/// by it (decision 2026-10-19, rule 11).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NotKnown {
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock: from the later of when it came to lack it, the node's
+    /// start, a sleep and the change of the kept entry.
+    pub lacking_secs: u64,
+    /// How long ago its latest answer about the kept entry was, in
+    /// seconds, where it gave one: a relay that held the change and then
+    /// says that it has no room for it is said for seven days from that.
+    pub said_secs: Option<u64>,
 }
 
 /// How grave what holds is.
@@ -303,6 +328,11 @@ const AMBER_WAIT_SECS: u64 = cordelia_core::protocol::STATUS_AMBER_WAIT_SECS;
 /// after this device applied it.
 const REMOVAL_SHOWN_SECS: u64 =
     cordelia_core::protocol::REMOVAL_NOT_APPLIED_SHOWN_DAYS as u64 * 24 * 60 * 60;
+
+/// A relay not known to hold the latest change is amber for this long
+/// (decision 2026-10-19, rule 11): as long as a removal that some device
+/// has not applied.
+const RELAY_NOT_KNOWN_SHOWN_SECS: u64 = REMOVAL_SHOWN_SECS;
 
 /// Names that no device lists yet in the new generation are amber for
 /// this long after this device applied the change: as long as a removal
@@ -397,11 +427,11 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 8. files too large;
 /// 9. folders that stopped syncing.
 ///
-/// **Amber,** in this order. What is about folders (0 to 3, and 8 to 10)
-/// holds only with sync on, something mapped and a report: with none of
-/// them, nothing would move anyway. What is about a person's devices (4
-/// to 7) holds wherever this device follows a phrase, with sync on or
-/// off, and with or without a folder mapped.
+/// **Amber,** in this order. What is about folders holds only with sync
+/// on, something mapped and a report: with none of them, nothing would
+/// move anyway. What is about a person's devices holds wherever this
+/// device follows a phrase, with sync on or off, and with or without a
+/// folder mapped.
 /// 0. the personal channel past the line, as the last report that read
 ///    it found (decision 2026-10-19 §2, rule 3): first, above every line
 ///    that the overflow itself can cause;
@@ -417,8 +447,13 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 ///    mapped to them, and of which what was brought in is not yet sent,
 ///    for more than five minutes: a machine that has just recovered maps
 ///    nothing, and may have sync off;
-/// 8. a relay that has been connected for more than five minutes and
-///    does not hold the latest change;
+/// 8. a relay not known to hold the latest change, connected or not,
+///    once it has lacked it for more than five minutes by the node's own
+///    clock, and for seven days from the latest of when this device came
+///    to keep the change entry, when this version first started on it,
+///    and that relay's latest answer about the entry (decision 2026-10-19,
+///    rule 11): after that it is in `cordelia
+///    devices` only. A relay in the third state is not counted;
 /// 9. a relay that refuses a new channel for room, or for the address's
 ///    allowance;
 /// 10. names that a device which still counts had listed and that no
@@ -427,7 +462,14 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 ///     applied the change: after that they are in `cordelia devices`
 ///     only, as a removal is, so that a device in a drawer does not keep
 ///     every line amber for good; or names not yet sent, for more than
-///     five minutes: those of them that the seventh does not say.
+///     five minutes: those of them that the seventh does not say;
+/// 11. a relay that holds the latest change and is out of reach, while
+///     another is reached: the least of them, and one that can last for
+///     good, so it comes last and hides nothing (rule 11).
+///
+/// What is about folders (0 to 3, and 9 to 11) holds only with sync on,
+/// something mapped and a report; the eighth, as 4 to 7, wherever this
+/// device follows a phrase.
 pub fn holds(f: &Facts) -> Vec<Holds> {
     let mut out: Vec<Holds> = Vec::new();
     let personal_and_running = f.initialised && !f.not_asked && f.running && f.role == "personal";
@@ -549,25 +591,37 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             let names = count(d.carried_to_go, "name");
             amber("carried", format!("memory: {names} carried, not yet sent"));
         }
+        // A relay that lacks the change, connected or not: nothing else
+        // stands once the command that made the change has ended
+        // (decision 2026-10-19, rule 11). For seven days from the later of
+        // when this device came to keep the entry and the relay's latest
+        // answer about it, so that a relay that this site can never reach
+        // does not hide what comes after it for good, and one that says it
+        // lacks the entry long after is said all the same.
+        let within = |secs: &u64| *secs <= RELAY_NOT_KNOWN_SHOWN_SECS;
+        let still_shown = |relay: &&NotKnown| {
+            d.known_since_secs.is_none_or(|secs| within(&secs))
+                || relay.said_secs.as_ref().is_some_and(within)
+        };
+        let lacking = d
+            .not_known_to_hold
+            .iter()
+            .filter(|relay| long(&relay.lacking_secs))
+            .filter(still_shown);
+        match lacking.count() {
+            0 => {}
+            1 => amber(
+                "relay_without_latest",
+                "memory: a relay not known to hold the latest change".into(),
+            ),
+            n => amber(
+                "relay_without_latest",
+                format!("memory: {n} relays not known to hold the latest change"),
+            ),
+        }
     }
     if !of_folders {
         return out;
-    }
-    match d
-        .without_latest_secs
-        .iter()
-        .filter(|secs| long(secs))
-        .count()
-    {
-        0 => {}
-        1 => amber(
-            "relay_without_latest",
-            "memory: a relay does not hold the latest change".into(),
-        ),
-        n => amber(
-            "relay_without_latest",
-            format!("memory: {n} relays do not hold the latest change"),
-        ),
     }
     if d.no_room_secs.iter().any(|ago| *ago <= NO_ROOM_STANDS_SECS) {
         amber("relay_no_room", "memory: a relay has no room".into());
@@ -587,6 +641,28 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     } else if not_sent {
         let names = count(of_folders_to_go, "name");
         amber("names", format!("memory: {names} not yet sent"));
+    }
+    // The warning of the ruling (decision 2026-10-19 §0, rule 11): said
+    // only while another relay is reached, and so never beside "no relay".
+    match d.out_of_reach_secs.as_slice() {
+        _ if !d.one_reached => {}
+        [] => {}
+        [secs] => {
+            // Rounded up: a relay that has just come to be out of reach is
+            // so for a minute, and not for none.
+            let minutes = secs.div_ceil(60).max(1);
+            amber(
+                "relay_out_of_reach",
+                format!(
+                    "memory: a relay out of reach for {minutes} {}",
+                    plural(minutes, "minute")
+                ),
+            )
+        }
+        several => amber(
+            "relay_out_of_reach",
+            format!("memory: {} relays out of reach", several.len()),
+        ),
     }
     out
 }
@@ -1021,7 +1097,7 @@ mod tests {
     ];
 
     /// Each thing of the amber list, alone, in the list's order.
-    const AMBER: [(Edit, &str, &str); 11] = [
+    const AMBER: [(Edit, &str, &str); 12] = [
         (
             &|f| {
                 f.peers_hot = 0;
@@ -1065,9 +1141,9 @@ mod tests {
             "memory: 1 name carried, not yet sent",
         ),
         (
-            &|f| f.devices.without_latest_secs = vec![10, 400],
+            &|f| f.devices.not_known_to_hold = lacking_for(&[10, 400]),
             "relay_without_latest",
-            "memory: a relay does not hold the latest change",
+            "memory: a relay not known to hold the latest change",
         ),
         (
             &|f| f.devices.no_room_secs = vec![30],
@@ -1090,11 +1166,25 @@ mod tests {
             "names",
             "memory: 1 name not yet sent",
         ),
+        (
+            &|f| {
+                f.devices.out_of_reach_secs = vec![420];
+                f.devices.one_reached = true;
+            },
+            "relay_out_of_reach",
+            "memory: a relay out of reach for 7 minutes",
+        ),
     ];
 
     /// The things of the amber list that are about a person's devices:
     /// the rest of it is about folders.
-    const OF_DEVICES: [&str; 4] = ["removal_not_applied", "added", "left", "carried"];
+    const OF_DEVICES: [&str; 5] = [
+        "removal_not_applied",
+        "added",
+        "left",
+        "carried",
+        "relay_without_latest",
+    ];
 
     /// What has no level, as it always was: each says its own.
     const NO_LEVEL: [(Edit, State, &str); 6] = [
@@ -1168,7 +1258,7 @@ mod tests {
         let several = with(&|f| {
             f.devices.said_left = 2;
             f.devices.added_not_cleared = 3;
-            f.devices.without_latest_secs = vec![400, 500];
+            f.devices.not_known_to_hold = lacking_for(&[400, 500]);
         });
         let says: Vec<&str> = several.holds.iter().map(|h| h.says.as_str()).collect();
         assert_eq!(
@@ -1176,7 +1266,7 @@ mod tests {
             [
                 "memory: 3 devices added, not yet cleared",
                 "memory: 2 devices have left",
-                "memory: 2 relays do not hold the latest change",
+                "memory: 2 relays not known to hold the latest change",
             ]
         );
     }
@@ -1207,6 +1297,7 @@ mod tests {
             "relay_without_latest",
             "relay_no_room",
             "names",
+            "relay_out_of_reach",
         ];
         let red = [
             "stopped",
@@ -1249,10 +1340,15 @@ mod tests {
         assert_eq!(whats(&all_amber), amber);
         assert_eq!(all_amber.level, Some(Level::Amber));
         assert_eq!(all_amber.summary, "memory: no relay for 6 minutes");
-        // Names not yet listed are said before names not yet sent.
+        // Names not yet listed are said before names not yet sent, and
+        // a relay out of reach after everything.
+        let says: Vec<&str> = all_amber.holds.iter().map(|h| h.says.as_str()).collect();
         assert_eq!(
-            all_amber.holds.last().unwrap().says,
-            "memory: 2 names not yet listed by a device"
+            says[says.len() - 2..],
+            [
+                "memory: 2 names not yet listed by a device",
+                "memory: a relay out of reach for 7 minutes"
+            ]
         );
     }
 
@@ -1347,12 +1443,12 @@ mod tests {
 
     /// The warning is first among the amber memory lines (decision
     /// 2026-10-19 §2, rule 3): with the channel past the line, each of the
-    /// eleven lines that the overflow itself can cause is made to hold in
+    /// twelve lines that the overflow itself can cause is made to hold in
     /// turn, and the line shown is the warning each time, with the other
     /// line after it.
     #[test]
     fn the_warning_is_shown_before_every_other_amber_memory_line() {
-        assert_eq!(AMBER.len(), 11);
+        assert_eq!(AMBER.len(), 12);
         let past = channel_of(12 * 1024 * 1024, 0, WORD);
         assert!(past.past_the_line());
         for (edit, what, says) in AMBER {
@@ -1657,9 +1753,9 @@ mod tests {
                 assert_eq!(shown.summary, *says, "{where_}");
                 assert_eq!(whats(&shown), [*what], "{where_}");
             }
-            // Amber: each of the four, alone, with the state as it is
+            // Amber: each of the five, alone, with the state as it is
             // without it.
-            for (amber, what, says) in &AMBER[3..7] {
+            for (amber, what, says) in &AMBER[3..8] {
                 let without = with(place);
                 let shown = with(&|f| {
                     amber(f);
@@ -1670,7 +1766,7 @@ mod tests {
                 assert_eq!(whats(&shown), [*what], "{where_}");
                 assert_eq!(shown.state, without.state, "{where_}");
             }
-            // Everything amber at once: the four, in their order, and
+            // Everything amber at once: the five, in their order, and
             // nothing that is about folders.
             let all = with(&|f| {
                 for (edit, _, _) in AMBER {
@@ -1711,7 +1807,7 @@ mod tests {
         // Sync off with a notice stored, errors, conflicts and no relay:
         // nothing of folders holds, and the line says off.
         let off = with(&|f| {
-            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[7..]) {
+            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[8..]) {
                 edit(f);
             }
             f.sync_enabled = false;
@@ -1853,7 +1949,7 @@ mod tests {
     #[test]
     fn with_nothing_mapped_or_no_report_yet_there_is_no_amber_of_folders() {
         let of_folders = |f: &mut Facts| {
-            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[7..]) {
+            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[8..]) {
                 edit(f);
             }
         };
@@ -1883,7 +1979,7 @@ mod tests {
         assert_eq!(no_report.summary, "memory sync starting");
         // Each thing of folders needs all three: with one of them
         // missing, none holds.
-        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[7..]) {
+        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[8..]) {
             for missing in [
                 (&|f: &mut Facts| f.mapped = 0) as &dyn Fn(&mut Facts),
                 &|f: &mut Facts| f.report_age_secs = None,
@@ -2183,9 +2279,9 @@ mod tests {
 
     /// The waits (decision 2026-10-04 §10.1). No relay: none at four
     /// minutes, amber at six, by the node's own clock; none beside a node
-    /// that does not say since when. A relay that does not hold the
-    /// latest change: amber once it has been connected for more than
-    /// five minutes. Names not yet in the new generation, or not yet
+    /// that does not say since when. A relay not known to hold the latest
+    /// change: amber once it has lacked it for more than five minutes
+    /// (decision 2026-10-19, rule 11). Names not yet in the new generation, or not yet
     /// sent: amber after more than five minutes, and the first of them
     /// for seven days from when the change was applied. A removal that some
     /// device has not applied: amber for its first seven days. A relay's
@@ -2216,7 +2312,8 @@ mod tests {
             "memory offline"
         );
 
-        let without_latest = |secs: u64| level(&|f| f.devices.without_latest_secs = vec![secs]);
+        let without_latest =
+            |secs: u64| level(&|f| f.devices.not_known_to_hold = lacking_for(&[secs]));
         assert_eq!(without_latest(10), None);
         assert_eq!(without_latest(300), None);
         assert_eq!(without_latest(301), amber);
@@ -2977,5 +3074,267 @@ mod tests {
         let mut f = synced();
         running(&mut f, &serde_json::json!({ "outbox_waiting": 1000 }));
         assert_eq!(f.outbox_waiting, 1000);
+    }
+
+    // ── A relay out of reach (decision 2026-10-19, rule 11) ──────────
+
+    /// Relays that have lacked the change for these seconds, with no
+    /// answer said of them.
+    fn lacking_for(secs: &[u64]) -> Vec<NotKnown> {
+        secs.iter()
+            .map(|secs| NotKnown {
+                lacking_secs: *secs,
+                said_secs: None,
+            })
+            .collect()
+    }
+
+    const NOT_KNOWN: &str = "memory: a relay not known to hold the latest change";
+
+    /// A relay that lacks the change for more than five minutes.
+    fn lacking(f: &mut Facts) {
+        f.devices.not_known_to_hold = lacking_for(&[301]);
+        f.devices.known_since_secs = Some(400);
+    }
+
+    /// A relay not known to hold the latest change is amber connected or
+    /// not, with sync on or off, with or without a folder mapped and a
+    /// report: wherever the device follows a phrase, as the other amber of
+    /// a person's devices (decision 2026-10-19, rule 11).
+    #[test]
+    fn a_relay_that_lacks_the_change_is_amber_connected_or_not_with_sync_on_or_off() {
+        let places: [Edit; 6] = [
+            &|_| {},
+            &|f| f.sync_enabled = false,
+            &|f| {
+                f.mapped = 0;
+                f.folders = 0;
+            },
+            &|f| f.report_age_secs = None,
+            // No relay connected at all.
+            &|f| {
+                f.peers_hot = 0;
+                f.no_relay_secs = Some(60);
+            },
+            &|f| {
+                f.sync_enabled = false;
+                f.mapped = 0;
+                f.report_age_secs = None;
+                f.peers_hot = 0;
+            },
+        ];
+        for (n, place) in places.iter().enumerate() {
+            let shown = with(&|f| {
+                lacking(f);
+                place(f);
+            });
+            assert_eq!(shown.level, Some(Level::Amber), "{n}");
+            assert_eq!(shown.summary, NOT_KNOWN, "{n}");
+            // Not where the device follows no phrase.
+            let alone = with(&|f| {
+                lacking(f);
+                place(f);
+                f.stands = "no_phrase".into();
+            });
+            assert!(!whats(&alone).contains(&"relay_without_latest"), "{n}");
+        }
+        // Not before five minutes.
+        let soon = with(&|f| {
+            lacking(f);
+            f.devices.not_known_to_hold = lacking_for(&[300, 12]);
+        });
+        assert_eq!(soon.level, None);
+        // Each that has lacked it for long enough is counted.
+        let two = with(&|f| {
+            lacking(f);
+            f.devices.not_known_to_hold = lacking_for(&[400, 12, 900]);
+        });
+        assert_eq!(
+            two.summary,
+            "memory: 2 relays not known to hold the latest change"
+        );
+    }
+
+    /// For seven days from the latest of when this device came to keep the
+    /// change entry, when this version first started on it, and the
+    /// relay's latest answer about the entry, and then not (decision
+    /// 2026-10-19, rule 11): after that it is in `cordelia devices` only. A
+    /// node that does not say since when is not cut short: the amber errs
+    /// toward being said.
+    #[test]
+    fn for_seven_days_and_then_not() {
+        let week = 7 * 24 * 60 * 60;
+        let since = |secs: Option<u64>| {
+            with(&|f| {
+                lacking(f);
+                f.devices.known_since_secs = secs;
+            })
+        };
+        assert_eq!(since(Some(week)).summary, NOT_KNOWN);
+        assert_eq!(since(Some(week + 1)).level, None);
+        assert_eq!(since(Some(90 * 24 * 60 * 60)).level, None);
+        assert_eq!(since(None).summary, NOT_KNOWN);
+        // A relay that answers that it lacks the entry long after it came
+        // to be kept is said for seven days from that answer.
+        let said = |secs: Option<u64>| {
+            with(&|f| {
+                lacking(f);
+                f.devices.known_since_secs = Some(30 * 24 * 60 * 60);
+                f.devices.not_known_to_hold[0].said_secs = secs;
+            })
+        };
+        assert_eq!(said(Some(60)).summary, NOT_KNOWN);
+        assert_eq!(said(Some(week)).summary, NOT_KNOWN);
+        assert_eq!(said(Some(week + 1)).level, None);
+        assert_eq!(said(None).level, None);
+        // Once it is no longer said, what came after it is.
+        let after = with(&|f| {
+            lacking(f);
+            f.devices.known_since_secs = Some(week + 1);
+            f.devices.no_room_secs = vec![30];
+        });
+        assert_eq!(after.summary, "memory: a relay has no room");
+    }
+
+    /// Its place (decision 2026-10-19, rule 11): after names carried, not
+    /// yet sent, and so after every other amber of a person's devices, and
+    /// before the amber of folders after it. A device added since, or one
+    /// that left, is not hidden by it; "a relay has no room" is, and the
+    /// tooltip says both.
+    #[test]
+    fn its_place_is_after_names_carried() {
+        let all = with(&|f| {
+            for (edit, _, _) in &AMBER[3..] {
+                edit(f);
+            }
+        });
+        let whats = whats(&all);
+        let at = |what: &str| whats.iter().position(|w| *w == what).unwrap();
+        assert_eq!(at("relay_without_latest"), at("carried") + 1, "{whats:?}");
+        assert!(
+            at("relay_without_latest") < at("relay_no_room"),
+            "{whats:?}"
+        );
+        assert!(at("relay_without_latest") < at("names"), "{whats:?}");
+        for (edit, what, says) in &AMBER[3..7] {
+            let shown = with(&|f| {
+                lacking(f);
+                edit(f);
+            });
+            assert_eq!(shown.summary, *says, "{what}");
+        }
+        let no_room = with(&|f| {
+            lacking(f);
+            f.devices.no_room_secs = vec![30];
+        });
+        assert_eq!(no_room.summary, NOT_KNOWN);
+        let details: Vec<String> = no_room.holds.iter().map(Holds::detail).collect();
+        assert_eq!(
+            details,
+            [
+                "To know: a relay not known to hold the latest change",
+                "To know: a relay has no room",
+            ]
+        );
+    }
+
+    /// A relay that holds the change and is out of reach is amber only
+    /// while another relay is reached, only with sync on, a folder mapped
+    /// and a report, as "no relay" is, and last among the amber (decision
+    /// 2026-10-19, rule 11). Where no relay is reached, it is not said.
+    #[test]
+    fn a_relay_out_of_reach_is_amber_last_only_with_folders_and_only_with_one_reached() {
+        let out = |f: &mut Facts| {
+            f.devices.out_of_reach_secs = vec![61];
+            f.devices.one_reached = true;
+        };
+        let shown = with(&out);
+        assert_eq!(shown.level, Some(Level::Amber));
+        assert_eq!(shown.summary, "memory: a relay out of reach for 2 minutes");
+        // Its minutes are rounded up: never none.
+        for (secs, says) in [(0, "1 minute"), (60, "1 minute"), (420, "7 minutes")] {
+            let shown = with(&|f| {
+                out(f);
+                f.devices.out_of_reach_secs = vec![secs];
+            });
+            let line = format!("memory: a relay out of reach for {says}");
+            assert_eq!(shown.summary, line, "{secs}");
+        }
+        let two = with(&|f| {
+            out(f);
+            f.devices.out_of_reach_secs = vec![61, 4000];
+        });
+        assert_eq!(two.summary, "memory: 2 relays out of reach");
+        let places: [Edit; 4] = [
+            &|f| f.devices.one_reached = false,
+            &|f| f.sync_enabled = false,
+            &|f| {
+                f.mapped = 0;
+                f.folders = 0;
+            },
+            &|f| f.report_age_secs = None,
+        ];
+        for (n, place) in places.iter().enumerate() {
+            let shown = with(&|f| {
+                out(f);
+                place(f);
+            });
+            assert!(!whats(&shown).contains(&"relay_out_of_reach"), "{n}");
+        }
+        // With no relay reached, "no relay" is said, and this is not.
+        let none = with(&|f| {
+            out(f);
+            f.devices.one_reached = false;
+            f.peers_hot = 0;
+            f.no_relay_secs = Some(400);
+        });
+        assert_eq!(whats(&none), ["no_relay"]);
+        // Last: after every other amber, which it hides nothing of.
+        for (edit, what, says) in &AMBER[..11] {
+            let shown = with(&|f| {
+                out(f);
+                edit(f);
+            });
+            assert_eq!(shown.summary, *says, "{what}");
+            assert_eq!(whats(&shown).last(), Some(&"relay_out_of_reach"), "{what}");
+        }
+    }
+
+    /// The two records of 2026-10-19 place their amber lines together: the
+    /// personal channel past the line first among every amber line (names
+    /// at the limit, §2, rule 3); a relay not known to hold the latest
+    /// change right after names carried, not yet sent; and a relay out of
+    /// reach last (a relay out of reach, rule 11). With everything amber at
+    /// once, each is where its record puts it, and the line says the first.
+    #[test]
+    fn the_lines_of_both_records_keep_their_places_together() {
+        let past = channel_of(12 * 1024 * 1024, 0, WORD);
+        let all = with(&|f| {
+            f.channel = Some(past.clone());
+            for (edit, _, _) in AMBER {
+                edit(f);
+            }
+        });
+        let order = whats(&all);
+        let at = |what: &str| order.iter().position(|w| *w == what).unwrap();
+        assert_eq!(order[0], "channel_nearly_full", "{order:?}");
+        assert_eq!(all.summary, NAMES_FILL);
+        assert_eq!(at("relay_without_latest"), at("carried") + 1, "{order:?}");
+        assert_eq!(order.last(), Some(&"relay_out_of_reach"), "{order:?}");
+        // Each of the relay's lines alone beside the warning: after it.
+        for edit in [
+            (&|f: &mut Facts| f.devices.not_known_to_hold = lacking_for(&[400])) as Edit,
+            &|f| {
+                f.devices.out_of_reach_secs = vec![420];
+                f.devices.one_reached = true;
+            },
+        ] {
+            let shown = with(&|f| {
+                f.channel = Some(past.clone());
+                edit(f);
+            });
+            assert_eq!(whats(&shown)[0], "channel_nearly_full");
+            assert_eq!(shown.summary, NAMES_FILL);
+        }
     }
 }

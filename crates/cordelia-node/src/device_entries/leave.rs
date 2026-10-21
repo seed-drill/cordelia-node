@@ -446,6 +446,8 @@ struct Given {
 struct Woke {
     /// When it woke: when it reached a relay after having reached none.
     at: Instant,
+    /// The same moment, by the time of day, in seconds.
+    wall: i64,
     /// The relays that have answered a show since, by name.
     heard: HashSet<String>,
     /// Whether the waking is over: every relay had answered, or the wait
@@ -459,6 +461,10 @@ struct Inner {
     given: HashMap<LinkId, Given>,
     /// Since the node last woke. `None` while it reaches no relay.
     woke: Option<Woke>,
+    /// While it reaches no relay: since when, by the time of day, in
+    /// seconds. From the node's start, a sleep, or the pass that found no
+    /// connection open.
+    unwoken_since: Option<i64>,
     /// The relays that the device is set up with, by name.
     set_up_with: Vec<String>,
     /// Whether the device was answered with a change that it could not
@@ -532,8 +538,9 @@ impl Leave {
     /// leave it was given is dropped. What is kept of a connection that
     /// is gone is forgotten.
     ///
-    /// It is called at each pass, and the two clocks are read here.
-    pub fn reaches(&self, set_up_with: &[String], reached: &[&Link]) {
+    /// It is called at each pass, and the two clocks are read here. Says
+    /// whether the machine slept since the pass before.
+    pub fn reaches(&self, set_up_with: &[String], reached: &[&Link]) -> bool {
         let now = self.clock.now();
         let read = (now, self.clock.wall_ms());
         let mut inner = lock(&self.inner);
@@ -546,25 +553,47 @@ impl Leave {
         // The lid was closed, and is open: the connections still look
         // open, and a leave still looks young, by a clock that stood
         // still. Every relay is asked first, as when the node starts.
-        if inner.last.is_some_and(|before| slept_between(before, read)) {
+        let slept = inner.last.is_some_and(|before| slept_between(before, read));
+        let wall = read.1 / 1000;
+        if slept || inner.last.is_none() {
+            inner.unwoken_since = Some(wall);
+        }
+        if slept {
             inner.given.clear();
             inner.woke = None;
         }
         inner.last = Some(read);
         if reached.is_empty() {
-            inner.woke = None;
+            if inner.woke.take().is_some() {
+                inner.unwoken_since = Some(wall);
+            }
         } else if inner.woke.is_none() {
             inner.woke = Some(Woke {
                 at: now,
+                wall,
                 heard: HashSet::new(),
                 awake: false,
             });
         }
+        slept
     }
 
     /// Whether the node is still waking.
     pub fn is_waking(&self) -> bool {
         lock(&self.inner).is_waking(self.clock.now())
+    }
+
+    /// When the node last woke, by the time of day, in seconds: where it
+    /// reaches no relay, and so has not woken, since when it has reached
+    /// none, from its start or a sleep (decision 2026-10-19 §5, D2 and
+    /// T1). `None` before its first pass.
+    pub fn woke_at(&self) -> Option<i64> {
+        let inner = lock(&self.inner);
+        inner
+            .woke
+            .as_ref()
+            .map(|woke| woke.wall)
+            .or(inner.unwoken_since)
     }
 
     /// Whether the relay called `name` has answered a show since the node
@@ -852,6 +881,7 @@ impl Leave {
             .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
             .filter(|entry| entry.channel == channel && entry.author == typed.key)
             .collect();
+        let set_up = state.own_channels.relays_set_up_as();
         let mut read = Vec::new();
         for entry in &handed {
             let now = unix();
@@ -863,7 +893,8 @@ impl Leave {
             let (accepted, _) = state.as_a_change_where(
                 |conn| {
                     at_relays::telling_a_change(conn, |conn| {
-                        adding::accept_typed(conn, identity, typed, sync_on(conn), entry, now)
+                        let sync_on = sync_on(conn);
+                        adding::accept_typed(conn, identity, typed, sync_on, entry, &set_up, now)
                     })
                 },
                 |(accepted, changed)| match accepted {
@@ -1392,6 +1423,7 @@ mod tests {
 
         let woke = |heard: &[&str]| Woke {
             at: now,
+            wall: 0,
             heard: heard.iter().map(|name| name.to_string()).collect(),
             awake: false,
         };

@@ -3190,8 +3190,12 @@ mod tests {
                 }),
                 another_form: 0,
                 refuses: None,
+                reach: Default::default(),
+                key: None,
             }],
             cannot_go_on: None,
+            word_to_come: false,
+            woke_at: None,
         });
         let (read, found) = read_at(
             &state,

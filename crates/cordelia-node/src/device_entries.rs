@@ -110,19 +110,23 @@
 
 pub mod leave;
 mod own_read;
+pub mod reach;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
+use cordelia_api::at_relays::known::{self, Known, RelayId};
 use cordelia_api::at_relays::{
-    self, Answered, Batch, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands, Which,
+    self, Answered, Batch, Found, Kind, Most, Own, Page, PageTaken, Places, Pushed, Sent, Stands,
+    Which,
 };
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
-    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, LeftAt, LeftPlace, LeftRead, NoRoom,
-    ProvedBy, RefusedOf,
+    AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, Holds, LeftAt, LeftPlace, LeftRead,
+    NoRoom, ProvedBy, RefusedOf,
 };
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
@@ -147,6 +151,8 @@ use rusqlite::Connection;
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
 };
+pub use reach::Reach;
+use reach::Said;
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -175,11 +181,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A relay that the device is set up with: what its configuration calls
-/// it, and the connection to it where there is one.
+/// it, the key the configuration gives it where it gives one, and the
+/// connection to it where there is one.
 #[derive(Debug, Clone)]
 pub struct Relay {
     pub name: String,
+    pub key: Option<[u8; 32]>,
     pub link: Option<Link>,
+}
+
+impl Relay {
+    /// The relay by its name and key together, as what is known of it is
+    /// kept (decision 2026-10-19 §1).
+    pub fn id(&self) -> RelayId {
+        RelayId {
+            name: self.name.clone(),
+            key: self.key,
+        }
+    }
 }
 
 /// Which pass.
@@ -336,6 +355,9 @@ struct OfRelay {
     /// Why the device refuses the entry that the relay last answered a
     /// show with, where it does.
     refuses: Option<String>,
+    /// Why it lacks the entry named in `holds`, by the latest answer in
+    /// which it said so (decision 2026-10-19 §1): none once it holds it.
+    lacks_for: Option<cordelia_api::state::LacksFor>,
     counts: Counts,
     /// What was pushed to it in the last minute: a device paces itself,
     /// so that it is never the one refused for going over.
@@ -353,6 +375,13 @@ struct Round {
     /// Whether the relay answered a show of the whole entry. A whole
     /// show whose stream was reset, or that timed out, was not answered.
     whole_answered: bool,
+    /// Whether a show was made: an attempt at the relay (decision
+    /// 2026-10-19 §1).
+    shown: bool,
+    /// What the latest show that counts said: "show it whole" to a short
+    /// show, and a short show not answered, are followed by a whole one,
+    /// whose answer is what counts.
+    said: Option<Said>,
 }
 
 /// A channel that found no room at a relay, or a show that got no leave
@@ -423,6 +452,15 @@ pub struct DeviceEntries {
     /// One round at a time of a read of a channel of the device's own
     /// (decision 2026-10-17 §4.2).
     own_rounds: tokio::sync::Mutex<()>,
+    /// Whether each relay can be reached, and its class (decision
+    /// 2026-10-19 §1): shared with the dial loop and the lookups of names.
+    reach: Arc<Reach>,
+    /// The relays that the device is set up with, as the last pass was
+    /// given them.
+    set_up: Mutex<Vec<RelayId>>,
+    /// Whether the start was noted in what is known of the relays
+    /// ([`known::started`]): once a node runs, at its first pass.
+    started: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -435,6 +473,18 @@ impl DeviceEntries {
     /// `most_proved` channels for one connection, where that is fewer
     /// than a relay does: no more than that are proved on one.
     pub fn proving_at_most(state: Arc<AppState>, clock: Clock, most_proved: usize) -> Arc<Self> {
+        let reach = Reach::new(clock.clone());
+        Self::reaching(state, clock, most_proved, reach)
+    }
+
+    /// [`Self::proving_at_most`], with `reach` shared with the dial loop
+    /// and the lookups of names.
+    pub fn reaching(
+        state: Arc<AppState>,
+        clock: Clock,
+        most_proved: usize,
+        reach: Arc<Reach>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state,
             leave: Leave::new(clock.clone()),
@@ -445,7 +495,15 @@ impl DeviceEntries {
             turns: Mutex::default(),
             asking: Mutex::default(),
             own_rounds: tokio::sync::Mutex::new(()),
+            reach,
+            set_up: Mutex::default(),
+            started: AtomicBool::new(false),
         })
+    }
+
+    /// Whether each relay can be reached, and its class.
+    pub fn reach(&self) -> &Arc<Reach> {
+        &self.reach
     }
 
     /// The leave to use each connection.
@@ -585,14 +643,18 @@ impl DeviceEntries {
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key: None,
                         });
                         continue;
                     };
+                    // The key of the connection that it is read on.
+                    let key = Some(link.relay().0);
                     if held_up {
                         let read_as = LeftRead::NotRead("the node is held up".into());
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key,
                         });
                         continue;
                     }
@@ -623,6 +685,7 @@ impl DeviceEntries {
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key,
                         });
                         continue;
                     };
@@ -632,7 +695,11 @@ impl DeviceEntries {
                         let read = engine
                             .read_left(&link, &channel, &proof, place, until)
                             .await;
-                        LeftAt { relay: name, read }
+                        LeftAt {
+                            relay: name,
+                            read,
+                            key,
+                        }
                     });
                 }
                 while let Some(done) = reads.join_next().await {
@@ -919,11 +986,19 @@ impl DeviceEntries {
         // A device that follows no phrase has no channel of its own: it
         // opens no stream, and nothing is said of it but in the status.
         if stands == Stands::NoPhrase {
+            self.observe(relays, stands);
             self.say(relays, stands);
             return true;
         }
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
-        self.leave.reaches(&names, links);
+        // A machine that slept moves every relay's reference: the five
+        // minutes before a relay is out of reach start again (decision
+        // 2026-10-19 §1). A pass that finds no connection open moves
+        // none.
+        if self.leave.reaches(&names, links) {
+            self.reach.slept();
+        }
+        self.observe(relays, stands);
         self.forget_gone(links);
         // A change that could not be applied is tried again, whichever
         // relays are reached now.
@@ -980,12 +1055,88 @@ impl DeviceEntries {
         while let Some(turn) = turns.join_next().await {
             read_all &= turn.unwrap_or(false);
         }
-        if whole {
-            self.say_sent(relays);
+        // Where it does not say that it has sent what it carried, it may
+        // say that what it carried is at the relays it reaches (decision
+        // 2026-10-19 §4, rule 4, condition 4).
+        if whole && !self.say_sent(relays) {
+            self.say_reached(relays);
         }
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
         read_all
+    }
+
+    /// What the pass finds of each relay in `relays`, for what is known of
+    /// its reach (decision 2026-10-19 §1, rule 2): the change entry the
+    /// device keeps, whether it has one to show (`stands`), and whether
+    /// each relay holds it, from what the database keeps of the relay and
+    /// the key of the connection to it. At the node's first pass, the
+    /// start is noted there ([`known::started`]).
+    fn observe(&self, relays: &[Relay], stands: Stands) {
+        let ids: Vec<RelayId> = relays.iter().map(Relay::id).collect();
+        *lock(&self.set_up) = ids.clone();
+        let now = self.unix();
+        // What a show that ends while this reads says stands over it.
+        let shows_ended = self.reach.shows_ended();
+        let read = {
+            let db = lock(&self.state.db);
+            if !self.started.swap(true, Ordering::SeqCst) {
+                match known::started(&db, &ids, now) {
+                    Ok(started) if started.marked => tracing::info!(
+                        "the first start of this version, under statement 1: each relay is marked with its change entry"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.started.store(false, Ordering::SeqCst);
+                        tracing::debug!(error = %e, "could not note the start in what is known of the relays");
+                    }
+                }
+            }
+            if let Err(e) = known::note_kept(&db, now) {
+                tracing::debug!(error = %e, "could not note when the change entry came to be kept");
+            }
+            at_relays::kept_id(&db).and_then(|kept| Ok((kept, known::read(&db)?)))
+        };
+        let (kept, known) = match read {
+            Ok(read) => read,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read what is known of the relays");
+                return;
+            }
+        };
+        // A device in a fork shows its own entry; one that has stopped
+        // otherwise shows none.
+        let shows = matches!(stands, Stands::Applied | Stands::Stopped(State::Fork));
+        let each: Vec<_> = relays
+            .iter()
+            .map(|relay| {
+                let id = relay.id();
+                let open = relay.link.as_ref().filter(|link| link.is_open());
+                self.reach.connection(&id, open.map(Link::id));
+                let of = known.of(&id);
+                let holds = known::holds(of, kept, open.map(|link| link.relay().0));
+                let answered = of
+                    .and_then(|of| of.answer)
+                    .filter(|answer| Some(answer.entry) == kept)
+                    .map(|answer| answer.at);
+                (id, holds, answered)
+            })
+            .collect();
+        self.reach.observe_as_read(shows_ended, kept, shows, &each);
+    }
+
+    /// The relay that `link` is a connection to, by its name and key
+    /// together, among the relays the device is set up with.
+    fn id_of(&self, link: &Link) -> RelayId {
+        let set_up = lock(&self.set_up);
+        let named = || set_up.iter().filter(|id| id.name == link.name());
+        let found = named()
+            .find(|id| id.key == Some(link.relay().0))
+            .or_else(|| named().find(|id| id.key.is_none()));
+        found.cloned().unwrap_or_else(|| RelayId {
+            name: link.name().to_string(),
+            key: None,
+        })
     }
 
     /// Write that this device has sent what it carried, once it has
@@ -995,9 +1146,11 @@ impl DeviceEntries {
     /// otherwise: nothing is said then, as nothing is forgotten
     /// ([`Self::forget_done`]). The word waits in the store, and the pass
     /// that sends is woken for it.
-    fn say_sent(&self, relays: &[Relay]) {
+    ///
+    /// Says whether the word was written.
+    fn say_sent(&self, relays: &[Relay]) -> bool {
         let Some(set_up) = self.set_up_by_key(relays) else {
-            return;
+            return false;
         };
         let said = {
             let db = lock(&self.state.db);
@@ -1007,9 +1160,95 @@ impl DeviceEntries {
             Ok(true) => {
                 tracing::info!("this device has sent what it carried, and says so");
                 self.state.own_channels.written();
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not say that what was carried is sent");
+                false
+            }
+        }
+    }
+
+    /// Write this device's carried word, where it has one to write
+    /// (decision 2026-10-19 §4, rule 4; [`at_relays::say_reached`]): at
+    /// the end of a whole pass that did not write `sent`, from each
+    /// relay's class and the rows of what was sent to it. The word waits
+    /// in the store, and the pass that sends is woken for it.
+    fn say_reached(&self, relays: &[Relay]) {
+        let said = {
+            let db = lock(&self.state.db);
+            // What waits at each relay that is reached says whether it is
+            // in a class.
+            self.note_waits(&db, relays);
+            let Some(found) = self.found(&db, relays) else {
+                return;
+            };
+            at_relays::say_reached(&db, &self.state.identity, &found, self.unix())
+        };
+        match said {
+            Ok(true) => {
+                tracing::info!(
+                    "this device says that what it carried is at the relays it reaches: the others cannot be reached"
+                );
+                self.state.own_channels.written();
             }
             Ok(false) => {}
-            Err(e) => tracing::debug!(error = %e, "could not say that what was carried is sent"),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not say where what was carried is");
+            }
+        }
+    }
+
+    /// Each relay of `relays`, as the carried word is written from it
+    /// (decision 2026-10-19 §4, rule 4): its key, where the device knows
+    /// one ([`Self::key_of`]), and its class, as the classes stand: what
+    /// waits at each relay that is reached is noted before
+    /// ([`Self::note_waits`]). `None` where `relays` are not as many as the
+    /// node said it is configured with: whoever gives fewer is not
+    /// believed.
+    fn found(&self, db: &Connection, relays: &[Relay]) -> Option<Vec<Found>> {
+        if Some(relays.len()) != self.state.own_channels.relays_set_up() {
+            return None;
+        }
+        let known = known::read(db).unwrap_or_default();
+        let found = relays
+            .iter()
+            .map(|relay| Found {
+                key: Self::key_of(relay, &known),
+                class: self.reach.of(&relay.id()).class,
+            })
+            .collect();
+        Some(found)
+    }
+
+    /// The node key of `relay`, where the device knows one: the key its
+    /// configuration gives it, the key of the connection open to it, or
+    /// the key that gave its latest answer to a show. Rows of what was
+    /// sent to a relay are kept by its key.
+    fn key_of(relay: &Relay, known: &Known) -> Option<[u8; 32]> {
+        let open = relay.link.as_ref().filter(|link| link.is_open());
+        relay
+            .key
+            .or(open.map(|link| link.relay().0))
+            .or_else(|| known.of(&relay.id())?.answer.map(|answer| answer.by))
+    }
+
+    /// Note what waits at each relay of `relays` that is reached: whether
+    /// it is in a class goes by it (decision 2026-10-19 §1).
+    fn note_waits(&self, db: &Connection, relays: &[Relay]) {
+        for relay in relays {
+            let (id, link) = (relay.id(), relay.link.as_ref());
+            let Some(link) = link.filter(|link| link.is_open()) else {
+                continue;
+            };
+            if self.reach.is_reached(&id) {
+                let waits =
+                    cordelia_api::leaving::waits_at(db, &self.state.identity, &link.relay().0);
+                if let Ok(waits) = waits {
+                    self.reach.waits(&id, waits > 0);
+                }
+            }
         }
     }
 
@@ -1364,6 +1603,9 @@ impl DeviceEntries {
     async fn show_at(&self, link: &Link, gated: bool) -> bool {
         let mut round = Round::default();
         let gave_leave = self.show_round(link, &mut round, gated).await;
+        if round.shown {
+            self.round_ended(link, &round);
+        }
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -1379,6 +1621,25 @@ impl DeviceEntries {
             of.show_left = Some((entry, LeftFor { refusals, until }));
         }
         gave_leave
+    }
+
+    /// A round of shows on `link` ended, and the attempt at the relay with
+    /// it (decision 2026-10-19 §1): with what its latest show that counts
+    /// said, or with nothing that says whether the relay holds the entry.
+    fn round_ended(&self, link: &Link, round: &Round) {
+        let relay = self.id_of(link);
+        let said = round.said.unwrap_or(Said::Neither);
+        // An answer that it does not hold the entry is believed though it
+        // could not be written down.
+        let holds = if said == Said::Lacks {
+            Holds::Lacks
+        } else {
+            let db = lock(&self.state.db);
+            let kept = at_relays::kept_id(&db).ok().flatten();
+            let known = known::read(&db).unwrap_or_default();
+            known::holds(known.of(&relay), kept, Some(link.relay().0))
+        };
+        self.reach.show_ends(&relay, link.id(), said, holds);
     }
 
     /// Whether a show of the entry named `entry` waits at the relay
@@ -1431,6 +1692,10 @@ impl DeviceEntries {
             if gated && !self.asks_after_refusals(link) {
                 return false;
             }
+            if !round.shown {
+                round.shown = true;
+                self.reach.show_begins(&self.id_of(link));
+            }
             let answered = match self.leave.show(link, entry, short).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
@@ -1441,6 +1706,7 @@ impl DeviceEntries {
                 }
                 Err(e) => {
                     tracing::debug!(relay = link.name(), error = %e, "a show was not answered");
+                    round.said = None;
                     return false;
                 }
             };
@@ -1449,6 +1715,7 @@ impl DeviceEntries {
             match answered.answer {
                 ShowAnswer::Held | ShowAnswer::Taken => {
                     self.holds(link, entry, true);
+                    round.said = Some(Said::Holds);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit) => {
@@ -1457,7 +1724,9 @@ impl DeviceEntries {
                     let over_allowance =
                         answered.answer == ShowAnswer::Refused(EntryRefused::OverLimit);
                     self.holds(link, entry, false);
-                    self.no_room(link, over_allowance, RefusedOf::Change);
+                    round.said = Some(Said::Lacks);
+                    let refused = self.no_room(link, over_allowance, RefusedOf::Change);
+                    self.lacks_for_room(link, refused);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
@@ -1465,17 +1734,25 @@ impl DeviceEntries {
                         relay = link.name(),
                         "a relay says that the change entry this device keeps is not signed as it must be"
                     );
+                    round.said = None;
                     return false;
                 }
+                // "Show it whole" to a short show is no answer: the whole
+                // show that follows is what counts.
                 ShowAnswer::Whole if short => whole = true,
                 // "Show it whole" is no answer to the whole entry.
-                ShowAnswer::Whole => return false,
+                ShowAnswer::Whole => {
+                    round.said = None;
+                    return false;
+                }
                 ShowAnswer::Other { id, .. } => {
                     // The relay holds another. One that the device keeps,
                     // made apart from its own, it asks no more about. For
                     // any other it shows its own whole, and is answered
                     // with the entry.
                     self.holds(link, entry, false);
+                    round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     if !short || shows.apart == Some(id) {
                         return false;
                     }
@@ -1483,6 +1760,8 @@ impl DeviceEntries {
                 }
                 ShowAnswer::Another(bytes) => {
                     self.holds(link, entry, false);
+                    round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     let Some(another) = Entry::from_wire(&bytes)
                         .ok()
                         .and_then(|entry| entry.check().ok())
@@ -1588,6 +1867,9 @@ impl DeviceEntries {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(relay.to_string()).or_default();
                     of.refuses = Some(why.to_string());
+                    of.lacks_for = Some(cordelia_api::state::LacksFor::Another {
+                        why: Some(why.to_string()),
+                    });
                 }
                 false
             }
@@ -1640,17 +1922,51 @@ impl DeviceEntries {
     }
 
     /// The relay at `link` answered a show of `entry`: it holds it, or it
-    /// does not.
+    /// does not. The answer writes over the one before in what is known of
+    /// the relay, kept across starts (decision 2026-10-19 §1, rule 2).
     fn holds(&self, link: &Link, entry: &CheckedEntry, holds: bool) {
+        {
+            let mut kept = lock(&self.kept);
+            let of = kept.relays.entry(link.name().to_string()).or_default();
+            of.holds = Some((entry.id(), holds));
+            if holds {
+                of.lacks_for = None;
+            }
+        }
+        let relay = self.id_of(link);
+        let (by, now) = (link.relay().0, self.unix());
+        let noted = known::note_answer(&lock(&self.state.db), &relay, &entry.id(), holds, &by, now);
+        if let Err(e) = noted {
+            tracing::debug!(relay = link.name(), error = %e, "could not note a relay's answer to a show");
+        }
+    }
+
+    /// The relay at `link` said that it lacks the change entry shown it
+    /// because it had no room for it: `refused`, that refusal, is why the
+    /// wait says that it refuses the change (decision 2026-10-19 §5, S8).
+    /// It is the change's own refusal, and not the relay's last kept
+    /// ([`NoRoom::keep`]), which may be of the personal channel in the
+    /// same pass.
+    fn lacks_for_room(&self, link: &Link, refused: NoRoom) {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
-        of.holds = Some((entry.id(), holds));
+        of.lacks_for = Some(cordelia_api::state::LacksFor::Room(refused));
+    }
+
+    /// The relay at `link` said that it lacks the change entry shown it
+    /// because it holds another: `why` this device does not take that
+    /// one, where it is known.
+    fn lacks_for_another(&self, link: &Link, why: Option<String>) {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        of.lacks_for = Some(cordelia_api::state::LacksFor::Another { why });
     }
 
     /// The relay at `link` refused something that it would have taken:
     /// the change entry, or an entry of the channel `refused`. One
-    /// refusal is kept for each relay ([`NoRoom::keep`]).
-    fn no_room(&self, link: &Link, over_allowance: bool, refused: RefusedOf) {
+    /// refusal is kept for each relay ([`NoRoom::keep`]). Returns the
+    /// refusal, kept or not.
+    fn no_room(&self, link: &Link, over_allowance: bool, refused: RefusedOf) -> NoRoom {
         let at = self.unix();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -1667,7 +1983,8 @@ impl DeviceEntries {
             over_allowance,
             of: refused,
         };
-        NoRoom::keep(&mut of.no_room, refused, of.passes);
+        NoRoom::keep(&mut of.no_room, refused.clone(), of.passes);
+        refused
     }
 
     // ── One relay's pass ────────────────────────────────────────────
@@ -2325,6 +2642,17 @@ impl DeviceEntries {
                     .extend(done.another_at.iter().map(|seq| (channel.id, *seq)));
             }
             let stopped = done.refused.is_some();
+            // What of the device's own a relay takes, or refuses at each
+            // offer, says whether it refuses what waits there (decision
+            // 2026-10-19 §1).
+            let (took, refused) = what_waits_heard(&channel.kind, &done);
+            let relay = self.id_of(link);
+            if took {
+                self.reach.took_what_waits(&relay);
+            }
+            if refused {
+                self.reach.refused_what_waits(&relay);
+            }
             if stopped || done.no_room > 0 {
                 // A relay with no room for the messages channel sets no
                 // hold, and changes no status's line (decision 2026-10-09
@@ -2561,14 +2889,29 @@ impl DeviceEntries {
                 .flat_map(|of| of.another_form.iter().copied())
                 .collect()
         };
-        let (latest, gone) = {
+        let (latest, gone, keys, word_to_come) = {
             let db = lock(&self.state.db);
+            // What waits at each relay that is reached says whether it is
+            // in a class (decision 2026-10-19 §1).
+            self.note_waits(&db, relays);
             let latest = at_relays::kept_id(&db).ok().flatten();
             let gone: HashSet<([u8; 32], i64)> = said
                 .into_iter()
                 .filter(|(channel, seq)| matches!(entries::holds_at(&db, channel, *seq), Ok(false)))
                 .collect();
-            (latest, gone)
+            let known = known::read(&db).unwrap_or_default();
+            let keys: Vec<Option<[u8; 32]>> = relays
+                .iter()
+                .map(|relay| Self::key_of(relay, &known))
+                .collect();
+            // Whether the next whole pass would write either word, by the
+            // functions that write them (decision 2026-10-19 §4, rule 8).
+            let by_key = self.set_up_by_key(relays);
+            let found = self.found(&db, relays);
+            let identity = &self.state.identity;
+            let to_come =
+                at_relays::word_to_come(&db, identity, by_key.as_deref(), found.as_deref());
+            (latest, gone, keys, to_come.unwrap_or(false))
         };
         let mut kept = lock(&self.kept);
         for of in kept.relays.values_mut() {
@@ -2577,7 +2920,8 @@ impl DeviceEntries {
         let kept = kept;
         let relays = relays
             .iter()
-            .map(|relay| {
+            .zip(keys)
+            .map(|(relay, key)| {
                 let of = kept.relays.get(&relay.name);
                 AtRelay {
                     relay: relay.name.clone(),
@@ -2591,6 +2935,15 @@ impl DeviceEntries {
                     no_room: of.and_then(|of| of.no_room.clone()).map(|(kept, _)| kept),
                     another_form: of.map_or(0, |of| of.another_form.len()),
                     refuses: of.and_then(|of| of.refuses.clone()),
+                    reach: cordelia_api::state::Reach {
+                        // Why it lacks the entry it was last shown, where
+                        // that is the kept entry.
+                        lacks_for: of
+                            .filter(|of| of.holds.map(|(entry, _)| entry) == latest)
+                            .and_then(|of| of.lacks_for.clone()),
+                        ..self.reach.of(&relay.id())
+                    },
+                    key,
                 }
             })
             .collect();
@@ -2612,6 +2965,8 @@ impl DeviceEntries {
         self.state.own_channels.say(AtRelays {
             relays,
             cannot_go_on,
+            word_to_come,
+            woke_at: self.leave.woke_at(),
         });
     }
 }
@@ -2628,6 +2983,18 @@ struct PageSeen {
     /// Whether it was asked from a place that is no longer the one kept:
     /// every place was forgotten while it was asked for.
     stale: bool,
+}
+
+/// What the answer `done` to a push of a channel of `kind` says of what of
+/// the device's own waits at the relay (decision 2026-10-19 §1): whether
+/// the relay took something of it, and whether it refused something, for
+/// room or for the address's allowance. The messages channel says neither:
+/// what waits there makes no relay STUCK (decision 2026-10-09 §8).
+fn what_waits_heard(kind: &Kind, done: &Sent) -> (bool, bool) {
+    if *kind == Kind::Messages {
+        return (false, false);
+    }
+    (done.held > 0, done.refused.is_some() || done.no_room > 0)
 }
 
 /// Whether a pull got somewhere by a page: it was `asked` from a mark and
@@ -2929,6 +3296,36 @@ mod tests {
             256 + 1024
         );
         assert_eq!(counted_as_handed(3), entry_cost(0));
+    }
+
+    /// What a push's answer says of what waits at a relay (decision
+    /// 2026-10-19 §1): something taken, and something refused for room or
+    /// for the allowance, of a channel of the device's memory; and nothing
+    /// of the messages channel, whatever its answer.
+    #[test]
+    fn what_waits_is_heard_of_memory_and_not_of_messages() {
+        let took = Sent {
+            held: 1,
+            ..Sent::default()
+        };
+        let no_room = Sent {
+            no_room: 1,
+            ..Sent::default()
+        };
+        let over = Sent {
+            refused: Some(Pushed::OverAllowance),
+            ..Sent::default()
+        };
+        let name = Kind::Name("notes".into());
+        for kind in [Kind::Personal, name.clone()] {
+            assert_eq!(what_waits_heard(&kind, &took), (true, false));
+            assert_eq!(what_waits_heard(&kind, &no_room), (false, true));
+            assert_eq!(what_waits_heard(&kind, &over), (false, true));
+            assert_eq!(what_waits_heard(&kind, &Sent::default()), (false, false));
+        }
+        for done in [&took, &no_room, &over] {
+            assert_eq!(what_waits_heard(&Kind::Messages, done), (false, false));
+        }
     }
 
     /// Each answer to a push says one of six things for sending: the

@@ -40,10 +40,19 @@ fn asks(node: &Node, path: &str, body: Value) -> (u16, String) {
 }
 
 /// What the node says that its device holds of its person: [`look`],
-/// without what it says of its relays, which changes as it reaches them.
+/// without what it says of its relays, which changes as it reaches them,
+/// and without the times its passes note of them (when it woke, and since
+/// when it has known its relays, which its first pass writes).
 fn holds(node: &Node) -> Value {
     let mut seen = look(node);
-    for of_its_relays in ["relays", "waiting", "not_reached", "says"] {
+    for of_its_relays in [
+        "relays",
+        "waiting",
+        "not_reached",
+        "says",
+        "woke_at",
+        "relays_known_since",
+    ] {
         seen.as_object_mut().unwrap().remove(of_its_relays);
     }
     seen
@@ -327,18 +336,26 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
         "the test was slow"
     );
     assert_eq!(waits(), Some(1), "{}", look(&laptop));
-    // The status, and `cordelia devices`, name the relay not heard from.
-    let not_heard = format!(
-        "has not heard from {NO_SUCH_NAME} since it woke: a change made while it was off may \
-         not have reached it"
-    );
+    // The status, and `cordelia devices`, name the relay not heard from
+    // (decision 2026-10-19 §5, T1 and D2): it is not out of reach yet.
     let status = laptop.cli(&["status"]);
-    assert!(status.contains(&not_heard), "{status}");
-    let devices = laptop.cli(&["devices"]);
+    let t1 = format!("has not heard from {NO_SUCH_NAME} since it started or woke at ");
+    let t1_ends = ": a change made while this device was off may be there, and not have \
+                   reached it";
     assert!(
-        devices.contains(&format!(
-            "{NO_SUCH_NAME}: has not answered since this device woke"
-        )),
+        status
+            .lines()
+            .any(|line| line.contains(&t1) && line.ends_with(t1_ends)),
+        "{status}"
+    );
+    let devices = laptop.cli(&["devices"]);
+    let d2 = format!("  {NO_SUCH_NAME}: has not answered since this device started or woke at ");
+    let d2_ends = " UTC. A change made while this device was off may be there, and not have \
+                   reached it.";
+    assert!(
+        devices
+            .lines()
+            .any(|line| line.starts_with(&d2) && line.ends_with(d2_ends)),
         "{devices}"
     );
     assert!(
@@ -1083,8 +1100,8 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
          changes made apart have to be settled with the phrase.",
     );
     at.says(
-        "This machine may be closed only when every relay holds the change and this device has \
-         sent what it holds.",
+        "You may close this machine once every relay holds the change, and what this device \
+         carried is at a relay that it reaches.",
     );
     let said = at.done();
     println!("{said}");
@@ -4089,130 +4106,12 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
             assert!(unguarded, "the image that waits");
         }
     }
-    at.says("This machine may be closed only when");
+    at.says("You may close this machine once every relay holds the change");
     let said = at.done();
     assert!(said.contains("this machine may be closed."), "{said}");
 }
 
 // ── What answers at the node's address ───────────────────────────────
-
-/// A stand-in at a port of this machine for the node at `port`: each
-/// request is passed on to the node, and the node's answer is handed back
-/// as `changed` leaves it. It is what a program that answers at the
-/// node's address could say to a command.
-struct Answers {
-    port: u16,
-    /// Each request that a command made here, in their order.
-    asked: std::sync::Arc<std::sync::Mutex<Vec<Asked>>>,
-}
-
-/// A request that a command made: its path, and its body.
-type Asked = (String, Vec<u8>);
-
-impl Answers {
-    fn in_the_place_of(
-        node: &Node,
-        changed: impl Fn(&str, &mut Value) + Send + Sync + 'static,
-    ) -> Self {
-        Self::losing(node, changed, |_| None)
-    }
-
-    /// [`Self::in_the_place_of`], where the answer to some requests is
-    /// lost: `lost` says of a request's path whether its answer is lost
-    /// once the node has done what was asked (`Some(true)`), or the
-    /// request is lost before it reaches the node (`Some(false)`). The
-    /// command is then answered nothing, and its connection is closed.
-    fn losing(
-        node: &Node,
-        changed: impl Fn(&str, &mut Value) + Send + Sync + 'static,
-        lost: impl Fn(&str) -> Option<bool> + Send + Sync + 'static,
-    ) -> Self {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let at = listener.local_addr().unwrap().port();
-        let (node_port, token) = (node.http, node.token());
-        let changed = std::sync::Arc::new(changed);
-        let lost = std::sync::Arc::new(lost);
-        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let kept = asked.clone();
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let (changed, token) = (changed.clone(), token.clone());
-                let (lost, kept) = (lost.clone(), kept.clone());
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_err() {
-                        return;
-                    }
-                    let mut parts = line.split_whitespace();
-                    let method = parts.next().unwrap_or_default().to_string();
-                    let path = parts.next().unwrap_or_default().to_string();
-                    let mut length = 0usize;
-                    loop {
-                        let mut header = String::new();
-                        let read = reader.read_line(&mut header).unwrap_or(0);
-                        if read == 0 || header == "\r\n" {
-                            break;
-                        }
-                        if let Some((name, value)) = header.split_once(':')
-                            && name.eq_ignore_ascii_case("content-length")
-                        {
-                            length = value.trim().parse().unwrap_or(0);
-                        }
-                    }
-                    let mut body = vec![0u8; length];
-                    if reader.read_exact(&mut body).is_err() {
-                        return;
-                    }
-                    kept.lock().unwrap().push((path.clone(), body.clone()));
-                    let loses = lost(&path);
-                    if loses == Some(false) {
-                        return;
-                    }
-                    let url = format!("http://127.0.0.1:{node_port}{path}");
-                    let agent: ureq::Agent = ureq::Agent::config_builder()
-                        .proxy(None)
-                        .http_status_as_error(false)
-                        .build()
-                        .into();
-                    let auth = format!("Bearer {token}");
-                    let answered = match method.as_str() {
-                        "GET" => agent.get(&url).header("Authorization", &auth).call(),
-                        _ => agent
-                            .post(&url)
-                            .header("Authorization", &auth)
-                            .header("Content-Type", "application/json")
-                            .send(&body[..]),
-                    };
-                    let Ok(mut answered) = answered else {
-                        return;
-                    };
-                    if loses == Some(true) {
-                        return;
-                    }
-                    let status = answered.status().as_u16();
-                    let mut answer: Value = answered.body_mut().read_json().unwrap_or(Value::Null);
-                    changed(&path, &mut answer);
-                    let out = answer.to_string();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{out}",
-                        out.len()
-                    );
-                });
-            }
-        });
-        Self { port: at, asked }
-    }
-
-    /// Every request that a command has made here: its path, and its
-    /// body.
-    fn asked(&self) -> Vec<Asked> {
-        self.asked.lock().unwrap().clone()
-    }
-}
 
 /// No word of a new phrase reaches the node (decision 2026-10-04 §5).
 /// `cordelia phrase` makes the words in its own process, and hands the
@@ -5454,5 +5353,487 @@ fn not_heard_from_yet_runs_only_from_a_time_of_this_devices_own() {
     assert!(
         on_the_desktop.ends_with(": not heard from yet"),
         "{on_the_desktop}"
+    );
+}
+
+// ── The wait after a change, and its three ends ──────────────────────
+
+/// How long a wait after a change is given to end where a relay is out of
+/// reach: its five minutes, the time of an attempt, and room for a slow
+/// machine (decision 2026-10-19 §1).
+const OUT_OF_REACH_WAITED: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A laptop set up with `relays`, by name and key, started and reaching
+/// `relay`, with a phrase made: the laptop, and the phrase's words.
+fn phrase_made_at(relay: &Node, relays: &[(String, Option<String>)]) -> (Node, String) {
+    let mut laptop = node_with_relays("laptop", "personal", relays);
+    laptop.start();
+    let all = [relay, &laptop];
+    wait_for("device healthy", &all, 30, || healthy(&laptop));
+    wait_for("device reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
+    });
+    let words = makes_a_phrase(&laptop, "laptop");
+    (laptop, words)
+}
+
+/// Whether `cordelia status` at `node` is amber, and says `says` among
+/// what holds (decision 2026-10-19, rule 11).
+fn amber_with(node: &Node, says: &str) -> Option<()> {
+    let status: Value = serde_json::from_str(&node.cli(&["status", "--json"])).ok()?;
+    let holds = status["holds"].as_array()?;
+    let said = holds.iter().any(|holds| holds["says"] == says);
+    (status["level"] == "amber" && said).then_some(())
+}
+
+/// What no line of a wait that ends without success says: that the
+/// machine may be closed, at end 1 or at end 2.
+fn says_not_that_it_may_be_closed(said: &str) {
+    assert!(!said.contains("this machine may be closed"), "{said}");
+    assert!(!said.contains("You may close this machine."), "{said}");
+}
+
+/// A change ends not done where a relay that lacks it cannot be reached
+/// (decision 2026-10-19 §4, rule 8, end 3). The laptop is set up with a
+/// relay that answers and with one whose name does not resolve, and
+/// renews. Within the five minutes the command goes on, and says that
+/// the second does not hold the change yet. After them it says S2, S8, S9
+/// and S10, and ends with status 3. It never says that the machine may be
+/// closed.
+#[test]
+#[ignore = "it waits out a relay's five minutes out of reach: about six minutes"]
+fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
+    use std::time::{Duration, Instant};
+    let relay = relay_started();
+    let reached = format!("127.0.0.1:{}", relay.p2p);
+    let (laptop, words) = phrase_made_at(
+        &relay,
+        &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
+    );
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    let made = Instant::now();
+    at.says(&format!("{reached} holds the change"));
+    // Said as the wait goes on, before or after that line: the first look
+    // after the change may still be of the entry before it, and then
+    // neither relay is said to hold the change.
+    assert!(
+        at.said.contains(&format!(
+            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+        )),
+        "{}",
+        at.said
+    );
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    assert!(
+        made.elapsed() >= Duration::from_secs(290),
+        "it ended after {:?}:\n{said}",
+        made.elapsed()
+    );
+    assert_eq!(status, Some(3), "{said}");
+    for line in [
+        format!(
+            "keep this machine on: {NO_SUCH_NAME} is not known to hold the change yet, and has \
+             not answered since"
+        ),
+        format!("  {NO_SUCH_NAME} is not known to hold the change, and has not answered since"),
+        format!(
+            "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
+        ),
+        "It looks its name up every 30 seconds.".to_string(),
+        format!(
+            "The change is not known to be at {NO_SUCH_NAME}. This command ends here, with \
+             status 3. It does not say that you may close this machine."
+        ),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+    }
+    says_not_that_it_may_be_closed(&said);
+    // The status line says so, with sync off and nothing mapped (rule
+    // 11): the command ends at five minutes, and the line once they are
+    // over, at the node's next pass. `cordelia devices` says D4.
+    let says = "memory: a relay not known to hold the latest change";
+    wait_for("the status line is amber", &[&relay, &laptop], 30, || {
+        amber_with(&laptop, says)
+    });
+    let status: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["summary"], says, "{status}");
+    let devices = laptop.cli(&["devices"]);
+    assert!(
+        devices.contains(&format!(
+            "  {NO_SUCH_NAME}: is not known to hold the latest change, and has not answered since"
+        )),
+        "{devices}"
+    );
+}
+
+/// The case that was seen (decision 2026-10-19 §1, rule 11): a removal
+/// made on alpha.12 that one relay never got, then the upgrade. The
+/// laptop removes the desktop with one relay, and its database is then
+/// put in alpha.12's form: nothing is kept of what each relay is known to
+/// hold. It is set up with a second relay, whose name does not resolve,
+/// and started on this version. The kept statement is not statement 1, so
+/// nothing is marked: the relay that answers holds the change once it
+/// answers, and the other lacks it. Five minutes on, the status line is
+/// amber with a relay not known to hold the latest change, with sync off
+/// and nothing mapped, however old the removal: its seven days run from
+/// this version's first start.
+#[test]
+#[ignore = "it waits out a relay's five minutes: about six minutes"]
+fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let mut at = removes(&laptop, &key_of(&desktop), &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&relay, &laptop, &desktop];
+    wait_for("the relay holds the removal", &all, 60, || {
+        let seen = look(&laptop);
+        (seen["change"] == 2 && seen["relays"][0]["reach"]["holds"] == "holds").then_some(())
+    });
+
+    laptop.stop();
+    let db = rusqlite::Connection::open(laptop.data_dir().join("cordelia.db")).unwrap();
+    let gone = db
+        .execute(
+            "DELETE FROM node_meta WHERE key = 'person.relays_known'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(gone, 1, "what is known of the relays was kept");
+    drop(db);
+    laptop.add_relay(NO_SUCH_NAME, None);
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    wait_for("the relay that answers holds the change", &all, 60, || {
+        (look(&laptop)["relays"][0]["reach"]["holds"] == "holds").then_some(())
+    });
+    let seen = look(&laptop);
+    assert_eq!(seen["relays"][1]["reach"]["holds"], "lacks", "{seen}");
+    let says = "memory: a relay not known to hold the latest change";
+    assert!(
+        amber_with(&laptop, says).is_none(),
+        "amber before five minutes"
+    );
+    wait_for("the status line is amber", &all, 360, || {
+        amber_with(&laptop, says)
+    });
+    let status: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["summary"], says, "{status}");
+}
+
+/// A change ends not done where the relay that it reaches refuses it
+/// (decision 2026-10-19 §4, rule 8, end 3). Relay A may hold no new
+/// channel: the laptop never showed it a change entry that it took, so
+/// the change is a new channel there, refused for room. Relay B's name
+/// does not resolve. After five minutes the command says S8 for both, S9
+/// and S10, and ends with status 3, though what was carried waits at A.
+#[test]
+#[ignore = "it waits out a relay's five minutes of refusals: about six minutes"]
+fn a_change_ends_not_done_where_the_relay_it_reaches_refuses_it() {
+    use std::time::{Duration, Instant};
+    let mut relay = node("relay", "relay", None);
+    relay.max_storage_bytes(1);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let reached = format!("127.0.0.1:{}", relay.p2p);
+    let (laptop, words) = phrase_made_at(
+        &relay,
+        &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
+    );
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    let made = Instant::now();
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    assert!(
+        made.elapsed() >= Duration::from_secs(290),
+        "it ended after {:?}:\n{said}",
+        made.elapsed()
+    );
+    assert_eq!(status, Some(3), "{said}");
+    for line in [
+        format!("  {reached} is reached, and has not taken the change: it had no room for it at"),
+        "(it is full).".to_string(),
+        format!("  {NO_SUCH_NAME} is not known to hold the change, and has not answered since"),
+        format!(
+            "{reached} refuses the change. A device that reaches it hears of it only once it takes it, or from another relay."
+        ),
+        format!(
+            "The change is not known to be at {reached} and {NO_SUCH_NAME}. This command ends \
+             here, with status 3."
+        ),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+    }
+    says_not_that_it_may_be_closed(&said);
+}
+
+/// A change ends not done where the other relay has the wrong key at the
+/// same address (decision 2026-10-19 §1; §4, rule 8). The laptop is set up
+/// with the test's one relay under two names, one with another key: that
+/// one is never dialled while the other is connected, and each tick that
+/// passes it over is a failed attempt. The command ends at end 3, with
+/// S9's words for a relay that cannot be dialled.
+#[test]
+#[ignore = "it waits out a relay's five minutes out of reach: about six minutes"]
+fn a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_address() {
+    let relay = relay_started();
+    let another = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+    let another = cordelia_crypto::bech32::encode_public_key(&another.public_key()).unwrap();
+    let right = format!("127.0.0.1:{}", relay.p2p);
+    let wrong = format!("localhost:{}", relay.p2p);
+    let (laptop, words) = phrase_made_at(
+        &relay,
+        &[
+            (right.clone(), Some(key_of(&relay))),
+            (wrong.clone(), Some(another)),
+        ],
+    );
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    assert_eq!(status, Some(3), "{said}");
+    for line in [
+        format!("  {wrong} is not known to hold the change, and has not answered since"),
+        format!("It cannot dial {wrong} while another relay answers at its address."),
+        format!("The change is not known to be at {wrong}."),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+    }
+    says_not_that_it_may_be_closed(&said);
+}
+
+/// A relay that comes back within five minutes does not end the wait
+/// (decision 2026-10-19 §1, §4, rule 8). Relay B is stopped at the
+/// change, and started again two minutes later: it takes the change, the
+/// laptop writes that it has sent what it carried, and the command ends at
+/// end 1, with status 0.
+#[test]
+#[ignore = "it waits two minutes for a relay to come back"]
+fn a_relay_that_comes_back_within_five_minutes_does_not_end_the_wait() {
+    use std::time::Duration;
+    let a = relay_started();
+    let mut b = relay_started();
+    let (laptop, words) = phrase_made_at(
+        &a,
+        &[
+            (format!("127.0.0.1:{}", a.p2p), None),
+            (format!("127.0.0.1:{}", b.p2p), None),
+        ],
+    );
+    wait_for(
+        "both relays hold the first change",
+        &[&a, &b, &laptop],
+        60,
+        || relay_holds_latest(&laptop),
+    );
+    b.stop();
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    let said = at.hears_for(Duration::from_secs(120)).to_string();
+    assert!(!said.contains("This command ends here"), "{said}");
+    says_not_that_it_may_be_closed(&said);
+    b.start();
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
+    assert_eq!(status, Some(0), "{said}");
+    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(!said.contains("This command ends here"), "{said}");
+}
+
+/// A relay that holds the change and cannot be reached ends the wait at
+/// end 2 (decision 2026-10-19 §4, rule 8), on the path where the laptop
+/// wrote `sent`. Relays A and B take the change and all that was carried,
+/// and the command that made it ends at end 1. Then B is stopped, and the
+/// wait after that change is run again: after five minutes it says S6 (B
+/// holds all that this device carried) and S7, and ends with status 0.
+/// The laptop's node is then started again: `cordelia devices` says D5 of
+/// B, from what is kept across the start.
+#[test]
+#[ignore = "it waits out a relay's five minutes out of reach twice: about twelve minutes"]
+fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
+    use std::time::Duration;
+    let a = relay_started();
+    let mut b = relay_started();
+    let (name_a, name_b) = (
+        format!("127.0.0.1:{}", a.p2p),
+        format!("127.0.0.1:{}", b.p2p),
+    );
+    // Each is given its key: a relay given none holds the change only
+    // while the device is connected to it (decision 2026-10-19 §1).
+    let (laptop, words) = phrase_made_at(
+        &a,
+        &[
+            (name_a.clone(), Some(key_of(&a))),
+            (name_b.clone(), Some(key_of(&b))),
+        ],
+    );
+    let said = renews(&laptop, &[], &words).done();
+    assert!(said.contains("this machine may be closed."), "{said}");
+    b.stop();
+    wait_for("the laptop sees that B is gone", &[&a, &laptop], 90, || {
+        (look(&laptop)["relays"][1]["reach"]["reached"] == false).then_some(())
+    });
+    let at = laptop.at_terminal(&["change-made", "2"]);
+    let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED + Duration::from_secs(300));
+    assert_eq!(status, Some(0), "{said}");
+    for line in [
+        format!(
+            "  {name_b} holds the change and all that this device carried, and has not been reached from here since"
+        ),
+        "Every relay holds the change. You may close this machine.".to_string(),
+        format!("All that this device carried is at {name_a} and {name_b}."),
+        format!("What this device writes from now on waits for {name_b}."),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+    }
+    assert!(!said.contains("This command ends here"), "{said}");
+    // The laptop's node starts again: what is known of B is kept across
+    // the start, and once B is out of reach again `cordelia devices` says
+    // D5 of it (decision 2026-10-19, rule 12).
+    let mut laptop = laptop;
+    laptop.stop();
+    laptop.start();
+    let d5 = format!("  {name_b}: holds the latest change (as it said at ");
+    wait_for("D5 is said of B", &[&a, &laptop], 420, || {
+        let devices = laptop.cli(&["devices"]);
+        let line = devices.lines().find(|line| line.starts_with(&d5))?;
+        line.contains("), and has not answered since ")
+            .then_some(())
+    });
+}
+
+/// The wait that cannot be started ends with status 3 (decision
+/// 2026-10-19 §4, rule 8): the program that made the change is taken away
+/// before the change is made, so that it cannot be run again for the
+/// wait. The command says where to look, and that the machine is to be
+/// kept on, and ends with status 3: the change is made.
+#[test]
+fn the_wait_that_cannot_start_ends_with_3() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    let away = laptop.home().join("taken-away");
+    std::fs::create_dir_all(&away).unwrap();
+    let program = away.join("cordelia");
+    std::fs::copy(common::BIN, &program).unwrap();
+    laptop.bin = Some(program.clone());
+    let mut at = renews_to_the_phrase(&laptop);
+    laptop.bin = None;
+    std::fs::remove_file(&program).unwrap();
+    at.types(&words);
+    at.says("The change is made (change 2).");
+    let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains("This command could not go on to say what is still missing"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "Keep this machine on until every relay holds the change and nothing is left to \
+             send."
+        ),
+        "{said}"
+    );
+    assert_eq!(look(&laptop)["change"], 2);
+}
+
+/// The wait after a change ends with status 3 where the device no longer
+/// stands in its phrase (decision 2026-10-19 §4, rule 8): the laptop is
+/// removed from the desktop, and the wait of the change it applied last
+/// is run on it. It shows the change to no relay, so no end would hold:
+/// the wait says why, and ends at once, never saying that the machine may
+/// be closed.
+#[test]
+fn the_wait_ends_with_3_where_the_device_no_longer_stands_in_its_phrase() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let all = [&relay, &laptop, &desktop];
+    let words = makes_a_phrase(&desktop, "desktop");
+    adds(&desktop, &laptop, "laptop");
+    let mut at = removes(&desktop, &key_of(&laptop), &[], &words);
+    at.says("The change is made");
+    drop(at);
+    wait_for("the laptop learns that it was removed", &all, 120, || {
+        (text(&look(&laptop), "state") == "removed").then_some(())
+    });
+    let change = look(&laptop)["change"]
+        .as_u64()
+        .expect("a change is applied");
+    // At a terminal, so that a wait that would not end fails the test in
+    // a minute, and does not hold it up.
+    let at = laptop.at_terminal(&["change-made", &change.to_string()]);
+    let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains("This device no longer stands in its phrase (this device was removed"),
+        "{said}"
+    );
+    says_not_that_it_may_be_closed(&said);
+}
+
+/// The wait after a change ends with status 3 where the device has since
+/// applied another change, and on an error during the wait (decision
+/// 2026-10-19 §4, rule 8): the change is made, and is not known to be at
+/// every relay. The error is said on standard error, with that the change
+/// is made and is not to be made again.
+#[test]
+fn the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    makes_a_phrase(&laptop, "laptop");
+    let out = laptop.command(&["change-made", "7"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{said}");
+    assert!(
+        said.contains("This device has since applied another change: `cordelia devices` says."),
+        "{said}"
+    );
+    // A node of another version in this one's place during the wait, and
+    // a look of which a relay's reach cannot be read: each ends the wait
+    // as an error, with status 3, and not by waiting for ever.
+    let other_version = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.1-another".into();
+        }
+    });
+    let unreadable = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/devices/list" {
+            for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+                relay.as_object_mut().unwrap().remove("reach");
+            }
+        }
+    });
+    for (through, why) in [
+        (&other_version, "0.0.1-another"),
+        (&unreadable, "what this command cannot read"),
+    ] {
+        let at = laptop.at_terminal_through(through.port, &["change-made", "1"]);
+        let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+        assert_eq!(status, Some(3), "{said}");
+        assert!(
+            said.contains("The change is made (change 1). This command could not go on: "),
+            "{said}"
+        );
+        assert!(said.contains(why), "{said}");
+    }
+    laptop.stop();
+    let out = laptop.command(&["change-made", "1"]);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{error}");
+    assert!(
+        error.contains("The change is made (change 1). This command could not go on: "),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Do not make the change again. `cordelia devices` shows whether each relay holds it."
+        ),
+        "{error}"
     );
 }

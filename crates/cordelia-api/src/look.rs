@@ -41,7 +41,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use cordelia_core::protocol::{
-    MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS, STATEMENTS_LEFT_SAID_BELOW,
+    FALLBACK_PEER_KEYS, FALLBACK_PEERS, MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS,
+    STATEMENTS_LEFT_SAID_BELOW,
 };
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
@@ -50,6 +51,7 @@ use cordelia_crypto::derive;
 use cordelia_crypto::entry::Value;
 use cordelia_crypto::fingerprint;
 use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::reached::CarriedWord;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::Statement;
 use cordelia_crypto::version;
@@ -64,9 +66,9 @@ use crate::leaving::{Among, among, left_name};
 use crate::names;
 use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
-    kept_entry, latest_entry, read_applied_word,
+    kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn, NoRoom, RefusedOf};
+use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, RefusedOf, Waits};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -118,8 +120,37 @@ pub struct Listed {
     /// Whether it says that it has sent what it carried when it applied
     /// the statement that this device has applied.
     pub sent: bool,
+    /// Its carried word under that statement, where it is read (decision
+    /// 2026-10-19 §4, rule 5): never beside `sent`.
+    pub carried_word: Option<CarriedWordLook>,
     /// Whether it has said that it left.
     pub left: bool,
+}
+
+/// A device's carried word, as a look shows it (decision 2026-10-19 §4,
+/// rules 4 to 6): what it carried is at the relays whose keys it names,
+/// and more; it may still wait at `not_yet` other relays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CarriedWordLook {
+    /// The relays' node keys, as a key is written, in the order of that
+    /// device's configuration.
+    pub keys: Vec<String>,
+    /// How many more relays hold what it carried: 0 unless it names 8.
+    pub more: u64,
+    /// At how many relays that it is set up with what it carried may still
+    /// wait.
+    pub not_yet: u64,
+}
+
+impl CarriedWordLook {
+    fn of(word: &CarriedWord) -> Result<Self, PersonError> {
+        let keys = word.keys.iter().map(encode_public_key);
+        Ok(Self {
+            keys: keys.collect::<Result<_, _>>()?,
+            more: word.more,
+            not_yet: word.not_yet,
+        })
+    }
 }
 
 /// A device added since the statement, or a record that is not counted.
@@ -139,6 +170,8 @@ pub struct AddedSince {
     pub applied: Option<u64>,
     /// As [`Listed::sent`].
     pub sent: bool,
+    /// As [`Listed::carried_word`].
+    pub carried_word: Option<CarriedWordLook>,
     pub left: bool,
 }
 
@@ -246,6 +279,64 @@ pub struct AtRelayLook {
     /// Why this device refuses the change that the relay holds, where it
     /// does.
     pub refuses: Option<String>,
+    /// Its node key, as a key is written, where the device knows one:
+    /// what another device's carried word names it by (decision
+    /// 2026-10-19, rule 6).
+    pub key: Option<String>,
+    /// Whether nothing that this device carried waits there, by its rows
+    /// of what it sent, reached or not: given where its own carried word
+    /// is read and the relay's key is known (decision 2026-10-19, rule 7).
+    pub has_what_was_carried: Option<bool>,
+    /// What the node knows of the relay's reach, and its class (decision
+    /// 2026-10-19 §1): what the wait after a change reads, and never works
+    /// out again.
+    pub reach: ReachLook,
+}
+
+/// What the node knows of a relay's reach, as a look shows it (decision
+/// 2026-10-19 §1): each relay's class, put by the node's own function,
+/// and what the lines of the wait after a change say of it. Each time is
+/// by the time of day, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ReachLook {
+    /// The change entry that the rest is about, by its ID in hex, as
+    /// `Look::latest` names one: none before the node's pass has found the
+    /// kept entry. The wait after a change reads nothing else of a relay
+    /// whose reach is about another entry (decision 2026-10-19 §4, rule 8).
+    pub about: Option<String>,
+    /// Its class, where it is in one.
+    pub class: Option<Class>,
+    /// Whether it holds the change entry that the device keeps.
+    pub holds: Holds,
+    /// Whether it is reached.
+    pub reached: bool,
+    /// Since when it is out of reach, where it is.
+    pub out_of_reach_since: Option<i64>,
+    /// Its reference: the latest of the node's start, a sleep, the change
+    /// of the kept entry, and the moment it was last reached.
+    pub reference: i64,
+    /// When it was last reached, where it was since the node started.
+    pub last_reached: Option<i64>,
+    /// What waits there, where it is reached.
+    pub waits: Option<Waits>,
+    /// Since when it has refused what waits there, where it does.
+    pub refusing_waits_since: Option<i64>,
+    /// Its last refusal for room, where it made one: of the change, or of
+    /// a channel of the device's own.
+    pub no_room: Option<NoRoom>,
+    /// When it gave its latest answer about the kept entry, where it gave
+    /// one: what `cordelia devices` says it said that it holds the change
+    /// at (decision 2026-10-19 §5, D5).
+    #[serde(default)]
+    pub answered_at: Option<i64>,
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock, where it lacks it: what the status line counts
+    /// (decision 2026-10-19, rule 11).
+    #[serde(default)]
+    pub lacking_secs: Option<u64>,
+    /// Why it lacks the change, by its latest answer that said so (§5,
+    /// S8).
+    pub lacks_for: Option<LacksFor>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -313,6 +404,20 @@ pub struct Look {
     pub short: Option<String>,
     /// What a status says, a sentence each.
     pub says: Vec<String>,
+    /// Whether the node's next whole pass would write that this device
+    /// has sent what it carried, or its carried word, by their own
+    /// conditions (decision 2026-10-19 §4, rule 8): the wait after a
+    /// change reads it, and never works the conditions out itself.
+    pub word_to_come: bool,
+    /// When the device last woke, by the time of day, in seconds: where it
+    /// reaches no relay, since when it has reached none (decision
+    /// 2026-10-19 §5, D2 and T1).
+    pub woke_at: Option<i64>,
+    /// The later of when this device came to keep the change entry it
+    /// keeps and when this version first started on its database, in
+    /// seconds: a relay not known to hold the latest change is amber for
+    /// seven days from it (decision 2026-10-19, rule 11).
+    pub relays_known_since: Option<i64>,
 }
 
 impl Look {
@@ -447,6 +552,9 @@ pub fn look(
             cannot_go_on: None,
             short: None,
             says: Vec::new(),
+            word_to_come: at_relays.word_to_come,
+            woke_at: at_relays.woke_at,
+            relays_known_since: relays_known_since(conn, now)?,
         };
         match held(conn)? {
             None => {
@@ -459,6 +567,7 @@ pub fn look(
             Some(held) => {
                 of_its_person(conn, identity, &held, at_relays, &mut look)?;
                 of_its_names(conn, &held, now, &mut look)?;
+                what_was_carried_at(conn, identity, at_relays, &mut look)?;
             }
         }
         for notice in &look.notices {
@@ -468,7 +577,8 @@ pub fn look(
         // nothing to show one.
         if look.state != "no_phrase" {
             for relay in &look.relays {
-                look.says.extend(relay.says());
+                look.says
+                    .extend(relay.says(look.woke_at, look.latest.as_deref(), now));
             }
         }
         // What became of a key that was taken is said only while it is
@@ -535,6 +645,7 @@ fn of_its_person(
             maker: device.key == statement.maker,
             applied: reader.applied(conn, &device.key)?,
             sent: reader.sent(conn, &device.key)?,
+            carried_word: reader.carried_word(conn, &device.key, &counting)?,
             left: reader.left(conn, &device.key)?.is_some() || kept_left.contains(&device.key),
         });
     }
@@ -576,6 +687,7 @@ fn of_its_person(
             why_not,
             applied: reader.applied(conn, &shown.key)?,
             sent: reader.sent(conn, &shown.key)?,
+            carried_word: reader.carried_word(conn, &shown.key, &counting)?,
             left: reader.left(conn, &shown.key)?.is_some(),
         });
     }
@@ -1037,6 +1149,31 @@ impl Reader {
         Ok(self.applied_word(conn, key)? == Some((self.number, true)))
     }
 
+    /// The device's carried word, where it is read (decision 2026-10-19 §4,
+    /// rule 5): the current version of its slot among the entries that
+    /// the key in the name signed, and no delete; signed by a key that
+    /// counts; of the statement that this device has applied; beside a
+    /// word under `applied/` of that number without ` sent`, since where a
+    /// device has both, `sent` counts; and well formed. Any other word is
+    /// no word.
+    fn carried_word(
+        &self,
+        conn: &Connection,
+        key: &[u8; 32],
+        counting: &Counting,
+    ) -> Result<Option<CarriedWordLook>, PersonError> {
+        if !counting.counts(key) || self.applied_word(conn, key)? != Some((self.number, false)) {
+            return Ok(None);
+        }
+        let Some((_, value)) = self.word(conn, key, &reached_name(key)?)? else {
+            return Ok(None);
+        };
+        match CarriedWord::from_value(&value) {
+            Ok(word) if word.number == self.number => Ok(Some(CarriedWordLook::of(&word)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// The device's word that it has applied a statement: the number, and
     /// whether it has sent what it carried.
     fn applied_word(
@@ -1377,7 +1514,7 @@ pub fn lists_of(statement: &Statement) -> Result<Lists, PersonError> {
 }
 
 /// Where the device stands at each relay, as the node last said it.
-fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
+pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
     at_relays
         .relays
         .iter()
@@ -1393,8 +1530,142 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             connected_secs: None,
             another_form: relay.another_form,
             refuses: relay.refuses.clone(),
+            key: relay.key.and_then(|key| encode_public_key(&key).ok()),
+            has_what_was_carried: None,
+            reach: ReachLook {
+                about: relay.reach.about.map(hex::encode),
+                class: relay.reach.class,
+                holds: relay.reach.holds,
+                reached: relay.reach.reached,
+                out_of_reach_since: relay.reach.out_of_reach_since,
+                reference: relay.reach.reference,
+                last_reached: relay.reach.last_reached,
+                waits: relay.reach.waits,
+                refusing_waits_since: relay.reach.refusing_waits_since,
+                no_room: relay.no_room.clone(),
+                answered_at: relay.reach.answered_at,
+                lacking_secs: relay.reach.lacking_secs,
+                lacks_for: relay.reach.lacks_for.clone(),
+            },
         })
         .collect()
+}
+
+/// The later of when this device came to keep the change entry that it
+/// keeps and when this version first started on its database (decision
+/// 2026-10-19, rule 11): from it a relay not known to hold the latest change
+/// is amber for seven days. An entry that the node has not yet noted it
+/// keeps came to be kept at `now`.
+fn relays_known_since(conn: &Connection, now: i64) -> Result<Option<i64>, PersonError> {
+    let known = crate::at_relays::known::read(conn)?;
+    let kept = crate::at_relays::kept_id(conn)?;
+    let kept_since = match (kept, known.kept) {
+        (None, _) => None,
+        (Some(entry), Some(noted)) if noted.entry == entry => Some(noted.since),
+        (Some(_), _) => Some(now),
+    };
+    Ok(kept_since.max(known.first_started))
+}
+
+/// Where this device's own carried word is read, whether nothing that it
+/// carried waits at each relay whose key it knows (decision 2026-10-19,
+/// rule 7): by its rows of what it sent, which are kept by key, whether
+/// or not the relay is reached now. The relays that a line about its word
+/// names as holding what it carried, and the others, never overlap.
+fn what_was_carried_at(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    at_relays: &AtRelays,
+    look: &mut Look,
+) -> Result<(), PersonError> {
+    let own = look
+        .devices
+        .iter()
+        .map(|device| (device.this_device, &device.carried_word));
+    let added = look
+        .added
+        .iter()
+        .map(|device| (device.this_device, &device.carried_word));
+    if !own.chain(added).any(|(this, word)| this && word.is_some()) {
+        return Ok(());
+    }
+    for (relay, at) in look.relays.iter_mut().zip(&at_relays.relays) {
+        if let Some(key) = at.key {
+            let waits = crate::at_relays::carried_waits_at(conn, identity, &key)?;
+            relay.has_what_was_carried = Some(!waits);
+        }
+    }
+    Ok(())
+}
+
+/// A relay that another device's carried word names by its node key
+/// `key`, as a key is written, as this device names it (decision
+/// 2026-10-19, rule 6): by the name that its own configuration gives it,
+/// where it knows that relay's key (`relays`: each relay that it is set up
+/// with, by name, with its key where it knows one); else, for a default
+/// relay, by its name in the program; else by its key, written whole.
+pub fn relay_named(key: &str, relays: &[(&str, Option<&str>)]) -> String {
+    if let Some((name, _)) = relays.iter().find(|(_, known)| *known == Some(key)) {
+        return name.to_string();
+    }
+    match FALLBACK_PEER_KEYS
+        .iter()
+        .position(|default| *default == key)
+    {
+        Some(at) => FALLBACK_PEERS[at].to_string(),
+        None => format!("the relay whose key is {key}"),
+    }
+}
+
+/// Things in a sentence: "A", "A and B", "A, B and C".
+pub fn joined(things: &[String]) -> String {
+    match things {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    }
+}
+
+/// The relays that a device's carried word names as holding what it
+/// carried, in a sentence (decision 2026-10-19 §5, `<held>`): each named
+/// as [`relay_named`] names it, and "and <m> more" where it counts more.
+pub fn held_named(word: &CarriedWordLook, relays: &[(&str, Option<&str>)]) -> String {
+    let named: Vec<String> = word
+        .keys
+        .iter()
+        .map(|key| relay_named(key, relays))
+        .collect();
+    match word.more {
+        0 => joined(&named),
+        more => format!("{} and {more} more", named.join(", ")),
+    }
+}
+
+/// A moment that the node noted by the wall clock, as a person reads it
+/// (decision 2026-10-19 §1, `<when>`): as [`time_of_day`] writes it, the
+/// hour and the minute in UTC, and then the date where it is not today,
+/// `now`.
+pub fn when(at: i64, now: i64) -> String {
+    let day = |at: i64| chrono::DateTime::from_timestamp(at, 0).map(|at| at.date_naive());
+    match chrono::DateTime::from_timestamp(at, 0) {
+        Some(moment) if day(at) == day(now) => moment.format("%H:%M UTC").to_string(),
+        Some(moment) => moment.format("%H:%M UTC on %Y-%m-%d").to_string(),
+        None => format!("{at}"),
+    }
+}
+
+/// `<since>` (decision 2026-10-19 §5): "has not been reached from here
+/// since <when>", where the relay was reached since its reference last
+/// moved by a start, a sleep or a change of the kept entry, at the moment
+/// it was last reached; "has not answered since <when>" where it was not,
+/// at its reference.
+pub fn since(reach: &ReachLook, now: i64) -> String {
+    match reach.last_reached {
+        Some(at) if at >= reach.reference => {
+            format!("has not been reached from here since {}", when(at, now))
+        }
+        _ => format!("has not answered since {}", when(reach.reference, now)),
+    }
 }
 
 /// What is said of a relay's last refusal (decision 2026-10-19 §2, rule
@@ -1430,15 +1701,47 @@ fn no_room_says(relay: &str, refused: &NoRoom) -> String {
 }
 
 impl AtRelayLook {
+    /// Whether it is out of reach, as the node last said, by what is
+    /// known of it about `latest`, the change entry that the device keeps
+    /// (`Look::latest`): what is known of a relay about the entry before
+    /// says nothing of whether it holds this one.
+    pub fn out_of_reach(&self, latest: Option<&str>) -> bool {
+        latest.is_some()
+            && self.reach.about.as_deref() == latest
+            && self.reach.out_of_reach_since.is_some()
+    }
+
     /// What is said of the relay in a status, where there is something to
-    /// say (decision 2026-10-04 §4.6, §8).
-    pub fn says(&self) -> Vec<String> {
+    /// say (decision 2026-10-04 §4.6, §8; decision 2026-10-19 §5, T1 to
+    /// T3), at `now`. `woke_at` is when the device last woke, and `latest`
+    /// the change entry it keeps.
+    ///
+    /// A relay out of reach is said to be so (T2, T3) before anything is
+    /// said of the wake: what is known of it is kept across starts, and
+    /// what it lacks matters more than that it has not answered since.
+    pub fn says(&self, woke_at: Option<i64>, latest: Option<&str>, now: i64) -> Vec<String> {
         let mut says = Vec::new();
-        if !self.heard_since_woke {
+        let since = || since(&self.reach, now);
+        let out = self.out_of_reach(latest);
+        if out && self.reach.holds == Holds::Lacks {
             says.push(format!(
-                "has not heard from {} since it woke: a change made while it was off may not \
-                 have reached it",
-                self.relay
+                "{} is not known to hold the latest change, and {}",
+                self.relay,
+                since()
+            ));
+        } else if out && self.reach.holds == Holds::Holds {
+            says.push(format!(
+                "{} {}: this device sends through the others",
+                self.relay,
+                since()
+            ));
+        } else if !self.heard_since_woke {
+            let at = woke_at.map(|at| format!(" at {}", when(at, now)));
+            says.push(format!(
+                "has not heard from {} since it started or woke{}: a change made while this \
+                 device was off may be there, and not have reached it",
+                self.relay,
+                at.unwrap_or_default()
             ));
         } else if self.holds_latest == Some(false) {
             says.push(format!(
@@ -2179,6 +2482,113 @@ mod tests {
         );
     }
 
+    /// The look carries what the node knows of each relay's reach, its
+    /// class among it, and the node's `word_to_come`, as the node gives
+    /// them (decision 2026-10-19 §4, rule 8): the wait after a change reads
+    /// both from it, and works neither out again. It does so whether or
+    /// not the device follows a phrase.
+    #[test]
+    fn the_look_carries_word_to_come_and_each_relays_reach() {
+        use crate::state::{Class, Holds, Reach, Waits};
+        let mut s = Several::new(1);
+        let refused = NoRoom {
+            at: 1_800_000_100,
+            over_allowance: false,
+            of: crate::state::RefusedOf::Change,
+        };
+        let stuck = Reach {
+            key: Some([7; 32]),
+            about: Some([3; 32]),
+            lacks_for: None,
+            holds: Holds::Holds,
+            reached: true,
+            out_of_reach_since: None,
+            reference: 1_800_000_000,
+            last_reached: Some(1_800_000_050),
+            refused_since: None,
+            waits: Some(Waits::Refused),
+            refusing_waits_since: Some(1_800_000_060),
+            answered_at: Some(1_800_000_050),
+            lacking_secs: None,
+            class: Some(Class::Stuck),
+        };
+        let out = Reach {
+            holds: Holds::Lacks,
+            reached: false,
+            out_of_reach_since: Some(1_800_000_300),
+            last_reached: None,
+            waits: None,
+            refusing_waits_since: None,
+            lacking_secs: Some(400),
+            class: Some(Class::OutLacking),
+            lacks_for: Some(crate::state::LacksFor::Room(refused.clone())),
+            ..stuck.clone()
+        };
+        let relay = |name: &str, reach: Reach, no_room| AtRelay {
+            relay: name.to_string(),
+            holds_latest: None,
+            heard_since_woke: true,
+            no_room,
+            another_form: 0,
+            refuses: None,
+            reach,
+            key: None,
+        };
+        let mut at = AtRelays {
+            relays: vec![
+                relay("one.example:1", stuck, None),
+                relay("two.example:1", out, Some(refused)),
+            ],
+            cannot_go_on: None,
+            word_to_come: true,
+            woke_at: None,
+        };
+        for phrase in [false, true] {
+            if phrase {
+                s.make_phrase(0);
+            }
+            for to_come in [true, false] {
+                at.word_to_come = to_come;
+                let seen = look(&s[0].conn, &s[0].identity, &at, s.now).unwrap();
+                assert_eq!(seen.word_to_come, to_come);
+                let json = serde_json::to_value(&seen).unwrap();
+                assert_eq!(json["word_to_come"], to_come);
+                // Where an entry is kept and not yet noted, it came to be
+                // kept now (decision 2026-10-19, rule 11).
+                assert_eq!(json["relays_known_since"].as_i64(), phrase.then_some(s.now));
+                assert_eq!(
+                    json["relays"][0]["reach"],
+                    serde_json::json!({
+                        "about": hex::encode([3; 32]), "lacks_for": null,
+                        "class": "stuck", "holds": "holds", "reached": true,
+                        "out_of_reach_since": null, "reference": 1_800_000_000,
+                        "last_reached": 1_800_000_050, "waits": "refused",
+                        "refusing_waits_since": 1_800_000_060, "no_room": null,
+                        "answered_at": 1_800_000_050, "lacking_secs": null,
+                    })
+                );
+                assert_eq!(
+                    json["relays"][1]["reach"],
+                    serde_json::json!({
+                        "about": hex::encode([3; 32]),
+                        "lacks_for": { "room": { "at": 1_800_000_100, "over_allowance": false,
+                                                 "of": "change" } },
+                        "class": "out_lacking", "holds": "lacks", "reached": false,
+                        "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
+                        "last_reached": null, "waits": null, "refusing_waits_since": null,
+                        "no_room": { "at": 1_800_000_100, "over_allowance": false,
+                                     "of": "change" },
+                        "answered_at": 1_800_000_050, "lacking_secs": 400,
+                    })
+                );
+                // What the command reads back is what the node gave.
+                let back: ReachLook =
+                    serde_json::from_value(json["relays"][1]["reach"].clone()).unwrap();
+                assert_eq!(back, seen.relays[1].reach);
+            }
+        }
+    }
+
     /// What a relay refused for room is said as what it is (decision
     /// 2026-10-19 §2, rule 6): by which channel of the device's own it
     /// was, and never as a new channel at a full relay. A refusal of the
@@ -2203,8 +2613,12 @@ mod tests {
                     no_room: Some(no_room),
                     another_form: 0,
                     refuses: None,
+                    reach: Default::default(),
+                    key: None,
                 }],
                 cannot_go_on: None,
+                word_to_come: false,
+                woke_at: None,
             };
             let look = look(&s[0].conn, &s[0].identity, &at, s.now).unwrap();
             let [said] = look.says.as_slice() else {
@@ -2312,12 +2726,15 @@ mod tests {
             no_room,
             another_form: 0,
             refuses: None,
+            reach: Default::default(),
+            key: None,
         };
         let full = NoRoom {
             at: 1_800_000_000,
             over_allowance: true,
             of: RefusedOf::Personal,
         };
+        let woke = s.now - 60;
         let mut at = AtRelays {
             relays: vec![
                 relay("one.example:1", Some(true), true, None),
@@ -2325,6 +2742,8 @@ mod tests {
                 relay("three.example:1", Some(false), true, Some(full)),
             ],
             cannot_go_on: None,
+            word_to_come: false,
+            woke_at: Some(woke),
         };
         let seen_at =
             |s: &Several, at: &AtRelays| look(&s[0].conn, &s[0].identity, at, s.now).unwrap();
@@ -2334,11 +2753,16 @@ mod tests {
 
         s.make_phrase(0);
         let look = seen_at(&s, &at);
+        assert_eq!(look.woke_at, Some(woke));
         assert_eq!(
             look.says,
             [
-                "has not heard from two.example:1 since it woke: a change made while it was \
-                 off may not have reached it",
+                format!(
+                    "has not heard from two.example:1 since it started or woke at {}: a change \
+                     made while this device was off may be there, and not have reached it",
+                    when(woke, s.now)
+                )
+                .as_str(),
                 "three.example:1 does not hold the latest change yet",
                 "three.example:1 had no room for a new channel at 08:00 UTC on 2027-01-15 \
                  (this address is over its allowance of new channels there)",
@@ -2545,5 +2969,335 @@ mod tests {
             .expect("the look says what was not carried");
         assert!(line.contains(&format!("{just}... in lab")), "{line}");
         assert!(!line.contains("x.md"), "{line}");
+    }
+
+    // ── The carried word (decision 2026-10-19 §4, rules 5 and 6) ────
+
+    /// Device 1's look at device 0, after a change under which both
+    /// applied statement 2, once device 1 is given what device 0 holds.
+    fn after_a_change() -> Several {
+        let mut s = Several::of_one_person(2);
+        s.hold(&[0, 1], "lab");
+        s.write(0, "lab", "notes.md", "one");
+        s.meet(&[0, 1]);
+        let change = s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &change, now).unwrap();
+        s.pass(0, 1);
+        s
+    }
+
+    /// Device `signer` writes `value` under `name` in the personal channel
+    /// at `rev`, and device 1 takes it through the one door.
+    fn written(s: &mut Several, signer: usize, rev: u64, name: &str, value: Value) {
+        let personal = s[1].personal();
+        let entry = crate::several::entry_by(&s[signer].identity, &personal, rev, name, value, &[]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &entry, now).unwrap();
+    }
+
+    /// What device 1's look reads of device 0's carried word.
+    fn read_of_0(s: &Several) -> Option<CarriedWordLook> {
+        let seen = look(
+            &s[1].conn,
+            &s[1].identity,
+            &AtRelays::default(),
+            crate::several::START,
+        )
+        .unwrap();
+        let key = encode_public_key(&s.key(0)).unwrap();
+        let device = seen.devices.iter().find(|device| device.device.key == key);
+        device.unwrap().carried_word.clone()
+    }
+
+    /// The bytes of a word, put together by hand: the number, the count of
+    /// keys and the keys, and the two counts.
+    fn bytes_of(number: u64, keys: &[[u8; 32]], more: u16, not_yet: u16) -> Value {
+        let mut bytes = number.to_be_bytes().to_vec();
+        bytes.push(keys.len() as u8);
+        for key in keys {
+            bytes.extend_from_slice(key);
+        }
+        bytes.extend_from_slice(&more.to_be_bytes());
+        bytes.extend_from_slice(&not_yet.to_be_bytes());
+        Value::Other(bytes)
+    }
+
+    /// A device reads a carried word only from the key in its slot's
+    /// name, signed by a key that counts, under the statement it has
+    /// applied, beside that device's word under `applied/` of that number
+    /// without ` sent`, and well formed (decision 2026-10-19 §4, rule 5).
+    /// Where `sent` is there too, `sent` is what is read.
+    #[test]
+    fn the_carried_word_is_read_only_from_its_own_key_under_the_applied_number() {
+        let mut s = after_a_change();
+        let reached = reached_name(&s.key(0)).unwrap();
+        let (a, b) = ([0xa1; 32], [0xa2; 32]);
+        let looked = |keys: &[[u8; 32]], more: u64, not_yet: u64| CarriedWordLook {
+            keys: keys
+                .iter()
+                .map(|key| encode_public_key(key).unwrap())
+                .collect(),
+            more,
+            not_yet,
+        };
+        assert_eq!(read_of_0(&s), None);
+        // Another device signed the slot: not read.
+        written(&mut s, 1, 10, &reached, bytes_of(2, &[a], 0, 1));
+        assert_eq!(read_of_0(&s), None);
+        // Its own, well formed: read, a fourth field of 0 among them.
+        written(&mut s, 0, 11, &reached, bytes_of(2, &[a, b], 0, 0));
+        assert_eq!(read_of_0(&s), Some(looked(&[a, b], 0, 0)));
+        // Each malformed word is no word, and the next good one is read.
+        let nine: Vec<[u8; 32]> = (1..=9).map(|n| [n; 32]).collect();
+        let eight = &nine[..8];
+        let mut rev = 12;
+        for (bad, why) in [
+            (bytes_of(3, &[a], 0, 1), "of another number"),
+            (bytes_of(2, &nine, 0, 0), "nine keys"),
+            (bytes_of(2, &[], 0, 2), "no key"),
+            (bytes_of(2, &[a, a], 0, 0), "a key twice"),
+            (
+                bytes_of(2, &[a], 1, 0),
+                "a third field with fewer than eight keys",
+            ),
+            (bytes_of(2, eight, 257, 0), "a count over 256"),
+            (bytes_of(2, &[a], 0, 257), "a count over 256"),
+            (Value::Other(vec![0; 3]), "malformed"),
+            (Value::Text("2".into()), "a text"),
+            (Value::Delete, "a delete"),
+        ] {
+            written(&mut s, 0, rev, &reached, bad);
+            assert_eq!(read_of_0(&s), None, "{why}");
+            written(&mut s, 0, rev + 1, &reached, bytes_of(2, &[a], 0, 1));
+            assert_eq!(read_of_0(&s), Some(looked(&[a], 0, 1)), "after {why}");
+            rev += 2;
+        }
+        // Eight keys, and more counted, at the bounds.
+        written(&mut s, 0, rev, &reached, bytes_of(2, eight, 256, 256));
+        assert_eq!(read_of_0(&s), Some(looked(eight, 256, 256)));
+        rev += 1;
+        written(&mut s, 0, rev, &reached, bytes_of(2, &[a], 0, 1));
+
+        // The key does not count: by a counting in which it is not.
+        let held = held(&s[1].conn).unwrap().unwrap();
+        let statement = &held.statement.statement;
+        let kept = held_rows::additions(&s[1].conn).unwrap();
+        let reader = Reader::of(&s[1].conn, statement, &kept).unwrap();
+        let counts = Counting::of(statement, &kept);
+        let key = s.key(0);
+        let word = reader.carried_word(&s[1].conn, &key, &counts).unwrap();
+        assert_eq!(word, Some(looked(&[a], 0, 1)));
+        let mut alone = statement.clone();
+        alone.devices.retain(|device| device.key != key);
+        let not = Counting::of(&alone, &[]);
+        assert!(!not.counts(&key));
+        let word = reader.carried_word(&s[1].conn, &key, &not).unwrap();
+        assert_eq!(word, None);
+
+        // Its word under `applied/` is of another number.
+        let applied = applied_name(&s.key(0)).unwrap();
+        written(&mut s, 0, 50, &applied, Value::Text("3".into()));
+        assert_eq!(read_of_0(&s), None);
+        // Of this number, and sent: `sent` is read, and not this.
+        written(&mut s, 0, 51, &applied, Value::Text("2 sent".into()));
+        assert_eq!(read_of_0(&s), None);
+        let seen = look(
+            &s[1].conn,
+            &s[1].identity,
+            &AtRelays::default(),
+            crate::several::START,
+        )
+        .unwrap();
+        assert!(
+            seen.devices
+                .iter()
+                .any(|device| !device.this_device && device.sent)
+        );
+        // Of this number alone: read again.
+        written(&mut s, 0, 52, &applied, Value::Text("2".into()));
+        assert_eq!(read_of_0(&s), Some(looked(&[a], 0, 1)));
+    }
+
+    /// A relay that another device's carried word names is shown three
+    /// ways (decision 2026-10-19, rule 6): by the name that this device's
+    /// configuration gives it, where it knows its key; else, for a default
+    /// relay, by its name in the program; else by its key, written whole.
+    #[test]
+    fn a_relay_is_named_three_ways() {
+        let laptop_relay = encode_public_key(&[0xa1; 32]).unwrap();
+        let unknown = encode_public_key(&[0xa3; 32]).unwrap();
+        let relays = [
+            ("relay-a.example:9474", Some(laptop_relay.as_str())),
+            ("relay-b.example:9474", None),
+        ];
+        assert_eq!(relay_named(&laptop_relay, &relays), "relay-a.example:9474");
+        assert_eq!(
+            relay_named(FALLBACK_PEER_KEYS[1], &relays),
+            FALLBACK_PEERS[1]
+        );
+        assert_eq!(
+            relay_named(&unknown, &relays),
+            format!("the relay whose key is {unknown}")
+        );
+        // A default relay set up under a name of this device's own goes by
+        // that name.
+        let renamed = [("my-relay:9474", Some(FALLBACK_PEER_KEYS[0]))];
+        assert_eq!(
+            relay_named(FALLBACK_PEER_KEYS[0], &renamed),
+            "my-relay:9474"
+        );
+        // With more counted.
+        let word = CarriedWordLook {
+            keys: vec![laptop_relay.clone(), unknown.clone()],
+            more: 0,
+            not_yet: 1,
+        };
+        assert_eq!(
+            held_named(&word, &relays),
+            format!("relay-a.example:9474 and the relay whose key is {unknown}")
+        );
+        let more = CarriedWordLook { more: 3, ..word };
+        assert_eq!(
+            held_named(&more, &relays),
+            format!("relay-a.example:9474, the relay whose key is {unknown} and 3 more")
+        );
+        assert_eq!(joined(&["a".into(), "b".into(), "c".into()]), "a, b and c");
+        assert_eq!(joined(&["a".into()]), "a");
+    }
+
+    /// What a status says of a relay (decision 2026-10-19 §5, T1 to T3),
+    /// word for word: T1 for one not heard since the device started or
+    /// woke, with `<when>` with and without its date; T2 for one out of
+    /// reach that lacks the change, and T3 for one that holds it, each
+    /// with `<since>` in both forms, whether or not it has answered since
+    /// the device woke; and the line of before for one that is reached.
+    #[test]
+    fn each_line_word_for_word() {
+        // Noon, 2026-10-21, in UTC.
+        let now = 1_792_584_000;
+        let relay = |heard: bool, holds_latest: Option<bool>, reach: ReachLook| AtRelayLook {
+            relay: "b.example:9474".into(),
+            holds_latest,
+            heard_since_woke: heard,
+            no_room: None,
+            no_room_at: None,
+            connected_secs: None,
+            another_form: 0,
+            refuses: None,
+            key: None,
+            has_what_was_carried: None,
+            reach,
+        };
+        // The change entry that the device keeps, as the look names it.
+        let latest = Some("0101");
+        let reach = |holds: Holds, out: Option<i64>, last_reached: Option<i64>| ReachLook {
+            about: latest.map(str::to_string),
+            lacks_for: None,
+            class: None,
+            holds,
+            reached: false,
+            out_of_reach_since: out,
+            reference: now - 900,
+            last_reached,
+            waits: None,
+            refusing_waits_since: None,
+            no_room: None,
+            answered_at: None,
+            lacking_secs: None,
+        };
+        let t1 = relay(false, None, reach(Holds::Neither, None, None));
+        assert_eq!(
+            t1.says(Some(now - 600), latest, now),
+            [
+                "has not heard from b.example:9474 since it started or woke at 11:50 UTC: a change \
+              made while this device was off may be there, and not have reached it"
+            ]
+        );
+        assert_eq!(
+            t1.says(Some(now - 86_400 - 600), latest, now),
+            [
+                "has not heard from b.example:9474 since it started or woke at 11:50 UTC on \
+              2026-10-20: a change made while this device was off may be there, and not have reached it"
+            ]
+        );
+        // A relay in the third state out of reach is still T1.
+        let third_out = relay(false, None, reach(Holds::Neither, Some(now - 60), None));
+        assert_eq!(
+            third_out.says(Some(now - 600), latest, now),
+            t1.says(Some(now - 600), latest, now)
+        );
+        for heard in [false, true] {
+            let t2 = relay(
+                heard,
+                Some(false),
+                reach(Holds::Lacks, Some(now - 60), None),
+            );
+            assert_eq!(
+                t2.says(Some(now - 600), latest, now),
+                [
+                    "b.example:9474 is not known to hold the latest change, and has not answered \
+                  since 11:45 UTC"
+                ]
+            );
+            let t3 = relay(
+                heard,
+                None,
+                reach(Holds::Holds, Some(now - 60), Some(now - 300)),
+            );
+            assert_eq!(
+                t3.says(Some(now - 600), latest, now),
+                [
+                    "b.example:9474 has not been reached from here since 11:55 UTC: this device \
+                  sends through the others"
+                ]
+            );
+        }
+        // What is known of a relay about the entry before says nothing of
+        // this one: the lines of before.
+        let mut before = relay(true, Some(false), reach(Holds::Lacks, Some(now - 60), None));
+        before.reach.about = Some("0202".into());
+        assert_eq!(
+            before.says(Some(now - 600), latest, now),
+            ["b.example:9474 does not hold the latest change yet"]
+        );
+        let reached = relay(true, Some(false), reach(Holds::Lacks, None, Some(now - 10)));
+        assert_eq!(
+            reached.says(Some(now - 600), latest, now),
+            ["b.example:9474 does not hold the latest change yet"]
+        );
+    }
+
+    /// The seven days of the amber of a relay not known to hold the latest
+    /// change run from the later of when this device came to keep the
+    /// change entry and when this version first started on its database
+    /// (decision 2026-10-19, rule 11). An entry that the node has not yet
+    /// noted came to be kept now; with no entry kept, only the start is
+    /// known.
+    #[test]
+    fn the_seven_days_run_from_the_later_of_the_two_times() {
+        use crate::at_relays::known;
+        let now = 1_900_000_000;
+        let mut s = Several::of_one_person(2);
+        let since = |s: &Several| relays_known_since(&s[0].conn, now).unwrap();
+        // Not yet noted: now.
+        assert_eq!(since(&s), Some(now));
+        known::started(&s[0].conn, &[], 1_000).unwrap();
+        assert_eq!(since(&s), Some(1_000));
+        // A later entry, not yet noted, and then noted.
+        s.change(0, &[0, 1], &[]);
+        assert_eq!(since(&s), Some(now));
+        known::note_kept(&s[0].conn, 3_000).unwrap();
+        assert_eq!(since(&s), Some(3_000));
+        // This version first started after the entry came to be kept.
+        let mut read = known::read(&s[0].conn).unwrap();
+        read.first_started = Some(5_000);
+        meta::set(
+            &s[0].conn,
+            meta::PERSON_RELAYS_KNOWN,
+            &serde_json::to_string(&read).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(since(&s), Some(5_000));
     }
 }

@@ -87,6 +87,15 @@ pub const PERSON_NAMES_BROUGHT_IN: &str = "person.names_brought_in";
 /// and the next recovery says so.
 pub const PERSON_LOOK_PENDING: &str = "person.look_pending";
 
+/// JSON object of what this device knows of which relay holds which change
+/// (decision 2026-10-19 §1, rule 2): for each relay, by its name and its
+/// key, the latest answer that said whether it holds the change entry
+/// shown, and its mark; and when the kept change entry came to be kept,
+/// and when the version that keeps this first started. All but that last
+/// time goes when the device leaves its phrase. A version that does not
+/// know it reads nothing of it.
+pub const PERSON_RELAYS_KNOWN: &str = "person.relays_known";
+
 /// JSON object of what this device called each key that a statement it
 /// applied removed, by the key in hex (decision 2026-10-04 §7.3): a
 /// statement lists removed keys bare, and a person names one by its

@@ -220,6 +220,10 @@ pub struct OwnChannels {
     /// How many relays the node is configured with, and one more: 0
     /// where it has not said.
     set_up_with: AtomicU64,
+    /// The relays the node is configured with, each once, by name and
+    /// key, as it last said: the relays that a mark is written for
+    /// (decision 2026-10-19 §1).
+    set_up_as: Mutex<Vec<crate::at_relays::known::RelayId>>,
     written: tokio::sync::Notify,
     asked: tokio::sync::Notify,
     /// How many whole passes the node has begun, and the number of the
@@ -352,6 +356,10 @@ impl LeftPlace {
 pub struct LeftAt {
     pub relay: String,
     pub read: LeftRead,
+    /// The node key of the connection that it was read on, where a read
+    /// was asked of one: a recovery judges the device it recovers from by
+    /// the keys of the relays it read (decision 2026-10-19 §4, rule 10).
+    pub key: Option<[u8; 32]>,
 }
 
 /// What a command's work asks of the node through the door for a carry
@@ -471,6 +479,20 @@ impl OwnChannels {
     pub fn relays_set_up(&self) -> Option<usize> {
         let said = self.set_up_with.load(Ordering::SeqCst);
         said.checked_sub(1).map(|relays| relays as usize)
+    }
+
+    /// The node is configured with `relays`, each once, by name and key.
+    pub fn set_up_as(&self, relays: Vec<crate::at_relays::known::RelayId>) {
+        *self.set_up_as.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+    }
+
+    /// The relays the node is configured with, each once, by name and
+    /// key, as it last said: none where it has not.
+    pub fn relays_set_up_as(&self) -> Vec<crate::at_relays::known::RelayId> {
+        self.set_up_as
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Something was written in a channel of the device's own: the node
@@ -865,6 +887,17 @@ pub struct AtRelays {
     pub relays: Vec<AtRelay>,
     /// Why the device cannot go on, where it cannot.
     pub cannot_go_on: Option<CannotGoOn>,
+    /// Whether the next whole pass would write that this device has sent
+    /// what it carried, or its carried word, by their own conditions, as
+    /// the relays stand now (decision 2026-10-19 §4, rule 8): worked out by
+    /// the functions that write them
+    /// ([`crate::at_relays::word_to_come`]).
+    pub word_to_come: bool,
+    /// When the device last woke, by the time of day, in seconds: where
+    /// it reaches no relay, since when it has reached none. What
+    /// `cordelia devices` and a status say a relay has not answered since
+    /// (decision 2026-10-19 §5, D2 and T1).
+    pub woke_at: Option<i64>,
 }
 
 /// Where a device stands at one relay.
@@ -894,10 +927,139 @@ pub struct AtRelay {
     /// secret already applied). It gives no leave for as long as it
     /// does.
     pub refuses: Option<String>,
+    /// What the device knows of the relay's reach, and of whether it
+    /// holds the change (decision 2026-10-19 §1).
+    pub reach: Reach,
+    /// Its node key, where the device knows one: the key its
+    /// configuration gives it, the key of the connection open to it, or
+    /// the key that gave its latest answer to a show. What another
+    /// device's carried word names it by (decision 2026-10-19, rule 6).
+    pub key: Option<[u8; 32]>,
+}
+
+/// Whether a relay holds the change entry that the device keeps, as far as
+/// the device knows (decision 2026-10-19 §1): by its latest answer about
+/// that entry, kept across starts, or by its mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Holds {
+    /// Its latest answer is about the kept entry and says that it holds
+    /// it (and, for a relay given no key, the device is connected to it
+    /// with the key that gave that answer).
+    Holds,
+    /// It does not hold it, as far as the device knows.
+    #[default]
+    Lacks,
+    /// The third state: no latest answer, and its mark is the kept entry.
+    /// Nothing acts on it.
+    Neither,
+}
+
+/// What of the device's own waits to be sent to a relay that is reached
+/// (decision 2026-10-19 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waits {
+    /// Nothing.
+    Nothing,
+    /// Something, which the relay has not refused at each offer for five
+    /// minutes.
+    Moving,
+    /// Something, which the relay has refused, for room or for the
+    /// address's allowance, at each offer for five minutes.
+    Refused,
+}
+
+/// The class of a relay in the wait after a change (decision 2026-10-19
+/// §1). A relay in none of them is in a state that time moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Class {
+    /// Reached, holds the change, and nothing waits there.
+    Ok,
+    /// Reached, holds the change, and refuses what waits.
+    Stuck,
+    /// Out of reach, and holds the change.
+    OutHolding,
+    /// Out of reach, and lacks the change.
+    OutLacking,
+    /// Reached, lacks the change, and has refused it for five minutes.
+    Refusing,
+}
+
+/// What the device knows of one relay's reach (decision 2026-10-19 §1):
+/// what the node keeps of it, in its database and in memory. Each time is
+/// by the time of day, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reach {
+    /// The key that the configuration gives the relay, where it gives one.
+    pub key: Option<[u8; 32]>,
+    /// The change entry that the rest is about, by its ID: the kept entry
+    /// as the node's pass last found it. `None` before a pass has. A wait
+    /// after a change reads nothing of a relay that is about another entry
+    /// than the change it waits for (decision 2026-10-19 §4, rule 8).
+    pub about: Option<[u8; 32]>,
+    /// Whether it holds the change entry that the device keeps.
+    pub holds: Holds,
+    /// Whether it is reached: a connection to it is open, and the latest
+    /// show of the kept entry on it got an answer that says whether it
+    /// holds it.
+    pub reached: bool,
+    /// Since when it is out of reach, where it is.
+    pub out_of_reach_since: Option<i64>,
+    /// Its reference: the latest of the node's start, a sleep that the
+    /// device woke from, the moment the kept entry last changed, and the
+    /// moment the relay was last reached.
+    pub reference: i64,
+    /// When it was last reached, where it was since the node started.
+    pub last_reached: Option<i64>,
+    /// Since when it has lacked the change, with every show answered on
+    /// it since saying that it does not hold it, where it is reached and
+    /// lacks it.
+    pub refused_since: Option<i64>,
+    /// What waits there, where it is reached.
+    pub waits: Option<Waits>,
+    /// Since when it has refused, at each offer, what of the device's own
+    /// waits there, where it is reached and something waits: what the
+    /// wait after a change says of a relay that is STUCK.
+    pub refusing_waits_since: Option<i64>,
+    /// When it gave its latest answer about the kept entry, where it gave
+    /// one.
+    pub answered_at: Option<i64>,
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock, where it lacks it: since the later of when it came to
+    /// lack it and the latest of the node's start, a sleep and the change
+    /// of the kept entry. A wake after no connection does not restart it
+    /// (decision 2026-10-19, rule 11). `None` where it holds the change,
+    /// and in the third state.
+    pub lacking_secs: Option<u64>,
+    /// Its class, where it is in one.
+    pub class: Option<Class>,
+    /// Why it lacks the kept entry, by the latest answer to a show of it in
+    /// which it said so, where it gave one since the node started.
+    pub lacks_for: Option<LacksFor>,
+}
+
+/// Why a relay said that it does not hold the change entry shown it
+/// (decision 2026-10-19 §1): what the wait after a change says of a relay
+/// that refuses the change (§5, S8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LacksFor {
+    /// It had no room for it, or the address was over its allowance of
+    /// new channels there.
+    Room(NoRoom),
+    /// It holds another change entry of the phrase. `why` is why this
+    /// device does not take that one, where it refused it as no change
+    /// entry that it takes.
+    Another { why: Option<String> },
 }
 
 /// A relay's refusal of something that it would have taken.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// One shape for both records of 2026-10-19: the names warning keeps what
+// was refused (its §2, rule 6), and the look of a relay out of reach
+// carries it whole, for S8 and the status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoRoom {
     /// When, in seconds, in UTC.
     pub at: i64,
@@ -913,7 +1075,8 @@ pub struct NoRoom {
 /// What a relay refused for room, or for the address's allowance. The
 /// messages channel is said apart, and is never one of these (decision
 /// 2026-10-09 §8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RefusedOf {
     /// The change entry.
     Change,
@@ -1429,6 +1592,25 @@ pub struct RelaySnapshot {
     pub last_tried_secs: Option<u64>,
     /// Why the last attempt failed.
     pub error: Option<String>,
+    /// How the node tries it while it is not connected (decision
+    /// 2026-10-19 §5, S9): what the wait after a change says of a relay
+    /// that lacks the change.
+    #[serde(skip)]
+    pub tried: Tried,
+}
+
+/// How the node tries a relay that it is not connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tried {
+    /// It is dialled, or it is connected.
+    #[default]
+    Dialled,
+    /// Its name does not resolve: it is looked up.
+    LookedUp,
+    /// It is set up with a key, and another relay answers at its address:
+    /// it is not dialled while that one is connected (decision 2026-10-17
+    /// §1).
+    NotDialled,
 }
 
 impl AppState {

@@ -305,12 +305,19 @@ pub fn forget(
 /// it leaves ([`begin`]), forgets what it held ([`forget`], with its word
 /// kept to be sent), and then follows this one. A device that has stopped
 /// is refused: the way on is another ([`PersonError::Stopped`]).
+///
+/// **Its change entry is the mark of each of `set_up`** (decision
+/// 2026-10-19 §1), the relays that the device is set up with: statement
+/// 1 removes no key and renews nothing, so a relay that lacks it puts
+/// nobody in reach of a removed device. What the device knew of its
+/// relays under the phrase it left went with it.
 pub fn start_again(
     conn: &Connection,
     identity: &NodeIdentity,
     shown: Among,
     entry: &CheckedEntry,
     statement_key: &[u8; 32],
+    set_up: &[crate::at_relays::known::RelayId],
     now: i64,
 ) -> Result<Applied, PersonError> {
     in_one(conn, || {
@@ -326,6 +333,7 @@ pub fn start_again(
             forget(conn, identity, true, now)?;
         }
         let applied = follow_first(conn, identity, entry, statement_key, now)?;
+        crate::at_relays::known::mark(conn, set_up, now)?;
         // Whatever key was typed at `cordelia accept` before was typed
         // by a device that had made no phrase of its own: none of them
         // is spent under this one (§16).
@@ -800,6 +808,7 @@ mod tests {
                 shown,
                 &made.entry,
                 &made.statement_key,
+                &[],
                 s.now + 1,
             )
         };

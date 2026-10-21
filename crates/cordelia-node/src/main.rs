@@ -218,6 +218,10 @@ enum Commands {
     /// phrase.
     ///
     /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     ///
     /// You cannot remove the device you are on. Remove it from another
     /// one.
@@ -242,9 +246,19 @@ enum Commands {
     /// list that you have checked.
     ///
     /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     Renew,
     /// Settle two changes that were made apart, with the recovery
     /// phrase, on a device that has seen both. Asks at a terminal.
+    ///
+    /// Keep this machine on until the command says you can close it.
+    /// Where a relay that is not known to hold the change cannot be
+    /// reached, or refuses it, the command says so and ends with status 3,
+    /// without saying that you can. Any status other than 0, 1 and 2 means
+    /// that the change is made: do not make it again.
     Settle,
     /// Recover on a new machine when you have no device you trust
     ///
@@ -264,6 +278,12 @@ enum Commands {
     /// one you type `have`, `lost` or `hands` (it may be in someone
     /// else's hands). Then the command shows the change it will make and
     /// asks you to type yes.
+    ///
+    /// After the look the command waits for every relay to hold the
+    /// change. Where one that is not known to hold it cannot be reached,
+    /// or refuses it, the command says so and ends with status 3. Any
+    /// status other than 0, 1 and 2 means that the recovery is made: do
+    /// not run it again. Keep this machine on.
     Recover {
         /// A name for this machine, such as "laptop" (default: the
         /// machine's name)
@@ -285,6 +305,13 @@ enum Commands {
         /// that was recovered from was read at the relays
         #[arg(long, value_enum, default_value_t = recover_cmd::ChannelRead::Whole)]
         channel_read: recover_cmd::ChannelRead,
+        /// With `--cut-short`: the relays that its carried word names,
+        /// where this recovery read none of them, as they are shown
+        #[arg(long)]
+        carried_to: Option<String>,
+        /// With `--carried-to`: how many relays that is
+        #[arg(long, default_value_t = 1)]
+        carried_relays: u64,
     },
     /// After a change is made: say what is still missing, until this
     /// machine may be closed. It is what `remove-device`, `renew` and
@@ -665,15 +692,22 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
-        Some(Commands::ChangeMade { number }) => person_cmd::change_made(&cli.config, number),
+        // Its own exit status: 3 where the change is made and not known
+        // to be at every relay (decision 2026-10-19 §4, rule 8).
+        Some(Commands::ChangeMade { number }) => {
+            std::process::exit(person_cmd::change_made(&cli.config, number))
+        }
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
         Some(Commands::RecoverMade {
             number,
             cut_short,
             channel_read,
+            carried_to,
+            carried_relays,
         }) => {
-            let cut_short = recover_cmd::CutShort::handed(cut_short, channel_read);
-            recover_cmd::recover_made(&cli.config, number, cut_short)
+            let cut_short =
+                recover_cmd::CutShort::handed(cut_short, channel_read, carried_to, carried_relays);
+            std::process::exit(recover_cmd::recover_made(&cli.config, number, cut_short))
         }
         Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
@@ -1784,10 +1818,24 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
             .filter(|notice| notice["kind"] == "added")
             .count(),
         said_left: said_left.filter(|device| device["left"] == true).count(),
-        without_latest_secs: list("relays")
-            .filter(|relay| relay["holds_latest"] == false)
-            .filter_map(|relay| relay["connected_secs"].as_u64())
+        // What is known of each relay's reach, as the node put it
+        // (decision 2026-10-19 §1, rule 11): nothing of it is worked out
+        // again here.
+        not_known_to_hold: list("relays")
+            .filter(|relay| relay["reach"]["holds"] == "lacks")
+            .filter_map(|relay| {
+                Some(indicator::NotKnown {
+                    lacking_secs: relay["reach"]["lacking_secs"].as_u64()?,
+                    said_secs: ago(&relay["reach"]["answered_at"]),
+                })
+            })
             .collect(),
+        known_since_secs: ago(&person["relays_known_since"]),
+        out_of_reach_secs: list("relays")
+            .filter(|relay| relay["reach"]["class"] == "out_holding")
+            .filter_map(|relay| ago(&relay["reach"]["out_of_reach_since"]))
+            .collect(),
+        one_reached: list("relays").any(|relay| relay["reach"]["reached"] == true),
         no_room_secs: list("relays")
             .filter_map(|relay| ago(&relay["no_room_at"]))
             .collect(),
@@ -2268,12 +2316,17 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // The relays as the configuration names them, whether or not a
         // name resolves: what the node is set up with.
         let relays_set_up = relays.clone();
+        // Whether each relay can be reached, on a device (decision
+        // 2026-10-19 §1): shared by its passes, its dials and the
+        // lookups of its relays' names.
+        let reach = (config.network.role == "personal")
+            .then(|| cordelia_node::device_entries::Reach::new(cordelia_node::device_entries::Clock::system()));
         if !relays.is_empty() {
-            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone()));
+            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone(), reach.clone()));
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection()).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection(), reach).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -3795,6 +3848,17 @@ const VERSION_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(30
 /// may be of any version.
 pub(crate) fn refuse_another_version(config_path: &str) -> anyhow::Result<()> {
     refuse_by_version(&node_status(config_path, VERSION_ASKED_FOR))
+}
+
+/// Why the running node is of another version than this command, where it
+/// is: what a command that has already changed something says, and not
+/// that nothing was done. An error where the node cannot be asked.
+pub(crate) fn node_of_another_version(config_path: &str) -> anyhow::Result<Option<String>> {
+    let node = node_status(config_path, VERSION_ASKED_FOR)?;
+    Ok(version_note(
+        node["version"].as_str(),
+        env!("CARGO_PKG_VERSION"),
+    ))
 }
 
 /// [`refuse_another_version`], given what the node answered when it was
@@ -6016,6 +6080,43 @@ mod tests {
         );
     }
 
+    /// What a recovery hands the process that waits for its look is read
+    /// back as it was handed (decision 2026-10-19, rule 10): a relay whose
+    /// name begins with "-" is not read as a flag.
+    #[test]
+    fn what_a_recovery_hands_on_is_read_back_whatever_its_relays_are_called() {
+        use clap::Parser;
+        let held = "-relay.example:9474 and b.example:9474";
+        let cut = recover_cmd::CutShort::handed(
+            Some("(w1 w2 w3 w4) \"laptop\"".into()),
+            recover_cmd::ChannelRead::Whole,
+            Some(held.into()),
+            2,
+        )
+        .unwrap();
+        let line = [
+            vec![
+                "cordelia".to_string(),
+                recover_cmd::MADE_COMMAND.into(),
+                "3".into(),
+            ],
+            cut.args(),
+        ]
+        .concat();
+        match super::Cli::try_parse_from(line).map(|cli| cli.command) {
+            Ok(Some(super::Commands::RecoverMade {
+                carried_to,
+                carried_relays,
+                ..
+            })) => {
+                assert_eq!(carried_to.as_deref(), Some(held));
+                assert_eq!(carried_relays, 2);
+            }
+            Ok(_) => panic!("no recover-made"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
     /// What is no more is refused by the command, before anything is sent
     /// (decision 2026-10-04 §10.1): `--all`, with whatever beside it;
     /// `--exclude`; and `exclude` and `include`, each with what to do
@@ -6773,6 +6874,45 @@ mod tests {
         );
     }
 
+    /// A relay in the third state is not amber (decision 2026-10-19 §1,
+    /// rule 11): it has not been shown to lack the change, and no change
+    /// has been made since its mark. A relay that lacks it is, connected
+    /// or not, as the node counts it.
+    #[test]
+    fn a_relay_in_the_third_state_is_not_amber() {
+        let now = 1_000_000;
+        let look = |holds: &str, reached: bool| {
+            serde_json::json!({
+                "state": "applied", "change": 3, "devices": [], "added": [],
+                "relays_known_since": now - 3_600,
+                "relays": [{ "relay": "b", "holds_latest": null, "connected_secs": null,
+                    "reach": { "holds": holds, "lacking_secs": 600, "reached": reached,
+                               "class": null, "out_of_reach_since": now - 300 } }],
+            })
+        };
+        let shown = |look: &serde_json::Value| {
+            let facts = indicator::Facts {
+                initialised: true,
+                running: true,
+                role: "personal".into(),
+                stands: "applied".into(),
+                devices: devices_facts(look, now),
+                ..Default::default()
+            };
+            indicator::shown(&facts)
+        };
+        let third = shown(&look("neither", false));
+        assert_eq!(third.level, None, "{:?}", third.holds);
+        for reached in [false, true] {
+            let lacks = shown(&look("lacks", reached));
+            assert_eq!(lacks.level, Some(indicator::Level::Amber));
+            assert_eq!(
+                lacks.summary,
+                "memory: a relay not known to hold the latest change"
+            );
+        }
+    }
+
     /// What a status goes by of the personal channel (decision 2026-10-19
     /// §2, rules 2 to 4): what the last cycle's report holds, each key
     /// that signed part of it named as the look names its devices, with
@@ -6884,11 +7024,21 @@ mod tests {
                 { "id": "4", "kind": "left_out" },
             ],
             "relays": [
-                { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null },
-                { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60 },
-                { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null },
-                { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5 },
+                { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null,
+                  "reach": { "holds": "lacks", "lacking_secs": 400, "reached": true,
+                             "class": null, "out_of_reach_since": null,
+                             "answered_at": now - 500 } },
+                { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60,
+                  "reach": { "holds": "holds", "lacking_secs": null, "reached": false,
+                             "class": "out_holding", "out_of_reach_since": now - 120 } },
+                { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null,
+                  "reach": { "holds": "lacks", "lacking_secs": 90, "reached": false,
+                             "class": "out_lacking", "out_of_reach_since": now - 30 } },
+                { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5,
+                  "reach": { "holds": "neither", "lacking_secs": null, "reached": false,
+                             "class": null, "out_of_reach_since": now - 60 } },
             ],
+            "relays_known_since": now - 7_200,
             // Two that a device which still counts had listed, and one
             // that only a device which counts no longer had.
             "names_not_listed": [
@@ -6908,9 +7058,23 @@ mod tests {
                 removal_not_applied_secs: Some(3_600),
                 added_not_cleared: 2,
                 said_left: 2,
-                // Only a relay that is connected and says that it does
-                // not hold it.
-                without_latest_secs: vec![400],
+                // Each relay that lacks the change, connected or not, as
+                // the node counts it; one in the third state is not
+                // among them.
+                not_known_to_hold: vec![
+                    indicator::NotKnown {
+                        lacking_secs: 400,
+                        said_secs: Some(500),
+                    },
+                    indicator::NotKnown {
+                        lacking_secs: 90,
+                        said_secs: None,
+                    },
+                ],
+                known_since_secs: Some(7_200),
+                // Only a relay out of reach that holds the change.
+                out_of_reach_secs: vec![120],
+                one_reached: true,
                 // A refusal in the clock's future was a moment ago.
                 no_room_secs: vec![60, 0],
                 names_not_listed: 2,
@@ -8136,15 +8300,27 @@ mod tests {
     /// device that was recovered from, where its word that it had sent
     /// what it carried was not read, and how the channel that the word
     /// is written in was read at the relays, which is one of three
-    /// things.
+    /// things; and, where its carried word names none of the relays that
+    /// the recovery read, those relays (decision 2026-10-19 §4, rule 10).
     #[test]
     fn test_what_a_recovery_hands_the_process_that_waits_is_read_there() {
         use clap::Parser;
         use recover_cmd::ChannelRead::{HeldByNone, InPart, Whole};
-        for read in [Whole, InPart, HeldByNone] {
+        let carried = recover_cmd::CarriedTo {
+            held: "a.example:9474 and b.example:9474".to_string(),
+            relays: 2,
+        };
+        for (read, carried_to) in [
+            (Whole, None),
+            (InPart, None),
+            (HeldByNone, None),
+            (Whole, Some(carried.clone())),
+            (InPart, Some(carried)),
+        ] {
             let handed = recover_cmd::CutShort {
                 device: "(w1 w2 w3 w4) \"laptop\"".to_string(),
                 read,
+                carried_to,
             };
             let mut line = vec!["cordelia".to_string()];
             line.extend([recover_cmd::MADE_COMMAND.to_string(), "3".to_string()]);
@@ -8154,15 +8330,25 @@ mod tests {
                     number,
                     cut_short,
                     channel_read,
+                    carried_to,
+                    carried_relays,
                 }) => {
                     assert_eq!(number, 3);
-                    let read = recover_cmd::CutShort::handed(cut_short, channel_read);
+                    let read = recover_cmd::CutShort::handed(
+                        cut_short,
+                        channel_read,
+                        carried_to,
+                        carried_relays,
+                    );
                     assert_eq!(read, Some(handed));
                 }
                 _ => panic!("what was handed is not read as that command"),
             }
         }
-        assert_eq!(recover_cmd::CutShort::handed(None, InPart), None);
+        assert_eq!(
+            recover_cmd::CutShort::handed(None, InPart, Some("a.example:9474".into()), 1),
+            None
+        );
         // With no such device, as it was.
         let line = ["cordelia", recover_cmd::MADE_COMMAND, "3"];
         match super::Cli::parse_from(line).command {
@@ -8170,6 +8356,8 @@ mod tests {
                 number: 3,
                 cut_short: None,
                 channel_read: Whole,
+                carried_to: None,
+                carried_relays: 1,
             }) => {}
             _ => panic!("that is not read as the command"),
         }
