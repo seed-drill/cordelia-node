@@ -181,8 +181,9 @@ impl HeldUp {
 /// And it carries how many relays the node is configured with
 /// ([`OwnChannels::set_up_with`]). The node says it from the list that
 /// each pass is given, which is every relay of its configuration, whether
-/// or not its name resolves, and each relay once: a name that reaches the
-/// same relay as one before it is not another (decision 2026-10-17 §1). What a device keeps of a relay is forgotten
+/// or not its name resolves, and each relay once: a name given the same
+/// key as one before it is not another, and a name given no key always is
+/// (decision 2026-10-17 §1). What a device keeps of a relay is forgotten
 /// as of one that it is set up with no longer only while every relay it
 /// is configured with is connected.
 ///
@@ -1607,9 +1608,9 @@ pub enum Tried {
     Dialled,
     /// Its name does not resolve: it is looked up.
     LookedUp,
-    /// It is set up with a key, and another relay answers at its address:
-    /// it is not dialled while that one is connected (decision 2026-10-17
-    /// §1).
+    /// Another relay answers at its address, and it was given another key
+    /// or none: it is not dialled while a connection is open there
+    /// (decision 2026-10-17 §1).
     NotDialled,
 }
 
