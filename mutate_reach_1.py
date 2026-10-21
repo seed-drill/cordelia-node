@@ -330,9 +330,9 @@ MUTATIONS = [
      [e2e("each_answer_that_says_writes_over_the_one_before")]),
     ("D5 no room does not say that it lacks it", DEVICE,
      '''                    round.said = Some(Said::Lacks);
-                    self.no_room(link, over_allowance, true);''',
+                    let refused = self.no_room(link, over_allowance, RefusedOf::Change);''',
      '''                    round.said = None;
-                    self.no_room(link, over_allowance, true);''',
+                    let refused = self.no_room(link, over_allowance, RefusedOf::Change);''',
      [e2e("each_answer_that_says_writes_over_the_one_before"),
       e2e("a_relay_that_held_and_then_refuses_is_refusing_five_minutes_on")]),
     ("D6 not signed says something", DEVICE,
