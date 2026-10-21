@@ -36,7 +36,7 @@ use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
     OWN_ENTRY_REQUESTS_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE, SHOW_ANSWER_ROOM_BYTES,
-    SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
+    SHOW_LEAVE_SECS, STATUS_AMBER_WAIT_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -9662,6 +9662,111 @@ async fn a_wake_after_no_connection_does_not_move_another_relays_reference() {
     let reach = device.at("b").reach;
     assert!(reach.reference >= start + 3600, "{reach:?}");
     assert_eq!(reach.out_of_reach_since, None);
+}
+
+/// A wake after no connection does not restart the five minutes of the
+/// status line's amber (decision 2026-10-19, rule 11, §11): relay B lacks
+/// the change and is down; two minutes on, a change is made; relay A drops
+/// and comes back every three minutes, and each return makes the device
+/// wake. What the line counts of B passes five minutes five minutes after
+/// the change, and not before, all the same; a sleep counts again from the
+/// wake. (That the line is amber past five minutes of this count is held by
+/// the indicator's tests.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_after_no_connection_does_not_restart_the_ambers_five_minutes() {
+    let a = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    started_before_its_relays(&device);
+    let phrase = phrase();
+    device.makes_the_phrase(&phrase);
+    device.set_up_with("b");
+    device.connects_to("a", a.port, a.key).await;
+    device.passes().await;
+    device.clock.run_ahead(Duration::from_secs(120));
+    device.passes().await;
+    let before = device
+        .at("b")
+        .reach
+        .lacking_secs
+        .expect("B lacks the change");
+    assert!(before >= 120, "{before}");
+    // The change: the five minutes start from it.
+    device.changes(&phrase, &[&device], &[]);
+    device.passes().await;
+    let mut secs = 0;
+    while secs < 390 {
+        device.clock.run_ahead(Duration::from_secs(30));
+        secs += 30;
+        if secs % 180 == 0 {
+            device.disconnects("a");
+            device.passes().await;
+            device.connects_to("a", a.port, a.key).await;
+        }
+        device.passes().await;
+        let reach = device.at("b").reach;
+        assert_eq!(reach.holds, Holds::Lacks, "at {secs} s");
+        let lacking = reach.lacking_secs.expect("B lacks the change");
+        assert!(
+            (secs..secs + 5).contains(&lacking),
+            "at {secs} s: {lacking}"
+        );
+        // Past the line's five minutes only once they are over, counted
+        // from the change.
+        if secs < STATUS_AMBER_WAIT_SECS {
+            assert!(lacking <= STATUS_AMBER_WAIT_SECS, "at {secs} s: {lacking}");
+        } else if secs > STATUS_AMBER_WAIT_SECS {
+            assert!(lacking > STATUS_AMBER_WAIT_SECS, "at {secs} s: {lacking}");
+        }
+    }
+    device.clock.slept(Duration::from_secs(3600));
+    device.passes().await;
+    let lacking = device.at("b").reach.lacking_secs.unwrap();
+    assert!(lacking < 5, "{lacking}");
+}
+
+/// What the status says the device woke at (decision 2026-10-19 §5, D2
+/// and T1): when it first reached a relay after reaching none; where it
+/// reaches none, since when, from its start, the pass that found no
+/// connection, or a sleep. A pass that finds it awake moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_status_says_when_the_device_woke() {
+    let a = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.set_up_with("a");
+    // Each moment is read before the pass that notes it, within a second.
+    let woke_at = |device: &Device, at: i64| {
+        let woke = device.status().woke_at.expect("a time is said");
+        assert!((at..=at + 1).contains(&woke), "{woke} for {at}");
+    };
+    let started = device.now();
+    device.passes().await;
+    woke_at(&device, started);
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.connects_to("a", a.port, a.key).await;
+    device.passes().await;
+    let woke = device.now();
+    woke_at(&device, woke);
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.passes().await;
+    woke_at(&device, woke);
+    device.disconnects("a");
+    let none = device.now();
+    device.passes().await;
+    woke_at(&device, none);
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.passes().await;
+    woke_at(&device, none);
+    // A sleep while it reaches none: since the wake from it.
+    device.clock.slept(Duration::from_secs(3600));
+    device.passes().await;
+    let after = device.status().woke_at.unwrap();
+    assert!(after >= none + 3600, "{after}");
+    device.clock.run_ahead(Duration::from_secs(60));
+    device.connects_to("a", a.port, a.key).await;
+    let woke = device.now();
+    device.passes().await;
+    woke_at(&device, woke);
 }
 
 /// A relay given no key holds the change only while the device is

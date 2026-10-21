@@ -40,10 +40,19 @@ fn asks(node: &Node, path: &str, body: Value) -> (u16, String) {
 }
 
 /// What the node says that its device holds of its person: [`look`],
-/// without what it says of its relays, which changes as it reaches them.
+/// without what it says of its relays, which changes as it reaches them,
+/// and without the times its passes note of them (when it woke, and since
+/// when it has known its relays, which its first pass writes).
 fn holds(node: &Node) -> Value {
     let mut seen = look(node);
-    for of_its_relays in ["relays", "waiting", "not_reached", "says"] {
+    for of_its_relays in [
+        "relays",
+        "waiting",
+        "not_reached",
+        "says",
+        "woke_at",
+        "relays_known_since",
+    ] {
         seen.as_object_mut().unwrap().remove(of_its_relays);
     }
     seen
@@ -327,18 +336,26 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
         "the test was slow"
     );
     assert_eq!(waits(), Some(1), "{}", look(&laptop));
-    // The status, and `cordelia devices`, name the relay not heard from.
-    let not_heard = format!(
-        "has not heard from {NO_SUCH_NAME} since it woke: a change made while it was off may \
-         not have reached it"
-    );
+    // The status, and `cordelia devices`, name the relay not heard from
+    // (decision 2026-10-19 §5, T1 and D2): it is not out of reach yet.
     let status = laptop.cli(&["status"]);
-    assert!(status.contains(&not_heard), "{status}");
-    let devices = laptop.cli(&["devices"]);
+    let t1 = format!("has not heard from {NO_SUCH_NAME} since it started or woke at ");
+    let t1_ends = ": a change made while this device was off may be there, and not have \
+                   reached it";
     assert!(
-        devices.contains(&format!(
-            "{NO_SUCH_NAME}: has not answered since this device woke"
-        )),
+        status
+            .lines()
+            .any(|line| line.contains(&t1) && line.ends_with(t1_ends)),
+        "{status}"
+    );
+    let devices = laptop.cli(&["devices"]);
+    let d2 = format!("  {NO_SUCH_NAME}: has not answered since this device started or woke at ");
+    let d2_ends = " UTC. A change made while this device was off may be there, and not have \
+                   reached it.";
+    assert!(
+        devices
+            .lines()
+            .any(|line| line.starts_with(&d2) && line.ends_with(d2_ends)),
         "{devices}"
     );
     assert!(
@@ -5360,6 +5377,15 @@ fn phrase_made_at(relay: &Node, relays: &[(String, Option<String>)]) -> (Node, S
     (laptop, words)
 }
 
+/// Whether `cordelia status` at `node` is amber, and says `says` among
+/// what holds (decision 2026-10-19, rule 11).
+fn amber_with(node: &Node, says: &str) -> Option<()> {
+    let status: Value = serde_json::from_str(&node.cli(&["status", "--json"])).ok()?;
+    let holds = status["holds"].as_array()?;
+    let said = holds.iter().any(|holds| holds["says"] == says);
+    (status["level"] == "amber" && said).then_some(())
+}
+
 /// What no line of a wait that ends without success says: that the
 /// machine may be closed, at end 1 or at end 2.
 fn says_not_that_it_may_be_closed(said: &str) {
@@ -5423,6 +5449,81 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
         assert!(said.contains(&line), "{line}\n{said}");
     }
     says_not_that_it_may_be_closed(&said);
+    // The status line says so, with sync off and nothing mapped (rule
+    // 11): the command ends at five minutes, and the line once they are
+    // over, at the node's next pass. `cordelia devices` says D4.
+    let says = "memory: a relay not known to hold the latest change";
+    wait_for("the status line is amber", &[&relay, &laptop], 30, || {
+        amber_with(&laptop, says)
+    });
+    let status: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["summary"], says, "{status}");
+    let devices = laptop.cli(&["devices"]);
+    assert!(
+        devices.contains(&format!(
+            "  {NO_SUCH_NAME}: is not known to hold the latest change, and has not answered since"
+        )),
+        "{devices}"
+    );
+}
+
+/// The case that was seen (decision 2026-10-19 §1, rule 11): a removal
+/// made on alpha.12 that one relay never got, then the upgrade. The
+/// laptop removes the desktop with one relay, and its database is then
+/// put in alpha.12's form: nothing is kept of what each relay is known to
+/// hold. It is set up with a second relay, whose name does not resolve,
+/// and started on this version. The kept statement is not statement 1, so
+/// nothing is marked: the relay that answers holds the change once it
+/// answers, and the other lacks it. Five minutes on, the status line is
+/// amber with a relay not known to hold the latest change, with sync off
+/// and nothing mapped, however old the removal: its seven days run from
+/// this version's first start.
+#[test]
+#[ignore = "it waits out a relay's five minutes: about six minutes"]
+fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade() {
+    let relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let mut at = removes(&laptop, &key_of(&desktop), &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    let all = [&relay, &laptop, &desktop];
+    wait_for("the relay holds the removal", &all, 60, || {
+        let seen = look(&laptop);
+        (seen["change"] == 2 && seen["relays"][0]["reach"]["holds"] == "holds").then_some(())
+    });
+
+    laptop.stop();
+    let db = rusqlite::Connection::open(laptop.data_dir().join("cordelia.db")).unwrap();
+    let gone = db
+        .execute(
+            "DELETE FROM node_meta WHERE key = 'person.relays_known'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(gone, 1, "what is known of the relays was kept");
+    drop(db);
+    laptop.add_relay(NO_SUCH_NAME, None);
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    wait_for("the relay that answers holds the change", &all, 60, || {
+        (look(&laptop)["relays"][0]["reach"]["holds"] == "holds").then_some(())
+    });
+    let seen = look(&laptop);
+    assert_eq!(seen["relays"][1]["reach"]["holds"], "lacks", "{seen}");
+    let says = "memory: a relay not known to hold the latest change";
+    assert!(
+        amber_with(&laptop, says).is_none(),
+        "amber before five minutes"
+    );
+    wait_for("the status line is amber", &all, 360, || {
+        amber_with(&laptop, says)
+    });
+    let status: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["summary"], says, "{status}");
 }
 
 /// A change ends not done where the relay that it reaches refuses it
@@ -5549,8 +5650,10 @@ fn a_relay_that_comes_back_within_five_minutes_does_not_end_the_wait() {
 /// and the command that made it ends at end 1. Then B is stopped, and the
 /// wait after that change is run again: after five minutes it says S6 (B
 /// holds all that this device carried) and S7, and ends with status 0.
+/// The laptop's node is then started again: `cordelia devices` says D5 of
+/// B, from what is kept across the start.
 #[test]
-#[ignore = "it waits out a relay's five minutes out of reach: about six minutes"]
+#[ignore = "it waits out a relay's five minutes out of reach twice: about twelve minutes"]
 fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
     use std::time::Duration;
     let a = relay_started();
@@ -5588,6 +5691,19 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
         assert!(said.contains(&line), "{line}\n{said}");
     }
     assert!(!said.contains("This command ends here"), "{said}");
+    // The laptop's node starts again: what is known of B is kept across
+    // the start, and once B is out of reach again `cordelia devices` says
+    // D5 of it (decision 2026-10-19, rule 12).
+    let mut laptop = laptop;
+    laptop.stop();
+    laptop.start();
+    let d5 = format!("  {name_b}: holds the latest change (as it said at ");
+    wait_for("D5 is said of B", &[&a, &laptop], 420, || {
+        let devices = laptop.cli(&["devices"]);
+        let line = devices.lines().find(|line| line.starts_with(&d5))?;
+        line.contains("), and has not answered since ")
+            .then_some(())
+    });
 }
 
 /// The wait that cannot be started ends with status 3 (decision
@@ -5624,6 +5740,41 @@ fn the_wait_that_cannot_start_ends_with_3() {
         "{said}"
     );
     assert_eq!(look(&laptop)["change"], 2);
+}
+
+/// The wait after a change ends with status 3 where the device no longer
+/// stands in its phrase (decision 2026-10-19 §4, rule 8): the laptop is
+/// removed from the desktop, and the wait of the change it applied last
+/// is run on it. It shows the change to no relay, so no end would hold:
+/// the wait says why, and ends at once, never saying that the machine may
+/// be closed.
+#[test]
+fn the_wait_ends_with_3_where_the_device_no_longer_stands_in_its_phrase() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let all = [&relay, &laptop, &desktop];
+    let words = makes_a_phrase(&desktop, "desktop");
+    adds(&desktop, &laptop, "laptop");
+    let mut at = removes(&desktop, &key_of(&laptop), &[], &words);
+    at.says("The change is made");
+    drop(at);
+    wait_for("the laptop learns that it was removed", &all, 120, || {
+        (text(&look(&laptop), "state") == "removed").then_some(())
+    });
+    let change = look(&laptop)["change"]
+        .as_u64()
+        .expect("a change is applied");
+    // At a terminal, so that a wait that would not end fails the test in
+    // a minute, and does not hold it up.
+    let at = laptop.at_terminal(&["change-made", &change.to_string()]);
+    let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains("This device no longer stands in its phrase (this device was removed"),
+        "{said}"
+    );
+    says_not_that_it_may_be_closed(&said);
 }
 
 /// The wait after a change ends with status 3 where the device has since

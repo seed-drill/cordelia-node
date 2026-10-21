@@ -446,6 +446,8 @@ struct Given {
 struct Woke {
     /// When it woke: when it reached a relay after having reached none.
     at: Instant,
+    /// The same moment, by the time of day, in seconds.
+    wall: i64,
     /// The relays that have answered a show since, by name.
     heard: HashSet<String>,
     /// Whether the waking is over: every relay had answered, or the wait
@@ -459,6 +461,10 @@ struct Inner {
     given: HashMap<LinkId, Given>,
     /// Since the node last woke. `None` while it reaches no relay.
     woke: Option<Woke>,
+    /// While it reaches no relay: since when, by the time of day, in
+    /// seconds. From the node's start, a sleep, or the pass that found no
+    /// connection open.
+    unwoken_since: Option<i64>,
     /// The relays that the device is set up with, by name.
     set_up_with: Vec<String>,
     /// Whether the device was answered with a change that it could not
@@ -548,16 +554,23 @@ impl Leave {
         // open, and a leave still looks young, by a clock that stood
         // still. Every relay is asked first, as when the node starts.
         let slept = inner.last.is_some_and(|before| slept_between(before, read));
+        let wall = read.1 / 1000;
+        if slept || inner.last.is_none() {
+            inner.unwoken_since = Some(wall);
+        }
         if slept {
             inner.given.clear();
             inner.woke = None;
         }
         inner.last = Some(read);
         if reached.is_empty() {
-            inner.woke = None;
+            if inner.woke.take().is_some() {
+                inner.unwoken_since = Some(wall);
+            }
         } else if inner.woke.is_none() {
             inner.woke = Some(Woke {
                 at: now,
+                wall,
                 heard: HashSet::new(),
                 awake: false,
             });
@@ -568,6 +581,19 @@ impl Leave {
     /// Whether the node is still waking.
     pub fn is_waking(&self) -> bool {
         lock(&self.inner).is_waking(self.clock.now())
+    }
+
+    /// When the node last woke, by the time of day, in seconds: where it
+    /// reaches no relay, and so has not woken, since when it has reached
+    /// none, from its start or a sleep (decision 2026-10-19 §5, D2 and
+    /// T1). `None` before its first pass.
+    pub fn woke_at(&self) -> Option<i64> {
+        let inner = lock(&self.inner);
+        inner
+            .woke
+            .as_ref()
+            .map(|woke| woke.wall)
+            .or(inner.unwoken_since)
     }
 
     /// Whether the relay called `name` has answered a show since the node
@@ -1397,6 +1423,7 @@ mod tests {
 
         let woke = |heard: &[&str]| Woke {
             at: now,
+            wall: 0,
             heard: heard.iter().map(|name| name.to_string()).collect(),
             awake: false,
         };

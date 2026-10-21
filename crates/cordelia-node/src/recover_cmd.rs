@@ -1996,11 +1996,7 @@ fn carried_elsewhere_says(
         }
         true => {
             let key = word.keys.first().map(String::as_str).unwrap_or_default();
-            said.push(format!(
-                "To bring it in by this recovery, answer no. On this machine, set up the relay \
-                 whose key is {key}: the configuration of that device (its \
-                 `[[network.bootnodes]]`) names it. Then run `cordelia recover` again."
-            ));
+            said.push(set_it_up(key, known));
             "that relay".to_string()
         }
     };
@@ -2009,6 +2005,38 @@ fn carried_elsewhere_says(
          <device>`, with the phrase, once this machine reaches {reaches}."
     ));
     said.join(" ")
+}
+
+/// R2's second ending (decision 2026-10-19 §5): set up on this machine
+/// the relay whose key is `key`, which the configuration of the device
+/// named names. Where this machine is set up with relays that it is given
+/// no key for, of `known`, and did not reach them, that relay may be one of
+/// them: reaching them is then the remedy, and setting it up only where it
+/// is none of them.
+fn set_it_up(key: &str, known: &[(String, Option<String>)]) -> String {
+    let keyless: Vec<String> = known
+        .iter()
+        .filter(|(_, key)| key.is_none())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if keyless.is_empty() {
+        return format!(
+            "To bring it in by this recovery, answer no. On this machine, set up the relay whose \
+             key is {key}: the configuration of that device (its `[[network.bootnodes]]`) names \
+             it. Then run `cordelia recover` again."
+        );
+    }
+    let may_be = match keyless.len() {
+        1 => "that one",
+        _ => "one of them",
+    };
+    format!(
+        "To bring it in by this recovery, answer no. Make sure this machine can reach {}: the \
+         relay whose key is {key} may be {may_be}. If it is not, set it up on this machine: the \
+         configuration of that device (its `[[network.bootnodes]]`) names it. Then run `cordelia \
+         recover` again.",
+        joined(&keyless)
+    )
 }
 
 /// What a recovery judges, before its yes, of the one device that it
@@ -2090,9 +2118,10 @@ impl CutShort {
         ]
         .into();
         if let Some(to) = &self.carried_to {
+            // Joined to its flag: a relay's name that begins with "-" is
+            // then never read as a flag of its own.
             args.extend([
-                "--carried-to".to_string(),
-                to.held.clone(),
+                format!("--carried-to={}", to.held),
                 "--carried-relays".to_string(),
                 to.relays.to_string(),
             ]);
@@ -2400,6 +2429,9 @@ enum Recovered {
     /// The device has since applied another change: whether that one is
     /// at every relay is the business of the command that made it.
     Another,
+    /// The device no longer stands in its phrase
+    /// ([`wait::no_longer_stands`]).
+    NoLongerStands,
 }
 
 /// The exit status of a recovery's command, as it ended (decision
@@ -2409,7 +2441,7 @@ enum Recovered {
 fn recovered_status(ended: &anyhow::Result<Recovered>) -> i32 {
     match ended {
         Ok(Recovered::Ended(end)) => end.status(),
-        Ok(Recovered::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Recovered::Another | Recovered::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
     }
 }
 
@@ -2563,6 +2595,10 @@ fn waits_for_the_change(
         if seen["change"].as_u64() != Some(number) {
             say("This device has since applied another change: `cordelia devices` says.".into());
             return Ok(Recovered::Another);
+        }
+        if let Some(line) = wait::no_longer_stands(&seen) {
+            say(line);
+            return Ok(Recovered::NoLongerStands);
         }
         let at = chrono::Utc::now().timestamp();
         let (relays, end) = wait::recovery_end_of_look(&seen)?;
@@ -2737,8 +2773,11 @@ fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
     let channels_wait = list(seen, "waiting").any(|relay| channels(relay) > 0);
     // Whether a relay lacks the change, as the node knows it (decision
     // 2026-10-19 §1), or is not connected: nothing is said to be waiting
-    // nowhere then.
-    let lacks = |relays: Vec<wait::RelayAt>| !relays.iter().all(|r| r.holds());
+    // nowhere then. A relay holds it only by what is known of it about the
+    // kept entry: a look before the node's pass has found the change says
+    // nothing of it.
+    let holds = |r: &wait::RelayAt| r.holds() && wait::is_about_the_kept_entry(r, seen);
+    let lacks = |relays: Vec<wait::RelayAt>| !relays.iter().all(holds);
     let keep_on = !not_reached.is_empty() || wait::relays_of(seen).map_or(true, lacks);
     match (to_go, channels_wait) {
         (0, false) if keep_on => {}
@@ -4322,8 +4361,13 @@ mod tests {
     /// it, as the node knows it (decision 2026-10-19 §1).
     fn holding(relay: &str, holds: bool) -> Value {
         let holds = if holds { "holds" } else { "lacks" };
-        json!({ "relay": relay, "reach": { "holds": holds, "reached": true, "reference": 0 } })
+        json!({ "relay": relay,
+                "reach": { "about": KEPT, "holds": holds, "reached": true, "reference": 0 } })
     }
+
+    /// The change entry that the looks of these tests name as kept, and
+    /// what [`holding`]'s reach is about.
+    const KEPT: &str = "aa";
 
     /// Once the look has ended the command says "keep this machine on"
     /// with how many names are still to send, and how each device that
@@ -4333,7 +4377,7 @@ mod tests {
     #[test]
     fn test_what_is_said_once_the_look_has_ended() {
         let seen = json!({
-            "this_device": "cordelia1thismachine",
+            "this_device": "cordelia1thismachine", "latest": KEPT,
             "relays": [
                 holding("one", true),
                 holding("two", false),
@@ -4394,7 +4438,7 @@ mod tests {
 
         // With nothing to send, and nobody to add again.
         let done = json!({
-            "this_device": "k", "relays": [holding("one", true)],
+            "this_device": "k", "latest": KEPT, "relays": [holding("one", true)],
             "waiting": [{ "relay": "one", "waits": 0 }],
             "names": { "to_go": [], "sent": ["a"] }, "left_out": [],
         });
@@ -4424,7 +4468,7 @@ mod tests {
     fn test_nothing_is_said_to_wait_only_where_nothing_does() {
         let seen = |to_go: Value, waits: u64| {
             json!({
-                "this_device": "k", "relays": [holding("one", true)],
+                "this_device": "k", "latest": KEPT, "relays": [holding("one", true)],
                 "names": { "to_go": to_go, "sent": [] }, "left_out": [],
                 "waiting": [{ "relay": "one", "waits": 0 }, { "relay": "two", "waits": waits }],
             })
@@ -4483,7 +4527,7 @@ mod tests {
         // none is named.
         let not_connected = |not_reached: Value| {
             json!({
-                "this_device": "k", "relays": [holding("one", true)],
+                "this_device": "k", "latest": KEPT, "relays": [holding("one", true)],
                 "names": { "to_go": [], "sent": [] }, "left_out": [],
                 "waiting": [], "not_reached": not_reached,
             })
@@ -4525,6 +4569,14 @@ mod tests {
         not_held_yet["relays"] = json!([holding("one", true), holding("two", true),]);
         let all = after_lines(&not_held_yet, 0);
         assert_eq!(all, [nothing]);
+        // Not where what is known of a relay is about the entry before the
+        // change: the node's pass has not found the change yet.
+        let mut stale = not_held_yet.clone();
+        stale["relays"][1]["reach"]["about"] = "bb".into();
+        assert_eq!(after_lines(&stale, 0), [shows]);
+        let mut unnamed = not_held_yet.clone();
+        unnamed.as_object_mut().unwrap().remove("latest");
+        assert_eq!(after_lines(&unnamed, 0), [shows]);
     }
 
     /// The sync status is read first, and what the device holds after
@@ -5485,8 +5537,7 @@ mod tests {
         assert_eq!(
             args.split_off(4),
             [
-                "--carried-to".to_string(),
-                format!("the relay whose key is {a}"),
+                format!("--carried-to=the relay whose key is {a}"),
                 "--carried-relays".to_string(),
                 "1".to_string()
             ]
@@ -5580,7 +5631,8 @@ mod tests {
             more: 0,
             not_yet: 0,
         };
-        let elsewhere = [("c.example:9474".to_string(), None)];
+        let c = cordelia_crypto::bech32::encode_public_key(&[9; 32]).unwrap();
+        let elsewhere = [("c.example:9474".to_string(), Some(c))];
         assert_eq!(
             carried_elsewhere_says(laptop, &two, &elsewhere),
             format!(
@@ -5594,6 +5646,33 @@ mod tests {
                  <device>`, with the phrase, once this machine reaches that relay."
             )
         );
+        // R2, where it is set up with a relay that it is given no key for
+        // and did not reach: that may be the relay the word names.
+        let keyless = [
+            ("c.example:9474".to_string(), None),
+            ("d.example:9474".to_string(), None),
+        ];
+        for (relays, may_be) in [(&keyless[..1], "that one"), (&keyless[..], "one of them")] {
+            let names = match relays.len() {
+                1 => "c.example:9474",
+                _ => "c.example:9474 and d.example:9474",
+            };
+            assert_eq!(
+                carried_elsewhere_says(laptop, &one, relays),
+                format!(
+                    "(w1 w2 w3 w4) \"laptop\" wrote that it had sent what it carried to the relay \
+                     whose key is {a}. It had not yet sent it to 1 other relay that it was set up \
+                     with. This machine has read none of it. The look of this recovery is made \
+                     once, so what that device carried may be only there. To bring it in by this \
+                     recovery, answer no. Make sure this machine can reach {names}: the relay \
+                     whose key is {a} may be {may_be}. If it is not, set it up on this machine: \
+                     the configuration of that device (its `[[network.bootnodes]]`) names it. \
+                     Then run `cordelia recover` again. If you answer yes, it comes in later only \
+                     by `cordelia sync carry <name> --from <device>`, with the phrase, once this \
+                     machine reaches that relay."
+                )
+            );
+        }
         // Two relays not yet, and more relays counted.
         let more = CarriedWordLook {
             keys: (1..=8)
@@ -5914,6 +5993,7 @@ mod tests {
             3
         );
         assert_eq!(recovered_status(&Ok(Recovered::Another)), 3);
+        assert_eq!(recovered_status(&Ok(Recovered::NoLongerStands)), 3);
         assert_eq!(recovered_status(&Err(anyhow::anyhow!("no node"))), 3);
         let (said, status) = look_not_waited_for(&"it was moved");
         assert_eq!(status, 3);
@@ -5928,6 +6008,20 @@ mod tests {
             said.last()
                 .unwrap()
                 .contains("since applied another change")
+        );
+        // The device no longer stands in its phrase: its node shows the
+        // change to no relay, and no end would hold.
+        let mut removed = looked(&[Reached, OutLacking]);
+        removed["state"] = "removed".into();
+        removed["cannot_go_on"] = "this device was removed".into();
+        let node = Stands::of(finished(false), vec![removed]);
+        let (ended, said) = after(&node);
+        assert_eq!(ended.unwrap(), Recovered::NoLongerStands);
+        assert!(
+            said.last().unwrap().starts_with(
+                "This device no longer stands in its phrase (this device was removed)"
+            ),
+            "{said:?}"
         );
         // The node stops answering during the wait.
         let mut node = Stands::of(

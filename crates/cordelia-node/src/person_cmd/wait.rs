@@ -352,6 +352,28 @@ pub(crate) fn recovery_end_of_look(
     Ok((relays, end))
 }
 
+/// Where the device no longer stands in its phrase, as the look says, what
+/// the wait after a change, and a recovery's, says before it ends with
+/// status 3: the line, and `None` where it stands. A device that was
+/// removed, that is in no list, that could not open the change, or that
+/// follows no phrase shows the change to no relay, and what the node knows
+/// of each relay's reach is then of the entry before: no end of the wait
+/// would hold for good. A device in a fork still shows its own entry, and
+/// its wait ends as rule 8 has it (decision 2026-10-19 §4, rule 8).
+pub(crate) fn no_longer_stands(seen: &Value) -> Option<String> {
+    let state = text(seen, "state");
+    if !matches!(state, "removed" | "not_listed" | "not_opened" | "no_phrase") {
+        return None;
+    }
+    let why = seen["cannot_go_on"].as_str().unwrap_or(state);
+    Some(format!(
+        "This device no longer stands in its phrase ({why}): it shows the change to no relay, \
+         and what each relay holds is not known from here. This command ends here, with status \
+         {NOT_AT_EVERY_RELAY_STATUS}. It does not say that you may close this machine. `cordelia \
+         devices` says what is so."
+    ))
+}
+
 /// R0: what a recovery says where a relay does not hold the change when
 /// its look has ended (decision 2026-10-19 §5).
 pub(crate) fn recovery_first_line() -> String {
@@ -379,32 +401,9 @@ pub(crate) fn recovery_end_lines(end: RecoveryEnd, relays: &[RelayAt], now: i64)
 
 // ── The words ───────────────────────────────────────────────────────
 
-/// A moment that the node noted by the wall clock, as a person reads it
-/// (decision 2026-10-19 §1, `<when>`): as `look.rs` writes a time of day,
-/// the hour and the minute in UTC, and then the date where it is not
-/// today, `now`.
-pub(crate) fn when(at: i64, now: i64) -> String {
-    let day = |at: i64| chrono::DateTime::from_timestamp(at, 0).map(|at| at.date_naive());
-    match chrono::DateTime::from_timestamp(at, 0) {
-        Some(moment) if day(at) == day(now) => moment.format("%H:%M UTC").to_string(),
-        Some(moment) => moment.format("%H:%M UTC on %Y-%m-%d").to_string(),
-        None => format!("{at}"),
-    }
-}
-
-/// `<since>` (decision 2026-10-19 §5): "has not been reached from here
-/// since <when>", where the relay was reached since its reference last
-/// moved by a start, a sleep or a change of the kept entry, at the moment
-/// it was last reached; "has not answered since <when>" where it was not,
-/// at its reference.
-pub(crate) fn since(reach: &ReachLook, now: i64) -> String {
-    match reach.last_reached {
-        Some(at) if at >= reach.reference => {
-            format!("has not been reached from here since {}", when(at, now))
-        }
-        _ => format!("has not answered since {}", when(reach.reference, now)),
-    }
-}
+// `<when>` and `<since>` are written where a status writes its lines, so
+// that the wait and the status never say a time two ways.
+pub(crate) use cordelia_api::look::{since, when};
 
 /// `<since>` of a relay, where the look says what is known of its reach.
 fn since_of(relay: &RelayAt, now: i64) -> String {
@@ -1385,6 +1384,7 @@ pub(crate) mod tests {
                 .collect(),
             cannot_go_on: None,
             word_to_come: to_come,
+            woke_at: None,
         };
         let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
         let mut relays = serde_json::to_value(looked(&at)).unwrap();
@@ -1687,6 +1687,8 @@ pub(crate) mod tests {
                 waits: None,
                 refusing_waits_since: (class == Some(Class::Stuck)).then_some(noon() - 420),
                 no_room: None,
+                answered_at: None,
+                lacking_secs: None,
             }),
             dial,
             has_what_was_carried: None,
@@ -2101,5 +2103,32 @@ pub(crate) mod tests {
             assert!(help.contains(h1), "{name}: {help}");
         }
         assert!(help_of(&mut cli, "recover").contains(h2));
+    }
+
+    /// The wait after a change, and a recovery's, end with status 3 where
+    /// the device no longer stands in its phrase (decision 2026-10-19 §4,
+    /// rule 8): removed, in no list, unable to open the change, or with no
+    /// phrase, it shows the change to no relay, and no end would hold. A
+    /// device in a fork, and one that stands, go on.
+    #[test]
+    fn the_wait_ends_where_the_device_no_longer_stands_in_its_phrase() {
+        let look = |state: &str| json!({ "state": state, "cannot_go_on": "why it cannot" });
+        for state in ["removed", "not_listed", "not_opened", "no_phrase"] {
+            assert_eq!(
+                no_longer_stands(&look(state)).as_deref(),
+                Some(
+                    "This device no longer stands in its phrase (why it cannot): it shows the \
+                     change to no relay, and what each relay holds is not known from here. This \
+                     command ends here, with status 3. It does not say that you may close this \
+                     machine. `cordelia devices` says what is so."
+                ),
+                "{state}"
+            );
+        }
+        let said = no_longer_stands(&json!({ "state": "removed" })).unwrap();
+        assert!(said.contains("(removed)"), "{said}");
+        for state in ["applied", "fork", ""] {
+            assert_eq!(no_longer_stands(&look(state)), None, "{state}");
+        }
     }
 }
