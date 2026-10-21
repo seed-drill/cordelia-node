@@ -1985,49 +1985,58 @@ fn carried_elsewhere_says(
         .filter(|(_, key)| key.as_ref().is_some_and(|key| word.keys.contains(key)))
         .map(|(name, _)| name.clone())
         .collect();
-    let reaches =
-        match set_up.is_empty() {
-            false => {
-                let relay = joined(&set_up);
-                said.push(format!(
-                    "To bring it in by this recovery, answer no. Make sure this machine can reach \
+    let reaches = match set_up.is_empty() {
+        false => {
+            let relay = joined(&set_up);
+            said.push(format!(
+                "To bring it in by this recovery, answer no. Make sure this machine can reach \
                  {relay}, and run `cordelia recover` again."
-                ));
-                relay
-            }
-            true => {
-                let key = word.keys.first().map(String::as_str).unwrap_or_default();
-                // A relay that this machine is given no key for, and did not
-                // reach, may be the one that the word names: reaching it is
-                // then the remedy, and setting up another is not.
-                let keyless: Vec<String> = known
-                    .iter()
-                    .filter(|(_, key)| key.is_none())
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                match keyless.is_empty() {
-                true => said.push(format!(
-                    "To bring it in by this recovery, answer no. On this machine, set up the \
-                     relay whose key is {key}: the configuration of that device (its \
-                     `[[network.bootnodes]]`) names it. Then run `cordelia recover` again."
-                )),
-                false => said.push(format!(
-                    "To bring it in by this recovery, answer no. Make sure this machine can reach \
-                     {}: the relay whose key is {key} may be {}. If it is not, set it up on this \
-                     machine: the configuration of that device (its `[[network.bootnodes]]`) \
-                     names it. Then run `cordelia recover` again.",
-                    joined(&keyless),
-                    if keyless.len() == 1 { "that one" } else { "one of them" }
-                )),
-            }
-                "that relay".to_string()
-            }
-        };
+            ));
+            relay
+        }
+        true => {
+            let key = word.keys.first().map(String::as_str).unwrap_or_default();
+            said.push(set_it_up(key, known));
+            "that relay".to_string()
+        }
+    };
     said.push(format!(
         "If you answer yes, it comes in later only by `cordelia sync carry <name> --from \
          <device>`, with the phrase, once this machine reaches {reaches}."
     ));
     said.join(" ")
+}
+
+/// R2's second ending (decision 2026-10-19 §5): set up on this machine
+/// the relay whose key is `key`, which the configuration of the device
+/// named names. Where this machine is set up with relays that it is given
+/// no key for, of `known`, and did not reach them, that relay may be one of
+/// them: reaching them is then the remedy, and setting it up only where it
+/// is none of them.
+fn set_it_up(key: &str, known: &[(String, Option<String>)]) -> String {
+    let keyless: Vec<String> = known
+        .iter()
+        .filter(|(_, key)| key.is_none())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if keyless.is_empty() {
+        return format!(
+            "To bring it in by this recovery, answer no. On this machine, set up the relay whose \
+             key is {key}: the configuration of that device (its `[[network.bootnodes]]`) names \
+             it. Then run `cordelia recover` again."
+        );
+    }
+    let may_be = match keyless.len() {
+        1 => "that one",
+        _ => "one of them",
+    };
+    format!(
+        "To bring it in by this recovery, answer no. Make sure this machine can reach {}: the \
+         relay whose key is {key} may be {may_be}. If it is not, set it up on this machine: the \
+         configuration of that device (its `[[network.bootnodes]]`) names it. Then run `cordelia \
+         recover` again.",
+        joined(&keyless)
+    )
 }
 
 /// What a recovery judges, before its yes, of the one device that it
