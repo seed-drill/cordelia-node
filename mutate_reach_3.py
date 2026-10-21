@@ -19,13 +19,16 @@ P2P = 'crates/cordelia-node/src/p2p.rs'
 CMD = 'crates/cordelia-node/src/person_cmd.rs'
 WAIT = 'crates/cordelia-node/src/person_cmd/wait.rs'
 MAIN = 'crates/cordelia-node/src/main.rs'
-ORIG = {f: open(f).read() for f in (STATE, LOOK, COMMANDS, REACH, P2P, CMD, WAIT, MAIN)}
+DEVICE = 'crates/cordelia-node/src/device_entries.rs'
+ORIG = {f: open(f).read() for f in (STATE, LOOK, COMMANDS, REACH, P2P, CMD, WAIT, MAIN, DEVICE)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 API = ("cordelia-api", ["--lib"])
 API_ROUTES = ("cordelia-api", ["--test", "commands_api"])
 BIN = ("cordelia-node", ["--bin", "cordelia"])
 PERSON_E2E = ("cordelia-node", ["--test", "person_e2e"])
+DEVICE_E2E = ("cordelia-node", ["--test", "device_entries_e2e"])
+def device(test): return (DEVICE_E2E, test)
 def look(test): return (API, "look::tests::" + test)
 def commands(test): return (API, "commands::tests::" + test)
 def routes(test): return (API_ROUTES, test)
@@ -50,6 +53,10 @@ MISSING = cmd("the_wait_says_what_is_missing_of_each_relay_and_of_what_is_sent")
 OVERLAP = cmd("held_and_not_yet_never_overlap")
 CANNOT_START = e2e("the_wait_that_cannot_start_ends_with_3")
 ERROR = e2e("the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied")
+BEFORE = wait("a_look_whose_classes_are_about_the_entry_before_ends_nothing")
+UNREADABLE = wait("a_look_that_cannot_be_read_ends_the_wait_as_an_error")
+ANSWERS = device("each_answer_that_says_writes_over_the_one_before")
+REFUSED_ENTRY = device("a_relay_that_holds_a_change_the_device_refuses_is_said_to")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -174,15 +181,15 @@ pub enum Class {''',
      '''            .is_some_and(|reach| reach.holds != Holds::Lacks)''',
      [READS]),
     ("E13 the command reads no relay's reach", WAIT,
-     '''            reach: serde_json::from_value(relay["reach"].clone()).ok(),''',
-     '''            reach: None,''',
+     '''                reach: Some(reach),''',
+     '''                reach: Some(reach).filter(|_| false),''',
      [NEVER, READS]),
     ("E14 the command reads `sent` as not sent", WAIT,
      '''    if rows().any(|device| device["sent"] == true) {''',
      '''    if rows().any(|device| device["sent"] == false) {''',
      [NEVER]),
     ("E15 the command does not read the word to come", WAIT,
-     '''    let end = end_of(&classes, word, seen["word_to_come"] == true);''',
+     '''    let end = end_of(&classes, word, word_to_come);''',
      '''    let end = end_of(&classes, word, false);''',
      [READS]),
     ("E16 the command reads a relay that is looked up as dialled", WAIT,
@@ -281,9 +288,10 @@ pub enum Class {''',
      '''        .filter(|relay| matches!(relay.class(), Some(Class::OutHolding | Class::Stuck)))''',
      '''        .filter(|relay| matches!(relay.class(), Some(Class::OutHolding | Class::Stuck | Class::Ok)))''',
      [WORDS]),
-    ("V8 S8 says no room where the change was not refused for room", WAIT,
-     '''        .filter(|refused| refused.of_the_change);''',
-     '''        .filter(|refused| !refused.of_the_change);''',
+    ("V8 S8 says nothing of why where the relay had no room for the change", WAIT,
+     '''        Some(LacksFor::Room(refused)) => format!(''',
+     '''        Some(LacksFor::Room(_)) if true => format!("  {} is reached.", relay.name),
+        Some(LacksFor::Room(refused)) => format!(''',
      [WORDS]),
     ("V9 S8 swaps a full relay and an address over its allowance", WAIT,
      '''                false => "it is full",''',
@@ -298,10 +306,8 @@ pub enum Class {''',
      '''    let not_dialled = dialled_so(Dial::LookedUp);''',
      [WORDS]),
     ("V12 S9 is said where no relay is reached", WAIT,
-     '''    if reached {
-        lines.push(why_not_done(relays));''',
-     '''    if !lines.is_empty() || reached {
-        lines.push(why_not_done(relays));''',
+     '''    if reached && !why.is_empty() {''',
+     '''    if (reached || !lines.is_empty()) && !why.is_empty() {''',
      [WORDS]),
     ("V13 S11 says that none holds the change where one does", WAIT,
      '''            if !relays.iter().any(RelayAt::holds) {''',
@@ -347,6 +353,83 @@ pub enum Class {''',
      '''    /// or refuses it, the command says so and ends with status 3. Any''',
      '''    /// or refuses it, the command says so and ends. Any''',
      [WORDS]),
+    # ── The look is of the change (rule 8), and can be read ─────────
+    ("N1 the node says of no relay which entry its reach is about", REACH,
+     '''        let about = lock(&self.inner).kept.flatten();''',
+     '''        let about: Option<[u8; 32]> = None;''',
+     [NEVER]),
+    ("N2 the look does not carry which entry a relay's reach is about", LOOK,
+     '''                about: relay.reach.about.map(hex::encode),''',
+     '''                about: None,''',
+     [CARRIED]),
+    ("N3 an end holds on classes from before the change", WAIT,
+     '''    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {''',
+     '''    if false {''',
+     [BEFORE]),
+    ("N4 a look that names no kept entry is taken to be of the change", WAIT,
+     '''    kept.is_some()
+        && relay''',
+     '''    relay''',
+     [BEFORE]),
+    ("N5 the lines read a relay's reach from before the change", CMD,
+     '''            relay.reach = None;''',
+     '''            let _ = &relay.reach;''',
+     [MISSING]),
+    ("N6 a relay whose reach cannot be read is in no class, and no error", WAIT,
+     '''            let reach = serde_json::from_value(relay["reach"].clone()).map_err(|e| {
+                anyhow::anyhow!("the node says of {name} what this command cannot read ({e})")
+            })?;
+            Ok(RelayAt {
+                name,
+                reach: Some(reach),''',
+     '''            let reach: Option<ReachLook> = serde_json::from_value(relay["reach"].clone()).ok();
+            Ok(RelayAt {
+                name,
+                reach,''',
+     [UNREADABLE, ERROR]),
+    ("N7 a look that does not say whether a word is to come is read as none", WAIT,
+     '''    let Some(word_to_come) = seen["word_to_come"].as_bool() else {''',
+     '''    let Some(word_to_come) = seen["word_to_come"].as_bool().or(Some(false)) else {''',
+     [UNREADABLE]),
+    ("N8 the wait does not ask the node's version", CMD,
+     '''        if let Some(note) = crate::node_of_another_version(config_path)? {''',
+     '''        if let Some(note) = None::<String> {''',
+     [ERROR]),
+    ("N9 end 3 holds with no relay listed", WAIT,
+     '''    let every_classed = !relays.is_empty() && relays.iter().all(|(class, _)| class.is_some());''',
+     '''    let every_classed = relays.iter().all(|(class, _)| class.is_some());''',
+     [NOT_ON_THE_WORD]),
+    ("N10 `<when>` puts the date before the time", WAIT,
+     '''        Some(moment) => moment.format("%H:%M UTC on %Y-%m-%d").to_string(),''',
+     '''        Some(moment) => moment.format("%Y-%m-%d %H:%M UTC").to_string(),''',
+     [WORDS]),
+    ("N11 the own word is read of any change", WAIT,
+     '''            .filter(|device| device["applied"].as_u64() == Some(number))''',
+     '''            .filter(|device| device["applied"].as_u64().is_some() || number > 0)''',
+     [READS]),
+    ("N12 S8 says of a relay with no reason noted that it holds another change", WAIT,
+     '''        None => format!("  {} is reached, and has not taken the change.", relay.name),''',
+     '''        None => format!("  {} is reached, and holds another change.", relay.name),''',
+     [WORDS]),
+    ("N13 the look does not carry why a relay lacks the change", LOOK,
+     '''                lacks_for: relay.reach.lacks_for.clone(),''',
+     '''                lacks_for: None,''',
+     [CARRIED]),
+    ("N14 no room for the change is not noted as why the relay lacks it", DEVICE,
+     '''                    self.lacks_for_room(link);''',
+     '''''',
+     [ANSWERS]),
+    ("N15 why a relay lacked the change outlives its holding it", DEVICE,
+     '''                of.lacks_for = None;''',
+     '''''',
+     [ANSWERS]),
+    ("N16 why the device refuses the relay's entry is not why it lacks the change", DEVICE,
+     '''                        why: Some(why.to_string()),''',
+     '''                        why: None,''',
+     [REFUSED_ENTRY]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.

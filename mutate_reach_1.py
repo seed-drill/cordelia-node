@@ -360,13 +360,17 @@ MUTATIONS = [
       e2e("each_answer_of_the_third_kind_is_a_failed_attempt")]),
     ("D9 word of another says nothing", DEVICE,
      '''                    round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     if !short || shows.apart == Some(id) {''',
-     '''                    if !short || shows.apart == Some(id) {''',
+     '''                    self.lacks_for_another(link, None);
+                    if !short || shows.apart == Some(id) {''',
      [e2e("each_answer_that_says_writes_over_the_one_before")]),
     ("D10 another entry handed says nothing", DEVICE,
      '''                    round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     let Some(another) = Entry::from_wire(&bytes)''',
-     '''                    let Some(another) = Entry::from_wire(&bytes)''',
+     '''                    self.lacks_for_another(link, None);
+                    let Some(another) = Entry::from_wire(&bytes)''',
      [e2e("each_answer_that_says_writes_over_the_one_before")]),
     ("D11 a show is no attempt", DEVICE,
      '''                self.reach.show_begins(&self.id_of(link));''',
@@ -412,8 +416,8 @@ MUTATIONS = [
      '''                    let _ = (&id, waits);''',
      [e2e("a_relay_that_refuses_what_waits_for_five_minutes_is_stuck")]),
     ("D20 a status says nothing of a relay's reach", DEVICE,
-     '''                    reach: self.reach.of(&relay.id()),''',
-     '''                    reach: Default::default(),''',
+     '''                        ..self.reach.of(&relay.id())''',
+     '''                        ..Default::default()''',
      [e2e("each_answer_that_says_writes_over_the_one_before")]),
 
     # ── Rule 3, the dial and the lookups ────────────────────────────
