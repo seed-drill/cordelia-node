@@ -139,6 +139,7 @@ pub async fn read_at_relays_from(
                 .map(|relay| LeftAt {
                     relay: relay.clone(),
                     read: LeftRead::Changed,
+                    key: None,
                 })
                 .collect(),
         };
@@ -323,12 +324,21 @@ pub fn handed(read: &[LeftAt]) -> (Vec<CheckedEntry>, Vec<serde_json::Value>) {
                 }
             }
         };
-        said.push(json!({
+        let mut of_it = json!({
             "relay": at.relay,
             "read": how,
             "entries": of_the_channel,
             "bytes": bytes,
-        }));
+        });
+        // The key of the connection that it was read on, as a key is
+        // written (decision 2026-10-19 §4, rule 10).
+        if let Some(key) = at
+            .key
+            .and_then(|key| cordelia_crypto::bech32::encode_public_key(&key).ok())
+        {
+            of_it["key"] = key.into();
+        }
+        said.push(of_it);
     }
     (entries, said)
 }
@@ -1615,6 +1625,7 @@ mod tests {
         let at = |relay: &str, read: LeftRead| LeftAt {
             relay: relay.into(),
             read,
+            key: None,
         };
         let read_as = |entries: &[Vec<u8>], whole: bool| LeftRead::Read {
             entries: entries.to_vec(),
@@ -1663,6 +1674,19 @@ mod tests {
                 ("eight", CONNECTION_CHANGED, 0, 0),
             ]
         );
+        // With the key of the connection that it was read on, as a key
+        // is written, where it was read on one (decision 2026-10-19 §4,
+        // rule 10).
+        let on_one = [LeftAt {
+            relay: "one".into(),
+            read: read_as(&wire, true),
+            key: Some([7; 32]),
+        }];
+        let (_, said) = handed(&on_one);
+        let written = cordelia_crypto::bech32::encode_public_key(&[7; 32]).unwrap();
+        assert_eq!(said[0]["key"], written.as_str());
+        let (_, said) = handed(&read);
+        assert!(said.iter().all(|of| of.get("key").is_none()), "{said:?}");
     }
 
     /// A carry by command, on the node (decision 2026-10-04 §7.3): the

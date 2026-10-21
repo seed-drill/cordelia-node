@@ -770,8 +770,27 @@ async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
             .configure(cordelia_api::configure_device_routes),
     )
     .await;
+    // The relays that the node is set up with, each with the key that its
+    // configuration gives it (decision 2026-10-19 §4, rule 10).
+    state.own_channels.set_up_as(vec![
+        cordelia_api::at_relays::known::RelayId {
+            name: "a.example:9474".into(),
+            key: Some([7; 32]),
+        },
+        cordelia_api::at_relays::known::RelayId {
+            name: "b.example:9474".into(),
+            key: None,
+        },
+    ]);
     let (status, said) = asks!(app, "/api/v1/recover/look", json!({}));
     assert_eq!(status, 200, "{said}");
+    assert_eq!(
+        said["relays"],
+        json!([
+            { "relay": "a.example:9474", "key": encode_public_key(&[7; 32]).unwrap() },
+            { "relay": "b.example:9474", "key": null },
+        ])
+    );
     assert_eq!(said["follows_a_phrase"], false);
     assert_eq!(
         said["this_device"],
