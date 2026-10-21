@@ -2281,7 +2281,13 @@ pub const NOT_AT_EVERY_RELAY_STATUS: i32 = 3;
 /// in this process: the command says where to look, and ends.
 fn stays_in_a_new_process(config_path: &str, number: u64) -> anyhow::Result<()> {
     use std::io::Write;
-    std::io::stdout().flush()?;
+    // The change is made: a failure from here on gives the status of a
+    // change not known to be at every relay, and never 1 (decision
+    // 2026-10-19 §4, rule 8).
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("{}", wait::could_not_go_on(number, &e.into()));
+        std::process::exit(NOT_AT_EVERY_RELAY_STATUS);
+    }
     #[cfg(unix)]
     let failed = {
         use std::os::unix::process::CommandExt;
@@ -2372,7 +2378,15 @@ pub fn change_made(config_path: &str, number: u64) -> i32 {
 /// - **Each other device,** and whether it has applied the change.
 fn after_a_change(seen: &Value, number: u64, own: &[u8; 32], now_at: i64) -> Vec<String> {
     let mut now: Vec<String> = Vec::new();
-    let relays = wait::relays_of(seen);
+    // A look whose relays cannot be read ends the wait as an error before
+    // its lines are said ([`wait::end_of_look`]).
+    let mut relays = wait::relays_of(seen).unwrap_or_default();
+    // What is known of a relay from before the change says nothing of it.
+    for relay in &mut relays {
+        if !wait::is_about_the_kept_entry(relay, seen) {
+            relay.reach = None;
+        }
+    }
     let set_up = relays.len();
     if relays.is_empty() {
         now.push("keep this machine on: no relay is reached yet".into());
@@ -2499,12 +2513,18 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
     let mut said: Vec<String> = Vec::new();
     loop {
         std::thread::sleep(ASK_EVERY);
+        // A node of another version, put in this one's place during the
+        // wait, may say what this command reads otherwise.
+        if let Some(note) = crate::node_of_another_version(config_path)? {
+            anyhow::bail!(note);
+        }
         let seen = look(config_path)?;
         if seen["change"].as_u64() != Some(number) {
             println!("This device has since applied another change: `cordelia devices` says.");
             return Ok(Waited::Another);
         }
         let at = chrono::Utc::now().timestamp();
+        let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
         let now = after_a_change(&seen, number, &own, at);
         for line in &now {
             if !said.contains(line) {
@@ -2512,7 +2532,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
             }
         }
         said = now;
-        if let (relays, word, Some(end)) = wait::end_of_look(&seen, number, &own) {
+        if let Some(end) = end {
             for line in wait::end_lines(end, &relays, word, at) {
                 println!("{line}");
             }
@@ -3530,13 +3550,15 @@ mod tests {
         let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
         let written = |n: u8| encode_public_key(&key(n)).unwrap();
         let reach = |holds: &str, out: Option<i64>| {
-            json!({ "class": null, "holds": holds, "reached": out.is_none(),
+            json!({ "about": "0101", "lacks_for": null,
+                    "class": null, "holds": holds, "reached": out.is_none(),
                     "out_of_reach_since": out, "reference": 0, "last_reached": null,
                     "waits": null, "refusing_waits_since": null, "no_room": null })
         };
         let look = |not_reached: Value, waiting: Value, to_go: Value, own: Value| {
             json!({
                 "change": 3,
+                "latest": "0101",
                 "relays": [{ "relay": "relay.example:9474", "reach": reach("holds", None) }],
                 "not_reached": not_reached,
                 "waiting": waiting,
@@ -3674,6 +3696,17 @@ mod tests {
             "{said:?}"
         );
         assert_eq!(missing(&out), 0, "{said:?}");
+        // What is known of a relay from before the change says nothing of
+        // it: it is not said to hold the change, nor to be out of reach.
+        out["relays"][0]["reach"]["about"] = json!("0202");
+        let said = lines(&out);
+        assert!(
+            said.contains(
+                &"keep this machine on: relay.example:9474 does not hold the change yet"
+                    .to_string()
+            ),
+            "{said:?}"
+        );
     }
 
     /// The exit status of the wait after a change (decision 2026-10-19 §4,
@@ -4803,7 +4836,7 @@ mod tests {
             ]) {
                 relay["reach"] = reach(class);
             }
-            let relays = wait::relays_of(&seen);
+            let relays = wait::relays_of(&seen).unwrap();
             let lines = wait::end_lines(wait::End::Warned, &relays, word, 0).join("\n");
             let all_at = lines
                 .split("All that this device carried is at ")
