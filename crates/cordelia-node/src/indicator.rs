@@ -125,12 +125,10 @@ pub struct Devices {
     pub added_not_cleared: usize,
     /// How many devices have said that they left.
     pub said_left: usize,
-    /// For each relay that is not known to hold the latest change
-    /// (decision 2026-10-19 §1), connected or not: for how long it has
-    /// lacked it, in seconds, by the node's own clock, from the later of
-    /// when it came to lack it, the node's start, a sleep and the change
-    /// of the kept entry. A relay in the third state is not among them.
-    pub not_known_to_hold_secs: Vec<u64>,
+    /// Each relay that is not known to hold the latest change (decision
+    /// 2026-10-19 §1), connected or not. A relay in the third state is not
+    /// among them.
+    pub not_known_to_hold: Vec<NotKnown>,
     /// How long ago, in seconds, the later of when this device came to
     /// keep the change entry it keeps and when this version first started
     /// on its database: a relay not known to hold the latest change is
@@ -163,6 +161,20 @@ pub struct Devices {
     pub carried_to_go: usize,
     /// For how long the first of those has waited, in seconds.
     pub carried_to_go_secs: Option<u64>,
+}
+
+/// A relay that is not known to hold the latest change, as a status goes
+/// by it (decision 2026-10-19, rule 11).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NotKnown {
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock: from the later of when it came to lack it, the node's
+    /// start, a sleep and the change of the kept entry.
+    pub lacking_secs: u64,
+    /// How long ago its latest answer about the kept entry was, in
+    /// seconds, where it gave one: a relay that held the change and then
+    /// says that it has no room for it is said for seven days from that.
+    pub said_secs: Option<u64>,
 }
 
 /// How grave what holds is.
@@ -350,9 +362,10 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 ///    nothing, and may have sync off;
 /// 8. a relay not known to hold the latest change, connected or not,
 ///    once it has lacked it for more than five minutes by the node's own
-///    clock, and for seven days from the later of when this device came to
-///    keep the change entry and when this version first started on it
-///    (decision 2026-10-19, rule 11): after that it is in `cordelia
+///    clock, and for seven days from the latest of when this device came
+///    to keep the change entry, when this version first started on it,
+///    and that relay's latest answer about the entry (decision 2026-10-19,
+///    rule 11): after that it is in `cordelia
 ///    devices` only. A relay in the third state is not counted;
 /// 9. a relay that refuses a new channel for room, or for the address's
 ///    allowance;
@@ -487,15 +500,22 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         }
         // A relay that lacks the change, connected or not: nothing else
         // stands once the command that made the change has ended
-        // (decision 2026-10-19, rule 11). For seven days, so that a relay
-        // that this site can never reach does not hide what comes after
-        // it for good.
-        let still_shown = d
-            .known_since_secs
-            .is_none_or(|secs| secs <= RELAY_NOT_KNOWN_SHOWN_SECS);
-        let lacking = d.not_known_to_hold_secs.iter().filter(|secs| long(secs));
+        // (decision 2026-10-19, rule 11). For seven days from the later of
+        // when this device came to keep the entry and the relay's latest
+        // answer about it, so that a relay that this site can never reach
+        // does not hide what comes after it for good, and one that says it
+        // lacks the entry long after is said all the same.
+        let within = |secs: &u64| *secs <= RELAY_NOT_KNOWN_SHOWN_SECS;
+        let still_shown = |relay: &&NotKnown| {
+            d.known_since_secs.is_none_or(|secs| within(&secs))
+                || relay.said_secs.as_ref().is_some_and(within)
+        };
+        let lacking = d
+            .not_known_to_hold
+            .iter()
+            .filter(|relay| long(&relay.lacking_secs))
+            .filter(still_shown);
         match lacking.count() {
-            _ if !still_shown => {}
             0 => {}
             1 => amber(
                 "relay_without_latest",
@@ -534,14 +554,18 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     match d.out_of_reach_secs.as_slice() {
         _ if !d.one_reached => {}
         [] => {}
-        [secs] => amber(
-            "relay_out_of_reach",
-            format!(
-                "memory: a relay out of reach for {} {}",
-                secs / 60,
-                plural(secs / 60, "minute")
-            ),
-        ),
+        [secs] => {
+            // Rounded up: a relay that has just come to be out of reach is
+            // so for a minute, and not for none.
+            let minutes = secs.div_ceil(60).max(1);
+            amber(
+                "relay_out_of_reach",
+                format!(
+                    "memory: a relay out of reach for {minutes} {}",
+                    plural(minutes, "minute")
+                ),
+            )
+        }
         several => amber(
             "relay_out_of_reach",
             format!("memory: {} relays out of reach", several.len()),
@@ -1024,7 +1048,7 @@ mod tests {
             "memory: 1 name carried, not yet sent",
         ),
         (
-            &|f| f.devices.not_known_to_hold_secs = vec![10, 400],
+            &|f| f.devices.not_known_to_hold = lacking_for(&[10, 400]),
             "relay_without_latest",
             "memory: a relay not known to hold the latest change",
         ),
@@ -1141,7 +1165,7 @@ mod tests {
         let several = with(&|f| {
             f.devices.said_left = 2;
             f.devices.added_not_cleared = 3;
-            f.devices.not_known_to_hold_secs = vec![400, 500];
+            f.devices.not_known_to_hold = lacking_for(&[400, 500]);
         });
         let says: Vec<&str> = several.holds.iter().map(|h| h.says.as_str()).collect();
         assert_eq!(
@@ -2018,7 +2042,8 @@ mod tests {
             "memory offline"
         );
 
-        let without_latest = |secs: u64| level(&|f| f.devices.not_known_to_hold_secs = vec![secs]);
+        let without_latest =
+            |secs: u64| level(&|f| f.devices.not_known_to_hold = lacking_for(&[secs]));
         assert_eq!(without_latest(10), None);
         assert_eq!(without_latest(300), None);
         assert_eq!(without_latest(301), amber);
@@ -2783,11 +2808,22 @@ mod tests {
 
     // ── A relay out of reach (decision 2026-10-19, rule 11) ──────────
 
+    /// Relays that have lacked the change for these seconds, with no
+    /// answer said of them.
+    fn lacking_for(secs: &[u64]) -> Vec<NotKnown> {
+        secs.iter()
+            .map(|secs| NotKnown {
+                lacking_secs: *secs,
+                said_secs: None,
+            })
+            .collect()
+    }
+
     const NOT_KNOWN: &str = "memory: a relay not known to hold the latest change";
 
     /// A relay that lacks the change for more than five minutes.
     fn lacking(f: &mut Facts) {
-        f.devices.not_known_to_hold_secs = vec![301];
+        f.devices.not_known_to_hold = lacking_for(&[301]);
         f.devices.known_since_secs = Some(400);
     }
 
@@ -2835,13 +2871,13 @@ mod tests {
         // Not before five minutes.
         let soon = with(&|f| {
             lacking(f);
-            f.devices.not_known_to_hold_secs = vec![300, 12];
+            f.devices.not_known_to_hold = lacking_for(&[300, 12]);
         });
         assert_eq!(soon.level, None);
         // Each that has lacked it for long enough is counted.
         let two = with(&|f| {
             lacking(f);
-            f.devices.not_known_to_hold_secs = vec![400, 12, 900];
+            f.devices.not_known_to_hold = lacking_for(&[400, 12, 900]);
         });
         assert_eq!(
             two.summary,
@@ -2849,11 +2885,12 @@ mod tests {
         );
     }
 
-    /// For seven days from the later of when this device came to keep the
-    /// change entry and when this version first started on it, and then
-    /// not (decision 2026-10-19, rule 11): after that it is in `cordelia
-    /// devices` only. A node that does not say since when is not cut
-    /// short: the amber errs toward being said.
+    /// For seven days from the latest of when this device came to keep the
+    /// change entry, when this version first started on it, and the
+    /// relay's latest answer about the entry, and then not (decision
+    /// 2026-10-19, rule 11): after that it is in `cordelia devices` only. A
+    /// node that does not say since when is not cut short: the amber errs
+    /// toward being said.
     #[test]
     fn for_seven_days_and_then_not() {
         let week = 7 * 24 * 60 * 60;
@@ -2867,6 +2904,19 @@ mod tests {
         assert_eq!(since(Some(week + 1)).level, None);
         assert_eq!(since(Some(90 * 24 * 60 * 60)).level, None);
         assert_eq!(since(None).summary, NOT_KNOWN);
+        // A relay that answers that it lacks the entry long after it came
+        // to be kept is said for seven days from that answer.
+        let said = |secs: Option<u64>| {
+            with(&|f| {
+                lacking(f);
+                f.devices.known_since_secs = Some(30 * 24 * 60 * 60);
+                f.devices.not_known_to_hold[0].said_secs = secs;
+            })
+        };
+        assert_eq!(said(Some(60)).summary, NOT_KNOWN);
+        assert_eq!(said(Some(week)).summary, NOT_KNOWN);
+        assert_eq!(said(Some(week + 1)).level, None);
+        assert_eq!(said(None).level, None);
         // Once it is no longer said, what came after it is.
         let after = with(&|f| {
             lacking(f);
@@ -2930,7 +2980,16 @@ mod tests {
         };
         let shown = with(&out);
         assert_eq!(shown.level, Some(Level::Amber));
-        assert_eq!(shown.summary, "memory: a relay out of reach for 1 minute");
+        assert_eq!(shown.summary, "memory: a relay out of reach for 2 minutes");
+        // Its minutes are rounded up: never none.
+        for (secs, says) in [(0, "1 minute"), (60, "1 minute"), (420, "7 minutes")] {
+            let shown = with(&|f| {
+                out(f);
+                f.devices.out_of_reach_secs = vec![secs];
+            });
+            let line = format!("memory: a relay out of reach for {says}");
+            assert_eq!(shown.summary, line, "{secs}");
+        }
         let two = with(&|f| {
             out(f);
             f.devices.out_of_reach_secs = vec![61, 4000];

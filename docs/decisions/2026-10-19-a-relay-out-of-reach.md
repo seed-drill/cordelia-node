@@ -1,7 +1,7 @@
 # Decision: a relay out of reach
 
 **Date**: 2026-10-19
-**Status**: Built (2026-10-21). It is the third form of "a relay that stays out of reach", revised three times after its own reviews (section 13). The records of 2026-10-04 and of relays now say what section 12 lists. Where the build differs from what was first written here, the text says what was built: what `adding::leave` forgets (section 1), the order of the relay lines (rule 12, and the status's lines of section 5), and three details of section 5 (`<when>` where no relay is reached, a line of sentences in `cordelia devices`, and "minute" for one). Its ends were checked over every combination of the classes of each relay, for two and three relays (appendix A); that every state comes to a class rests on section 1 and its event-sequence tests. The first two forms were reviewed and found not sound to build from. Nothing here is built before this form passes a review.
+**Status**: Built (2026-10-21). It is the third form of "a relay that stays out of reach", revised three times after its own reviews (section 13). The records of 2026-10-04 and of relays now say what section 12 lists. Where the build differs from what was first written here, the text says what was built: what `adding::leave` forgets (section 1), the order of the relay lines (rule 12, and the status's lines of section 5), the seven days of rule 11, which also run from a relay's latest answer, and three details of section 5 (`<when>` where no relay is reached, a line of sentences in `cordelia devices`, and the minutes of a relay out of reach, rounded up). Its ends were checked over every combination of the classes of each relay, for two and three relays (appendix A); that every state comes to a class rests on section 1 and its event-sequence tests. The first two forms were reviewed and found not sound to build from; this form was built after it passed its review, in five slices, each reviewed.
 **Cited as**: "decision 2026-10-19 §4, rule 7". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -483,9 +483,9 @@ The look itself is not changed by any of the four: what it takes was never decid
 
 **"memory: a relay not known to hold the latest change"** (or "memory: <n> relays not known to hold the latest change"), amber. Where the node has not yet noted that it keeps the entry it keeps, it came to keep it now.
 
-- **For each relay that lacks the change** (section 1), once it has lacked it for more than five minutes by the node's own clock. The five minutes are counted from the later of when the kept entry last changed, the node's start, and a sleep (section 1). A wake after no connection does not restart them (fourth check, finding 2).
+- **For each relay that lacks the change** (section 1), once it has lacked it for more than five minutes by the node's own clock. The five minutes are counted from the later of when the relay came to lack the change, when the kept entry last changed, the node's start, and a sleep (section 1): a relay that held the change and lost it lacks it from then. A wake after no connection does not restart them (fourth check, finding 2).
 - **Connected or not, with sync on or off, and with or without a folder mapped:** wherever the device follows a phrase, as the other amber of a person's devices. It is no longer among the amber of folders.
-- **For seven days** (`REMOVAL_NOT_APPLIED_SHOWN_DAYS`), as "a removal not yet applied by every device" is, from the later of when this device came to keep the entry and when this version first started on it. So after the upgrade a removal made on alpha.12 that a relay never got is amber for seven days, however old the removal. After that it is in `cordelia devices` only (D4).
+- **For seven days** (`REMOVAL_NOT_APPLIED_SHOWN_DAYS`), as "a removal not yet applied by every device" is, from the latest of when this device came to keep the entry, when this version first started on it, and that relay's latest answer about the entry. So after the upgrade a removal made on alpha.12 that a relay never got is amber for seven days, however old the removal; and a relay that held the change and says, weeks later, that it has no room for it is amber again, for seven days from its answer, and for as long as it goes on saying so. A relay that gives no answer (one set up later, or one that this site cannot reach) is amber for seven days from the later of the other two times, and then no more. After that it is in `cordelia devices` only (D4).
 - **Its place:** after "names carried, not yet sent" (item 7 of `indicator.rs:316-342`), and so after every other amber of a person's devices, and before the amber of folders. A device added since, or one that left, is not hidden by it. "A relay has no room" is hidden by it, as any later amber is by an earlier one; the tooltip says both.
 - **A relay in the third state of section 1 is not counted:** it has not been shown to lack the change, and no change has been made since its mark.
 
@@ -611,7 +611,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 - **T3,** a relay that holds it and is out of reach: "<relay> <since>: this device sends through the others"
 - **The line:**
   - "memory: a relay not known to hold the latest change", or "memory: <n> relays not known to hold the latest change";
-  - "memory: a relay out of reach for <minutes> minutes" ("1 minute" for one), or "memory: <n> relays out of reach" (rule 11). The minutes are counted from when it came to be out of reach.
+  - "memory: a relay out of reach for <minutes> minutes" (rounded up, so never 0: "1 minute" for one), or "memory: <n> relays out of reach" (rule 11). The minutes are counted from when it came to be out of reach.
 
 **The help:**
 

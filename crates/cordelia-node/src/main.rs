@@ -1770,9 +1770,14 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         // What is known of each relay's reach, as the node put it
         // (decision 2026-10-19 §1, rule 11): nothing of it is worked out
         // again here.
-        not_known_to_hold_secs: list("relays")
+        not_known_to_hold: list("relays")
             .filter(|relay| relay["reach"]["holds"] == "lacks")
-            .filter_map(|relay| relay["reach"]["lacking_secs"].as_u64())
+            .filter_map(|relay| {
+                Some(indicator::NotKnown {
+                    lacking_secs: relay["reach"]["lacking_secs"].as_u64()?,
+                    said_secs: ago(&relay["reach"]["answered_at"]),
+                })
+            })
             .collect(),
         known_since_secs: ago(&person["relays_known_since"]),
         out_of_reach_secs: list("relays")
@@ -6861,7 +6866,8 @@ mod tests {
             "relays": [
                 { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null,
                   "reach": { "holds": "lacks", "lacking_secs": 400, "reached": true,
-                             "class": null, "out_of_reach_since": null } },
+                             "class": null, "out_of_reach_since": null,
+                             "answered_at": now - 500 } },
                 { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60,
                   "reach": { "holds": "holds", "lacking_secs": null, "reached": false,
                              "class": "out_holding", "out_of_reach_since": now - 120 } },
@@ -6895,7 +6901,16 @@ mod tests {
                 // Each relay that lacks the change, connected or not, as
                 // the node counts it; one in the third state is not
                 // among them.
-                not_known_to_hold_secs: vec![400, 90],
+                not_known_to_hold: vec![
+                    indicator::NotKnown {
+                        lacking_secs: 400,
+                        said_secs: Some(500),
+                    },
+                    indicator::NotKnown {
+                        lacking_secs: 90,
+                        said_secs: None,
+                    },
+                ],
                 known_since_secs: Some(7_200),
                 // Only a relay out of reach that holds the change.
                 out_of_reach_secs: vec![120],
