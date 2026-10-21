@@ -301,12 +301,13 @@ pub(crate) fn ends_recovered(relays: &[Classed]) -> bool {
 /// Not done for a recovery: some relay lacks the change, and each relay
 /// that lacks it is OUT and lacking, or REFUSING. A relay that holds the
 /// change is asked nothing: what waits there is said by the lines that
-/// came before the wait.
+/// came before the wait. With no relay it does not hold, as end 3 does
+/// not: the node has not yet said where it stands at its relays.
 pub(crate) fn ends_recovery_not_done(relays: &[Classed]) -> bool {
     let lacking = || relays.iter().filter(|(_, holds)| !holds);
     let each_settled =
         lacking().all(|(class, _)| matches!(class, Some(Class::OutLacking | Class::Refusing)));
-    relays.is_empty() || (lacking().next().is_some() && each_settled)
+    lacking().next().is_some() && each_settled
 }
 
 /// The first of a recovery's two ends that holds, or none while time can
@@ -325,14 +326,30 @@ pub(crate) fn recovery_end_of(relays: &[Classed]) -> Option<RecoveryEnd> {
 /// What a look after a recovery says of its end: its relays, and the end
 /// that holds, where one does. Each relay's class is read from the look,
 /// as the node gives it.
-pub(crate) fn recovery_end_of_look(seen: &Value) -> (Vec<RelayAt>, Option<RecoveryEnd>) {
-    let relays = relays_of(seen);
+///
+/// **No end holds while what is known of a relay is about another entry
+/// than the recovery's change** (decision 2026-10-19 §4, rule 9, as rule
+/// 8 has it): the classes come from the node's last pass, which may have
+/// been before the change was kept. Each relay's reach names the entry
+/// it is about, and that must be the kept entry that the look names. A
+/// look that says of a relay what cannot be read is an error, and so the
+/// end of the wait with status 3.
+pub(crate) fn recovery_end_of_look(
+    seen: &Value,
+) -> anyhow::Result<(Vec<RelayAt>, Option<RecoveryEnd>)> {
+    let relays = relays_of(seen)?;
+    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, None));
+    }
     let classes: Vec<Classed> = relays
         .iter()
         .map(|relay| (relay.class(), relay.holds()))
         .collect();
     let end = recovery_end_of(&classes);
-    (relays, end)
+    Ok((relays, end))
 }
 
 /// R0: what a recovery says where a relay does not hold the change when
@@ -1210,8 +1227,8 @@ pub(crate) mod tests {
     /// (decision 2026-10-19 §4, rule 9): at R1, with status 0, where every
     /// relay holds it, whatever its class; not done, with status 3, where
     /// each relay that lacks it is OUT and lacking, or REFUSING; and at
-    /// neither while a relay that lacks it is in no class. A machine set
-    /// up with no relay is not done.
+    /// neither while a relay that lacks it is in no class. A look that
+    /// lists no relay ends nothing.
     #[test]
     fn a_recovery_ends_by_the_relays_that_lack_the_change() {
         let ok = (Some(Class::Ok), true);
@@ -1236,7 +1253,7 @@ pub(crate) mod tests {
         for waits in [vec![ok, lacks_for_now], vec![lacks_for_now, out_lacking]] {
             assert_eq!(recovery_end_of(&waits), None);
         }
-        assert_eq!(recovery_end_of(&[]), Some(RecoveryEnd::NotDone));
+        assert_eq!(recovery_end_of(&[]), None);
         assert_eq!(RecoveryEnd::Recovered.status(), 0);
         assert_eq!(RecoveryEnd::NotDone.status(), 3);
     }
@@ -1522,6 +1539,45 @@ pub(crate) mod tests {
         assert_eq!(end, None);
         let (_, _, end) = end_of_look_ok(&look_at(&stuck, OwnWord::None, false), 3, &own);
         assert_eq!(end, Some(End::NotDone));
+    }
+
+    /// A recovery's wait gives no end on what the node knows of its relays
+    /// from before the change (decision 2026-10-19 §4, rule 9, as rule 8
+    /// has it): a look whose relays' reach is about another entry than the
+    /// kept entry it names, or that names none, gives no R1 and no status
+    /// 0, and no end at all. Once every relay's reach is about the kept
+    /// entry, the end holds. A relay whose reach cannot be read is an
+    /// error.
+    #[test]
+    fn a_recoverys_look_whose_classes_are_about_the_entry_before_ends_nothing() {
+        let ok = (Scenario::Ok, reached(Scenario::Ok));
+        let out = (Scenario::OutHolding, reached(Scenario::OutHolding));
+        let lacking = (Scenario::OutLacking, reached(Scenario::OutLacking));
+        for (relays, end) in [
+            (vec![ok.clone(), out.clone()], RecoveryEnd::Recovered),
+            (vec![ok.clone(), lacking.clone()], RecoveryEnd::NotDone),
+        ] {
+            let seen = look_at(&relays, OwnWord::None, false);
+            assert_eq!(recovery_end_of_look(&seen).unwrap().1, Some(end));
+            let mut before = seen.clone();
+            before["latest"] = hex::encode(BEFORE).into();
+            assert_eq!(recovery_end_of_look(&before).unwrap().1, None, "{end:?}");
+            let mut one = seen.clone();
+            one["relays"][1]["reach"]["about"] = hex::encode(BEFORE).into();
+            assert_eq!(recovery_end_of_look(&one).unwrap().1, None, "{end:?}");
+            let mut none = seen.clone();
+            none.as_object_mut().unwrap().remove("latest");
+            assert_eq!(recovery_end_of_look(&none).unwrap().1, None, "{end:?}");
+            let mut unread = seen.clone();
+            unread["relays"][0]["reach"] = "what this command cannot read".into();
+            assert!(recovery_end_of_look(&unread).is_err(), "{end:?}");
+            let mut missing = seen.clone();
+            missing["relays"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("reach");
+            assert!(recovery_end_of_look(&missing).is_err(), "{end:?}");
+        }
     }
 
     /// No end holds on what the node knows of its relays from before the
