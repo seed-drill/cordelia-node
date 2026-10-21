@@ -4584,6 +4584,27 @@ mod tests {
                     .to_string()
             )
         );
+        // Its own carried word of another change than this one (rule 7:
+        // "under this change"): the line of today.
+        let mut seen = look_with_words(
+            word_naming(std::slice::from_ref(&a), 0, 2),
+            Value::Null,
+            [Some(true), Some(false), None],
+        );
+        seen["devices"][0]["applied"] = json!(2);
+        let lines = waited(&seen);
+        assert!(
+            lines.contains(
+                &"keep this machine on: this device has not yet sent every relay what it carried"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("this device has sent"))
+        );
         // Without its own carried word, the line of today.
         let seen = look_with_words(Value::Null, Value::Null, [Some(true), None, None]);
         assert!(
