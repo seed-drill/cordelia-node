@@ -5506,9 +5506,16 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     at.says("The change is made (change 2).");
     let made = Instant::now();
     at.says(&format!("{reached} holds the change"));
-    at.says(&format!(
-        "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
-    ));
+    // Said as the wait goes on, before or after that line: the first look
+    // after the change may still be of the entry before it, and then
+    // neither relay is said to hold the change.
+    assert!(
+        at.said.contains(&format!(
+            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+        )),
+        "{}",
+        at.said
+    );
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert!(
         made.elapsed() >= Duration::from_secs(290),
@@ -5754,6 +5761,34 @@ fn the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied() {
         said.contains("This device has since applied another change: `cordelia devices` says."),
         "{said}"
     );
+    // A node of another version in this one's place during the wait, and
+    // a look of which a relay's reach cannot be read: each ends the wait
+    // as an error, with status 3, and not by waiting for ever.
+    let other_version = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.1-another".into();
+        }
+    });
+    let unreadable = Answers::in_the_place_of(&laptop, |path, answer| {
+        if path == "/api/v1/devices/list" {
+            for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+                relay.as_object_mut().unwrap().remove("reach");
+            }
+        }
+    });
+    for (through, why) in [
+        (&other_version, "0.0.1-another"),
+        (&unreadable, "what this command cannot read"),
+    ] {
+        let at = laptop.at_terminal_through(through.port, &["change-made", "1"]);
+        let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+        assert_eq!(status, Some(3), "{said}");
+        assert!(
+            said.contains("The change is made (change 1). This command could not go on: "),
+            "{said}"
+        );
+        assert!(said.contains(why), "{said}");
+    }
     laptop.stop();
     let out = laptop.command(&["change-made", "1"]);
     let error = String::from_utf8_lossy(&out.stderr);

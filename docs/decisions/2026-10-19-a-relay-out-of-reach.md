@@ -133,7 +133,7 @@ Each is used in the rules below only as defined here.
 
 **When, and the words**
 
-- **When** (`<when>` below) is a moment that the node noted by the wall clock. It is written as `look.rs` writes a time of day, with the date (`YYYY-MM-DD`) before it where it is not today. The five minutes themselves are counted by the node's own clock, not by the wall clock.
+- **When** (`<when>` below) is a moment that the node noted by the wall clock. It is written as `look.rs` writes a time of day, the hour and the minute in UTC, with " on <the date>" (`YYYY-MM-DD`) after it where it is not today: "14:05 UTC", "23:00 UTC on 2026-10-19". The five minutes themselves are counted by the node's own clock, not by the wall clock.
 - **The carried word** is the device's entry under `reached/<its key>` in the personal channel (rule 4).
 - **The wait after a change** is what `cordelia remove-device`, `cordelia renew` and `cordelia settle` go on to once the change is made: `cordelia change-made <n>`, in a new image of the program (`person_cmd.rs:2182-2224`).
 
@@ -527,8 +527,9 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 - `<relay>` is a relay as the device's configuration names it (its address), and as rule 6 names it in a line about another device's word.
 - `<when>` is as section 1 defines it.
 - `<since>` is one of two phrases:
-  - "has not been reached from here since <when>", where the relay was reached since the device last woke, at the moment it was last reached;
+  - "has not been reached from here since <when>", where the relay was reached since the latest of the start, a sleep and the change of the kept entry, at the moment it was last reached;
   - "has not answered since <when>", where it was not, at the relay's reference (section 1): the start, the sleep, or the change of the kept entry, whichever was latest. A wake after no connection does not move it (fourth check, finding 7).
+  - So a relay reached before a change, and not since, "has not answered since" the change: it has said nothing of the change, and "reached from here since" a moment before the change would read as though it had.
 - `<minutes>` is whole minutes. A list of relays is joined with ", " and " and ".
 - **`<held>` and `<not yet>` come from two sets that never overlap** (this record's third review, finding 4):
   - of this device's own: `<held>` is each relay at which nothing that it carried waits, by its rows of what it sent, reached or not; `<not yet>` is every other relay;

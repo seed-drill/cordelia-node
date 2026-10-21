@@ -1863,6 +1863,14 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
     assert_eq!(device.stands(), Stands::Applied);
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
     let said = device.at("relay").refuses.expect("the status says so");
+    // The same is why the relay lacks the change (decision 2026-10-19 §5,
+    // S8).
+    assert_eq!(
+        device.at("relay").reach.lacks_for,
+        Some(cordelia_api::state::LacksFor::Another {
+            why: Some(said.clone())
+        })
+    );
     assert!(
         said.contains("lacks a key that the applied one removed"),
         "{said}"
@@ -9404,7 +9412,9 @@ fn answer_of(device: &Device, name: &str) -> Option<known::Answer> {
 /// writes over the one before, through the pass (decision 2026-10-19 §1,
 /// rule 2): "took" and "held" say that it holds it; "no room", "over the
 /// allowance", word of another, and another that it hands, that it does
-/// not.
+/// not. What the status says of the relay is about the kept entry, and
+/// says why it lacks it, by the latest answer that said so: no room, over
+/// the allowance, or another change (decision 2026-10-19 §5, S8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_answer_that_says_writes_over_the_one_before() {
     let relay = StandIn::started().await;
@@ -9459,6 +9469,27 @@ async fn each_answer_that_says_writes_over_the_one_before() {
         let reach = device.at("relay").reach;
         assert_eq!(reach.holds, holds, "{short:?} {whole:?}");
         assert!(reach.reached, "{short:?} {whole:?}");
+        assert_eq!(reach.about, Some(kept), "{short:?} {whole:?}");
+        let lacks_for = match &whole {
+            Say::Answer(ShowAnswer::Refused(refused)) => match &reach.lacks_for {
+                Some(cordelia_api::state::LacksFor::Room(no_room)) => {
+                    assert!(no_room.of_the_change);
+                    Some(no_room.over_allowance == (*refused == EntryRefused::OverLimit))
+                }
+                other => panic!("{other:?} for {whole:?}"),
+            },
+            Say::Answer(ShowAnswer::Other { .. } | ShowAnswer::Another(_)) => Some(matches!(
+                reach.lacks_for,
+                Some(cordelia_api::state::LacksFor::Another { .. })
+            )),
+            _ => reach.lacks_for.is_none().then_some(true),
+        };
+        assert_eq!(
+            lacks_for,
+            Some(true),
+            "{short:?} {whole:?}: {:?}",
+            reach.lacks_for
+        );
     }
 }
 
