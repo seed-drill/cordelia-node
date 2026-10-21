@@ -1,7 +1,7 @@
 # Decision: a warning before the personal channel fills a relay's room
 
 **Date**: 2026-10-19
-**Status**: Proposed. Not built.
+**Status**: Built.
 **Cited as**: code comments will cite this record as "decision 2026-10-19", and its rules as "§2, rule 3". The numbers do not change.
 
 Words used throughout:
@@ -205,7 +205,7 @@ Each fails on an assertion with its rule taken out. No timed test is a rule's gu
 - `indicator.rs`: `the_warning_is_shown_before_every_other_amber_memory_line`. With the total past the line, each of the eleven lines that rule 3 names is made to hold in turn, and the line shown is the warning each time. Rule 3.
 - `indicator.rs`: `the_warning_says_what_fills_the_channel`. Another device with half of what is not words and one entry more, and more than a quarter of the total, gives the first form; at exactly half of what is not words, or at exactly a quarter of the total, it does not. This device in its place gives the second. Words at exactly half the total give the third. Words below half, with two devices each at half of the rest, give the fourth. Rule 4.
 - `crates/cordelia-api/src/look.rs`: `a_refusal_for_room_says_which_channel`. A refusal kept for the personal channel, for a name's channel and for a pair channel each gives its own words of rule 6; one for the change entry and one for the address's allowance give today's; where the personal channel and a name's are refused in one pass, the personal channel's is kept. Rule 6.
-- `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_relays_refusal_for_room_is_said_as_what_it_is`. A device and a relay run as real processes, the relay with a `max_storage_bytes` that one entry fills. In one pass the relay refuses an entry of the personal channel, and `cordelia devices` shows the words of rule 6 for it; in a later pass, after the first is taken back, it refuses an entry of a name's channel, and the words for that show. Neither says "a new channel". This tests a full relay; a channel at its cap is answered the same on the wire (`NoRoom`, §1), and 16 MiB is too large for a test of real processes, so the cap is tested in units only. Rule 6.
+- `crates/cordelia-node/tests/device_entries_e2e.rs`: `a_relays_refusal_for_room_is_said_as_what_it_is`. A device and a relay run as real processes, the relay with a `max_storage_bytes` that one entry fills. In one pass the relay refuses an entry of the personal channel, and `cordelia devices` shows the words of rule 6 for it; in a later pass, while the first waits to be offered again (so that pass does not offer it), it refuses an entry of a name's channel, and the words for that show. Neither says "a new channel". This tests a full relay; a channel at its cap is answered the same on the wire (`NoRoom`, §1), and 16 MiB is too large for a test of real processes, so the cap is tested in units only. Rule 6.
 - `crates/cordelia-node/src/person_cmd.rs`: `devices_shows_what_each_device_keeps_past_the_line`, and none below it. Rule 5.
 - `crates/cordelia-storage/src/relay.rs`: `the_headroom_holds_what_can_arrive`. A channel holding 9,831 words (12,583,680 bytes, the first count past the line) takes 64 `applied/` words, 64 `left/` words, 320 records of 512 bytes, 2,048 more words and then 716 words, and refuses the 717th. It holds the constants of §6 to the relay's own count.
 

@@ -494,10 +494,15 @@ pub async fn list(
 ) -> Result<HttpResponse, ApiError> {
     asked(&req, &state)?;
     let at = state.own_channels.read();
-    let (seen, sync_on, folders) = {
+    let (seen, sync_on, folders, filled) = {
         let conn = db(&state);
         let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
-        (seen, sync_is_on(&conn)?, folders_mapped(&conn)?)
+        (
+            seen,
+            sync_is_on(&conn)?,
+            folders_mapped(&conn)?,
+            personal_channel(&conn)?,
+        )
     };
     let mut answer = serde_json::to_value(&seen).map_err(|e| ApiError::Internal(e.to_string()))?;
     // For how long each relay has been connected, by the node's own
@@ -522,6 +527,9 @@ pub async fn list(
     }
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
+    // What the personal channel holds, as the last cycle that read it
+    // found (decision 2026-10-19 §2, rule 5): nothing is summed here.
+    answer["personal_channel"] = filled;
     if body.is_some_and(|request| request.sent_to_no_relay) {
         let (versions, of_names) =
             crate::names::waits_in_every_name(&db(&state), &state.identity).map_err(refused)?;
@@ -550,6 +558,17 @@ pub async fn list(
     }
     answer["names"] = names;
     Ok(HttpResponse::Ok().json(answer))
+}
+
+/// What the personal channel holds, from the report of the last sync
+/// cycle that the node stored (decision 2026-10-19 §2, rules 2 and 5):
+/// null where there is none.
+fn personal_channel(conn: &rusqlite::Connection) -> Result<serde_json::Value, ApiError> {
+    let report: Option<serde_json::Value> =
+        meta::get(conn, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+    Ok(report
+        .and_then(|report| report.get("personal_channel").cloned())
+        .unwrap_or(serde_json::Value::Null))
 }
 
 // ── POST /api/v1/devices/clear ──────────────────────────────────────

@@ -126,7 +126,7 @@ use cordelia_api::at_relays::{
 use cordelia_api::person::{PersonError, Shown};
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, Holds, LeftAt, LeftPlace, LeftRead,
-    NoRoom, ProvedBy,
+    NoRoom, ProvedBy, RefusedOf,
 };
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
@@ -338,8 +338,12 @@ struct OfRelay {
     /// Whether it holds the entry named so, as it last answered a show of
     /// that entry.
     holds: Option<([u8; 32], bool)>,
-    /// Its last refusal for room.
-    no_room: Option<NoRoom>,
+    /// Its last refusal for room, with the pass it was in: the personal
+    /// channel's refusal is kept over another's in one pass (decision
+    /// 2026-10-19 §2, rule 6).
+    no_room: Option<(NoRoom, u64)>,
+    /// How many passes have begun there since the node started.
+    passes: u64,
     /// The entries of the device's own that it said it holds in another
     /// form, each by its channel and its place in the store's own order.
     /// What a status says is how many of them the store still holds
@@ -1721,8 +1725,8 @@ impl DeviceEntries {
                         answered.answer == ShowAnswer::Refused(EntryRefused::OverLimit);
                     self.holds(link, entry, false);
                     round.said = Some(Said::Lacks);
-                    self.no_room(link, over_allowance, true);
-                    self.lacks_for_room(link);
+                    let refused = self.no_room(link, over_allowance, RefusedOf::Change);
+                    self.lacks_for_room(link, refused);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
@@ -1938,13 +1942,15 @@ impl DeviceEntries {
     }
 
     /// The relay at `link` said that it lacks the change entry shown it
-    /// because it had no room for it ([`Self::no_room`], noted just
-    /// before): why the wait says that it refuses the change (decision
-    /// 2026-10-19 §5, S8).
-    fn lacks_for_room(&self, link: &Link) {
+    /// because it had no room for it: `refused`, that refusal, is why the
+    /// wait says that it refuses the change (decision 2026-10-19 §5, S8).
+    /// It is the change's own refusal, and not the relay's last kept
+    /// ([`NoRoom::keep`]), which may be of the personal channel in the
+    /// same pass.
+    fn lacks_for_room(&self, link: &Link, refused: NoRoom) {
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
-        of.lacks_for = of.no_room.map(cordelia_api::state::LacksFor::Room);
+        of.lacks_for = Some(cordelia_api::state::LacksFor::Room(refused));
     }
 
     /// The relay at `link` said that it lacks the change entry shown it
@@ -1956,8 +1962,11 @@ impl DeviceEntries {
         of.lacks_for = Some(cordelia_api::state::LacksFor::Another { why });
     }
 
-    /// The relay at `link` refused something that it would have taken.
-    fn no_room(&self, link: &Link, over_allowance: bool, of_the_change: bool) {
+    /// The relay at `link` refused something that it would have taken:
+    /// the change entry, or an entry of the channel `refused`. One
+    /// refusal is kept for each relay ([`NoRoom::keep`]). Returns the
+    /// refusal, kept or not.
+    fn no_room(&self, link: &Link, over_allowance: bool, refused: RefusedOf) -> NoRoom {
         let at = self.unix();
         let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -1965,15 +1974,17 @@ impl DeviceEntries {
             tracing::info!(
                 relay = link.name(),
                 over_allowance,
-                of_the_change,
+                refused = ?refused,
                 "a relay had no room for what this device sent; it is kept, and sent again"
             );
         }
-        of.no_room = Some(NoRoom {
+        let refused = NoRoom {
             at,
             over_allowance,
-            of_the_change,
-        });
+            of: refused,
+        };
+        NoRoom::keep(&mut of.no_room, refused.clone(), of.passes);
+        refused
     }
 
     // ── One relay's pass ────────────────────────────────────────────
@@ -2007,6 +2018,12 @@ impl DeviceEntries {
     /// where `prove` finds no room for it on the connection, and that is
     /// what the device says as the pass ends ([`Self::say_no_place`]).
     async fn relay_pass(&self, link: &Link, kind: Pass) -> bool {
+        // A pass begins: what a relay refuses from here is of this pass.
+        lock(&self.kept)
+            .relays
+            .entry(link.name().to_string())
+            .or_default()
+            .passes += 1;
         let read = {
             let db = lock(&self.state.db);
             let own = at_relays::channels(&db, &self.state.identity);
@@ -2640,8 +2657,8 @@ impl DeviceEntries {
                 // A relay with no room for the messages channel sets no
                 // hold, and changes no status's line (decision 2026-10-09
                 // §8): what it refused still waits, and is sent again.
-                if channel.kind != Kind::Messages {
-                    self.no_room(link, done.refused == Some(Pushed::OverAllowance), false);
+                if let Some(refused) = refused_of(&channel.kind) {
+                    self.no_room(link, done.refused == Some(Pushed::OverAllowance), refused);
                 } else if done.no_room > 0 || done.refused == Some(Pushed::NoRoom) {
                     // It is kept for `send`, which says so (§4.1, §10).
                     self.state
@@ -2915,7 +2932,7 @@ impl DeviceEntries {
                         .filter(|(entry, _)| Some(*entry) == latest)
                         .map(|(_, holds)| holds),
                     heard_since_woke: self.leave.has_heard(&relay.name),
-                    no_room: of.and_then(|of| of.no_room),
+                    no_room: of.and_then(|of| of.no_room.clone()).map(|(kept, _)| kept),
                     another_form: of.map_or(0, |of| of.another_form.len()),
                     refuses: of.and_then(|of| of.refuses.clone()),
                     reach: cordelia_api::state::Reach {
@@ -3020,6 +3037,19 @@ fn taken_from(of: &mut OfRelay) -> &mut ByteCounter {
     of.taken.get_or_insert_with(|| {
         ByteCounter::new(Duration::from_secs(60), PUSH_BYTES_PER_PEER_PER_MINUTE)
     })
+}
+
+/// What a refusal of an entry of a channel of `kind` is kept as (decision
+/// 2026-10-19 §2, rule 6): which channel it was, as the device knows its
+/// channels. None for the messages channel, which sets no hold and
+/// changes no status's line (decision 2026-10-09 §8).
+fn refused_of(kind: &Kind) -> Option<RefusedOf> {
+    match kind {
+        Kind::Personal => Some(RefusedOf::Personal),
+        Kind::Name(name) => Some(RefusedOf::Name(name.clone())),
+        Kind::Pair => Some(RefusedOf::Pair),
+        Kind::Messages => None,
+    }
 }
 
 /// What a device has pushed to a relay in the last minute.

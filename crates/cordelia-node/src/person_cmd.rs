@@ -50,7 +50,8 @@ use cordelia_api::look::{CarriedWordLook, held_named, joined, lists_of};
 use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
 use cordelia_core::protocol::{
-    CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, PHRASE_WORDS, STATUS_AMBER_WAIT_SECS,
+    CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
+    PERSONAL_CHANNEL_WARN_BYTES, PHRASE_WORDS, STATUS_AMBER_WAIT_SECS,
 };
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
@@ -957,6 +958,37 @@ fn addresses_within(
         .unwrap_or_else(|_| vec![Vec::new(); count])
 }
 
+/// A mebibyte: every size of what a relay keeps is said in MiB (decision
+/// 2026-10-19 §2, rule 5).
+const MIB: u64 = 1024 * 1024;
+
+/// `bytes` in MiB, to a tenth.
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / MIB as f64)
+}
+
+/// What the personal channel holds, as the last sync cycle that read it
+/// found, where it is past the line (decision 2026-10-19 §2, rules 3 and
+/// 5): `cordelia devices` shows the sizes past the line only.
+fn past_the_line(seen: &Value) -> Option<&Value> {
+    let filled = &seen["personal_channel"];
+    (filled["total"].as_u64()? > PERSONAL_CHANNEL_WARN_BYTES).then_some(filled)
+}
+
+/// What `device` signed of the personal channel, as `filled` says, in
+/// bytes as a relay counts them.
+fn signed_by(filled: &Value, device: &Value) -> u64 {
+    filled["by"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|signed| signed["key"] == device["key"])
+        .map(|signed| {
+            signed["words"].as_u64().unwrap_or(0) + signed["not_words"].as_u64().unwrap_or(0)
+        })
+        .sum()
+}
+
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
 fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
@@ -1077,6 +1109,21 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         true => "; has said that it left",
         false => "",
     };
+    // Past the line, what each device keeps at a relay (decision
+    // 2026-10-19 §2, rule 5).
+    let past = past_the_line(seen);
+    let keeps = |device: &Value| match past {
+        Some(filled) => format!("; keeps {} MiB there", mib(signed_by(filled, device))),
+        None => String::new(),
+    };
+    if let Some(filled) = past {
+        out.push(format!(
+            "Your devices keep {} MiB of the {} MiB a relay holds for them (names: {} MiB)",
+            mib(filled["total"].as_u64().unwrap_or(0)),
+            MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / MIB,
+            mib(filled["words"].as_u64().unwrap_or(0)),
+        ));
+    }
 
     out.push(String::new());
     out.push("Devices of the last change:".into());
@@ -1086,10 +1133,11 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             false => "",
         };
         out.push(format!(
-            "  {}: {}{made}{}",
+            "  {}: {}{made}{}{}",
             shown(device),
             applied(device),
-            left(device)
+            left(device),
+            keeps(device)
         ));
         out.push(format!("      {}", text(device, "key")));
     }
@@ -1102,7 +1150,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         let by = shown(&device["by"]);
         let at = device["at"].as_u64().map(time_of).unwrap_or_default();
         let says = match device["counted"] == true {
-            true => format!("{}{}", applied(device), left(device)),
+            true => format!("{}{}{}", applied(device), left(device), keeps(device)),
             false => format!(
                 "not counted ({})",
                 device["why_not"]
@@ -4047,6 +4095,90 @@ mod tests {
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
             "names": { "sent": ["lab"], "to_go": [] } });
         assert!(names_lines(&quiet).is_empty());
+    }
+
+    /// `cordelia devices` shows what your devices keep at a relay past
+    /// the line, from the last sync cycle's report (decision 2026-10-19
+    /// §2, rule 5): the total and the names in MiB, and beside each
+    /// device, of the last change and added since, the MiB it signed.
+    /// At the line and below it, none of it is shown.
+    #[test]
+    fn devices_shows_what_each_device_keeps_past_the_line() {
+        let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
+        let written = |n: u8| encode_public_key(&key(n)).unwrap();
+        let mib = 1024 * 1024;
+        let seen_at = |total: u64| {
+            json!({
+                "this_device": written(1),
+                "change": 1,
+                "devices": [
+                    { "key": written(1), "label": "laptop", "words": "w", "applied": 1,
+                      "sent": true, "maker": true },
+                    { "key": written(2), "label": "desktop", "words": "w", "applied": 1,
+                      "sent": true },
+                ],
+                "added": [
+                    { "key": written(3), "label": "tablet", "words": "w", "counted": true,
+                      "by": { "key": written(1), "label": "laptop", "words": "w" },
+                      "at": 0, "applied": 1, "sent": true },
+                ],
+                "personal_channel": {
+                    "total": total,
+                    "words": 12_373_197_u64,
+                    "by": [
+                        { "key": written(1), "words": 6 * mib, "not_words": 107_000 },
+                        { "key": written(2), "words": 3_250_586_u64, "not_words": 0 },
+                        { "key": written(3), "words": 0, "not_words": 1_280 },
+                        { "key": written(9), "words": 1_280, "not_words": 0 },
+                    ],
+                    "at": "2026-10-19T10:00:00Z",
+                },
+            })
+        };
+        let past = devices_lines_at(&seen_at(13_002_342), &key(1), 0, &LOOKED_UP);
+        assert!(
+            past.contains(
+                &"Your devices keep 12.4 MiB of the 16 MiB a relay holds for them (names: 11.8 \
+                  MiB)"
+                    .to_string()
+            ),
+            "{past:#?}"
+        );
+        let line_of = |lines: &[String], label: &str| -> String {
+            let of_it = format!("\"{label}\"");
+            lines
+                .iter()
+                .find(|line| line.contains(&of_it))
+                .unwrap_or_else(|| panic!("no line for {label}: {lines:?}"))
+                .clone()
+        };
+        assert!(
+            line_of(&past, "laptop").ends_with("; keeps 6.1 MiB there"),
+            "{past:#?}"
+        );
+        assert!(
+            line_of(&past, "desktop").ends_with("; keeps 3.1 MiB there"),
+            "{past:#?}"
+        );
+        assert!(
+            line_of(&past, "tablet").ends_with("; keeps 0.0 MiB there"),
+            "{past:#?}"
+        );
+        // At the line, and with no report: nothing of it.
+        let line = PERSONAL_CHANNEL_WARN_BYTES;
+        for seen in [
+            seen_at(line),
+            json!({ "this_device": written(1), "change": 1 }),
+        ] {
+            let lines = devices_lines_at(&seen, &key(1), 0, &LOOKED_UP).join("\n");
+            assert!(!lines.contains("MiB"), "{lines}");
+        }
+        let just_past = devices_lines_at(&seen_at(line + 256), &key(1), 0, &LOOKED_UP);
+        assert!(
+            just_past
+                .iter()
+                .any(|l| l.starts_with("Your devices keep 12.0 MiB of the 16"))
+        );
     }
 
     /// Right after a device is added, nothing is said against it that is

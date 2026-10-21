@@ -251,6 +251,9 @@ pub struct Counting {
     /// The keys that a device of the statement has added, by any record
     /// the device keeps, counted or not.
     added_by_a_listed: Vec<[u8; 32]>,
+    /// The key of every record of an addition that the device keeps,
+    /// counted or not.
+    recorded: Vec<[u8; 32]>,
 }
 
 impl Counting {
@@ -267,7 +270,26 @@ impl Counting {
             added_by_a_listed: keys(
                 &mut kept.iter().filter(|record| statement.lists(&record.adder)),
             ),
+            recorded: keys(&mut kept.iter()),
         }
+    }
+
+    /// Every key that counts or that the device keeps a record of an
+    /// addition for, each once, in order (decision 2026-10-19 §2, rule
+    /// 1): the keys whose slots tell a delete of the personal channel that
+    /// is no word.
+    pub(crate) fn known(&self) -> Vec<[u8; 32]> {
+        let mut keys: Vec<[u8; 32]> = self
+            .listed
+            .iter()
+            .chain(&self.added)
+            .chain(&self.recorded)
+            .filter(|key| self.counts(key) || self.recorded.contains(key))
+            .copied()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     /// Who counts where `devices` are the devices of the statement, with
@@ -279,6 +301,7 @@ impl Counting {
             removed: Vec::new(),
             added: Vec::new(),
             added_by_a_listed: Vec::new(),
+            recorded: Vec::new(),
         }
     }
 

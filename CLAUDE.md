@@ -255,6 +255,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
 | `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
 | `OUT_OF_REACH_SECS` | 300s (derived: `STATUS_AMBER_WAIT_SECS`; a relay not reached, with every attempt at it failed, for this long since its reference is out of reach) | parameter-rationale.md §12.10 |
+| `PERSONAL_CHANNEL_HEADROOM_BYTES`, `PERSONAL_CHANNEL_WARN_BYTES` | 4 MiB, 12 MiB (derived: the status warns past it, decision 2026-10-19; nothing is refused) | parameter-rationale.md §12.10 |
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
 | `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |
 

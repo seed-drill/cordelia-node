@@ -68,7 +68,7 @@ use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
     kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, Waits};
+use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, RefusedOf, Waits};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -1522,22 +1522,11 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             relay: relay.relay.clone(),
             holds_latest: relay.holds_latest,
             heard_since_woke: relay.heard_since_woke,
-            no_room: relay.no_room.map(|refused| {
-                format!(
-                    "{} had no room for {} at {} ({})",
-                    relay.relay,
-                    match refused.of_the_change {
-                        true => "the change",
-                        false => "a new channel",
-                    },
-                    time_of_day(refused.at),
-                    match refused.over_allowance {
-                        true => "this address is over its allowance of new channels there",
-                        false => "it is full",
-                    }
-                )
-            }),
-            no_room_at: relay.no_room.map(|refused| refused.at),
+            no_room: relay
+                .no_room
+                .as_ref()
+                .map(|refused| no_room_says(&relay.relay, refused)),
+            no_room_at: relay.no_room.as_ref().map(|refused| refused.at),
             connected_secs: None,
             another_form: relay.another_form,
             refuses: relay.refuses.clone(),
@@ -1553,7 +1542,7 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                 last_reached: relay.reach.last_reached,
                 waits: relay.reach.waits,
                 refusing_waits_since: relay.reach.refusing_waits_since,
-                no_room: relay.no_room,
+                no_room: relay.no_room.clone(),
                 answered_at: relay.reach.answered_at,
                 lacking_secs: relay.reach.lacking_secs,
                 lacks_for: relay.reach.lacks_for.clone(),
@@ -1676,6 +1665,38 @@ pub fn since(reach: &ReachLook, now: i64) -> String {
             format!("has not been reached from here since {}", when(at, now))
         }
         _ => format!("has not answered since {}", when(reach.reference, now)),
+    }
+}
+
+/// What is said of a relay's last refusal (decision 2026-10-19 §2, rule
+/// 6): a refusal of an entry of a channel of the device's own for room is
+/// said as what it is, by which channel it was. The relay may be full, or
+/// the channel as large as a relay keeps: one answer on the wire says
+/// both. A refusal of the change entry, and one for the address's
+/// allowance, are said as before.
+fn no_room_says(relay: &str, refused: &NoRoom) -> String {
+    let at = time_of_day(refused.at);
+    let what_of = |what: &str| {
+        let why = match refused.over_allowance {
+            true => "this address is over its allowance of new channels there",
+            false => "it is full",
+        };
+        format!("{relay} had no room for {what} at {at} ({why})")
+    };
+    let sent = |why: String| format!("{relay} had no room for what you sent at {at}: {why}");
+    match &refused.of {
+        RefusedOf::Change => what_of("the change"),
+        _ if refused.over_allowance => what_of("a new channel"),
+        RefusedOf::Personal => {
+            sent("the relay is full, or what your devices keep there is.".into())
+        }
+        RefusedOf::Name(name) => sent(format!(
+            "the relay is full, or your memory of {} there is as large as a relay keeps.",
+            name_shown(name)
+        )),
+        RefusedOf::Pair => {
+            sent("the relay is full, so no device can be added through it now.".into())
+        }
     }
 }
 
@@ -2473,7 +2494,7 @@ mod tests {
         let refused = NoRoom {
             at: 1_800_000_100,
             over_allowance: false,
-            of_the_change: true,
+            of: crate::state::RefusedOf::Change,
         };
         let stuck = Reach {
             key: Some([7; 32]),
@@ -2500,7 +2521,7 @@ mod tests {
             refusing_waits_since: None,
             lacking_secs: Some(400),
             class: Some(Class::OutLacking),
-            lacks_for: Some(crate::state::LacksFor::Room(refused)),
+            lacks_for: Some(crate::state::LacksFor::Room(refused.clone())),
             ..stuck.clone()
         };
         let relay = |name: &str, reach: Reach, no_room| AtRelay {
@@ -2551,12 +2572,12 @@ mod tests {
                     serde_json::json!({
                         "about": hex::encode([3; 32]),
                         "lacks_for": { "room": { "at": 1_800_000_100, "over_allowance": false,
-                                                 "of_the_change": true } },
+                                                 "of": "change" } },
                         "class": "out_lacking", "holds": "lacks", "reached": false,
                         "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
                         "last_reached": null, "waits": null, "refusing_waits_since": null,
                         "no_room": { "at": 1_800_000_100, "over_allowance": false,
-                                     "of_the_change": true },
+                                     "of": "change" },
                         "answered_at": 1_800_000_050, "lacking_secs": 400,
                     })
                 );
@@ -2566,6 +2587,129 @@ mod tests {
                 assert_eq!(back, seen.relays[1].reach);
             }
         }
+    }
+
+    /// What a relay refused for room is said as what it is (decision
+    /// 2026-10-19 §2, rule 6): by which channel of the device's own it
+    /// was, and never as a new channel at a full relay. A refusal of the
+    /// change entry, and one for the address's allowance, are said as
+    /// before. Of a refusal of the personal channel and of a name's in one
+    /// pass, the personal channel's is kept; in another pass, the latest.
+    #[test]
+    fn a_refusal_for_room_says_which_channel() {
+        let mut s = Several::new(1);
+        s.make_phrase(0);
+        let refused = |of: RefusedOf, over_allowance: bool| NoRoom {
+            at: 1_800_000_000,
+            over_allowance,
+            of,
+        };
+        let said_of = |s: &Several, no_room: NoRoom| -> String {
+            let at = AtRelays {
+                relays: vec![AtRelay {
+                    relay: "one.example:1".into(),
+                    holds_latest: Some(true),
+                    heard_since_woke: true,
+                    no_room: Some(no_room),
+                    another_form: 0,
+                    refuses: None,
+                    reach: Default::default(),
+                    key: None,
+                }],
+                cannot_go_on: None,
+                word_to_come: false,
+                woke_at: None,
+            };
+            let look = look(&s[0].conn, &s[0].identity, &at, s.now).unwrap();
+            let [said] = look.says.as_slice() else {
+                panic!("{:?}", look.says);
+            };
+            assert_eq!(look.relays[0].no_room.as_ref(), Some(said));
+            said.clone()
+        };
+        let cases = [
+            (
+                refused(RefusedOf::Personal, false),
+                "one.example:1 had no room for what you sent at 08:00 UTC on 2027-01-15: the \
+                 relay is full, or what your devices keep there is.",
+            ),
+            (
+                refused(RefusedOf::Name("lab".into()), false),
+                "one.example:1 had no room for what you sent at 08:00 UTC on 2027-01-15: the \
+                 relay is full, or your memory of lab there is as large as a relay keeps.",
+            ),
+            (
+                refused(RefusedOf::Pair, false),
+                "one.example:1 had no room for what you sent at 08:00 UTC on 2027-01-15: the \
+                 relay is full, so no device can be added through it now.",
+            ),
+            (
+                refused(RefusedOf::Change, false),
+                "one.example:1 had no room for the change at 08:00 UTC on 2027-01-15 (it is \
+                 full)",
+            ),
+            (
+                refused(RefusedOf::Change, true),
+                "one.example:1 had no room for the change at 08:00 UTC on 2027-01-15 (this \
+                 address is over its allowance of new channels there)",
+            ),
+            (
+                refused(RefusedOf::Personal, true),
+                "one.example:1 had no room for a new channel at 08:00 UTC on 2027-01-15 (this \
+                 address is over its allowance of new channels there)",
+            ),
+            (
+                refused(RefusedOf::Name("lab".into()), true),
+                "one.example:1 had no room for a new channel at 08:00 UTC on 2027-01-15 (this \
+                 address is over its allowance of new channels there)",
+            ),
+        ];
+        for (no_room, says) in cases {
+            let said = said_of(&s, no_room.clone());
+            assert_eq!(said, says, "{no_room:?}");
+            if !no_room.over_allowance {
+                assert!(!said.contains("a new channel"), "{said}");
+            }
+        }
+
+        // One pass refuses the personal channel and then a name's: the
+        // personal channel's is kept. A pair channel's before it in the
+        // pass gives way to it.
+        let mut kept = None;
+        assert!(NoRoom::keep(&mut kept, refused(RefusedOf::Pair, false), 1));
+        assert!(NoRoom::keep(
+            &mut kept,
+            refused(RefusedOf::Personal, false),
+            1
+        ));
+        assert!(!NoRoom::keep(
+            &mut kept,
+            refused(RefusedOf::Name("lab".into()), false),
+            1
+        ));
+        assert!(!NoRoom::keep(
+            &mut kept,
+            refused(RefusedOf::Change, false),
+            1
+        ));
+        assert_eq!(kept, Some((refused(RefusedOf::Personal, false), 1)));
+        // The personal channel again in that pass: the later is kept.
+        let later = NoRoom {
+            at: 1_800_000_060,
+            ..refused(RefusedOf::Personal, false)
+        };
+        assert!(NoRoom::keep(&mut kept, later.clone(), 1));
+        assert_eq!(kept, Some((later, 1)));
+        // In the next pass, the latest.
+        assert!(NoRoom::keep(
+            &mut kept,
+            refused(RefusedOf::Name("lab".into()), false),
+            2
+        ));
+        assert_eq!(
+            kept,
+            Some((refused(RefusedOf::Name("lab".into()), false), 2))
+        );
     }
 
     /// What the node says of each relay is said: one that the device has
@@ -2588,7 +2732,7 @@ mod tests {
         let full = NoRoom {
             at: 1_800_000_000,
             over_allowance: true,
-            of_the_change: false,
+            of: RefusedOf::Personal,
         };
         let woke = s.now - 60;
         let mut at = AtRelays {
