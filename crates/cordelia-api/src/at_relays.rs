@@ -846,11 +846,68 @@ fn write_reached(
     Ok(())
 }
 
+/// The keys of `relays` at which nothing that this device carried waits,
+/// by its rows of what it sent, which are kept by key, whether or not the
+/// relay is reached now: in the order of the configuration, each once.
+fn holding(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[Found],
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let mut held: Vec<[u8; 32]> = Vec::new();
+    for key in relays.iter().filter_map(|relay| relay.key) {
+        if !held.contains(&key) && !carried_waits_at(conn, identity, &key)? {
+            held.push(key);
+        }
+    }
+    Ok(held)
+}
+
+/// The carried word under the statement numbered `number` whose second
+/// field is `held` ([`holding`]): the first eight keys and how many more,
+/// and how many of `relays` are in neither, a relay of no known key among
+/// them. The two never overlap. `None` where no key is held, or where a
+/// count would be over its bound: a reader would refuse it.
+fn word_over(number: u64, relays: &[Found], mut held: Vec<[u8; 32]>) -> Option<CarriedWord> {
+    let is_held = |relay: &Found| relay.key.is_some_and(|key| held.contains(&key));
+    let not_yet = relays.iter().filter(|relay| !is_held(relay)).count() as u64;
+    let more = held.len().saturating_sub(REACHED_WORD_MAX_RELAYS) as u64;
+    held.truncate(REACHED_WORD_MAX_RELAYS);
+    if held.is_empty() || more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {
+        return None;
+    }
+    Some(CarriedWord {
+        number,
+        keys: held,
+        more,
+        not_yet,
+    })
+}
+
+/// The carried word that this device holds standing in its slot, where it
+/// holds one: not a delete, and a word that reads.
+fn standing(
+    conn: &Connection,
+    alone: &Alone,
+    own: &[u8; 32],
+) -> Result<Option<CarriedWord>, PersonError> {
+    let Some(held) = own_reached(conn, alone, own)? else {
+        return Ok(None);
+    };
+    if held.delete {
+        return Ok(None);
+    }
+    let said = held.check()?.open(&alone.personal)?.value;
+    Ok(CarriedWord::from_value(&said).ok())
+}
+
 /// The carried word that this device would write at the end of a whole
 /// pass in which `sent` is not written (decision 2026-10-19 §4, rule 4),
 /// where `relays`, every relay that it is set up with, in the order of its
 /// configuration and each once, are as found. `None` where it would write
-/// none: where a condition fails, or where the word it holds says the same.
+/// none by these conditions: where one fails, or where the word it holds
+/// says the same. A word that stands where they fail is
+/// [`standing_to_mend`]'s.
 ///
 /// It is written where all of these hold:
 ///
@@ -861,13 +918,8 @@ fn write_reached(
 ///    or is STUCK: reached, holding the change, and refusing what waits;
 /// 4. not every relay is OK: then `sent` is the word, and never this.
 ///
-/// **What it says.** The keys of the relays at which nothing that the
-/// device carried waits, by its rows of what it sent, which are kept by
-/// key, whether or not the relay is reached now: the first eight in the
-/// order of the configuration, each once, and how many more. Then how
-/// many relays are in neither: a relay of no known key among them. The two
-/// never overlap. Where a count would be over its bound, no word is
-/// written: a reader would refuse it.
+/// **What it says** is [`word_over`] the keys at which nothing that the
+/// device carried waits ([`holding`]).
 pub fn reached_to_write(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -888,46 +940,71 @@ pub fn reached_to_write(
     if relays.iter().all(|relay| relay.class == Some(Class::Ok)) {
         return Ok(None);
     }
-    let mut held: Vec<[u8; 32]> = Vec::new();
-    for key in relays.iter().filter_map(|relay| relay.key) {
-        if !held.contains(&key) && !carried_waits_at(conn, identity, &key)? {
-            held.push(key);
-        }
-    }
+    let held = holding(conn, identity, relays)?;
     let is_held = |relay: &Found| relay.key.is_some_and(|key| held.contains(&key));
     let ok_and_held = |relay: &Found| relay.class == Some(Class::Ok) && is_held(relay);
     if !relays.iter().any(ok_and_held) {
         return Ok(None);
     }
-    let not_yet = relays.iter().filter(|relay| !is_held(relay)).count() as u64;
-    let more = held.len().saturating_sub(REACHED_WORD_MAX_RELAYS) as u64;
-    held.truncate(REACHED_WORD_MAX_RELAYS);
-    if more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {
+    let Some(word) = word_over(alone.number, relays, held) else {
         return Ok(None);
-    }
-    let word = CarriedWord {
-        number: alone.number,
-        keys: held,
-        more,
-        not_yet,
     };
     // Rewritten only where a field changes.
-    let own = identity.public_key();
-    if let Some(held) = own_reached(conn, &alone, &own)?
-        && !held.delete
-    {
-        let said = held.check()?.open(&alone.personal)?.value;
-        if CarriedWord::from_value(&said).as_ref() == Ok(&word) {
-            return Ok(None);
-        }
+    if standing(conn, &alone, &identity.public_key())?.as_ref() == Some(&word) {
+        return Ok(None);
     }
     Ok(Some(word))
 }
 
-/// Write this device's carried word, where [`reached_to_write`] gives one
-/// (decision 2026-10-19 §4, rule 4). The pass asks only where it did not
-/// write `sent`. Returns whether the word was written: it waits in the
-/// store, and is sent as anything is.
+/// What becomes of a carried word that stands where rule 4's conditions
+/// to write one do not hold ([`standing_to_mend`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mend {
+    /// It is rewritten with the fields that hold now.
+    Word(CarriedWord),
+    /// No relay holds what was carried, by the rows, or a count would be
+    /// over its bound: a delete is written in its slot.
+    Delete,
+}
+
+/// What becomes of the carried word that this device holds standing, where
+/// [`reached_to_write`] gives none, whatever the relays' classes (decision
+/// 2026-10-19 §4, rule 4: it is "rewritten where any of its fields
+/// changes"). The fields are worked out again from the rows of what was
+/// sent: where they say the same, nothing; where they say otherwise, the
+/// word is rewritten with them; and where no relay is left that holds what
+/// was carried, it is deleted. So the word never names a relay as holding
+/// what was carried where that relay dropped it since (its rows were
+/// started again, `kept_rows::start_again`). `None` where nothing stands,
+/// or where the device does not stand as it does to write the word
+/// ([`Alone`]): then `sent` stands, or nothing is written.
+pub fn standing_to_mend(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[Found],
+) -> Result<Option<Mend>, PersonError> {
+    let Some(alone) = alone(conn, identity)? else {
+        return Ok(None);
+    };
+    if relays.is_empty() {
+        return Ok(None);
+    }
+    let Some(stands) = standing(conn, &alone, &identity.public_key())? else {
+        return Ok(None);
+    };
+    let held = holding(conn, identity, relays)?;
+    Ok(match word_over(alone.number, relays, held) {
+        Some(word) if word == stands => None,
+        Some(word) => Some(Mend::Word(word)),
+        None => Some(Mend::Delete),
+    })
+}
+
+/// Write this device's carried word, where [`reached_to_write`] gives one;
+/// and otherwise rewrite or delete the word that stands, where
+/// [`standing_to_mend`] says so (decision 2026-10-19 §4, rule 4). The pass
+/// asks only where it did not write `sent`. Returns whether anything was
+/// written: it waits in the store, and is sent as anything is.
 pub fn say_reached(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -935,13 +1012,26 @@ pub fn say_reached(
     now: i64,
 ) -> Result<bool, PersonError> {
     in_one(conn, || {
-        let Some(word) = reached_to_write(conn, identity, relays)? else {
-            return Ok(false);
+        let value = match reached_to_write(conn, identity, relays)? {
+            Some(word) => word,
+            None => match standing_to_mend(conn, identity, relays)? {
+                Some(Mend::Word(word)) => word,
+                Some(Mend::Delete) => {
+                    let Some(alone) = alone(conn, identity)? else {
+                        return Ok(false);
+                    };
+                    let held = own_reached(conn, &alone, &identity.public_key())?;
+                    let rev = held.map(|held| held.rev);
+                    write_reached(conn, identity, &alone, rev, Value::Delete, now)?;
+                    return Ok(true);
+                }
+                None => return Ok(false),
+            },
         };
         let Some(alone) = alone(conn, identity)? else {
             return Ok(false);
         };
-        let value = word
+        let value = value
             .to_value()
             .map_err(|e| PersonError::Held(format!("the carried word: {e}")))?;
         let held = own_reached(conn, &alone, &identity.public_key())?;
@@ -957,7 +1047,8 @@ pub fn say_reached(
 /// that write them, so that a command that reads it never works the
 /// conditions out itself. `by_key` is every relay by its key where every
 /// one is connected ([`say_sent`]'s `relays`), and `found` each relay as
-/// [`say_reached`] is given it.
+/// [`say_reached`] is given it. A carried word that stands and is to be
+/// rewritten or deleted is to come too ([`standing_to_mend`]).
 pub fn word_to_come(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -976,7 +1067,10 @@ pub fn word_to_come(
         }
     }
     Ok(match found {
-        Some(found) => reached_to_write(conn, identity, found)?.is_some(),
+        Some(found) => {
+            reached_to_write(conn, identity, found)?.is_some()
+                || standing_to_mend(conn, identity, found)?.is_some()
+        }
         None => false,
     })
 }
@@ -3754,5 +3848,124 @@ mod tests {
         };
         assert_eq!(has(0), [Some(true), Some(false), None]);
         assert_eq!(has(1), [None, None, None]);
+    }
+
+    /// Every channel of device 0's own is started again at the relay whose
+    /// key is `relay`: the relay dropped them, and what was carried waits
+    /// there again (`kept_rows::start_again`).
+    fn dropped_all(s: &Several, relay: &[u8; 32]) {
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        for channel in channels(conn, identity).unwrap() {
+            not_held_at(conn, relay, &channel.id).unwrap();
+        }
+        assert!(carried_waits_at(conn, identity, relay).unwrap());
+    }
+
+    /// A carried word that stands is rewritten where its fields no longer
+    /// hold, and deleted where no relay is left that holds what was
+    /// carried, whatever the relays' classes (decision 2026-10-19 §4, rule
+    /// 4: "rewritten where any of its fields changes"). It never names a
+    /// relay as holding what was carried where that relay dropped it.
+    #[test]
+    fn a_standing_word_is_rewritten_or_deleted_when_its_fields_no_longer_hold() {
+        use Class::{Ok as OK, OutHolding, OutLacking, Stuck};
+        let now = crate::several::START;
+        let word = |s: &Several| match reached_word(s, 0, 0) {
+            Some(Value::Delete) => Some(Value::Delete),
+            Some(value) => Some(Value::Other(
+                CarriedWord::from_value(&value).unwrap().to_value().unwrap(),
+            )),
+            None => None,
+        };
+        let as_value = |word: CarriedWord| Some(Value::Other(word.to_value().unwrap()));
+
+        // A takes everything, and the word names it; then A drops its
+        // channels. Whether A is still OK or in no class at all, the word
+        // is deleted, and that is to come until it is written.
+        for a_now in [Some(OK), None] {
+            let s = carried_after_a_change();
+            let (conn, identity) = (&s[0].conn, &s[0].identity);
+            took_all(&s, &relay_key(1));
+            let before = [found(1, Some(OK)), found(2, Some(OutLacking))];
+            assert!(say_reached(conn, identity, &before, now).unwrap());
+            assert_eq!(word(&s), as_value(carried_word(2, &[1], 0, 1)));
+            dropped_all(&s, &relay_key(1));
+            let after = [found(1, a_now), found(2, Some(OutLacking))];
+            assert_eq!(reached_to_write(conn, identity, &after).unwrap(), None);
+            assert_eq!(
+                standing_to_mend(conn, identity, &after).unwrap(),
+                Some(Mend::Delete)
+            );
+            assert!(word_to_come(conn, identity, None, Some(&after)).unwrap());
+            assert!(say_reached(conn, identity, &after, now).unwrap());
+            assert_eq!(word(&s), Some(Value::Delete), "{a_now:?}");
+            assert_eq!(standing_to_mend(conn, identity, &after).unwrap(), None);
+            assert!(!word_to_come(conn, identity, None, Some(&after)).unwrap());
+            assert!(!say_reached(conn, identity, &after, now).unwrap());
+        }
+
+        // A and B took everything; then A drops its channels and has no
+        // room to take them back: A is STUCK, and B out of reach. The word
+        // is rewritten to name B alone, and A is counted as not yet.
+        let s = carried_after_a_change();
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        took_all(&s, &relay_key(1));
+        took_all(&s, &relay_key(2));
+        let before = [found(1, Some(OK)), found(2, Some(OutHolding))];
+        assert!(say_reached(conn, identity, &before, now).unwrap());
+        assert_eq!(word(&s), as_value(carried_word(2, &[1, 2], 0, 0)));
+        dropped_all(&s, &relay_key(1));
+        let stuck = [found(1, Some(Stuck)), found(2, Some(OutHolding))];
+        assert_eq!(reached_to_write(conn, identity, &stuck).unwrap(), None);
+        let mended = carried_word(2, &[2], 0, 1);
+        assert_eq!(
+            standing_to_mend(conn, identity, &stuck).unwrap(),
+            Some(Mend::Word(mended.clone()))
+        );
+        assert!(word_to_come(conn, identity, None, Some(&stuck)).unwrap());
+        assert!(say_reached(conn, identity, &stuck, now).unwrap());
+        assert_eq!(word(&s), as_value(mended));
+        // Written: nothing more until a field changes.
+        assert_eq!(standing_to_mend(conn, identity, &stuck).unwrap(), None);
+        assert!(!word_to_come(conn, identity, None, Some(&stuck)).unwrap());
+        // B drops them too: no relay holds what was carried, and the word
+        // is deleted with A still STUCK.
+        dropped_all(&s, &relay_key(2));
+        assert!(say_reached(conn, identity, &stuck, now).unwrap());
+        assert_eq!(word(&s), Some(Value::Delete));
+
+        // A recovery's look that is pending writes nothing, and mends
+        // nothing either.
+        let s = carried_after_a_change();
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        took_all(&s, &relay_key(1));
+        let before = [found(1, Some(OK)), found(2, Some(OutLacking))];
+        assert!(say_reached(conn, identity, &before, now).unwrap());
+        meta::set(conn, meta::PERSON_LOOK_PENDING, "1").unwrap();
+        dropped_all(&s, &relay_key(1));
+        assert_eq!(standing_to_mend(conn, identity, &before).unwrap(), None);
+        assert!(!say_reached(conn, identity, &before, now).unwrap());
+        assert_eq!(word(&s), as_value(carried_word(2, &[1], 0, 1)));
+
+        // With no word standing, nothing is mended.
+        let s = carried_after_a_change();
+        let none = [found(1, Some(Stuck)), found(2, Some(OutLacking))];
+        assert_eq!(
+            standing_to_mend(&s[0].conn, &s[0].identity, &none).unwrap(),
+            None
+        );
+        assert!(!say_reached(&s[0].conn, &s[0].identity, &none, now).unwrap());
+        // Nor once `sent` is written.
+        took_all(&s, &relay_key(1));
+        let a_and_b = [found(1, Some(OK)), found(2, Some(OutLacking))];
+        assert!(say_reached(&s[0].conn, &s[0].identity, &a_and_b, now).unwrap());
+        took_all(&s, &relay_key(2));
+        let both = [relay_key(1), relay_key(2)];
+        assert!(say_sent(&s[0].conn, &s[0].identity, &both, now).unwrap());
+        dropped_all(&s, &relay_key(1));
+        assert_eq!(
+            standing_to_mend(&s[0].conn, &s[0].identity, &none).unwrap(),
+            None
+        );
     }
 }
