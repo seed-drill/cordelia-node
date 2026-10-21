@@ -68,7 +68,7 @@ use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
     kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn, Class, Holds, NoRoom, Waits};
+use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, Waits};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -299,6 +299,11 @@ pub struct AtRelayLook {
 /// by the time of day, in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ReachLook {
+    /// The change entry that the rest is about, by its ID in hex, as
+    /// `Look::latest` names one: none before the node's pass has found the
+    /// kept entry. The wait after a change reads nothing else of a relay
+    /// whose reach is about another entry (decision 2026-10-19 §4, rule 8).
+    pub about: Option<String>,
     /// Its class, where it is in one.
     pub class: Option<Class>,
     /// Whether it holds the change entry that the device keeps.
@@ -329,6 +334,9 @@ pub struct ReachLook {
     /// (decision 2026-10-19, rule 11).
     #[serde(default)]
     pub lacking_secs: Option<u64>,
+    /// Why it lacks the change, by its latest answer that said so (§5,
+    /// S8).
+    pub lacks_for: Option<LacksFor>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -569,7 +577,8 @@ pub fn look(
         // nothing to show one.
         if look.state != "no_phrase" {
             for relay in &look.relays {
-                look.says.extend(relay.says(look.woke_at, now));
+                look.says
+                    .extend(relay.says(look.woke_at, look.latest.as_deref(), now));
             }
         }
         // What became of a key that was taken is said only while it is
@@ -1535,6 +1544,7 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             key: relay.key.and_then(|key| encode_public_key(&key).ok()),
             has_what_was_carried: None,
             reach: ReachLook {
+                about: relay.reach.about.map(hex::encode),
                 class: relay.reach.class,
                 holds: relay.reach.holds,
                 reached: relay.reach.reached,
@@ -1546,6 +1556,7 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                 no_room: relay.no_room,
                 answered_at: relay.reach.answered_at,
                 lacking_secs: relay.reach.lacking_secs,
+                lacks_for: relay.reach.lacks_for.clone(),
             },
         })
         .collect()
@@ -1642,13 +1653,14 @@ pub fn held_named(word: &CarriedWordLook, relays: &[(&str, Option<&str>)]) -> St
 }
 
 /// A moment that the node noted by the wall clock, as a person reads it
-/// (decision 2026-10-19 §1, `<when>`): the hour and the minute, in UTC,
-/// with the date before it where it is not today, `now`.
+/// (decision 2026-10-19 §1, `<when>`): as [`time_of_day`] writes it, the
+/// hour and the minute in UTC, and then the date where it is not today,
+/// `now`.
 pub fn when(at: i64, now: i64) -> String {
     let day = |at: i64| chrono::DateTime::from_timestamp(at, 0).map(|at| at.date_naive());
     match chrono::DateTime::from_timestamp(at, 0) {
         Some(moment) if day(at) == day(now) => moment.format("%H:%M UTC").to_string(),
-        Some(moment) => moment.format("%Y-%m-%d %H:%M UTC").to_string(),
+        Some(moment) => moment.format("%H:%M UTC on %Y-%m-%d").to_string(),
         None => format!("{at}"),
     }
 }
@@ -1668,28 +1680,35 @@ pub fn since(reach: &ReachLook, now: i64) -> String {
 }
 
 impl AtRelayLook {
-    /// Whether it is out of reach, as the node last said.
-    pub fn out_of_reach(&self) -> bool {
-        self.reach.out_of_reach_since.is_some()
+    /// Whether it is out of reach, as the node last said, by what is
+    /// known of it about `latest`, the change entry that the device keeps
+    /// (`Look::latest`): what is known of a relay about the entry before
+    /// says nothing of whether it holds this one.
+    pub fn out_of_reach(&self, latest: Option<&str>) -> bool {
+        latest.is_some()
+            && self.reach.about.as_deref() == latest
+            && self.reach.out_of_reach_since.is_some()
     }
 
     /// What is said of the relay in a status, where there is something to
     /// say (decision 2026-10-04 §4.6, §8; decision 2026-10-19 §5, T1 to
-    /// T3), at `now`. `woke_at` is when the device last woke.
+    /// T3), at `now`. `woke_at` is when the device last woke, and `latest`
+    /// the change entry it keeps.
     ///
     /// A relay out of reach is said to be so (T2, T3) before anything is
     /// said of the wake: what is known of it is kept across starts, and
     /// what it lacks matters more than that it has not answered since.
-    pub fn says(&self, woke_at: Option<i64>, now: i64) -> Vec<String> {
+    pub fn says(&self, woke_at: Option<i64>, latest: Option<&str>, now: i64) -> Vec<String> {
         let mut says = Vec::new();
         let since = || since(&self.reach, now);
-        if self.out_of_reach() && self.reach.holds == Holds::Lacks {
+        let out = self.out_of_reach(latest);
+        if out && self.reach.holds == Holds::Lacks {
             says.push(format!(
                 "{} is not known to hold the latest change, and {}",
                 self.relay,
                 since()
             ));
-        } else if self.out_of_reach() && self.reach.holds == Holds::Holds {
+        } else if out && self.reach.holds == Holds::Holds {
             says.push(format!(
                 "{} {}: this device sends through the others",
                 self.relay,
@@ -2458,6 +2477,8 @@ mod tests {
         };
         let stuck = Reach {
             key: Some([7; 32]),
+            about: Some([3; 32]),
+            lacks_for: None,
             holds: Holds::Holds,
             reached: true,
             out_of_reach_since: None,
@@ -2479,6 +2500,7 @@ mod tests {
             refusing_waits_since: None,
             lacking_secs: Some(400),
             class: Some(Class::OutLacking),
+            lacks_for: Some(crate::state::LacksFor::Room(refused)),
             ..stuck.clone()
         };
         let relay = |name: &str, reach: Reach, no_room| AtRelay {
@@ -2516,6 +2538,7 @@ mod tests {
                 assert_eq!(
                     json["relays"][0]["reach"],
                     serde_json::json!({
+                        "about": hex::encode([3; 32]), "lacks_for": null,
                         "class": "stuck", "holds": "holds", "reached": true,
                         "out_of_reach_since": null, "reference": 1_800_000_000,
                         "last_reached": 1_800_000_050, "waits": "refused",
@@ -2526,6 +2549,9 @@ mod tests {
                 assert_eq!(
                     json["relays"][1]["reach"],
                     serde_json::json!({
+                        "about": hex::encode([3; 32]),
+                        "lacks_for": { "room": { "at": 1_800_000_100, "over_allowance": false,
+                                                 "of_the_change": true } },
                         "class": "out_lacking", "holds": "lacks", "reached": false,
                         "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
                         "last_reached": null, "waits": null, "refusing_waits_since": null,
@@ -2564,6 +2590,7 @@ mod tests {
             over_allowance: true,
             of_the_change: false,
         };
+        let woke = s.now - 60;
         let mut at = AtRelays {
             relays: vec![
                 relay("one.example:1", Some(true), true, None),
@@ -2572,7 +2599,7 @@ mod tests {
             ],
             cannot_go_on: None,
             word_to_come: false,
-            woke_at: Some(s.now - 60),
+            woke_at: Some(woke),
         };
         let seen_at =
             |s: &Several, at: &AtRelays| look(&s[0].conn, &s[0].identity, at, s.now).unwrap();
@@ -2582,14 +2609,14 @@ mod tests {
 
         s.make_phrase(0);
         let look = seen_at(&s, &at);
-        assert_eq!(look.woke_at, Some(s.now - 60));
+        assert_eq!(look.woke_at, Some(woke));
         assert_eq!(
             look.says,
             [
                 format!(
                     "has not heard from two.example:1 since it started or woke at {}: a change \
                      made while this device was off may be there, and not have reached it",
-                    when(s.now - 60, s.now)
+                    when(woke, s.now)
                 )
                 .as_str(),
                 "three.example:1 does not hold the latest change yet",
@@ -3018,7 +3045,11 @@ mod tests {
             has_what_was_carried: None,
             reach,
         };
+        // The change entry that the device keeps, as the look names it.
+        let latest = Some("0101");
         let reach = |holds: Holds, out: Option<i64>, last_reached: Option<i64>| ReachLook {
+            about: latest.map(str::to_string),
+            lacks_for: None,
             class: None,
             holds,
             reached: false,
@@ -3033,24 +3064,24 @@ mod tests {
         };
         let t1 = relay(false, None, reach(Holds::Neither, None, None));
         assert_eq!(
-            t1.says(Some(now - 600), now),
+            t1.says(Some(now - 600), latest, now),
             [
                 "has not heard from b.example:9474 since it started or woke at 11:50 UTC: a change \
               made while this device was off may be there, and not have reached it"
             ]
         );
         assert_eq!(
-            t1.says(Some(now - 86_400 - 600), now),
+            t1.says(Some(now - 86_400 - 600), latest, now),
             [
-                "has not heard from b.example:9474 since it started or woke at 2026-10-20 11:50 \
-              UTC: a change made while this device was off may be there, and not have reached it"
+                "has not heard from b.example:9474 since it started or woke at 11:50 UTC on \
+              2026-10-20: a change made while this device was off may be there, and not have reached it"
             ]
         );
         // A relay in the third state out of reach is still T1.
         let third_out = relay(false, None, reach(Holds::Neither, Some(now - 60), None));
         assert_eq!(
-            third_out.says(Some(now - 600), now),
-            t1.says(Some(now - 600), now)
+            third_out.says(Some(now - 600), latest, now),
+            t1.says(Some(now - 600), latest, now)
         );
         for heard in [false, true] {
             let t2 = relay(
@@ -3059,7 +3090,7 @@ mod tests {
                 reach(Holds::Lacks, Some(now - 60), None),
             );
             assert_eq!(
-                t2.says(Some(now - 600), now),
+                t2.says(Some(now - 600), latest, now),
                 [
                     "b.example:9474 is not known to hold the latest change, and has not answered \
                   since 11:45 UTC"
@@ -3071,16 +3102,24 @@ mod tests {
                 reach(Holds::Holds, Some(now - 60), Some(now - 300)),
             );
             assert_eq!(
-                t3.says(Some(now - 600), now),
+                t3.says(Some(now - 600), latest, now),
                 [
                     "b.example:9474 has not been reached from here since 11:55 UTC: this device \
                   sends through the others"
                 ]
             );
         }
+        // What is known of a relay about the entry before says nothing of
+        // this one: the lines of before.
+        let mut before = relay(true, Some(false), reach(Holds::Lacks, Some(now - 60), None));
+        before.reach.about = Some("0202".into());
+        assert_eq!(
+            before.says(Some(now - 600), latest, now),
+            ["b.example:9474 does not hold the latest change yet"]
+        );
         let reached = relay(true, Some(false), reach(Holds::Lacks, None, Some(now - 10)));
         assert_eq!(
-            reached.says(Some(now - 600), now),
+            reached.says(Some(now - 600), latest, now),
             ["b.example:9474 does not hold the latest change yet"]
         );
     }

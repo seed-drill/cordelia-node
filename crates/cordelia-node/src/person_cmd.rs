@@ -1202,7 +1202,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     let to_send = |waits: &Value| waits["waits"].as_u64().filter(|n| *n > 0);
     let woke_at = seen["woke_at"].as_i64();
     for (n, relay) in relays.iter().enumerate() {
-        let holds = relay_says(relay, woke_at, now);
+        let holds = relay_says(relay, woke_at, seen["latest"].as_str(), now);
         let waits = waiting.iter().copied().filter(|waits| is_of(waits, n));
         let still = waits
             .filter_map(to_send)
@@ -1275,9 +1275,11 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
 }
 
 /// What `cordelia devices` says of a relay, after its name (decision
-/// 2026-10-19, rule 12), at `now`: `woke_at` is when the device last woke.
-/// What the node knows of its reach is read from the look, and nothing of
-/// it is worked out again.
+/// 2026-10-19, rule 12), at `now`: `woke_at` is when the device last woke,
+/// and `latest` the change entry it keeps, as the look names it. What the
+/// node knows of its reach is read from the look, and nothing of it is
+/// worked out again; what is known of it about another entry says nothing
+/// of this one.
 ///
 /// - **Out of reach, and lacks the change:** D4. **Out of reach, and holds
 ///   it:** D5. What is known of a relay is kept across starts, so these
@@ -1288,13 +1290,13 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
 ///   and D3 once it is: a relay in the third state, which neither holds
 ///   nor lacks the change.
 /// - Otherwise the lines of before.
-fn relay_says(relay: &Value, woke_at: Option<i64>, now: i64) -> String {
+fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i64) -> String {
     use cordelia_api::look::{ReachLook, since, when};
     use cordelia_api::state::Holds;
     let reach: Option<ReachLook> = serde_json::from_value(relay["reach"].clone()).ok();
-    let out = reach
-        .as_ref()
-        .filter(|reach| reach.out_of_reach_since.is_some());
+    let out = reach.as_ref().filter(|reach| {
+        latest.is_some() && reach.about.as_deref() == latest && reach.out_of_reach_since.is_some()
+    });
     let name = text(relay, "relay");
     let woke = woke_at
         .map(|at| format!(" at {}", when(at, now)))
@@ -2343,7 +2345,13 @@ pub const NOT_AT_EVERY_RELAY_STATUS: i32 = 3;
 /// in this process: the command says where to look, and ends.
 fn stays_in_a_new_process(config_path: &str, number: u64) -> anyhow::Result<()> {
     use std::io::Write;
-    std::io::stdout().flush()?;
+    // The change is made: a failure from here on gives the status of a
+    // change not known to be at every relay, and never 1 (decision
+    // 2026-10-19 §4, rule 8).
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("{}", wait::could_not_go_on(number, &e.into()));
+        std::process::exit(NOT_AT_EVERY_RELAY_STATUS);
+    }
     #[cfg(unix)]
     let failed = {
         use std::os::unix::process::CommandExt;
@@ -2434,7 +2442,15 @@ pub fn change_made(config_path: &str, number: u64) -> i32 {
 /// - **Each other device,** and whether it has applied the change.
 fn after_a_change(seen: &Value, number: u64, own: &[u8; 32], now_at: i64) -> Vec<String> {
     let mut now: Vec<String> = Vec::new();
-    let relays = wait::relays_of(seen);
+    // A look whose relays cannot be read ends the wait as an error before
+    // its lines are said ([`wait::end_of_look`]).
+    let mut relays = wait::relays_of(seen).unwrap_or_default();
+    // What is known of a relay from before the change says nothing of it.
+    for relay in &mut relays {
+        if !wait::is_about_the_kept_entry(relay, seen) {
+            relay.reach = None;
+        }
+    }
     let set_up = relays.len();
     if relays.is_empty() {
         now.push("keep this machine on: no relay is reached yet".into());
@@ -2561,12 +2577,18 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
     let mut said: Vec<String> = Vec::new();
     loop {
         std::thread::sleep(ASK_EVERY);
+        // A node of another version, put in this one's place during the
+        // wait, may say what this command reads otherwise.
+        if let Some(note) = crate::node_of_another_version(config_path)? {
+            anyhow::bail!(note);
+        }
         let seen = look(config_path)?;
         if seen["change"].as_u64() != Some(number) {
             println!("This device has since applied another change: `cordelia devices` says.");
             return Ok(Waited::Another);
         }
         let at = chrono::Utc::now().timestamp();
+        let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
         let now = after_a_change(&seen, number, &own, at);
         for line in &now {
             if !said.contains(line) {
@@ -2574,7 +2596,7 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
             }
         }
         said = now;
-        if let (relays, word, Some(end)) = wait::end_of_look(&seen, number, &own) {
+        if let Some(end) = end {
             for line in wait::end_lines(end, &relays, word, at) {
                 println!("{line}");
             }
@@ -3592,13 +3614,15 @@ mod tests {
         let key = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap().public_key();
         let written = |n: u8| encode_public_key(&key(n)).unwrap();
         let reach = |holds: &str, out: Option<i64>| {
-            json!({ "class": null, "holds": holds, "reached": out.is_none(),
+            json!({ "about": "0101", "lacks_for": null,
+                    "class": null, "holds": holds, "reached": out.is_none(),
                     "out_of_reach_since": out, "reference": 0, "last_reached": null,
                     "waits": null, "refusing_waits_since": null, "no_room": null })
         };
         let look = |not_reached: Value, waiting: Value, to_go: Value, own: Value| {
             json!({
                 "change": 3,
+                "latest": "0101",
                 "relays": [{ "relay": "relay.example:9474", "reach": reach("holds", None) }],
                 "not_reached": not_reached,
                 "waiting": waiting,
@@ -3736,6 +3760,17 @@ mod tests {
             "{said:?}"
         );
         assert_eq!(missing(&out), 0, "{said:?}");
+        // What is known of a relay from before the change says nothing of
+        // it: it is not said to hold the change, nor to be out of reach.
+        out["relays"][0]["reach"]["about"] = json!("0202");
+        let said = lines(&out);
+        assert!(
+            said.contains(
+                &"keep this machine on: relay.example:9474 does not hold the change yet"
+                    .to_string()
+            ),
+            "{said:?}"
+        );
     }
 
     /// The exit status of the wait after a change (decision 2026-10-19 §4,
@@ -4123,12 +4158,15 @@ mod tests {
                     "holds_latest": holds_latest, "reach": reach })
         };
         let reach = |holds: &str, out: Option<i64>, last_reached: Option<i64>| {
-            json!({ "class": null, "holds": holds, "reached": false, "out_of_reach_since": out,
+            json!({ "about": "0101", "lacks_for": null,
+                    "class": null, "holds": holds, "reached": false, "out_of_reach_since": out,
                     "reference": now - 900, "last_reached": last_reached, "waits": null,
                     "refusing_waits_since": null, "no_room": null,
                     "answered_at": yesterday, "lacking_secs": null })
         };
         let woke = Some(now - 600);
+        // The change entry the device keeps, as the look names it.
+        const LATEST: Option<&str> = Some("0101");
         let cases = [
             // D2: not heard since the device woke, not out of reach.
             (
@@ -4161,7 +4199,7 @@ mod tests {
                     Value::Null,
                     reach("holds", Some(now - 60), Some(now - 600)),
                 ),
-                "holds the latest change (as it said at 2026-10-20 12:00 UTC), and has not been \
+                "holds the latest change (as it said at 12:00 UTC on 2026-10-20), and has not been \
                  reached from here since 11:50 UTC",
             ),
             (
@@ -4170,7 +4208,7 @@ mod tests {
                     json!(true),
                     reach("holds", Some(now - 60), Some(now - 300)),
                 ),
-                "holds the latest change (as it said at 2026-10-20 12:00 UTC), and has not been \
+                "holds the latest change (as it said at 12:00 UTC on 2026-10-20), and has not been \
                  reached from here since 11:55 UTC",
             ),
             // The lines of before.
@@ -4188,15 +4226,23 @@ mod tests {
             ),
         ];
         for (relay, said) in cases {
-            assert_eq!(relay_says(&relay, woke, now), said, "{relay}");
+            assert_eq!(relay_says(&relay, woke, LATEST, now), said, "{relay}");
         }
+        // What is known of a relay about the entry before says nothing of
+        // this one: the lines of before.
+        let mut before = relay(true, json!(true), reach("holds", Some(now - 60), None));
+        before["reach"]["about"] = json!("0202");
+        assert_eq!(
+            relay_says(&before, woke, LATEST, now),
+            "holds the latest change"
+        );
         // With no wake said, no time is said of it.
         let d2 = relay(false, Value::Null, reach("lacks", None, None));
         assert!(
-            relay_says(&d2, None, now)
+            relay_says(&d2, None, LATEST, now)
                 .starts_with("has not answered since this device started or woke. "),
             "{}",
-            relay_says(&d2, None, now)
+            relay_says(&d2, None, LATEST, now)
         );
 
         // In the list, what waits at a relay whose line is sentences is
@@ -4204,7 +4250,7 @@ mod tests {
         let key = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
         let seen = json!({
             "this_device": encode_public_key(&key).unwrap(),
-            "change": 1, "devices": [], "woke_at": now - 600,
+            "change": 1, "devices": [], "woke_at": now - 600, "latest": "0101",
             "relays": [
                 relay(false, Value::Null, reach("lacks", Some(now - 60), None)),
                 relay(false, Value::Null, reach("lacks", None, None)),
@@ -4987,7 +5033,7 @@ mod tests {
             ]) {
                 relay["reach"] = reach(class);
             }
-            let relays = wait::relays_of(&seen);
+            let relays = wait::relays_of(&seen).unwrap();
             let lines = wait::end_lines(wait::End::Warned, &relays, word, 0).join("\n");
             let all_at = lines
                 .split("All that this device carried is at ")
