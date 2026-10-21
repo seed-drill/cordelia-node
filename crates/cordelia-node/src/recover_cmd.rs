@@ -6003,14 +6003,17 @@ mod tests {
             "{said:?}"
         );
         assert_eq!(said.last().unwrap(), "Every relay holds the change.");
-        // S2 and S3 are not said of a reach about the entry before.
-        let mut one = looked(&[Reached, OutLacking]);
+        // S2 and S3 are not said of a reach about the entry before: there
+        // the relay held the entry kept before, and is out of reach.
+        let mut one = looked(&[Reached, OutHolding]);
         one["relays"][1]["reach"]["about"] = hex::encode([2u8; 32]).into();
         let node = Stands::of(
             finished(false),
             vec![one.clone(), looked(&[Reached, OutLacking])],
         );
         let (_, said) = after(&node);
+        let s3 = "  relay-1.example:9474 holds the change, and ";
+        assert!(!said.iter().any(|line| line.starts_with(s3)), "{said:?}");
         let s2 = "  keep this machine on: relay-1.example:9474 is not known to hold";
         assert_eq!(
             said.iter().filter(|line| line.starts_with(s2)).count(),
