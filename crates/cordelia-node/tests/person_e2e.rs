@@ -40,10 +40,19 @@ fn asks(node: &Node, path: &str, body: Value) -> (u16, String) {
 }
 
 /// What the node says that its device holds of its person: [`look`],
-/// without what it says of its relays, which changes as it reaches them.
+/// without what it says of its relays, which changes as it reaches them,
+/// and without the times its passes note of them (when it woke, and since
+/// when it has known its relays, which its first pass writes).
 fn holds(node: &Node) -> Value {
     let mut seen = look(node);
-    for of_its_relays in ["relays", "waiting", "not_reached", "says"] {
+    for of_its_relays in [
+        "relays",
+        "waiting",
+        "not_reached",
+        "says",
+        "woke_at",
+        "relays_known_since",
+    ] {
         seen.as_object_mut().unwrap().remove(of_its_relays);
     }
     seen
