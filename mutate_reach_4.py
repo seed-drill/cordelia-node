@@ -49,6 +49,8 @@ STATUSES = rcmd("the_statuses_of_a_recovery")
 ONE_SHOT = rcmd("test_what_is_said_once_the_look_has_ended")
 NOTHING_WAITS = rcmd("test_nothing_is_said_to_wait_only_where_nothing_does")
 HANDED = main("test_what_a_recovery_hands_the_process_that_waits_is_read_there")
+STALE_WAIT = wait("a_recoverys_look_whose_classes_are_about_the_entry_before_ends_nothing")
+STALE = rcmd("a_recovery_ends_only_on_classes_of_its_change_and_with_3_on_what_it_cannot_read")
 STATUS_E2E = e2e("a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error")
 
 # Each part: (a short id and what the fault is, the file, the exact text
@@ -78,12 +80,12 @@ MUTATIONS = [
      '''        lacking().all(|(class, _)| matches!(class, Some(Class::OutLacking)));''',
      [ENDS, REC_ENDS, WAITS]),
     ("E6 not done for a recovery where no relay lacks the change", WAIT,
-     '''    relays.is_empty() || (lacking().next().is_some() && each_settled)''',
-     '''    relays.is_empty() || each_settled''',
-     [ENDS, REC_ENDS]),
-    ("E7 a recovery set up with no relay waits for ever", WAIT,
-     '''    relays.is_empty() || (lacking().next().is_some() && each_settled)''',
      '''    lacking().next().is_some() && each_settled''',
+     '''    each_settled''',
+     [ENDS, REC_ENDS]),
+    ("E7 a look that lists no relay ends a recovery not done", WAIT,
+     '''    lacking().next().is_some() && each_settled''',
+     '''    relays.is_empty() || (lacking().next().is_some() && each_settled)''',
      [REC_ENDS]),
     ("E8 not done for a recovery has status 0", WAIT,
      '''            RecoveryEnd::NotDone => NOT_AT_EVERY_RELAY_STATUS,''',
@@ -129,10 +131,8 @@ MUTATIONS = [
      '''            say(String::new());''',
      [PENDING, WAITS]),
     ("S7 S2 and S3 are not said as they come", RCMD,
-     '''            .filter(|relay| relay.out_of_reach())
-            .map(|relay| wait::out_of_reach_line(relay, at))''',
-     '''            .filter(|relay| relay.out_of_reach() && relay.name.is_empty())
-            .map(|relay| wait::out_of_reach_line(relay, at))''',
+     '''            .filter(|relay| relay.out_of_reach() && wait::is_about_the_kept_entry(relay, &seen))''',
+     '''            .filter(|relay| relay.out_of_reach() && relay.name.is_empty())''',
      [WAITS]),
     ("S8 S2 and S3 are said again at each look", RCMD,
      '''            if !said.contains(line) {
@@ -149,7 +149,7 @@ MUTATIONS = [
         .collect();''',
      [ONE_SHOT]),
     ("S10 nothing is said to wait where a relay lacks the change", RCMD,
-     '''    let keep_on = !not_reached.is_empty() || !wait::relays_of(seen).iter().all(|r| r.holds());''',
+     '''    let keep_on = !not_reached.is_empty() || wait::relays_of(seen).map_or(true, lacks);''',
      '''    let keep_on = !not_reached.is_empty();''',
      [NOTHING_WAITS]),
 
@@ -311,6 +311,47 @@ MUTATIONS = [
             carried_to: None,
         })''',
      [HANDED]),
+
+    # ── Slice 3's review, in a recovery's wait (rule 9, as rule 8) ──
+    ("B1 a recovery ends on classes from before its change", WAIT,
+     '''    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, None));''',
+     '''    if false {
+        return Ok((relays, None));''',
+     [STALE_WAIT, STALE]),
+    ("B2 S2 and S3 are said of a reach from before the change", RCMD,
+     '''            .filter(|relay| relay.out_of_reach() && wait::is_about_the_kept_entry(relay, &seen))''',
+     '''            .filter(|relay| relay.out_of_reach())''',
+     [STALE]),
+    ("B3 a node of another version does not end a recovery's wait", RCMD,
+     '''        if let Some(note) = node.another_version()? {''',
+     '''        if let Some(note) = node.another_version()?.filter(|_| false) {''',
+     [STALE, STATUS_E2E]),
+    ("B4 the node's version is not asked during the wait", RCMD,
+     '''        crate::node_of_another_version(self.0)''',
+     '''        crate::node_of_another_version(self.0).map(|_| None)''',
+     [STATUS_E2E]),
+    ("B5 a relay whose reach cannot be read is passed over", WAIT,
+     '''    let relays = relays_of(seen)?;
+    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, None));''',
+     '''    let relays = relays_of(seen).unwrap_or_default();
+    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, None));''',
+     [STALE_WAIT, STALE, STATUS_E2E]),
+    ("B6 nothing is said to wait where a relay cannot be read", RCMD,
+     '''wait::relays_of(seen).map_or(true, lacks);''',
+     '''wait::relays_of(seen).map_or(false, lacks);''',
+     [NOTHING_WAITS]),
 
     # ── R2 and R3, word for word (§5) ───────────────────────────────
     ("W1 R2's first ending names every relay with a key", RCMD,

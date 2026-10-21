@@ -366,8 +366,10 @@ pub enum Class {''',
      '''    if !relays
         .iter()
         .all(|relay| is_about_the_kept_entry(relay, seen))
-    {''',
-     '''    if false {''',
+    {
+        return Ok((relays, word, None));''',
+     '''    if false {
+        return Ok((relays, word, None));''',
      [BEFORE]),
     ("N4 a look that names no kept entry is taken to be of the change", WAIT,
      '''    kept.is_some()
