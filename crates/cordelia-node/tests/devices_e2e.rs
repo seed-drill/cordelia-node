@@ -1253,6 +1253,7 @@ fn the_harness_takes_an_address_of_this_machine() {
 fn the_harness_takes_the_name_under_which_nothing_is_looked_up() {
     use std::net::ToSocketAddrs;
     assert!(!NO_SUCH_NAME.contains(':'));
+    assert!(NO_SUCH_NAME.ends_with(".invalid"));
     let read = NO_SUCH_NAME.to_socket_addrs().map(|_| ());
     assert_eq!(
         read.map_err(|e| e.kind()),
