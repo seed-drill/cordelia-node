@@ -42,6 +42,7 @@ READ = look("the_carried_word_is_read_only_from_its_own_key_under_the_applied_nu
 NAMED = look("a_relay_is_named_three_ways")
 LINES = cmd("each_line_of_the_carried_word_word_for_word")
 OVERLAP = cmd("held_and_not_yet_never_overlap")
+STANDING = at_relays("a_standing_word_is_rewritten_or_deleted_when_its_fields_no_longer_hold")
 PASS = e2e("a_pass_writes_the_carried_word_where_the_other_relay_is_out_of_reach")
 FORM = word("the_value_is_four_fields_byte_for_byte")
 REFUSED = word("a_word_out_of_its_form_is_no_word")
@@ -191,20 +192,22 @@ MUTATIONS = [
      '''''',
      [EIGHT]),
     ("W15 a count over its bound is written", AT_RELAYS,
-     '''    if more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {
-        return Ok(None);
-    }''',
-     '''''',
+     '''    if held.is_empty() || more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {''',
+     '''    if held.is_empty() {''',
      [EIGHT]),
+    ("W20 a word of no key is written over a standing one", AT_RELAYS,
+     '''    if held.is_empty() || more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {''',
+     '''    if more > REACHED_WORD_MAX_COUNT || not_yet > REACHED_WORD_MAX_COUNT {''',
+     [STANDING]),
     ("W16 the keys are not in the order of the configuration", AT_RELAYS,
      '''    held.truncate(REACHED_WORD_MAX_RELAYS);''',
      '''    held.sort();
     held.truncate(REACHED_WORD_MAX_RELAYS);''',
      [EIGHT]),
     ("W17 the word is written again where nothing changed", AT_RELAYS,
-     '''        if CarriedWord::from_value(&said).as_ref() == Ok(&word) {
-            return Ok(None);
-        }''',
+     '''    if standing(conn, &alone, &identity.public_key())?.as_ref() == Some(&word) {
+        return Ok(None);
+    }''',
      '''''',
      [REWRITTEN, TO_COME]),
     ("W18 `sent` leaves the carried word standing", AT_RELAYS,
@@ -224,9 +227,58 @@ MUTATIONS = [
      '''''',
      [TO_COME]),
     ("T2 the carried word to come is not said", AT_RELAYS,
-     '''        Some(found) => reached_to_write(conn, identity, found)?.is_some(),''',
-     '''        Some(found) => reached_to_write(conn, identity, found)?.is_none() && false,''',
+     '''            reached_to_write(conn, identity, found)?.is_some()''',
+     '''            false''',
      [TO_COME, PASS]),
+    ("T4 a standing word to be rewritten or deleted is not said to come", AT_RELAYS,
+     '''                || standing_to_mend(conn, identity, found)?.is_some()''',
+     '''''',
+     [STANDING]),
+
+    # ── Rule 4: a standing word whose fields no longer hold ─────────
+    ("M1 a standing word is rewritten though its fields say the same", AT_RELAYS,
+     '''        Some(word) if word == stands => None,''',
+     '''        Some(word) if word != word => None,''',
+     [STANDING]),
+    ("M2 a standing word that no relay holds is not deleted", AT_RELAYS,
+     '''        None => Some(Mend::Delete),''',
+     '''        None => None,''',
+     [STANDING]),
+    ("M3 a standing word whose fields changed is not rewritten", AT_RELAYS,
+     '''        Some(word) => Some(Mend::Word(word)),''',
+     '''        Some(_) => None,''',
+     [STANDING]),
+    ("M4 the pass does not mend a standing word", AT_RELAYS,
+     '''            None => match standing_to_mend(conn, identity, relays)? {''',
+     '''            None => match None::<Mend> {''',
+     [STANDING]),
+    ("M5 a standing word is mended though the device does not stand to write it", AT_RELAYS,
+     '''pub fn standing_to_mend(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[Found],
+) -> Result<Option<Mend>, PersonError> {
+    let Some(alone) = alone(conn, identity)? else {
+        return Ok(None);
+    };''',
+     '''pub fn standing_to_mend(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    relays: &[Found],
+) -> Result<Option<Mend>, PersonError> {
+    let Some(alone) = alone(conn, identity)?.or_else(|| {
+        let standing = Standing::to_write(conn).ok()?;
+        let personal = derive::personal_secret(&standing.secret).ok()?;
+        Some(Alone {
+            number: standing.number(),
+            channel: derive::channel_id(&personal).ok()?,
+            personal,
+            applied_rev: 0,
+        })
+    }) else {
+        return Ok(None);
+    };''',
+     [STANDING]),
     ("T3 `sent` is to come though what was carried waits", AT_RELAYS,
      '''            waits |= carried_waits_at(conn, identity, relay)?;''',
      '''            waits |= false;''',
@@ -357,6 +409,10 @@ MUTATIONS = [
     }''',
      '''''',
      [LINES, OVERLAP]),
+    ("S8 S4 is said of a word under another change", CMD,
+     '''            device["applied"].as_u64() == Some(number) && carried_word_of(device).is_some()''',
+     '''            carried_word_of(device).is_some()''',
+     [LINES]),
     ("S7 one other relay is said as many", CMD,
      '''        1 => "1 other relay".into(),''',
      '''        1 => "1 other relays".into(),''',
