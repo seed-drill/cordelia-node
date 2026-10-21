@@ -330,7 +330,7 @@ A device writes, in the personal channel of the generation it has applied, under
 - **Why a slot of its own:** see rule 1. A device of alpha.12 stores an entry under a name that it does not know, where its signer counts, and reads nothing of it (`take.rs:188-255, 327-328`).
 - **Why keys:** a key is what a relay shows anyone who connects. A reader knows the key of each relay it is set up with that has one in its configuration, and of each it has reached.
 - **What it costs:**
-  - one entry for each device that has a relay out of reach after a change, and its delete: a content of 256 bytes where the word names up to four keys, as every other entry of the personal channel is, and of 512 bytes where it names five or more;
+  - one entry for each device that has a relay out of reach after a change, and its delete: a content of 256 bytes where the word names up to four keys, as a device's words under `applied/` and `left/` are, and of 512 bytes where it names five or more, as a record of an addition is;
   - every device of the person learns the keys of the relays to which each other device sent what it carried. For the default relays those keys are in the program already.
 - **Set aside:**
   - **The names of the relays out of reach** (the second form). They are addresses, and a reader can do nothing with them but repeat them (the second review, M7). The count says enough: "not yet to <k> other relays".
@@ -658,7 +658,7 @@ The wait does not save it there. What the third form adds there is the faster di
 
 **What a relay sees of it:**
 
-- the carried word and its delete: one entry of the personal channel each. A word that names up to four keys, and every delete, is of a size it cannot tell from any other entry there (a content of 256 bytes). A word that names five keys or more is of 512 bytes, and so tells it that the device named five relays or more. It is not padded to 512: then every carried word would be the one entry of its size in the channel, and a relay could tell each from the rest;
+- the carried word and its delete: one entry of the personal channel each. A word that names up to four keys, and every delete, is a content of 256 bytes, as a device's words under `applied/` and `left/` are; a word that names five keys or more is of 512 bytes, as a record of an addition is. So a relay cannot tell it by its size from every other entry there, only from those of the other size. It is not padded to 512: for a device set up with the two default relays it would then stand beside the records of additions and apart from every word of a device, where at 256 it stands among them;
 - dials every 30 seconds from a device for which it lacks a change, where today it sees one every 15 minutes.
 
 ## 8. What it costs
