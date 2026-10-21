@@ -2420,6 +2420,9 @@ enum Recovered {
     /// The device has since applied another change: whether that one is
     /// at every relay is the business of the command that made it.
     Another,
+    /// The device no longer stands in its phrase
+    /// ([`wait::no_longer_stands`]).
+    NoLongerStands,
 }
 
 /// The exit status of a recovery's command, as it ended (decision
@@ -2429,7 +2432,7 @@ enum Recovered {
 fn recovered_status(ended: &anyhow::Result<Recovered>) -> i32 {
     match ended {
         Ok(Recovered::Ended(end)) => end.status(),
-        Ok(Recovered::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Recovered::Another | Recovered::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
     }
 }
 
@@ -2583,6 +2586,10 @@ fn waits_for_the_change(
         if seen["change"].as_u64() != Some(number) {
             say("This device has since applied another change: `cordelia devices` says.".into());
             return Ok(Recovered::Another);
+        }
+        if let Some(line) = wait::no_longer_stands(&seen) {
+            say(line);
+            return Ok(Recovered::NoLongerStands);
         }
         let at = chrono::Utc::now().timestamp();
         let (relays, end) = wait::recovery_end_of_look(&seen)?;
@@ -5977,6 +5984,7 @@ mod tests {
             3
         );
         assert_eq!(recovered_status(&Ok(Recovered::Another)), 3);
+        assert_eq!(recovered_status(&Ok(Recovered::NoLongerStands)), 3);
         assert_eq!(recovered_status(&Err(anyhow::anyhow!("no node"))), 3);
         let (said, status) = look_not_waited_for(&"it was moved");
         assert_eq!(status, 3);
@@ -5991,6 +5999,20 @@ mod tests {
             said.last()
                 .unwrap()
                 .contains("since applied another change")
+        );
+        // The device no longer stands in its phrase: its node shows the
+        // change to no relay, and no end would hold.
+        let mut removed = looked(&[Reached, OutLacking]);
+        removed["state"] = "removed".into();
+        removed["cannot_go_on"] = "this device was removed".into();
+        let node = Stands::of(finished(false), vec![removed]);
+        let (ended, said) = after(&node);
+        assert_eq!(ended.unwrap(), Recovered::NoLongerStands);
+        assert!(
+            said.last().unwrap().starts_with(
+                "This device no longer stands in its phrase (this device was removed)"
+            ),
+            "{said:?}"
         );
         // The node stops answering during the wait.
         let mut node = Stands::of(

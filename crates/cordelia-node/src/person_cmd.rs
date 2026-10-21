@@ -2404,16 +2404,19 @@ enum Waited {
     /// The device has since applied another change: whether that one is
     /// at every relay is the business of the command that made it.
     Another,
+    /// The device no longer stands in its phrase
+    /// ([`wait::no_longer_stands`]).
+    NoLongerStands,
 }
 
 /// The exit status of the wait after a change, as it ended (decision
 /// 2026-10-19 §4, rule 8): 0 only at ends 1 and 2; 3 at end 3, where the
-/// device has since applied another change, and on any error during the
-/// wait.
+/// device has since applied another change or no longer stands in its
+/// phrase, and on any error during the wait.
 fn status_of(waited: &anyhow::Result<Waited>) -> i32 {
     match waited {
         Ok(Waited::Ended(end)) => end.status(),
-        Ok(Waited::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Waited::Another | Waited::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
     }
 }
 
@@ -2595,6 +2598,10 @@ fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
         if seen["change"].as_u64() != Some(number) {
             println!("This device has since applied another change: `cordelia devices` says.");
             return Ok(Waited::Another);
+        }
+        if let Some(line) = wait::no_longer_stands(&seen) {
+            println!("{line}");
+            return Ok(Waited::NoLongerStands);
         }
         let at = chrono::Utc::now().timestamp();
         let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
@@ -3795,6 +3802,7 @@ mod tests {
         assert_eq!(status_of(&Ok(Waited::Ended(End::Warned))), 0);
         assert_eq!(status_of(&Ok(Waited::Ended(End::NotDone))), 3);
         assert_eq!(status_of(&Ok(Waited::Another)), 3);
+        assert_eq!(status_of(&Ok(Waited::NoLongerStands)), 3);
         assert_eq!(status_of(&Err(anyhow::anyhow!("the node stopped"))), 3);
         let (said, status) = wait_not_started(&"no such file");
         assert_eq!(status, 3);
