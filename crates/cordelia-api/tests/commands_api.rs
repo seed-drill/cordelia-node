@@ -1307,3 +1307,71 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
         );
     }
 }
+
+/// The look carries what the wait after a change reads and never works out
+/// again (decision 2026-10-19 §4, rule 8; §5, S9): the node's word that a
+/// word is to come, each relay's class as the node put it, and how the
+/// node tries each relay.
+#[actix_web::test]
+async fn test_the_look_carries_the_word_to_come_each_class_and_how_each_relay_is_tried() {
+    use cordelia_api::state::{AtRelay, AtRelays, Class, Holds, Reach, RelaySnapshot, Tried};
+    let (state, _dir) = state_of(false);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(cordelia_api::configure_routes),
+    )
+    .await;
+    let at = |name: &str, class| AtRelay {
+        relay: name.into(),
+        holds_latest: None,
+        heard_since_woke: true,
+        no_room: None,
+        another_form: 0,
+        refuses: None,
+        reach: Reach {
+            holds: Holds::Lacks,
+            class,
+            ..Default::default()
+        },
+        key: None,
+    };
+    let names = ["one.example:9474", "two.example:9474", "three.example:9474"];
+    state.own_channels.say(AtRelays {
+        relays: vec![
+            at(names[0], Some(Class::OutLacking)),
+            at(names[1], Some(Class::OutLacking)),
+            at(names[2], None),
+        ],
+        cannot_go_on: None,
+        word_to_come: true,
+    });
+    let known = |name: &str, stands: &str, tried: Tried| RelaySnapshot {
+        host: name.into(),
+        key: None,
+        state: stands.into(),
+        unreachable_secs: None,
+        last_tried_secs: None,
+        error: None,
+        tried,
+    };
+    *state.relays.write().unwrap() = vec![
+        known(names[0], "unreachable", Tried::LookedUp),
+        known(names[1], "wrong key", Tried::NotDialled),
+        known(names[2], "connected", Tried::Dialled),
+    ];
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(seen["word_to_come"], true, "{seen}");
+    let relays = seen["relays"].as_array().unwrap();
+    let dial: Vec<&str> = relays.iter().map(|r| r["dial"].as_str().unwrap()).collect();
+    assert_eq!(dial, ["looked_up", "not_dialled", "connected"]);
+    assert_eq!(relays[0]["reach"]["class"], "out_lacking");
+    assert_eq!(relays[2]["reach"]["class"], Value::Null);
+    state.own_channels.say(AtRelays {
+        relays: vec![at(names[0], None)],
+        cannot_go_on: None,
+        word_to_come: false,
+    });
+    let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
+    assert_eq!(seen["word_to_come"], false, "{seen}");
+}

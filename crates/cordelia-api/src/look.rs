@@ -68,7 +68,7 @@ use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
     kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn};
+use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, Waits};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -287,6 +287,46 @@ pub struct AtRelayLook {
     /// of what it sent, reached or not: given where its own carried word
     /// is read and the relay's key is known (decision 2026-10-19, rule 7).
     pub has_what_was_carried: Option<bool>,
+    /// What the node knows of the relay's reach, and its class (decision
+    /// 2026-10-19 §1): what the wait after a change reads, and never works
+    /// out again.
+    pub reach: ReachLook,
+}
+
+/// What the node knows of a relay's reach, as a look shows it (decision
+/// 2026-10-19 §1): each relay's class, put by the node's own function,
+/// and what the lines of the wait after a change say of it. Each time is
+/// by the time of day, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ReachLook {
+    /// The change entry that the rest is about, by its ID in hex, as
+    /// `Look::latest` names one: none before the node's pass has found the
+    /// kept entry. The wait after a change reads nothing else of a relay
+    /// whose reach is about another entry (decision 2026-10-19 §4, rule 8).
+    pub about: Option<String>,
+    /// Its class, where it is in one.
+    pub class: Option<Class>,
+    /// Whether it holds the change entry that the device keeps.
+    pub holds: Holds,
+    /// Whether it is reached.
+    pub reached: bool,
+    /// Since when it is out of reach, where it is.
+    pub out_of_reach_since: Option<i64>,
+    /// Its reference: the latest of the node's start, a sleep, the change
+    /// of the kept entry, and the moment it was last reached.
+    pub reference: i64,
+    /// When it was last reached, where it was since the node started.
+    pub last_reached: Option<i64>,
+    /// What waits there, where it is reached.
+    pub waits: Option<Waits>,
+    /// Since when it has refused what waits there, where it does.
+    pub refusing_waits_since: Option<i64>,
+    /// Its last refusal for room, where it made one: of the change, or of
+    /// a channel of the device's own.
+    pub no_room: Option<NoRoom>,
+    /// Why it lacks the change, by its latest answer that said so (§5,
+    /// S8).
+    pub lacks_for: Option<LacksFor>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -354,6 +394,11 @@ pub struct Look {
     pub short: Option<String>,
     /// What a status says, a sentence each.
     pub says: Vec<String>,
+    /// Whether the node's next whole pass would write that this device
+    /// has sent what it carried, or its carried word, by their own
+    /// conditions (decision 2026-10-19 §4, rule 8): the wait after a
+    /// change reads it, and never works the conditions out itself.
+    pub word_to_come: bool,
 }
 
 impl Look {
@@ -488,6 +533,7 @@ pub fn look(
             cannot_go_on: None,
             short: None,
             says: Vec::new(),
+            word_to_come: at_relays.word_to_come,
         };
         match held(conn)? {
             None => {
@@ -1446,7 +1492,7 @@ pub fn lists_of(statement: &Statement) -> Result<Lists, PersonError> {
 }
 
 /// Where the device stands at each relay, as the node last said it.
-fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
+pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
     at_relays
         .relays
         .iter()
@@ -1475,6 +1521,19 @@ fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             refuses: relay.refuses.clone(),
             key: relay.key.and_then(|key| encode_public_key(&key).ok()),
             has_what_was_carried: None,
+            reach: ReachLook {
+                about: relay.reach.about.map(hex::encode),
+                class: relay.reach.class,
+                holds: relay.reach.holds,
+                reached: relay.reach.reached,
+                out_of_reach_since: relay.reach.out_of_reach_since,
+                reference: relay.reach.reference,
+                last_reached: relay.reach.last_reached,
+                waits: relay.reach.waits,
+                refusing_waits_since: relay.reach.refusing_waits_since,
+                no_room: relay.no_room,
+                lacks_for: relay.reach.lacks_for.clone(),
+            },
         })
         .collect()
 }
@@ -2301,6 +2360,105 @@ mod tests {
                 fingerprint::shown(&s.key(0))
             ))
         );
+    }
+
+    /// The look carries what the node knows of each relay's reach, its
+    /// class among it, and the node's `word_to_come`, as the node gives
+    /// them (decision 2026-10-19 §4, rule 8): the wait after a change reads
+    /// both from it, and works neither out again. It does so whether or
+    /// not the device follows a phrase.
+    #[test]
+    fn the_look_carries_word_to_come_and_each_relays_reach() {
+        use crate::state::{Class, Holds, Reach, Waits};
+        let mut s = Several::new(1);
+        let refused = NoRoom {
+            at: 1_800_000_100,
+            over_allowance: false,
+            of_the_change: true,
+        };
+        let stuck = Reach {
+            key: Some([7; 32]),
+            about: Some([3; 32]),
+            lacks_for: None,
+            holds: Holds::Holds,
+            reached: true,
+            out_of_reach_since: None,
+            reference: 1_800_000_000,
+            last_reached: Some(1_800_000_050),
+            refused_since: None,
+            waits: Some(Waits::Refused),
+            refusing_waits_since: Some(1_800_000_060),
+            answered_at: Some(1_800_000_050),
+            class: Some(Class::Stuck),
+        };
+        let out = Reach {
+            holds: Holds::Lacks,
+            reached: false,
+            out_of_reach_since: Some(1_800_000_300),
+            last_reached: None,
+            waits: None,
+            refusing_waits_since: None,
+            class: Some(Class::OutLacking),
+            lacks_for: Some(crate::state::LacksFor::Room(refused)),
+            ..stuck.clone()
+        };
+        let relay = |name: &str, reach: Reach, no_room| AtRelay {
+            relay: name.to_string(),
+            holds_latest: None,
+            heard_since_woke: true,
+            no_room,
+            another_form: 0,
+            refuses: None,
+            reach,
+            key: None,
+        };
+        let mut at = AtRelays {
+            relays: vec![
+                relay("one.example:1", stuck, None),
+                relay("two.example:1", out, Some(refused)),
+            ],
+            cannot_go_on: None,
+            word_to_come: true,
+        };
+        for phrase in [false, true] {
+            if phrase {
+                s.make_phrase(0);
+            }
+            for to_come in [true, false] {
+                at.word_to_come = to_come;
+                let seen = look(&s[0].conn, &s[0].identity, &at, s.now).unwrap();
+                assert_eq!(seen.word_to_come, to_come);
+                let json = serde_json::to_value(&seen).unwrap();
+                assert_eq!(json["word_to_come"], to_come);
+                assert_eq!(
+                    json["relays"][0]["reach"],
+                    serde_json::json!({
+                        "about": hex::encode([3; 32]), "lacks_for": null,
+                        "class": "stuck", "holds": "holds", "reached": true,
+                        "out_of_reach_since": null, "reference": 1_800_000_000,
+                        "last_reached": 1_800_000_050, "waits": "refused",
+                        "refusing_waits_since": 1_800_000_060, "no_room": null,
+                    })
+                );
+                assert_eq!(
+                    json["relays"][1]["reach"],
+                    serde_json::json!({
+                        "about": hex::encode([3; 32]),
+                        "lacks_for": { "room": { "at": 1_800_000_100, "over_allowance": false,
+                                                 "of_the_change": true } },
+                        "class": "out_lacking", "holds": "lacks", "reached": false,
+                        "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
+                        "last_reached": null, "waits": null, "refusing_waits_since": null,
+                        "no_room": { "at": 1_800_000_100, "over_allowance": false,
+                                     "of_the_change": true },
+                    })
+                );
+                // What the command reads back is what the node gave.
+                let back: ReachLook =
+                    serde_json::from_value(json["relays"][1]["reach"].clone()).unwrap();
+                assert_eq!(back, seen.relays[1].reach);
+            }
+        }
     }
 
     /// What the node says of each relay is said: one that the device has

@@ -1115,19 +1115,27 @@ impl AtTerminal {
     /// was typed there and is still waiting, unread, for whoever reads
     /// the terminal next, as a shell does once a command has ended.
     pub fn ends_and_leaves(mut self) -> (bool, String, String) {
-        let (success, said) = self.has_ended_within(Duration::from_secs(300));
+        let (status, said) = self.has_ended_within(Duration::from_secs(300));
         // The terminal is there for as long as the test holds its end.
-        (success, said, left_typed_at(&self.theirs))
+        (status.success(), said, left_typed_at(&self.theirs))
     }
 
     /// [`Self::ends`], for a command that must end within `long`.
     pub fn ends_within(mut self, long: Duration) -> (bool, String) {
-        self.has_ended_within(long)
+        let (status, said) = self.has_ended_within(long);
+        (status.success(), said)
     }
 
-    /// Wait for the command to end, within `long`: whether it succeeded,
-    /// and everything that its terminal showed.
-    fn has_ended_within(&mut self, long: Duration) -> (bool, String) {
+    /// [`Self::ends_within`], with the command's exit status in place of
+    /// whether it succeeded: `None` where a signal ended it.
+    pub fn ends_with_status_within(mut self, long: Duration) -> (Option<i32>, String) {
+        let (status, said) = self.has_ended_within(long);
+        (status.code(), said)
+    }
+
+    /// Wait for the command to end, within `long`: how it ended, and
+    /// everything that its terminal showed.
+    fn has_ended_within(&mut self, long: Duration) -> (std::process::ExitStatus, String) {
         let deadline = Instant::now() + long;
         let status = loop {
             let heard = self.hears(Duration::from_millis(100));
@@ -1164,7 +1172,7 @@ impl AtTerminal {
                 );
             }
         }
-        (status.success(), std::mem::take(&mut self.said))
+        (status, std::mem::take(&mut self.said))
     }
 
     /// [`Self::ends`], for a command that must succeed: what it said.

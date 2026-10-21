@@ -589,6 +589,7 @@ impl Reach {
     /// What is known of `relay`'s reach now, and its class: what a
     /// status and the wait after a change read.
     pub fn of(&self, relay: &RelayId) -> Reached {
+        let about = lock(&self.inner).kept.flatten();
         self.with(relay, |of, common, now| {
             let reached = of.reached.is_some();
             let holds = of.holds.unwrap_or_default();
@@ -605,9 +606,14 @@ impl Reach {
                     (true, _) => Waits::Moving,
                 }
             });
+            let refusing_waits_since = of
+                .refusing_waits_since
+                .filter(|_| reached && of.waits == Some(true))
+                .map(|since| Moment::back_from(now, since).wall);
             let out = of.out_since.is_some();
             Reached {
                 key: relay.key,
+                about,
                 holds,
                 reached,
                 out_of_reach_since: of.out_since.map(|since| since.wall),
@@ -615,8 +621,10 @@ impl Reach {
                 last_reached: of.last_reached.map(|at| at.wall),
                 refused_since: refused_since.map(|since| since.wall),
                 waits,
+                refusing_waits_since,
                 answered_at: of.answered_at,
                 class: class(holds, reached, out, waits, refused_long),
+                lacks_for: None,
             }
         })
     }

@@ -931,7 +931,8 @@ pub struct AtRelay {
 /// Whether a relay holds the change entry that the device keeps, as far as
 /// the device knows (decision 2026-10-19 §1): by its latest answer about
 /// that entry, kept across starts, or by its mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Holds {
     /// Its latest answer is about the kept entry and says that it holds
     /// it (and, for a relay given no key, the device is connected to it
@@ -947,7 +948,8 @@ pub enum Holds {
 
 /// What of the device's own waits to be sent to a relay that is reached
 /// (decision 2026-10-19 §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Waits {
     /// Nothing.
     Nothing,
@@ -961,7 +963,8 @@ pub enum Waits {
 
 /// The class of a relay in the wait after a change (decision 2026-10-19
 /// §1). A relay in none of them is in a state that time moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Class {
     /// Reached, holds the change, and nothing waits there.
     Ok,
@@ -982,6 +985,11 @@ pub enum Class {
 pub struct Reach {
     /// The key that the configuration gives the relay, where it gives one.
     pub key: Option<[u8; 32]>,
+    /// The change entry that the rest is about, by its ID: the kept entry
+    /// as the node's pass last found it. `None` before a pass has. A wait
+    /// after a change reads nothing of a relay that is about another entry
+    /// than the change it waits for (decision 2026-10-19 §4, rule 8).
+    pub about: Option<[u8; 32]>,
     /// Whether it holds the change entry that the device keeps.
     pub holds: Holds,
     /// Whether it is reached: a connection to it is open, and the latest
@@ -1002,15 +1010,37 @@ pub struct Reach {
     pub refused_since: Option<i64>,
     /// What waits there, where it is reached.
     pub waits: Option<Waits>,
+    /// Since when it has refused, at each offer, what of the device's own
+    /// waits there, where it is reached and something waits: what the
+    /// wait after a change says of a relay that is STUCK.
+    pub refusing_waits_since: Option<i64>,
     /// When it gave its latest answer about the kept entry, where it gave
     /// one.
     pub answered_at: Option<i64>,
     /// Its class, where it is in one.
     pub class: Option<Class>,
+    /// Why it lacks the kept entry, by the latest answer to a show of it in
+    /// which it said so, where it gave one since the node started.
+    pub lacks_for: Option<LacksFor>,
+}
+
+/// Why a relay said that it does not hold the change entry shown it
+/// (decision 2026-10-19 §1): what the wait after a change says of a relay
+/// that refuses the change (§5, S8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LacksFor {
+    /// It had no room for it, or the address was over its allowance of
+    /// new channels there.
+    Room(NoRoom),
+    /// It holds another change entry of the phrase. `why` is why this
+    /// device does not take that one, where it refused it as no change
+    /// entry that it takes.
+    Another { why: Option<String> },
 }
 
 /// A relay's refusal of something that it would have taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoRoom {
     /// When, in seconds, in UTC.
     pub at: i64,
@@ -1498,6 +1528,25 @@ pub struct RelaySnapshot {
     pub last_tried_secs: Option<u64>,
     /// Why the last attempt failed.
     pub error: Option<String>,
+    /// How the node tries it while it is not connected (decision
+    /// 2026-10-19 §5, S9): what the wait after a change says of a relay
+    /// that lacks the change.
+    #[serde(skip)]
+    pub tried: Tried,
+}
+
+/// How the node tries a relay that it is not connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tried {
+    /// It is dialled, or it is connected.
+    #[default]
+    Dialled,
+    /// Its name does not resolve: it is looked up.
+    LookedUp,
+    /// It is set up with a key, and another relay answers at its address:
+    /// it is not dialled while that one is connected (decision 2026-10-17
+    /// §1).
+    NotDialled,
 }
 
 impl AppState {
