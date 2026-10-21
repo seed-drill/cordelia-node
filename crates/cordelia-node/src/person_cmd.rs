@@ -1294,9 +1294,11 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
     use cordelia_api::look::{ReachLook, since, when};
     use cordelia_api::state::Holds;
     let reach: Option<ReachLook> = serde_json::from_value(relay["reach"].clone()).ok();
-    let out = reach.as_ref().filter(|reach| {
-        latest.is_some() && reach.about.as_deref() == latest && reach.out_of_reach_since.is_some()
-    });
+    // What is known of it about the change entry the device keeps.
+    let of_latest = reach
+        .as_ref()
+        .filter(|reach| latest.is_some() && reach.about.as_deref() == latest);
+    let out = of_latest.filter(|reach| reach.out_of_reach_since.is_some());
     let name = text(relay, "relay");
     let woke = woke_at
         .map(|at| format!(" at {}", when(at, now)))
@@ -1321,10 +1323,17 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
         }
         _ => {}
     }
-    match (
-        relay["heard_since_woke"] == true,
-        relay["holds_latest"].as_bool(),
-    ) {
+    // Whether it holds the change, as section 1 says it where the node
+    // knows its reach of the kept entry: a relay given no key that lost its
+    // connection lacks it, whatever its last answer said. Where it does
+    // not, by the relay's last answer, as before.
+    let holds = match of_latest.map(|reach| reach.holds) {
+        Some(Holds::Holds) => Some(true),
+        Some(Holds::Lacks) => Some(false),
+        Some(Holds::Neither) => None,
+        None => relay["holds_latest"].as_bool(),
+    };
+    match (relay["heard_since_woke"] == true, holds) {
         (false, _) if out.is_some() => format!(
             "has not answered since this device started or woke{woke}, and cannot be reached \
              from here. A change made while this device was off may be there, and not have \
@@ -4223,6 +4232,17 @@ mod tests {
             (
                 relay(true, Value::Null, reach("neither", None, None)),
                 "has not said whether it holds the latest change",
+            ),
+            // Its reach of the kept entry, not its last answer: a relay
+            // given no key whose connection closed lacks the change though
+            // it answered that it holds it (decision 2026-10-19 §1).
+            (
+                relay(true, json!(true), reach("lacks", None, None)),
+                "does not hold the latest change yet",
+            ),
+            (
+                relay(true, json!(false), reach("holds", None, None)),
+                "holds the latest change",
             ),
         ];
         for (relay, said) in cases {
