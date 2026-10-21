@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Mutation checks for slice 5 of a relay out of reach: the status line
+"""Mutation checks for slice 5 of a relay out of reach, with the fixes of
+its review and of slice 4's: the status line
 of a relay not known to hold the latest change and of a relay out of
 reach, with what the node counts for it (for how long a relay has lacked
 the change, when the device woke, and when its seven days begin); the
@@ -17,19 +18,25 @@ ENTRIES = 'crates/cordelia-node/src/device_entries.rs'
 INDICATOR = 'crates/cordelia-node/src/indicator.rs'
 MAIN = 'crates/cordelia-node/src/main.rs'
 CMD = 'crates/cordelia-node/src/person_cmd.rs'
-ORIG = {f: open(f).read() for f in (LOOK, REACH, LEAVE, ENTRIES, INDICATOR, MAIN, CMD)}
+WAIT = 'crates/cordelia-node/src/person_cmd/wait.rs'
+RCMD = 'crates/cordelia-node/src/recover_cmd.rs'
+ORIG = {f: open(f).read() for f in (LOOK, REACH, LEAVE, ENTRIES, INDICATOR, MAIN, CMD, WAIT, RCMD)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 API = ("cordelia-api", ["--lib"])
 NODE = ("cordelia-node", ["--lib"])
 BIN = ("cordelia-node", ["--bin", "cordelia"])
 DEVICE_E2E = ("cordelia-node", ["--test", "device_entries_e2e"])
+PERSON_E2E = ("cordelia-node", ["--test", "person_e2e"])
 def look(test): return (API, "look::tests::" + test)
 def reach(test): return (NODE, "device_entries::reach::tests::" + test)
 def indicator(test): return (BIN, "indicator::tests::" + test)
 def main(test): return (BIN, "tests::" + test)
 def cmd(test): return (BIN, "person_cmd::tests::" + test)
 def device(test): return (DEVICE_E2E, test)
+def wait(test): return (BIN, "person_cmd::wait::tests::" + test)
+def rcmd(test): return (BIN, "recover_cmd::tests::" + test)
+def person(test): return (PERSON_E2E, test)
 
 COUNTS = reach("what_the_status_line_counts_of_a_relay_that_lacks_the_change")
 WAKE = device("a_wake_after_no_connection_does_not_restart_the_ambers_five_minutes")
@@ -45,6 +52,14 @@ OUT = indicator("a_relay_out_of_reach_is_amber_last_only_with_folders_and_only_w
 THIRD = main("a_relay_in_the_third_state_is_not_amber")
 FACTS = main("test_what_a_status_goes_by_of_a_persons_devices")
 D_LINES = cmd("each_relay_line_by_its_case")
+STATUSES = cmd("the_statuses")
+REC_STATUSES = rcmd("the_statuses_of_a_recovery")
+NO_LONGER = wait("the_wait_ends_where_the_device_no_longer_stands_in_its_phrase")
+NO_LONGER_E2E = person("the_wait_ends_with_3_where_the_device_no_longer_stands_in_its_phrase")
+NOTHING_WAITS = rcmd("test_nothing_is_said_to_wait_only_where_nothing_does")
+R_WORDS = rcmd("r0_to_r3_word_for_word")
+HANDED = main("what_a_recovery_hands_on_is_read_back_whatever_its_relays_are_called")
+JUDGED = rcmd("a_recovery_says_nothing_of_a_device_whose_carried_word_names_a_relay_it_read")
 
 
 def between(f, start, end):
@@ -193,30 +208,35 @@ MUTATIONS = [
 
     # ── The status line (rule 11) ───────────────────────────────────
     ("I1 the seven days are not kept", INDICATOR,
-     '''            _ if !still_shown => {}''',
-     '''            _ if still_shown && false => {}''',
+     '''        let still_shown = |relay: &&NotKnown| {
+            d.known_since_secs.is_none_or(|secs| within(&secs))
+                || relay.said_secs.as_ref().is_some_and(within)
+        };''',
+     '''        let still_shown = |_: &&NotKnown| true;''',
      [SEVEN]),
     ("I2 the seventh day is not shown", INDICATOR,
-     '''            .is_none_or(|secs| secs <= RELAY_NOT_KNOWN_SHOWN_SECS);''',
-     '''            .is_none_or(|secs| secs < RELAY_NOT_KNOWN_SHOWN_SECS);''',
+     '''        let within = |secs: &u64| *secs <= RELAY_NOT_KNOWN_SHOWN_SECS;''',
+     '''        let within = |secs: &u64| *secs < RELAY_NOT_KNOWN_SHOWN_SECS;''',
      [SEVEN]),
     ("I3 a node that does not say since when is not shown", INDICATOR,
-     '''            .is_none_or(|secs| secs <= RELAY_NOT_KNOWN_SHOWN_SECS);''',
-     '''            .is_some_and(|secs| secs <= RELAY_NOT_KNOWN_SHOWN_SECS);''',
+     '''            d.known_since_secs.is_none_or(|secs| within(&secs))''',
+     '''            d.known_since_secs.is_some_and(|secs| within(&secs))''',
+     [SEVEN]),
+    ("I13 the seven days do not run from a relay's latest answer", INDICATOR,
+     '''                || relay.said_secs.as_ref().is_some_and(within)''',
+     '''                || relay.said_secs.is_some() && false''',
      [SEVEN]),
     ("I4 fourteen days", INDICATOR,
      '''const RELAY_NOT_KNOWN_SHOWN_SECS: u64 = REMOVAL_SHOWN_SECS;''',
      '''const RELAY_NOT_KNOWN_SHOWN_SECS: u64 = REMOVAL_SHOWN_SECS * 2;''',
      [SEVEN]),
     ("I5 no five minutes", INDICATOR,
-     '''        let lacking = d.not_known_to_hold_secs.iter().filter(|secs| long(secs));''',
-     '''        let lacking = d.not_known_to_hold_secs.iter().filter(|_| true);''',
+     '''            .filter(|relay| long(&relay.lacking_secs))''',
+     '''            .filter(|_| true)''',
      [AMBER]),
     ("I6 only with sync on, a folder mapped and a report", INDICATOR,
-     '''        let still_shown = d
-            .known_since_secs''',
-     '''        let still_shown = of_folders
-            && d.known_since_secs''',
+     '''            d.known_since_secs.is_none_or(|secs| within(&secs))''',
+     '''            of_folders && d.known_since_secs.is_none_or(|secs| within(&secs))''',
      [AMBER]),
     ("I7 several are said as one", INDICATOR,
      '''                format!("memory: {n} relays not known to hold the latest change"),''',
@@ -243,10 +263,16 @@ MUTATIONS = [
      ['', OUT_BLOCK + '''    let shown_still = |secs: &u64|'''],
      [OUT]),
     ("I12 its minutes are half minutes", INDICATOR,
-     '''                secs / 60,
-                plural(secs / 60, "minute")''',
-     '''                secs / 30,
-                plural(secs / 30, "minute")''',
+     '''            let minutes = secs.div_ceil(60).max(1);''',
+     '''            let minutes = secs.div_ceil(30).max(1);''',
+     [OUT]),
+    ("I14 a relay out of reach for none", INDICATOR,
+     '''            let minutes = secs.div_ceil(60).max(1);''',
+     '''            let minutes = secs.div_ceil(60);''',
+     [OUT]),
+    ("I15 its minutes are rounded down", INDICATOR,
+     '''            let minutes = secs.div_ceil(60).max(1);''',
+     '''            let minutes = (secs / 60).max(1);''',
      [OUT]),
 
     # ── What the status takes from the look (rule 11) ───────────────
@@ -255,8 +281,8 @@ MUTATIONS = [
      '''            .filter(|relay| relay["reach"]["holds"] != "holds")''',
      [THIRD]),
     ("M2 how long it has been connected, not how long it has lacked the change", MAIN,
-     '''            .filter_map(|relay| relay["reach"]["lacking_secs"].as_u64())''',
-     '''            .filter_map(|relay| relay["connected_secs"].as_u64())''',
+     '''                    lacking_secs: relay["reach"]["lacking_secs"].as_u64()?,''',
+     '''                    lacking_secs: relay["connected_secs"].as_u64()?,''',
      [FACTS]),
     ("M3 a relay out of reach that lacks the change is the warning's", MAIN,
      '''            .filter(|relay| relay["reach"]["class"] == "out_holding")''',
@@ -265,6 +291,10 @@ MUTATIONS = [
     ("M4 every relay must be reached", MAIN,
      '''        one_reached: list("relays").any(|relay| relay["reach"]["reached"] == true),''',
      '''        one_reached: list("relays").all(|relay| relay["reach"]["reached"] == true),''',
+     [FACTS]),
+    ("M6 a relay's latest answer is not read", MAIN,
+     '''                    said_secs: ago(&relay["reach"]["answered_at"]),''',
+     '''                    said_secs: None,''',
      [FACTS]),
     ("M5 the seven days are not read", MAIN,
      '''        known_since_secs: ago(&person["relays_known_since"]),''',
@@ -283,8 +313,16 @@ MUTATIONS = [
      '''        (false, _) if false => format!(''',
      [D_LINES]),
     ("C9 what is known of a relay about the entry before is said of this one", CMD,
-     '''        latest.is_some() && reach.about.as_deref() == latest && reach.out_of_reach_since.is_some()''',
-     '''        reach.out_of_reach_since.is_some()''',
+     '''        .filter(|reach| latest.is_some() && reach.about.as_deref() == latest);''',
+     '''        .filter(|_| true);''',
+     [D_LINES]),
+    ("C10 a relay whose reach lacks the change holds it by its last answer", CMD,
+     '''        Some(Holds::Lacks) => Some(false),''',
+     '''        Some(Holds::Lacks) => relay["holds_latest"].as_bool(),''',
+     [D_LINES]),
+    ("C11 with no reach of the kept entry, nothing is said of its last answer", CMD,
+     '''        None => relay["holds_latest"].as_bool(),''',
+     '''        None => None,''',
      [D_LINES]),
     ("C3 D5 says not when the relay said it", CMD,
      '''                .map(|at| format!(" (as it said at {})", when(at, now)))''',
@@ -315,6 +353,61 @@ MUTATIONS = [
      '''            "has not answered since this device woke{woke}: a change made while it was off \\
              may not have reached it"''',
      [D_LINES]),
+
+    # ── A recovery's lines after its look (#182, lows 1, 3, 6) ───────
+    ("X1 a relay holds the change by a reach of the entry before", RCMD,
+     '''    let holds = |r: &wait::RelayAt| r.holds() && wait::is_about_the_kept_entry(r, seen);''',
+     '''    let holds = |r: &wait::RelayAt| r.holds();''',
+     [NOTHING_WAITS]),
+    ("X2 R2 says to set up a relay that may be one this machine did not reach", RCMD,
+     '''    if keyless.is_empty() {
+        return format!(''',
+     '''    if !keyless.is_empty() || keyless.is_empty() {
+        return format!(''',
+     [R_WORDS]),
+    ("X3 the relays a word names are handed apart from their flag", RCMD,
+     '''                format!("--carried-to={}", to.held),''',
+     '''                "--carried-to".to_string(),
+                to.held.clone(),''',
+     [HANDED, JUDGED]),
+
+    # ── A wait whose device no longer stands in its phrase ───────────
+    ("Y1 a device in no list goes on waiting", WAIT,
+     '''    if !matches!(state, "removed" | "not_listed" | "not_opened" | "no_phrase") {''',
+     '''    if !matches!(state, "removed" | "not_opened" | "no_phrase") {''',
+     [NO_LONGER]),
+    ("Y2 a device in a fork stops waiting", WAIT,
+     '''    if !matches!(state, "removed" | "not_listed" | "not_opened" | "no_phrase") {''',
+     '''    if !matches!(state, "removed" | "not_listed" | "not_opened" | "no_phrase" | "fork") {''',
+     [NO_LONGER]),
+    ("Y3 the line does not say why", WAIT,
+     '''    let why = seen["cannot_go_on"].as_str().unwrap_or(state);''',
+     '''    let why = state;''',
+     [NO_LONGER, REC_STATUSES]),
+    ("Y4 the wait after a change goes on", CMD,
+     '''        if let Some(line) = wait::no_longer_stands(&seen) {
+            println!("{line}");
+            return Ok(Waited::NoLongerStands);
+        }''',
+     '''''',
+     [NO_LONGER_E2E]),
+    ("Y5 a recovery's wait goes on", RCMD,
+     '''        if let Some(line) = wait::no_longer_stands(&seen) {
+            say(line);
+            return Ok(Recovered::NoLongerStands);
+        }''',
+     '''''',
+     [REC_STATUSES]),
+    ("Y6 the wait after a change ends with 0", CMD,
+     '''        Ok(Waited::Another | Waited::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,''',
+     '''        Ok(Waited::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Waited::NoLongerStands) => 0,''',
+     [STATUSES, NO_LONGER_E2E]),
+    ("Y7 a recovery's wait ends with 0", RCMD,
+     '''        Ok(Recovered::Another | Recovered::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,''',
+     '''        Ok(Recovered::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Recovered::NoLongerStands) => 0,''',
+     [REC_STATUSES]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.

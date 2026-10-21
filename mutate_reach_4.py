@@ -165,8 +165,8 @@ MUTATIONS = [
      '''        Ok(Recovered::Ended(_)) => 0,''',
      [STATUSES, PENDING]),
     ("T3 another change, or an error, gives 1", RCMD,
-     '''        Ok(Recovered::Another) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,''',
-     '''        Ok(Recovered::Another) | Err(_) => 1,''',
+     '''        Ok(Recovered::Another | Recovered::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,''',
+     '''        Ok(Recovered::Another | Recovered::NoLongerStands) | Err(_) => 1,''',
      [STATUSES, STATUS_E2E]),
     ("T4 a look that cannot be waited for gives 0", RCMD,
      '''             this machine has still to send. Keep this machine on until nothing is left to send."
@@ -290,9 +290,9 @@ MUTATIONS = [
      [JUDGED]),
     ("J9 R3 is not handed on to the process that waits", RCMD,
      '''        if let Some(to) = &self.carried_to {
-            args.extend([''',
+            // Joined to its flag''',
      '''        if let Some(to) = self.carried_to.as_ref().filter(|_| false) {
-            args.extend([''',
+            // Joined to its flag''',
      [JUDGED, HANDED]),
     ("J10 the count of relays handed is not read", RCMD,
      '''            relays: carried_relays,''',
