@@ -1301,9 +1301,26 @@ mod tests {
             &[],
         );
         let applied_before = s[1].word_of(&key);
+        let conn = &s[1].conn;
+        let additions = held_rows::additions(conn).unwrap();
+        let counting = who_counts(conn).unwrap();
+        let other = identity_of(7).public_key();
+        let counted = |counting: &Counting| {
+            let keys = [key, s[1].key(), other];
+            (counting.adders(), keys.map(|key| counting.counts(&key)))
+        };
+        // `record_in` reads no record in it, and counts no key by it.
+        let personal = s[1].personal();
+        assert_eq!(
+            record_in(conn, &entry, &personal, false, s.now).unwrap(),
+            (None, 0)
+        );
         assert_eq!(given(&s, 1, &entry), STORED);
         assert!(s[1].stored().contains(&entry));
         assert_eq!(s[1].word_of(&key), applied_before);
+        // No addition is kept by it, and the counting is as it was.
+        assert_eq!(held_rows::additions(conn).unwrap(), additions);
+        assert_eq!(counted(&who_counts(conn).unwrap()), counted(&counting));
         let applied = applied_before.map(|value| match value {
             Value::Text(word) => crate::person::read_applied_word(&word),
             _ => None,
