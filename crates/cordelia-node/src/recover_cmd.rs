@@ -2548,7 +2548,7 @@ fn waits_for_the_change(
             return Ok(Recovered::Another);
         }
         let at = chrono::Utc::now().timestamp();
-        let (relays, end) = wait::recovery_end_of_look(&seen);
+        let (relays, end) = wait::recovery_end_of_look(&seen)?;
         if first && end != Some(RecoveryEnd::Recovered) {
             say(format!("\n{}", wait::recovery_first_line()));
         }
@@ -2721,7 +2721,8 @@ fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
     // Whether a relay lacks the change, as the node knows it (decision
     // 2026-10-19 §1), or is not connected: nothing is said to be waiting
     // nowhere then.
-    let keep_on = !not_reached.is_empty() || !wait::relays_of(seen).iter().all(|r| r.holds());
+    let lacks = |relays: Vec<wait::RelayAt>| !relays.iter().all(|r| r.holds());
+    let keep_on = !not_reached.is_empty() || wait::relays_of(seen).map_or(true, lacks);
     match (to_go, channels_wait) {
         (0, false) if keep_on => {}
         (0, false) if to_come == 0 && connected > 0 => lines.push(

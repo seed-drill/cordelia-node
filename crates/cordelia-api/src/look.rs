@@ -68,7 +68,7 @@ use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
     kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn, Class, Holds, NoRoom, Waits};
+use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, Waits};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -299,6 +299,11 @@ pub struct AtRelayLook {
 /// by the time of day, in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ReachLook {
+    /// The change entry that the rest is about, by its ID in hex, as
+    /// `Look::latest` names one: none before the node's pass has found the
+    /// kept entry. The wait after a change reads nothing else of a relay
+    /// whose reach is about another entry (decision 2026-10-19 §4, rule 8).
+    pub about: Option<String>,
     /// Its class, where it is in one.
     pub class: Option<Class>,
     /// Whether it holds the change entry that the device keeps.
@@ -319,6 +324,9 @@ pub struct ReachLook {
     /// Its last refusal for room, where it made one: of the change, or of
     /// a channel of the device's own.
     pub no_room: Option<NoRoom>,
+    /// Why it lacks the change, by its latest answer that said so (§5,
+    /// S8).
+    pub lacks_for: Option<LacksFor>,
 }
 
 /// Everything `cordelia devices` and `cordelia status` say of a device and
@@ -1514,6 +1522,7 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
             key: relay.key.and_then(|key| encode_public_key(&key).ok()),
             has_what_was_carried: None,
             reach: ReachLook {
+                about: relay.reach.about.map(hex::encode),
                 class: relay.reach.class,
                 holds: relay.reach.holds,
                 reached: relay.reach.reached,
@@ -1523,6 +1532,7 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                 waits: relay.reach.waits,
                 refusing_waits_since: relay.reach.refusing_waits_since,
                 no_room: relay.no_room,
+                lacks_for: relay.reach.lacks_for.clone(),
             },
         })
         .collect()
@@ -2368,6 +2378,8 @@ mod tests {
         };
         let stuck = Reach {
             key: Some([7; 32]),
+            about: Some([3; 32]),
+            lacks_for: None,
             holds: Holds::Holds,
             reached: true,
             out_of_reach_since: None,
@@ -2387,6 +2399,7 @@ mod tests {
             waits: None,
             refusing_waits_since: None,
             class: Some(Class::OutLacking),
+            lacks_for: Some(crate::state::LacksFor::Room(refused)),
             ..stuck.clone()
         };
         let relay = |name: &str, reach: Reach, no_room| AtRelay {
@@ -2420,6 +2433,7 @@ mod tests {
                 assert_eq!(
                     json["relays"][0]["reach"],
                     serde_json::json!({
+                        "about": hex::encode([3; 32]), "lacks_for": null,
                         "class": "stuck", "holds": "holds", "reached": true,
                         "out_of_reach_since": null, "reference": 1_800_000_000,
                         "last_reached": 1_800_000_050, "waits": "refused",
@@ -2429,6 +2443,9 @@ mod tests {
                 assert_eq!(
                     json["relays"][1]["reach"],
                     serde_json::json!({
+                        "about": hex::encode([3; 32]),
+                        "lacks_for": { "room": { "at": 1_800_000_100, "over_allowance": false,
+                                                 "of_the_change": true } },
                         "class": "out_lacking", "holds": "lacks", "reached": false,
                         "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
                         "last_reached": null, "waits": null, "refusing_waits_since": null,

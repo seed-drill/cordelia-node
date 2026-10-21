@@ -3785,6 +3785,17 @@ pub(crate) fn refuse_another_version(config_path: &str) -> anyhow::Result<()> {
     refuse_by_version(&node_status(config_path, VERSION_ASKED_FOR))
 }
 
+/// Why the running node is of another version than this command, where it
+/// is: what a command that has already changed something says, and not
+/// that nothing was done. An error where the node cannot be asked.
+pub(crate) fn node_of_another_version(config_path: &str) -> anyhow::Result<Option<String>> {
+    let node = node_status(config_path, VERSION_ASKED_FOR)?;
+    Ok(version_note(
+        node["version"].as_str(),
+        env!("CARGO_PKG_VERSION"),
+    ))
+}
+
 /// [`refuse_another_version`], given what the node answered when it was
 /// asked its status.
 fn refuse_by_version(status: &anyhow::Result<serde_json::Value>) -> anyhow::Result<()> {

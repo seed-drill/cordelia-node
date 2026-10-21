@@ -16,7 +16,7 @@
 //!   one that time moves (decision 2026-10-19 §1).
 
 use cordelia_api::look::{ReachLook, joined};
-use cordelia_api::state::{Class, Holds};
+use cordelia_api::state::{Class, Holds, LacksFor};
 use cordelia_core::protocol::{BACKOFF_BASE_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
 use serde_json::Value;
 
@@ -41,13 +41,10 @@ pub(crate) enum Dial {
 pub(crate) struct RelayAt {
     /// The name that the configuration gives it.
     pub name: String,
-    /// What the node knows of its reach. `None` where the look gives
-    /// nothing: in no class, and lacking the change.
+    /// What the node knows of its reach. A look gives it of every relay
+    /// ([`relays_of`]); `None` only in a test.
     pub reach: Option<ReachLook>,
     pub dial: Dial,
-    /// Why this device refuses the change that the relay holds, where it
-    /// does.
-    pub refuses: Option<String>,
     /// Whether nothing that this device carried waits there, where the
     /// look says.
     pub has_what_was_carried: Option<bool>,
@@ -82,19 +79,29 @@ impl RelayAt {
 }
 
 /// The relays that a look shows, in the order of the configuration.
-pub(crate) fn relays_of(seen: &Value) -> Vec<RelayAt> {
+///
+/// **A relay whose reach cannot be read is an error**, and so the end of
+/// the wait (decision 2026-10-19 §4, rule 8): it is in no class, so no end
+/// would ever hold. That is a look from a node of another version, or one
+/// that says what this command does not know.
+pub(crate) fn relays_of(seen: &Value) -> anyhow::Result<Vec<RelayAt>> {
     list(seen, "relays")
-        .map(|relay| RelayAt {
-            name: text(relay, "relay").to_string(),
-            reach: serde_json::from_value(relay["reach"].clone()).ok(),
-            dial: match relay["dial"].as_str() {
-                Some("connected") => Dial::Connected,
-                Some("looked_up") => Dial::LookedUp,
-                Some("not_dialled") => Dial::NotDialled,
-                _ => Dial::Dialled,
-            },
-            refuses: relay["refuses"].as_str().map(str::to_string),
-            has_what_was_carried: relay["has_what_was_carried"].as_bool(),
+        .map(|relay| {
+            let name = text(relay, "relay").to_string();
+            let reach = serde_json::from_value(relay["reach"].clone()).map_err(|e| {
+                anyhow::anyhow!("the node says of {name} what this command cannot read ({e})")
+            })?;
+            Ok(RelayAt {
+                name,
+                reach: Some(reach),
+                dial: match relay["dial"].as_str() {
+                    Some("connected") => Dial::Connected,
+                    Some("looked_up") => Dial::LookedUp,
+                    Some("not_dialled") => Dial::NotDialled,
+                    _ => Dial::Dialled,
+                },
+                has_what_was_carried: relay["has_what_was_carried"].as_bool(),
+            })
         })
         .collect()
 }
@@ -183,8 +190,12 @@ pub(crate) fn ends_warned(relays: &[Classed], word_to_come: bool) -> bool {
 /// change, or none is OK and the node will not write over the device's own
 /// word. Nothing is asked of the word where a relay lacks the change:
 /// safety does not need it, and the word may wait on a whole pass.
+///
+/// With no relay it does not hold: the node has not yet said where it
+/// stands at its relays (a look before its first pass), and a node always
+/// has one to dial.
 pub(crate) fn ends_not_done(relays: &[Classed], word_to_come: bool) -> bool {
-    let every_classed = relays.iter().all(|(class, _)| class.is_some());
+    let every_classed = !relays.is_empty() && relays.iter().all(|(class, _)| class.is_some());
     let one_lacks = relays.iter().any(|(_, holds)| !holds);
     let none_ok = !relays.iter().any(is(Class::Ok));
     every_classed && (one_lacks || (none_ok && !word_to_come))
@@ -207,23 +218,53 @@ pub(crate) fn end_of(relays: &[Classed], word: OwnWord, word_to_come: bool) -> O
     }
 }
 
+/// Whether what the look says of `relay`'s reach is about the change entry
+/// that the device keeps, as the look names it (`latest`): the node's last
+/// pass found that entry kept.
+pub(crate) fn is_about_the_kept_entry(relay: &RelayAt, seen: &Value) -> bool {
+    let kept = seen["latest"].as_str();
+    kept.is_some()
+        && relay
+            .reach
+            .as_ref()
+            .and_then(|reach| reach.about.as_deref())
+            == kept
+}
+
 /// What a look after the change numbered `number` says of its end: its
 /// relays, the device's own word, and the end that holds, where one does.
 /// Each relay's class and the node's `word_to_come` are read from the
 /// look, as the node gives them.
+///
+/// **No end holds while what is known of a relay is about another entry
+/// than the change** (decision 2026-10-19 §4, rule 8): the look reads the
+/// change from the database, and the classes from the node's last pass,
+/// which may have been before the change was made. Each relay's reach
+/// names the entry it is about, and that must be the kept entry that the
+/// look names. A look that does not say whether a word is to come, or
+/// says of a relay what cannot be read, is an error.
 pub(crate) fn end_of_look(
     seen: &Value,
     number: u64,
     own: &[u8; 32],
-) -> (Vec<RelayAt>, OwnWord, Option<End>) {
-    let relays = relays_of(seen);
+) -> anyhow::Result<(Vec<RelayAt>, OwnWord, Option<End>)> {
+    let relays = relays_of(seen)?;
     let word = own_word(seen, number, own);
+    let Some(word_to_come) = seen["word_to_come"].as_bool() else {
+        anyhow::bail!("the node does not say whether its next pass writes a word");
+    };
+    if !relays
+        .iter()
+        .all(|relay| is_about_the_kept_entry(relay, seen))
+    {
+        return Ok((relays, word, None));
+    }
     let classes: Vec<Classed> = relays
         .iter()
         .map(|relay| (relay.class(), relay.holds()))
         .collect();
-    let end = end_of(&classes, word, seen["word_to_come"] == true);
-    (relays, word, end)
+    let end = end_of(&classes, word, word_to_come);
+    Ok((relays, word, end))
 }
 
 // ── A recovery's wait ───────────────────────────────────────────────
@@ -284,14 +325,16 @@ pub(crate) fn recovery_end_of(relays: &[Classed]) -> Option<RecoveryEnd> {
 /// What a look after a recovery says of its end: its relays, and the end
 /// that holds, where one does. Each relay's class is read from the look,
 /// as the node gives it.
-pub(crate) fn recovery_end_of_look(seen: &Value) -> (Vec<RelayAt>, Option<RecoveryEnd>) {
-    let relays = relays_of(seen);
+pub(crate) fn recovery_end_of_look(
+    seen: &Value,
+) -> anyhow::Result<(Vec<RelayAt>, Option<RecoveryEnd>)> {
+    let relays = relays_of(seen)?;
     let classes: Vec<Classed> = relays
         .iter()
         .map(|relay| (relay.class(), relay.holds()))
         .collect();
     let end = recovery_end_of(&classes);
-    (relays, end)
+    Ok((relays, end))
 }
 
 /// R0: what a recovery says where a relay does not hold the change when
@@ -322,13 +365,14 @@ pub(crate) fn recovery_end_lines(end: RecoveryEnd, relays: &[RelayAt], now: i64)
 // ── The words ───────────────────────────────────────────────────────
 
 /// A moment that the node noted by the wall clock, as a person reads it
-/// (decision 2026-10-19 §1, `<when>`): the hour and the minute, in UTC,
-/// with the date before it where it is not today, `now`.
+/// (decision 2026-10-19 §1, `<when>`): as `look.rs` writes a time of day,
+/// the hour and the minute in UTC, and then the date where it is not
+/// today, `now`.
 pub(crate) fn when(at: i64, now: i64) -> String {
     let day = |at: i64| chrono::DateTime::from_timestamp(at, 0).map(|at| at.date_naive());
     match chrono::DateTime::from_timestamp(at, 0) {
         Some(moment) if day(at) == day(now) => moment.format("%H:%M UTC").to_string(),
-        Some(moment) => moment.format("%Y-%m-%d %H:%M UTC").to_string(),
+        Some(moment) => moment.format("%H:%M UTC on %Y-%m-%d").to_string(),
         None => format!("{at}"),
     }
 }
@@ -501,15 +545,19 @@ fn warned_lines(relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
     lines
 }
 
-/// S8 of a relay that is reached and refuses the change.
+/// S8 of a relay that is reached and refuses the change, by its latest
+/// answer that said it lacks it: no room for it, or another change. A
+/// relay is REFUSING only once it has been reached and lacked the change
+/// for five minutes, by answers given since the node started, so the node
+/// has noted why. Were it not noted, the line would say only what the
+/// class says: that the relay has not taken the change.
 fn refusing_line(relay: &RelayAt, now: i64) -> String {
-    let no_room = relay
+    let lacks_for = relay
         .reach
         .as_ref()
-        .and_then(|reach| reach.no_room)
-        .filter(|refused| refused.of_the_change);
-    match (&relay.refuses, no_room) {
-        (None, Some(refused)) => format!(
+        .and_then(|reach| reach.lacks_for.clone());
+    match lacks_for {
+        Some(LacksFor::Room(refused)) => format!(
             "  {} is reached, and has not taken the change: it had no room for it at {} ({}).",
             relay.name,
             when(refused.at, now),
@@ -518,13 +566,14 @@ fn refusing_line(relay: &RelayAt, now: i64) -> String {
                 false => "it is full",
             }
         ),
-        (why, _) => format!(
+        Some(LacksFor::Another { why }) => format!(
             "  {} is reached, and holds a change that this device does not take ({}). It does \
              not take this one in its place.",
             relay.name,
             why.as_deref()
-                .unwrap_or("it is not the change that this device keeps")
+                .unwrap_or("it is another change than the one this device keeps")
         ),
+        None => format!("  {} is reached, and has not taken the change.", relay.name),
     }
 }
 
@@ -554,8 +603,9 @@ fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<Str
     }
     let lacking: Vec<&RelayAt> = relays.iter().filter(|relay| !relay.holds()).collect();
     let reached = relays.iter().any(RelayAt::reached);
-    if reached {
-        lines.push(why_not_done(relays));
+    let why = why_not_done(relays);
+    if reached && !why.is_empty() {
+        lines.push(why);
     }
     let ends = format!(
         "This command ends here, with status {NOT_AT_EVERY_RELAY_STATUS}. It does not say that \
@@ -707,6 +757,8 @@ pub(crate) mod tests {
 
     /// The change entry that the device keeps: the change just made.
     const KEPT: [u8; 32] = [1; 32];
+    /// The change entry that the device kept before it.
+    const BEFORE: [u8; 32] = [2; 32];
     /// The key that a relay answers with.
     const BY: [u8; 32] = [7; 32];
 
@@ -800,9 +852,14 @@ pub(crate) mod tests {
 
     /// Whether the node's next whole pass would write `sent` or the
     /// carried word, by their conditions over the classes (decision
-    /// 2026-10-19, rules 1 and 4), as appendix A states them: the node's
-    /// `word_to_come`, which `at_relays::word_to_come` works out from its
-    /// store.
+    /// 2026-10-19, rules 1 and 4), as appendix A states them. It is the
+    /// model's, not the node's: the node's `at_relays::word_to_come` works
+    /// the same conditions out from its store, which no enumeration of
+    /// millions of states can build, and its own tests hold it to them
+    /// (`word_to_come_is_what_the_next_pass_would_write`). Over the node's
+    /// own word, the looks of
+    /// [`the_wait_never_says_may_be_closed_or_ends_with_0_while_a_relay_lacks_the_change`]
+    /// take both values of it.
     fn word_to_come(relays: &[OneRelay], word: OwnWord, pending: bool) -> bool {
         let every_ok = relays.iter().all(|r| r.class == Some(Class::Ok));
         let can_sent = !pending && word != OwnWord::Sent && every_ok;
@@ -960,7 +1017,13 @@ pub(crate) mod tests {
             ),
             None
         );
-        assert_eq!(end_of(&[], OwnWord::Sent, false), Some(End::NotDone));
+        // With no relay listed, nothing ends: the node has not yet said
+        // where it stands at its relays.
+        for word in [OwnWord::None, OwnWord::Carried, OwnWord::Sent] {
+            for to_come in [false, true] {
+                assert_eq!(end_of(&[], word, to_come), None);
+            }
+        }
     }
 
     /// Each case that the table of rule 8 names reaches its end, with its
@@ -1292,7 +1355,16 @@ pub(crate) mod tests {
                     }),
                     another_form: 0,
                     refuses: None,
-                    reach: reach.clone(),
+                    reach: Reached {
+                        lacks_for: (*scenario == Scenario::Refusing).then_some(LacksFor::Room(
+                            NoRoom {
+                                at: 0,
+                                over_allowance: false,
+                                of_the_change: true,
+                            },
+                        )),
+                        ..reach.clone()
+                    },
                     key: reach.key,
                 })
                 .collect(),
@@ -1306,6 +1378,7 @@ pub(crate) mod tests {
         }
         json!({
             "change": 3,
+            "latest": hex::encode(KEPT),
             "relays": relays,
             "word_to_come": to_come,
             "devices": [{
@@ -1318,6 +1391,15 @@ pub(crate) mod tests {
                 },
             }],
         })
+    }
+
+    /// [`end_of_look`], of a look that can be read.
+    fn end_of_look_ok(
+        seen: &Value,
+        number: u64,
+        own: &[u8; 32],
+    ) -> (Vec<RelayAt>, OwnWord, Option<End>) {
+        end_of_look(seen, number, own).unwrap()
     }
 
     /// The wait never says that the machine may be closed, and never ends
@@ -1358,7 +1440,7 @@ pub(crate) mod tests {
             for word in [OwnWord::None, OwnWord::Carried, OwnWord::Sent] {
                 for to_come in [false, true] {
                     let seen = look_at(relays, word, to_come);
-                    let (looked, read, end) = end_of_look(&seen, 3, &own);
+                    let (looked, read, end) = end_of_look(&seen, 3, &own).unwrap();
                     assert_eq!(read, word);
                     let Some(end) = end else { continue };
                     ends[match end {
@@ -1401,9 +1483,9 @@ pub(crate) mod tests {
             (Scenario::OutHolding, reached(Scenario::OutHolding)),
         ];
         for word in [OwnWord::None, OwnWord::Carried, OwnWord::Sent] {
-            let (_, _, end) = end_of_look(&look_at(&relays, word, false), 3, &own);
+            let (_, _, end) = end_of_look_ok(&look_at(&relays, word, false), 3, &own);
             assert_eq!(end, Some(End::Warned), "{word:?}");
-            let (_, _, end) = end_of_look(&look_at(&relays, word, true), 3, &own);
+            let (_, _, end) = end_of_look_ok(&look_at(&relays, word, true), 3, &own);
             assert_eq!(end, None, "{word:?}");
         }
         // Every relay OK: end 1 waits for `sent`, which is to come.
@@ -1411,14 +1493,14 @@ pub(crate) mod tests {
             (Scenario::Ok, reached(Scenario::Ok)),
             (Scenario::Ok, reached(Scenario::Ok)),
         ];
-        let (_, _, end) = end_of_look(&look_at(&ok, OwnWord::Carried, true), 3, &own);
+        let (_, _, end) = end_of_look_ok(&look_at(&ok, OwnWord::Carried, true), 3, &own);
         assert_eq!(end, None);
-        let (_, _, end) = end_of_look(&look_at(&ok, OwnWord::Sent, false), 3, &own);
+        let (_, _, end) = end_of_look_ok(&look_at(&ok, OwnWord::Sent, false), 3, &own);
         assert_eq!(end, Some(End::Done));
         // A relay in the third state is not taken to hold the change.
         let mut seen = look_at(&relays, OwnWord::Sent, false);
         seen["relays"][1]["reach"]["holds"] = "neither".into();
-        let read = relays_of(&seen);
+        let read = relays_of(&seen).unwrap();
         assert!(read[0].holds() && !read[1].holds());
         // How the node tries each relay is read from the look.
         for (said, dial) in [
@@ -1428,18 +1510,100 @@ pub(crate) mod tests {
             ("not_dialled", Dial::NotDialled),
         ] {
             seen["relays"][0]["dial"] = said.into();
-            assert_eq!(relays_of(&seen)[0].dial, dial);
+            assert_eq!(relays_of(&seen).unwrap()[0].dial, dial);
         }
-        // A look that does not say it is read as no word to come.
-        let mut seen = look_at(&relays, OwnWord::Carried, true);
-        seen.as_object_mut().unwrap().remove("word_to_come");
-        assert_eq!(end_of_look(&seen, 3, &own).2, Some(End::Warned));
+        // The own word is this change's: a word under the change before
+        // is no word.
+        let mut seen = look_at(&ok, OwnWord::Sent, false);
+        seen["devices"][0]["applied"] = 2.into();
+        assert_eq!(end_of_look_ok(&seen, 3, &own).1, OwnWord::None);
+        assert_eq!(end_of_look_ok(&seen, 3, &own).2, Some(End::Warned));
         // Where no relay is OK and none lacks the change, the same.
         let stuck = [(Scenario::Stuck, reached(Scenario::Stuck))];
-        let (_, _, end) = end_of_look(&look_at(&stuck, OwnWord::None, true), 3, &own);
+        let (_, _, end) = end_of_look_ok(&look_at(&stuck, OwnWord::None, true), 3, &own);
         assert_eq!(end, None);
-        let (_, _, end) = end_of_look(&look_at(&stuck, OwnWord::None, false), 3, &own);
+        let (_, _, end) = end_of_look_ok(&look_at(&stuck, OwnWord::None, false), 3, &own);
         assert_eq!(end, Some(End::NotDone));
+    }
+
+    /// No end holds on what the node knows of its relays from before the
+    /// change (decision 2026-10-19 §4, rule 8): a look whose relays' reach
+    /// is about another entry than the kept entry it names, or that names
+    /// none, gives no end, so no status 0 and no "may be closed", whatever
+    /// the classes say. Once every relay's reach is about the kept entry,
+    /// the end holds.
+    #[test]
+    fn a_look_whose_classes_are_about_the_entry_before_ends_nothing() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let ok = (Scenario::Ok, reached(Scenario::Ok));
+        let out = (Scenario::OutHolding, reached(Scenario::OutHolding));
+        let lacking = (Scenario::OutLacking, reached(Scenario::OutLacking));
+        for (relays, word, end) in [
+            (vec![ok.clone(), ok.clone()], OwnWord::Sent, End::Done),
+            (vec![ok.clone(), out.clone()], OwnWord::Carried, End::Warned),
+            (
+                vec![ok.clone(), lacking.clone()],
+                OwnWord::None,
+                End::NotDone,
+            ),
+        ] {
+            let seen = look_at(&relays, word, false);
+            assert_eq!(end_of_look_ok(&seen, 3, &own).2, Some(end));
+            // The kept entry is the change; the classes are of the one
+            // before it.
+            let mut before = seen.clone();
+            before["latest"] = hex::encode(BEFORE).into();
+            assert_eq!(end_of_look_ok(&before, 3, &own).2, None, "{end:?}");
+            // One relay's reach is of the entry before.
+            let mut one = seen.clone();
+            one["relays"][1]["reach"]["about"] = hex::encode(BEFORE).into();
+            assert_eq!(end_of_look_ok(&one, 3, &own).2, None, "{end:?}");
+            // The node has not found the kept entry yet; the look names
+            // none.
+            let mut none = seen.clone();
+            none["relays"][0]["reach"]["about"] = Value::Null;
+            assert_eq!(end_of_look_ok(&none, 3, &own).2, None, "{end:?}");
+            let mut unnamed = seen.clone();
+            unnamed.as_object_mut().unwrap().remove("latest");
+            assert_eq!(end_of_look_ok(&unnamed, 3, &own).2, None, "{end:?}");
+            // Nor where neither the look nor any relay names one.
+            for relay in unnamed["relays"].as_array_mut().unwrap() {
+                relay["reach"]["about"] = Value::Null;
+            }
+            assert_eq!(end_of_look_ok(&unnamed, 3, &own).2, None, "{end:?}");
+        }
+    }
+
+    /// A look that cannot be read ends the wait as an error (decision
+    /// 2026-10-19 §4, rule 8; status 3): a relay with no reach, or with
+    /// one that says what this command does not know, would be in no class
+    /// for ever; and a look that does not say whether a word is to come.
+    #[test]
+    fn a_look_that_cannot_be_read_ends_the_wait_as_an_error() {
+        let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let relays = [
+            (Scenario::Ok, reached(Scenario::Ok)),
+            (Scenario::OutHolding, reached(Scenario::OutHolding)),
+        ];
+        let seen = look_at(&relays, OwnWord::Carried, false);
+        assert!(end_of_look(&seen, 3, &own).is_ok());
+        let mut none = seen.clone();
+        none["relays"][1].as_object_mut().unwrap().remove("reach");
+        let error = end_of_look(&none, 3, &own).unwrap_err().to_string();
+        assert!(
+            error.contains("the node says of relay-1.example:9474 what this command cannot read"),
+            "{error}"
+        );
+        let mut unknown = seen.clone();
+        unknown["relays"][0]["reach"]["class"] = "lost".into();
+        assert!(end_of_look(&unknown, 3, &own).is_err());
+        let mut unsaid = seen.clone();
+        unsaid.as_object_mut().unwrap().remove("word_to_come");
+        let error = end_of_look(&unsaid, 3, &own).unwrap_err().to_string();
+        assert!(
+            error.contains("whether its next pass writes a word"),
+            "{error}"
+        );
     }
 
     // ── The words ───────────────────────────────────────────────────
@@ -1457,6 +1621,8 @@ pub(crate) mod tests {
         RelayAt {
             name: name.into(),
             reach: Some(ReachLook {
+                about: Some(hex::encode(KEPT)),
+                lacks_for: None,
                 class,
                 holds: if holds { Holds::Holds } else { Holds::Lacks },
                 reached,
@@ -1469,7 +1635,6 @@ pub(crate) mod tests {
                 no_room: None,
             }),
             dial,
-            refuses: None,
             has_what_was_carried: None,
         }
     }
@@ -1493,7 +1658,7 @@ pub(crate) mod tests {
 
         // `<when>`, today and not; `<since>`, both forms.
         assert_eq!(when(now - 600, now), "11:50 UTC");
-        assert_eq!(when(now - 13 * 3600, now), "2026-10-19 23:00 UTC");
+        assert_eq!(when(now - 13 * 3600, now), "23:00 UTC on 2026-10-19");
         let a = relay_at(
             "a.example:9474",
             Some(Class::OutLacking),
@@ -1609,27 +1774,26 @@ pub(crate) mod tests {
             false,
             Dial::Connected,
         );
-        full.reach.as_mut().unwrap().no_room = Some(NoRoom {
-            at: now - 900,
-            over_allowance: false,
-            of_the_change: true,
-        });
+        let room = |over_allowance| {
+            Some(LacksFor::Room(NoRoom {
+                at: now - 900,
+                over_allowance,
+                of_the_change: true,
+            }))
+        };
+        full.reach.as_mut().unwrap().lacks_for = room(false);
         let mut over = full.clone();
         over.name = "e.example:9474".into();
-        over.reach
-            .as_mut()
-            .unwrap()
-            .no_room
-            .as_mut()
-            .unwrap()
-            .over_allowance = true;
+        over.reach.as_mut().unwrap().lacks_for = room(true);
         let mut another = relay_at(
             "f.example:9474",
             Some(Class::Refusing),
             false,
             Dial::Connected,
         );
-        another.refuses = Some("another key than the phrase's wrote it".into());
+        another.reach.as_mut().unwrap().lacks_for = Some(LacksFor::Another {
+            why: Some("another key than the phrase's wrote it".into()),
+        });
         let unresolved = relay_at(
             "g.example:9474",
             Some(Class::OutLacking),
@@ -1699,6 +1863,31 @@ pub(crate) mod tests {
                  i.example:9474. This command ends here, with status 3. It does not say that \
                  you may close this machine. `cordelia devices`, here or on a device of yours \
                  that reaches them, says when they hold the latest change.",
+            ]
+        );
+        // A relay that holds another change, with no reason known, and one
+        // of which no reason was noted.
+        let mut other = relay_at(
+            "m.example:9474",
+            Some(Class::Refusing),
+            false,
+            Dial::Connected,
+        );
+        other.reach.as_mut().unwrap().lacks_for = Some(LacksFor::Another { why: None });
+        let unnoted = relay_at(
+            "n.example:9474",
+            Some(Class::Refusing),
+            false,
+            Dial::Connected,
+        );
+        let lines = end_lines(End::NotDone, &[other, unnoted], OwnWord::None, now);
+        assert_eq!(
+            lines[..2],
+            [
+                "  m.example:9474 is reached, and holds a change that this device does not take \
+                 (it is another change than the one this device keeps). It does not take this \
+                 one in its place.",
+                "  n.example:9474 is reached, and has not taken the change.",
             ]
         );
         // One relay of each kind: the singular.
@@ -1791,8 +1980,7 @@ pub(crate) mod tests {
              devices` says when what it carried is sent."
         );
         // S9 says nothing of a relay that lacks nothing.
-        assert_eq!(lines.len(), 4, "{lines:?}");
-        assert_eq!(lines[2], "");
+        assert_eq!(lines.len(), 3, "{lines:?}");
 
         // S11, with and without its second part.
         let lines = end_lines(
