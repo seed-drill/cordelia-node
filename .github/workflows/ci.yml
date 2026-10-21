@@ -74,8 +74,8 @@ jobs:
   # made longer, and is run here, on every pull request, beside it. They
   # are the ignored tests of cordelia-node's test files, and only those:
   # the other crates' ignored tests are timed for a release build, or are
-  # no part of this. Each runs whatever another fails. About fourteen
-  # minutes of tests after the build.
+  # no part of this. Each runs whatever another fails. About half an hour
+  # of tests after the build.
   out-of-reach:
     name: out of reach
     runs-on: ubuntu-latest
@@ -104,6 +104,9 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    # The test job runs every test; this one only measures. Two hours is
+    # well above what it takes without the sequences below.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -133,7 +136,9 @@ jobs:
           LLVM_PROFILE_FILE: '/tmp/cordelia-cov/cordelia-%p-%m.profraw'
         run: |
           mkdir -p /tmp/cordelia-cov
-          cargo test --lib --test two_node -- --skip test_bv19
+          # The sequences of cordelia-sync take hours under coverage and are
+          # run in full by the test job.
+          cargo test --lib --test two_node -- --skip test_bv19 --skip claude::sequences::
 
       - name: Generate LCOV report
         run: |

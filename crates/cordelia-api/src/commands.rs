@@ -338,6 +338,36 @@ fn not_reached(state: &AppState, at: &crate::state::AtRelays) -> Vec<String> {
         .collect()
 }
 
+/// How the node tries each relay that the device is set up with, in the
+/// order of `at`, by the names of its configuration (decision 2026-10-19
+/// §5, S9): `connected`; `dialled`, while it is not; `looked_up`, while
+/// its name does not resolve; or `not_dialled`, where another relay
+/// answers at its address. A relay is found in the node's list by its name
+/// and the key that its configuration gives it, together (decision
+/// 2026-10-17 §1). A relay that the node has not listed yet is dialled.
+fn dial_of(state: &AppState, at: &crate::state::AtRelays) -> Vec<&'static str> {
+    use crate::state::Tried;
+    let known = state.relays.read().unwrap_or_else(|e| e.into_inner());
+    at.relays
+        .iter()
+        .map(|relay| {
+            let listed = known.iter().find(|known| {
+                let key = known
+                    .key
+                    .as_deref()
+                    .and_then(|key| decode_public_key(key).ok());
+                known.host == relay.relay && key == relay.reach.key
+            });
+            match listed {
+                Some(listed) if listed.state == "connected" => "connected",
+                Some(listed) if listed.tried == Tried::LookedUp => "looked_up",
+                Some(listed) if listed.tried == Tried::NotDialled => "not_dialled",
+                _ => "dialled",
+            }
+        })
+        .collect()
+}
+
 /// The relays that this node is connected to now, each by its node key
 /// and by when it was last connected, in seconds, at `now`: the node
 /// counts for how long each has been connected by its own clock, which
@@ -475,11 +505,20 @@ pub async fn list(
     // change only once it has been connected for some minutes (decision
     // 2026-10-04 §10.1).
     let at_now = std::time::Instant::now();
-    for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+    let dial = dial_of(&state, &at);
+    for (at, relay) in answer["relays"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let connected = relay["relay"]
             .as_str()
             .and_then(|name| state.own_channels.connected_for(name, at_now));
         relay["connected_secs"] = connected.map(|connected| connected.as_secs()).into();
+        // How the node tries it: what the wait after a change says of a
+        // relay that lacks the change (decision 2026-10-19 §5, S9).
+        relay["dial"] = dial.get(at).copied().unwrap_or("dialled").into();
     }
     answer["sync_on"] = sync_on.into();
     answer["folders"] = folders.into();
@@ -1733,6 +1772,7 @@ exit 0"#,
             unreachable_secs: None,
             last_tried_secs: None,
             error: None,
+            tried: Default::default(),
         };
         // Before the node has listed its relays, none has a name.
         let rows = waiting(&state).unwrap();
@@ -1792,6 +1832,7 @@ exit 0"#,
             unreachable_secs: None,
             last_tried_secs: None,
             error: None,
+            tried: Default::default(),
         };
         // Before the node has listed its relays, none is known to be
         // connected.
@@ -1810,6 +1851,84 @@ exit 0"#,
         assert!(not_reached(&state, &set_up).is_empty());
         // A device that is set up with no relay has none to reach.
         assert!(not_reached(&state, &AtRelays::default()).is_empty());
+    }
+
+    /// The look says how the node tries each relay that the device is set
+    /// up with, by the name of its configuration (decision 2026-10-19 §5,
+    /// S9): connected; dialled while it is not; looked up while its name
+    /// does not resolve; and not dialled where another relay answers at
+    /// its address. A relay that the node has not listed yet is dialled.
+    #[test]
+    fn test_the_look_says_how_the_node_tries_each_relay() {
+        use crate::state::{AtRelay, AtRelays, RelaySnapshot, Tried};
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let at = |name: &str| AtRelay {
+            relay: name.into(),
+            holds_latest: None,
+            heard_since_woke: true,
+            no_room: None,
+            another_form: 0,
+            refuses: None,
+            reach: Default::default(),
+            key: None,
+        };
+        let names = [
+            "one.example:9474",
+            "two.example:9474",
+            "three.example:9474",
+            "four.example:9474",
+        ];
+        let set_up = AtRelays {
+            relays: names.iter().map(|name| at(name)).collect(),
+            cannot_go_on: None,
+            word_to_come: false,
+        };
+        assert_eq!(dial_of(&state, &set_up), ["dialled"; 4]);
+        let known = |name: &str, stands: &str, tried: Tried| RelaySnapshot {
+            host: name.into(),
+            key: None,
+            state: stands.into(),
+            unreachable_secs: None,
+            last_tried_secs: None,
+            error: None,
+            tried,
+        };
+        *state.relays.write().unwrap() = vec![
+            known(names[0], "connected", Tried::Dialled),
+            known(names[1], "unreachable", Tried::Dialled),
+            known(names[2], "unreachable", Tried::LookedUp),
+            known(names[3], "wrong key", Tried::NotDialled),
+        ];
+        assert_eq!(
+            dial_of(&state, &set_up),
+            ["connected", "dialled", "looked_up", "not_dialled"]
+        );
+        // One name given twice, with two keys: each by its own key.
+        let with_key = |name: &str, key: [u8; 32]| AtRelay {
+            reach: crate::state::Reach {
+                key: Some(key),
+                ..Default::default()
+            },
+            ..at(name)
+        };
+        let twice = AtRelays {
+            relays: vec![
+                with_key("h.example:9474", [7; 32]),
+                with_key("h.example:9474", [8; 32]),
+            ],
+            cannot_go_on: None,
+            word_to_come: false,
+        };
+        let keyed = |key: [u8; 32], stands: &str, tried: Tried| RelaySnapshot {
+            key: Some(encode_public_key(&key).unwrap()),
+            ..known("h.example:9474", stands, tried)
+        };
+        *state.relays.write().unwrap() = vec![
+            keyed([7; 32], "connected", Tried::Dialled),
+            keyed([8; 32], "wrong key", Tried::NotDialled),
+        ];
+        assert_eq!(dial_of(&state, &twice), ["connected", "not_dialled"]);
     }
 
     /// How much each device wrote that this device received in the last

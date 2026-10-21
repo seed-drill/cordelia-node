@@ -605,6 +605,10 @@ impl Reach {
                     (true, _) => Waits::Moving,
                 }
             });
+            let refusing_waits_since = of
+                .refusing_waits_since
+                .filter(|_| reached && of.waits == Some(true))
+                .map(|since| Moment::back_from(now, since).wall);
             let out = of.out_since.is_some();
             Reached {
                 key: relay.key,
@@ -615,6 +619,7 @@ impl Reach {
                 last_reached: of.last_reached.map(|at| at.wall),
                 refused_since: refused_since.map(|since| since.wall),
                 waits,
+                refusing_waits_since,
                 answered_at: of.answered_at,
                 class: class(holds, reached, out, waits, refused_long),
             }
