@@ -351,6 +351,9 @@ struct OfRelay {
     /// Why the device refuses the entry that the relay last answered a
     /// show with, where it does.
     refuses: Option<String>,
+    /// Why it lacks the entry named in `holds`, by the latest answer in
+    /// which it said so (decision 2026-10-19 §1): none once it holds it.
+    lacks_for: Option<cordelia_api::state::LacksFor>,
     counts: Counts,
     /// What was pushed to it in the last minute: a device paces itself,
     /// so that it is never the one refused for going over.
@@ -1719,6 +1722,7 @@ impl DeviceEntries {
                     self.holds(link, entry, false);
                     round.said = Some(Said::Lacks);
                     self.no_room(link, over_allowance, true);
+                    self.lacks_for_room(link);
                     return true;
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
@@ -1744,6 +1748,7 @@ impl DeviceEntries {
                     // with the entry.
                     self.holds(link, entry, false);
                     round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     if !short || shows.apart == Some(id) {
                         return false;
                     }
@@ -1752,6 +1757,7 @@ impl DeviceEntries {
                 ShowAnswer::Another(bytes) => {
                     self.holds(link, entry, false);
                     round.said = Some(Said::Lacks);
+                    self.lacks_for_another(link, None);
                     let Some(another) = Entry::from_wire(&bytes)
                         .ok()
                         .and_then(|entry| entry.check().ok())
@@ -1857,6 +1863,9 @@ impl DeviceEntries {
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(relay.to_string()).or_default();
                     of.refuses = Some(why.to_string());
+                    of.lacks_for = Some(cordelia_api::state::LacksFor::Another {
+                        why: Some(why.to_string()),
+                    });
                 }
                 false
             }
@@ -1916,6 +1925,9 @@ impl DeviceEntries {
             let mut kept = lock(&self.kept);
             let of = kept.relays.entry(link.name().to_string()).or_default();
             of.holds = Some((entry.id(), holds));
+            if holds {
+                of.lacks_for = None;
+            }
         }
         let relay = self.id_of(link);
         let (by, now) = (link.relay().0, self.unix());
@@ -1923,6 +1935,25 @@ impl DeviceEntries {
         if let Err(e) = noted {
             tracing::debug!(relay = link.name(), error = %e, "could not note a relay's answer to a show");
         }
+    }
+
+    /// The relay at `link` said that it lacks the change entry shown it
+    /// because it had no room for it ([`Self::no_room`], noted just
+    /// before): why the wait says that it refuses the change (decision
+    /// 2026-10-19 §5, S8).
+    fn lacks_for_room(&self, link: &Link) {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        of.lacks_for = of.no_room.map(cordelia_api::state::LacksFor::Room);
+    }
+
+    /// The relay at `link` said that it lacks the change entry shown it
+    /// because it holds another: `why` this device does not take that
+    /// one, where it is known.
+    fn lacks_for_another(&self, link: &Link, why: Option<String>) {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        of.lacks_for = Some(cordelia_api::state::LacksFor::Another { why });
     }
 
     /// The relay at `link` refused something that it would have taken.
@@ -2887,7 +2918,14 @@ impl DeviceEntries {
                     no_room: of.and_then(|of| of.no_room),
                     another_form: of.map_or(0, |of| of.another_form.len()),
                     refuses: of.and_then(|of| of.refuses.clone()),
-                    reach: self.reach.of(&relay.id()),
+                    reach: cordelia_api::state::Reach {
+                        // Why it lacks the entry it was last shown, where
+                        // that is the kept entry.
+                        lacks_for: of
+                            .filter(|of| of.holds.map(|(entry, _)| entry) == latest)
+                            .and_then(|of| of.lacks_for.clone()),
+                        ..self.reach.of(&relay.id())
+                    },
                     key,
                 }
             })
@@ -2911,6 +2949,7 @@ impl DeviceEntries {
             relays,
             cannot_go_on,
             word_to_come,
+            woke_at: self.leave.woke_at(),
         });
     }
 }

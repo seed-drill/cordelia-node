@@ -1001,6 +1001,7 @@ async fn test_a_look_says_what_a_status_goes_by_for_its_level() {
         ],
         cannot_go_on: None,
         word_to_come: false,
+        woke_at: None,
     });
     let now = std::time::Instant::now();
     let earlier = now.checked_sub(Duration::from_secs(400)).unwrap();
@@ -1364,6 +1365,7 @@ async fn test_the_look_carries_the_word_to_come_each_class_and_how_each_relay_is
         ],
         cannot_go_on: None,
         word_to_come: true,
+        woke_at: None,
     });
     let known = |name: &str, stands: &str, tried: Tried| RelaySnapshot {
         host: name.into(),
@@ -1390,6 +1392,7 @@ async fn test_the_look_carries_the_word_to_come_each_class_and_how_each_relay_is
         relays: vec![at(names[0], None)],
         cannot_go_on: None,
         word_to_come: false,
+        woke_at: None,
     });
     let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
     assert_eq!(seen["word_to_come"], false, "{seen}");

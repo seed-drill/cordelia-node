@@ -4484,3 +4484,96 @@ async fn one_relay_under_two_names_is_counted_and_paced_once() {
     assert_eq!(listed(&laptop), expected);
     assert_eq!(inbound_connections(&relay), 1);
 }
+
+// ── A relay out of reach (decision 2026-10-19) ───────────────────────
+
+/// Whether `cordelia status` at `node` says, among what holds, that a
+/// relay is not known to hold the latest change.
+fn says_a_relay_lacks_the_change(node: &Node) -> bool {
+    let status: serde_json::Value =
+        serde_json::from_str(&node.cli(&["status", "--json"])).unwrap_or_default();
+    let holds = status["holds"].as_array().cloned().unwrap_or_default();
+    holds
+        .iter()
+        .any(|holds| holds["says"] == "memory: a relay not known to hold the latest change")
+}
+
+/// What `node` knows of the reach of its relay at `host`, as its look
+/// says.
+fn reach_of(node: &Node, host: &str) -> serde_json::Value {
+    let seen = person_of(node);
+    let relays = seen["relays"].as_array().cloned().unwrap_or_default();
+    let relay = relays.into_iter().find(|relay| relay["relay"] == host);
+    relay
+        .map(|relay| relay["reach"].clone())
+        .unwrap_or_default()
+}
+
+/// A relay that cannot be reached from here is dialled as today until a
+/// change (decision 2026-10-19 §6, rules 3 and 11). The laptop is set up
+/// with relay A and with a relay whose name does not resolve, and is
+/// added from the desktop: that relay's mark is the handed change, so it
+/// neither holds nor lacks it. For six minutes it stays so, with no amber
+/// of a relay not known to hold the change; the node goes on looking its
+/// name up as it looks up the names of relays that hold the change
+/// (rule 3 holds that pace in `p2p.rs`); and once it is out of reach,
+/// `cordelia devices` says D3 of it. Then a change is made on the desktop:
+/// within five minutes and a half the laptop shows the amber, with sync
+/// off and nothing mapped, and the relay lacks the change.
+#[test]
+#[ignore = "it waits six minutes, and then a relay's five minutes: about twelve minutes"]
+fn a_relay_unreachable_from_here_is_dialled_as_today_until_a_change() {
+    let relay = relay_started();
+    let reached = format!("127.0.0.1:{}", relay.p2p);
+    let desktop = device_started("desktop", &relay);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
+    );
+    laptop.start();
+    let all = [&relay, &desktop, &laptop];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    wait_for("the laptop reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
+    });
+    let words = makes_a_phrase(&desktop, "desktop");
+    adds(&desktop, &laptop, "laptop");
+    wait_for("the relay that cannot be found is marked", &all, 60, || {
+        (reach_of(&laptop, NO_SUCH_NAME)["holds"] == "neither").then_some(())
+    });
+
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_secs(360) {
+        let reach = reach_of(&laptop, NO_SUCH_NAME);
+        assert_eq!(reach["holds"], "neither", "{reach}");
+        assert!(
+            !says_a_relay_lacks_the_change(&laptop),
+            "amber after {:?}",
+            began.elapsed()
+        );
+        std::thread::sleep(Duration::from_secs(10));
+    }
+    let devices = laptop.cli(&["devices"]);
+    assert!(
+        devices.lines().any(|line| {
+            line.starts_with(&format!(
+                "  {NO_SUCH_NAME}: has not answered since this device started or woke at "
+            )) && line.contains(", and cannot be reached from here. ")
+        }),
+        "{devices}"
+    );
+
+    let mut at = renews(&desktop, &["stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    wait_for("the laptop applies the change", &all, 60, || {
+        (person_of(&laptop)["change"] == 2).then_some(())
+    });
+    wait_for("the laptop shows the amber", &all, 330, || {
+        says_a_relay_lacks_the_change(&laptop).then_some(())
+    });
+    assert_eq!(reach_of(&laptop, NO_SUCH_NAME)["holds"], "lacks");
+    let sync: serde_json::Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
+    assert_eq!(sync["level"], "amber", "{sync}");
+}

@@ -893,6 +893,11 @@ pub struct AtRelays {
     /// the functions that write them
     /// ([`crate::at_relays::word_to_come`]).
     pub word_to_come: bool,
+    /// When the device last woke, by the time of day, in seconds: where
+    /// it reaches no relay, since when it has reached none. What
+    /// `cordelia devices` and a status say a relay has not answered since
+    /// (decision 2026-10-19 §5, D2 and T1).
+    pub woke_at: Option<i64>,
 }
 
 /// Where a device stands at one relay.
@@ -989,6 +994,11 @@ pub enum Class {
 pub struct Reach {
     /// The key that the configuration gives the relay, where it gives one.
     pub key: Option<[u8; 32]>,
+    /// The change entry that the rest is about, by its ID: the kept entry
+    /// as the node's pass last found it. `None` before a pass has. A wait
+    /// after a change reads nothing of a relay that is about another entry
+    /// than the change it waits for (decision 2026-10-19 §4, rule 8).
+    pub about: Option<[u8; 32]>,
     /// Whether it holds the change entry that the device keeps.
     pub holds: Holds,
     /// Whether it is reached: a connection to it is open, and the latest
@@ -1016,8 +1026,33 @@ pub struct Reach {
     /// When it gave its latest answer about the kept entry, where it gave
     /// one.
     pub answered_at: Option<i64>,
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock, where it lacks it: since the later of when it came to
+    /// lack it and the latest of the node's start, a sleep and the change
+    /// of the kept entry. A wake after no connection does not restart it
+    /// (decision 2026-10-19, rule 11). `None` where it holds the change,
+    /// and in the third state.
+    pub lacking_secs: Option<u64>,
     /// Its class, where it is in one.
     pub class: Option<Class>,
+    /// Why it lacks the kept entry, by the latest answer to a show of it in
+    /// which it said so, where it gave one since the node started.
+    pub lacks_for: Option<LacksFor>,
+}
+
+/// Why a relay said that it does not hold the change entry shown it
+/// (decision 2026-10-19 §1): what the wait after a change says of a relay
+/// that refuses the change (§5, S8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LacksFor {
+    /// It had no room for it, or the address was over its allowance of
+    /// new channels there.
+    Room(NoRoom),
+    /// It holds another change entry of the phrase. `why` is why this
+    /// device does not take that one, where it refused it as no change
+    /// entry that it takes.
+    Another { why: Option<String> },
 }
 
 /// A relay's refusal of something that it would have taken.

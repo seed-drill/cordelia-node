@@ -2422,6 +2422,9 @@ trait AfterTheChange {
     /// What the device holds of its person, and where it stands at each
     /// relay.
     fn look(&self) -> anyhow::Result<Value>;
+    /// Why the node is of another version than this command, where it is
+    /// ([`crate::node_of_another_version`]).
+    fn another_version(&self) -> anyhow::Result<Option<String>>;
     /// The time between two askings.
     fn pause(&self);
 }
@@ -2445,6 +2448,10 @@ impl AfterTheChange for TheNode<'_> {
 
     fn look(&self) -> anyhow::Result<Value> {
         look(self.0)
+    }
+
+    fn another_version(&self) -> anyhow::Result<Option<String>> {
+        crate::node_of_another_version(self.0)
     }
 
     fn pause(&self) {
@@ -2534,6 +2541,11 @@ fn after_the_recovery(
 /// the machine's own word: its look may stay pending until the next
 /// statement, and then neither `sent` nor the carried word is written. It
 /// never says that the machine may be closed.
+///
+/// **No end with status 0 is given on classes that are not of this
+/// change** ([`wait::recovery_end_of_look`]), and S2 and S3 are said only
+/// of a relay whose reach is about it. **A look that cannot be read, or a
+/// node of another version, is an error:** the wait ends with status 3.
 fn waits_for_the_change(
     number: u64,
     mut seen: Value,
@@ -2543,19 +2555,24 @@ fn waits_for_the_change(
     let mut said: Vec<String> = Vec::new();
     let mut first = true;
     loop {
+        // A node of another version, put in this one's place during the
+        // wait, may say what this command reads otherwise.
+        if let Some(note) = node.another_version()? {
+            anyhow::bail!(note);
+        }
         if seen["change"].as_u64() != Some(number) {
             say("This device has since applied another change: `cordelia devices` says.".into());
             return Ok(Recovered::Another);
         }
         let at = chrono::Utc::now().timestamp();
-        let (relays, end) = wait::recovery_end_of_look(&seen);
+        let (relays, end) = wait::recovery_end_of_look(&seen)?;
         if first && end != Some(RecoveryEnd::Recovered) {
             say(format!("\n{}", wait::recovery_first_line()));
         }
         first = false;
         let now: Vec<String> = relays
             .iter()
-            .filter(|relay| relay.out_of_reach())
+            .filter(|relay| relay.out_of_reach() && wait::is_about_the_kept_entry(relay, &seen))
             .map(|relay| wait::out_of_reach_line(relay, at))
             .collect();
         for line in &now {
@@ -2721,7 +2738,8 @@ fn after_lines(seen: &Value, to_come: usize) -> Vec<String> {
     // Whether a relay lacks the change, as the node knows it (decision
     // 2026-10-19 §1), or is not connected: nothing is said to be waiting
     // nowhere then.
-    let keep_on = !not_reached.is_empty() || !wait::relays_of(seen).iter().all(|r| r.holds());
+    let lacks = |relays: Vec<wait::RelayAt>| !relays.iter().all(|r| r.holds());
+    let keep_on = !not_reached.is_empty() || wait::relays_of(seen).map_or(true, lacks);
     match (to_go, channels_wait) {
         (0, false) if keep_on => {}
         (0, false) if to_come == 0 && connected > 0 => lines.push(
@@ -5658,6 +5676,7 @@ mod tests {
         looks: std::cell::RefCell<Vec<Value>>,
         fails: bool,
         asked: std::cell::Cell<usize>,
+        version: Option<String>,
     }
 
     impl Stands {
@@ -5667,6 +5686,7 @@ mod tests {
                 looks: std::cell::RefCell::new(looks),
                 fails: false,
                 asked: std::cell::Cell::new(0),
+                version: None,
             }
         }
     }
@@ -5677,6 +5697,9 @@ mod tests {
         }
         fn sync_status(&self) -> Option<Value> {
             None
+        }
+        fn another_version(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.version.clone())
         }
         fn look(&self) -> anyhow::Result<Value> {
             // A wait that would never end fails the test at once.
@@ -5942,5 +5965,76 @@ mod tests {
             3
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// **A recovery gives no R1 and no status 0 on classes that are not of
+    /// its change** (decision 2026-10-19 §4, rule 9, as rule 8 has it):
+    /// where every look's relays are about the entry kept before, the wait
+    /// never says R1, and ends at the stand-in's bound as an error; where
+    /// one look is stale and the next is of the change, it says R0 and then
+    /// R1. **A look that cannot be read, or a node of another version,
+    /// ends it with status 3,** with the error said apart.
+    #[test]
+    fn a_recovery_ends_only_on_classes_of_its_change_and_with_3_on_what_it_cannot_read() {
+        use wait::tests::Scenario::{Ok as Reached, OutHolding, OutLacking};
+        let stale = || {
+            let mut seen = looked(&[Reached, OutHolding]);
+            seen["latest"] = hex::encode([2u8; 32]).into();
+            seen
+        };
+        let node = Stands::of(finished(false), vec![stale()]);
+        let (ended, said) = after(&node);
+        assert!(ended.is_err(), "{said:?}");
+        assert!(
+            !said
+                .iter()
+                .any(|line| line == "Every relay holds the change."),
+            "{said:?}"
+        );
+        let node = Stands::of(
+            finished(false),
+            vec![stale(), stale(), looked(&[Reached, OutHolding])],
+        );
+        let (ended, said) = after(&node);
+        assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::Recovered));
+        assert!(
+            said.iter()
+                .any(|line| line.contains("This command stays until")),
+            "{said:?}"
+        );
+        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        // S2 and S3 are not said of a reach about the entry before.
+        let mut one = looked(&[Reached, OutLacking]);
+        one["relays"][1]["reach"]["about"] = hex::encode([2u8; 32]).into();
+        let node = Stands::of(
+            finished(false),
+            vec![one.clone(), looked(&[Reached, OutLacking])],
+        );
+        let (_, said) = after(&node);
+        let s2 = "  keep this machine on: relay-1.example:9474 is not known to hold";
+        assert_eq!(
+            said.iter().filter(|line| line.starts_with(s2)).count(),
+            1,
+            "{said:?}"
+        );
+        // A look whose relay cannot be read: status 3, with the error.
+        let mut unread = looked(&[Reached, OutLacking]);
+        unread["relays"][1]["reach"] = "what this command cannot read".into();
+        let node = Stands::of(finished(false), vec![unread]);
+        let mut errors = Vec::new();
+        let status = recovery_status(3, None, &node, |_| {}, |line| errors.push(line));
+        assert_eq!(status, 3);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("relay-1.example:9474"), "{errors:?}");
+        // A node of another version: status 3, whatever its look says.
+        let mut node = Stands::of(finished(false), vec![looked(&[Reached, Reached])]);
+        node.version = Some("the node is of another version".into());
+        let mut errors = Vec::new();
+        let status = recovery_status(3, None, &node, |_| {}, |line| errors.push(line));
+        assert_eq!(status, 3);
+        assert!(
+            errors[0].contains("the node is of another version"),
+            "{errors:?}"
+        );
     }
 }
