@@ -45,7 +45,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{LEFT_SECRET_KEPT_DAYS, PERSONAL_NAME_PREFIX};
+use cordelia_core::protocol::{LEFT_SECRET_KEPT_DAYS, PERSONAL_NAME_PREFIX, entry_cost};
 use cordelia_core::revision::next_under;
 use cordelia_crypto::bech32::encode_channel_id;
 use cordelia_crypto::derive;
@@ -208,6 +208,139 @@ struct Words {
     /// The key of each word that is under `name/` and lists no name, once
     /// for each such word, in order of key.
     not_names: Vec<[u8; 32]>,
+    /// What the channel holds, as a relay counts it.
+    fill: Fill,
+}
+
+/// What the personal channel holds, as this device's store holds it and
+/// as a relay counts it ([`entry_cost`]): every entry of every author,
+/// deletes and what waits to be sent among them (decision 2026-10-19 §2,
+/// rules 1 and 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fill {
+    /// The channel's total, in bytes.
+    pub total: u64,
+    /// Of it, the bytes that are words.
+    pub words: u64,
+    /// Each key that signed an entry, in order of key.
+    pub by: Vec<Signed>,
+}
+
+/// What one key signed of the personal channel, as a relay counts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    pub key: [u8; 32],
+    /// Its bytes of words.
+    pub words: u64,
+    /// Its bytes of what is not a word.
+    pub not_words: u64,
+}
+
+impl Fill {
+    /// Count an entry of `cost` bytes that `key` signed: a word, or not.
+    fn add(&mut self, key: [u8; 32], cost: u64, word: bool) {
+        self.total += cost;
+        let at = match self.by.binary_search_by(|signed| signed.key.cmp(&key)) {
+            Ok(at) => at,
+            Err(at) => {
+                self.by.insert(
+                    at,
+                    Signed {
+                        key,
+                        words: 0,
+                        not_words: 0,
+                    },
+                );
+                at
+            }
+        };
+        match word {
+            true => {
+                self.words += cost;
+                self.by[at].words += cost;
+            }
+            false => self.by[at].not_words += cost,
+        }
+    }
+}
+
+/// What a delete's slot says of it, in the personal channel (decision
+/// 2026-10-19 §2, rule 1): a delete is not opened, and is told by its
+/// slot alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotIs {
+    /// The slot of `applied/` or `left/` and this key: a delete there by
+    /// this key is no word.
+    OwnOf([u8; 32]),
+    /// The slot of `added/` and a key: a delete there by any key is no
+    /// word.
+    Added,
+}
+
+/// The slots that tell a delete that is no word, for the keys they were
+/// worked out for.
+#[derive(Default)]
+struct Slots {
+    keys: Vec<[u8; 32]>,
+    of: HashMap<[u8; 32], SlotIs>,
+    /// The key the slots are worked out under.
+    slot_key: [u8; 32],
+    /// The slots of the `applied/` and `left/` words of each author of a
+    /// delete that is not among `keys`, worked out once for each.
+    own_of: HashMap<[u8; 32], [[u8; 32]; 2]>,
+}
+
+impl Slots {
+    /// The slots of `applied/`, `left/` and `added/` for each of `keys`,
+    /// in the personal channel whose secret is `personal`.
+    fn of(personal: &[u8; 32], keys: Vec<[u8; 32]>) -> Result<Self, PersonError> {
+        let slot_key = derive::slot_key(personal)?;
+        let mut of = HashMap::with_capacity(3 * keys.len());
+        for key in &keys {
+            let slot = |name: String| slot_id(&slot_key, &name);
+            of.insert(slot(crate::person::applied_name(key)?), SlotIs::OwnOf(*key));
+            of.insert(slot(crate::leaving::left_name(key)?), SlotIs::OwnOf(*key));
+            of.insert(slot(crate::person::added_name(key)?), SlotIs::Added);
+        }
+        Ok(Self {
+            keys,
+            of,
+            slot_key,
+            own_of: HashMap::new(),
+        })
+    }
+
+    /// Whether a delete in `slot` that `author` signed is a word: every
+    /// delete is, but one in the slot of `applied/` or `left/` and its
+    /// own author's key, whoever the author is, and one in the slot of
+    /// `added/` and a key that the device knows (decision 2026-10-19 §2,
+    /// rule 1). The slots of an author the device does not know are
+    /// worked out the first time one of its deletes is read.
+    fn delete_is_a_word(&mut self, slot: &[u8; 32], author: &[u8; 32]) -> bool {
+        match self.of.get(slot) {
+            Some(SlotIs::OwnOf(key)) if key == author => return false,
+            Some(SlotIs::Added) => return false,
+            Some(SlotIs::OwnOf(_)) => return true,
+            None => {}
+        }
+        if self.keys.binary_search(author).is_ok() {
+            return true;
+        }
+        let slot_key = self.slot_key;
+        let own = match self.own_of.entry(*author) {
+            std::collections::hash_map::Entry::Occupied(own) => *own.get(),
+            std::collections::hash_map::Entry::Vacant(at) => {
+                let (Ok(applied), Ok(left)) = (
+                    crate::person::applied_name(author),
+                    crate::leaving::left_name(author),
+                ) else {
+                    return true;
+                };
+                *at.insert([slot_id(&slot_key, &applied), slot_id(&slot_key, &left)])
+            }
+        };
+        !own.contains(slot)
+    }
 }
 
 /// Each word of the personal channel that lists something, as this
@@ -245,16 +378,10 @@ fn words_in(
     if !keeps_what_it_reads(standing) {
         // A device that has stopped reads each entry afresh, and keeps
         // nothing of what it found.
-        return words_kept(
-            conn,
-            &personal,
-            standing.number(),
-            of,
-            &mut Kept::of(&channel),
-        );
+        return words_kept(conn, &personal, standing, of, &mut Kept::of(&channel));
     }
     let mut kept = Kept::take(slot, &channel);
-    let words = words_kept(conn, &personal, standing.number(), of, &mut kept);
+    let words = words_kept(conn, &personal, standing, of, &mut kept);
     kept.put_back(slot);
     words
 }
@@ -320,6 +447,10 @@ struct Kept {
     afresh: usize,
     /// How many reads of the words used this.
     reads: usize,
+    /// The slots that tell a delete that is no word ([`Slots`]): worked
+    /// out once for the keys that the device knows, and again only where
+    /// they change (decision 2026-10-19 §2, rule 1).
+    slots: Slots,
 }
 
 /// Where what is kept between reads is ([`Kept`]): of one channel, or of
@@ -409,22 +540,35 @@ impl Kept {
 }
 
 /// [`words`], with what is kept from the reads before: of the personal
-/// channel whose secret is `personal`, under the statement numbered
-/// `number`. `kept` holds afterwards what this read found, and nothing
-/// of an entry that is no longer stored.
+/// channel whose secret is `personal`, under `standing`. `kept` holds
+/// afterwards what this read found, and nothing of an entry that is no
+/// longer stored.
+///
+/// **The channel's total is taken in the same pass** (decision
+/// 2026-10-19 §2, rule 1): each stored row is counted as a relay counts
+/// it, by its content's length, before the filter of who is read and
+/// which band, so that every entry the store holds is counted. A text is
+/// a word where what is kept of it is a name under `name/`; a delete is
+/// not opened, and is told by its slot ([`Slots`]).
 fn words_kept(
     conn: &Connection,
     personal: &[u8; 32],
-    number: u64,
+    standing: &Standing,
     of: impl Fn(&[u8; 32]) -> bool,
     kept: &mut Kept,
 ) -> Result<Words, PersonError> {
+    let number = standing.number();
     let channel = derive::channel_id(personal)?;
     if kept.channel != channel {
         *kept = Kept::of(&channel);
     }
     kept.reads += 1;
+    let known = standing.counting.known();
+    if kept.slots.of.is_empty() || kept.slots.keys != known {
+        kept.slots = Slots::of(personal, known)?;
+    }
     let (mut names, mut not_names) = (Vec::new(), Vec::new());
+    let mut fill = Fill::default();
     let mut found_now = HashMap::new();
     for held in entries::channel_stored(conn, &channel)? {
         let (author, rev, delete) = (held.entry.author, held.entry.rev, held.entry.delete);
@@ -435,6 +579,15 @@ fn words_kept(
                 find(held.entry.clone(), personal)
             }
         };
+        // Counted before the filter below, as a relay holds it.
+        let word = match (&found, delete) {
+            (_, true) => kept.slots.delete_is_a_word(&held.entry.slot, &author),
+            (Ok(Some(inside)), false) => inside
+                .strip_prefix(PERSONAL_NAME_PREFIX)
+                .is_some_and(is_a_name),
+            (_, false) => false,
+        };
+        fill.add(author, entry_cost(held.entry.content.len()), word);
         match &found {
             Err(e) => tracing::warn!(
                 seq = held.seq,
@@ -455,7 +608,11 @@ fn words_kept(
     names.sort();
     names.dedup();
     not_names.sort();
-    Ok(Words { names, not_names })
+    Ok(Words {
+        names,
+        not_names,
+        fill,
+    })
 }
 
 /// Check and open, with the database's lock let go, each entry of the
@@ -623,25 +780,32 @@ pub fn said_here(
     Ok(said.into_iter().map(|(name, _)| name).collect())
 }
 
+/// What [`said_and_listed`] gives: the names this device says it syncs,
+/// the names the personal channel lists, and what the channel holds.
+pub type SaidAndListed = (BTreeSet<String>, Vec<Listed>, Option<Fill>);
+
 /// [`said_here`] and [`listed`] together, from one read of the personal
-/// channel: what a cycle of sync asks.
+/// channel, with what the channel holds ([`Fill`]): what a cycle of sync
+/// asks. The fill is taken in the same read (decision 2026-10-19 §2, rule
+/// 1); `None` on a device that follows no phrase, which reads nothing.
 pub fn said_and_listed(
     conn: &Connection,
     identity: &NodeIdentity,
-) -> Result<(BTreeSet<String>, Vec<Listed>), PersonError> {
+) -> Result<SaidAndListed, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
-        return Ok((BTreeSet::new(), Vec::new()));
+        return Ok((BTreeSet::new(), Vec::new(), None));
     };
     let own = identity.public_key();
     let counts = |key: &[u8; 32]| standing.counting.counts(key);
-    let read = words(conn, &standing, |key| *key == own || counts(key))?.names;
+    let read = words(conn, &standing, |key| *key == own || counts(key))?;
     let said = read
+        .names
         .iter()
         .filter(|(_, key)| *key == own)
         .map(|(name, _)| name.clone())
         .collect();
-    let listed = by_name(read.into_iter().filter(|(_, key)| counts(key)));
-    Ok((said, listed))
+    let listed = by_name(read.names.into_iter().filter(|(_, key)| counts(key)));
+    Ok((said, listed, Some(read.fill)))
 }
 
 /// A name that the personal channel lists, with each key that lists it.
@@ -2087,7 +2251,11 @@ mod tests {
         names.sort();
         names.dedup();
         not_names.sort();
-        Words { names, not_names }
+        Words {
+            names,
+            not_names,
+            fill: Fill::default(),
+        }
     }
 
     /// Whose words a read reads.
@@ -2130,7 +2298,7 @@ mod tests {
             assert_eq!(kept.not_names, fresh.not_names);
         }
         // And what the public reads give is the same.
-        let (said, listed_now) = said_and_listed(&on.conn, &on.identity).unwrap();
+        let (said, listed_now, _) = said_and_listed(&on.conn, &on.identity).unwrap();
         assert_eq!(said, said_here(&on.conn, &on.identity).unwrap());
         assert_eq!(listed_now, listed(&on.conn).unwrap());
         let by_counted = words_afresh(&on.conn, &standing, counts);
@@ -2594,4 +2762,235 @@ mod tests {
         read_ahead_in(&db, &empty).unwrap();
         assert_eq!(afresh(&empty), 0);
     }
+
+    // ── What the personal channel holds (decision 2026-10-19) ────────
+
+    /// The channel's total is taken in the one read of the words, before
+    /// its filter of who is read and which band (decision 2026-10-19 §2,
+    /// rules 1 and 2): every entry the store holds of the personal channel
+    /// of the statement applied, every author's and every delete, counted
+    /// as a relay counts it. A text is a word where it is a name under
+    /// `name/`; a delete is a word but in the slot of `applied/` or
+    /// `left/` and its own author's key, or of `added/` and a key the
+    /// device knows. Nothing of another channel is counted.
+    #[test]
+    fn the_channels_total_counts_every_author_and_every_delete() {
+        use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, REV_COUNT_BITS};
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        let channel = derive::channel_id(&personal).unwrap();
+        // What the statement wrote is taken out: the store holds only
+        // what the test puts there.
+        entries::remove_channel(&s[0].conn, &channel).unwrap();
+        let (this, other, stranger) = (s.key(0), s.key(1), Machine::new(9));
+        assert!(!s[0].counts(&stranger.key()));
+        let band_above = ((s[0].number() + 1) << REV_COUNT_BITS) + 1;
+        let one = |by: &NodeIdentity, rev: u64, name: String, value: Value| {
+            entry_by(by, &personal, rev, &name, value, &[])
+        };
+        let word = |by: &NodeIdentity, rev: u64, name: &str| {
+            one(by, rev, word_name(name), Value::Text(String::new()))
+        };
+        let delete = |by: &NodeIdentity, name: String| one(by, 2, name, Value::Delete);
+        let (me, them) = (&s[0].identity, &s[1].identity);
+        let applied = crate::person::applied_name(&this).unwrap();
+        let record = one(
+            them,
+            1,
+            crate::person::added_name(&Machine::new(5).key()).unwrap(),
+            Value::Text("r".repeat(300)),
+        );
+        assert_eq!(record.content.len(), 512);
+        let held = [
+            // This device's two words and its delete of a third.
+            word(me, 1, "lab"),
+            word(me, 1, "team"),
+            delete(me, word_name("old")),
+            // The other device's word, its record of an addition, and
+            // what is no name.
+            word(them, 1, "lab"),
+            record,
+            word(them, 1, "A Lab"),
+            // This device's `applied/` word, and its delete of its own
+            // `left/` word.
+            one(me, 1, applied, Value::Text("1".into())),
+            delete(me, crate::leaving::left_name(&this).unwrap()),
+            // A word by a key that does not count, and one of this
+            // device's in a band that the filter leaves out.
+            word(&stranger.identity, 1, "lab"),
+            word(me, band_above, "later"),
+            // A delete under `added/` and a key that counts, and one by
+            // the other device in this device's `left/` slot.
+            delete(me, crate::person::added_name(&other).unwrap()),
+            delete(them, crate::leaving::left_name(&this).unwrap()),
+        ];
+        let left = derive::personal_secret(&[0x5e; 32]).unwrap();
+        let of_left = entry_by(me, &left, 1, "name/lab", Value::Text(String::new()), &[]);
+        let now = s.tick();
+        for entry in &held {
+            entries::store(&s[0].conn, entry, now).unwrap();
+        }
+        // Beside them: an entry of a name's channel, and one of the
+        // personal channel of a generation left.
+        s.hold(&[0], "lab");
+        s.write(0, "lab", "notes.md", "of a name's channel");
+        entries::store(&s[0].conn, &of_left, now).unwrap();
+
+        let (said, listed, fill) = said_and_listed(&s[0].conn, &s[0].identity).unwrap();
+        let fill = fill.unwrap();
+        let word_bytes = (MIN_WORD + ENTRY_OVERHEAD_BYTES) as u64;
+        assert_eq!(word_bytes, 1_280);
+        assert_eq!(fill.total, 11 * 1_280 + 1_536);
+        assert_eq!(fill.total, 15_616);
+        assert_eq!(fill.words, 7 * 1_280);
+        assert_eq!(fill.by, {
+            let mut by = vec![
+                Signed {
+                    key: this,
+                    words: 4 * 1_280,
+                    not_words: 3 * 1_280,
+                },
+                Signed {
+                    key: other,
+                    words: 2 * 1_280,
+                    not_words: 1_536 + 1_280,
+                },
+                Signed {
+                    key: stranger.key(),
+                    words: 1_280,
+                    not_words: 0,
+                },
+            ];
+            by.sort_by_key(|signed| signed.key);
+            by
+        });
+        // The read of the words is as it was: the filter still reads.
+        assert_eq!(said, BTreeSet::from(["lab".into(), "team".into()]));
+        let listed: Vec<(String, usize)> = listed
+            .into_iter()
+            .map(|one| (one.name, one.by.len()))
+            .collect();
+        assert_eq!(listed, [("lab".to_string(), 2), ("team".to_string(), 1)]);
+        // The longest word, and a delete of it, are each of the smallest
+        // content (decision 2026-10-19 §6): every word counts alike.
+        let longest = "x".repeat(200);
+        assert!(is_a_name(&longest));
+        for value in [Value::Text(String::new()), Value::Delete] {
+            let entry = entry_by(
+                &s[0].identity,
+                &personal,
+                3,
+                &word_name(&longest),
+                value,
+                &[],
+            );
+            assert_eq!(entry.content.len(), MIN_WORD);
+        }
+        // A device that follows no phrase reads nothing, and takes no
+        // total.
+        let alone = Machine::new(7);
+        assert_eq!(
+            said_and_listed(&alone.conn, &alone.identity).unwrap().2,
+            None
+        );
+    }
+
+    /// What `key` signed of the personal channel on device `n` of `s`,
+    /// as a read of the words sums it: its bytes of words, and of what is
+    /// not a word.
+    fn signed_on(s: &Several, n: usize, key: &[u8; 32]) -> (u64, u64) {
+        let (_, _, fill) = said_and_listed(&s[n].conn, &s[n].identity).unwrap();
+        let fill = fill.unwrap();
+        fill.by
+            .iter()
+            .find(|signed| signed.key == *key)
+            .map_or((0, 0), |signed| (signed.words, signed.not_words))
+    }
+
+    /// A delete in the `applied/` or `left/` slot of its own author's key
+    /// is no word, whoever the author is (decision 2026-10-19 §2, rule
+    /// 1): a key that this device neither counts nor keeps a record of
+    /// too. Its delete in another key's `left/` slot is a word.
+    #[test]
+    fn a_delete_in_its_own_authors_slot_is_no_word_whoever_the_author() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        let stranger = Machine::new(9);
+        assert!(!s[0].counts(&stranger.key()));
+        let delete =
+            |name: String| entry_by(&stranger.identity, &personal, 2, &name, Value::Delete, &[]);
+        let now = s.tick();
+        for entry in [
+            delete(crate::leaving::left_name(&stranger.key()).unwrap()),
+            delete(crate::person::applied_name(&stranger.key()).unwrap()),
+            delete(crate::leaving::left_name(&s.key(1)).unwrap()),
+        ] {
+            entries::store(&s[0].conn, &entry, now).unwrap();
+        }
+        assert_eq!(signed_on(&s, 0, &stranger.key()), (1_280, 2 * 1_280));
+    }
+
+    /// The slots that tell a delete are worked out again when the keys
+    /// the device knows change (decision 2026-10-19 §2, rule 1): a delete
+    /// under `added/` and a key is a word while the key is unknown here,
+    /// and no word once a record that adds it counts.
+    #[test]
+    fn the_slots_are_worked_out_again_when_a_key_comes_to_count() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        let nine = Machine::new(9);
+        let added = crate::person::added_name(&nine.key()).unwrap();
+        let delete = entry_by(&s[0].identity, &personal, 2, &added, Value::Delete, &[]);
+        let now = s.tick();
+        entries::store(&s[0].conn, &delete, now).unwrap();
+        let before = signed_on(&s, 0, &s.key(0));
+        // Device 1 adds the ninth, and device 0 is given its record.
+        let by_one =
+            crate::adding::add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now)
+                .unwrap();
+        let now = s.tick();
+        take(&s[0].conn, &s[0].identity, &by_one.record.unwrap(), now).unwrap();
+        assert!(s[0].counts(&nine.key()));
+        let after = signed_on(&s, 0, &s.key(0));
+        assert_eq!(after, (before.0 - 1_280, before.1 + 1_280), "{before:?}");
+    }
+
+    /// A delete under `added/` and a key that the device keeps a record
+    /// of, though the record does not count, is no word (decision
+    /// 2026-10-19 §2, rule 1).
+    #[test]
+    fn a_delete_under_added_and_a_recorded_key_that_does_not_count_is_no_word() {
+        let mut s = Several::of_one_person(2);
+        let personal = s[0].personal();
+        // Device 1 adds a ninth, which may not add: a record by the ninth
+        // is kept, and does not count.
+        let (nine, ten) = (Machine::new(9), Machine::new(10));
+        let now = s.tick();
+        let by_one =
+            crate::adding::add_device(&s[1].conn, &s[1].identity, &nine.key(), "device 9", now)
+                .unwrap();
+        take(&s[0].conn, &s[0].identity, &by_one.record.unwrap(), now).unwrap();
+        assert!(s[0].counts(&nine.key()));
+        let statement = &s[0].held().statement.statement;
+        let record = cordelia_crypto::addition::Addition::under(
+            statement,
+            cordelia_crypto::statement::Device::new(ten.key(), "device 10").unwrap(),
+            nine.key(),
+            now as u64,
+        )
+        .unwrap()
+        .sign(&nine.identity)
+        .unwrap();
+        crate::person::see_addition(&s[0].conn, &record, now).unwrap();
+        assert!(!s[0].counts(&ten.key()));
+        let added = crate::person::added_name(&ten.key()).unwrap();
+        let delete = entry_by(&s[0].identity, &personal, 2, &added, Value::Delete, &[]);
+        let before = signed_on(&s, 0, &s.key(0));
+        entries::store(&s[0].conn, &delete, now).unwrap();
+        let after = signed_on(&s, 0, &s.key(0));
+        assert_eq!(after, (before.0, before.1 + 1_280), "{before:?}");
+    }
+
+    /// The content of the smallest entry: every word is one.
+    const MIN_WORD: usize = cordelia_core::protocol::MIN_ENTRY_CONTENT_BYTES;
 }

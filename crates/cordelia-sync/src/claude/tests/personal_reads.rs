@@ -139,7 +139,7 @@ fn entries_of(st: &AppState, channel: &[u8; 32]) -> i64 {
 fn cycle(st: &AppState, wanted: &BTreeSet<String>) -> (Duration, Vec<String>) {
     let generation = st.sync_control.generation();
     let started = Instant::now();
-    let others = exchange_names(st, wanted, generation).unwrap();
+    let (others, _) = exchange_names(st, wanted, generation).unwrap();
     (started.elapsed(), others)
 }
 

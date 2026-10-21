@@ -455,7 +455,7 @@ pub fn relays_say(
                 .relays
                 .iter()
                 .find(|relay| relay.relay == at.relay)
-                .and_then(|relay| relay.no_room);
+                .and_then(|relay| relay.no_room.as_ref());
             if let Some(last) = last {
                 line.push_str(&format!(", the last time {}", ago(now - last.at)));
             }

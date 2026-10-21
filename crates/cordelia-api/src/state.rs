@@ -1056,16 +1056,64 @@ pub enum LacksFor {
 }
 
 /// A relay's refusal of something that it would have taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// One shape for both records of 2026-10-19: the names warning keeps what
+// was refused (its §2, rule 6), and the look of a relay out of reach
+// carries it whole, for S8 and the status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoRoom {
     /// When, in seconds, in UTC.
     pub at: i64,
     /// Whether it was for the address's allowance of new channels, and
     /// not for the relay's room.
     pub over_allowance: bool,
-    /// Whether it was the change entry that was refused, and not an entry
-    /// of a channel of the device's own.
-    pub of_the_change: bool,
+    /// What was refused: the change entry, or an entry of which channel of
+    /// the device's own, as the device knows its channels (decision
+    /// 2026-10-19 §2, rule 6).
+    pub of: RefusedOf,
+}
+
+/// What a relay refused for room, or for the address's allowance. The
+/// messages channel is said apart, and is never one of these (decision
+/// 2026-10-09 §8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedOf {
+    /// The change entry.
+    Change,
+    /// An entry of the personal channel: what the person's devices keep
+    /// at a relay.
+    Personal,
+    /// An entry of the channel of this name.
+    Name(String),
+    /// An entry of a pair channel, which carries a hand-over.
+    Pair,
+}
+
+impl RefusedOf {
+    /// Whether it was the change entry that was refused.
+    pub fn is_the_change(&self) -> bool {
+        *self == RefusedOf::Change
+    }
+}
+
+impl NoRoom {
+    /// Keep `refused`, a relay's refusal in the pass numbered `pass`, in
+    /// the place of `kept`, that relay's last, which was in the pass
+    /// `kept_in`. One is kept for each relay, the latest; but where the
+    /// personal channel and another were refused in one pass, the
+    /// personal channel's is kept (decision 2026-10-19 §2, rule 6): what
+    /// fills it is what a person can act on, and the status's warning
+    /// speaks of it. Returns whether `refused` was kept.
+    pub fn keep(kept: &mut Option<(NoRoom, u64)>, refused: NoRoom, pass: u64) -> bool {
+        let personal_this_pass = kept
+            .as_ref()
+            .is_some_and(|(kept, kept_in)| *kept_in == pass && kept.of == RefusedOf::Personal);
+        if personal_this_pass && refused.of != RefusedOf::Personal {
+            return false;
+        }
+        *kept = Some((refused, pass));
+        true
+    }
 }
 
 /// Why a device cannot go on in the channels of its own.

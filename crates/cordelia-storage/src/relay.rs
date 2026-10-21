@@ -2327,6 +2327,76 @@ mod tests {
         assert_eq!(held(&conn), [1, 2]);
     }
 
+    /// The room below a channel's cap once the status warns of the
+    /// personal channel holds what can arrive before a person acts
+    /// (decision 2026-10-19 §2, §6), by the relay's own count. A channel of
+    /// 9,831 words, 12,583,680 bytes, is the first count past the line
+    /// that a store can hold. It then takes 64 `applied/` words, 64
+    /// `left/` words, 320 records of 512 bytes, 2,048 words (a recovery's
+    /// names and a joining device's), and then 716 words more; and
+    /// refuses the 717th.
+    #[test]
+    fn the_headroom_holds_what_can_arrive() {
+        use cordelia_core::protocol::{
+            MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_CHANNEL_HEADROOM_BYTES,
+            PERSONAL_CHANNEL_WARN_BYTES, RECOVERY_MAX_NAMES,
+        };
+        let (conn, mut room) = relay();
+        assert_eq!(room.max_channel_bytes, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        // One channel, its words each in a slot of its own, by one
+        // device, as a relay counts them.
+        let mut rev = 0;
+        let mut takes = |name: String, said: &str, cost: u64| {
+            rev += 1;
+            let entry = made(1, 1, rev, &name, said);
+            assert_eq!(entry_cost(entry.content.len()), cost, "{name}");
+            take(&conn, &mut room, &entry, &from(1), NOW).unwrap()
+        };
+        let mut words = 0;
+        let mut word = |takes: &mut dyn FnMut(String, &str, u64) -> Taken| {
+            words += 1;
+            takes(format!("name/w{words}"), "", SMALL)
+        };
+        for _ in 0..9_831 {
+            assert_eq!(word(&mut takes), Taken::Stored);
+        }
+        let held = |conn: &Connection| held_channel(conn, &channel(1)).unwrap().unwrap().bytes;
+        assert_eq!(held(&conn), 12_583_680);
+        assert!(held(&conn) > PERSONAL_CHANNEL_WARN_BYTES);
+        assert!(held(&conn) - SMALL <= PERSONAL_CHANNEL_WARN_BYTES);
+        // What is written whatever the total.
+        for n in 0..2 * MAX_COUNTED_DEVICES {
+            let prefix = if n % 2 == 0 { "applied/" } else { "left/" };
+            assert_eq!(takes(format!("{prefix}k{n}"), "1", SMALL), Taken::Stored);
+        }
+        for n in 0..MAX_COUNTED_DEVICES + MAX_NOT_COUNTED_RECORDS {
+            let record = "r".repeat(300);
+            assert_eq!(
+                takes(format!("added/k{n}"), &record, SMALL + 256),
+                Taken::Stored
+            );
+        }
+        // A recovery's names, and a joining device's.
+        for _ in 0..2 * RECOVERY_MAX_NAMES {
+            assert_eq!(word(&mut takes), Taken::Stored);
+        }
+        // And 716 words for names added meanwhile.
+        for _ in 0..716 {
+            assert_eq!(word(&mut takes), Taken::Stored);
+        }
+        // 256 bytes are left, less than a word: the headroom, from the
+        // first count past the line, is spent to the last word that fits.
+        let full = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - 256;
+        assert_eq!(held(&conn), full);
+        assert_eq!(
+            full - 12_583_680,
+            PERSONAL_CHANNEL_HEADROOM_BYTES - 768 - 256
+        );
+        assert_eq!(word(&mut takes), Taken::Refused(Refused::ChannelFull));
+        assert_eq!(held(&conn), MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - 256);
+        counted(&conn);
+    }
+
     /// At its cap a relay takes no channel that it does not hold. A newer
     /// revision of an entry it holds, that is no larger, is never refused
     /// for room: so a change entry replaces the one before it at a relay

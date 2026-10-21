@@ -1365,7 +1365,7 @@ pub(crate) mod tests {
                     no_room: (*scenario == Scenario::Refusing).then_some(NoRoom {
                         at: 0,
                         over_allowance: false,
-                        of_the_change: true,
+                        of: cordelia_api::state::RefusedOf::Change,
                     }),
                     another_form: 0,
                     refuses: None,
@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
                             NoRoom {
                                 at: 0,
                                 over_allowance: false,
-                                of_the_change: true,
+                                of: cordelia_api::state::RefusedOf::Change,
                             },
                         )),
                         ..reach.clone()
@@ -1834,7 +1834,7 @@ pub(crate) mod tests {
             Some(LacksFor::Room(NoRoom {
                 at: now - 900,
                 over_allowance,
-                of_the_change: true,
+                of: cordelia_api::state::RefusedOf::Change,
             }))
         };
         full.reach.as_mut().unwrap().lacks_for = room(false);

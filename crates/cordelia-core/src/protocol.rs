@@ -1739,6 +1739,45 @@ const _: () = assert!(OUT_OF_REACH_SECS > 2 * WAKE_WAIT_SECS);
 const _: () = assert!(OUT_OF_REACH_SECS > BOOTNODE_RESOLVE_RETRY_SECS);
 const _: () = assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS);
 
+/// The room left below what a relay holds of one channel once the status
+/// warns that the personal channel nears it, in bytes as entries are
+/// counted: 4 MiB (decision 2026-10-19 §2, §6).
+///
+/// Nothing but a removal frees room in the personal channel in under 90
+/// days, so this is the budget a person has after the warning. It holds
+/// the entries that are written whatever the total (an `applied/` and a
+/// `left/` word for each of 64 devices, and 320 records of an addition:
+/// 640 KiB), a recovery's 1,024 names, a device that joins with as many
+/// folders mapped, and 716 words more for names added meanwhile.
+pub const PERSONAL_CHANNEL_HEADROOM_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Where the status turns amber for the personal channel, as this
+/// device's store holds it: past 12 MiB (decision 2026-10-19 §2, rule 3).
+/// Nothing is refused at the line.
+/// Derived: MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - PERSONAL_CHANNEL_HEADROOM_BYTES.
+pub const PERSONAL_CHANNEL_WARN_BYTES: u64 =
+    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY - PERSONAL_CHANNEL_HEADROOM_BYTES;
+
+// Checked at compile time (decision 2026-10-19 §6): the headroom holds
+// what is written whatever the total and what a recovery and a joining
+// device write before they have read the channel; and the longest word,
+// a text or a delete, is an entry of the smallest content, so that every
+// word is counted alike. A word is `name/` and a name of at most 200
+// bytes (`sync::valid_sync_name`), with the name's length, the value's
+// kind, an empty text's length and an empty chain, sealed.
+const _: () = assert!(
+    PERSONAL_CHANNEL_HEADROOM_BYTES
+        >= 2 * MAX_COUNTED_DEVICES as u64 * entry_cost(MIN_ENTRY_CONTENT_BYTES)
+            + (MAX_COUNTED_DEVICES + MAX_NOT_COUNTED_RECORDS) as u64
+                * entry_cost(2 * MIN_ENTRY_CONTENT_BYTES)
+            + 2 * RECOVERY_MAX_NAMES as u64 * entry_cost(MIN_ENTRY_CONTENT_BYTES)
+);
+const _: () = assert!(
+    ITEM_SEAL_OVERHEAD_BYTES + 2 + PERSONAL_NAME_PREFIX.len() + 200 + 1 + 2 + 2
+        <= MIN_ENTRY_CONTENT_BYTES
+);
+const _: () = assert!(PERSONAL_CHANNEL_WARN_BYTES < MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+
 /// The most characters of a file's name that a command prints, and that
 /// the node puts in a line of its status (decision 2026-10-04 §16):
 /// another device may have written the name, and a name may be as long
@@ -3243,6 +3282,32 @@ mod tests {
         // in a minute, for the answer to a show (§16).
         assert_eq!(SHOW_ANSWER_ROOM_BYTES, 65_536 + 1024);
         assert_eq!(SHOW_ANSWER_ROOM_BYTES, entry_cost(MAX_ITEM_BYTES));
+    }
+
+    /// The line past which the status warns of the personal channel, and
+    /// the room below the cap after it (decision 2026-10-19 §2, §6): 12
+    /// MiB and 4 MiB, the headroom no less than what can arrive before a
+    /// person acts, 3,276,800 bytes, and 716 words more.
+    #[test]
+    fn test_the_line_of_the_personal_channel_decision_2026_10_19_6() {
+        assert_eq!(PERSONAL_CHANNEL_HEADROOM_BYTES, 4 * 1024 * 1024);
+        assert_eq!(PERSONAL_CHANNEL_WARN_BYTES, 12 * 1024 * 1024);
+        assert_eq!(
+            PERSONAL_CHANNEL_WARN_BYTES + PERSONAL_CHANNEL_HEADROOM_BYTES,
+            MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
+        );
+        let word = entry_cost(MIN_ENTRY_CONTENT_BYTES);
+        assert_eq!(word, 1_280);
+        let whatever = 2 * MAX_COUNTED_DEVICES as u64 * word
+            + (MAX_COUNTED_DEVICES + MAX_NOT_COUNTED_RECORDS) as u64
+                * entry_cost(2 * MIN_ENTRY_CONTENT_BYTES);
+        assert_eq!(whatever, 640 * 1024);
+        let before_a_read = 2 * RECOVERY_MAX_NAMES as u64 * word;
+        assert_eq!(whatever + before_a_read, 3_276_800);
+        assert_eq!(
+            (PERSONAL_CHANNEL_HEADROOM_BYTES - whatever - before_a_read) / word,
+            716
+        );
     }
 
     // ── Messages between your own agents (decision 2026-10-09) ───────
