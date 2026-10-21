@@ -5733,6 +5733,41 @@ fn the_wait_that_cannot_start_ends_with_3() {
     assert_eq!(look(&laptop)["change"], 2);
 }
 
+/// The wait after a change ends with status 3 where the device no longer
+/// stands in its phrase (decision 2026-10-19 §4, rule 8): the laptop is
+/// removed from the desktop, and the wait of the change it applied last
+/// is run on it. It shows the change to no relay, so no end would hold:
+/// the wait says why, and ends at once, never saying that the machine may
+/// be closed.
+#[test]
+fn the_wait_ends_with_3_where_the_device_no_longer_stands_in_its_phrase() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let all = [&relay, &laptop, &desktop];
+    let words = makes_a_phrase(&desktop, "desktop");
+    adds(&desktop, &laptop, "laptop");
+    let mut at = removes(&desktop, &key_of(&laptop), &[], &words);
+    at.says("The change is made");
+    drop(at);
+    wait_for("the laptop learns that it was removed", &all, 120, || {
+        (text(&look(&laptop), "state") == "removed").then_some(())
+    });
+    let change = look(&laptop)["change"]
+        .as_u64()
+        .expect("a change is applied");
+    // At a terminal, so that a wait that would not end fails the test in
+    // a minute, and does not hold it up.
+    let at = laptop.at_terminal(&["change-made", &change.to_string()]);
+    let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
+    assert_eq!(status, Some(3), "{said}");
+    assert!(
+        said.contains("This device no longer stands in its phrase (this device was removed"),
+        "{said}"
+    );
+    says_not_that_it_may_be_closed(&said);
+}
+
 /// The wait after a change ends with status 3 where the device has since
 /// applied another change, and on an error during the wait (decision
 /// 2026-10-19 §4, rule 8): the change is made, and is not known to be at
