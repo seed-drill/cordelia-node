@@ -5506,9 +5506,16 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     at.says("The change is made (change 2).");
     let made = Instant::now();
     at.says(&format!("{reached} holds the change"));
-    at.says(&format!(
-        "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
-    ));
+    // Said as the wait goes on, before or after that line: the first look
+    // after the change may still be of the entry before it, and then
+    // neither relay is said to hold the change.
+    assert!(
+        at.said.contains(&format!(
+            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+        )),
+        "{}",
+        at.said
+    );
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert!(
         made.elapsed() >= Duration::from_secs(290),
