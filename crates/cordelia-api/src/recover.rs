@@ -103,10 +103,12 @@ use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::meta;
 use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
 
+use crate::at_relays::known::RelayId;
 use crate::carry::{self, Allows, Rule, Tally, Word};
 use crate::carrying;
 use crate::commands;
 use crate::error::ApiError;
+use crate::look::CarriedWordLook;
 use crate::names;
 use crate::person::{self, NotCounted, PersonError, in_one};
 use crate::state::{AppState, AtRelays};
@@ -301,6 +303,52 @@ pub struct Generation {
     /// (Whoever had the channel read knows how it was read at each
     /// relay, and says which it is.)
     pub cut_short: Option<[u8; 32]>,
+    /// That device's carried word, where it wrote it and not `sent`, as a
+    /// device that had applied the statement reads it (decision
+    /// 2026-10-19 §4, rule 5): what it carried is at the relays that the
+    /// word names ([`Generation::judged`]).
+    pub carried_word: Option<CarriedWordLook>,
+}
+
+/// What a recovery judges of the one device of the statement it recovers
+/// from, by that device's words, before its yes (decision 2026-10-19 §4,
+/// rule 10): one of four cases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Judged {
+    /// It wrote `sent`, or the statement lists more devices than one, or
+    /// is the first: not cut short, and nothing is said.
+    Sent,
+    /// It wrote the carried word, and one of the keys that the word names
+    /// is the key of a relay that this machine read: what it carried is at
+    /// a relay that the look reads. Not cut short, and nothing is said.
+    CarriedToARelayRead,
+    /// It wrote the carried word, and this machine read none of the relays
+    /// that it names: what it carried may be only there.
+    CarriedElsewhere(CarriedWordLook),
+    /// Neither word was found: it may have been cut short, by how the
+    /// channel was read.
+    NoWord,
+}
+
+impl Generation {
+    /// What this recovery judges of the one device it recovers from
+    /// (rule 10), where `read` is the node key, as a key is written, of
+    /// each relay at which it read the personal channel of the change it
+    /// recovers from to its end, by the key of the connection that it read
+    /// on. Section 1's "reached" is not used: before its yes the machine
+    /// keeps no change entry, and makes no show.
+    pub fn judged(&self, read: &[String]) -> Judged {
+        if self.cut_short.is_none() {
+            return Judged::Sent;
+        }
+        match &self.carried_word {
+            None => Judged::NoWord,
+            Some(word) if word.keys.iter().any(|key| read.contains(key)) => {
+                Judged::CarriedToARelayRead
+            }
+            Some(word) => Judged::CarriedElsewhere(word.clone()),
+        }
+    }
 }
 
 /// How often the entries of a personal channel are given again, at most,
@@ -570,16 +618,19 @@ pub fn read_generation(
     }
 
     // Whether the one device of a statement that was made after another
-    // wrote that it had sent what it carried (§8).
+    // wrote that it had sent what it carried (§8), and its carried word,
+    // which the same reader reads (decision 2026-10-19 §4, rules 5 and
+    // 10).
     let mut cut_short = None;
+    let mut carried_word = None;
     if statement.devices.len() == 1 && statement.number > 1 {
         let seen = crate::look::look(&conn, &reader, &AtRelays::default(), now)?;
-        let said_sent = seen
-            .devices
-            .first()
-            .is_some_and(|device| device.applied == Some(statement.number) && device.sent);
+        let device = seen.devices.first();
+        let said_sent =
+            device.is_some_and(|device| device.applied == Some(statement.number) && device.sent);
         if !said_sent {
             cut_short = Some(statement.devices[0].key);
+            carried_word = device.and_then(|device| device.carried_word.clone());
         }
     }
     Ok(Generation {
@@ -588,6 +639,7 @@ pub fn read_generation(
         no_row,
         names,
         cut_short,
+        carried_word,
     })
 }
 
@@ -920,6 +972,12 @@ pub fn names_before(
 /// recovery is refused where it does), and each relay that it is set up
 /// with, with the value of the session of its connection, over which the
 /// command makes its proofs. A relay with no session is not reached.
+///
+/// And each relay that it is set up with, by its name, with the key that
+/// its configuration gives it, where it gives one: with the key of each
+/// connection that a read is made on, what the command names a relay by
+/// where a device's carried word names it (decision 2026-10-19 §4, rule
+/// 10).
 pub async fn look(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
     commands::asked(&req, &state)?;
     let sessions = carrying::sessions(&state).await;
@@ -930,7 +988,22 @@ pub async fn look(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpRe
         "this_device": this_device,
         "follows_a_phrase": follows,
         "sessions": carrying::sessions_say(&sessions),
+        "relays": set_up_say(&state.own_channels.relays_set_up_as()),
     })))
+}
+
+/// The relays that the device is set up with, as a command is told them:
+/// each by its name, with the key that its configuration gives it, as a
+/// key is written, where it gives one.
+fn set_up_say(relays: &[RelayId]) -> Vec<serde_json::Value> {
+    let key = |relay: &RelayId| {
+        let key = relay.key.as_ref();
+        key.and_then(|key| cordelia_crypto::bech32::encode_public_key(key).ok())
+    };
+    relays
+        .iter()
+        .map(|relay| json!({ "relay": relay.name, "key": key(relay) }))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -4426,5 +4499,110 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read.cut_short, None);
+    }
+
+    /// A recovery judges the one device of the statement it recovers from
+    /// by that device's words (decision 2026-10-19 §4, rule 10), one of
+    /// four cases: it wrote `sent`, and is not cut short; it wrote the
+    /// carried word, and one of the relays that the word names is a relay
+    /// that this recovery read to its end, by the key of the connection
+    /// that it read on, and is not cut short; it wrote the carried word,
+    /// and this recovery read none of those relays; neither word was
+    /// found. The carried word is read by the reader of rule 5, over what
+    /// was handed: a word of another number is no word.
+    #[test]
+    fn a_recovery_reads_the_carried_word_of_the_one_device() {
+        use cordelia_crypto::reached::CarriedWord;
+        let mut s = Several::of_one_person(2);
+        s.change(0, &[0], &[1]);
+        let from = candidate(&s[0].latest());
+        let statement_key = *phrase().statement_key().unwrap();
+        let personal = s[0].personal();
+        let band = 2u64 << cordelia_core::protocol::REV_COUNT_BITS;
+        let (a, b, c) = ([0xa1; 32], [0xa2; 32], [0xa3; 32]);
+        let written = |key: &[u8; 32]| cordelia_crypto::bech32::encode_public_key(key).unwrap();
+        let mut handed = s[0].stored_in(&personal);
+        handed.push(entry_by(
+            &s[0].identity,
+            &personal,
+            band + 3,
+            &applied_name(&s.key(0)).unwrap(),
+            text(&applied_word(2, false)),
+            &[],
+        ));
+        let read = |handed: &[CheckedEntry]| {
+            read_generation(&from, &statement_key, &s[0].secret(), handed, s.now).unwrap()
+        };
+
+        // 4. Neither word was found.
+        let neither = read(&handed);
+        assert_eq!(neither.cut_short, Some(s.key(0)));
+        assert_eq!(neither.carried_word, None);
+        assert_eq!(neither.judged(&[written(&a)]), Judged::NoWord);
+        assert_eq!(neither.judged(&[]), Judged::NoWord);
+
+        // Its carried word, naming relays A and B, with one relay more at
+        // which what it carried may still wait.
+        let word = |number: u64| CarriedWord {
+            number,
+            keys: vec![a, b],
+            more: 0,
+            not_yet: 1,
+        };
+        let carried = |number: u64, rev: u64| {
+            let value = word(number).to_value().unwrap();
+            entry_by(
+                &s[0].identity,
+                &personal,
+                band + rev,
+                &crate::person::reached_name(&s.key(0)).unwrap(),
+                cordelia_crypto::entry::Value::Other(value),
+                &[],
+            )
+        };
+        let mut with_word = handed.clone();
+        with_word.push(carried(2, 4));
+        let generation = read(&with_word);
+        assert_eq!(generation.cut_short, Some(s.key(0)));
+        let looked = CarriedWordLook {
+            keys: vec![written(&a), written(&b)],
+            more: 0,
+            not_yet: 1,
+        };
+        assert_eq!(generation.carried_word, Some(looked.clone()));
+        // 2. One of the relays that it names was read: not cut short.
+        for read_by in [vec![written(&a)], vec![written(&c), written(&b)]] {
+            assert_eq!(generation.judged(&read_by), Judged::CarriedToARelayRead);
+        }
+        // 3. None of them was read: another relay, or none.
+        for read_by in [vec![written(&c)], vec![]] {
+            assert_eq!(
+                generation.judged(&read_by),
+                Judged::CarriedElsewhere(looked.clone())
+            );
+        }
+        // A word of another number is no word: read as the fourth case.
+        let mut of_another = handed.clone();
+        of_another.push(carried(3, 4));
+        let generation = read(&of_another);
+        assert_eq!(generation.carried_word, None);
+        assert_eq!(generation.judged(&[written(&a)]), Judged::NoWord);
+
+        // 1. It wrote `sent`: not cut short, whatever was read, and its
+        //    carried word, if it had one, is not read beside it.
+        let mut sent = with_word.clone();
+        sent.push(entry_by(
+            &s[0].identity,
+            &personal,
+            band + 5,
+            &applied_name(&s.key(0)).unwrap(),
+            text(&applied_word(2, true)),
+            &[],
+        ));
+        let generation = read(&sent);
+        assert_eq!(generation.cut_short, None);
+        assert_eq!(generation.carried_word, None);
+        assert_eq!(generation.judged(&[]), Judged::Sent);
+        assert_eq!(generation.judged(&[written(&c)]), Judged::Sent);
     }
 }

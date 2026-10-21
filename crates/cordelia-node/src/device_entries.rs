@@ -636,14 +636,18 @@ impl DeviceEntries {
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key: None,
                         });
                         continue;
                     };
+                    // The key of the connection that it is read on.
+                    let key = Some(link.relay().0);
                     if held_up {
                         let read_as = LeftRead::NotRead("the node is held up".into());
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key,
                         });
                         continue;
                     }
@@ -674,6 +678,7 @@ impl DeviceEntries {
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,
+                            key,
                         });
                         continue;
                     };
@@ -683,7 +688,11 @@ impl DeviceEntries {
                         let read = engine
                             .read_left(&link, &channel, &proof, place, until)
                             .await;
-                        LeftAt { relay: name, read }
+                        LeftAt {
+                            relay: name,
+                            read,
+                            key,
+                        }
                     });
                 }
                 while let Some(done) = reads.join_next().await {

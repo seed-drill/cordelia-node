@@ -5024,6 +5024,9 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
         handed_ids(&read[0].read),
         Some((at_the_relay.clone(), true))
     );
+    // With the key of the connection that it was read on (decision
+    // 2026-10-19 §4, rule 10).
+    assert_eq!(read[0].key, Some(key_of(&relay)));
     // Nothing of it is stored, and no place is kept there.
     assert_eq!(stored(&a), stored_before);
     assert!(a.holds_of(&old).is_empty());
@@ -5082,6 +5085,7 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
     let pulled = a.counts("relay").pulled;
     let read = reads_left(&a, old, made("relay", [7; 32], proof)).await;
     assert_eq!(read[0].read, LeftRead::Changed);
+    assert_eq!(read[0].key, Some(key_of(&relay)));
     let read = reads_left(&a, old, made("other", session, proof)).await;
     assert_eq!(read[0].read, LeftRead::Changed);
     assert_eq!(a.counts("relay").pulled, pulled);
@@ -5109,6 +5113,8 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
         .map(|at| (at.relay.as_str(), at.read == LeftRead::NotReached))
         .collect();
     assert_eq!(said, [("relay", false), ("far", true)]);
+    // A relay that is not reached was read on no connection.
+    assert_eq!(read[1].key, None);
     // Asked for at some of them, it is read at those alone, and no
     // other is answered for.
     for (only, reached) in [("relay", true), ("far", false)] {
