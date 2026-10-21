@@ -6029,6 +6029,43 @@ mod tests {
         );
     }
 
+    /// What a recovery hands the process that waits for its look is read
+    /// back as it was handed (decision 2026-10-19, rule 10): a relay whose
+    /// name begins with "-" is not read as a flag.
+    #[test]
+    fn what_a_recovery_hands_on_is_read_back_whatever_its_relays_are_called() {
+        use clap::Parser;
+        let held = "-relay.example:9474 and b.example:9474";
+        let cut = recover_cmd::CutShort::handed(
+            Some("(w1 w2 w3 w4) \"laptop\"".into()),
+            recover_cmd::ChannelRead::Whole,
+            Some(held.into()),
+            2,
+        )
+        .unwrap();
+        let line = [
+            vec![
+                "cordelia".to_string(),
+                recover_cmd::MADE_COMMAND.into(),
+                "3".into(),
+            ],
+            cut.args(),
+        ]
+        .concat();
+        match super::Cli::try_parse_from(line).map(|cli| cli.command) {
+            Ok(Some(super::Commands::RecoverMade {
+                carried_to,
+                carried_relays,
+                ..
+            })) => {
+                assert_eq!(carried_to.as_deref(), Some(held));
+                assert_eq!(carried_relays, 2);
+            }
+            Ok(_) => panic!("no recover-made"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
     /// What is no more is refused by the command, before anything is sent
     /// (decision 2026-10-04 §10.1): `--all`, with whatever beside it;
     /// `--exclude`; and `exclude` and `include`, each with what to do
