@@ -1162,6 +1162,8 @@ pub(crate) mod tests {
         let lacks_for_now = (None, false);
         for holding in [vec![ok], vec![stuck, moving], vec![out_holding, ok]] {
             assert_eq!(recovery_end_of(&holding), Some(RecoveryEnd::Recovered));
+            // Where no relay lacks the change, a recovery is not "not done".
+            assert!(!ends_recovery_not_done(&holding), "{holding:?}");
         }
         for lacking in [
             vec![ok, out_lacking],
