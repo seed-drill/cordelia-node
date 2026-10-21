@@ -330,7 +330,7 @@ A device writes, in the personal channel of the generation it has applied, under
 - **Why a slot of its own:** see rule 1. A device of alpha.12 stores an entry under a name that it does not know, where its signer counts, and reads nothing of it (`take.rs:188-255, 327-328`).
 - **Why keys:** a key is what a relay shows anyone who connects. A reader knows the key of each relay it is set up with that has one in its configuration, and of each it has reached.
 - **What it costs:**
-  - one entry for each device that has a relay out of reach after a change, a content of 512 bytes, and its delete;
+  - one entry for each device that has a relay out of reach after a change, and its delete: a content of 256 bytes where the word names up to four keys, as every other entry of the personal channel is, and of 512 bytes where it names five or more;
   - every device of the person learns the keys of the relays to which each other device sent what it carried. For the default relays those keys are in the program already.
 - **Set aside:**
   - **The names of the relays out of reach** (the second form). They are addresses, and a reader can do nothing with them but repeat them (the second review, M7). The count says enough: "not yet to <k> other relays".
@@ -658,7 +658,7 @@ The wait does not save it there. What the third form adds there is the faster di
 
 **What a relay sees of it:**
 
-- the carried word and its delete: one entry of the personal channel each, of a size it cannot tell from any other;
+- the carried word and its delete: one entry of the personal channel each. A word that names up to four keys, and every delete, is of a size it cannot tell from any other entry there (a content of 256 bytes). A word that names five keys or more is of 512 bytes, and so tells it that the device named five relays or more. It is not padded to 512: then every carried word would be the one entry of its size in the channel, and a relay could tell each from the rest;
 - dials every 30 seconds from a device for which it lacks a change, where today it sees one every 15 minutes.
 
 ## 8. What it costs
