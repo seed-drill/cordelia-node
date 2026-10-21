@@ -5657,6 +5657,7 @@ mod tests {
         progress: Value,
         looks: std::cell::RefCell<Vec<Value>>,
         fails: bool,
+        asked: std::cell::Cell<usize>,
     }
 
     impl Stands {
@@ -5665,6 +5666,7 @@ mod tests {
                 progress,
                 looks: std::cell::RefCell::new(looks),
                 fails: false,
+                asked: std::cell::Cell::new(0),
             }
         }
     }
@@ -5677,6 +5679,11 @@ mod tests {
             None
         }
         fn look(&self) -> anyhow::Result<Value> {
+            // A wait that would never end fails the test at once.
+            self.asked.set(self.asked.get() + 1);
+            if self.asked.get() > 100 {
+                anyhow::bail!("the wait did not end");
+            }
             let mut looks = self.looks.borrow_mut();
             if self.fails && looks.len() == 1 {
                 anyhow::bail!("the node did not answer");
