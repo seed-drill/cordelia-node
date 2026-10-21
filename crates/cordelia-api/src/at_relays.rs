@@ -3934,6 +3934,19 @@ mod tests {
         assert!(say_reached(conn, identity, &stuck, now).unwrap());
         assert_eq!(word(&s), Some(Value::Delete));
 
+        // A recovery's look that is pending writes nothing, and mends
+        // nothing either.
+        let s = carried_after_a_change();
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        took_all(&s, &relay_key(1));
+        let before = [found(1, Some(OK)), found(2, Some(OutLacking))];
+        assert!(say_reached(conn, identity, &before, now).unwrap());
+        meta::set(conn, meta::PERSON_LOOK_PENDING, "1").unwrap();
+        dropped_all(&s, &relay_key(1));
+        assert_eq!(standing_to_mend(conn, identity, &before).unwrap(), None);
+        assert!(!say_reached(conn, identity, &before, now).unwrap());
+        assert_eq!(word(&s), as_value(carried_word(2, &[1], 0, 1)));
+
         // With no word standing, nothing is mended.
         let s = carried_after_a_change();
         let none = [found(1, Some(Stuck)), found(2, Some(OutLacking))];
