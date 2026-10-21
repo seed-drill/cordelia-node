@@ -2518,7 +2518,9 @@ fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_no
 /// before the change is made, so that it cannot be run again for the
 /// wait: the command says where to look, and that the machine is to be
 /// kept on. The error is said on standard error, with that the change is
-/// made and is not to be made again.
+/// made and is not to be made again. So it ends where a node of another
+/// version is in this one's place during the wait, and where the look
+/// says of a relay what the command cannot read.
 #[test]
 fn a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error() {
     let relay = relay_started();
@@ -2562,6 +2564,36 @@ fn a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error() {
         said.contains("This device has since applied another change: `cordelia devices` says."),
         "{said}"
     );
+    // A node of another version in this one's place during the wait, and
+    // a look of which a relay's reach cannot be read: each ends the wait
+    // as an error, with status 3, and not by waiting for ever (decision
+    // 2026-10-19 §4, rule 9).
+    let other_version = Answers::in_the_place_of(&new, |path, answer| {
+        if path == "/api/v1/status" {
+            answer["version"] = "0.0.1-another".into();
+        }
+    });
+    let unreadable = Answers::in_the_place_of(&new, |path, answer| {
+        if path == "/api/v1/devices/list" {
+            for relay in answer["relays"].as_array_mut().into_iter().flatten() {
+                relay.as_object_mut().unwrap().remove("reach");
+            }
+        }
+    });
+    for (through, why) in [
+        (&other_version, "0.0.1-another"),
+        (&unreadable, "what this command cannot read"),
+    ] {
+        let at = new.at_terminal_through(through.port, &["recover-made", "2"]);
+        let (status, said) = at.ends_with_status_within(Duration::from_secs(60));
+        assert_eq!(status, Some(3), "{said}");
+        assert!(
+            said.contains("The change is made (change 2). This command could not go on: "),
+            "{said}"
+        );
+        assert!(said.contains(why), "{said}");
+        assert!(!said.contains("Every relay holds the change."), "{said}");
+    }
     // The node cannot be asked.
     new.stop();
     let out = new.command(&["recover-made", "2"]);
