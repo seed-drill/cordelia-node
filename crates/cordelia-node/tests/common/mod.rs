@@ -664,10 +664,12 @@ pub const NOWHERE: &str = "127.0.0.1:9";
 
 /// A relay's name under which nothing can be looked up, on any machine:
 /// it has no port, and a name with none is refused where it is read,
-/// before any lookup is made. A test gives a node this relay where it
-/// needs one whose name does not resolve: the node is set up with it, and
-/// dials nothing for it.
-pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve";
+/// before any lookup is made; and should it ever be looked up, it is under
+/// `.invalid`, which no resolver answers (RFC 2606), whatever search
+/// domains the machine is set up with. A test gives a node this relay
+/// where it needs one whose name does not resolve: the node is set up
+/// with it, and dials nothing for it.
+pub const NO_SUCH_NAME: &str = "a-relay-whose-name-does-not-resolve.invalid";
 
 /// A test node dials nothing that is not on this machine, whatever a test
 /// gives it: a loopback address with its port, read as the node first

@@ -1903,8 +1903,9 @@ line shows as amber that some device has not applied it (decision §8,
 in a drawer does not keep every status line amber for good. Names that no
 device lists yet in the new generation are shown for as long. A relay not
 known to hold the latest change is shown for as long (decision 2026-10-19,
-rule 11), from the later of when the device came to keep the change entry
-and when this version first started on it. `protocol.rs`
+rule 11), from the latest of when the device came to keep the change entry,
+when this version first started on it, and that relay's latest answer about
+the entry. `protocol.rs`
 asserts that it is shorter than a left secret is kept
 (`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
 known.
