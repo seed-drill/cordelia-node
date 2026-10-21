@@ -1824,6 +1824,7 @@ exit 0"#,
             relays: vec![at("one.example:9474"), at("two.example:9474")],
             cannot_go_on: None,
             word_to_come: false,
+            woke_at: None,
         };
         let known = |name: &str, stands: &str| RelaySnapshot {
             host: name.into(),
@@ -1883,6 +1884,7 @@ exit 0"#,
             relays: names.iter().map(|name| at(name)).collect(),
             cannot_go_on: None,
             word_to_come: false,
+            woke_at: None,
         };
         assert_eq!(dial_of(&state, &set_up), ["dialled"; 4]);
         let known = |name: &str, stands: &str, tried: Tried| RelaySnapshot {
@@ -1919,6 +1921,7 @@ exit 0"#,
             ],
             cannot_go_on: None,
             word_to_come: false,
+            woke_at: None,
         };
         let keyed = |key: [u8; 32], stands: &str, tried: Tried| RelaySnapshot {
             key: Some(encode_public_key(&key).unwrap()),

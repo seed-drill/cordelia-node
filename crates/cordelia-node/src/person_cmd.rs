@@ -1200,25 +1200,23 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         by_name(waits, relays[n]) || (waits["name"].is_null() && found_at[n].iter().any(found))
     };
     let to_send = |waits: &Value| waits["waits"].as_u64().filter(|n| *n > 0);
+    let woke_at = seen["woke_at"].as_i64();
     for (n, relay) in relays.iter().enumerate() {
-        let holds = match (
-            relay["heard_since_woke"] == true,
-            relay["holds_latest"].as_bool(),
-        ) {
-            (false, _) => {
-                "has not answered since this device woke: a change made while it was \
-                           off may not have reached it"
-            }
-            (true, Some(true)) => "holds the latest change",
-            (true, Some(false)) => "does not hold the latest change yet",
-            (true, None) => "has not said whether it holds the latest change",
-        };
+        let holds = relay_says(relay, woke_at, now);
         let waits = waiting.iter().copied().filter(|waits| is_of(waits, n));
-        let still = match waits.filter_map(to_send).max() {
-            Some(n) => format!("; {n} of this device's channels still to send there"),
-            None => String::new(),
-        };
-        out.push(format!("  {}: {holds}{still}", text(relay, "relay")));
+        let still = waits
+            .filter_map(to_send)
+            .max()
+            .map(|n| format!("{n} of this device's channels still to send there"));
+        // A line of sentences says what waits there on a line of its own.
+        match still {
+            Some(still) if holds.ends_with('.') => {
+                out.push(format!("  {}: {holds}", text(relay, "relay")));
+                out.push(format!("      {still}"));
+            }
+            Some(still) => out.push(format!("  {}: {holds}; {still}", text(relay, "relay"))),
+            None => out.push(format!("  {}: {holds}", text(relay, "relay"))),
+        }
         for more in [&relay["no_room"], &relay["refuses"]] {
             if let Some(more) = more.as_str() {
                 out.push(format!("      {more}"));
@@ -1274,6 +1272,70 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         out.push(format!("  - {}", text(notice, "says")));
     }
     out
+}
+
+/// What `cordelia devices` says of a relay, after its name (decision
+/// 2026-10-19, rule 12), at `now`: `woke_at` is when the device last woke.
+/// What the node knows of its reach is read from the look, and nothing of
+/// it is worked out again.
+///
+/// - **Out of reach, and lacks the change:** D4. **Out of reach, and holds
+///   it:** D5. What is known of a relay is kept across starts, so these
+///   come before what is said of the wake: after a restart a relay that
+///   holds the change and cannot be reached is D5, though it has not
+///   answered since the start.
+/// - **Not heard since the device woke:** D2 while it is not out of reach,
+///   and D3 once it is: a relay in the third state, which neither holds
+///   nor lacks the change.
+/// - Otherwise the lines of before.
+fn relay_says(relay: &Value, woke_at: Option<i64>, now: i64) -> String {
+    use cordelia_api::look::{ReachLook, since, when};
+    use cordelia_api::state::Holds;
+    let reach: Option<ReachLook> = serde_json::from_value(relay["reach"].clone()).ok();
+    let out = reach
+        .as_ref()
+        .filter(|reach| reach.out_of_reach_since.is_some());
+    let name = text(relay, "relay");
+    let woke = woke_at
+        .map(|at| format!(" at {}", when(at, now)))
+        .unwrap_or_default();
+    match out {
+        Some(reach) if reach.holds == Holds::Lacks => {
+            return format!(
+                "is not known to hold the latest change, and {}. A device of yours that \
+                 reaches only it may not have heard of that change. If you know that {name} is \
+                 gone for good, take it out of the configuration of every device. Do not do so \
+                 only because this machine cannot reach it: it may still serve a device that \
+                 does.",
+                since(reach, now)
+            );
+        }
+        Some(reach) if reach.holds == Holds::Holds => {
+            let said = reach
+                .answered_at
+                .map(|at| format!(" (as it said at {})", when(at, now)))
+                .unwrap_or_default();
+            return format!("holds the latest change{said}, and {}", since(reach, now));
+        }
+        _ => {}
+    }
+    match (
+        relay["heard_since_woke"] == true,
+        relay["holds_latest"].as_bool(),
+    ) {
+        (false, _) if out.is_some() => format!(
+            "has not answered since this device started or woke{woke}, and cannot be reached \
+             from here. A change made while this device was off may be there, and not have \
+             reached it."
+        ),
+        (false, _) => format!(
+            "has not answered since this device started or woke{woke}. A change made while \
+             this device was off may be there, and not have reached it."
+        ),
+        (true, Some(true)) => "holds the latest change".into(),
+        (true, Some(false)) => "does not hold the latest change yet".into(),
+        (true, None) => "has not said whether it holds the latest change".into(),
+    }
 }
 
 /// What `cordelia devices` says of names (decision 2026-10-04 §7.3, §8):
@@ -4042,6 +4104,128 @@ mod tests {
         heard["added"][0]["applied"] = json!(1);
         let line = says_of(&heard, 1, "desktop", now + 1);
         assert!(line.contains("has applied change 1"), "{line}");
+    }
+
+    /// What `cordelia devices` says of each relay, one case each
+    /// (decision 2026-10-19, rule 12): D2 while a relay not heard since the
+    /// device woke is not out of reach, D3 once it is; D4 for one that is
+    /// out of reach and lacks the change; D5 for one that is out of reach
+    /// and holds it, whether or not it has answered since the device woke;
+    /// and the lines of before. Each word for word, with `<when>` with and
+    /// without its date, and `<since>` in both forms.
+    #[test]
+    fn each_relay_line_by_its_case() {
+        // Noon, 2026-10-21, in UTC; and a moment of the day before.
+        let now = 1_792_584_000;
+        let yesterday = now - 86_400;
+        let relay = |heard: bool, holds_latest: Value, reach: Value| {
+            json!({ "relay": "b.example:9474", "heard_since_woke": heard,
+                    "holds_latest": holds_latest, "reach": reach })
+        };
+        let reach = |holds: &str, out: Option<i64>, last_reached: Option<i64>| {
+            json!({ "class": null, "holds": holds, "reached": false, "out_of_reach_since": out,
+                    "reference": now - 900, "last_reached": last_reached, "waits": null,
+                    "refusing_waits_since": null, "no_room": null,
+                    "answered_at": yesterday, "lacking_secs": null })
+        };
+        let woke = Some(now - 600);
+        let cases = [
+            // D2: not heard since the device woke, not out of reach.
+            (
+                relay(false, Value::Null, reach("neither", None, None)),
+                "has not answered since this device started or woke at 11:50 UTC. A change made \
+                 while this device was off may be there, and not have reached it.",
+            ),
+            // D3: the same, out of reach.
+            (
+                relay(false, Value::Null, reach("neither", Some(now - 60), None)),
+                "has not answered since this device started or woke at 11:50 UTC, and cannot be \
+                 reached from here. A change made while this device was off may be there, and \
+                 not have reached it.",
+            ),
+            // D4: out of reach, and lacks the change; `<since>` at its
+            // reference, where it was not reached since.
+            (
+                relay(false, Value::Null, reach("lacks", Some(now - 60), None)),
+                "is not known to hold the latest change, and has not answered since 11:45 UTC. \
+                 A device of yours that reaches only it may not have heard of that change. If \
+                 you know that b.example:9474 is gone for good, take it out of the \
+                 configuration of every device. Do not do so only because this machine cannot \
+                 reach it: it may still serve a device that does.",
+            ),
+            // D5: out of reach, and holds it, by what is kept across a
+            // start; `<since>` at when it was last reached.
+            (
+                relay(
+                    false,
+                    Value::Null,
+                    reach("holds", Some(now - 60), Some(now - 600)),
+                ),
+                "holds the latest change (as it said at 2026-10-20 12:00 UTC), and has not been \
+                 reached from here since 11:50 UTC",
+            ),
+            (
+                relay(
+                    true,
+                    json!(true),
+                    reach("holds", Some(now - 60), Some(now - 300)),
+                ),
+                "holds the latest change (as it said at 2026-10-20 12:00 UTC), and has not been \
+                 reached from here since 11:55 UTC",
+            ),
+            // The lines of before.
+            (
+                relay(true, json!(true), reach("holds", None, None)),
+                "holds the latest change",
+            ),
+            (
+                relay(true, json!(false), reach("lacks", None, None)),
+                "does not hold the latest change yet",
+            ),
+            (
+                relay(true, Value::Null, reach("neither", None, None)),
+                "has not said whether it holds the latest change",
+            ),
+        ];
+        for (relay, said) in cases {
+            assert_eq!(relay_says(&relay, woke, now), said, "{relay}");
+        }
+        // With no wake said, no time is said of it.
+        let d2 = relay(false, Value::Null, reach("lacks", None, None));
+        assert!(
+            relay_says(&d2, None, now)
+                .starts_with("has not answered since this device started or woke. "),
+            "{}",
+            relay_says(&d2, None, now)
+        );
+
+        // In the list, what waits at a relay whose line is sentences is
+        // said on a line of its own.
+        let key = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
+        let seen = json!({
+            "this_device": encode_public_key(&key).unwrap(),
+            "change": 1, "devices": [], "woke_at": now - 600,
+            "relays": [
+                relay(false, Value::Null, reach("lacks", Some(now - 60), None)),
+                relay(false, Value::Null, reach("lacks", None, None)),
+            ],
+            "waiting": [{ "relay": "192.0.2.1:9474", "name": "b.example:9474", "waits": 2 }],
+        });
+        let lines = devices_lines_at(&seen, &key, now, &LOOKED_UP);
+        let from = lines.iter().position(|line| line == "Relays:").unwrap();
+        // The device's wake, as the look says it.
+        assert!(
+            lines[from + 3].contains("since this device started or woke at 11:50 UTC. "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[from + 1].starts_with("  b.example:9474: is not known to hold the latest change"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[from + 2],
+            "      2 of this device's channels still to send there"
+        );
     }
 
     /// `cordelia devices` lists each relay once, by its name, with both

@@ -1877,8 +1877,10 @@ alone.
 
 **Rationale:** How long a thing that will pass by itself has lasted before
 the status line shows it as amber (decision §10.1): no relay connected; a
-relay that is connected and does not hold the latest change; and, after a
-change, names that are not yet in the new generation or not yet sent. It is
+relay that is not known to hold the latest change, connected or not, counted
+from the later of the change of the kept entry, the node's start and a
+sleep, and not from a wake after no connection (decision 2026-10-19, rule
+11); and, after a change, names that are not yet in the new generation or not yet sent. It is
 also for how long, after a device joined or another was added, `cordelia
 devices` says of a device that it has not heard from only "not heard from
 yet", and advises nothing (decision §8): after that it says that the device
@@ -1899,7 +1901,10 @@ It is the time a relay takes to be out of reach (`OUT_OF_REACH_SECS`).
 line shows as amber that some device has not applied it (decision §8,
 §10.1). After that it is said in `cordelia devices` only: a device that lies
 in a drawer does not keep every status line amber for good. Names that no
-device lists yet in the new generation are shown for as long. `protocol.rs`
+device lists yet in the new generation are shown for as long. A relay not
+known to hold the latest change is shown for as long (decision 2026-10-19,
+rule 11), from the later of when the device came to keep the change entry
+and when this version first started on it. `protocol.rs`
 asserts that it is shorter than a left secret is kept
 (`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
 known.

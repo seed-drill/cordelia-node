@@ -321,31 +321,9 @@ pub(crate) fn recovery_end_lines(end: RecoveryEnd, relays: &[RelayAt], now: i64)
 
 // ── The words ───────────────────────────────────────────────────────
 
-/// A moment that the node noted by the wall clock, as a person reads it
-/// (decision 2026-10-19 §1, `<when>`): the hour and the minute, in UTC,
-/// with the date before it where it is not today, `now`.
-pub(crate) fn when(at: i64, now: i64) -> String {
-    let day = |at: i64| chrono::DateTime::from_timestamp(at, 0).map(|at| at.date_naive());
-    match chrono::DateTime::from_timestamp(at, 0) {
-        Some(moment) if day(at) == day(now) => moment.format("%H:%M UTC").to_string(),
-        Some(moment) => moment.format("%Y-%m-%d %H:%M UTC").to_string(),
-        None => format!("{at}"),
-    }
-}
-
-/// `<since>` (decision 2026-10-19 §5): "has not been reached from here
-/// since <when>", where the relay was reached since its reference last
-/// moved by a start, a sleep or a change of the kept entry, at the moment
-/// it was last reached; "has not answered since <when>" where it was not,
-/// at its reference.
-pub(crate) fn since(reach: &ReachLook, now: i64) -> String {
-    match reach.last_reached {
-        Some(at) if at >= reach.reference => {
-            format!("has not been reached from here since {}", when(at, now))
-        }
-        _ => format!("has not answered since {}", when(reach.reference, now)),
-    }
-}
+// `<when>` and `<since>` are written where a status writes its lines, so
+// that the wait and the status never say a time two ways.
+pub(crate) use cordelia_api::look::{since, when};
 
 /// `<since>` of a relay, where the look says what is known of its reach.
 fn since_of(relay: &RelayAt, now: i64) -> String {
@@ -1298,6 +1276,7 @@ pub(crate) mod tests {
                 .collect(),
             cannot_go_on: None,
             word_to_come: to_come,
+            woke_at: None,
         };
         let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
         let mut relays = serde_json::to_value(looked(&at)).unwrap();
@@ -1467,6 +1446,8 @@ pub(crate) mod tests {
                 waits: None,
                 refusing_waits_since: (class == Some(Class::Stuck)).then_some(noon() - 420),
                 no_room: None,
+                answered_at: None,
+                lacking_secs: None,
             }),
             dial,
             refuses: None,

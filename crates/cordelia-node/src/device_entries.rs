@@ -2911,6 +2911,7 @@ impl DeviceEntries {
             relays,
             cannot_go_on,
             word_to_come,
+            woke_at: self.leave.woke_at(),
         });
     }
 }

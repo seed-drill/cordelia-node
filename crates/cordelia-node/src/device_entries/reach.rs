@@ -610,6 +610,16 @@ impl Reach {
                 .filter(|_| reached && of.waits == Some(true))
                 .map(|since| Moment::back_from(now, since).wall);
             let out = of.out_since.is_some();
+            // What the status line counts (decision 2026-10-19, rule 11):
+            // from the later of when it came to lack the change and the
+            // start, a sleep or the change of the kept entry. Its own
+            // reference is not used: being reached moves that.
+            let lacking_secs = (holds == Holds::Lacks).then(|| {
+                let from = of
+                    .lacking_since
+                    .map_or(common.at, |since| since.at.max(common.at));
+                now.at.saturating_duration_since(from).as_secs()
+            });
             Reached {
                 key: relay.key,
                 holds,
@@ -621,6 +631,7 @@ impl Reach {
                 waits,
                 refusing_waits_since,
                 answered_at: of.answered_at,
+                lacking_secs,
                 class: class(holds, reached, out, waits, refused_long),
             }
         })
@@ -743,6 +754,54 @@ mod tests {
             .of(relay)
             .out_of_reach_since
             .map(|since| since - start)
+    }
+
+    /// For how long a relay has lacked the change, as the status line
+    /// counts it (decision 2026-10-19, rule 11): from the later of when it
+    /// came to lack it and the node's start, a sleep or a change of the
+    /// kept entry, by the node's own clock. Being reached does not restart
+    /// it, nor a dial; a relay that holds the change, or is in the third
+    /// state, has none.
+    #[test]
+    fn what_the_status_line_counts_of_a_relay_that_lacks_the_change() {
+        let (a, b, c) = (relay("a"), relay("b"), relay("c"));
+        let (reach, clock) =
+            started(&[(&a, Holds::Holds), (&b, Holds::Lacks), (&c, Holds::Neither)]);
+        let secs = |relay: &RelayId| reach.of(relay).lacking_secs;
+        let mut at = At::new(&clock);
+        at.to(120);
+        assert_eq!(secs(&a), None);
+        assert_eq!(secs(&b), Some(120));
+        assert_eq!(secs(&c), None);
+        // Reached, and still lacking: its own reference moves, and the
+        // count goes on.
+        shown(&reach, &b, link(1), Said::Lacks, Holds::Lacks);
+        dial_fails(&reach, &b);
+        at.to(301);
+        assert_eq!(secs(&b), Some(301));
+        // A relay that held the change counts from when it came to lack
+        // it.
+        shown(&reach, &a, link(2), Said::Lacks, Holds::Lacks);
+        at.to(400);
+        assert_eq!(secs(&a), Some(99));
+        // A sleep counts again from the wake.
+        clock.slept(Duration::from_secs(3600));
+        reach.slept();
+        at.to(460);
+        assert_eq!(secs(&b), Some(60));
+        assert_eq!(secs(&a), Some(60));
+        // And so does a new kept entry.
+        observe(
+            &reach,
+            LATER,
+            &[(&a, Holds::Lacks), (&b, Holds::Lacks), (&c, Holds::Lacks)],
+        );
+        at.to(500);
+        assert_eq!(secs(&b), Some(40));
+        assert_eq!(secs(&c), Some(40));
+        // One that holds it again has none.
+        shown(&reach, &b, link(1), Said::Holds, Holds::Holds);
+        assert_eq!(secs(&b), None);
     }
 
     /// A relay is out of reach once five minutes have gone with every

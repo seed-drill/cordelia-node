@@ -893,6 +893,11 @@ pub struct AtRelays {
     /// the functions that write them
     /// ([`crate::at_relays::word_to_come`]).
     pub word_to_come: bool,
+    /// When the device last woke, by the time of day, in seconds: where
+    /// it reaches no relay, since when it has reached none. What
+    /// `cordelia devices` and a status say a relay has not answered since
+    /// (decision 2026-10-19 §5, D2 and T1).
+    pub woke_at: Option<i64>,
 }
 
 /// Where a device stands at one relay.
@@ -1016,6 +1021,13 @@ pub struct Reach {
     /// When it gave its latest answer about the kept entry, where it gave
     /// one.
     pub answered_at: Option<i64>,
+    /// For how long it has lacked the change, in seconds, by the node's
+    /// own clock, where it lacks it: since the later of when it came to
+    /// lack it and the latest of the node's start, a sleep and the change
+    /// of the kept entry. A wake after no connection does not restart it
+    /// (decision 2026-10-19, rule 11). `None` where it holds the change,
+    /// and in the third state.
+    pub lacking_secs: Option<u64>,
     /// Its class, where it is in one.
     pub class: Option<Class>,
 }

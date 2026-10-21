@@ -3195,6 +3195,7 @@ mod tests {
             }],
             cannot_go_on: None,
             word_to_come: false,
+            woke_at: None,
         });
         let (read, found) = read_at(
             &state,

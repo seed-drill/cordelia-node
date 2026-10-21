@@ -1767,10 +1767,19 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
             .filter(|notice| notice["kind"] == "added")
             .count(),
         said_left: said_left.filter(|device| device["left"] == true).count(),
-        without_latest_secs: list("relays")
-            .filter(|relay| relay["holds_latest"] == false)
-            .filter_map(|relay| relay["connected_secs"].as_u64())
+        // What is known of each relay's reach, as the node put it
+        // (decision 2026-10-19 §1, rule 11): nothing of it is worked out
+        // again here.
+        not_known_to_hold_secs: list("relays")
+            .filter(|relay| relay["reach"]["holds"] == "lacks")
+            .filter_map(|relay| relay["reach"]["lacking_secs"].as_u64())
             .collect(),
+        known_since_secs: ago(&person["relays_known_since"]),
+        out_of_reach_secs: list("relays")
+            .filter(|relay| relay["reach"]["class"] == "out_holding")
+            .filter_map(|relay| ago(&relay["reach"]["out_of_reach_since"]))
+            .collect(),
+        one_reached: list("relays").any(|relay| relay["reach"]["reached"] == true),
         no_room_secs: list("relays")
             .filter_map(|relay| ago(&relay["no_room_at"]))
             .collect(),
@@ -6761,6 +6770,45 @@ mod tests {
         );
     }
 
+    /// A relay in the third state is not amber (decision 2026-10-19 §1,
+    /// rule 11): it has not been shown to lack the change, and no change
+    /// has been made since its mark. A relay that lacks it is, connected
+    /// or not, as the node counts it.
+    #[test]
+    fn a_relay_in_the_third_state_is_not_amber() {
+        let now = 1_000_000;
+        let look = |holds: &str, reached: bool| {
+            serde_json::json!({
+                "state": "applied", "change": 3, "devices": [], "added": [],
+                "relays_known_since": now - 3_600,
+                "relays": [{ "relay": "b", "holds_latest": null, "connected_secs": null,
+                    "reach": { "holds": holds, "lacking_secs": 600, "reached": reached,
+                               "class": null, "out_of_reach_since": now - 300 } }],
+            })
+        };
+        let shown = |look: &serde_json::Value| {
+            let facts = indicator::Facts {
+                initialised: true,
+                running: true,
+                role: "personal".into(),
+                stands: "applied".into(),
+                devices: devices_facts(look, now),
+                ..Default::default()
+            };
+            indicator::shown(&facts)
+        };
+        let third = shown(&look("neither", false));
+        assert_eq!(third.level, None, "{:?}", third.holds);
+        for reached in [false, true] {
+            let lacks = shown(&look("lacks", reached));
+            assert_eq!(lacks.level, Some(indicator::Level::Amber));
+            assert_eq!(
+                lacks.summary,
+                "memory: a relay not known to hold the latest change"
+            );
+        }
+    }
+
     /// What a status goes by of a person's devices, from the node's look
     /// at them (decision 2026-10-04 §8, §10.1): each thing as the look
     /// gives it, and nothing where the look says nothing.
@@ -6800,11 +6848,20 @@ mod tests {
                 { "id": "4", "kind": "left_out" },
             ],
             "relays": [
-                { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null },
-                { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60 },
-                { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null },
-                { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5 },
+                { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null,
+                  "reach": { "holds": "lacks", "lacking_secs": 400, "reached": true,
+                             "class": null, "out_of_reach_since": null } },
+                { "relay": "b", "holds_latest": true, "connected_secs": 900, "no_room_at": now - 60,
+                  "reach": { "holds": "holds", "lacking_secs": null, "reached": false,
+                             "class": "out_holding", "out_of_reach_since": now - 120 } },
+                { "relay": "c", "holds_latest": false, "connected_secs": null, "no_room_at": null,
+                  "reach": { "holds": "lacks", "lacking_secs": 90, "reached": false,
+                             "class": "out_lacking", "out_of_reach_since": now - 30 } },
+                { "relay": "d", "holds_latest": null, "connected_secs": 700, "no_room_at": now + 5,
+                  "reach": { "holds": "neither", "lacking_secs": null, "reached": false,
+                             "class": null, "out_of_reach_since": now - 60 } },
             ],
+            "relays_known_since": now - 7_200,
             // Two that a device which still counts had listed, and one
             // that only a device which counts no longer had.
             "names_not_listed": [
@@ -6824,9 +6881,14 @@ mod tests {
                 removal_not_applied_secs: Some(3_600),
                 added_not_cleared: 2,
                 said_left: 2,
-                // Only a relay that is connected and says that it does
-                // not hold it.
-                without_latest_secs: vec![400],
+                // Each relay that lacks the change, connected or not, as
+                // the node counts it; one in the third state is not
+                // among them.
+                not_known_to_hold_secs: vec![400, 90],
+                known_since_secs: Some(7_200),
+                // Only a relay out of reach that holds the change.
+                out_of_reach_secs: vec![120],
+                one_reached: true,
                 // A refusal in the clock's future was a moment ago.
                 no_room_secs: vec![60, 0],
                 names_not_listed: 2,
