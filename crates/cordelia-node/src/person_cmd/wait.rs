@@ -1397,6 +1397,11 @@ mod tests {
             let mut unnamed = seen.clone();
             unnamed.as_object_mut().unwrap().remove("latest");
             assert_eq!(end_of_look_ok(&unnamed, 3, &own).2, None, "{end:?}");
+            // Nor where neither the look nor any relay names one.
+            for relay in unnamed["relays"].as_array_mut().unwrap() {
+                relay["reach"]["about"] = Value::Null;
+            }
+            assert_eq!(end_of_look_ok(&unnamed, 3, &own).2, None, "{end:?}");
         }
     }
 
