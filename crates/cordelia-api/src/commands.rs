@@ -362,6 +362,7 @@ fn dial_of(state: &AppState, at: &crate::state::AtRelays) -> Vec<&'static str> {
                 Some(listed) if listed.state == "connected" => "connected",
                 Some(listed) if listed.tried == Tried::LookedUp => "looked_up",
                 Some(listed) if listed.tried == Tried::NotDialled => "not_dialled",
+                Some(listed) if listed.tried == Tried::NoKey => "no_key",
                 _ => "dialled",
             }
         })
@@ -1925,6 +1926,10 @@ exit 0"#,
             dial_of(&state, &set_up),
             ["connected", "dialled", "looked_up", "not_dialled"]
         );
+        // A relay given no key at a keyed relay's place (decision
+        // 2026-10-17 §1).
+        state.relays.write().unwrap()[3] = known(names[3], "unreachable", Tried::NoKey);
+        assert_eq!(dial_of(&state, &set_up)[3], "no_key");
         // One name given twice, with two keys: each by its own key.
         let with_key = |name: &str, key: [u8; 32]| AtRelay {
             reach: crate::state::Reach {

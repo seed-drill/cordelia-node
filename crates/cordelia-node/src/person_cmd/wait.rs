@@ -34,6 +34,9 @@ pub(crate) enum Dial {
     LookedUp,
     /// Another relay answers at its address: it is not dialled.
     NotDialled,
+    /// It is given no key, at the place of a relay given one: it is never
+    /// reached.
+    NoKey,
 }
 
 /// One relay that the device is set up with, as the look shows it.
@@ -98,6 +101,7 @@ pub(crate) fn relays_of(seen: &Value) -> anyhow::Result<Vec<RelayAt>> {
                     Some("connected") => Dial::Connected,
                     Some("looked_up") => Dial::LookedUp,
                     Some("not_dialled") => Dial::NotDialled,
+                    Some("no_key") => Dial::NoKey,
                     _ => Dial::Dialled,
                 },
                 has_what_was_carried: relay["has_what_was_carried"].as_bool(),
@@ -731,6 +735,21 @@ fn why_not_done(relays: &[RelayAt]) -> String {
         said.push(format!(
             "It cannot dial {} while another relay answers at its address.",
             names(&not_dialled)
+        ));
+    }
+    let no_key = dialled_so(Dial::NoKey);
+    if !no_key.is_empty() {
+        let n = no_key.len();
+        said.push(format!(
+            "{} {} given no key, at the address of a relay given one, so this machine never \
+             reaches {}. To have {} reached, give {} that relay's key, or remove {} from your \
+             configuration.",
+            names(&no_key),
+            verb(n, "is", "are"),
+            it_them(n),
+            it_them(n),
+            verb(n, "it", "each"),
+            it_them(n)
         ));
     }
     if !refusing.is_empty() {
@@ -1693,6 +1712,42 @@ pub(crate) mod tests {
             dial,
             has_what_was_carried: None,
         }
+    }
+
+    /// S9 of a relay given no key at a keyed relay's place, word for word
+    /// (decision 2026-10-19 §5; decision 2026-10-17 §1): it is never
+    /// reached, and the person is told what to do. It is not said to be
+    /// dialled every 30 seconds.
+    #[test]
+    fn s9_says_what_to_do_of_a_relay_given_no_key_at_a_keyed_relays_place() {
+        let ok = relay_at("a.example:9474", Some(Class::Ok), true, Dial::Connected);
+        let keyless = |name: &str| relay_at(name, Some(Class::OutLacking), false, Dial::NoKey);
+        let s9 = |relays: &[RelayAt]| -> String {
+            let lines = end_lines(End::NotDone, relays, OwnWord::None, noon());
+            let s9 = lines
+                .iter()
+                .find(|line| line.starts_with("A device of yours"));
+            s9.cloned().unwrap_or_default()
+        };
+        let one = s9(&[ok.clone(), keyless("b.example:9474")]);
+        assert!(
+            one.contains(
+                "b.example:9474 is given no key, at the address of a relay given one, so this \
+                 machine never reaches it. To have it reached, give it that relay's key, or \
+                 remove it from your configuration."
+            ),
+            "{one}"
+        );
+        assert!(!one.contains("dials"), "{one}");
+        let two = s9(&[ok, keyless("b.example:9474"), keyless("c.example:9474")]);
+        assert!(
+            two.contains(
+                "b.example:9474 and c.example:9474 are given no key, at the address of a relay \
+                 given one, so this machine never reaches them. To have them reached, give each \
+                 that relay's key, or remove them from your configuration."
+            ),
+            "{two}"
+        );
     }
 
     /// Each line of the wait after a change, word for word (decision
