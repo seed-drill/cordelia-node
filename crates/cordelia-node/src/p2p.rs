@@ -3083,9 +3083,12 @@ pub async fn p2p_loop(
                 tracing::debug!(items = deduped, peers = peer_batches.len(), seen_table = seen_len, "relay repush flush (epidemic)");
 
                 for (peer_id, items) in peer_batches {
-                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                    let Some(conn) = conn_mgr.get_connection(&peer_id) else {
+                        continue;
+                    };
+                    for items in in_pushes(items) {
                         let conn = conn.clone();
-                        let pid = peer_id;
+                        let pid = peer_id.clone();
                         let count = items.len();
                         let rtx = retry_fail_tx.clone();
                         tokio::spawn(async move {
@@ -5220,6 +5223,25 @@ async fn handle_inbound_push(
     None
 }
 
+/// The items a relay passes on to one peer, as pushes of at most
+/// MAX_PUSHED_ITEMS each, in their order: a push of more is refused where
+/// it is read (parameter-rationale.md §1).
+fn in_pushes(
+    items: Vec<cordelia_network::messages::Item>,
+) -> Vec<Vec<cordelia_network::messages::Item>> {
+    let mut items = items.into_iter().peekable();
+    let mut pushes = Vec::new();
+    while items.peek().is_some() {
+        pushes.push(
+            items
+                .by_ref()
+                .take(cordelia_core::protocol::MAX_PUSHED_ITEMS)
+                .collect(),
+        );
+    }
+    pushes
+}
+
 /// The most requests of one stream that [`answer_sync_with_nothing`]
 /// answers: a peer that goes on asking on one stream is left there.
 const NOTHING_ANSWERED_AT_MOST: usize = 64;
@@ -6212,6 +6234,52 @@ mod tests {
         }
         let answer = nothing_for(&which).unwrap();
         assert!(nothing_for(&answer).is_none());
+    }
+
+    /// A relay passes items on to a peer in pushes of at most
+    /// MAX_PUSHED_ITEMS, every item once and in its order: a push of more
+    /// would be refused where it is read.
+    #[test]
+    fn test_a_relay_passes_items_on_in_pushes_of_at_most_the_bound() {
+        use cordelia_core::protocol::MAX_PUSHED_ITEMS;
+        let item = |n: usize| cordelia_network::messages::Item {
+            item_id: format!("ci_{n}"),
+            channel_id: "grp_x".into(),
+            item_type: "memory".into(),
+            encrypted_blob: Vec::new(),
+            content_hash: vec![0; 32],
+            content_length: 0,
+            author_id: vec![0; 32],
+            signature: vec![0; 64],
+            key_version: 1,
+            published_at: "2026-10-22T10:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        for (count, sizes) in [
+            (0, vec![]),
+            (1, vec![1]),
+            (MAX_PUSHED_ITEMS, vec![MAX_PUSHED_ITEMS]),
+            (MAX_PUSHED_ITEMS + 1, vec![MAX_PUSHED_ITEMS, 1]),
+            (
+                2 * MAX_PUSHED_ITEMS + 7,
+                vec![MAX_PUSHED_ITEMS, MAX_PUSHED_ITEMS, 7],
+            ),
+        ] {
+            let pushes = in_pushes((0..count).map(item).collect());
+            assert_eq!(
+                pushes.iter().map(Vec::len).collect::<Vec<_>>(),
+                sizes,
+                "{count}"
+            );
+            let ids: Vec<String> = pushes.into_iter().flatten().map(|i| i.item_id).collect();
+            assert_eq!(
+                ids,
+                (0..count).map(|n| format!("ci_{n}")).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// What this thread holds, counted by an allocator that counts for

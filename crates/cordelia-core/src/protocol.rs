@@ -711,7 +711,8 @@ pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID
 /// Derived: as many entries of no ciphertext as one peer's allowance for a
 /// minute takes, each counted as what an entry takes beyond its
 /// ciphertext. A push of more is over any limited peer's allowance, and
-/// is refused whole; a relay passes items on one at a time.
+/// is refused whole. A relay that passes items on sends them in pushes of
+/// at most this many.
 pub const MAX_PUSHED_ITEMS: usize = (PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(0)) as usize;
 
 // Checked at compile time: a node's own pushes are within the bound.
