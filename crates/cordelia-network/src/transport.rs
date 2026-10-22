@@ -789,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
         let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
-        let (mut send, _recv) = node_end.open_bi().await.unwrap();
+        let (mut send, mut recv) = node_end.open_bi().await.unwrap();
         // A frame of a megabyte, its length included.
         let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize - 4];
 
@@ -802,7 +802,11 @@ mod tests {
             assert!(began.elapsed() < Duration::from_secs(1));
         }
         let began = std::time::Instant::now();
-        let third = crate::codec::write_raw_frame(&mut send, &message).await;
+        // Through a join of the two halves, as a request and its answer
+        // are written: the join gives up the stream it writes to.
+        let third =
+            crate::codec::write_raw_frame(&mut tokio::io::join(&mut recv, &mut send), &message)
+                .await;
         let waited = began.elapsed();
         assert!(
             matches!(third, Err(crate::codec::CodecError::Timeout(_))),
