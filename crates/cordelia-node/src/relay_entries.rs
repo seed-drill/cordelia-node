@@ -1403,7 +1403,7 @@ impl RelayEntries {
                 return None;
             }
         };
-        let request = match codec::decode_message(&frame) {
+        let request = match codec::decode_message(protocol, &frame) {
             Ok(request) => request,
             Err(e) => {
                 tracing::debug!(peer = %who.peer, error = %e, "a frame on a stream of entries that is no message");

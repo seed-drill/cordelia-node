@@ -124,7 +124,7 @@ pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     write_frame(stream, &propose).await?;
 
     // Read accept
-    let response = read_frame(stream).await?;
+    let response = read_frame(stream, Protocol::Handshake).await?;
     match response {
         WireMessage::HandshakeAccept(accept) => validate_accept(&accept, tls_peer_node_id),
         _ => Err(HandshakeError::UnexpectedMessage),
@@ -150,7 +150,7 @@ pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // Read propose
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::Handshake).await?;
     let propose = match msg {
         WireMessage::HandshakePropose(p) => p,
         _ => return Err(HandshakeError::UnexpectedMessage),
@@ -384,7 +384,7 @@ mod tests {
         write_frame(&mut client, &bad_propose).await.unwrap();
 
         // Read rejection
-        let response = read_frame(&mut client).await.unwrap();
+        let response = read_frame(&mut client, Protocol::Handshake).await.unwrap();
         match response {
             WireMessage::HandshakeAccept(a) => {
                 assert_eq!(a.version, 0);
@@ -446,7 +446,7 @@ mod tests {
         write_frame(&mut client, &bad_propose).await.unwrap();
 
         // Read rejection -- verify reject_reason doesn't leak clock delta (BV-17)
-        let response = read_frame(&mut client).await.unwrap();
+        let response = read_frame(&mut client, Protocol::Handshake).await.unwrap();
         match response {
             WireMessage::HandshakeAccept(a) => {
                 assert_eq!(a.version, 0);
@@ -489,7 +489,7 @@ mod tests {
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
-        let _ = read_frame(&mut client).await.unwrap(); // read rejection
+        let _ = read_frame(&mut client, Protocol::Handshake).await.unwrap(); // read rejection
         let server_err = server_task.await.unwrap();
         assert!(matches!(server_err, Err(HandshakeError::ClockSkew { .. })));
     }
@@ -522,7 +522,7 @@ mod tests {
         });
         write_frame(&mut client, &bad_propose).await.unwrap();
 
-        let response = read_frame(&mut client).await.unwrap();
+        let response = read_frame(&mut client, Protocol::Handshake).await.unwrap();
         match response {
             WireMessage::HandshakeAccept(a) => {
                 assert_eq!(a.version, 0);

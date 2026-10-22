@@ -20,7 +20,9 @@
 //! has held the channel and when the channel was last used.
 
 use cordelia_core::protocol::{
-    CHANNEL_MARK_BYTES, ENTRY_PAGE_MAX_ENTRIES, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL,
+    CHANNEL_MARK_BYTES, DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, ENTRY_PAGE_MAX_ENTRIES,
+    MAX_CHANNELS_ASKED_OF_A_PEER, MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS,
+    MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL,
     PROTOCOL_ENTRY_PUSH, PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
 };
 use cordelia_storage::relay;
@@ -104,6 +106,8 @@ pub struct HandshakePropose {
     #[serde(with = "serde_bytes")]
     pub channel_digest: Vec<u8>, // 32 bytes
     pub channel_count: u16,
+    /// At most MAX_HANDSHAKE_ROLES.
+    #[serde(deserialize_with = "at_most_roles")]
     pub roles: Vec<String>,
     /// P2P listening port, so peers know where to connect back.
     #[serde(default)]
@@ -119,6 +123,8 @@ pub struct HandshakeAccept {
     #[serde(with = "serde_bytes")]
     pub channel_digest: Vec<u8>, // 32 bytes
     pub channel_count: u16,
+    /// At most MAX_HANDSHAKE_ROLES.
+    #[serde(deserialize_with = "at_most_roles")]
     pub roles: Vec<String>,
     pub reject_reason: Option<String>,
     /// P2P listening port, so peers know where to connect back.
@@ -150,6 +156,8 @@ pub struct PeerShareRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerShareResponse {
+    /// At most DEFAULT_MAX_PEERS_SHARE: the most a node asks for.
+    #[serde(deserialize_with = "at_most_peers")]
     pub peers: Vec<PeerAddress>,
 }
 
@@ -157,7 +165,10 @@ pub struct PeerShareResponse {
 pub struct PeerAddress {
     #[serde(with = "serde_bytes")]
     pub node_id: Vec<u8>, // 32 bytes
-    pub addrs: Vec<String>, // SocketAddr as string for CBOR portability
+    /// SocketAddr as string for CBOR portability. At most
+    /// MAX_SHARED_PEER_ADDRS.
+    #[serde(deserialize_with = "at_most_addrs")]
+    pub addrs: Vec<String>,
     pub last_seen: u64,
     pub exclude: bool,
 }
@@ -187,6 +198,8 @@ pub struct ChannelListRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelListResponse {
+    /// At most MAX_CHANNELS_ASKED_OF_A_PEER.
+    #[serde(deserialize_with = "at_most_descriptors")]
     pub channels: Vec<ChannelDescriptor>,
 }
 
@@ -216,6 +229,8 @@ pub struct SyncChannelListRequest {}
 /// Phase 0 response: channel IDs the responder has stored items for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncChannelListResponse {
+    /// At most MAX_LISTED_CHANNEL_IDS.
+    #[serde(deserialize_with = "at_most_channel_ids")]
     pub channel_ids: Vec<String>,
 }
 
@@ -233,6 +248,8 @@ pub struct SyncRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
+    /// At most DEFAULT_SYNC_LIMIT: the most a node asks for.
+    #[serde(deserialize_with = "at_most_headers")]
     pub items: Vec<ItemHeader>,
     pub has_more: bool,
     /// With `after_seq` paging: the responder's sequence number of the last
@@ -267,11 +284,15 @@ pub struct ItemHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchRequest {
+    /// At most MAX_FETCH_ITEMS.
+    #[serde(deserialize_with = "at_most_fetched_ids")]
     pub item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchResponse {
+    /// At most MAX_FETCH_ITEMS: one for each ID asked for.
+    #[serde(deserialize_with = "at_most_fetched_items")]
     pub items: Vec<Item>,
 }
 
@@ -306,6 +327,8 @@ pub struct Item {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushPayload {
+    /// At most MAX_PUSHED_ITEMS.
+    #[serde(deserialize_with = "at_most_pushed_items")]
     pub items: Vec<Item>,
 }
 
@@ -320,7 +343,13 @@ pub struct PushAck {
     /// the list it could not tell which they were. Omitted when empty, so
     /// an answer with nothing refused is unchanged on the wire. A receiver
     /// older than 0.2.0-alpha.4 never sends it and only counts them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// At most MAX_PUSHED_ITEMS: one for each item a push may hold.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "at_most_refusals"
+    )]
     pub refused: Vec<Refusal>,
 }
 
@@ -706,6 +735,97 @@ where
     at_most(deserializer, ENTRY_PAGE_MAX_ENTRIES, "entries")
 }
 
+// The lists of the eight older streams, each bounded where it is read
+// (parameter-rationale.md §1). Each bound is at least what a node of any
+// version sends: a list longer than its bound is no node's, and is refused
+// where its first element too many is met. Without one, a list of the
+// smallest elements costs some 24 bytes of memory, or more, for each byte
+// of the frame.
+
+/// At most MAX_HANDSHAKE_ROLES roles in a handshake.
+fn at_most_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_HANDSHAKE_ROLES, "roles")
+}
+
+/// At most DEFAULT_MAX_PEERS_SHARE peers shared: the most a node asks for.
+fn at_most_peers<'de, D>(deserializer: D) -> Result<Vec<PeerAddress>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, u32::from(DEFAULT_MAX_PEERS_SHARE), "peers")
+}
+
+/// At most MAX_SHARED_PEER_ADDRS addresses of one peer shared.
+fn at_most_addrs<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_SHARED_PEER_ADDRS, "addresses")
+}
+
+/// At most MAX_CHANNELS_ASKED_OF_A_PEER channel descriptors.
+fn at_most_descriptors<'de, D>(deserializer: D) -> Result<Vec<ChannelDescriptor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(
+        deserializer,
+        MAX_CHANNELS_ASKED_OF_A_PEER as u32,
+        "channels",
+    )
+}
+
+/// At most MAX_LISTED_CHANNEL_IDS channel IDs listed.
+fn at_most_channel_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_LISTED_CHANNEL_IDS, "channel IDs")
+}
+
+/// At most DEFAULT_SYNC_LIMIT headers in a page: the most a node asks for.
+fn at_most_headers<'de, D>(deserializer: D) -> Result<Vec<ItemHeader>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, DEFAULT_SYNC_LIMIT, "headers")
+}
+
+/// At most MAX_FETCH_ITEMS IDs asked for in one fetch.
+fn at_most_fetched_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_FETCH_ITEMS as u32, "item IDs")
+}
+
+/// At most MAX_FETCH_ITEMS items handed for one fetch.
+fn at_most_fetched_items<'de, D>(deserializer: D) -> Result<Vec<Item>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_FETCH_ITEMS as u32, "items")
+}
+
+/// At most MAX_PUSHED_ITEMS items in one push.
+fn at_most_pushed_items<'de, D>(deserializer: D) -> Result<Vec<Item>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_PUSHED_ITEMS as u32, "items")
+}
+
+/// At most MAX_PUSHED_ITEMS items refused: one for each a push holds.
+fn at_most_refusals<'de, D>(deserializer: D) -> Result<Vec<Refusal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    at_most(deserializer, MAX_PUSHED_ITEMS as u32, "refusals")
+}
+
 /// Relay-Entries (0x14): a relay asks which channels from their secrets
 /// the receiver holds, a page at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,7 +990,13 @@ impl From<&relay::ToldChannel> for RelayChannel {
 
 /// Top-level enum for dispatching any wire message by protocol.
 /// Each variant maps 1:1 to a protocol's message set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// It is written with its name under [`MESSAGE_NAME_KEY`], first, beside
+/// the fields of the message. It is read by the stream it arrives on
+/// ([`On`]), never as this enum: serde reads an enum tagged so by holding
+/// the whole frame as values of no type first, some 32 bytes for each byte
+/// of the frame, before it knows what the message is.
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "msg_type")]
 pub enum WireMessage {
     // Handshake
@@ -928,6 +1054,272 @@ pub enum WireMessage {
     RelayChannelsHeld(RelayChannelsHeld),
     RelayPull(RelayPull),
     RelayPush(RelayPush),
+}
+
+// ── Reading a message of one stream ────────────────────────────────
+
+/// The key under which a message's name is written: the first key of the
+/// map that is the message.
+pub const MESSAGE_NAME_KEY: &str = "msg_type";
+
+/// The messages, by name, and how each is read: straight into its own
+/// type, from the rest of the map that its name began.
+macro_rules! named {
+    ($($name:ident),+ $(,)?) => {
+        /// Which message a name names.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Named {
+            $($name,)+
+        }
+
+        impl Named {
+            fn of(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($name) => Some(Self::$name),)+
+                    _ => None,
+                }
+            }
+
+            fn read<'de, D>(self, rest: D) -> Result<WireMessage, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Ok(match self {
+                    $(Self::$name => WireMessage::$name($name::deserialize(rest)?),)+
+                })
+            }
+        }
+    };
+}
+
+named![
+    HandshakePropose,
+    HandshakeAccept,
+    Ping,
+    Pong,
+    PeerShareRequest,
+    PeerShareResponse,
+    ChannelJoined,
+    ChannelLeft,
+    ChannelStateHash,
+    ChannelListRequest,
+    ChannelListResponse,
+    SyncChannelListRequest,
+    SyncChannelListResponse,
+    SyncRequest,
+    SyncResponse,
+    FetchRequest,
+    FetchResponse,
+    PushPayload,
+    PushAck,
+    PskRequest,
+    PskResponse,
+    PairingRequest,
+    PairingResponse,
+    EntryShow,
+    EntryShowShort,
+    EntryShown,
+    ChannelProve,
+    ChannelProved,
+    EntryPull,
+    EntryPulled,
+    EntryPush,
+    EntryPushed,
+    RelayChannelsAsk,
+    RelayChannelsHeld,
+    RelayPull,
+    RelayPush,
+];
+
+impl Named {
+    /// Whether this message travels on a stream of `protocol`, one way or
+    /// the other.
+    fn travels_on(self, protocol: Protocol) -> bool {
+        use Named::*;
+        match protocol {
+            Protocol::Handshake => matches!(self, HandshakePropose | HandshakeAccept),
+            Protocol::KeepAlive => matches!(self, Ping | Pong),
+            Protocol::PeerSharing => matches!(self, PeerShareRequest | PeerShareResponse),
+            Protocol::ChannelAnnounce => matches!(
+                self,
+                ChannelJoined
+                    | ChannelLeft
+                    | ChannelStateHash
+                    | ChannelListRequest
+                    | ChannelListResponse
+            ),
+            Protocol::ItemSync => matches!(
+                self,
+                SyncChannelListRequest
+                    | SyncChannelListResponse
+                    | SyncRequest
+                    | SyncResponse
+                    | FetchRequest
+                    | FetchResponse
+            ),
+            Protocol::ItemPush => matches!(self, PushPayload | PushAck),
+            Protocol::PskExchange => matches!(self, PskRequest | PskResponse),
+            Protocol::Pairing => matches!(self, PairingRequest | PairingResponse),
+            Protocol::EntryShow => matches!(self, EntryShow | EntryShowShort | EntryShown),
+            Protocol::ChannelProve => matches!(self, ChannelProve | ChannelProved),
+            Protocol::EntryPull => matches!(self, EntryPull | EntryPulled),
+            Protocol::EntryPush => matches!(self, EntryPush | EntryPushed),
+            Protocol::RelayEntries => matches!(
+                self,
+                RelayChannelsAsk
+                    | RelayChannelsHeld
+                    | RelayPull
+                    | RelayPush
+                    | EntryPulled
+                    | EntryPushed
+            ),
+        }
+    }
+}
+
+/// The stream that a message travels on: the first of them, for the two
+/// answers that travel on two.
+#[cfg(test)]
+pub(crate) fn stream_of(message: &WireMessage) -> Protocol {
+    use WireMessage::*;
+    match message {
+        HandshakePropose(_) | HandshakeAccept(_) => Protocol::Handshake,
+        Ping(_) | Pong(_) => Protocol::KeepAlive,
+        PeerShareRequest(_) | PeerShareResponse(_) => Protocol::PeerSharing,
+        ChannelJoined(_)
+        | ChannelLeft(_)
+        | ChannelStateHash(_)
+        | ChannelListRequest(_)
+        | ChannelListResponse(_) => Protocol::ChannelAnnounce,
+        SyncChannelListRequest(_)
+        | SyncChannelListResponse(_)
+        | SyncRequest(_)
+        | SyncResponse(_)
+        | FetchRequest(_)
+        | FetchResponse(_) => Protocol::ItemSync,
+        PushPayload(_) | PushAck(_) => Protocol::ItemPush,
+        PskRequest(_) | PskResponse(_) => Protocol::PskExchange,
+        PairingRequest(_) | PairingResponse(_) => Protocol::Pairing,
+        EntryShow(_) | EntryShowShort(_) | EntryShown(_) => Protocol::EntryShow,
+        ChannelProve(_) | ChannelProved(_) => Protocol::ChannelProve,
+        EntryPull(_) | EntryPulled(_) => Protocol::EntryPull,
+        EntryPush(_) | EntryPushed(_) => Protocol::EntryPush,
+        RelayChannelsAsk(_) | RelayChannelsHeld(_) | RelayPull(_) | RelayPush(_) => {
+            Protocol::RelayEntries
+        }
+    }
+}
+
+/// A message read as one of the stream whose protocol byte is `P`.
+///
+/// The message is a map whose first key is [`MESSAGE_NAME_KEY`], with the
+/// name of a message of that stream. The rest of the map is read straight
+/// into that message's own type, whose lists are each bounded where they
+/// are read: nothing of the frame is held as values of no type. What is
+/// not a map, does not name its message first, or names one of another
+/// stream, is refused before anything else of it is read.
+pub struct On<const P: u8>(pub WireMessage);
+
+impl<'de, const P: u8> Deserialize<'de> for On<P> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some(protocol) = Protocol::from_byte(P) else {
+            return Err(serde::de::Error::custom(format!("no stream {P:#04x}")));
+        };
+        deserializer.deserialize_map(OfStream(protocol)).map(On)
+    }
+}
+
+/// Reads one message of a stream from the map that it is.
+struct OfStream(Protocol);
+
+impl<'de> serde::de::Visitor<'de> for OfStream {
+    type Value = WireMessage;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "a message of the stream {:#04x}, its name first",
+            self.0.as_byte()
+        )
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<WireMessage, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        if map.next_key_seed(NameKey)?.is_none() {
+            return Err(serde::de::Error::custom("a message with no name"));
+        }
+        let named = map.next_value_seed(Name)?;
+        if !named.travels_on(self.0) {
+            return Err(serde::de::Error::custom(format!(
+                "{named:?} is no message of the stream {:#04x}",
+                self.0.as_byte()
+            )));
+        }
+        named.read(serde::de::value::MapAccessDeserializer::new(map))
+    }
+}
+
+/// The first key of a message: [`MESSAGE_NAME_KEY`], and nothing else.
+struct NameKey;
+
+impl<'de> serde::de::DeserializeSeed<'de> for NameKey {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for NameKey {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the key {MESSAGE_NAME_KEY:?} first")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<(), E> {
+        // What the peer wrote is not put in the error: it may be as long
+        // as the frame.
+        if key == MESSAGE_NAME_KEY {
+            Ok(())
+        } else {
+            Err(E::custom("a message whose first key is not its name"))
+        }
+    }
+}
+
+/// A message's name: one of [`Named`].
+struct Name;
+
+impl<'de> serde::de::DeserializeSeed<'de> for Name {
+    type Value = Named;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Named, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Name {
+    type Value = Named;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the name of a message")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Named, E> {
+        Named::of(name).ok_or_else(|| E::custom("a message of no name there is"))
+    }
 }
 
 #[cfg(test)]
@@ -1043,7 +1435,7 @@ mod tests {
         assert_eq!(read_by_older, older);
         // The same inside the message envelope, as it travels.
         let framed = encode(&WireMessage::PushAck(with_list.clone()));
-        let WireMessage::PushAck(read) = ciborium::from_reader(framed.as_slice()).unwrap() else {
+        let WireMessage::PushAck(read) = decode_message(&framed).unwrap() else {
             panic!("not a push answer");
         };
         assert_eq!(read.refused, with_list.refused);
@@ -1055,7 +1447,20 @@ mod tests {
 
     // ── Entries of a channel from its secret ─────────────────────────
 
-    use crate::codec::{decode_message, encode_message, read_frame, write_frame};
+    use crate::codec::{encode_message, read_frame, write_frame};
+
+    /// A message read on whichever stream reads it: each is tried. The
+    /// error is the last stream's.
+    fn decode_message(bytes: &[u8]) -> Result<WireMessage, crate::codec::CodecError> {
+        let mut last = None;
+        for protocol in (0..=u8::MAX).filter_map(Protocol::from_byte) {
+            match crate::codec::decode_message(protocol, bytes) {
+                Ok(message) => return Ok(message),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("there are streams"))
+    }
     use cordelia_core::protocol::{
         ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, MAX_ENTRY_WIRE_BYTES, MAX_MESSAGE_BYTES,
     };
@@ -1624,7 +2029,7 @@ mod tests {
         }
         let mut cursor = std::io::Cursor::new(stream);
         for message in &messages {
-            let read = read_frame(&mut cursor).await.unwrap();
+            let read = read_frame(&mut cursor, stream_of(message)).await.unwrap();
             assert_eq!(of_entries(&read), of_entries(message));
         }
         // And each is encoded the same every time.
@@ -2472,5 +2877,744 @@ mod tests {
                 places: 57,
             }
         );
+    }
+
+    // ── Every message, read by its stream ──────────────────────────────
+
+    /// One of each of the 36 messages, with every field set, and both
+    /// forms of a field that may be left out: the messages of the eight
+    /// older streams, and those of the streams of entries.
+    fn every_message() -> Vec<WireMessage> {
+        let header = ItemHeader {
+            item_id: "ci_header".into(),
+            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
+            item_type: "memory".into(),
+            content_hash: vec![0xa1; 32],
+            author_id: vec![0xa2; 32],
+            signature: vec![0xa3; 64],
+            key_version: 3,
+            published_at: "2026-10-22T10:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: Some("ci_parent".into()),
+            slot: Some(vec![0xa4; 32]),
+            rev: Some(9),
+        };
+        let item = Item {
+            item_id: "ci_item".into(),
+            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
+            item_type: "memory".into(),
+            encrypted_blob: vec![0xb0; 300],
+            content_hash: vec![0xb1; 32],
+            content_length: 300,
+            author_id: vec![0xb2; 32],
+            signature: vec![0xb3; 64],
+            key_version: 1,
+            published_at: "2026-10-22T10:00:01Z".into(),
+            is_tombstone: true,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        let descriptor = ChannelDescriptor {
+            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
+            channel_name: Some("research".into()),
+            access: "open".into(),
+            mode: "realtime".into(),
+            key_version: 2,
+            psk_hash: vec![0xc1; 32],
+            creator_id: vec![0xc2; 32],
+            created_at: "2026-10-22T10:00:02Z".into(),
+            signature: vec![0xc3; 64],
+        };
+        let mut messages = vec![
+            WireMessage::HandshakePropose(HandshakePropose {
+                magic: HANDSHAKE_MAGIC,
+                version_min: 1,
+                version_max: 2,
+                node_id: vec![0x42; 32],
+                timestamp: 1_767_225_600,
+                channel_digest: vec![0xab; 32],
+                channel_count: 5,
+                roles: vec!["personal".into()],
+                p2p_port: 9474,
+            }),
+            WireMessage::HandshakeAccept(HandshakeAccept {
+                version: 1,
+                node_id: vec![0x43; 32],
+                timestamp: 1_767_225_601,
+                channel_digest: vec![0xac; 32],
+                channel_count: 0,
+                roles: vec!["relay".into()],
+                reject_reason: Some("no".into()),
+                p2p_port: 9475,
+            }),
+            WireMessage::HandshakeAccept(HandshakeAccept {
+                version: 1,
+                node_id: vec![0x44; 32],
+                timestamp: 0,
+                channel_digest: Vec::new(),
+                channel_count: 1,
+                roles: Vec::new(),
+                reject_reason: None,
+                p2p_port: 0,
+            }),
+            WireMessage::Ping(Ping {
+                seq: u64::MAX,
+                sent_at_ns: 1_710_100_000_000_000_000,
+            }),
+            WireMessage::Pong(Pong {
+                seq: 7,
+                sent_at_ns: 8,
+                recv_at_ns: 9,
+            }),
+            WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 }),
+            WireMessage::PeerShareResponse(PeerShareResponse {
+                peers: vec![
+                    PeerAddress {
+                        node_id: vec![0x51; 32],
+                        addrs: vec!["203.0.113.1:9474".into()],
+                        last_seen: 1_767_225_602,
+                        exclude: false,
+                    },
+                    PeerAddress {
+                        node_id: vec![0x52; 32],
+                        addrs: vec!["[2001:db8::1]:9474".into(), "203.0.113.2:9474".into()],
+                        last_seen: 0,
+                        exclude: true,
+                    },
+                ],
+            }),
+            WireMessage::ChannelJoined(ChannelJoined {
+                channel_id: descriptor.channel_id.clone(),
+                descriptor: descriptor.clone(),
+            }),
+            WireMessage::ChannelJoined(ChannelJoined {
+                channel_id: "grp_x".into(),
+                descriptor: ChannelDescriptor {
+                    channel_name: None,
+                    ..descriptor.clone()
+                },
+            }),
+            WireMessage::ChannelLeft(ChannelLeft {
+                channel_id: "grp_y".into(),
+            }),
+            WireMessage::ChannelStateHash(ChannelStateHash {
+                digest: vec![0xd1; 32],
+                count: 3,
+            }),
+            WireMessage::ChannelListRequest(ChannelListRequest {}),
+            WireMessage::ChannelListResponse(ChannelListResponse {
+                channels: vec![descriptor.clone(), descriptor],
+            }),
+            WireMessage::SyncChannelListRequest(SyncChannelListRequest {}),
+            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                channel_ids: vec!["grp_a".into(), "grp_b".into()],
+            }),
+            WireMessage::SyncRequest(SyncRequest {
+                channel_id: "grp_a".into(),
+                since: Some("2026-10-22T09:00:00Z".into()),
+                limit: 100,
+                after_seq: None,
+            }),
+            WireMessage::SyncRequest(SyncRequest {
+                channel_id: "grp_a".into(),
+                since: None,
+                limit: 14,
+                after_seq: Some(57),
+            }),
+            WireMessage::SyncResponse(SyncResponse {
+                items: vec![header.clone()],
+                has_more: true,
+                last_seq: Some(58),
+            }),
+            WireMessage::SyncResponse(SyncResponse {
+                items: vec![ItemHeader {
+                    parent_id: None,
+                    slot: None,
+                    rev: None,
+                    ..header
+                }],
+                has_more: false,
+                last_seq: None,
+            }),
+            WireMessage::FetchRequest(FetchRequest {
+                item_ids: vec!["ci_item".into(), "ci_header".into()],
+            }),
+            WireMessage::FetchResponse(FetchResponse {
+                items: vec![item.clone()],
+            }),
+            WireMessage::PushPayload(PushPayload {
+                items: vec![
+                    item.clone(),
+                    Item {
+                        slot: Some(vec![0xb4; 32]),
+                        rev: Some(2),
+                        parent_id: Some("ci_parent".into()),
+                        ..item
+                    },
+                ],
+            }),
+            WireMessage::PushAck(PushAck::default()),
+            WireMessage::PushAck(PushAck {
+                stored: 1,
+                dedup_dropped: 2,
+                policy_rejected: 3,
+                verification_failed: 4,
+                refused: vec![Refusal {
+                    item_id: "ci_item".into(),
+                    why: REFUSED_FULL.into(),
+                }],
+            }),
+            WireMessage::PskRequest(PskRequest {
+                channel_id: "grp_a".into(),
+                subscriber_xpk: vec![0xe1; 32],
+            }),
+            WireMessage::PskResponse(PskResponse {
+                status: "ok".into(),
+                reason: None,
+                ecies_envelope: Some(vec![0xe2; 92]),
+                key_version: Some(2),
+            }),
+            WireMessage::PskResponse(PskResponse {
+                status: "denied".into(),
+                reason: Some("not authorized".into()),
+                ecies_envelope: None,
+                key_version: None,
+            }),
+            WireMessage::PairingRequest(PairingRequest {
+                node_id: vec![0xf1; 32],
+                pairing_code: "123456".into(),
+            }),
+            WireMessage::PairingResponse(PairingResponse {
+                status: "ok".into(),
+                reason: Some("paired".into()),
+            }),
+        ];
+        // The messages of the streams of entries, with bytes that are the
+        // same each time: a sealed entry is not.
+        let entry = vec![0x5e; 400];
+        let other = vec![0x5f; 401];
+        let channel = [0x61; 32];
+        messages.extend([
+            WireMessage::EntryShow(EntryShow {
+                entry: entry.clone(),
+            }),
+            WireMessage::EntryShowShort(EntryShowShort {
+                channel,
+                author: [0x62; 32],
+                slot: [0x63; 32],
+                rev: 5,
+                id: [0x64; 32],
+            }),
+            WireMessage::ChannelProve(ChannelProve {
+                channel,
+                proof: [0x65; 64],
+            }),
+            WireMessage::ChannelProved(ChannelProved { proved: true }),
+            WireMessage::ChannelProved(ChannelProved { proved: false }),
+            WireMessage::EntryPull(EntryPull {
+                channel,
+                mark: MARK,
+                after: (1 << 53) + 7,
+                limit: 100,
+            }),
+            WireMessage::EntryPulled(EntryPulled {
+                entries: vec![ByteBuf::from(entry.clone()), ByteBuf::from(other.clone())],
+                next: u64::MAX,
+                mark: MARK,
+            }),
+            WireMessage::EntryPulled(EntryPulled {
+                entries: Vec::new(),
+                next: 0,
+                mark: [0; 8],
+            }),
+            WireMessage::EntryPush(EntryPush {
+                entries: vec![ByteBuf::from(entry.clone()), ByteBuf::from(other.clone())],
+            }),
+            WireMessage::EntryPush(EntryPush {
+                entries: Vec::new(),
+            }),
+            WireMessage::EntryPushed(EntryPushed {
+                answers: vec![
+                    PushAnswer::Stored,
+                    PushAnswer::Held,
+                    PushAnswer::Older,
+                    PushAnswer::Refused(EntryRefused::NotSigned),
+                    PushAnswer::Refused(EntryRefused::NoRoom),
+                    PushAnswer::Refused(EntryRefused::OverLimit),
+                    PushAnswer::Another,
+                ],
+            }),
+            WireMessage::EntryPushed(EntryPushed {
+                answers: Vec::new(),
+            }),
+            WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+                after: [0; 32],
+                limit: 1000,
+            }),
+            WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                channels: vec![
+                    RelayChannel {
+                        channel,
+                        mark: MARK,
+                        held_since: 1_700_000_000,
+                        used_at: 1_800_000_000,
+                        places: 57,
+                    },
+                    RelayChannel {
+                        channel: [0xff; 32],
+                        mark: [0xff; 8],
+                        held_since: i64::MIN,
+                        used_at: i64::MAX,
+                        places: u64::MAX,
+                    },
+                ],
+            }),
+            WireMessage::RelayChannelsHeld(RelayChannelsHeld {
+                channels: Vec::new(),
+            }),
+            WireMessage::RelayPull(RelayPull {
+                channel,
+                mark: MARK,
+                after: 57,
+                limit: 100,
+            }),
+            WireMessage::RelayPush(RelayPush {
+                entries: vec![
+                    RelayEntry {
+                        entry: entry.clone(),
+                        held_since: 1_700_000_000,
+                        used_at: 1_800_000_000,
+                    },
+                    RelayEntry {
+                        entry: other.clone(),
+                        held_since: 0,
+                        used_at: -1,
+                    },
+                ],
+            }),
+        ]);
+        for answer in [
+            ShowAnswer::Held,
+            ShowAnswer::Taken,
+            ShowAnswer::Another(other),
+            ShowAnswer::Refused(EntryRefused::NotSigned),
+            ShowAnswer::Refused(EntryRefused::NoRoom),
+            ShowAnswer::Refused(EntryRefused::OverLimit),
+            ShowAnswer::Whole,
+            ShowAnswer::Other {
+                rev: 6,
+                id: [0x1d; 32],
+            },
+        ] {
+            messages.push(WireMessage::EntryShown(EntryShown { answer }));
+        }
+        messages
+    }
+
+    /// The name a message is written under.
+    fn name_of(message: &WireMessage) -> String {
+        let bytes = encode_message(message).unwrap();
+        let ciborium::Value::Map(map) = ciborium::from_reader(bytes.as_slice()).unwrap() else {
+            panic!("not a map");
+        };
+        map[0].1.as_text().unwrap().to_string()
+    }
+
+    /// SHA-256 of the encodings of [`every_message`], each after its
+    /// length as four bytes: what this node writes.
+    fn digest_of_every_message() -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for message in every_message() {
+            let bytes = encode_message(&message).unwrap();
+            hash.update((bytes.len() as u32).to_be_bytes());
+            hash.update(&bytes);
+        }
+        hex::encode(hash.finalize())
+    }
+
+    /// The messages as a node of 0.2.0-alpha.14 knows them: the same
+    /// types, written and read through the tagged enum, as that version
+    /// does both.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "msg_type")]
+    enum Alpha14WireMessage {
+        HandshakePropose(HandshakePropose),
+        HandshakeAccept(HandshakeAccept),
+        Ping(Ping),
+        Pong(Pong),
+        PeerShareRequest(PeerShareRequest),
+        PeerShareResponse(PeerShareResponse),
+        ChannelJoined(ChannelJoined),
+        ChannelLeft(ChannelLeft),
+        ChannelStateHash(ChannelStateHash),
+        ChannelListRequest(ChannelListRequest),
+        ChannelListResponse(ChannelListResponse),
+        SyncChannelListRequest(SyncChannelListRequest),
+        SyncChannelListResponse(SyncChannelListResponse),
+        SyncRequest(SyncRequest),
+        SyncResponse(SyncResponse),
+        FetchRequest(FetchRequest),
+        FetchResponse(FetchResponse),
+        PushPayload(PushPayload),
+        PushAck(PushAck),
+        PskRequest(PskRequest),
+        PskResponse(PskResponse),
+        PairingRequest(PairingRequest),
+        PairingResponse(PairingResponse),
+        EntryShow(EntryShow),
+        EntryShowShort(EntryShowShort),
+        EntryShown(EntryShown),
+        ChannelProve(ChannelProve),
+        ChannelProved(ChannelProved),
+        EntryPull(EntryPull),
+        EntryPulled(EntryPulled),
+        EntryPush(EntryPush),
+        EntryPushed(EntryPushed),
+        RelayChannelsAsk(RelayChannelsAsk),
+        RelayChannelsHeld(RelayChannelsHeld),
+        RelayPull(RelayPull),
+        RelayPush(RelayPush),
+    }
+
+    /// The digest of [`every_message`] as 0.2.0-alpha.14 writes it: the
+    /// same test, run on that version's code (main at 5bb3fb6).
+    const EVERY_MESSAGE_AT_ALPHA_14: &str =
+        "b9b808a5181dcd97f4bc06f860916e9aed5625512a8063431c9c684d9234e3d8";
+
+    /// Nothing on the wire is changed: every message is written as it was,
+    /// byte for byte.
+    #[test]
+    fn every_message_is_written_as_alpha_14_writes_it() {
+        assert_eq!(every_message().len(), 54);
+        assert_eq!(digest_of_every_message(), EVERY_MESSAGE_AT_ALPHA_14);
+    }
+
+    /// Each of the 36 messages goes through the codec on its stream, and
+    /// is read as it was written; on every other stream it is refused.
+    #[test]
+    fn every_message_is_read_on_its_stream_and_on_no_other() {
+        let messages = every_message();
+        let names: std::collections::BTreeSet<String> = messages.iter().map(name_of).collect();
+        assert_eq!(names.len(), 36, "{names:?}");
+        let protocols: Vec<Protocol> = (0..=u8::MAX).filter_map(Protocol::from_byte).collect();
+        assert_eq!(protocols.len(), 13);
+        for message in &messages {
+            let bytes = encode_message(message).unwrap();
+            let name = name_of(message);
+            let mut read_on = Vec::new();
+            for &protocol in &protocols {
+                match crate::codec::decode_message(protocol, &bytes) {
+                    Ok(read) => {
+                        // Read as it was written: written again, the same
+                        // bytes.
+                        assert_eq!(encode_message(&read).unwrap(), bytes, "{name}");
+                        assert_eq!(name_of(&read), name);
+                        read_on.push(protocol);
+                    }
+                    Err(e) => assert!(
+                        matches!(e, crate::codec::CodecError::CborDecode(_)),
+                        "{name} on {protocol:?}: {e:?}"
+                    ),
+                }
+            }
+            // On its stream, and on no other. The two answers that a
+            // relay gives on the stream between relays too are read on
+            // both.
+            let mut streams = vec![stream_of(message)];
+            if matches!(
+                message,
+                WireMessage::EntryPulled(_) | WireMessage::EntryPushed(_)
+            ) {
+                streams.push(Protocol::RelayEntries);
+            }
+            assert_eq!(read_on, streams, "{name}");
+        }
+    }
+
+    /// What this node writes, a node of 0.2.0-alpha.14 reads as it was
+    /// written; and what that node writes, this node reads as it was
+    /// written.
+    #[test]
+    fn every_message_reads_the_same_both_ways_with_alpha_14() {
+        for message in every_message() {
+            let name = name_of(&message);
+            let ours = encode_message(&message).unwrap();
+            // Read by alpha.14, through its tagged enum.
+            let theirs: Alpha14WireMessage = ciborium::from_reader(ours.as_slice())
+                .unwrap_or_else(|e| panic!("{name}: alpha.14 does not read it: {e}"));
+            // Written by alpha.14: the same bytes, and this node reads
+            // them on the message's stream as the same message.
+            let written = encode(&theirs);
+            assert_eq!(written, ours, "{name}");
+            let read = crate::codec::decode_message(stream_of(&message), &written)
+                .unwrap_or_else(|e| panic!("{name}: not read here: {e}"));
+            assert_eq!(encode_message(&read).unwrap(), written, "{name}");
+        }
+    }
+
+    /// A message is a map whose first key is its name, and nothing comes
+    /// after it: what is not so is refused. A field that is not known is
+    /// passed over, as it always was: that is how a field is added.
+    #[test]
+    fn a_message_not_in_its_form_is_refused() {
+        use ciborium::Value;
+        let text = |s: &str| Value::Text(s.into());
+        let int = |n: u64| Value::Integer(n.into());
+        let bytes_of = |value: &Value| encode(value);
+        let read = |bytes: &[u8]| crate::codec::decode_message(Protocol::KeepAlive, bytes);
+        let ping = |entries: Vec<(Value, Value)>| bytes_of(&Value::Map(entries));
+
+        // The control: its name first, then its fields.
+        let good = ping(vec![
+            (text("msg_type"), text("Ping")),
+            (text("seq"), int(1)),
+            (text("sent_at_ns"), int(2)),
+        ]);
+        assert!(matches!(
+            read(&good),
+            Ok(WireMessage::Ping(Ping {
+                seq: 1,
+                sent_at_ns: 2
+            }))
+        ));
+        // A field that is not known is passed over.
+        let more = ping(vec![
+            (text("msg_type"), text("Ping")),
+            (text("seq"), int(1)),
+            (text("later"), Value::Array(vec![int(5); 3])),
+            (text("sent_at_ns"), int(2)),
+        ]);
+        assert!(matches!(read(&more), Ok(WireMessage::Ping(_))));
+
+        // Its name after a field.
+        let late = ping(vec![
+            (text("seq"), int(1)),
+            (text("msg_type"), text("Ping")),
+            (text("sent_at_ns"), int(2)),
+        ]);
+        assert!(read(&late).is_err());
+        // No name, a name that is no message's, a name that is not text,
+        // a first key that is not text.
+        assert!(
+            read(&ping(vec![
+                (text("seq"), int(1)),
+                (text("sent_at_ns"), int(2))
+            ]))
+            .is_err()
+        );
+        assert!(read(&ping(vec![(text("msg_type"), text("Pingg"))])).is_err());
+        assert!(read(&ping(vec![(text("msg_type"), int(1))])).is_err());
+        assert!(read(&ping(vec![(int(0), text("Ping"))])).is_err());
+        // A name under another key, first.
+        assert!(
+            read(&ping(vec![
+                (text("type"), text("Ping")),
+                (text("seq"), int(1)),
+                (text("sent_at_ns"), int(2)),
+            ]))
+            .is_err()
+        );
+        assert!(read(&ping(Vec::new())).is_err());
+        // Not a map: the message as an array, or anything else.
+        assert!(read(&bytes_of(&Value::Array(vec![text("Ping"), int(1), int(2)]))).is_err());
+        assert!(read(&bytes_of(&text("Ping"))).is_err());
+        assert!(read(&[]).is_err());
+        // Its fields as an array, inside the map.
+        let inner = bytes_of(&Value::Map(vec![
+            (text("msg_type"), text("PeerShareResponse")),
+            (
+                text("peers"),
+                Value::Array(vec![Value::Array(vec![
+                    Value::Bytes(vec![1; 32]),
+                    Value::Array(vec![text("203.0.113.1:9474")]),
+                    int(0),
+                    Value::Bool(false),
+                ])]),
+            ),
+        ]));
+        assert!(crate::codec::decode_message(Protocol::PeerSharing, &inner).is_err());
+        // Anything after the message.
+        let mut after = good.clone();
+        after.push(0x00);
+        assert!(read(&after).is_err());
+        let mut twice = good.clone();
+        twice.extend_from_slice(&good);
+        assert!(read(&twice).is_err());
+    }
+
+    /// Each list of the eight older streams is bounded where it is read:
+    /// a list as long as its bound is read, and one longer is refused.
+    #[test]
+    fn each_list_of_the_older_streams_is_bounded_where_it_is_read() {
+        use cordelia_core::protocol::{
+            DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, MAX_CHANNELS_ASKED_OF_A_PEER,
+            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS, MAX_PUSHED_ITEMS,
+            MAX_SHARED_PEER_ADDRS,
+        };
+        let messages = every_message();
+        let first = |name: &str| {
+            messages
+                .iter()
+                .find(|message| name_of(message) == name)
+                .unwrap()
+                .clone()
+        };
+        let header = match first("SyncResponse") {
+            WireMessage::SyncResponse(page) => page.items[0].clone(),
+            _ => unreachable!(),
+        };
+        let item = match first("FetchResponse") {
+            WireMessage::FetchResponse(fetched) => fetched.items[0].clone(),
+            _ => unreachable!(),
+        };
+        let peer = match first("PeerShareResponse") {
+            WireMessage::PeerShareResponse(shared) => shared.peers[0].clone(),
+            _ => unreachable!(),
+        };
+        let descriptor = match first("ChannelListResponse") {
+            WireMessage::ChannelListResponse(list) => list.channels[0].clone(),
+            _ => unreachable!(),
+        };
+        // Each list: its name, its bound, and the message that holds `n`.
+        type Of = Box<dyn Fn(usize) -> WireMessage>;
+        let lists: Vec<(&str, usize, Of)> = vec![
+            ("HandshakePropose.roles", MAX_HANDSHAKE_ROLES as usize, {
+                let WireMessage::HandshakePropose(propose) = first("HandshakePropose") else {
+                    unreachable!()
+                };
+                Box::new(move |n| {
+                    WireMessage::HandshakePropose(HandshakePropose {
+                        roles: vec!["relay".into(); n],
+                        ..propose.clone()
+                    })
+                })
+            }),
+            ("HandshakeAccept.roles", MAX_HANDSHAKE_ROLES as usize, {
+                let WireMessage::HandshakeAccept(accept) = first("HandshakeAccept") else {
+                    unreachable!()
+                };
+                Box::new(move |n| {
+                    WireMessage::HandshakeAccept(HandshakeAccept {
+                        roles: vec![String::new(); n],
+                        ..accept.clone()
+                    })
+                })
+            }),
+            (
+                "PeerShareResponse.peers",
+                usize::from(DEFAULT_MAX_PEERS_SHARE),
+                {
+                    let peer = peer.clone();
+                    Box::new(move |n| {
+                        WireMessage::PeerShareResponse(PeerShareResponse {
+                            peers: vec![peer.clone(); n],
+                        })
+                    })
+                },
+            ),
+            ("PeerAddress.addrs", MAX_SHARED_PEER_ADDRS as usize, {
+                Box::new(move |n| {
+                    WireMessage::PeerShareResponse(PeerShareResponse {
+                        peers: vec![PeerAddress {
+                            addrs: vec![String::new(); n],
+                            ..peer.clone()
+                        }],
+                    })
+                })
+            }),
+            (
+                "ChannelListResponse.channels",
+                MAX_CHANNELS_ASKED_OF_A_PEER,
+                {
+                    Box::new(move |n| {
+                        WireMessage::ChannelListResponse(ChannelListResponse {
+                            channels: vec![descriptor.clone(); n],
+                        })
+                    })
+                },
+            ),
+            (
+                "SyncChannelListResponse.channel_ids",
+                MAX_LISTED_CHANNEL_IDS as usize,
+                Box::new(|n| {
+                    WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                        channel_ids: vec![String::new(); n],
+                    })
+                }),
+            ),
+            ("SyncResponse.items", DEFAULT_SYNC_LIMIT as usize, {
+                Box::new(move |n| {
+                    WireMessage::SyncResponse(SyncResponse {
+                        items: vec![header.clone(); n],
+                        has_more: true,
+                        last_seq: None,
+                    })
+                })
+            }),
+            (
+                "FetchRequest.item_ids",
+                MAX_FETCH_ITEMS,
+                Box::new(|n| {
+                    WireMessage::FetchRequest(FetchRequest {
+                        item_ids: vec![String::new(); n],
+                    })
+                }),
+            ),
+            ("FetchResponse.items", MAX_FETCH_ITEMS, {
+                let item = item.clone();
+                Box::new(move |n| {
+                    WireMessage::FetchResponse(FetchResponse {
+                        items: vec![item.clone(); n],
+                    })
+                })
+            }),
+            ("PushPayload.items", MAX_PUSHED_ITEMS, {
+                Box::new(move |n| {
+                    WireMessage::PushPayload(PushPayload {
+                        items: vec![item.clone(); n],
+                    })
+                })
+            }),
+            (
+                "PushAck.refused",
+                MAX_PUSHED_ITEMS,
+                Box::new(|n| {
+                    WireMessage::PushAck(PushAck {
+                        refused: vec![
+                            Refusal {
+                                item_id: "ci_x".into(),
+                                why: REFUSED_FULL.into(),
+                            };
+                            n
+                        ],
+                        ..Default::default()
+                    })
+                }),
+            ),
+        ];
+        assert_eq!(lists.len(), 11);
+        for (list, most, of) in &lists {
+            for n in [0, 1, *most] {
+                let message = of(n);
+                let bytes = encode_message(&message).unwrap();
+                let read = crate::codec::decode_message(stream_of(&message), &bytes);
+                assert!(read.is_ok(), "{list} of {n}: {read:?}");
+                assert_eq!(
+                    encode_message(&read.unwrap()).unwrap(),
+                    bytes,
+                    "{list} of {n}"
+                );
+            }
+            for n in [*most + 1, *most * 2 + 7] {
+                let message = of(n);
+                let bytes = encode_message(&message).unwrap();
+                assert!(
+                    crate::codec::decode_message(stream_of(&message), &bytes).is_err(),
+                    "{list} of {n} was read: its bound is {most}"
+                );
+            }
+        }
     }
 }

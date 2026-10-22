@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(state.next_seq, 2);
 
         // Read ping on server side
-        let msg = read_frame(&mut server).await.unwrap();
+        let msg = read_frame(&mut server, Protocol::KeepAlive).await.unwrap();
         let ping = match msg {
             WireMessage::Ping(p) => p,
             other => panic!("expected Ping, got {:?}", other),
@@ -336,7 +336,7 @@ mod tests {
         send_pong(&mut server, &ping).await.unwrap();
 
         // Read pong on client side
-        let msg = read_frame(&mut client).await.unwrap();
+        let msg = read_frame(&mut client, Protocol::KeepAlive).await.unwrap();
         let pong = match msg {
             WireMessage::Pong(p) => p,
             other => panic!("expected Pong, got {:?}", other),

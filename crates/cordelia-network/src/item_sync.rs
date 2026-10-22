@@ -51,7 +51,7 @@ pub async fn send_channel_list_request<W: AsyncWrite + Unpin, R: AsyncRead + Unp
 ) -> Result<SyncChannelListResponse, ItemSyncError> {
     let req = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
     write_frame(writer, &req).await?;
-    let resp = read_frame(reader).await?;
+    let resp = read_frame(reader, Protocol::ItemSync).await?;
     match resp {
         WireMessage::SyncChannelListResponse(r) => Ok(r),
         _ => Err(ItemSyncError::UnexpectedMessage),
@@ -108,7 +108,7 @@ pub async fn send_sync_request_raw<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         after_seq: None,
     });
     write_frame(send, &req).await?;
-    let resp = read_frame(recv).await?;
+    let resp = read_frame(recv, Protocol::ItemSync).await?;
     match resp {
         WireMessage::SyncResponse(sr) => Ok(sr),
         _ => Err(ItemSyncError::UnexpectedMessage),
@@ -133,7 +133,7 @@ pub async fn send_sync_page<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         after_seq: Some(after_seq),
     });
     write_frame(send, &req).await?;
-    match read_frame(recv).await? {
+    match read_frame(recv, Protocol::ItemSync).await? {
         WireMessage::SyncResponse(sr) => Ok(sr),
         _ => Err(ItemSyncError::UnexpectedMessage),
     }
@@ -149,7 +149,7 @@ pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(ItemSyncError::UnexpectedMessage);
     }
 
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::ItemSync).await?;
     let req = match msg {
         WireMessage::SyncRequest(r) => r,
         _ => return Err(ItemSyncError::UnexpectedMessage),
@@ -183,7 +183,7 @@ pub async fn send_fetch_request<W: AsyncWrite + Unpin>(
 pub async fn read_fetch_response<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Vec<Item>, ItemSyncError> {
-    let msg = read_frame(reader).await?;
+    let msg = read_frame(reader, Protocol::ItemSync).await?;
     match msg {
         WireMessage::FetchResponse(fr) => Ok(fr.items),
         _ => Err(ItemSyncError::UnexpectedMessage),
@@ -195,7 +195,7 @@ pub async fn handle_fetch_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     get_items: impl FnOnce(&[String]) -> Vec<Item>,
 ) -> Result<(), ItemSyncError> {
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::ItemSync).await?;
     let req = match msg {
         WireMessage::FetchRequest(r) => r,
         _ => return Err(ItemSyncError::UnexpectedMessage),
@@ -235,7 +235,7 @@ pub async fn handle_push<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(ItemSyncError::UnexpectedMessage);
     }
 
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::ItemPush).await?;
     let items = match msg {
         WireMessage::PushPayload(pp) => pp.items,
         _ => return Err(ItemSyncError::UnexpectedMessage),
@@ -505,7 +505,9 @@ mod tests {
             .await
         });
 
-        // Send a Ping where a SyncRequest is expected
+        // Send a Ping where a SyncRequest is expected. A message of
+        // another stream is not read at all: it is refused where its name
+        // is read, before anything else of it.
         write_protocol_byte(&mut client, Protocol::ItemSync)
             .await
             .unwrap();
@@ -516,7 +518,15 @@ mod tests {
         write_frame(&mut client, &wrong_msg).await.unwrap();
 
         let result = server_task.await.unwrap();
-        assert!(matches!(result, Err(ItemSyncError::UnexpectedMessage)));
+        assert!(
+            matches!(
+                result,
+                Err(ItemSyncError::Codec(crate::codec::CodecError::CborDecode(
+                    _
+                )))
+            ),
+            "{result:?}"
+        );
     }
 
     // T3-06 variant: wrong message type in push
@@ -729,7 +739,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             // Serve two sync requests in a loop
             for expected_ch in &["ch1", "ch2"] {
-                let msg = read_frame(&mut server_r).await.unwrap();
+                let msg = read_frame(&mut server_r, Protocol::ItemSync).await.unwrap();
                 let req = match msg {
                     WireMessage::SyncRequest(r) => r,
                     _ => panic!("expected SyncRequest"),

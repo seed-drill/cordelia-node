@@ -16,7 +16,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §3
 
-use crate::messages::{Protocol, WireMessage};
+use crate::messages::{On, Protocol, WireMessage};
 use cordelia_core::protocol;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -69,9 +69,48 @@ pub fn encode_message(msg: &WireMessage) -> Result<Vec<u8>, CodecError> {
     Ok(buf)
 }
 
-/// Decode a WireMessage from CBOR bytes.
-pub fn decode_message(data: &[u8]) -> Result<WireMessage, CodecError> {
-    ciborium::from_reader(data).map_err(|e| CodecError::CborDecode(e.to_string()))
+/// Decode a message that arrived on a stream of `protocol` from its CBOR
+/// bytes: one of that stream's messages, read straight into its own type
+/// ([`On`]), with nothing after it.
+///
+/// A stream's protocol is known before its first frame. A message is
+/// never read as the tagged [`WireMessage`]: serde reads such an enum by
+/// holding the whole frame as values of no type first, some 32 bytes for
+/// each byte of the frame, before it looks at the name. Read by its
+/// stream, a frame of n bytes costs at most what its texts and bytes are,
+/// and the lists of its message, each bounded where it is read
+/// (parameter-rationale.md §1).
+pub fn decode_message(protocol: Protocol, data: &[u8]) -> Result<WireMessage, CodecError> {
+    match protocol {
+        Protocol::Handshake => decode_on::<{ Protocol::Handshake as u8 }>(data),
+        Protocol::KeepAlive => decode_on::<{ Protocol::KeepAlive as u8 }>(data),
+        Protocol::PeerSharing => decode_on::<{ Protocol::PeerSharing as u8 }>(data),
+        Protocol::ChannelAnnounce => decode_on::<{ Protocol::ChannelAnnounce as u8 }>(data),
+        Protocol::ItemSync => decode_on::<{ Protocol::ItemSync as u8 }>(data),
+        Protocol::ItemPush => decode_on::<{ Protocol::ItemPush as u8 }>(data),
+        Protocol::PskExchange => decode_on::<{ Protocol::PskExchange as u8 }>(data),
+        Protocol::Pairing => decode_on::<{ Protocol::Pairing as u8 }>(data),
+        Protocol::EntryShow => decode_on::<{ Protocol::EntryShow as u8 }>(data),
+        Protocol::ChannelProve => decode_on::<{ Protocol::ChannelProve as u8 }>(data),
+        Protocol::EntryPull => decode_on::<{ Protocol::EntryPull as u8 }>(data),
+        Protocol::EntryPush => decode_on::<{ Protocol::EntryPush as u8 }>(data),
+        Protocol::RelayEntries => decode_on::<{ Protocol::RelayEntries as u8 }>(data),
+    }
+}
+
+/// Decode one message of the stream whose protocol byte is `P`, and refuse
+/// a frame that holds anything after it.
+fn decode_on<const P: u8>(data: &[u8]) -> Result<WireMessage, CodecError> {
+    let mut rest = data;
+    let On(message) = ciborium::from_reader::<On<P>, _>(&mut rest)
+        .map_err(|e| CodecError::CborDecode(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(CodecError::CborDecode(format!(
+            "{} bytes after the message",
+            rest.len()
+        )));
+    }
+    Ok(message)
 }
 
 // ── Timeout-guarded I/O helpers ──────────────────────────────────
@@ -140,8 +179,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     write_all_guarded(writer, &payload).await
 }
 
-/// Read a length-prefixed CBOR frame.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<WireMessage, CodecError> {
+/// Read a length-prefixed CBOR frame on a stream of `protocol`, and decode
+/// it as one of that stream's messages ([`decode_message`]).
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    protocol: Protocol,
+) -> Result<WireMessage, CodecError> {
     let mut len_buf = [0u8; 4];
     read_exact_guarded(reader, &mut len_buf).await?;
 
@@ -153,7 +196,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<WireMess
     let mut payload = vec![0u8; len as usize];
     read_exact_guarded(reader, &mut payload).await?;
 
-    decode_message(&payload)
+    decode_message(protocol, &payload)
 }
 
 // ── Raw frame read/write (pre-encoded CBOR) ──────────────────────
@@ -200,7 +243,7 @@ pub async fn send_request<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<WireMessage, CodecError> {
     write_protocol_byte(stream, protocol).await?;
     write_frame(stream, request).await?;
-    read_frame(stream).await
+    read_frame(stream, protocol).await
 }
 
 #[cfg(test)]
@@ -226,7 +269,7 @@ mod tests {
             sent_at_ns: 1_710_100_000_000_000_000,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         match decoded {
             WireMessage::Ping(p) => {
                 assert_eq!(p.seq, 42);
@@ -250,7 +293,7 @@ mod tests {
             p2p_port: 9474,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         match decoded {
             WireMessage::HandshakePropose(h) => {
                 assert_eq!(h.magic, HANDSHAKE_MAGIC);
@@ -281,7 +324,7 @@ mod tests {
             descriptor: desc,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         match decoded {
             WireMessage::ChannelJoined(cj) => {
                 assert_eq!(cj.channel_id, "abc123");
@@ -313,7 +356,7 @@ mod tests {
         };
         let msg = WireMessage::PushPayload(PushPayload { items: vec![item] });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         match decoded {
             WireMessage::PushPayload(pp) => {
                 assert_eq!(pp.items.len(), 1);
@@ -331,7 +374,7 @@ mod tests {
             subscriber_xpk: vec![0xDD; 32],
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         match decoded {
             WireMessage::PskRequest(r) => {
                 assert_eq!(r.channel_id, "abc123");
@@ -444,7 +487,7 @@ mod tests {
 
         for msg in &messages {
             let encoded = encode_message(msg).unwrap();
-            let decoded = decode_message(&encoded).unwrap();
+            let decoded = decode_message(stream_of(msg), &encoded).unwrap();
             assert_eq!(
                 std::mem::discriminant(msg),
                 std::mem::discriminant(&decoded),
@@ -463,7 +506,7 @@ mod tests {
         write_frame(&mut buf, &msg).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
-        let decoded = read_frame(&mut cursor).await.unwrap();
+        let decoded = read_frame(&mut cursor, Protocol::KeepAlive).await.unwrap();
         match decoded {
             WireMessage::Ping(p) => {
                 assert_eq!(p.seq, 99);
@@ -501,7 +544,7 @@ mod tests {
         buf.push(0x00);
 
         let mut cursor = std::io::Cursor::new(buf);
-        let result = read_frame(&mut cursor).await;
+        let result = read_frame(&mut cursor, Protocol::KeepAlive).await;
         assert!(matches!(result, Err(CodecError::MessageTooLarge { .. })));
     }
 
@@ -521,7 +564,7 @@ mod tests {
         let raw = read_raw_frame(&mut cursor).await.unwrap();
         assert_eq!(raw, payload);
 
-        let decoded = decode_message(&raw).unwrap();
+        let decoded = decode_message(Protocol::KeepAlive, &raw).unwrap();
         match decoded {
             WireMessage::Pong(p) => assert_eq!(p.seq, 1),
             other => panic!("expected Pong, got {:?}", other),
@@ -560,15 +603,15 @@ mod tests {
             Protocol::KeepAlive
         );
 
-        match read_frame(&mut cursor).await.unwrap() {
+        match read_frame(&mut cursor, Protocol::KeepAlive).await.unwrap() {
             WireMessage::Ping(p) => assert_eq!(p.seq, 1),
             other => panic!("expected Ping, got {:?}", other),
         }
-        match read_frame(&mut cursor).await.unwrap() {
+        match read_frame(&mut cursor, Protocol::KeepAlive).await.unwrap() {
             WireMessage::Pong(p) => assert_eq!(p.seq, 1),
             other => panic!("expected Pong, got {:?}", other),
         }
-        match read_frame(&mut cursor).await.unwrap() {
+        match read_frame(&mut cursor, Protocol::KeepAlive).await.unwrap() {
             WireMessage::Ping(p) => assert_eq!(p.seq, 2),
             other => panic!("expected Ping, got {:?}", other),
         }
@@ -583,7 +626,7 @@ mod tests {
         buf.extend_from_slice(&garbage);
 
         let mut cursor = std::io::Cursor::new(buf);
-        let result = read_frame(&mut cursor).await;
+        let result = read_frame(&mut cursor, Protocol::KeepAlive).await;
         assert!(matches!(result, Err(CodecError::CborDecode(_))));
     }
 
@@ -595,7 +638,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; 50]);
 
         let mut cursor = std::io::Cursor::new(buf);
-        let result = read_frame(&mut cursor).await;
+        let result = read_frame(&mut cursor, Protocol::KeepAlive).await;
         assert!(matches!(result, Err(CodecError::UnexpectedEof)));
     }
 
@@ -640,7 +683,7 @@ mod tests {
         buf.extend_from_slice(&len);
 
         let mut cursor = std::io::Cursor::new(buf);
-        let result = read_frame(&mut cursor).await;
+        let result = read_frame(&mut cursor, Protocol::KeepAlive).await;
         assert!(matches!(result, Err(CodecError::CborDecode(_))));
     }
 
@@ -654,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_eof_on_length_prefix() {
         let mut cursor = std::io::Cursor::new(vec![0u8, 0u8]);
-        let result = read_frame(&mut cursor).await;
+        let result = read_frame(&mut cursor, Protocol::KeepAlive).await;
         assert!(matches!(result, Err(CodecError::UnexpectedEof)));
     }
 
@@ -672,7 +715,7 @@ mod tests {
             p2p_port: 9474,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         if let WireMessage::HandshakePropose(h) = decoded {
             assert_eq!(h.timestamp, 1767225600);
         } else {
@@ -698,7 +741,7 @@ mod tests {
             sent_at_ns: u64::MAX,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         if let WireMessage::Ping(p) = decoded {
             assert_eq!(p.seq, u64::MAX);
             assert_eq!(p.sent_at_ns, u64::MAX);
@@ -721,7 +764,7 @@ mod tests {
             p2p_port: 0,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         if let WireMessage::HandshakePropose(h) = decoded {
             assert!(h.channel_digest.is_empty());
             assert!(h.node_id.is_empty());
@@ -741,7 +784,7 @@ mod tests {
             key_version: None,
         });
         let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(&encoded).unwrap();
+        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
         if let WireMessage::PskResponse(r) = decoded {
             assert_eq!(r.status, "denied");
             assert!(r.ecies_envelope.is_none());
@@ -773,9 +816,13 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         // Skip past what the client would have written
         let _ = read_protocol_byte(&mut cursor).await.unwrap();
-        let _ = read_frame(&mut cursor).await.unwrap();
+        let _ = read_frame(&mut cursor, Protocol::PeerSharing)
+            .await
+            .unwrap();
         // Read the response
-        let got = read_frame(&mut cursor).await.unwrap();
+        let got = read_frame(&mut cursor, Protocol::PeerSharing)
+            .await
+            .unwrap();
         assert!(matches!(got, WireMessage::PeerShareResponse(_)));
     }
 }

@@ -783,7 +783,7 @@ impl StandIn {
         let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
             return;
         };
-        let Ok(request) = codec::read_frame(&mut recv).await else {
+        let Ok(request) = codec::read_frame(&mut recv, protocol).await else {
             return;
         };
         // What it does with the request: `Ok` with the answer, or with

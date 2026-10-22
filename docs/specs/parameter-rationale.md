@@ -80,6 +80,53 @@ stream is enough. Two for the connection lets a second exchange begin
 while the first is being read. With 200 connections a relay holds at
 most 400MB unread.
 
+### What one connection can cost
+
+A node serves one stream of a connection at a time (`handle_peer_streams`).
+What it holds for a connection, at most:
+
+| What | Most | From |
+|------|------|------|
+| Unread, on the connection | 2 MB | `receive_window` above |
+| A frame, read whole before it is decoded | 1 MB | `MAX_MESSAGE_BYTES` (§4) |
+| Decoding that frame, at its peak | 3 MB; measured, 2.0 MB at worst | the message is read by its stream, its lists bounded (below) |
+| The message, once decoded | 2 MB and 64 KB; measured, 1.97 MB at worst | its texts and bytes, each in room that grows by doubling, and its lists |
+| A frame that is refused, once refused | nothing but its error; measured, at most 1.2 MB at its peak | the same |
+| While it waits for a peer's next request | none of the request it last answered | a request is dropped before anything is awaited |
+
+**Decode, measured** (with a counting allocator, of the bytes asked for:
+`crates/cordelia-network/tests/decode_cost.rs`). A message is read by the
+stream it arrives on, straight into its own type. Up to 0.2.0-alpha.14
+it was read as the enum of every message, tagged by name, which serde
+reads by holding the whole frame as values of no type before it looks at
+the name: some 32 bytes for each byte of the frame. Frames of about 1 MB
+that a peer chose, before and after:
+
+| Frame | Before: peak, held | After: peak, held |
+|-------|--------------------|-------------------|
+| A map of 512K pairs of zeros, with no name, or its name last | 48 MB, nothing (refused) | 215 bytes, nothing (refused) |
+| A fetch of about 1M empty IDs | 80 MB, 32 MB | 4.6 KB, nothing (refused) |
+| One peer with about 1M empty addresses | 80 MB, 32 MB | 320 bytes, nothing (refused) |
+| About 200K peers, each written as an array | 42 MB, 16 MB | 206 bytes, nothing (refused) |
+| A list of about 1M empty channel IDs | 80 MB, 32 MB | 1.2 MB, nothing (refused) |
+| A page of fifteen entries of the largest size | 2.0 MB, 1.97 MB | 2.0 MB, 1.97 MB |
+
+**The bounds of the lists**, each at least what a node of any version
+sends, so that none of it is refused:
+
+| List | Bound | Why |
+|------|-------|-----|
+| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with |
+| Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
+| Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
+| Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
+| Channel IDs listed | `MAX_LISTED_CHANNEL_IDS` = 24,966 | Derived: as many of the shortest ID a node makes (`grp_` and a UUID, `SHORTEST_CHANNEL_ID_LEN` = 40) as fit in one message. A relay lists a relay it works with every channel it holds |
+| Headers of a page | `DEFAULT_SYNC_LIMIT` = 100 | The most a node asks for |
+| IDs of a fetch, items handed for it | `MAX_FETCH_ITEMS` = 100 | A fetch is of the IDs of one page |
+| Items of a push, and those it refused | `MAX_PUSHED_ITEMS` = 2048 | Derived: as many entries of no ciphertext as one peer's allowance for a minute takes (`PUSH_BYTES_PER_PEER_PER_MINUTE`, each at `ENTRY_OVERHEAD_BYTES`). A node's outbox pushes at most `OUTBOX_BATCH_MAX_ITEMS` = 500, and a version before may have pushed more: a push of more than this is over any limited peer's allowance, and is refused whole |
+| Entries of a push, a page, or passed on; answers to a push | `ENTRY_PAGE_MAX_ENTRIES` = 100 | As before (§12.7) |
+| Channels a relay tells of | `RELAY_CHANNELS_PAGE_MAX` = 1000 | As before (§12.7) |
+
 ---
 
 ## 2. Application Keepalive Parameters

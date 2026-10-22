@@ -56,7 +56,7 @@ pub async fn handle_peer_request<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(PeerSharingError::UnexpectedMessage);
     }
 
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::PeerSharing).await?;
     let max_peers = match msg {
         WireMessage::PeerShareRequest(r) => r.max_peers as usize,
         _ => return Err(PeerSharingError::UnexpectedMessage),

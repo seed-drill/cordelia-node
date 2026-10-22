@@ -658,6 +658,51 @@ pub const MAX_FETCH_ITEMS: usize = 100;
 /// enabling address-space enumeration.
 pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 
+// The lists of the older streams, each bounded where it is read
+// (parameter-rationale.md §1). A list that is read without a bound costs
+// some 24 bytes of memory for each byte of the frame that holds it, or
+// more: an empty text is one byte on the wire and 24 in memory. Each
+// bound is at least what a node of any version sends. The lists that
+// other constants bound: the peers shared (DEFAULT_MAX_PEERS_SHARE, the
+// most a node asks for), the headers of a page (DEFAULT_SYNC_LIMIT, the
+// same), the IDs of a fetch and the items handed for it (MAX_FETCH_ITEMS),
+// and the descriptors of channels (MAX_CHANNELS_ASKED_OF_A_PEER).
+
+/// The most roles a node may say it has in its handshake
+/// (network-protocol.md §4.1). A node says one: the role it is configured
+/// with. Primitive: 8, room for a node that one day says more than one.
+pub const MAX_HANDSHAKE_ROLES: u32 = 8;
+
+/// The most addresses of one peer that a node may tell when it shares
+/// peers (network-protocol.md §4.3). A node tells one: where the peer
+/// listens. Primitive: 8, room for a peer with an address of each family
+/// and more.
+pub const MAX_SHARED_PEER_ADDRS: u32 = 8;
+
+/// The length of the shortest ID of a channel of the older kind that a
+/// node makes: `grp_` and a UUID. Every other kind is longer
+/// (channel-naming.md).
+pub const SHORTEST_CHANNEL_ID_LEN: u32 = 40;
+
+/// The most channel IDs that a node may list when it is asked which
+/// channels it holds (network-protocol.md §4.5). A relay lists another
+/// relay that it works with every channel it holds, with no other limit
+/// than the message's. Derived: as many of the shortest IDs as fit in one
+/// message, each with the two bytes that say a text and its length.
+pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID_LEN + 2);
+
+/// The most items one push may hold, and the most its answer may list as
+/// refused (network-protocol.md §4.6). A node's outbox pushes at most
+/// OUTBOX_BATCH_MAX_ITEMS, and a version before may have pushed more.
+/// Derived: as many entries of no ciphertext as one peer's allowance for a
+/// minute takes, each counted as what an entry takes beyond its
+/// ciphertext. A push of more is over any limited peer's allowance, and
+/// is refused whole; a relay passes items on one at a time.
+pub const MAX_PUSHED_ITEMS: usize = (PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(0)) as usize;
+
+// Checked at compile time: a node's own pushes are within the bound.
+const _: () = assert!(MAX_PUSHED_ITEMS >= OUTBOX_BATCH_MAX_ITEMS);
+
 /// How long a deleted key's tombstone is kept (decision 2026-09-30 §4.4).
 /// Primitive: 90 days. When a key's newest revision is a tombstone older
 /// than this, every node drops the key's whole slot history. A device
@@ -2487,6 +2532,22 @@ mod tests {
     #[test]
     fn test_default_max_peers_share_network_protocol_4_3() {
         assert_eq!(DEFAULT_MAX_PEERS_SHARE, 20);
+    }
+
+    /// The bounds of the lists of the older streams, where they are read
+    /// (parameter-rationale.md §1).
+    #[test]
+    fn test_the_lists_of_the_older_streams_are_bounded() {
+        assert_eq!(MAX_HANDSHAKE_ROLES, 8);
+        assert_eq!(MAX_SHARED_PEER_ADDRS, 8);
+        assert_eq!(SHORTEST_CHANNEL_ID_LEN, 40);
+        assert_eq!(MAX_LISTED_CHANNEL_IDS, 24_966);
+        assert_eq!(MAX_PUSHED_ITEMS, 2048);
+        // The shortest ID a node makes is that long.
+        assert_eq!(
+            format!("grp_{}", "0".repeat(36)).len(),
+            SHORTEST_CHANNEL_ID_LEN as usize
+        );
     }
 
     #[test]
