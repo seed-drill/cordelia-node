@@ -5060,6 +5060,50 @@ pub async fn handle_peer_streams(
 
 // ── Protocol handlers (extracted from handle_peer_streams) ───────
 
+/// Read the one push on a stream of Item-Push. A frame that is no push,
+/// bytes that are no message of the stream or a message that is not a
+/// push, is not answered, and its bytes count against what the peer may
+/// push, as an entry of that size would, where the peer is `limited`: the
+/// node read them, and a megabyte read for nothing is still a megabyte.
+/// `Err` holds the breach where they are over either allowance.
+async fn read_push<R>(
+    recv: &mut R,
+    peer_id: &NodeId,
+    peer_rates: &std::sync::Mutex<Rates>,
+    limited: bool,
+    address: std::net::IpAddr,
+) -> Result<cordelia_network::messages::PushPayload, Option<OverLimit>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let frame = match cordelia_network::codec::read_raw_frame(recv).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
+            return Err(None);
+        }
+    };
+    match cordelia_network::codec::decode_message(
+        cordelia_network::messages::Protocol::ItemPush,
+        &frame,
+    ) {
+        Ok(cordelia_network::messages::WireMessage::PushPayload(payload)) => Ok(payload),
+        read => {
+            tracing::debug!(peer = %peer_id, bytes = frame.len(), is_message = read.is_ok(), "a frame on a push stream that is no push");
+            let bytes = cordelia_core::protocol::entry_cost(frame.len());
+            Err(limited
+                .then(|| {
+                    peer_rates
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pushed(peer_id, address, bytes)
+                        .err()
+                })
+                .flatten())
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "forwarding state moves into a struct when slot/rev and tombstones change this handler"
@@ -5077,22 +5121,14 @@ async fn handle_inbound_push(
     limited: bool,
     address: std::net::IpAddr,
 ) -> Option<OverLimit> {
-    let msg = match cordelia_network::codec::read_frame(
-        recv,
-        cordelia_network::messages::Protocol::ItemPush,
-    )
-    .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
-            return None;
+    let payload = match read_push(recv, peer_id, peer_rates, limited, address).await {
+        Ok(payload) => payload,
+        Err(over) => {
+            if over.is_some() {
+                refuse_stream(send, recv);
+            }
+            return over;
         }
-    };
-
-    let payload = match msg {
-        cordelia_network::messages::WireMessage::PushPayload(p) => p,
-        _ => return None,
     };
 
     // What this push carries counts against the connection's allowance
@@ -6234,6 +6270,85 @@ mod tests {
         }
         let answer = nothing_for(&which).unwrap();
         assert!(nothing_for(&answer).is_none());
+    }
+
+    /// A frame on a push stream that is no push counts against what the
+    /// peer may push, by its bytes, where the peer is limited: frames of
+    /// bytes that are no message, and a message that is not a push. Over
+    /// the allowance, the breach is returned. A push is read as it was.
+    #[tokio::test]
+    async fn test_a_frame_that_is_no_push_counts_against_the_push_allowance() {
+        use cordelia_core::protocol::{PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost};
+        use cordelia_network::codec::encode_message;
+        use cordelia_network::messages::{PushAck, PushPayload, WireMessage};
+
+        // A frame of `payload`, as it travels.
+        fn framed(payload: &[u8]) -> Vec<u8> {
+            [&(payload.len() as u32).to_be_bytes()[..], payload].concat()
+        }
+        // What `read_push` makes of `bytes` from a peer that is `limited`.
+        async fn read(
+            rates: &std::sync::Mutex<Rates>,
+            limited: bool,
+            bytes: Vec<u8>,
+        ) -> Result<PushPayload, Option<OverLimit>> {
+            let peer = NodeId([9; 32]);
+            let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+            let mut cursor = std::io::Cursor::new(bytes);
+            read_push(&mut cursor, &peer, rates, limited, address).await
+        }
+
+        // Frames of 900,000 bytes that are no message: two are within the
+        // allowance, and the third is over it.
+        let garbage = framed(&vec![0x5a; 900_000]);
+        assert!(2 * entry_cost(900_000) <= PUSH_BYTES_PER_PEER_PER_MINUTE);
+        assert!(3 * entry_cost(900_000) > PUSH_BYTES_PER_PEER_PER_MINUTE);
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..2 {
+            assert!(matches!(
+                read(&rates, true, garbage.clone()).await,
+                Err(None)
+            ));
+        }
+        assert!(matches!(
+            read(&rates, true, garbage.clone()).await,
+            Err(Some(_))
+        ));
+
+        // A message of the stream that is not a push counts the same.
+        let ack = framed(&encode_message(&WireMessage::PushAck(PushAck::default())).unwrap());
+        let rates = std::sync::Mutex::new(Rates::default());
+        let mut over = None;
+        for tries in 1..=2_100 {
+            if let Err(Some(breach)) = read(&rates, true, ack.clone()).await {
+                over = Some((tries, breach));
+                break;
+            }
+        }
+        let (tries, _) = over.expect("answers sent as pushes were never over");
+        assert_eq!(
+            tries as u64,
+            PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(ack.len() - 4) + 1
+        );
+
+        // A peer that is not limited is not counted.
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..4 {
+            assert!(matches!(
+                read(&rates, false, garbage.clone()).await,
+                Err(None)
+            ));
+        }
+
+        // A push is read as it was, and counts nothing here.
+        let push = framed(
+            &encode_message(&WireMessage::PushPayload(PushPayload { items: Vec::new() })).unwrap(),
+        );
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..2 {
+            assert!(read(&rates, true, garbage.clone()).await.is_err());
+        }
+        assert!(read(&rates, true, push).await.is_ok());
     }
 
     /// A relay passes items on to a peer in pushes of at most
