@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Mutation checks for reading each wire message by the stream it arrives
-on, straight into its own type with every list bounded, and dropping a
-request before anything is awaited (network-protocol.md §3.2,
+on, straight into its own type with every list bounded (the channel IDs a
+relay lists kept to their bound), dropping a request before anything is
+awaited, a relay's pushes of items passed on held to the bound, and a
+frame on a push stream that is no push counted (network-protocol.md §3.2,
 parameter-rationale.md §1). A part for each rule of the slice: put each
 fault in, and confirm the test named for it fails on an assertion. Run
 from the root of a checkout that nothing else edits."""
@@ -24,11 +26,14 @@ def p2p(test): return (NODE_BIN, "p2p::tests::" + test)
 BOUNDED = messages("each_list_of_the_older_streams_is_bounded_where_it_is_read")
 FORM = messages("a_message_not_in_its_form_is_refused")
 ON_ITS_STREAM = messages("every_message_is_read_on_its_stream_and_on_no_other")
-BOTH_WAYS = messages("every_message_reads_the_same_both_ways_with_alpha_14")
+BOTH_WAYS = messages("every_message_reads_the_same_through_the_tagged_enum_both_ways")
 WRITTEN = messages("every_message_is_written_as_alpha_14_writes_it")
 COST = cost("decoding_a_frame_costs_at_most_three_times_its_bytes")
 REFUSED_COST = cost("a_frame_that_is_refused_is_refused_before_it_is_held")
 NOT_HELD = p2p("test_a_fetch_request_is_not_held_while_the_node_waits")
+SHORT_IDS = cost("a_list_of_short_channel_ids_past_its_bound_keeps_the_bound")
+IN_PUSHES = p2p("test_a_relay_passes_items_on_in_pushes_of_at_most_the_bound")
+NO_PUSH = p2p("test_a_frame_that_is_no_push_counts_against_the_push_allowance")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -84,10 +89,14 @@ MUTATIONS = [
      '''    #[serde(deserialize_with = "at_most_descriptors")]
 ''', '',
      [BOUNDED]),
-    ("B6 the channel IDs listed are not bounded", MESSAGES,
-     '''    #[serde(deserialize_with = "at_most_channel_ids")]
+    ("B6 the channel IDs listed are all kept", MESSAGES,
+     '''    #[serde(deserialize_with = "first_channel_ids")]
 ''', '',
-     [BOUNDED]),
+     [SHORT_IDS]),
+    ("B6b channel IDs past their bound are refused, not passed over", MESSAGES,
+     '''    first_of(deserializer, MAX_LISTED_CHANNEL_IDS, "channel IDs")''',
+     '''    at_most(deserializer, MAX_LISTED_CHANNEL_IDS, "channel IDs")''',
+     [SHORT_IDS, COST]),
     ("B7 the headers of a page are not bounded", MESSAGES,
      '''    #[serde(deserialize_with = "at_most_headers")]
 ''', '',
@@ -120,6 +129,18 @@ MUTATIONS = [
      '''                drop(freq);
 ''', '',
      [NOT_HELD]),
+    # A relay passes items on in pushes no larger than a push may be.
+    ("R1 a relay's push of items passed on holds one more than the bound", P2P,
+     '''                .take(cordelia_core::protocol::MAX_PUSHED_ITEMS)''',
+     '''                .take(cordelia_core::protocol::MAX_PUSHED_ITEMS + 1)''',
+     [IN_PUSHES]),
+    # A frame on a push stream that is no push is counted.
+    ("P1 a frame that is no push counts nothing", P2P,
+     '''            Err(limited
+                .then(|| {''',
+     '''            Err((limited && false)
+                .then(|| {''',
+     [NO_PUSH]),
     # Nothing changed on the wire.
     ("W1 a message is written with its name under another key", MESSAGES,
      '''#[derive(Debug, Clone, Serialize)]
