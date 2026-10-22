@@ -229,8 +229,9 @@ pub struct SyncChannelListRequest {}
 /// Phase 0 response: channel IDs the responder has stored items for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncChannelListResponse {
-    /// At most MAX_LISTED_CHANNEL_IDS.
-    #[serde(deserialize_with = "at_most_channel_ids")]
+    /// The first MAX_LISTED_CHANNEL_IDS are read, and the rest passed
+    /// over.
+    #[serde(deserialize_with = "first_channel_ids")]
     pub channel_ids: Vec<String>,
 }
 
@@ -736,11 +737,63 @@ where
 }
 
 // The lists of the eight older streams, each bounded where it is read
-// (parameter-rationale.md §1). Each bound is at least what a node of any
-// version sends: a list longer than its bound is no node's, and is refused
-// where its first element too many is met. Without one, a list of the
-// smallest elements costs some 24 bytes of memory, or more, for each byte
-// of the frame.
+// (parameter-rationale.md §1). Without a bound, a list of the smallest
+// elements costs some 24 bytes of memory, or more, for each byte of the
+// frame. Each bound but one is at least what a node of any version sends,
+// whatever others sent it: a list longer than its bound is no node's, and
+// is refused where its first element too many is met. The channel IDs a
+// relay lists are what others sent it, and may be as short as a byte: an
+// honest relay can list more of them than their bound, so the first are
+// kept and the rest passed over ([`first_of`]).
+
+/// Read a list, and keep at most its first `most`: each one past them is
+/// read as nothing ([`serde::de::IgnoredAny`]) and passed over. What is
+/// held is bounded as it is for [`at_most`], and a longer list is not
+/// refused.
+fn first_of<'de, D, T>(deserializer: D, most: u32, what: &'static str) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct FirstOf<T> {
+        most: usize,
+        what: &'static str,
+        of: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for FirstOf<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                f,
+                "a list of {}, of which the first {} are kept",
+                self.what, self.most
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while list.len() < self.most {
+                match seq.next_element::<T>()? {
+                    Some(one) => list.push(one),
+                    None => return Ok(list),
+                }
+            }
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(list)
+        }
+    }
+
+    deserializer.deserialize_seq(FirstOf {
+        most: most as usize,
+        what,
+        of: std::marker::PhantomData,
+    })
+}
 
 /// At most MAX_HANDSHAKE_ROLES roles in a handshake.
 fn at_most_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -778,12 +831,14 @@ where
     )
 }
 
-/// At most MAX_LISTED_CHANNEL_IDS channel IDs listed.
-fn at_most_channel_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+/// The first MAX_LISTED_CHANNEL_IDS channel IDs listed; the rest are
+/// passed over. Whoever asks takes at most MAX_CHANNELS_ASKED_OF_A_PEER
+/// of them from a peer it is held to, in any case.
+fn first_channel_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    at_most(deserializer, MAX_LISTED_CHANNEL_IDS, "channel IDs")
+    first_of(deserializer, MAX_LISTED_CHANNEL_IDS, "channel IDs")
 }
 
 /// At most DEFAULT_SYNC_LIMIT headers in a page: the most a node asks for.
@@ -3234,9 +3289,8 @@ mod tests {
         hex::encode(hash.finalize())
     }
 
-    /// The messages as a node of 0.2.0-alpha.14 knows them: the same
-    /// types, written and read through the tagged enum, as that version
-    /// does both.
+    /// The messages through the tagged enum, as 0.2.0-alpha.14 writes and
+    /// reads them both, over this version's types.
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "msg_type")]
     enum Alpha14WireMessage {
@@ -3333,11 +3387,15 @@ mod tests {
         }
     }
 
-    /// What this node writes, a node of 0.2.0-alpha.14 reads as it was
-    /// written; and what that node writes, this node reads as it was
-    /// written.
+    /// What this node writes, the tagged enum reads as it was written; and
+    /// what the tagged enum writes, this node reads on the message's stream
+    /// as it was written. The enum is read as alpha.14 reads, through
+    /// serde's tag, but over this version's types, with their bounds: it is
+    /// not alpha.14's code. The guard across versions is the digest of
+    /// every message as alpha.14 writes it
+    /// ([`every_message_is_written_as_alpha_14_writes_it`]).
     #[test]
-    fn every_message_reads_the_same_both_ways_with_alpha_14() {
+    fn every_message_reads_the_same_through_the_tagged_enum_both_ways() {
         for message in every_message() {
             let name = name_of(&message);
             let ours = encode_message(&message).unwrap();
@@ -3445,13 +3503,14 @@ mod tests {
     }
 
     /// Each list of the eight older streams is bounded where it is read:
-    /// a list as long as its bound is read, and one longer is refused.
+    /// a list as long as its bound is read, and one longer is refused. The
+    /// one other, the channel IDs a relay lists, keeps its first and passes
+    /// over the rest (`decode_cost.rs`).
     #[test]
     fn each_list_of_the_older_streams_is_bounded_where_it_is_read() {
         use cordelia_core::protocol::{
             DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, MAX_CHANNELS_ASKED_OF_A_PEER,
-            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS, MAX_PUSHED_ITEMS,
-            MAX_SHARED_PEER_ADDRS,
+            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS,
         };
         let messages = every_message();
         let first = |name: &str| {
@@ -3535,15 +3594,6 @@ mod tests {
                     })
                 },
             ),
-            (
-                "SyncChannelListResponse.channel_ids",
-                MAX_LISTED_CHANNEL_IDS as usize,
-                Box::new(|n| {
-                    WireMessage::SyncChannelListResponse(SyncChannelListResponse {
-                        channel_ids: vec![String::new(); n],
-                    })
-                }),
-            ),
             ("SyncResponse.items", DEFAULT_SYNC_LIMIT as usize, {
                 Box::new(move |n| {
                     WireMessage::SyncResponse(SyncResponse {
@@ -3594,7 +3644,9 @@ mod tests {
                 }),
             ),
         ];
-        assert_eq!(lists.len(), 11);
+        // The channel IDs a relay lists are kept to their bound, not
+        // refused past it: `decode_cost.rs` reads such a list.
+        assert_eq!(lists.len(), 10);
         for (list, most, of) in &lists {
             for n in [0, 1, *most] {
                 let message = of(n);

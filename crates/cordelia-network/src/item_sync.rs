@@ -45,7 +45,10 @@ pub enum ItemSyncError {
 
 /// Send a channel list request (Phase 0, §4.5).
 /// Relay nodes use this to discover which channels a peer has items for.
-pub async fn send_channel_list_request<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+pub async fn send_channel_list_request<
+    W: AsyncWrite + Unpin + crate::codec::GiveUp,
+    R: AsyncRead + Unpin,
+>(
     writer: &mut W,
     reader: &mut R,
 ) -> Result<SyncChannelListResponse, ItemSyncError> {
@@ -59,7 +62,7 @@ pub async fn send_channel_list_request<W: AsyncWrite + Unpin, R: AsyncRead + Unp
 }
 
 /// Handle a channel list request (Phase 0 responder, §4.5).
-pub async fn handle_channel_list_request<W: AsyncWrite + Unpin>(
+pub async fn handle_channel_list_request<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     channel_ids: &[String],
 ) -> Result<(), ItemSyncError> {
@@ -71,7 +74,7 @@ pub async fn handle_channel_list_request<W: AsyncWrite + Unpin>(
 }
 
 /// Send a sync request (initiator side).
-pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     channel_id: &str,
     since: Option<&str>,
@@ -94,7 +97,10 @@ pub async fn send_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// Used in batched sync (§4.5): multiple channels on one stream.
 /// The caller writes the protocol byte once before the first call.
-pub async fn send_sync_request_raw<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+pub async fn send_sync_request_raw<
+    W: AsyncWrite + Unpin + crate::codec::GiveUp,
+    R: AsyncRead + Unpin,
+>(
     send: &mut W,
     recv: &mut R,
     channel_id: &str,
@@ -119,7 +125,7 @@ pub async fn send_sync_request_raw<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 /// already-opened sync stream (§4.4a). Returns items that arrived on the
 /// responder after `after_seq`; the response's `last_seq` is the cursor for
 /// the next page (absent if the responder predates arrival paging).
-pub async fn send_sync_page<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+pub async fn send_sync_page<W: AsyncWrite + Unpin + crate::codec::GiveUp, R: AsyncRead + Unpin>(
     send: &mut W,
     recv: &mut R,
     channel_id: &str,
@@ -140,7 +146,7 @@ pub async fn send_sync_page<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 }
 
 /// Handle a sync request (responder side).
-pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     get_headers: impl FnOnce(&str, Option<&str>, u32) -> (Vec<ItemHeader>, bool),
 ) -> Result<String, ItemSyncError> {
@@ -168,7 +174,7 @@ pub async fn handle_sync_request<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Send a fetch request for specific items (on the same stream after sync).
-pub async fn send_fetch_request<W: AsyncWrite + Unpin>(
+pub async fn send_fetch_request<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     item_ids: &[String],
 ) -> Result<(), ItemSyncError> {
@@ -191,7 +197,7 @@ pub async fn read_fetch_response<R: AsyncRead + Unpin>(
 }
 
 /// Handle a fetch request (responder side).
-pub async fn handle_fetch_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn handle_fetch_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     get_items: impl FnOnce(&[String]) -> Vec<Item>,
 ) -> Result<(), ItemSyncError> {
@@ -211,7 +217,7 @@ pub async fn handle_fetch_request<S: AsyncRead + AsyncWrite + Unpin>(
 // ── Item-Push (0x06) ───────────────────────────────────────────────
 
 /// Push items to a peer (sender side).
-pub async fn send_push<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn send_push<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     items: &[Item],
 ) -> Result<PushAck, ItemSyncError> {
@@ -226,7 +232,7 @@ pub async fn send_push<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Handle an incoming push (receiver side).
-pub async fn handle_push<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn handle_push<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     process_items: impl FnOnce(Vec<Item>) -> PushAck,
 ) -> Result<PushAck, ItemSyncError> {

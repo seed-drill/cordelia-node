@@ -86,6 +86,15 @@ pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
 /// there was no such bound: a thousand streams, each over a megabyte.
 pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 
+/// How much this node may have written on one connection, over all its
+/// streams, that the peer has not acknowledged: two messages. A write
+/// beyond it waits for acknowledgements, for STREAM_TIMEOUT_SECS, and then
+/// fails, and its stream is reset (ERR_STREAM_TIMEOUT). This is what bounds the memory a peer that reads and never
+/// acknowledges can make a node hold. Left to QUIC's default it was ten
+/// megabytes. Rationale: parameter-rationale.md §1.
+/// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
+pub const QUIC_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
+
 /// TLS certificate validity in days (network-protocol.md §2.2).
 /// Primitive: 1 year; self-signed certs, identity is the public key.
 pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
@@ -681,14 +690,19 @@ pub const MAX_SHARED_PEER_ADDRS: u32 = 8;
 
 /// The length of the shortest ID of a channel of the older kind that a
 /// node makes: `grp_` and a UUID. Every other kind is longer
-/// (channel-naming.md).
+/// (channel-naming.md). It is not the shortest a relay stores and lists:
+/// an ID that others sent may be 1 to MAX_CHANNEL_ID_LEN bytes.
 pub const SHORTEST_CHANNEL_ID_LEN: u32 = 40;
 
-/// The most channel IDs that a node may list when it is asked which
-/// channels it holds (network-protocol.md §4.5). A relay lists another
-/// relay that it works with every channel it holds, with no other limit
-/// than the message's. Derived: as many of the shortest IDs as fit in one
-/// message, each with the two bytes that say a text and its length.
+/// The most channel IDs that a node keeps of a list of those a peer holds
+/// (network-protocol.md §4.5); the rest of the list is passed over, not
+/// refused. A relay lists another relay that it works with every channel
+/// it holds, with no other limit than the message's, and the IDs it holds
+/// are what others sent it: an honest relay can list more than this, of
+/// IDs shorter than a node makes. Derived: as many IDs of the length that
+/// a node makes as fit in one message, each with the two bytes that say a
+/// text and its length. Whoever asks a peer it is held to takes at most
+/// MAX_CHANNELS_ASKED_OF_A_PEER of them in any case.
 pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID_LEN + 2);
 
 /// The most items one push may hold, and the most its answer may list as
@@ -697,7 +711,8 @@ pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID
 /// Derived: as many entries of no ciphertext as one peer's allowance for a
 /// minute takes, each counted as what an entry takes beyond its
 /// ciphertext. A push of more is over any limited peer's allowance, and
-/// is refused whole; a relay passes items on one at a time.
+/// is refused whole. A relay that passes items on sends them in pushes of
+/// at most this many.
 pub const MAX_PUSHED_ITEMS: usize = (PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(0)) as usize;
 
 // Checked at compile time: a node's own pushes are within the bound.
@@ -832,6 +847,11 @@ pub const ERR_CAPACITY: u32 = 0x01;
 /// when a request is over the limit, and the connection is closed with it
 /// when the peer keeps going over.
 pub const ERR_RATE_LIMIT: u32 = 0x03;
+
+/// QUIC application error: a write that did not end within
+/// STREAM_TIMEOUT_SECS. The stream is reset with it, so that what was
+/// written on it and not acknowledged is let go (parameter-rationale.md §1).
+pub const ERR_STREAM_TIMEOUT: u32 = 0x04;
 
 // ── Bootstrap ────────────────────────────────────────────────────────
 
@@ -2296,6 +2316,24 @@ mod tests {
     #[test]
     fn test_quic_max_uni_streams_network_protocol_2_1() {
         assert_eq!(QUIC_MAX_UNI_STREAMS, 0);
+    }
+
+    /// A write that timed out resets its stream with a code of its own,
+    /// which no other error uses.
+    #[test]
+    fn test_err_stream_timeout_parameter_rationale_1() {
+        assert_eq!(ERR_STREAM_TIMEOUT, 0x04);
+        for other in [ERR_CAPACITY, ERR_UNKNOWN_PROTOCOL, ERR_RATE_LIMIT] {
+            assert_ne!(ERR_STREAM_TIMEOUT, other);
+        }
+    }
+
+    /// Two messages, as much as a peer may have unread on a connection.
+    #[test]
+    fn test_quic_send_window_parameter_rationale_1() {
+        assert_eq!(QUIC_SEND_WINDOW, 2_097_152);
+        assert_eq!(QUIC_SEND_WINDOW, 2 * MAX_MESSAGE_BYTES as u64);
+        assert_eq!(QUIC_SEND_WINDOW, QUIC_RECEIVE_WINDOW as u64);
     }
 
     #[test]

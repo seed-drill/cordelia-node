@@ -96,7 +96,7 @@ fn now_unix_secs() -> u64 {
 ///
 /// Writes protocol byte + HandshakePropose, reads HandshakeAccept.
 /// `tls_peer_node_id` is the Ed25519 key extracted from the peer's TLS cert.
-pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     local_node_id: &[u8; 32],
     channel_ids: &[String],
@@ -135,7 +135,7 @@ pub async fn initiate_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// Reads protocol byte + HandshakePropose, validates, writes HandshakeAccept.
 /// `tls_peer_node_id` is the Ed25519 key extracted from the peer's TLS cert.
-pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn accept_handshake<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     local_node_id: &[u8; 32],
     channel_ids: &[String],

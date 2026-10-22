@@ -200,24 +200,29 @@ fn hostile_frames() -> Vec<Frame> {
     ];
     // The lists of texts, each with about 1M empty texts.
     let empties = filling(1, 64);
-    for (what, name, field, on) in [
+    // Each is refused, but for the channel IDs a relay lists, which are
+    // read: the first of them kept and the rest passed over.
+    for (what, name, field, on, read) in [
         (
             "a fetch of about 1M empty IDs",
             "FetchRequest",
             "item_ids",
             Protocol::ItemSync,
+            false,
         ),
         (
             "a list of about 1M empty channel IDs",
             "SyncChannelListResponse",
             "channel_ids",
             Protocol::ItemSync,
+            true,
         ),
         (
             "a handshake of about 1M empty roles",
             "HandshakePropose",
             "roles",
             Protocol::Handshake,
+            false,
         ),
     ] {
         frames.push(Frame {
@@ -228,9 +233,26 @@ fn hostile_frames() -> Vec<Frame> {
                 1,
                 [text(field), array(empties), times(&[0x60], empties)].concat(),
             ),
-            read: false,
+            read,
         });
     }
+    // About 500K channel IDs of one letter, as a relay may list them.
+    let letters = filling(2, 64);
+    frames.push(Frame {
+        what: "a list of about 500K one-letter channel IDs",
+        on: vec![Protocol::ItemSync],
+        bytes: message(
+            "SyncChannelListResponse",
+            1,
+            [
+                text("channel_ids"),
+                array(letters),
+                times(&[0x61, 0x63], letters),
+            ]
+            .concat(),
+        ),
+        read: true,
+    });
     // Peers written as arrays, five bytes each: [h'', [], 0, false].
     let peers = filling(5, 64);
     frames.push(Frame {
@@ -384,8 +406,8 @@ const PEAK_MOST: usize = 3 * MAX_MESSAGE_BYTES as usize;
 const HELD_MOST: usize = 2 * MAX_MESSAGE_BYTES as usize + 64 * 1024;
 /// What a frame that is refused still holds: nothing but its error.
 const REFUSED_HOLDS_MOST: usize = 1024;
-/// What the longest list of the smallest elements may ask for before it
-/// is refused: MAX_LISTED_CHANNEL_IDS empty texts, 24 bytes each, in a
+/// What the longest list of the smallest elements may ask for, before it
+/// is refused or passes over the rest: MAX_LISTED_CHANNEL_IDS empty texts, 24 bytes each, in a
 /// list that grows by doubling.
 const LIST_MOST: usize = 2 * MAX_LISTED_CHANNEL_IDS as usize * size_of::<String>();
 
@@ -454,5 +476,65 @@ fn a_frame_that_is_refused_is_refused_before_it_is_held() {
             );
             assert!(held <= REFUSED_HOLDS_MOST, "{} on {protocol:?}", frame.what);
         }
+    }
+}
+
+/// The channel IDs a relay lists are what others sent it, of 1 to 96 bytes
+/// each, so an honest relay can list more of them than their bound in one
+/// frame. Such a list is read: the first MAX_LISTED_CHANNEL_IDS are kept,
+/// in their order, and the rest passed over, and what is held is no more
+/// than the bound's list and the IDs it keeps.
+#[test]
+fn a_list_of_short_channel_ids_past_its_bound_keeps_the_bound() {
+    let most = MAX_LISTED_CHANNEL_IDS as usize;
+    // As many IDs `c0`, `c1`, ... as fit in one frame: far more than the
+    // bound.
+    let mut ids: Vec<String> = Vec::new();
+    let mut size = 64;
+    while size + 2 + format!("c{}", ids.len()).len() <= MAX_MESSAGE_BYTES as usize {
+        let id = format!("c{}", ids.len());
+        size += id.len() + 2;
+        ids.push(id);
+    }
+    assert!(ids.len() > 4 * most, "{}", ids.len());
+    let bytes = encode_message(&WireMessage::SyncChannelListResponse(
+        SyncChannelListResponse {
+            channel_ids: ids.clone(),
+        },
+    ))
+    .unwrap();
+    assert!(bytes.len() <= MAX_MESSAGE_BYTES as usize, "{}", bytes.len());
+
+    let (read, peak, held) = measured(|| decode_message(Protocol::ItemSync, &bytes));
+    let Ok(WireMessage::SyncChannelListResponse(read)) = read else {
+        panic!("a list of {} short channel IDs was not read", ids.len());
+    };
+    assert_eq!(read.channel_ids.len(), most);
+    assert_eq!(read.channel_ids[..], ids[..most]);
+    // What the bound promises: its list, which grows by doubling, and the
+    // texts of the IDs it keeps.
+    let kept: usize = ids[..most].iter().map(String::len).sum();
+    println!(
+        "{} IDs in {} bytes: kept {most}, peak {peak}, held {held}",
+        ids.len(),
+        bytes.len()
+    );
+    assert!(held <= LIST_MOST + kept, "{held} bytes held");
+    assert!(peak <= PEAK_MOST, "{peak} bytes at the peak");
+
+    // At the bound and one below, every ID is kept.
+    for n in [most - 1, most] {
+        let bytes = encode_message(&WireMessage::SyncChannelListResponse(
+            SyncChannelListResponse {
+                channel_ids: ids[..n].to_vec(),
+            },
+        ))
+        .unwrap();
+        let Ok(WireMessage::SyncChannelListResponse(read)) =
+            decode_message(Protocol::ItemSync, &bytes)
+        else {
+            panic!("{n}");
+        };
+        assert_eq!(read.channel_ids[..], ids[..n]);
     }
 }
