@@ -113,7 +113,7 @@ fn now_ns() -> u64 {
 }
 
 /// Send a ping message.
-pub async fn send_ping<W: AsyncWrite + Unpin>(
+pub async fn send_ping<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     state: &mut KeepAliveState,
 ) -> Result<(), KeepAliveError> {
@@ -128,7 +128,7 @@ pub async fn send_ping<W: AsyncWrite + Unpin>(
 }
 
 /// Send a pong response to a received ping.
-pub async fn send_pong<W: AsyncWrite + Unpin>(
+pub async fn send_pong<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     ping: &Ping,
 ) -> Result<(), KeepAliveError> {

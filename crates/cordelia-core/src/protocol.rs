@@ -797,6 +797,11 @@ pub const ERR_CAPACITY: u32 = 0x01;
 /// when the peer keeps going over.
 pub const ERR_RATE_LIMIT: u32 = 0x03;
 
+/// QUIC application error: a write that did not end within
+/// STREAM_TIMEOUT_SECS. The stream is reset with it, so that what was
+/// written on it and not acknowledged is let go (parameter-rationale.md §1).
+pub const ERR_STREAM_TIMEOUT: u32 = 0x04;
+
 // ── Bootstrap ────────────────────────────────────────────────────────
 
 /// The default relays, compiled into the binary (decision
@@ -2260,6 +2265,16 @@ mod tests {
     #[test]
     fn test_quic_max_uni_streams_network_protocol_2_1() {
         assert_eq!(QUIC_MAX_UNI_STREAMS, 0);
+    }
+
+    /// A write that timed out resets its stream with a code of its own,
+    /// which no other error uses.
+    #[test]
+    fn test_err_stream_timeout_parameter_rationale_1() {
+        assert_eq!(ERR_STREAM_TIMEOUT, 0x04);
+        for other in [ERR_CAPACITY, ERR_UNKNOWN_PROTOCOL, ERR_RATE_LIMIT] {
+            assert_ne!(ERR_STREAM_TIMEOUT, other);
+        }
     }
 
     /// Two messages, as much as a peer may have unread on a connection.

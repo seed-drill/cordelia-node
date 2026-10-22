@@ -783,7 +783,9 @@ mod tests {
 
     /// T3. A message written to a peer that does not acknowledge waits for
     /// the window for STREAM_TIMEOUT_SECS, as any write does, and then
-    /// fails: the stream is given up, and the node holds no more.
+    /// fails. The stream is reset, so what was written on it is let go: a
+    /// message on another stream is taken at once, though the peer still
+    /// acknowledges nothing.
     #[tokio::test]
     async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
         let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
@@ -811,6 +813,17 @@ mod tests {
             waited >= timeout - Duration::from_millis(50)
                 && waited < timeout + Duration::from_secs(2),
             "the write waited {waited:?}"
+        );
+
+        let (mut other, _recv) = node_end.open_bi().await.unwrap();
+        let taken = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::codec::write_raw_frame(&mut other, &message),
+        )
+        .await;
+        assert!(
+            matches!(taken, Ok(Ok(()))),
+            "the stream that timed out still held the window: {taken:?}"
         );
     }
 

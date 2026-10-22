@@ -118,7 +118,7 @@ impl ChannelAnnounceState {
 }
 
 /// Send a ChannelJoined announcement.
-pub async fn send_channel_joined<W: AsyncWrite + Unpin>(
+pub async fn send_channel_joined<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     channel_id: &str,
     descriptor: &ChannelDescriptor,
@@ -132,7 +132,7 @@ pub async fn send_channel_joined<W: AsyncWrite + Unpin>(
 }
 
 /// Send a ChannelLeft announcement.
-pub async fn send_channel_left<W: AsyncWrite + Unpin>(
+pub async fn send_channel_left<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     channel_id: &str,
 ) -> Result<(), ChannelAnnounceError> {
@@ -144,7 +144,7 @@ pub async fn send_channel_left<W: AsyncWrite + Unpin>(
 }
 
 /// Send a ChannelStateHash for reconciliation.
-pub async fn send_state_hash<W: AsyncWrite + Unpin>(
+pub async fn send_state_hash<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     channel_ids: &[String],
 ) -> Result<(), ChannelAnnounceError> {
@@ -158,7 +158,7 @@ pub async fn send_state_hash<W: AsyncWrite + Unpin>(
 }
 
 /// Send a ChannelListRequest.
-pub async fn send_list_request<W: AsyncWrite + Unpin>(
+pub async fn send_list_request<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
 ) -> Result<(), ChannelAnnounceError> {
     let msg = WireMessage::ChannelListRequest(ChannelListRequest {});
@@ -167,7 +167,7 @@ pub async fn send_list_request<W: AsyncWrite + Unpin>(
 }
 
 /// Send a ChannelListResponse.
-pub async fn send_list_response<W: AsyncWrite + Unpin>(
+pub async fn send_list_response<W: AsyncWrite + Unpin + crate::codec::GiveUp>(
     writer: &mut W,
     descriptors: &[ChannelDescriptor],
 ) -> Result<(), ChannelAnnounceError> {
