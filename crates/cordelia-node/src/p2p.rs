@@ -5639,10 +5639,14 @@ async fn send_channel_announcements(
 
     let (mut send, _recv) = open_bi(conn).await?;
 
-    // Write protocol byte for ChannelAnnounce (0x04)
-    send.write_all(&[cordelia_network::messages::Protocol::ChannelAnnounce as u8])
-        .await
-        .map_err(|e| format!("write protocol byte: {e}"))?;
+    // The protocol byte for ChannelAnnounce (0x04), through the codec, so
+    // that it has the codec's timeout as every write does.
+    cordelia_network::codec::write_protocol_byte(
+        &mut send,
+        cordelia_network::messages::Protocol::ChannelAnnounce,
+    )
+    .await
+    .map_err(|e| format!("write protocol byte: {e}"))?;
 
     for channel_id in &channels {
         // The ID and nothing else: a relay is not told a channel's name.
