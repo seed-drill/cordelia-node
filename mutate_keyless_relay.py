@@ -38,6 +38,9 @@ REACHED = "a_relay_found_at_a_keyed_relays_place_is_reached_no_more_at_once"
 S9 = "s9_says_what_to_do_of_a_relay_given_no_key_at_a_keyed_relays_place"
 LOOK = "test_the_look_says_how_the_node_tries_each_relay"
 WARNED = "a_relay_given_no_key_at_a_keyed_relays_address_is_warned_of"
+KEY_AT = "the_dial_loop_reads_the_key_that_answers_at_an_address"
+ANSWERED = "a_dial_answered_at_a_keyed_relays_place_ends_the_relay_given_no_key_once"
+FOUND = "the_addresses_found_warn_of_relays_at_one_address_with_what_to_do"
 LISTED = "two_relays_at_one_address_are_each_listed_and_a_wrong_key_is_their_own"
 ONE = "one_relay_under_two_names_is_one_relay"
 DEFAULT = "a_default_relay_named_without_a_key_takes_the_compiled_key"
@@ -174,6 +177,35 @@ MUTATIONS = [
      '''                .find(|r| r.key.is_some() && r.addr == relay.addr)?;''',
      '''                .find(|r| r.key.is_some() && r.addr == relay.addr && false)?;''',
      [network(WARNED)]),
+    ("KR24 the dial loop reads no key at an address", P2P,
+     '''    let key_at = |addr| key_at(conn_mgr, addr);''',
+     '''    let key_at = |_addr| None;''',
+     [p2p(KEY_AT)]),
+    ("KR25 the pace of a dial's answer takes any connection for a relay's own", P2P,
+     '''        .map(|relays| with_tick(set_up, &relays, conn_mgr, any_connected_as_itself))''',
+     '''        .map(|relays| relays.iter().any(|r| relay_connected(conn_mgr, r)))''',
+     [p2p(KEY_AT)]),
+    ("KR26 a dial answered at a keyed relay's place does not end for the relay given no key", P2P,
+     '''    for (relay, other) in &passed {''',
+     '''    for (relay, other) in passed.iter().filter(|_| false) {''',
+     [p2p(ANSWERED)]),
+    ("KR27 a dial's answer judges a relay given no key by the address alone", P2P,
+     '''            None => match keyed_relay_at(set_up, relays, addr, Some(*answered)) {''',
+     '''            None => match keyed_relay_at(set_up, relays, addr, None) {''',
+     [p2p(ANSWERED)]),
+    ("KR28 a relay given no key passed at a dial's answer is also taken to have moved", P2P,
+     '''        .chain(passed.iter().map(|(relay, _)| relay))''',
+     '''        .chain(passed.iter().map(|(relay, _)| relay).filter(|_| false))''',
+     [p2p(ANSWERED)]),
+    ("KR29 two names given no key at one address are warned of nothing", P2P,
+     '''            (true, true) => said.push(format!(''',
+     '''            (true, true) if false => said.push(format!(''',
+     [p2p(FOUND)]),
+    ("KR30 the addresses found warn of nothing", P2P,
+     '''    Some(address_warnings(resolved))''',
+     '''    let _ = address_warnings;
+    Some(Vec::new())''',
+     [p2p(FOUND)]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
