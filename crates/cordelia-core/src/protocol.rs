@@ -89,7 +89,7 @@ pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 /// How much this node may have written on one connection, over all its
 /// streams, that the peer has not acknowledged: two messages. A write
 /// beyond it waits for acknowledgements, for STREAM_TIMEOUT_SECS, and then
-/// fails. This is what bounds the memory a peer that reads and never
+/// fails, and its stream is reset (ERR_STREAM_TIMEOUT). This is what bounds the memory a peer that reads and never
 /// acknowledges can make a node hold. Left to QUIC's default it was ten
 /// megabytes. Rationale: parameter-rationale.md §1.
 /// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
@@ -796,6 +796,11 @@ pub const ERR_CAPACITY: u32 = 0x01;
 /// when a request is over the limit, and the connection is closed with it
 /// when the peer keeps going over.
 pub const ERR_RATE_LIMIT: u32 = 0x03;
+
+/// QUIC application error: a write that did not end within
+/// STREAM_TIMEOUT_SECS. The stream is reset with it, so that what was
+/// written on it and not acknowledged is let go (parameter-rationale.md §1).
+pub const ERR_STREAM_TIMEOUT: u32 = 0x04;
 
 // ── Bootstrap ────────────────────────────────────────────────────────
 
@@ -2260,6 +2265,16 @@ mod tests {
     #[test]
     fn test_quic_max_uni_streams_network_protocol_2_1() {
         assert_eq!(QUIC_MAX_UNI_STREAMS, 0);
+    }
+
+    /// A write that timed out resets its stream with a code of its own,
+    /// which no other error uses.
+    #[test]
+    fn test_err_stream_timeout_parameter_rationale_1() {
+        assert_eq!(ERR_STREAM_TIMEOUT, 0x04);
+        for other in [ERR_CAPACITY, ERR_UNKNOWN_PROTOCOL, ERR_RATE_LIMIT] {
+            assert_ne!(ERR_STREAM_TIMEOUT, other);
+        }
     }
 
     /// Two messages, as much as a peer may have unread on a connection.

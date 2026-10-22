@@ -115,6 +115,8 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 ///   waits for acknowledgements, and the codec gives it up after
 ///   STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it is sent
 ///   cannot make a node hold more than that either.
+/// - It may send no datagrams: no node sends or reads one, and quinn's
+///   default would keep 1.25 MB of them unread on every connection.
 fn transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(
@@ -129,6 +131,7 @@ fn transport_config() -> quinn::TransportConfig {
     transport.stream_receive_window(protocol::QUIC_STREAM_RECEIVE_WINDOW.into());
     transport.receive_window(protocol::QUIC_RECEIVE_WINDOW.into());
     transport.send_window(protocol::QUIC_SEND_WINDOW);
+    transport.datagram_receive_buffer_size(None);
     transport
 }
 
@@ -780,11 +783,13 @@ mod tests {
 
     /// T3. A message written to a peer that does not acknowledge waits for
     /// the window for STREAM_TIMEOUT_SECS, as any write does, and then
-    /// fails: the stream is given up, and the node holds no more.
+    /// fails. The stream is reset, so what was written on it is let go: a
+    /// message on another stream is taken at once, though the peer still
+    /// acknowledges nothing.
     #[tokio::test]
     async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
         let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
-        let (mut send, _recv) = node_end.open_bi().await.unwrap();
+        let (mut send, mut recv) = node_end.open_bi().await.unwrap();
         // A frame of a megabyte, its length included.
         let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize - 4];
 
@@ -797,7 +802,11 @@ mod tests {
             assert!(began.elapsed() < Duration::from_secs(1));
         }
         let began = std::time::Instant::now();
-        let third = crate::codec::write_raw_frame(&mut send, &message).await;
+        // Through a join of the two halves, as a request and its answer
+        // are written: the join gives up the stream it writes to.
+        let third =
+            crate::codec::write_raw_frame(&mut tokio::io::join(&mut recv, &mut send), &message)
+                .await;
         let waited = began.elapsed();
         assert!(
             matches!(third, Err(crate::codec::CodecError::Timeout(_))),
@@ -809,6 +818,47 @@ mod tests {
                 && waited < timeout + Duration::from_secs(2),
             "the write waited {waited:?}"
         );
+
+        let (mut other, _recv) = node_end.open_bi().await.unwrap();
+        let taken = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::codec::write_raw_frame(&mut other, &message),
+        )
+        .await;
+        assert!(
+            matches!(taken, Ok(Ok(()))),
+            "the stream that timed out still held the window: {taken:?}"
+        );
+    }
+
+    /// A node takes no datagrams: a peer with quinn's own settings, which
+    /// would send them, is told that it may not, and so is a node.
+    #[tokio::test]
+    async fn a_node_takes_no_datagrams() {
+        let node_id = NodeIdentity::generate().unwrap();
+        let peer_id = NodeIdentity::generate().unwrap();
+        let node = create_endpoint(&node_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (cert, key) = generate_self_signed_cert(&peer_id).unwrap();
+        let mut peer = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        peer.set_default_client_config(
+            client_config_with(cert, key, quinn::TransportConfig::default()).unwrap(),
+        );
+        let accepting = {
+            let node = node.clone();
+            tokio::spawn(async move { node.accept().await.unwrap().await.unwrap() })
+        };
+        let peer_end = peer
+            .connect(node.local_addr().unwrap(), "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let _node_end = accepting.await.unwrap();
+        assert_eq!(peer_end.max_datagram_size(), None);
+        assert!(peer_end.send_datagram(vec![b'x'].into()).is_err());
+
+        let (client, server, _c, _s) = connected().await;
+        assert_eq!(client.max_datagram_size(), None);
+        assert_eq!(server.max_datagram_size(), None);
     }
 
     /// T19. A node cannot connect under a key it does not hold: a listening
