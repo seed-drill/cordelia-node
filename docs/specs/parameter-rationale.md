@@ -149,16 +149,16 @@ is not every buffer.
 | Quinn's reassembly beyond them: a stream's received buffers are compacted only once they exceed what is buffered by max(32 KiB, 1.5 x it), so 2.5 x 2 MiB and 32 KiB on each of 64 streams, less the 2 MiB above. Read from quinn-proto 0.11's source (`assembler.rs`), not measured; only a peer that sends tiny frames comes near it | 5 MiB |
 | Send window: what the node wrote and the peer has not acknowledged (`QUIC_SEND_WINDOW`) | 2 MiB |
 | Datagrams: none, since `datagram_receive_buffer_size` is off and a peer is told it may send none (quinn's default kept 1.25 MB of them unread) | 0 |
-| The frame of the request being answered (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES) | 1 MiB |
-| The request, decoded: read by its stream into its own type, every list bounded (below). 3 x MAX_MESSAGE_BYTES at the decode's peak, and at most 2 x MAX_MESSAGE_BYTES and 64 KiB once decoded; measured, 2.0 MB and 1.97 MB at worst | 3 MiB |
-| The answer being built (a page of entries, or a show's answer) | 1 MiB |
-| The answer, encoded, before it is copied into the send window (`write_frame`) | 1 MiB |
-| **One connection, as counted** | **15 MiB** |
+| The frame of the request being read and answered (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES), dropped before the answer is written | 1 MiB |
+| The request, decoded: read by its stream into its own type, every list bounded (below), and every field of a page's header (below). 3 x MAX_MESSAGE_BYTES at the decode's peak, and at most 2 x MAX_MESSAGE_BYTES and 64 KiB once decoded; measured, 2.0 MB and 1.97 MB at worst. Dropped before the answer is written | 3 MiB |
+| The answer being built (a page of entries, or a show's answer); on the streams of entries, dropped once it is encoded | 1 MiB |
+| The answer, encoded, held through its write (`write_frame`, `write_raw_frame`): at most MAX_MESSAGE_BYTES of it, in room that grows by doubling, so at most twice that | 2 MiB |
+| **One connection, as counted** | **16 MiB** |
 
 At the bound of 200 inbound connections (MAX_INBOUND_CONNECTIONS, §5)
-that is 3,000 MiB, about 3.1 GB. Without the reassembly row, which needs
-a peer that sends tiny frames on purpose, it is 10 MiB a connection and
-2,000 MiB at the bound. The count is an upper bound on each part: the
+that is 3,200 MiB, about 3.4 GB. Without the reassembly row, which needs
+a peer that sends tiny frames on purpose, it is 11 MiB a connection and
+2,200 MiB at the bound. The count is an upper bound on each part: the
 decode's peak passes before the answer is built, a request is small when
 its answer is large (a pull of pages), and the other way round (a push).
 Before the send window was set, datagrams were turned off and a message
@@ -167,11 +167,25 @@ the send window at quinn's default (9.5 MiB), 1.2 MiB of datagrams, and a
 request read through the enum of every message at up to 80 MiB at its
 peak and 32 MiB held (below).
 
-A request is dropped, with all it holds, before its answer is written: a
-node does not keep it through the write of the answer and the read of the
-next request, up to STREAM_TIMEOUT_SECS each (§6). The streams of entries
-(`relay_entries`) keep the frame and the request through the one write of
-their answer, which is small whenever the request is large.
+The parts of a request and its answer are held together only between two
+waits: once the request is read, it is decoded and answered with no wait
+on the peer. Through each wait, up to STREAM_TIMEOUT_SECS (§6), the node
+holds one of two things for the stream it answers: the frame it is
+reading, or the answer it is writing. A request is dropped, with all it
+holds, before its answer is written: a node does not keep it through the
+write of the answer and the read of the next request. On the streams of
+entries (`RelayEntries::serve`), the frame of the request, the request and
+the answer as a message are all dropped before the write, and what is
+held through it is the answer as it is written. Measured with a counting
+allocator, while the peer does not read the answer
+(`a_request_is_not_held_while_its_answer_is_written`), before and after
+the drops:
+
+| Request | Answer | Held through the write: before | After |
+|---------|--------|--------------------------------|-------|
+| A pull padded to 1 MiB with a field that is not read | 51 bytes | 1,049,896 | 1,096 |
+| A push of twelve entries of the largest size, 789,365 bytes | 91 bytes | 2,364,009 | 1,160 |
+| A pull answered with twelve entries of the largest size | 789,387 bytes | 1,842,926 | 1,053,047: the answer, in room of 1,048,576 |
 
 What it leaves out:
 
@@ -251,6 +265,7 @@ each: of those, the first are kept and the rest passed over.
 | Items of a push, and those it refused | `MAX_PUSHED_ITEMS` = 2048 | Derived: as many entries of no ciphertext as one peer's allowance for a minute takes (`PUSH_BYTES_PER_PEER_PER_MINUTE`, each at `ENTRY_OVERHEAD_BYTES`). A node's outbox pushes at most `OUTBOX_BATCH_MAX_ITEMS` = 500, and a version before may have pushed more: a push of more than this is over any limited peer's allowance, and is refused whole. A relay passes items on to the relays it is hot with in pushes of at most this many |
 | Entries of a push, a page, or passed on; answers to a push | `ENTRY_PAGE_MAX_ENTRIES` = 100 | As before (§12.7) |
 | Channels a relay tells of | `RELAY_CHANNELS_PAGE_MAX` = 1000 | As before (§12.7) |
+| The texts and bytes of a header of a page | Each its own (below) | At least what a node writes, and what every node since 0.2.0-alpha.5 stores |
 
 **The fields of a header.** A page of the older kind lists up to 100
 headers, and a node holds what it read of them while it fetches their
