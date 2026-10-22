@@ -1,7 +1,7 @@
 # Decision: a scale test for R1
 
 **Date**: 2026-10-22
-**Status**: Proposed. Not built. Revised once after its first review.
+**Status**: Proposed. Not built. Revised once after its first review (section 9).
 **Cited as**: "decision 2026-10-22 §3, rule 4". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -401,3 +401,26 @@ What section 1 needs inside the node: the wrapper around the lock, with its kind
 
 No other record or spec is changed by this one. Changes A and B, when they are made, alter: the record of relays §2 (a relay too keeps its devices and its listed relays through churn); `network-protocol.md` §5.4 (churn at a relay); the rationale §1, §4 and §5; `configuration.md` §2.6 and `network-protocol.md` §9.1 and §12.4 (the bound, and that the setting is read). The demand model §2.5 is not met for the Dev Team and Enterprise personas by v1 (bar 2), and is left as it is.
 
+## 9. The first review, and how each finding is settled
+
+The first review read the record at its first commit, built the release binary, measured the threads and descriptors of idle nodes at 1 and 4 cores, and read the code for the rest: high 3, medium 6, low 6.
+
+| # | Severity | Finding | How it is settled |
+|---|---|---|---|
+| 1 | High | Churn would not happen in a run (no cold peer; the one churn in the window wasted), so bar 11 tested nothing; and a relay's churn of devices cannot bring in another peer | Both. Devices go off and on in the window, from the demand model's intermittent availability (§2.1, rule 4); the window is placed and sized to hold two churns of each relay (§4.2, step 4); a run with fewer, or without change A with no closure, is invalid (§6, rule 7). And change A (§7.3): a relay does not churn devices or the relays it lists. The test measures the build without change A at stages 100 and 190, and every stage with it (bar 11) |
+| 2 | High | The raised bound was to come from the benign cost of a connection; the bound is for a flood; the configuration's field is not read | The bound is derived from the worst case, 640 connections at about 2.34 MiB each against a stated host of 2 GiB for the relay (§2.5). Change B (§7.4) raises the constant with its test and rationale, and has the code read `limits.max_inbound_connections` (and `max_connections_per_ip`), refusing a value above the constant. R1 carries about 199 devices until then (§0). Whether 500 is the count is the person's to say (§0) |
+| 3 | High | The removal bars ignored the carry; the spread was timed from the command's end | The spread is timed from "The change is made (change N)" (bar 10a). The carry window is barred by its length, derived from `OUTBOX_BYTES_PER_MINUTE` and what was carried (bar 10b), and is treated apart from bars 1, 2 and 4 (bar 10c). Bar 13 models the generation left and one to k carried copies |
+| 4 | Medium | The p99 lock bars cannot see writes | A histogram for each kind of take; reads barred at p99, writes and sweeps by their most and the count over 50 ms (bar 4); a device by the count of waits over 100 ms (bar 5) |
+| 5 | Medium | Threads and descriptors on 16 cores were wrong (actix starts a worker for each core too) | §1.4 gives the review's measurement and about 34 threads and 81 descriptors a node on 16 cores, about 17,600 threads for 502 nodes (§2.4). The harness checks `pid_max`, `threads-max` and `ulimit -u` before it starts, and masks devices to 4 cores where they are short (§2.4, §4.2 step 1). The waste of a device's HTTP workers is noted, not changed (§5) |
+| 6 | Medium | An address for each person hides the limits for an address and a subnet | Both a cohort and a statement: an office of three heavy people behind one address, with the refusals expected stated (rule 6 of §2.2, bar 14); and the limit stated as accepted for R1, because raising it weakens what it caps and R1's people are single users at home |
+| 7 | Medium | "From the demand model" was partly true | The devices, the Developer's edits and the rates off and on are marked chosen (§2.1). Bar 2 says that the model's latency for the Dev Team and Enterprise personas is not met by v1, and the model is left as it is (§8) |
+| 8 | Medium | The test for growth would fail on noise | Growth must persist through both halves of the window; the bar fails on more than 1% of devices or one device in two runs of three; the threshold is in MiB an hour, and is set from stage 100's spread from stage 190 (bar 6) |
+| 9 | Medium | No relay falls over; the link between relays can be churned | The second relay stops for two minutes mid-window (§4.2 step 6, bar 15). The link's closures are counted (§1.2), and change A spares listed relays (§7.3, bar 11) |
+| 10 | Low | Shows were "at least" and checked within a fifth; pushes not modelled | Shows and pushes are checked as lower bounds only, with why (bar 12) |
+| 11 | Low | No measure of the disk | iowait and the disk's mean write are recorded and are in the checks of validity (§1.3, §6 rule 5) |
+| 12 | Low | `peers_hot` is overwritten by two writers; tiers mean little at a relay | The first piece serves the governor's hot count apart from the connections; the record expects about 1 hot and every other peer warm at a relay, and says that "hot 50, warm 50" decide nothing there today (§1.2) |
+| 13 | Low | Timing the lock is a wrapper type; the nested mutexes inflate the hold | The wrapper is planned, with the places unchanged (§1.1 rule 4); `rates` and `room` are timed, and their waits reported apart from the hold (§1.1 rule 4, §1.2) |
+| 14 | Low | A harness that is killed leaves its nodes behind | A process group and `PR_SET_PDEATHSIG` for each node, a pid file, and a check for what an earlier run left (§4.3 rule 6, §6 test 7) |
+| 15 | Low | The harness's configuration listens on 0.0.0.0 and gives settings not listed | The harness writes its own configurations: relays on 127.0.0.1, devices on the person's address; every setting beyond the defaults, `allow_private_addresses` among them, is listed in the summary (§4.3 rule 2, §6 test 6) |
+
+Nothing is left unsettled. One is settled by a smaller change than the review offered: finding 5's cap on a device's HTTP workers is noted and not made, since the test measures the node as it is, and the mask covers the machine's limit.
