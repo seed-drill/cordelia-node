@@ -89,7 +89,7 @@ pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 /// How much this node may have written on one connection, over all its
 /// streams, that the peer has not acknowledged: two messages. A write
 /// beyond it waits for acknowledgements, for STREAM_TIMEOUT_SECS, and then
-/// fails. This is what bounds the memory a peer that reads and never
+/// fails, and its stream is reset (ERR_STREAM_TIMEOUT). This is what bounds the memory a peer that reads and never
 /// acknowledges can make a node hold. Left to QUIC's default it was ten
 /// megabytes. Rationale: parameter-rationale.md §1.
 /// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
