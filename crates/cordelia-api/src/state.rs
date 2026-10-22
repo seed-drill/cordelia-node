@@ -1612,6 +1612,10 @@ pub enum Tried {
     /// or none: it is not dialled while a connection is open there
     /// (decision 2026-10-17 §1).
     NotDialled,
+    /// It is given no key, at the place of a relay given one: its name
+    /// resolves to that relay's address, or that relay's key answers there.
+    /// It is never reached (decision 2026-10-17 §1).
+    NoKey,
 }
 
 impl AppState {

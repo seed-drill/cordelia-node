@@ -4530,7 +4530,8 @@ async fn a_relay_given_no_key_at_another_relays_address_is_counted_as_its_own() 
     assert_eq!(
         said,
         Some(serde_json::json!(format!(
-            "given no key, at the address of {keyed}"
+            "given no key, at the address of {keyed}: give it that relay's key, or remove it \
+             from your configuration"
         )))
     );
     // The device's own list of its relays: both, and only the one given
