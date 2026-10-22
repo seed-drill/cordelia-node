@@ -1044,7 +1044,11 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
 /// only the address it reached the relay at: the command finds that
 /// address under the relay's name, and says it on the relay's line. Here
 /// the relay has too little room for the folder, so something of it
-/// waits there for as long as the test looks.
+/// waits there for as long as the test looks, once the relay has refused
+/// it. The test looks only then: before it, what waits may be only what
+/// is not yet offered, such as the entries of the phrase, and be sent a
+/// moment later. The refusal is said under the relay's line, by what it
+/// was for (decision 2026-10-19, names at the limit, rule 6).
 #[test]
 fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
     let mut relay = node("relay", "relay", None);
@@ -1067,26 +1071,41 @@ fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
         std::fs::write(memory.join(format!("note-{n}.md")), format!("{n}\n{text}")).unwrap();
     }
     syncs_notes_as_lab(&device, &notes);
+    // The relay has refused something for room, the name is still to
+    // send, and the row with no name says that something waits there.
+    // Each holds from then on: the relay never has room for the folder.
     wait_for(
-        "something waits at the relay",
+        "the relay refuses for room what waits there",
         &[&device, &relay],
         120,
         || {
             let seen = person_of(&device);
-            let waiting = seen["waiting"].as_array()?.clone();
-            waiting
+            let refused = seen["relays"]
+                .as_array()?
                 .iter()
-                .any(|row| row["name"].is_null() && row["waits"].as_u64().is_some_and(|n| n > 0))
-                .then_some(())
+                .any(|at| at["relay"] == name.as_str() && at["no_room"].is_string());
+            let to_go = seen["names"]["to_go"]
+                .as_array()?
+                .iter()
+                .any(|to_go| to_go == "lab");
+            let waits = seen["waiting"]
+                .as_array()?
+                .iter()
+                .any(|row| row["name"].is_null() && row["waits"].as_u64().is_some_and(|n| n > 0));
+            (refused && to_go && waits).then_some(())
         },
     );
 
     let said = device.cli(&["devices"]);
-    let block: Vec<&str> = said
+    let relays: Vec<&str> = said
         .lines()
         .skip_while(|line| *line != "Relays:")
         .skip(1)
         .take_while(|line| !line.is_empty())
+        .collect();
+    let block: Vec<&str> = relays
+        .iter()
+        .copied()
         .filter(|line| !line.starts_with("      "))
         .collect();
     let port = format!(":{}", relay.p2p);
@@ -1094,6 +1113,19 @@ fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
     assert_eq!(of_it.len(), 1, "{said}");
     assert!(of_it[0].starts_with(&format!("  {name}: ")), "{said}");
     assert!(of_it[0].contains("still to send there"), "{said}");
+    // Under it, what the relay had no room for.
+    let under: Vec<&str> = relays
+        .iter()
+        .copied()
+        .skip_while(|line| !line.starts_with(&format!("  {name}: ")))
+        .skip(1)
+        .take_while(|line| line.starts_with("      "))
+        .collect();
+    let refusal = format!("      {name} had no room for what you sent at ");
+    assert!(
+        under.iter().any(|line| line.starts_with(&refusal)),
+        "{said}"
+    );
     for address in [format!("127.0.0.1{port}"), format!("[::1]{port}")] {
         assert!(!said.contains(&address), "{address}: {said}");
     }
