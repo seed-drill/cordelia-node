@@ -167,16 +167,20 @@ the send window at quinn's default (9.5 MiB), 1.2 MiB of datagrams, and a
 request read through the enum of every message at up to 80 MiB at its
 peak and 32 MiB held (below).
 
-The parts of a request and its answer are held together only between two
-waits: once the request is read, it is decoded and answered with no wait
-on the peer. Through each wait, up to STREAM_TIMEOUT_SECS (§6), the node
-holds one of two things for the stream it answers: the frame it is
-reading, or the answer it is writing. A request is dropped, with all it
-holds, before its answer is written: a node does not keep it through the
-write of the answer and the read of the next request. On the streams of
-entries (`RelayEntries::serve`), the frame of the request, the request and
-the answer as a message are all dropped before the write, and what is
-held through it is the answer as it is written. Measured with a counting
+The parts of a request and its answer are held together without a wait
+on the peer: once the request is read, it is decoded and answered before
+anything is awaited. What is held through each wait, up to
+STREAM_TIMEOUT_SECS (§6), differs by stream. On the streams of entries
+(`RelayEntries::serve`), the frame of the request, the request and the
+answer as a message are all dropped before the write, and what is held
+through it is the answer as it is written: through each wait, the frame
+being read or the answer being written, and nothing else of the stream.
+On a sync of the older kind (`handle_inbound_sync`), a request for items
+is dropped before its answer is written, and the frame is dropped once it
+is decoded; but each answer is held both as a message and encoded through
+its write, and the answer to a page, the node's own headers (some 76 KB
+at their bounds), is still held through the read of the next request.
+The rows above count both. Measured with a counting
 allocator, while the peer does not read the answer
 (`a_request_is_not_held_while_its_answer_is_written`), before and after
 the drops:
