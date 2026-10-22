@@ -151,8 +151,7 @@ use rusqlite::Connection;
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
 };
-pub use reach::Reach;
-use reach::Said;
+pub use reach::{Reach, Said};
 
 /// How long a proof stands before the channel's key is proved again on a
 /// connection that lasts.
@@ -249,7 +248,10 @@ struct At<'a> {
 /// relay took by, and says it has sent what it carried by. `None`
 /// otherwise: then nothing is forgotten, dropped or said. A relay that
 /// another key answers for at its address is given with no connection
-/// (decision 2026-10-17 §1), so while it fails this is `None`.
+/// (decision 2026-10-17 §1), so while it fails this is `None`. **The keys
+/// are counted once each:** one connection that serves two relays, as two
+/// names given no key at one address are served, is one relay that holds
+/// what it took, never two, so this is `None` then too.
 pub fn every_relay_by_key(relays: &[Relay], configured: Option<usize>) -> Option<Vec<[u8; 32]>> {
     let set_up: Option<Vec<[u8; 32]>> = relays
         .iter()
@@ -258,7 +260,13 @@ pub fn every_relay_by_key(relays: &[Relay], configured: Option<usize>) -> Option
             Some(link.relay().0)
         })
         .collect();
-    set_up.filter(|keys| Some(keys.len()) == configured)
+    let distinct = |keys: &Vec<[u8; 32]>| {
+        let mut each = keys.clone();
+        each.sort_unstable();
+        each.dedup();
+        each.len() == keys.len()
+    };
+    set_up.filter(|keys| Some(keys.len()) == configured && distinct(keys))
 }
 
 /// What became of one step of a relay's pass.

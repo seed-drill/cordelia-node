@@ -177,9 +177,49 @@ pub fn sharing_an_address(resolved: &[RelayAddr]) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// The relays among `resolved` given no key whose address is that of a
+/// relay given a key, each with the name of the first such relay: what the
+/// node warns of in its log when the addresses change. Such a relay is
+/// never taken for that one, and is not reached (decision 2026-10-17 §1).
+pub fn keyless_at_keyed(resolved: &[RelayAddr]) -> Vec<(&str, &str)> {
+    resolved
+        .iter()
+        .filter(|relay| relay.key.is_none())
+        .filter_map(|relay| {
+            let keyed = resolved
+                .iter()
+                .find(|r| r.key.is_some() && r.addr == relay.addr)?;
+            Some((relay.host.as_str(), keyed.host.as_str()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relay given no key at the address of one given a key is named with
+    /// it, for the warning; one given no key beside another given none, or
+    /// at an address of its own, is not.
+    #[test]
+    fn a_relay_given_no_key_at_a_keyed_relays_address_is_warned_of() {
+        let at = |host: &str, addr: &str, key: Option<[u8; 32]>| RelayAddr {
+            host: host.into(),
+            addr: addr.parse().unwrap(),
+            key,
+        };
+        let resolved = [
+            at("keyless.example:9474", "127.0.0.1:9474", None),
+            at("keyed.example:9474", "127.0.0.1:9474", Some([7; 32])),
+            at("one.example:9474", "127.0.0.2:9474", None),
+            at("two.example:9474", "127.0.0.2:9474", None),
+            at("alone.example:9474", "127.0.0.3:9474", None),
+        ];
+        assert_eq!(
+            keyless_at_keyed(&resolved),
+            [("keyless.example:9474", "keyed.example:9474")]
+        );
+    }
 
     fn key(n: u8) -> ([u8; 32], String) {
         let id = cordelia_crypto::identity::NodeIdentity::from_seed([n; 32]).unwrap();

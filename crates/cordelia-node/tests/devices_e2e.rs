@@ -4428,15 +4428,77 @@ fn inbound_connections(relay: &Node) -> usize {
         .count()
 }
 
-/// One relay set up under two names is one relay (decision 2026-10-17
-/// §1). A device is set up with one relay of the test's own, under one
-/// name with its key and under another with none. It is listed under the
-/// first as connected, and under the second as the same relay. The
-/// device counts one relay, and paces and passes it once: the relays
-/// that its person's view lists are one, and that one holds the latest
-/// change. The relay took one connection from it.
+/// One relay set up under two names given its key is one relay (decision
+/// 2026-10-17 §1). A device is set up with one relay of the test's own,
+/// under two names, each given its key. It is listed under the first as
+/// connected, and under the second as the same relay. The device counts
+/// one relay, and paces and passes it once: the relays that its person's
+/// view lists are one, and that one holds the latest change. The relay
+/// took one connection from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_relay_under_two_names_is_counted_and_paced_once() {
+    let mut relay = node("relay", "relay", None);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let first = format!("127.0.0.1:{}", relay.p2p);
+    let again = format!("localhost:{}", relay.p2p);
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (first.clone(), Some(key_of(&relay))),
+            (again.clone(), Some(key_of(&relay))),
+        ],
+    );
+    laptop.start();
+    let all = [&relay, &laptop];
+    wait_for("node healthy", &all, 30, || healthy(&laptop));
+    makes_a_phrase(&laptop, "laptop");
+    let expected = vec![
+        (first.clone(), "connected".to_string()),
+        (again.clone(), "same relay".to_string()),
+    ];
+    wait_for("each name is listed as it stands", &all, 60, || {
+        (listed_relays(&laptop) == expected).then_some(())
+    });
+    // The device's own list of its relays: what it counts, paces and
+    // passes, and says holds the latest change.
+    let counted = wait_for("the relay holds the latest change", &all, 60, || {
+        let seen = person_of(&laptop);
+        let relays = seen["relays"].as_array()?.clone();
+        relays
+            .iter()
+            .all(|relay| relay["holds_latest"] == true)
+            .then_some(relays)
+    });
+    let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();
+    assert_eq!(names, [first.as_str()], "{counted:?}");
+    assert_eq!(listed_relays(&laptop), expected);
+    assert_eq!(inbound_connections(&relay), 1);
+}
+
+/// Each relay that `n` lists, by its name, with its state.
+fn listed_relays(n: &Node) -> Vec<(String, String)> {
+    relays_of(n)
+        .iter()
+        .map(|r| {
+            let host = r["host"].as_str().unwrap_or_default().to_string();
+            (host, r["state"].as_str().unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// A relay given no key is never taken for another relay (decision
+/// 2026-10-17 §1). A device is set up with one relay of the test's own
+/// under a name given its key, and under another name given none that
+/// resolves to the same address. The first is connected and holds the
+/// latest change. The second is a relay of its own: it is listed as
+/// unreachable, never as the same relay or as connected, it stays among
+/// the relays that the device counts, and it is never said to hold the
+/// latest change, since no connection answers for it by its own name. The
+/// relay took one connection from the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_given_no_key_at_another_relays_address_is_counted_as_its_own() {
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -4454,35 +4516,50 @@ async fn one_relay_under_two_names_is_counted_and_paced_once() {
     let all = [&relay, &laptop];
     wait_for("node healthy", &all, 30, || healthy(&laptop));
     makes_a_phrase(&laptop, "laptop");
-    let listed = |n: &Node| -> Vec<(String, String)> {
-        relays_of(n)
-            .iter()
-            .map(|r| {
-                let host = r["host"].as_str().unwrap_or_default().to_string();
-                (host, r["state"].as_str().unwrap_or_default().to_string())
-            })
-            .collect()
-    };
     let expected = vec![
         (keyed.clone(), "connected".to_string()),
-        (keyless.clone(), "same relay".to_string()),
+        (keyless.clone(), "unreachable".to_string()),
     ];
     wait_for("each name is listed as it stands", &all, 60, || {
-        (listed(&laptop) == expected).then_some(())
+        (listed_relays(&laptop) == expected).then_some(())
     });
-    // The device's own list of its relays: what it counts, paces and
-    // passes, and says holds the latest change.
-    let counted = wait_for("the relay holds the latest change", &all, 60, || {
-        let seen = person_of(&laptop);
+    let said = relays_of(&laptop)
+        .iter()
+        .find(|r| r["host"] == keyless.as_str())
+        .map(|r| r["error"].clone());
+    assert_eq!(
+        said,
+        Some(serde_json::json!(format!(
+            "given no key, at the address of {keyed}: give it that relay's key, or remove it \
+             from your configuration"
+        )))
+    );
+    // The device's own list of its relays: both, and only the one given
+    // the key holds the latest change.
+    let holds = |n: &Node| -> Option<Vec<(String, bool)>> {
+        let seen = person_of(n);
         let relays = seen["relays"].as_array()?.clone();
-        relays
-            .iter()
-            .all(|relay| relay["holds_latest"] == true)
-            .then_some(relays)
-    });
-    let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();
-    assert_eq!(names, [keyed.as_str()], "{counted:?}");
-    assert_eq!(listed(&laptop), expected);
+        Some(
+            relays
+                .iter()
+                .map(|r| {
+                    let name = r["relay"].as_str().unwrap_or_default().to_string();
+                    (name, r["holds_latest"] == true)
+                })
+                .collect(),
+        )
+    };
+    let expected_holds = vec![(keyed.clone(), true), (keyless.clone(), false)];
+    wait_for(
+        "the relay given its key holds the latest change",
+        &all,
+        60,
+        || (holds(&laptop)? == expected_holds).then_some(()),
+    );
+    // Ten seconds on, two passes and more: nothing has changed.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+    assert_eq!(holds(&laptop), Some(expected_holds));
+    assert_eq!(listed_relays(&laptop), expected);
     assert_eq!(inbound_connections(&relay), 1);
 }
 
