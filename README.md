@@ -16,11 +16,11 @@ a device that is lost and brings your memory back to a new machine.
 
 **Pre-release (October 2026).** v1 is built and tested. The tests include
 end-to-end runs with real processes over QUIC through a relay. Two relays
-are running. The current pre-release is `v0.2.0-alpha.14`, for macOS and
+are running. The current pre-release is `v0.2.0-alpha.15`, for macOS and
 Linux. To install it, run:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.14 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.15 sh
 ```
 
 To upgrade, run the same command with a later version. The script then:
