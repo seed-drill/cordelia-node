@@ -274,9 +274,14 @@ text is read from the decoder's own buffer and copied only once it fits,
 so one that is over its size costs nothing. A header with a text over its
 size is refused where it is read: the text is not kept, and the header
 holds in its place a mark of one byte over the size, which the check of
-an entry's fields before a fetch refuses, so the entry is never fetched
-and the rest of its page is gone through (a relay gets past what it will
-not store, `t03_a_relay_gets_past_what_it_will_not_store`). Bytes of
+an entry's fields before a fetch refuses, so the entry is never fetched.
+Where the text is its ID, type, time or parent, the rest of its page is
+gone through (a relay gets past what it will not store,
+`t03_a_relay_gets_past_what_it_will_not_store`). Where it is its channel,
+the mark is no channel's ID, so a fetch held to what it asked for (from a
+peer that is not a relay it lists) finds a header of another channel: the
+page is not the one asked for and the pass fails, as it did before the
+bound, when the long ID was no more the channel asked for. Bytes of
 another size than their own refuse the page, and so does a text or bytes
 longer than the decoder's buffer (4,096 bytes), which is not read at all.
 Every node since 0.2.0-alpha.5 refuses to store an entry with a field

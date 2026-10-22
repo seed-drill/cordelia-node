@@ -269,7 +269,10 @@ pub struct SyncResponse {
 /// MAX_ITEM_TYPE_LEN, MAX_TIMESTAMP_LEN): a text over it is not kept, and
 /// the header is refused where it is read, its text held as a mark one
 /// byte over the size ([`over_its_size`]), so that the entry is never
-/// fetched and its page is still gone through. Its hash, author, signature
+/// fetched. Where the text is its ID, type, time or parent, the rest of
+/// its page is still gone through. Where it is its channel, a fetch that
+/// is held to what it asked for finds the page not the one it asked for,
+/// as it did before the bound, and that pass fails. Its hash, author, signature
 /// and slot must be of exactly their size, or the page is refused. Every
 /// node since 0.2.0-alpha.5 refuses to store an entry over any of them, so
 /// no page it lists holds one. Without the bounds a page's headers could
