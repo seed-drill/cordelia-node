@@ -2668,17 +2668,8 @@ pub async fn p2p_loop(
                 let relays = relay_addrs.read().map(|r| r.clone()).unwrap_or_default();
                 let now = std::time::Instant::now();
                 let settled = std::time::Duration::from_secs(p2p_gov_tick_secs.max(1));
-                let connected = |relay: &cordelia_network::bootstrap::RelayAddr| {
-                    relay_connected(&conn_mgr, relay)
-                };
-                let key_at = |addr| key_at(&conn_mgr, addr);
-                let at = AtTick {
-                    set_up: &relays_set_up,
-                    relays: &relays,
-                    connected: &connected,
-                    key_at: &key_at,
-                };
-                let any_connected = any_connected_as_itself(&at);
+                with_tick(&relays_set_up, &relays, &conn_mgr, |at| {
+                let any_connected = any_connected_as_itself(at);
                 // A relay that came to lack the change is dialled within
                 // BACKOFF_BASE_SECS, whatever wait was set (rule 3).
                 if let Some(reach) = &reach {
@@ -2695,7 +2686,7 @@ pub async fn p2p_loop(
                     let dials = relay_turn(
                         &mut relay_tries,
                         &mut dialling,
-                        (&at, relay),
+                        (at, relay),
                         tick,
                         reach.as_deref(),
                     );
@@ -2714,6 +2705,7 @@ pub async fn p2p_loop(
                         }
                     });
                 }
+                });
                 publish_relays(&state, &relays_set_up, &relays, &relay_tries, &conn_mgr);
             }
 
@@ -3581,31 +3573,15 @@ pub async fn keep_relays_resolved(
         let have_any = if resolved.is_empty() {
             addrs.read().map(|a| !a.is_empty()).unwrap_or(false)
         } else {
-            if let Ok(mut current) = addrs.write()
-                && *current != resolved
-            {
+            if let Some(warnings) = addresses_found(&addrs, &resolved) {
                 let list: Vec<String> = resolved
                     .iter()
                     .map(|r| format!("{}={}", r.host, r.addr))
                     .collect();
                 tracing::info!(addrs = ?list, "relay addresses updated");
-                // Each is kept and dialled; one key answers at an address
-                // (decision 2026-10-17 §1).
-                for (relay, first) in cordelia_network::bootstrap::sharing_an_address(&resolved) {
-                    tracing::warn!(
-                        relay,
-                        first,
-                        "two relays this node is set up with resolve to one address: only one key can answer there, and a relay given another key is shown with the wrong key"
-                    );
+                for warning in warnings {
+                    tracing::warn!("{warning}");
                 }
-                for (relay, keyed) in cordelia_network::bootstrap::keyless_at_keyed(&resolved) {
-                    tracing::warn!(
-                        relay,
-                        keyed,
-                        "{relay} is given no key, and resolves to the address of {keyed}: it is never taken for that relay, and is not reached. Give it that relay's key, or remove it from your configuration"
-                    );
-                }
-                *current = resolved.clone();
             }
             true
         };
@@ -3618,6 +3594,63 @@ pub async fn keep_relays_resolved(
             None => tokio::time::sleep(wait).await,
         }
     }
+}
+
+/// Publish `resolved` to `addrs` where it is not what they hold. Returns
+/// what the node warns of in its log then ([`address_warnings`]), or
+/// `None` where nothing changed.
+fn addresses_found(
+    addrs: &RelayAddrs,
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+) -> Option<Vec<String>> {
+    let mut current = addrs.write().ok()?;
+    if *current == resolved {
+        return None;
+    }
+    *current = resolved.to_vec();
+    Some(address_warnings(resolved))
+}
+
+/// What the node warns of in its log of the relays that share an address,
+/// as their names resolve (decision 2026-10-17 §1): each is kept and
+/// dialled, and one key answers at an address.
+///
+/// - Two relays given keys: only one key can answer there, and a relay
+///   given another is shown with the wrong key.
+/// - A relay given no key at the address of one given a key: it is never
+///   taken for that relay, and what to do.
+/// - Two relays given no key: they are two relays on one connection,
+///   never counted as one, and what to do.
+fn address_warnings(resolved: &[cordelia_network::bootstrap::RelayAddr]) -> Vec<String> {
+    use cordelia_network::bootstrap::{keyless_at_keyed, sharing_an_address};
+    let keyless = |host: &str| {
+        resolved
+            .iter()
+            .any(|relay| relay.host == host && relay.key.is_none())
+    };
+    let mut said = Vec::new();
+    for (relay, first) in sharing_an_address(resolved) {
+        match (keyless(relay), keyless(first)) {
+            (false, false) => said.push(format!(
+                "{relay} and {first} resolve to one address: only one key can answer there, and \
+                 a relay given another key is shown with the wrong key"
+            )),
+            (true, true) => said.push(format!(
+                "{relay} and {first} are given no key, and resolve to one address: they are two \
+                 relays on one connection, never counted as one, so this device never says that \
+                 it has sent what it carried. Give the one name only"
+            )),
+            _ => {}
+        }
+    }
+    for (relay, keyed) in keyless_at_keyed(resolved) {
+        said.push(format!(
+            "{relay} is given no key, and resolves to the address of {keyed}: it is never taken \
+             for that relay, and is not reached. Give it that relay's key, or remove it from your \
+             configuration"
+        ));
+    }
+    said
 }
 
 /// What a lookup of the names of `relays` that found `resolved` says, and
@@ -4437,20 +4470,31 @@ fn any_relay_connected(
     relay_addrs: &RelayAddrs,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
 ) -> bool {
+    relay_addrs
+        .read()
+        .map(|relays| with_tick(set_up, &relays, conn_mgr, any_connected_as_itself))
+        .unwrap_or(false)
+}
+
+/// Do `work` with what a tick of the dial loop sees of the relays now
+/// ([`AtTick`]): `set_up`, `relays` as their names resolve, and the
+/// connections of `conn_mgr`, by a relay's key or at its address, with the
+/// key that answers on each.
+fn with_tick<R>(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+    work: impl FnOnce(&AtTick) -> R,
+) -> R {
     let connected =
         |relay: &cordelia_network::bootstrap::RelayAddr| relay_connected(conn_mgr, relay);
     let key_at = |addr| key_at(conn_mgr, addr);
-    relay_addrs
-        .read()
-        .map(|relays| {
-            any_connected_as_itself(&AtTick {
-                set_up,
-                relays: &relays,
-                connected: &connected,
-                key_at: &key_at,
-            })
-        })
-        .unwrap_or(false)
+    work(&AtTick {
+        set_up,
+        relays,
+        connected: &connected,
+        key_at: &key_at,
+    })
 }
 
 /// Whether any relay of `at` is connected in its own right
@@ -7203,6 +7247,192 @@ mod tests {
         let one = relays_with_links(&set_up[..1], &addrs, &conn_mgr, &own);
         assert!(by_key(&one, own.relays_set_up()).is_some());
         conn_mgr.shutdown();
+    }
+
+    /// The dial loop reads the key that answers on the connection at a
+    /// relay's address (decision 2026-10-17 §1): with a real connection,
+    /// whose key is a keyed relay's, and that relay's name missing from the
+    /// lookup or moved, the relay given no key at that address is not
+    /// connected in its own right. It makes no relay connected for the
+    /// loop's pace (only the keyed relay, by its key, where it is listed),
+    /// its turns pass it over, and it is out of reach after five minutes.
+    /// With the keyed relay's name resolved there, that relay is connected
+    /// by its key.
+    #[tokio::test]
+    async fn the_dial_loop_reads_the_key_that_answers_at_an_address() {
+        use cordelia_api::state::Holds;
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let (mut conn_mgr, key, addr, _relay) = connected_to_a_relay().await;
+        let set_up = [
+            Relay {
+                host: "keyed.test:9474".into(),
+                key: Some(key),
+            },
+            Relay {
+                host: "keyless.test:9474".into(),
+                key: None,
+            },
+        ];
+        let keyless = RelayAddr {
+            host: "keyless.test:9474".into(),
+            addr,
+            key: None,
+        };
+        let keyed_at = |addr| RelayAddr {
+            host: "keyed.test:9474".into(),
+            addr,
+            key: Some(key),
+        };
+        let moved = keyed_at("127.0.0.1:1".parse().unwrap());
+        for listed in [vec![keyless.clone()], vec![moved, keyless.clone()]] {
+            let at_keyless = |at: &AtTick| connected_as_itself(at, &keyless);
+            assert!(!with_tick(&set_up, &listed, &conn_mgr, at_keyless));
+            let addrs: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(listed.clone()));
+            // Only the keyed relay, listed where it moved, is connected, by
+            // its key: the relay given no key never is.
+            let keyed_listed = listed.len() == 2;
+            assert_eq!(
+                any_relay_connected(&set_up, &addrs, &conn_mgr),
+                keyed_listed
+            );
+            let id = tried_relay(&keyless);
+            let (reach, clock) = reach_of(&[(&id, Holds::Lacks)]);
+            let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+            let mut dialling = Dialling::default();
+            let now = std::time::Instant::now();
+            for second in 0..=300 {
+                if second > 0 {
+                    clock.run_ahead(std::time::Duration::from_secs(1));
+                }
+                let tick = tick_at(now + std::time::Duration::from_secs(second), false);
+                let dials = with_tick(&set_up, &listed, &conn_mgr, |at| {
+                    relay_turn(
+                        &mut tries,
+                        &mut dialling,
+                        (at, &keyless),
+                        tick,
+                        Some(&reach),
+                    )
+                });
+                assert!(!dials, "{second}");
+            }
+            assert!(reach.is_out_of_reach(&reach_id(&id)));
+        }
+        let both = vec![keyed_at(addr), keyless.clone()];
+        let addrs: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(both.clone()));
+        assert!(any_relay_connected(&set_up, &addrs, &conn_mgr));
+        assert!(with_tick(&set_up, &both, &conn_mgr, |at| {
+            connected_as_itself(at, &both[0])
+        }));
+        conn_mgr.shutdown();
+    }
+
+    /// A dial answered at a keyed relay's place, by that relay's key
+    /// (decision 2026-10-17 §1): the relay given no key there is not
+    /// answered, and its dial ends once, failed, with what to do; the
+    /// relay given the key is answered. So too where the keyed relay's
+    /// name is missing from the lookup, and only its key tells.
+    #[test]
+    fn a_dial_answered_at_a_keyed_relays_place_ends_the_relay_given_no_key_once() {
+        use cordelia_api::state::Holds;
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let here: std::net::SocketAddr = "127.0.0.1:9474".parse().unwrap();
+        let set_up = [
+            Relay {
+                host: "keyed.example:9474".into(),
+                key: Some([1; 32]),
+            },
+            Relay {
+                host: "keyless.example:9474".into(),
+                key: None,
+            },
+        ];
+        let resolved: Vec<RelayAddr> = set_up
+            .iter()
+            .map(|relay| RelayAddr {
+                host: relay.host.clone(),
+                addr: here,
+                key: relay.key,
+            })
+            .collect();
+        let (keyed, keyless) = (tried_relay(&resolved[0]), tried_relay(&resolved[1]));
+        for listed in [resolved.clone(), resolved[1..].to_vec()] {
+            let (reach, _clock) = reach_of(&[(&keyless, Holds::Lacks)]);
+            let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+            let mut dialling = Dialling::default();
+            dialling.insert(here, listed.iter().map(tried_relay).collect());
+            reach.dial_begins(&reach_id(&keyless));
+            let (answers, refused) = dial_answered(
+                &mut tries,
+                &mut dialling,
+                (&set_up, &listed),
+                (here, &[1; 32]),
+                (10, true),
+                Some(&reach),
+            );
+            let hosts: Vec<&str> = answers.iter().map(|relay| relay.host.as_str()).collect();
+            let keyed_listed = listed.len() == 2;
+            assert_eq!(
+                hosts,
+                if keyed_listed {
+                    vec!["keyed.example:9474"]
+                } else {
+                    vec![]
+                }
+            );
+            assert!(refused.is_empty());
+            let tried = &tries[&keyless];
+            assert_eq!(tried.failures, 1, "{listed:?}");
+            assert_eq!(
+                tried.error.as_deref(),
+                Some(no_key_at("keyed.example:9474").as_str())
+            );
+            assert_eq!(tries.contains_key(&keyed), keyed_listed);
+        }
+    }
+
+    /// What the node warns of in its log when the addresses change
+    /// (decision 2026-10-17 §1), written by the call that publishes them:
+    /// two relays given keys at one address, a relay given no key at a
+    /// keyed relay's address, and two names given no key at one address,
+    /// each with what to do. Addresses that do not change are not
+    /// published again, and warn of nothing.
+    #[test]
+    fn the_addresses_found_warn_of_relays_at_one_address_with_what_to_do() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let at = |host: &str, addr: &str, key: Option<[u8; 32]>| RelayAddr {
+            host: host.into(),
+            addr: addr.parse().unwrap(),
+            key,
+        };
+        let resolved = vec![
+            at("one.example:9474", "127.0.0.1:9474", Some([1; 32])),
+            at("two.example:9474", "127.0.0.1:9474", Some([2; 32])),
+            at("keyed.example:9474", "127.0.0.2:9474", Some([3; 32])),
+            at("keyless.example:9474", "127.0.0.2:9474", None),
+            at("localhost:9474", "127.0.0.3:9474", None),
+            at("127.0.0.3:9474", "127.0.0.3:9474", None),
+        ];
+        let addrs: RelayAddrs = Default::default();
+        let warnings = addresses_found(&addrs, &resolved);
+        assert_eq!(
+            warnings,
+            Some(vec![
+                "two.example:9474 and one.example:9474 resolve to one address: only one key can \
+                 answer there, and a relay given another key is shown with the wrong key"
+                    .to_string(),
+                "127.0.0.3:9474 and localhost:9474 are given no key, and resolve to one address: \
+                 they are two relays on one connection, never counted as one, so this device \
+                 never says that it has sent what it carried. Give the one name only"
+                    .to_string(),
+                "keyless.example:9474 is given no key, and resolves to the address of \
+                 keyed.example:9474: it is never taken for that relay, and is not reached. Give \
+                 it that relay's key, or remove it from your configuration"
+                    .to_string(),
+            ])
+        );
+        assert_eq!(*addrs.read().unwrap(), resolved);
+        assert_eq!(addresses_found(&addrs, &resolved), None);
     }
 
     /// A relay given no key that was reached on a connection while it was
