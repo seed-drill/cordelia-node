@@ -369,7 +369,8 @@ where
     deserializer.deserialize_str(AtMost { most, what })
 }
 
-/// Read bytes of exactly `size`.
+/// Read bytes of exactly `size`. Bytes written as an array of integers are
+/// refused: every version since 0.2.0-alpha.4 writes them as CBOR bytes.
 fn bytes_of<'de, D>(deserializer: D, size: usize, what: &'static str) -> Result<Vec<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
