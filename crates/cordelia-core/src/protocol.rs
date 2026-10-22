@@ -86,6 +86,15 @@ pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
 /// there was no such bound: a thousand streams, each over a megabyte.
 pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 
+/// How much this node may have written on one connection, over all its
+/// streams, that the peer has not acknowledged: two messages. A write
+/// beyond it waits for acknowledgements, for STREAM_TIMEOUT_SECS, and then
+/// fails. This is what bounds the memory a peer that reads and never
+/// acknowledges can make a node hold. Left to QUIC's default it was ten
+/// megabytes. Rationale: parameter-rationale.md §1.
+/// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
+pub const QUIC_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
+
 /// TLS certificate validity in days (network-protocol.md §2.2).
 /// Primitive: 1 year; self-signed certs, identity is the public key.
 pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
@@ -2251,6 +2260,14 @@ mod tests {
     #[test]
     fn test_quic_max_uni_streams_network_protocol_2_1() {
         assert_eq!(QUIC_MAX_UNI_STREAMS, 0);
+    }
+
+    /// Two messages, as much as a peer may have unread on a connection.
+    #[test]
+    fn test_quic_send_window_parameter_rationale_1() {
+        assert_eq!(QUIC_SEND_WINDOW, 2_097_152);
+        assert_eq!(QUIC_SEND_WINDOW, 2 * MAX_MESSAGE_BYTES as u64);
+        assert_eq!(QUIC_SEND_WINDOW, QUIC_RECEIVE_WINDOW as u64);
     }
 
     #[test]

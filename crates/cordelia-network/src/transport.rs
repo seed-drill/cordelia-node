@@ -110,6 +110,11 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 /// - It may send one message's worth on a stream, and two on the whole
 ///   connection, before this node has read it. So one connection can make
 ///   a node buffer two megabytes, whatever the peer does.
+/// - This node may have written two messages' worth on the connection that
+///   the peer has not acknowledged (QUIC_SEND_WINDOW). A write beyond it
+///   waits for acknowledgements, and the codec gives it up after
+///   STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it is sent
+///   cannot make a node hold more than that either.
 fn transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(
@@ -123,6 +128,7 @@ fn transport_config() -> quinn::TransportConfig {
     transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
     transport.stream_receive_window(protocol::QUIC_STREAM_RECEIVE_WINDOW.into());
     transport.receive_window(protocol::QUIC_RECEIVE_WINDOW.into());
+    transport.send_window(protocol::QUIC_SEND_WINDOW);
     transport
 }
 
@@ -170,6 +176,16 @@ fn client_config_with_cert(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
 ) -> Result<ClientConfig, TransportError> {
+    client_config_with(cert_der, key_der, transport_config())
+}
+
+/// A client config with `transport` in place of a node's own. A node uses
+/// only its own; the tests give a stand-in peer other settings.
+fn client_config_with(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    transport: quinn::TransportConfig,
+) -> Result<ClientConfig, TransportError> {
     let cert = CertificateDer::from(cert_der);
     let key = PrivatePkcs8KeyDer::from(key_der);
 
@@ -183,8 +199,6 @@ fn client_config_with_cert(
         .map_err(|e| TransportError::Tls(e.to_string()))?;
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
-
-    let transport = transport_config();
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -624,6 +638,177 @@ mod tests {
             streams.push((send, recv));
         }
         assert_eq!(taken, 2, "the connection took {taken} megabytes unread");
+    }
+
+    /// The send window that a config carries, as quinn shows it: quinn has
+    /// no getter for it, but its `Debug` names every field.
+    fn send_window_of(config: &impl std::fmt::Debug) -> u64 {
+        let shown = format!("{config:?}");
+        let at = shown
+            .find("send_window: ")
+            .expect("the config shows its send window")
+            + "send_window: ".len();
+        let digits: String = shown[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().unwrap()
+    }
+
+    /// T3. What a node may have written on one connection that the peer has
+    /// not acknowledged is QUIC_SEND_WINDOW, at both ends: as the client
+    /// that dials, and as the server that is dialled.
+    #[test]
+    fn the_send_window_is_two_messages_at_both_ends() {
+        let id = NodeIdentity::generate().unwrap();
+        let window = protocol::QUIC_SEND_WINDOW;
+        assert_eq!(send_window_of(&transport_config()), window);
+        assert_eq!(send_window_of(&client_config(&id).unwrap()), window);
+        assert_eq!(
+            send_window_of(&server_config(&id).unwrap().transport),
+            window
+        );
+    }
+
+    /// A path to `server` over UDP, as a client sees it: the address to
+    /// dial, and a switch that, while it is on, drops everything the client
+    /// sends. What the server sends always gets through. So a client behind
+    /// it that is cut off goes on receiving, and acknowledges nothing.
+    async fn path_to(
+        server: SocketAddr,
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        back.connect(server).await.unwrap();
+        let addr = front.local_addr().unwrap();
+        let cut = Arc::new(AtomicBool::new(false));
+        let cutting = cut.clone();
+        let carrying = tokio::spawn(async move {
+            let mut client = None;
+            let (mut up, mut down) = (vec![0u8; 65536], vec![0u8; 65536]);
+            loop {
+                tokio::select! {
+                    Ok((n, from)) = front.recv_from(&mut up) => {
+                        client = Some(from);
+                        if !cutting.load(Ordering::SeqCst) {
+                            let _ = back.send(&up[..n]).await;
+                        }
+                    }
+                    Ok(n) = back.recv(&mut down) => {
+                        if let Some(client) = client {
+                            let _ = front.send_to(&down[..n], client).await;
+                        }
+                    }
+                }
+            }
+        });
+        (addr, cut, carrying)
+    }
+
+    /// A node's end of a connection from a stand-in peer behind
+    /// [`path_to`], with the path cut once the connection is made. The peer
+    /// offers 64 MB of credit on a stream and on the connection, so only
+    /// the node's own send window holds back what it writes.
+    async fn a_peer_that_stops_acknowledging() -> (
+        quinn::Connection,
+        quinn::Connection,
+        Arc<std::sync::atomic::AtomicBool>,
+        (Endpoint, Endpoint, tokio::task::JoinHandle<()>),
+    ) {
+        let node_id = NodeIdentity::generate().unwrap();
+        let peer_id = NodeIdentity::generate().unwrap();
+        let node = create_endpoint(&node_id, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (dial, cut, carrying) = path_to(node.local_addr().unwrap()).await;
+
+        let mut credit = transport_config();
+        credit.stream_receive_window((64u32 << 20).into());
+        credit.receive_window((64u32 << 20).into());
+        let (cert, key) = generate_self_signed_cert(&peer_id).unwrap();
+        let mut peer = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        peer.set_default_client_config(client_config_with(cert, key, credit).unwrap());
+
+        let accepting = {
+            let node = node.clone();
+            tokio::spawn(async move { node.accept().await.unwrap().await.unwrap() })
+        };
+        let peer_end = peer.connect(dial, "cordelia").unwrap().await.unwrap();
+        let node_end = accepting.await.unwrap();
+        // Let the handshake settle, then acknowledge nothing more.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cut.store(true, std::sync::atomic::Ordering::SeqCst);
+        (node_end, peer_end, cut, (node, peer, carrying))
+    }
+
+    /// T3. A peer that stops acknowledging cannot make a node hold more
+    /// than its send window of what the node writes: the node's writes take
+    /// that much, and then wait. Once the peer acknowledges again, they go
+    /// on.
+    #[tokio::test]
+    async fn a_peer_that_stops_acknowledging_is_held_to_the_send_window() {
+        let (node_end, _peer_end, cut, _held) = a_peer_that_stops_acknowledging().await;
+        let window = protocol::QUIC_SEND_WINDOW as usize;
+        let (mut send, _recv) = node_end.open_bi().await.unwrap();
+
+        // Write until a write waits: 16 MB offered, 64 KB at a time.
+        let chunk = vec![0u8; 64 * 1024];
+        let mut taken = 0usize;
+        while taken < 16 << 20 {
+            match tokio::time::timeout(Duration::from_millis(1000), send.write(&chunk)).await {
+                Ok(Ok(n)) => taken += n,
+                Ok(Err(e)) => panic!("a write failed: {e}"),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            taken, window,
+            "the node took {taken} bytes that the peer did not acknowledge"
+        );
+
+        // The peer acknowledges again: what waited goes, and more is taken.
+        cut.store(false, std::sync::atomic::Ordering::SeqCst);
+        let more = tokio::time::timeout(Duration::from_secs(10), send.write_all(&chunk)).await;
+        assert!(
+            matches!(more, Ok(Ok(()))),
+            "a write did not go on once the peer acknowledged"
+        );
+    }
+
+    /// T3. A message written to a peer that does not acknowledge waits for
+    /// the window for STREAM_TIMEOUT_SECS, as any write does, and then
+    /// fails: the stream is given up, and the node holds no more.
+    #[tokio::test]
+    async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
+        let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
+        let (mut send, _recv) = node_end.open_bi().await.unwrap();
+        // A frame of a megabyte, its length included.
+        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize - 4];
+
+        // Two fill the window, and are taken at once. The third waits.
+        for _ in 0..2 {
+            let began = std::time::Instant::now();
+            crate::codec::write_raw_frame(&mut send, &message)
+                .await
+                .unwrap();
+            assert!(began.elapsed() < Duration::from_secs(1));
+        }
+        let began = std::time::Instant::now();
+        let third = crate::codec::write_raw_frame(&mut send, &message).await;
+        let waited = began.elapsed();
+        assert!(
+            matches!(third, Err(crate::codec::CodecError::Timeout(_))),
+            "{third:?}"
+        );
+        let timeout = Duration::from_secs(protocol::STREAM_TIMEOUT_SECS);
+        assert!(
+            waited >= timeout - Duration::from_millis(50)
+                && waited < timeout + Duration::from_secs(2),
+            "the write waited {waited:?}"
+        );
     }
 
     /// T19. A node cannot connect under a key it does not hold: a listening

@@ -80,6 +80,69 @@ stream is enough. Two for the connection lets a second exchange begin
 while the first is being read. With 200 connections a relay holds at
 most 400MB unread.
 
+### send_window = 2MB (`QUIC_SEND_WINDOW`)
+
+**Rationale:** How much this node may have written on one connection,
+over all its streams, that the peer has not acknowledged. Quinn keeps
+every byte written until the peer acknowledges it, so this is what
+bounds the memory that a peer which reads and never acknowledges can
+make a node hold. Quinn's default is 8 x 1,250,000 = 10,000,000 bytes:
+a peer that pulled pages from a relay and acknowledged none could make
+it hold about ten megabytes for that connection, until it closed.
+
+**Derivation:** 2 x MAX_MESSAGE_BYTES = 2,097,152 bytes. The largest
+thing a node writes on one stream is one message (MAX_MESSAGE_BYTES: a
+page of entries is at most ENTRY_PAGE_MAX_BYTES = 917,504 bytes of it).
+A node answers the streams a peer opens one at a time, so on a
+connection it writes at most one answer and one request of its own at
+once: two messages, which the window holds whole. It is also what the
+peer lets it send: an honest peer runs the same settings, and its
+receive window for the connection (QUIC_RECEIVE_WINDOW) is two messages,
+so a larger send window would let nothing more go. Bytes leave the
+window as they are acknowledged, within a round trip, so it limits the
+rate to the window per round trip: about 20 MB/s at 100 ms and 4 MB/s at
+500 ms, where STREAM_TIMEOUT (§6) needs only 100 KB/s to move a whole
+message. A write to a peer that acknowledges waits for it a round trip
+at a time at most.
+
+**A write that meets it** waits for acknowledgements. Every write goes
+through the codec, which gives it STREAM_TIMEOUT_SECS (§6); a write that
+is still waiting then fails, and the stream is given up. For a peer that
+does not acknowledge that is the right outcome: what it has not
+acknowledged it may never have received, and the node holds no more
+than the window for it while it waits.
+
+**If you increase it:** Nothing goes faster to an honest peer, whose
+receive window is two messages, and a peer that does not acknowledge
+can make a node hold more.
+
+**If you decrease it below one message:** A full page or push cannot be
+written whole before its first acknowledgement, and each one takes a
+round trip more.
+
+### What one connection can cost
+
+Every buffer that one connection can make a node hold at once, each at
+its largest:
+
+| Buffer | Bytes |
+|--------|-------|
+| Receive windows: what the peer sent and the node has not read (`stream_receive_window` lies within `receive_window`) | 2 MiB |
+| Send window: what the node wrote and the peer has not acknowledged | 2 MiB |
+| The frame of a request being read (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES) | 1 MiB |
+| The request, decoded | 1 MiB |
+| The answer being built (a page of entries, or a show's answer) | 1 MiB |
+| The answer, encoded, before it is copied into the send window (`write_frame`) | 1 MiB |
+| **One connection** | **8 MiB** |
+
+At the bound of 200 inbound connections (MAX_INBOUND_CONNECTIONS, §5)
+that is 1,600 MiB, about 1.7 GB. Before the send window was set it was
+about 15.5 MiB a connection and 3,100 MiB at the bound. The count is an
+upper bound: a request is small when its answer is large (a pull of
+pages), and the other way round (a push). The bound on connections is
+§5's, and is not changed here; on a relay host with less memory than
+this, it is that bound that has to come down.
+
 ---
 
 ## 2. Application Keepalive Parameters
@@ -564,9 +627,9 @@ push holds fewer than 200 entries, and the item bound is not reached.
 
 ### max_inbound_connections = 200
 
-**Rationale:** Maximum simultaneous inbound QUIC connections. At ~50KB
-memory per connection, 200 connections = ~10MB. Prevents memory exhaustion
-from connection flood attacks.
+**Rationale:** Maximum simultaneous inbound QUIC connections. Prevents memory
+exhaustion from connection flood attacks. What one connection can cost at
+most, and what that gives at this bound, is counted in §1.
 
 **Reference:** Cardano relay nodes accept ~3000 connections. We use 200
 as a conservative Phase 1 default.
