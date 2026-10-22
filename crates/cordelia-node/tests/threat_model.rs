@@ -725,7 +725,7 @@ impl StandIn {
         let Ok(bytes) = codec::read_raw_frame(&mut recv).await else {
             return;
         };
-        let request = codec::decode_message(&bytes).ok();
+        let request = codec::decode_message(protocol, &bytes).ok();
         // What an entry that is shown or pushed is answered with, where
         // its bytes are an entry's: it is held, or taken, or refused for
         // room.
@@ -2500,7 +2500,7 @@ impl Client {
                     continue;
                 }
                 let mut pass = Pass::default();
-                while let Ok(msg) = codec::read_frame(&mut recv).await {
+                while let Ok(msg) = codec::read_frame(&mut recv, Protocol::ItemSync).await {
                     let items = held.items.lock().unwrap().clone();
                     let answer = match msg {
                         WireMessage::SyncChannelListRequest(_) if held.makes_up_names > 0 => {

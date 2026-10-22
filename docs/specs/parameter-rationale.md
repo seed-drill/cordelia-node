@@ -137,38 +137,50 @@ round trip more.
 
 An estimate, each part at its largest, of what one connection can make a
 node hold: QUIC's windows and what quinn may allocate beyond them, and
-what the inbound loop holds for the one stream it answers. It leaves out
-what the node's own streams on the connection hold (listed below the
-table), so it is not every buffer.
+what the inbound loop holds for the one stream it answers. The node
+answers the streams a peer opens one at a time (`handle_peer_streams`),
+so these parts are of one request and its answer. It leaves out what the
+node's own streams on the connection hold (listed below the table), so it
+is not every buffer.
 
 | Part | At most |
 |------|---------|
 | Receive windows: what the peer sent and the node has not read (`stream_receive_window` lies within `receive_window`) | 2 MiB |
 | Quinn's reassembly beyond them: a stream's received buffers are compacted only once they exceed what is buffered by max(32 KiB, 1.5 x it), so 2.5 x 2 MiB and 32 KiB on each of 64 streams, less the 2 MiB above. Read from quinn-proto 0.11's source (`assembler.rs`), not measured; only a peer that sends tiny frames comes near it | 5 MiB |
-| Send window: what the node wrote and the peer has not acknowledged | 2 MiB |
+| Send window: what the node wrote and the peer has not acknowledged (`QUIC_SEND_WINDOW`) | 2 MiB |
 | Datagrams: none, since `datagram_receive_buffer_size` is off and a peer is told it may send none (quinn's default kept 1.25 MB of them unread) | 0 |
 | The frame of the request being answered (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES) | 1 MiB |
-| The request, decoded | 1 MiB |
+| The request, decoded: read by its stream into its own type, every list bounded (below). 3 x MAX_MESSAGE_BYTES at the decode's peak, and at most 2 x MAX_MESSAGE_BYTES and 64 KiB once decoded; measured, 2.0 MB and 1.97 MB at worst | 3 MiB |
 | The answer being built (a page of entries, or a show's answer) | 1 MiB |
 | The answer, encoded, before it is copied into the send window (`write_frame`) | 1 MiB |
-| **One connection, as counted** | **13 MiB** |
+| **One connection, as counted** | **15 MiB** |
 
 At the bound of 200 inbound connections (MAX_INBOUND_CONNECTIONS, §5)
-that is 2,600 MiB, about 2.7 GB. The same count with the send window at
-quinn's default and datagrams on was about 21.7 MiB a connection, and
-4,350 MiB at the bound. Without the reassembly row, which needs a peer
-that sends tiny frames on purpose, it is 8 MiB a connection and 1,600
-MiB at the bound. The count is an upper bound on each part: a request is
-small when its answer is large (a pull of pages), and the other way
-round (a push).
+that is 3,000 MiB, about 3.1 GB. Without the reassembly row, which needs
+a peer that sends tiny frames on purpose, it is 10 MiB a connection and
+2,000 MiB at the bound. The count is an upper bound on each part: the
+decode's peak passes before the answer is built, a request is small when
+its answer is large (a pull of pages), and the other way round (a push).
+Before the send window was set, datagrams were turned off and a message
+was read by its stream, the same count was about 101 MiB a connection:
+the send window at quinn's default (9.5 MiB), 1.2 MiB of datagrams, and a
+request read through the enum of every message at up to 80 MiB at its
+peak and 32 MiB held (below).
+
+A request is dropped, with all it holds, before its answer is written: a
+node does not keep it through the write of the answer and the read of the
+next request, up to STREAM_TIMEOUT_SECS each (§6). The streams of entries
+(`relay_entries`) keep the frame and the request through the one write of
+their answer, which is small whenever the request is large.
 
 What it leaves out:
 
 - The node's own streams on the connection. Each holds the request it
   writes, encoded (up to a message), for as long as its write waits, at
-  most STREAM_TIMEOUT_SECS; a pull also holds the frame of its answer and
-  its decoding (up to two messages) while it reads it. They are as many
-  as the node starts, up to the streams the peer lets it open at once
+  most STREAM_TIMEOUT_SECS; a pull also holds the frame of its answer (a
+  message) and its decoding (as for a request above: at most three
+  messages at its peak) while it reads it. They are as many as the node
+  starts, up to the streams the peer lets it open at once
   (QUIC_MAX_BIDI_STREAMS between nodes). What they write is still within
   the one send window above; what they hold in their own memory is not.
   A repush that fails is queued again as a retry of each item, which
@@ -179,6 +191,41 @@ What it leaves out:
 
 The bound on connections is §5's, and is not changed here; on a relay
 host with less memory than this, it is that bound that has to come down.
+
+**Decode, measured** (with a counting allocator, of the bytes asked for:
+`crates/cordelia-network/tests/decode_cost.rs`). A message is read by the
+stream it arrives on, straight into its own type. Up to 0.2.0-alpha.14
+it was read as the enum of every message, tagged by name, which serde
+reads by holding the whole frame as values of no type before it looks at
+the name: some 32 bytes for each byte of the frame. Frames of about 1 MB
+that a peer chose, before and after:
+
+| Frame | Before: peak, held | After: peak, held |
+|-------|--------------------|-------------------|
+| A map of 512K pairs of zeros, with no name, or its name last | 48 MB, nothing (refused) | 215 bytes, nothing (refused) |
+| A fetch of about 1M empty IDs | 80 MB, 32 MB | 4.6 KB, nothing (refused) |
+| One peer with about 1M empty addresses | 80 MB, 32 MB | 320 bytes, nothing (refused) |
+| About 200K peers, each written as an array | 42 MB, 16 MB | 206 bytes, nothing (refused) |
+| A list of about 1M empty channel IDs | 80 MB, 32 MB | 1.2 MB, 786 KB (the first 24,966 kept) |
+| A page of fifteen entries of the largest size | 2.0 MB, 1.97 MB | 2.0 MB, 1.97 MB |
+
+**The bounds of the lists.** Each but one is at least what a node of any
+version sends, whatever others sent it, and a longer list is refused. The
+channel IDs a relay lists are what others sent it, from 1 to 96 bytes
+each: of those, the first are kept and the rest passed over.
+
+| List | Bound | Why |
+|------|-------|-----|
+| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with |
+| Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
+| Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
+| Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
+| Channel IDs listed, the first kept | `MAX_LISTED_CHANNEL_IDS` = 24,966 | Derived: as many IDs of the shortest length a node makes (`grp_` and a UUID, `SHORTEST_CHANNEL_ID_LEN` = 40) as fit in one message. A relay lists a relay it works with every channel it holds, and stores IDs others sent of 1 to 96 bytes, so an honest list can be longer: the rest are passed over, not refused. Whoever asks a peer it is held to takes at most `MAX_CHANNELS_ASKED_OF_A_PEER` of them |
+| Headers of a page | `DEFAULT_SYNC_LIMIT` = 100 | The most a node asks for |
+| IDs of a fetch, items handed for it | `MAX_FETCH_ITEMS` = 100 | A fetch is of the IDs of one page |
+| Items of a push, and those it refused | `MAX_PUSHED_ITEMS` = 2048 | Derived: as many entries of no ciphertext as one peer's allowance for a minute takes (`PUSH_BYTES_PER_PEER_PER_MINUTE`, each at `ENTRY_OVERHEAD_BYTES`). A node's outbox pushes at most `OUTBOX_BATCH_MAX_ITEMS` = 500, and a version before may have pushed more: a push of more than this is over any limited peer's allowance, and is refused whole. A relay passes items on to the relays it is hot with in pushes of at most this many |
+| Entries of a push, a page, or passed on; answers to a push | `ENTRY_PAGE_MAX_ENTRIES` = 100 | As before (§12.7) |
+| Channels a relay tells of | `RELAY_CHANNELS_PAGE_MAX` = 1000 | As before (§12.7) |
 
 ---
 

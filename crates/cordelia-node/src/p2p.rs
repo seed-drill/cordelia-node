@@ -3083,9 +3083,12 @@ pub async fn p2p_loop(
                 tracing::debug!(items = deduped, peers = peer_batches.len(), seen_table = seen_len, "relay repush flush (epidemic)");
 
                 for (peer_id, items) in peer_batches {
-                    if let Some(conn) = conn_mgr.get_connection(&peer_id) {
+                    let Some(conn) = conn_mgr.get_connection(&peer_id) else {
+                        continue;
+                    };
+                    for items in in_pushes(items) {
                         let conn = conn.clone();
-                        let pid = peer_id;
+                        let pid = peer_id.clone();
                         let count = items.len();
                         let rtx = retry_fail_tx.clone();
                         tokio::spawn(async move {
@@ -5057,6 +5060,50 @@ pub async fn handle_peer_streams(
 
 // ── Protocol handlers (extracted from handle_peer_streams) ───────
 
+/// Read the one push on a stream of Item-Push. A frame that is no push,
+/// bytes that are no message of the stream or a message that is not a
+/// push, is not answered, and its bytes count against what the peer may
+/// push, as an entry of that size would, where the peer is `limited`: the
+/// node read them, and a megabyte read for nothing is still a megabyte.
+/// `Err` holds the breach where they are over either allowance.
+async fn read_push<R>(
+    recv: &mut R,
+    peer_id: &NodeId,
+    peer_rates: &std::sync::Mutex<Rates>,
+    limited: bool,
+    address: std::net::IpAddr,
+) -> Result<cordelia_network::messages::PushPayload, Option<OverLimit>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let frame = match cordelia_network::codec::read_raw_frame(recv).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
+            return Err(None);
+        }
+    };
+    match cordelia_network::codec::decode_message(
+        cordelia_network::messages::Protocol::ItemPush,
+        &frame,
+    ) {
+        Ok(cordelia_network::messages::WireMessage::PushPayload(payload)) => Ok(payload),
+        read => {
+            tracing::debug!(peer = %peer_id, bytes = frame.len(), is_message = read.is_ok(), "a frame on a push stream that is no push");
+            let bytes = cordelia_core::protocol::entry_cost(frame.len());
+            Err(limited
+                .then(|| {
+                    peer_rates
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pushed(peer_id, address, bytes)
+                        .err()
+                })
+                .flatten())
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "forwarding state moves into a struct when slot/rev and tombstones change this handler"
@@ -5074,17 +5121,14 @@ async fn handle_inbound_push(
     limited: bool,
     address: std::net::IpAddr,
 ) -> Option<OverLimit> {
-    let msg = match cordelia_network::codec::read_frame(recv).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
-            return None;
+    let payload = match read_push(recv, peer_id, peer_rates, limited, address).await {
+        Ok(payload) => payload,
+        Err(over) => {
+            if over.is_some() {
+                refuse_stream(send, recv);
+            }
+            return over;
         }
-    };
-
-    let payload = match msg {
-        cordelia_network::messages::WireMessage::PushPayload(p) => p,
-        _ => return None,
     };
 
     // What this push carries counts against the connection's allowance
@@ -5215,6 +5259,25 @@ async fn handle_inbound_push(
     None
 }
 
+/// The items a relay passes on to one peer, as pushes of at most
+/// MAX_PUSHED_ITEMS each, in their order: a push of more is refused where
+/// it is read (parameter-rationale.md §1).
+fn in_pushes(
+    items: Vec<cordelia_network::messages::Item>,
+) -> Vec<Vec<cordelia_network::messages::Item>> {
+    let mut items = items.into_iter().peekable();
+    let mut pushes = Vec::new();
+    while items.peek().is_some() {
+        pushes.push(
+            items
+                .by_ref()
+                .take(cordelia_core::protocol::MAX_PUSHED_ITEMS)
+                .collect(),
+        );
+    }
+    pushes
+}
+
 /// The most requests of one stream that [`answer_sync_with_nothing`]
 /// answers: a peer that goes on asking on one stream is left there.
 const NOTHING_ANSWERED_AT_MOST: usize = 64;
@@ -5254,10 +5317,24 @@ async fn answer_sync_with_nothing(
     peer_id: &NodeId,
 ) {
     for _ in 0..NOTHING_ANSWERED_AT_MOST {
-        let Ok(asked) = cordelia_network::codec::read_frame(recv).await else {
+        let Ok(asked) = cordelia_network::codec::read_frame(
+            recv,
+            cordelia_network::messages::Protocol::ItemSync,
+        )
+        .await
+        else {
             break;
         };
-        let Some(nothing) = nothing_for(&asked) else {
+        let nothing = nothing_for(&asked);
+        // What was asked is dropped before the answer is written: the
+        // request (a channel's ID of up to a message, as the peer wrote
+        // it) is not held through `write_frame`, which may wait up to
+        // STREAM_TIMEOUT for a peer that does not read. It is untested: a
+        // test would need a counting allocator and a stream whose write
+        // waits, as `test_a_fetch_request_is_not_held_while_the_node_waits`
+        // has for the sync of a node that carries the older kind.
+        drop(asked);
+        let Some(nothing) = nothing else {
             break;
         };
         if cordelia_network::codec::write_frame(send, &nothing)
@@ -5271,15 +5348,23 @@ async fn answer_sync_with_nothing(
     let _ = send.finish();
 }
 
-async fn handle_inbound_sync(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+async fn handle_inbound_sync<W, R>(
+    send: &mut W,
+    recv: &mut R,
     peer_id: &NodeId,
     state: &web::Data<cordelia_api::state::AppState>,
     is_relay_peer: bool,
     is_swarm_peer: bool,
-) {
-    let msg = match cordelia_network::codec::read_frame(recv).await {
+) where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let msg = match cordelia_network::codec::read_frame(
+        recv,
+        cordelia_network::messages::Protocol::ItemSync,
+    )
+    .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(peer = %peer_id, error = %e, "sync request read failed");
@@ -5313,7 +5398,12 @@ async fn handle_inbound_sync(
             let _ = cordelia_network::codec::write_frame(send, &resp).await;
 
             // Now read the actual SyncRequest
-            match cordelia_network::codec::read_frame(recv).await {
+            match cordelia_network::codec::read_frame(
+                recv,
+                cordelia_network::messages::Protocol::ItemSync,
+            )
+            .await
+            {
                 Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => r,
                 Ok(_) => return,
                 Err(_) => return, // Peer may close after Phase 0 (no channels to sync)
@@ -5350,7 +5440,12 @@ async fn handle_inbound_sync(
             );
             let _ = cordelia_network::codec::write_frame(send, &resp).await;
             // Don't abort stream -- read next frame to continue batch
-            match cordelia_network::codec::read_frame(recv).await {
+            match cordelia_network::codec::read_frame(
+                recv,
+                cordelia_network::messages::Protocol::ItemSync,
+            )
+            .await
+            {
                 Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
                     current_req = r;
                     channels_served += 1;
@@ -5419,7 +5514,12 @@ async fn handle_inbound_sync(
         tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "served sync request");
 
         // Read next frame: FetchRequest (for this channel), SyncRequest (next channel), or EOF
-        match cordelia_network::codec::read_frame(recv).await {
+        match cordelia_network::codec::read_frame(
+            recv,
+            cordelia_network::messages::Protocol::ItemSync,
+        )
+        .await
+        {
             Ok(cordelia_network::messages::WireMessage::FetchRequest(mut freq)) => {
                 freq.item_ids
                     .truncate(cordelia_core::protocol::MAX_BATCH_SIZE);
@@ -5468,14 +5568,26 @@ async fn handle_inbound_sync(
                     })
                     .collect::<Vec<_>>()
                 };
+                // The request is answered, and is dropped here with all it
+                // holds, before anything is awaited: a peer would otherwise
+                // have a node keep it through the write of the answer and
+                // the read of the next request, up to STREAM_TIMEOUT each.
+                let fetched = freq.item_ids.len();
+                drop(freq);
                 let fresp = cordelia_network::messages::WireMessage::FetchResponse(
                     cordelia_network::messages::FetchResponse { items: fetch_items },
                 );
                 let _ = cordelia_network::codec::write_frame(send, &fresp).await;
-                tracing::debug!(peer = %peer_id, fetched = freq.item_ids.len(), "served fetch request");
+                drop(fresp);
+                tracing::debug!(peer = %peer_id, fetched, "served fetch request");
 
                 // After fetch, read next frame for potential next channel
-                match cordelia_network::codec::read_frame(recv).await {
+                match cordelia_network::codec::read_frame(
+                    recv,
+                    cordelia_network::messages::Protocol::ItemSync,
+                )
+                .await
+                {
                     Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
                         current_req = r;
                         continue;
@@ -5501,7 +5613,12 @@ async fn handle_inbound_peer_share(
     shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: &str,
 ) {
-    let msg = match cordelia_network::codec::read_frame(recv).await {
+    let msg = match cordelia_network::codec::read_frame(
+        recv,
+        cordelia_network::messages::Protocol::PeerSharing,
+    )
+    .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(peer = %peer_id, error = %e, "peer-share read failed");
@@ -5572,7 +5689,12 @@ async fn handle_inbound_channel_announce(
 ) {
     let (mut announced, mut withdrawn) = (0u64, 0u64);
     loop {
-        let msg = match cordelia_network::codec::read_frame(recv).await {
+        let msg = match cordelia_network::codec::read_frame(
+            recv,
+            cordelia_network::messages::Protocol::ChannelAnnounce,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(_) => break, // EOF or error -- stream done
         };
@@ -6154,6 +6276,277 @@ mod tests {
         }
         let answer = nothing_for(&which).unwrap();
         assert!(nothing_for(&answer).is_none());
+    }
+
+    /// A frame on a push stream that is no push counts against what the
+    /// peer may push, by its bytes, where the peer is limited: frames of
+    /// bytes that are no message, and a message that is not a push. Over
+    /// the allowance, the breach is returned. A push is read as it was.
+    #[tokio::test]
+    async fn test_a_frame_that_is_no_push_counts_against_the_push_allowance() {
+        use cordelia_core::protocol::{PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost};
+        use cordelia_network::codec::encode_message;
+        use cordelia_network::messages::{PushAck, PushPayload, WireMessage};
+
+        // A frame of `payload`, as it travels.
+        fn framed(payload: &[u8]) -> Vec<u8> {
+            [&(payload.len() as u32).to_be_bytes()[..], payload].concat()
+        }
+        // What `read_push` makes of `bytes` from a peer that is `limited`.
+        async fn read(
+            rates: &std::sync::Mutex<Rates>,
+            limited: bool,
+            bytes: Vec<u8>,
+        ) -> Result<PushPayload, Option<OverLimit>> {
+            let peer = NodeId([9; 32]);
+            let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+            let mut cursor = std::io::Cursor::new(bytes);
+            read_push(&mut cursor, &peer, rates, limited, address).await
+        }
+
+        // Frames of 900,000 bytes that are no message: two are within the
+        // allowance, and the third is over it.
+        let garbage = framed(&vec![0x5a; 900_000]);
+        assert!(2 * entry_cost(900_000) <= PUSH_BYTES_PER_PEER_PER_MINUTE);
+        assert!(3 * entry_cost(900_000) > PUSH_BYTES_PER_PEER_PER_MINUTE);
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..2 {
+            assert!(matches!(
+                read(&rates, true, garbage.clone()).await,
+                Err(None)
+            ));
+        }
+        assert!(matches!(
+            read(&rates, true, garbage.clone()).await,
+            Err(Some(_))
+        ));
+
+        // A message of the stream that is not a push counts the same.
+        let ack = framed(&encode_message(&WireMessage::PushAck(PushAck::default())).unwrap());
+        let rates = std::sync::Mutex::new(Rates::default());
+        let mut over = None;
+        for tries in 1..=2_100 {
+            if let Err(Some(breach)) = read(&rates, true, ack.clone()).await {
+                over = Some((tries, breach));
+                break;
+            }
+        }
+        let (tries, _) = over.expect("answers sent as pushes were never over");
+        assert_eq!(
+            tries as u64,
+            PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(ack.len() - 4) + 1
+        );
+
+        // A peer that is not limited is not counted.
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..4 {
+            assert!(matches!(
+                read(&rates, false, garbage.clone()).await,
+                Err(None)
+            ));
+        }
+
+        // A push is read as it was, and counts nothing here.
+        let push = framed(
+            &encode_message(&WireMessage::PushPayload(PushPayload { items: Vec::new() })).unwrap(),
+        );
+        let rates = std::sync::Mutex::new(Rates::default());
+        for _ in 0..2 {
+            assert!(read(&rates, true, garbage.clone()).await.is_err());
+        }
+        assert!(read(&rates, true, push).await.is_ok());
+    }
+
+    /// A relay passes items on to a peer in pushes of at most
+    /// MAX_PUSHED_ITEMS, every item once and in its order: a push of more
+    /// would be refused where it is read.
+    #[test]
+    fn test_a_relay_passes_items_on_in_pushes_of_at_most_the_bound() {
+        use cordelia_core::protocol::MAX_PUSHED_ITEMS;
+        let item = |n: usize| cordelia_network::messages::Item {
+            item_id: format!("ci_{n}"),
+            channel_id: "grp_x".into(),
+            item_type: "memory".into(),
+            encrypted_blob: Vec::new(),
+            content_hash: vec![0; 32],
+            content_length: 0,
+            author_id: vec![0; 32],
+            signature: vec![0; 64],
+            key_version: 1,
+            published_at: "2026-10-22T10:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        for (count, sizes) in [
+            (0, vec![]),
+            (1, vec![1]),
+            (MAX_PUSHED_ITEMS, vec![MAX_PUSHED_ITEMS]),
+            (MAX_PUSHED_ITEMS + 1, vec![MAX_PUSHED_ITEMS, 1]),
+            (
+                2 * MAX_PUSHED_ITEMS + 7,
+                vec![MAX_PUSHED_ITEMS, MAX_PUSHED_ITEMS, 7],
+            ),
+        ] {
+            let pushes = in_pushes((0..count).map(item).collect());
+            assert_eq!(
+                pushes.iter().map(Vec::len).collect::<Vec<_>>(),
+                sizes,
+                "{count}"
+            );
+            let ids: Vec<String> = pushes.into_iter().flatten().map(|i| i.item_id).collect();
+            assert_eq!(
+                ids,
+                (0..count).map(|n| format!("ci_{n}")).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// What this thread holds, counted by an allocator that counts for
+    /// each thread: the bytes asked for and not given back.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        pub struct Counting;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+        }
+
+        fn counted(bytes: isize) {
+            let _ = LIVE.try_with(|live| live.set(live.get() + bytes));
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let at = unsafe { System.alloc(layout) };
+                if !at.is_null() {
+                    counted(layout.size() as isize);
+                }
+                at
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let at = unsafe { System.alloc_zeroed(layout) };
+                if !at.is_null() {
+                    counted(layout.size() as isize);
+                }
+                at
+            }
+
+            unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(at, layout) };
+                counted(-(layout.size() as isize));
+            }
+
+            unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                let moved = unsafe { System.realloc(at, layout, size) };
+                if !moved.is_null() {
+                    counted(size as isize - layout.size() as isize);
+                }
+                moved
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// The bytes this thread holds.
+        pub fn live() -> isize {
+            LIVE.with(Cell::get)
+        }
+    }
+
+    /// A node's state over a database in memory, with no network.
+    fn a_state() -> web::Data<cordelia_api::state::AppState> {
+        web::Data::new(cordelia_api::state::AppState {
+            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
+            bearer_token: "t".into(),
+            home_dir: std::env::temp_dir().join("cordelia-p2p-test-no-such-directory"),
+            started_at: std::time::Instant::now(),
+            sync_errors: Default::default(),
+            peers_hot: Default::default(),
+            peers_warm: Default::default(),
+            push_tx: None,
+            announce_tx: None,
+            peers: Default::default(),
+            relays: Default::default(),
+            outbox_refused: Default::default(),
+            relist: Default::default(),
+            sync_control: Default::default(),
+            own_channels: Default::default(),
+            held: Default::default(),
+            history: Default::default(),
+        })
+    }
+
+    /// A request for items that a peer sent on a sync of the older kind is
+    /// answered and dropped before the node writes the answer: while it
+    /// waits for the peer's next request, up to STREAM_TIMEOUT, it holds
+    /// nothing of the request. One of a hundred IDs of some 9 KB each is
+    /// near a megabyte.
+    #[tokio::test]
+    async fn test_a_fetch_request_is_not_held_while_the_node_waits() {
+        use cordelia_network::codec::{encode_message, read_raw_frame, write_raw_frame};
+        use cordelia_network::messages::{FetchRequest, SyncRequest, WireMessage};
+
+        let state = a_state();
+        let peer = NodeId([7; 32]);
+        // A pipe each way, small, so that what a pipe keeps for itself is
+        // small.
+        let (mut node_w, mut client_r) = tokio::io::duplex(8 * 1024);
+        let (mut client_w, mut node_r) = tokio::io::duplex(8 * 1024);
+        // Each request, encoded before anything is counted.
+        let sync = encode_message(&WireMessage::SyncRequest(SyncRequest {
+            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
+            since: None,
+            limit: 100,
+            after_seq: None,
+        }))
+        .unwrap();
+        let small = encode_message(&WireMessage::FetchRequest(FetchRequest {
+            item_ids: vec!["ci_a".into()],
+        }))
+        .unwrap();
+        let large = encode_message(&WireMessage::FetchRequest(FetchRequest {
+            item_ids: vec!["x".repeat(9_000); 100],
+        }))
+        .unwrap();
+        assert!(large.len() > 900_000, "{}", large.len());
+
+        let node = handle_inbound_sync(&mut node_w, &mut node_r, &peer, &state, true, false);
+        tokio::pin!(node);
+        let client = async {
+            // A channel and a small fetch first: whatever the node keeps
+            // from then on, such as its prepared statements, is in the
+            // count it is measured from.
+            write_raw_frame(&mut client_w, &sync).await.unwrap();
+            let _ = read_raw_frame(&mut client_r).await.unwrap();
+            write_raw_frame(&mut client_w, &small).await.unwrap();
+            let _ = read_raw_frame(&mut client_r).await.unwrap();
+            let before = counting::live();
+            // The next channel, and a fetch near a megabyte. Once its
+            // answer is read, the node waits for the next request.
+            write_raw_frame(&mut client_w, &sync).await.unwrap();
+            let _ = read_raw_frame(&mut client_r).await.unwrap();
+            write_raw_frame(&mut client_w, &large).await.unwrap();
+            let _ = read_raw_frame(&mut client_r).await.unwrap();
+            counting::live() - before
+        };
+        // Both on this thread, polled in turn: the node is waiting on its
+        // read when the client measures.
+        let held = tokio::select! {
+            _ = &mut node => panic!("the node ended the stream"),
+            held = client => held,
+        };
+        println!("held while the node waits: {held} bytes");
+        assert!(
+            held < 64 * 1024,
+            "the node holds {held} bytes more while it waits for the next request"
+        );
     }
 
     /// A personal node carries no channel of the older kind (decision
@@ -9580,7 +9973,7 @@ mod tests {
                 assert_eq!(protocol, Protocol::PeerSharing);
                 handle_inbound_peer_share(&mut out, &mut into, &asker_id, &shared, role).await;
                 let _ = out.finish();
-                match codec::read_frame(&mut recv).await {
+                match codec::read_frame(&mut recv, Protocol::PeerSharing).await {
                     Ok(WireMessage::PeerShareResponse(answer)) => {
                         let mut keys: Vec<Vec<u8>> =
                             answer.peers.into_iter().map(|p| p.node_id).collect();

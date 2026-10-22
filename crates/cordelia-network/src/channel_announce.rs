@@ -561,7 +561,9 @@ mod tests {
             .await
             .unwrap();
 
-        let msg = read_frame(&mut reader).await.unwrap();
+        let msg = read_frame(&mut reader, Protocol::ChannelAnnounce)
+            .await
+            .unwrap();
         match msg {
             WireMessage::ChannelJoined(cj) => {
                 assert_eq!(cj.channel_id, "test_channel_abc123");

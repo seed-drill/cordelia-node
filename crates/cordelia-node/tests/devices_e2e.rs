@@ -3891,7 +3891,7 @@ fn serves_the_older_kind(conn: &quinn::Connection, items: Vec<cordelia_network::
             ) {
                 continue;
             }
-            while let Ok(asked) = codec::read_frame(&mut recv).await {
+            while let Ok(asked) = codec::read_frame(&mut recv, Protocol::ItemSync).await {
                 let answer = match asked {
                     WireMessage::SyncChannelListRequest(_) => {
                         let mut channel_ids: Vec<String> =

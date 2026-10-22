@@ -64,7 +64,7 @@ pub async fn handle_psk_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec
         return Err(PskExchangeError::UnexpectedMessage);
     }
 
-    let msg = read_frame(stream).await?;
+    let msg = read_frame(stream, Protocol::PskExchange).await?;
     let req = match msg {
         WireMessage::PskRequest(r) => r,
         _ => return Err(PskExchangeError::UnexpectedMessage),

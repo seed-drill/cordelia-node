@@ -1158,7 +1158,7 @@ async fn what_is_no_request_for_its_stream_counts_as_pushed() {
     let relay = relay_started(None);
     let client = client_of(&relay).await.expect("the client connects");
     // Bytes that are no message, as a frame on a stream of `protocol`.
-    // `true` where an answer came back.
+    // `true` where an answer of any kind came back.
     let sends = |protocol: Protocol, frame: Vec<u8>| {
         let conn = client.conn.clone();
         async move {
@@ -1168,7 +1168,7 @@ async fn what_is_no_request_for_its_stream_counts_as_pushed() {
                 .unwrap();
             codec::write_raw_frame(&mut send, &frame).await.unwrap();
             let _ = send.finish();
-            codec::read_frame(&mut recv).await.is_ok()
+            codec::read_raw_frame(&mut recv).await.is_ok()
         }
     };
     // Some 900 KB that are no message, twice, on two of the streams.

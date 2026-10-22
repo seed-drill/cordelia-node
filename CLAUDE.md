@@ -171,6 +171,9 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `NEW_CHANNELS_PER_ADDRESS_PER_HOUR` | 16 | parameter-rationale.md §4 |
 | `OUTBOX_BYTES_PER_MINUTE` | 1.5MB | parameter-rationale.md §4 |
 | `SYNC_PAGE_STEPS` | 100, 14, 3, 1 | parameter-rationale.md §4 |
+| `MAX_HANDSHAKE_ROLES`, `MAX_SHARED_PEER_ADDRS` | 8, 8 (lists of the older streams, bounded where they are read) | parameter-rationale.md §1 |
+| `SHORTEST_CHANNEL_ID_LEN`, `MAX_LISTED_CHANNEL_IDS` | 40, 24,966 (derived: that many of the shortest ID fill one message) | parameter-rationale.md §1 |
+| `MAX_PUSHED_ITEMS` | 2048 (derived: the items of no ciphertext one peer's allowance takes in a minute) | parameter-rationale.md §1 |
 | `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
 | `OUTBOX_REFUSED_RETRY_MAX_SECS` | 600s | parameter-rationale.md §4 |
 | `RELAY_ASK_AGAIN_SECS` | 600s | parameter-rationale.md §4 |

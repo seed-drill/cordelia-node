@@ -231,6 +231,19 @@ All wire messages use CBOR (Concise Binary Object Representation) with determini
 
 **Forward-compatibility rules:** Unknown fields within a known message type MUST be logged at DEBUG level and ignored (forward-compatible). Unknown message types (unknown protocol byte or unknown serde variant) MUST be rejected at the dispatch layer -- stream reset for unknown protocol byte (application error `0x02`), decode error for unknown variant. New capabilities are added as new protocol bytes (§3.3), not as new variants within existing protocol message sets. The handshake version negotiation (§4.1.4) ensures both sides speak the same protocol version.
 
+**How a message is read:** a message is a CBOR map whose first key is
+`msg_type`, the message's name, followed by its fields; every version
+writes it so. A receiver knows a stream's protocol from its protocol byte
+before its first frame, and reads each frame as one of that stream's
+messages, straight into its own type. It refuses a frame that is not a
+map, whose first key is not `msg_type`, that names a message of another
+stream, or that holds anything after the message, before it reads the
+rest. Each list in a message is bounded where it is read, and a longer one
+is refused at its first element too many (parameter-rationale.md §1).
+Decoding a frame of 1 MB so costs at most 3 MB at its peak, where reading
+the frame first as values of no type, to find the name, cost some 32
+bytes for each byte of the frame.
+
 **Cross-language implementation notes:**
 - `cbor-x` (TypeScript) encodes `Uint8Array` with CBOR tag 64 (typed byte array). Use `Buffer.from()` instead for spec-compliant CBOR byte strings (major type 2).
 - `ciborium` (Rust) with `#[serde(with = "serde_bytes")]` produces correct CBOR byte strings (major type 2).

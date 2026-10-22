@@ -96,7 +96,7 @@ async fn test_two_node_keepalive() {
                 .unwrap();
             assert_eq!(proto_byte, Protocol::KeepAlive);
 
-            let msg = read_frame(&mut recv).await.unwrap();
+            let msg = read_frame(&mut recv, Protocol::KeepAlive).await.unwrap();
             let ping = match msg {
                 WireMessage::Ping(p) => p,
                 other => panic!("expected Ping, got {:?}", other),
@@ -125,7 +125,7 @@ async fn test_two_node_keepalive() {
     keepalive::send_ping(&mut send, &mut state).await.unwrap();
 
     // Read pong
-    let msg = read_frame(&mut recv).await.unwrap();
+    let msg = read_frame(&mut recv, Protocol::KeepAlive).await.unwrap();
     let pong = match msg {
         WireMessage::Pong(p) => p,
         other => panic!("expected Pong, got {:?}", other),
@@ -189,13 +189,17 @@ async fn test_two_node_channel_announce() {
             let known = HashMap::new();
 
             // Read two ChannelJoined messages
-            let msg1 = read_frame(&mut recv).await.unwrap();
+            let msg1 = read_frame(&mut recv, Protocol::ChannelAnnounce)
+                .await
+                .unwrap();
             if let WireMessage::ChannelJoined(cj) = msg1 {
                 channel_announce::handle_channel_joined(&mut state, &cj, &channels_b, &known)
                     .unwrap();
             }
 
-            let msg2 = read_frame(&mut recv).await.unwrap();
+            let msg2 = read_frame(&mut recv, Protocol::ChannelAnnounce)
+                .await
+                .unwrap();
             if let WireMessage::ChannelJoined(cj) = msg2 {
                 channel_announce::handle_channel_joined(&mut state, &cj, &channels_b, &known)
                     .unwrap();
@@ -499,7 +503,9 @@ async fn test_two_node_full_lifecycle() {
     let node_a_id = cordelia_core::NodeId(id_a.public_key());
     let conn_b = mgr_b.get_connection(&node_a_id).unwrap().clone();
     let (_, mut recv_ann) = conn_b.accept_bi().await.unwrap();
-    let msg = read_frame(&mut recv_ann).await.unwrap();
+    let msg = read_frame(&mut recv_ann, Protocol::ChannelAnnounce)
+        .await
+        .unwrap();
     assert!(matches!(msg, WireMessage::ChannelJoined(_)));
 
     // Step 3: Keepalive on another stream (parallel with announce stream)
@@ -518,13 +524,15 @@ async fn test_two_node_full_lifecycle() {
         .await
         .unwrap();
     assert_eq!(proto, Protocol::KeepAlive);
-    let ping_msg = read_frame(&mut recv_b_ka).await.unwrap();
+    let ping_msg = read_frame(&mut recv_b_ka, Protocol::KeepAlive)
+        .await
+        .unwrap();
     if let WireMessage::Ping(ping) = ping_msg {
         keepalive::send_pong(&mut send_b_ka, &ping).await.unwrap();
     }
 
     // A reads pong
-    let pong_msg = read_frame(&mut recv_ka).await.unwrap();
+    let pong_msg = read_frame(&mut recv_ka, Protocol::KeepAlive).await.unwrap();
     assert!(matches!(pong_msg, WireMessage::Pong(_)));
 
     // All three protocols worked on separate streams of the same QUIC connection
@@ -637,7 +645,11 @@ async fn test_chaos_disconnect_during_sync() {
         .close(0u32.into(), b"chaos");
 
     // A tries to read response -- should get error (ReadTimeout or connection error), not hang
-    let result = cordelia_network::codec::read_frame(&mut recv).await;
+    let result = cordelia_network::codec::read_frame(
+        &mut recv,
+        cordelia_network::messages::Protocol::ItemSync,
+    )
+    .await;
     assert!(
         result.is_err(),
         "read should return error after peer crashes"
