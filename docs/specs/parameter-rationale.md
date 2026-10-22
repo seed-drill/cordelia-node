@@ -227,6 +227,57 @@ each: of those, the first are kept and the rest passed over.
 | Entries of a push, a page, or passed on; answers to a push | `ENTRY_PAGE_MAX_ENTRIES` = 100 | As before (§12.7) |
 | Channels a relay tells of | `RELAY_CHANNELS_PAGE_MAX` = 1000 | As before (§12.7) |
 
+**The fields of a header.** A page of the older kind lists up to 100
+headers, and a node holds what it read of them while it fetches their
+entries. Each text and each bytes of a header is read within its size. A
+text is read from the decoder's own buffer and copied only once it fits,
+so one that is over its size costs nothing. A header with a text over its
+size is refused where it is read: the text is not kept, and the header
+holds in its place a mark of one byte over the size, which the check of
+an entry's fields before a fetch refuses, so the entry is never fetched
+and the rest of its page is gone through (a relay gets past what it will
+not store, `t03_a_relay_gets_past_what_it_will_not_store`). Bytes of
+another size than their own refuse the page, and so does a text or bytes
+longer than the decoder's buffer (4,096 bytes), which is not read at all.
+Every node since 0.2.0-alpha.5 refuses to store an entry with a field
+over its size (§4, `entry_overhead_bytes`), and a node checks an entry's
+signature before it stores it (`check_item`), which needs its hash,
+author, signature and slot of exactly their size. A page lists what a
+node stored, so no node of those versions lists a header past these
+bounds. A relay of an earlier version may have stored what a peer sent it
+whatever its fields; where it still holds such an entry, the page that
+lists it is refused where the entry's bytes are not of their size or a
+text is longer than 4,096 bytes, and otherwise gone through without it,
+as the entry itself has been refused by every node since.
+
+| Field | Bound | The largest a node writes, and where it comes from |
+|-------|-------|----------------------------------------------------|
+| `item_id` | at most `MAX_ITEM_ID_LEN` = 64 | 29: `ci_` and a ULID of 26 characters (`items::generate_item_id`) |
+| `channel_id` | at most `MAX_CHANNEL_ID_LEN` = 96 | 70: an inbox, `inbox_` and 64 hex digits (`naming`) |
+| `item_type` | at most `MAX_ITEM_TYPE_LEN` = 32 | 12 of the node's own (`psk_envelope`); a type given through the API is stored only within 32 |
+| `published_at` | at most `MAX_TIMESTAMP_LEN` = 40 | 35: RFC 3339 with nanoseconds and an offset (`to_rfc3339`) |
+| `parent_id` | absent, or at most `MAX_ITEM_ID_LEN` = 64 | 29, as an ID |
+| `content_hash` | exactly `ITEM_HASH_BYTES` = 32 | 32: SHA-256 |
+| `author_id` | exactly `ITEM_AUTHOR_BYTES` = 32 | 32: an Ed25519 public key |
+| `signature` | exactly `ITEM_SIGNATURE_BYTES` = 64 | 64: an Ed25519 signature |
+| `slot` | absent, or exactly `ITEM_SLOT_BYTES` = 32 | 32 (decision 2026-09-30 §4.3) |
+
+Measured (`decode_cost.rs`): a page of 1,042,859 bytes, 100 headers each
+with a signature of about 10 KB, asked for 1,716,376 bytes at its peak and
+held 1,708,320 once read; it is now refused at its first signature, at 306
+bytes. A page of 100 headers with every field at its bound is 60,959
+bytes and holds 76,320 once read, and one whose headers each have a type
+of 4,000 bytes, 457,859 bytes, holds 76,420 (`PAGE_OF_HEADERS_MOST`, the
+bound the test holds both to, is 93,600).
+
+An item that is fetched or pushed (`Item`) has the same fields, and they
+are not bounded where it is read. What it holds is its own bytes, which
+its ciphertext may make up to a message in any case (a push of one item
+of nearly 1 MB, above), and an item with a field over its size is refused
+item by item where it is checked, with the sender told which and why
+(REFUSED_TOO_LARGE, REFUSED_INVALID): refused where it is read, the whole
+push would be refused and nothing said of the rest.
+
 ---
 
 ## 2. Application Keepalive Parameters

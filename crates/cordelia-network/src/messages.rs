@@ -21,9 +21,11 @@
 
 use cordelia_core::protocol::{
     CHANNEL_MARK_BYTES, DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, ENTRY_PAGE_MAX_ENTRIES,
-    MAX_CHANNELS_ASKED_OF_A_PEER, MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS,
-    MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL,
-    PROTOCOL_ENTRY_PUSH, PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
+    ITEM_AUTHOR_BYTES, ITEM_HASH_BYTES, ITEM_SIGNATURE_BYTES, ITEM_SLOT_BYTES, MAX_CHANNEL_ID_LEN,
+    MAX_CHANNELS_ASKED_OF_A_PEER, MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_ITEM_ID_LEN,
+    MAX_ITEM_TYPE_LEN, MAX_LISTED_CHANNEL_IDS, MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS,
+    MAX_TIMESTAMP_LEN, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL, PROTOCOL_ENTRY_PUSH,
+    PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
 };
 use cordelia_storage::relay;
 use serde::{Deserialize, Serialize};
@@ -259,28 +261,220 @@ pub struct SyncResponse {
     pub last_seq: Option<u64>,
 }
 
+/// The header of an entry of the older kind, as a page lists it.
+///
+/// Each text and each bytes of it is read within its size
+/// (parameter-rationale.md §1). Its texts may be at most the size that an
+/// entry's field must fit in (MAX_ITEM_ID_LEN, MAX_CHANNEL_ID_LEN,
+/// MAX_ITEM_TYPE_LEN, MAX_TIMESTAMP_LEN): a text over it is not kept, and
+/// the header is refused where it is read, its text held as a mark one
+/// byte over the size ([`over_its_size`]), so that the entry is never
+/// fetched and its page is still gone through. Its hash, author, signature
+/// and slot must be of exactly their size, or the page is refused. Every
+/// node since 0.2.0-alpha.5 refuses to store an entry over any of them, so
+/// no page it lists holds one. Without the bounds a page's headers could
+/// be a message's worth of bytes, which a node would hold while it fetched
+/// their entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemHeader {
+    #[serde(deserialize_with = "an_item_id")]
     pub item_id: String,
+    #[serde(deserialize_with = "a_channel_id")]
     pub channel_id: String,
+    #[serde(deserialize_with = "an_item_type")]
     pub item_type: String,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "a_content_hash"
+    )]
     pub content_hash: Vec<u8>, // 32 bytes
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "an_author"
+    )]
     pub author_id: Vec<u8>, // 32 bytes
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "a_signature"
+    )]
     pub signature: Vec<u8>, // 64 bytes
     pub key_version: u32,
+    #[serde(deserialize_with = "a_time")]
     pub published_at: String,
     pub is_tombstone: bool,
+    #[serde(deserialize_with = "a_parent")]
     pub parent_id: Option<String>,
     /// Replaceable-item slot (32 bytes) and revision (decision 2026-09-30
     /// §4.3). Both present or both absent; omitted from the encoding when
     /// absent, so ordinary items encode exactly as before.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "a_slot"
+    )]
     pub slot: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<u64>,
+}
+
+// The fields of a header, each read within its size. A text is read from
+// the decoder's own buffer and copied only once it is known to fit, so a
+// text over its size costs nothing before it is refused; and so do bytes.
+// A text or bytes longer than that buffer (4,096 bytes) is not read at all,
+// and its page is refused.
+
+/// What a header holds in place of a text over its size `most`: a mark of
+/// `most` and one bytes, which the check of an entry's fields before a
+/// fetch refuses ([`cordelia_core::protocol::entry_fields_fit`]). The text
+/// itself is not kept.
+pub fn over_its_size(most: usize) -> String {
+    "#".repeat(most + 1)
+}
+
+/// Read a text of at most `most` bytes; one that is longer is read as
+/// [`over_its_size`].
+fn text_of_at_most<'de, D>(
+    deserializer: D,
+    most: usize,
+    what: &'static str,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AtMost {
+        most: usize,
+        what: &'static str,
+    }
+
+    impl serde::de::Visitor<'_> for AtMost {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "{} of at most {} bytes", self.what, self.most)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<String, E> {
+            if text.len() > self.most {
+                return Ok(over_its_size(self.most));
+            }
+            Ok(text.to_owned())
+        }
+    }
+
+    deserializer.deserialize_str(AtMost { most, what })
+}
+
+/// Read bytes of exactly `size`.
+fn bytes_of<'de, D>(deserializer: D, size: usize, what: &'static str) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Exactly {
+        size: usize,
+        what: &'static str,
+    }
+
+    impl serde::de::Visitor<'_> for Exactly {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "{} of {} bytes", self.what, self.size)
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            if bytes.len() != self.size {
+                return Err(E::invalid_length(bytes.len(), &self));
+            }
+            Ok(bytes.to_vec())
+        }
+    }
+
+    deserializer.deserialize_bytes(Exactly { size, what })
+}
+
+/// An entry's ID: at most MAX_ITEM_ID_LEN bytes.
+fn an_item_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    text_of_at_most(deserializer, MAX_ITEM_ID_LEN, "an entry's ID")
+}
+
+/// An entry's channel: at most MAX_CHANNEL_ID_LEN bytes.
+fn a_channel_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    text_of_at_most(deserializer, MAX_CHANNEL_ID_LEN, "a channel's ID")
+}
+
+/// An entry's type: at most MAX_ITEM_TYPE_LEN bytes.
+fn an_item_type<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    text_of_at_most(deserializer, MAX_ITEM_TYPE_LEN, "an entry's type")
+}
+
+/// An entry's time: at most MAX_TIMESTAMP_LEN bytes.
+fn a_time<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    text_of_at_most(deserializer, MAX_TIMESTAMP_LEN, "an entry's time")
+}
+
+/// An entry's parent, where it has one: at most MAX_ITEM_ID_LEN bytes.
+fn a_parent<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    struct Parent;
+
+    impl<'de> serde::de::Visitor<'de> for Parent {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                f,
+                "no parent, or an entry's ID of at most {MAX_ITEM_ID_LEN} bytes"
+            )
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            text_of_at_most(d, MAX_ITEM_ID_LEN, "a parent's ID").map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(Parent)
+}
+
+/// An entry's content hash: ITEM_HASH_BYTES.
+fn a_content_hash<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    bytes_of(deserializer, ITEM_HASH_BYTES, "a content hash")
+}
+
+/// An entry's author: ITEM_AUTHOR_BYTES.
+fn an_author<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    bytes_of(deserializer, ITEM_AUTHOR_BYTES, "an author's key")
+}
+
+/// An entry's signature: ITEM_SIGNATURE_BYTES.
+fn a_signature<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    bytes_of(deserializer, ITEM_SIGNATURE_BYTES, "a signature")
+}
+
+/// A replaceable entry's slot, where it has one: ITEM_SLOT_BYTES.
+fn a_slot<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error> {
+    struct Slot;
+
+    impl<'de> serde::de::Visitor<'de> for Slot {
+        type Value = Option<Vec<u8>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "no slot, or a slot of {ITEM_SLOT_BYTES} bytes")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            bytes_of(d, ITEM_SLOT_BYTES, "a slot").map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(Slot)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3667,6 +3861,183 @@ mod tests {
                     "{list} of {n} was read: its bound is {most}"
                 );
             }
+        }
+    }
+
+    /// Each text and each bytes of a header of a page is read within its
+    /// size, where it is read: a header with each field at its bound, and
+    /// one with each at the largest a node writes, are read and written
+    /// again as they were. A header with a text past its bound is refused:
+    /// the text is not kept, the header holds the mark of one over its
+    /// size, which the check before a fetch refuses, and the page is read,
+    /// so that what follows the header is gone through. A text longer than
+    /// the decoder's buffer, and bytes of another size, refuse the page.
+    #[test]
+    fn a_header_with_a_field_past_its_bound_is_refused_where_it_is_read() {
+        use cordelia_core::protocol::{
+            ITEM_AUTHOR_BYTES, ITEM_HASH_BYTES, ITEM_SIGNATURE_BYTES, ITEM_SLOT_BYTES,
+            MAX_CHANNEL_ID_LEN, MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN, MAX_TIMESTAMP_LEN,
+        };
+        let WireMessage::SyncResponse(page) = every_message()
+            .into_iter()
+            .find(|message| name_of(message) == "SyncResponse")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let header = ItemHeader {
+            parent_id: Some("ci_parent".into()),
+            slot: Some(vec![0xa4; ITEM_SLOT_BYTES]),
+            rev: Some(9),
+            ..page.items[0].clone()
+        };
+        let read = |header: &ItemHeader| {
+            let page = WireMessage::SyncResponse(SyncResponse {
+                items: vec![header.clone(); 3],
+                has_more: false,
+                last_seq: Some(4),
+            });
+            let bytes = encode_message(&page).unwrap();
+            crate::codec::decode_message(Protocol::ItemSync, &bytes)
+                .map(|read| encode_message(&read).unwrap() == bytes)
+        };
+        // At its bound, each field; and as a node writes each at its
+        // largest: an ID of `ci_` and a ULID, an inbox's ID, the longest
+        // type a node writes, and a time in RFC 3339 with nanoseconds and
+        // an offset.
+        let at_bounds = ItemHeader {
+            item_id: "i".repeat(MAX_ITEM_ID_LEN),
+            channel_id: "c".repeat(MAX_CHANNEL_ID_LEN),
+            item_type: "t".repeat(MAX_ITEM_TYPE_LEN),
+            published_at: "p".repeat(MAX_TIMESTAMP_LEN),
+            parent_id: Some("q".repeat(MAX_ITEM_ID_LEN)),
+            ..header.clone()
+        };
+        let largest_written = ItemHeader {
+            item_id: format!("ci_{}", "0".repeat(26)),
+            channel_id: format!("inbox_{}", "a".repeat(64)),
+            item_type: "psk_envelope".into(),
+            published_at: "2026-10-22T10:00:00.123456789+00:00".into(),
+            parent_id: Some(format!("ci_{}", "1".repeat(26))),
+            ..header.clone()
+        };
+        for (what, header) in [
+            ("as every message has it", &header),
+            ("with no parent and no slot", &page.items[0]),
+            ("at its bounds", &at_bounds),
+            ("at the largest a node writes", &largest_written),
+        ] {
+            assert_eq!(read(header).ok(), Some(true), "a header {what}");
+        }
+
+        // A text past its bound, each in turn: by one byte, and by as many
+        // as the decoder's buffer holds.
+        type Text = fn(&mut ItemHeader) -> &mut String;
+        let texts: [(&str, usize, Text); 4] = [
+            ("its ID", MAX_ITEM_ID_LEN, |h| &mut h.item_id),
+            ("its channel", MAX_CHANNEL_ID_LEN, |h| &mut h.channel_id),
+            ("its type", MAX_ITEM_TYPE_LEN, |h| &mut h.item_type),
+            ("its time", MAX_TIMESTAMP_LEN, |h| &mut h.published_at),
+        ];
+        let fits = |h: &ItemHeader| {
+            cordelia_core::protocol::entry_fields_fit(
+                &h.item_id,
+                &h.channel_id,
+                &h.item_type,
+                &h.published_at,
+                h.parent_id.as_deref(),
+            )
+        };
+        let read_back = |header: &ItemHeader| {
+            let bytes = encode_message(&WireMessage::SyncResponse(SyncResponse {
+                items: vec![
+                    largest_written.clone(),
+                    header.clone(),
+                    largest_written.clone(),
+                ],
+                has_more: false,
+                last_seq: Some(4),
+            }))
+            .unwrap();
+            match crate::codec::decode_message(Protocol::ItemSync, &bytes) {
+                Ok(WireMessage::SyncResponse(page)) => Some(page.items),
+                _ => None,
+            }
+        };
+        for past in [1, 4_000] {
+            for (what, most, field) in texts {
+                let mut one = at_bounds.clone();
+                *field(&mut one) = "x".repeat(most + past);
+                let items = read_back(&one)
+                    .unwrap_or_else(|| panic!("{what} past its bound by {past}: page refused"));
+                assert_eq!(items.len(), 3, "{what}");
+                let mut held = items[1].clone();
+                assert_eq!(
+                    *field(&mut held),
+                    over_its_size(most),
+                    "{what} past its bound by {past} was kept"
+                );
+                assert!(
+                    !fits(&held),
+                    "{what} past its bound by {past} would be fetched"
+                );
+                assert!(fits(&items[0]) && fits(&items[2]), "{what}");
+            }
+            let mut one = at_bounds.clone();
+            one.parent_id = Some("q".repeat(MAX_ITEM_ID_LEN + past));
+            let items = read_back(&one).expect("a long parent: page refused");
+            assert_eq!(items[1].parent_id, Some(over_its_size(MAX_ITEM_ID_LEN)));
+            assert!(!fits(&items[1]), "a long parent would be fetched");
+        }
+        // A text longer than the decoder's buffer is not read at all.
+        let mut one = at_bounds.clone();
+        one.item_type = "x".repeat(4_097);
+        assert!(read(&one).is_err(), "a type of 4,097 bytes was read");
+
+        // Bytes of another size, each in turn.
+        type Past = Box<dyn Fn(&mut ItemHeader)>;
+        let past: Vec<(&str, Past)> = vec![
+            (
+                "its hash, long",
+                Box::new(|h| h.content_hash = vec![1; ITEM_HASH_BYTES + 1]),
+            ),
+            (
+                "its hash, short",
+                Box::new(|h| h.content_hash = vec![1; ITEM_HASH_BYTES - 1]),
+            ),
+            (
+                "its author, long",
+                Box::new(|h| h.author_id = vec![2; ITEM_AUTHOR_BYTES + 1]),
+            ),
+            (
+                "its author, short",
+                Box::new(|h| h.author_id = vec![2; ITEM_AUTHOR_BYTES - 1]),
+            ),
+            (
+                "its signature, long",
+                Box::new(|h| h.signature = vec![3; ITEM_SIGNATURE_BYTES + 1]),
+            ),
+            (
+                "its signature, as long as the decoder's buffer",
+                Box::new(|h| h.signature = vec![3; 4_096]),
+            ),
+            (
+                "its signature, short",
+                Box::new(|h| h.signature = vec![3; ITEM_SIGNATURE_BYTES - 1]),
+            ),
+            (
+                "its slot, long",
+                Box::new(|h| h.slot = Some(vec![4; ITEM_SLOT_BYTES + 1])),
+            ),
+            (
+                "its slot, short",
+                Box::new(|h| h.slot = Some(vec![4; ITEM_SLOT_BYTES - 1])),
+            ),
+        ];
+        for (what, change) in &past {
+            let mut one = at_bounds.clone();
+            change(&mut one);
+            assert!(read(&one).is_err(), "a header with {what} was read");
         }
     }
 }
