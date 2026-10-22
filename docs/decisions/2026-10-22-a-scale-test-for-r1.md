@@ -1,7 +1,7 @@
 # Decision: a scale test for R1
 
 **Date**: 2026-10-22
-**Status**: Proposed. Not built. Revised twice after its reviews (section 9 for the first).
+**Status**: Proposed. Not built. Revised twice after its reviews (sections 9 and 10).
 **Cited as**: "decision 2026-10-22 §3, rule 4". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -485,3 +485,27 @@ The first review read the record at its first commit, built the release binary, 
 Nothing is left unsettled. One is settled by a smaller change than the review offered: finding 5's cap on a device's HTTP workers is noted and not made, since the test measures the node as it is, and the mask covers the machine's limit.
 
 Rows 1, 2 and 9 are answered again by the second review (section 10): W and the bound are derived afresh with the send window counted, against the deployed hosts, and change A closes no connection by warm churn at all.
+
+## 10. The second review, and how each finding is settled
+
+The second review read the record at its second revision against the code and against quinn-proto 0.11.14, and built nothing: high 4, medium 4, low 7.
+
+| # | Severity | Finding | How it is settled |
+|---|---|---|---|
+| H1 | High | W left out the send window (quinn's default, 10,000,000 bytes, never set) and the application's buffers; the true W is about 14 MiB, and today's 200 is above what it allows | Change C (section 7.1), the first change and one of its own: the send window set to two messages. W counts every buffer: the receive window, the send window, the frame, the decoded message, the answer and the tables (section 2.5): 7.34 MiB with change C, 14.9 MiB today. The record says plainly that today's 200 is unsafe on every deployed host (section 0, item 1). The 230 KiB line cites the rationale §4, not a constant no relay uses |
+| H2 | High | The 2 GiB host is not R1's; change B made an unsafe value the default; `deploy/relay` was not named | The bound is derived against the deployed hosts: 61 in the container of `compose.yml`, 95 on the README's host bare, 21 on Fly's machine, with change C (section 2.5). The default is 56, safe in the container; a larger host raises it by configuration up to a cap of 1,024, and a value above the cap is refused. Each deployment file's change is said (sections 2.5, 7.5). 500 devices take a relay that may hold about 4.2 GiB, on a host of 6 GB: the person's choice, with gate 9 |
+| H3 | High | The office could not be set up behind one address | It is set up on separate addresses and moved to its one address before the window (rule 6 of §2.2; section 4.2, steps 3 and 4) |
+| H4 | High | Bar 9's equality fails at almost every sample (frozen devices stay connected; started devices connect at once) | Bar 9 is a band: at least the devices running 120 s or more, at most every device running and each frozen in the last 90 s, one or two for the other relay, and the office's 5 |
+| M1 | Medium | The only relay a relay knows is a listed one, so change A as written switched warm churn off and bar 11 tested nothing; the churn counter would read zero | Change A is stated as "a relay and a bootnode close no connection by warm churn", and the case of an unlisted relay is dropped (section 7.4). Churns are counted in `churn`, before warm churn looks (section 1.2); bar 11 checks that no connection is closed by churn, and that churns ran |
+| M2 | Medium | With change A nothing sheds a connection that stays alive; "the bounds cap an attacker" was false for the slots | Stated as a known limit of R1 and of today's 200 (section 0, section 5); change A's reasoning no longer says the bounds cap that |
+| M3 | Medium | The second relay's restart reset its churn clock, so at stage 500 it counted one churn and every run was invalid | The restart is anchored after the second relay's first churn in the window, the removals after its churn following the restart, and the window's end after the first relay's second churn (section 4.2, steps 7 to 9); a window cut at five hours is invalid |
+| M4 | Medium | An edit replaced by a later one counted as arrived: a lost update passed | An edit counts as arrived only by its own line, in the file or a copy kept beside it (bar 3; section 4.2, step 6; section 6, test 3); and no file is written twice on one device within 15 s, so every edit is published (section 2.1, item 8) |
+| L1 | Low | The governor makes no dial for an inbound peer at all | Said so: a relay holds no address for a peer that dialled it (section 0, item 3; section 7.4) |
+| L2 | Low | Refusing at load needed detail: the role, the value 0, the address's allowance | Refused on a relay or a bootnode only; 0 refused; a personal node does not read it; the address's allowance follows the value in force (section 7.5, items 2 and 3) |
+| L3 | Low | Change A contradicts two tests and the record of relays §2 | Named, with what each becomes (section 7.4) |
+| L4 | Low | The deployed host has 1 vCPU, not 2 | Bar 8 is half a core on average and one in any minute; the host for 500 devices is said with two vCPU (section 2.5) |
+| L5 | Low | The relays do not list each other by key | Said so; the harness lists each by address and key (rule 3 of §2.2; section 4.3, rule 1; section 6, test 6) |
+| L6 | Low | The thread check contradicted itself, and missed `pids.max` | It masks where a limit is short, and refuses only where one is short even masked; it reads the cgroup's `pids.max` (section 2.4; section 6, test 7) |
+| L7 | Low | Bar 5 did not treat the carry apart | It does (bar 5) |
+
+Nothing of this review is left unsettled. Some answers to the first review are replaced by these: W and the bound (finding 2 of section 9), and change A's sparing of devices and listed relays alone (findings 1 and 9 of section 9), which is now no closing by warm churn at all.
