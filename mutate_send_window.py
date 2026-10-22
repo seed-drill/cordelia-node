@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Mutation checks for a node's QUIC send window: what it may have written
 on one connection that the peer has not acknowledged is QUIC_SEND_WINDOW,
-two messages, at both ends of a connection, and a write beyond it waits
-for STREAM_TIMEOUT_SECS and then fails (parameter-rationale.md §1, §6).
+two messages, at both ends of a connection; a write beyond it waits for
+STREAM_TIMEOUT_SECS, then fails and resets its stream with
+ERR_STREAM_TIMEOUT, through a join too; and a node takes no datagrams
+(parameter-rationale.md §1, §6).
 A part for each rule of the slice: put each fault in, and confirm the
 test named for it fails on an assertion. Run from the root of a checkout
 that nothing else edits."""
@@ -23,6 +25,7 @@ def transport(test): return (NETWORK, "transport::tests::" + test)
 BOTH_ENDS = transport("the_send_window_is_two_messages_at_both_ends")
 HELD = transport("a_peer_that_stops_acknowledging_is_held_to_the_send_window")
 TIMED_OUT = transport("a_message_that_meets_the_send_window_fails_after_the_stream_timeout")
+NO_DATAGRAMS = transport("a_node_takes_no_datagrams")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -57,6 +60,33 @@ MUTATIONS = [
      '''match tokio::time::timeout(STREAM_TIMEOUT, writer.write_all(data)).await {''',
      '''match tokio::time::timeout(STREAM_TIMEOUT / 4, writer.write_all(data)).await {''',
      [TIMED_OUT]),
+    ("SW6 a node keeps quinn's datagram buffer", TRANSPORT,
+     '''    transport.datagram_receive_buffer_size(None);
+''',
+     '''''',
+     [NO_DATAGRAMS]),
+    ("SW7 a write that timed out does not give its stream up", CODEC,
+     '''            writer.give_up();
+''',
+     '''''',
+     [TIMED_OUT]),
+    ("SW8 a QUIC stream is given up by finishing it, not by a reset", CODEC,
+     '''        let _ = self.reset(quinn::VarInt::from_u32(protocol::ERR_STREAM_TIMEOUT));''',
+     '''        let _ = protocol::ERR_STREAM_TIMEOUT;
+        let _ = self.finish();''',
+     [TIMED_OUT]),
+    ("SW9 a join gives up nothing", CODEC,
+     '''        self.writer_mut().give_up()''',
+     '''        let _ = self.writer_mut();''',
+     [TIMED_OUT]),
+    ("SW10 a reference to a stream gives up nothing", CODEC,
+     '''        (**self).give_up()''',
+     '''        let _ = self;''',
+     [TIMED_OUT]),
+    ("SW11 a timed-out write resets with the rate limit's code", PROTOCOL,
+     '''pub const ERR_STREAM_TIMEOUT: u32 = 0x04;''',
+     '''pub const ERR_STREAM_TIMEOUT: u32 = 0x03;''',
+     [core("test_err_stream_timeout_parameter_rationale_1")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
