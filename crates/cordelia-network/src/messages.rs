@@ -3289,9 +3289,8 @@ mod tests {
         hex::encode(hash.finalize())
     }
 
-    /// The messages as a node of 0.2.0-alpha.14 knows them: the same
-    /// types, written and read through the tagged enum, as that version
-    /// does both.
+    /// The messages through the tagged enum, as 0.2.0-alpha.14 writes and
+    /// reads them both, over this version's types.
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "msg_type")]
     enum Alpha14WireMessage {
@@ -3388,11 +3387,15 @@ mod tests {
         }
     }
 
-    /// What this node writes, a node of 0.2.0-alpha.14 reads as it was
-    /// written; and what that node writes, this node reads as it was
-    /// written.
+    /// What this node writes, the tagged enum reads as it was written; and
+    /// what the tagged enum writes, this node reads on the message's stream
+    /// as it was written. The enum is read as alpha.14 reads, through
+    /// serde's tag, but over this version's types, with their bounds: it is
+    /// not alpha.14's code. The guard across versions is the digest of
+    /// every message as alpha.14 writes it
+    /// ([`every_message_is_written_as_alpha_14_writes_it`]).
     #[test]
-    fn every_message_reads_the_same_both_ways_with_alpha_14() {
+    fn every_message_reads_the_same_through_the_tagged_enum_both_ways() {
         for message in every_message() {
             let name = name_of(&message);
             let ours = encode_message(&message).unwrap();
