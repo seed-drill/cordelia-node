@@ -185,6 +185,31 @@ What it leaves out:
   the one send window above; what they hold in their own memory is not.
   A repush that fails is queued again as a retry of each item, which
   starts more of them.
+- A relay's fetch of the older kind from a peer (`fetch_on`), on a stream
+  it opens itself to each connected peer that is not hot. Beyond its
+  request and the frame it reads, it holds the channels it has still to
+  go through: from a peer that is not a relay it lists, at most
+  MAX_CHANNELS_ASKED_OF_A_PEER of the IDs the peer listed, each of at most
+  MAX_CHANNEL_ID_LEN bytes, 120 KiB with their places in the list, each
+  let go once it has been gone through. While it fetches a page's
+  entries, it holds what it took out of the page and no more: the IDs to
+  fetch (at most MAX_FETCH_ITEMS of at most MAX_ITEM_ID_LEN bytes, 8,800
+  bytes with their places), the place the page ends at, and whether it
+  listed anything and has more. The page itself, up to 100 headers (76 KB
+  at their bounds, above), is dropped before the fetch is sent. The peer
+  can keep each read waiting up to STREAM_TIMEOUT_SECS on its length and
+  as long again on the rest, and a fetch that ended with more to fetch is
+  started again at the next cycle, so what it holds through the waits is
+  what it can hold all the time. Measured with a counting allocator, while
+  the peer keeps the fetch of a page's entries waiting
+  (`test_a_page_is_not_held_while_its_entries_are_fetched`): 8,760 bytes
+  for a page of 100 headers at their bounds, where keeping the page held
+  79,480; and before a header's fields were bounded, a page of about a
+  megabyte, its headers each with a signature of about 10 KB, held
+  1,711,480. And where a peer lists 200 channels of 96-byte IDs and
+  answers each with an empty page, the fetch holds 19,104 bytes less at
+  the last than at the first, the IDs it has let go
+  (`test_each_channel_is_let_go_once_it_has_been_gone_through`).
 - Quinn's own state for the connection beyond the data of its streams:
   its packets, its crypto buffer (16 KiB) and its tables.
 - What the node stores of what the connection brought, in its database.
