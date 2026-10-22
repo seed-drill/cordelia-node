@@ -1,7 +1,7 @@
 # Decision: a scale test for R1
 
 **Date**: 2026-10-22
-**Status**: Proposed. Not built. Revised four times after its reviews (sections 9 to 11 for the first three). Change C is merging (cordelia-node #187); change D is built and in review (cordelia-node #189).
+**Status**: Proposed. Not built. Revised four times after its reviews (sections 9, 10, 11 and 12). Change C is merging (cordelia-node #187); change D is built and in review (cordelia-node #189).
 **Cited as**: "decision 2026-10-22 §3, rule 4". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -576,3 +576,18 @@ The narrow check read the record at its third revision against the code and quin
 | F9 | Low | The proofs row was low (48 KiB) | 66 KiB: 2,048 buckets of 33 bytes (section 2.5); no bound changes by it |
 
 **What waits on change D:** W's decode row and P; change B's default and cap, and the claim that the default is safe; so change B, and stages 250 and 500. Change C, the counters and the harness do not wait on it. (Section 12 corrects this paragraph for stages 100 and 190: they wait on it.)
+
+## 12. The second narrow check, and how each finding is settled
+
+The second narrow check read the record at its fourth revision against the code, and measured decodes of the older kind with a counting allocator: high 1, medium 3, low 4. Since it, change C is merging as cordelia-node #187 (with datagrams off, and a stream reset where its write times out), and change D is built as cordelia-node #189, in review. #189's diff was read for this revision: every frame a node reads goes through `On<P>`, the relay's own fetch included.
+
+| # | Severity | Finding | How it is settled |
+|---|---|---|---|
+| H1 | High | A relay reads answers on streams it opens itself (its fetch from each peer, in a task of its own), outside "one message in hand", outside change D's text and outside B's hostile test | W gains the row of the relay's own fetch, a frame being read (1,024 KiB), and the sentence "one message in hand" is gone (section 2.5). #189 decodes those answers by the protocol (`send_channel_list_request`, `send_sync_request_raw`, `send_sync_page`, `read_fetch_response`), as section 7.2 says from its diff. The decode rows and P are #189's measurements: W 8.42 MiB, the container 52, the default 48, and a relay on the README's way to deploy carries 47 devices, under the traction bar (sections 0, 2.5). B's hostile peer answers the relay's own requests with frames of 1 MiB, trickled (section 7.5, item 7) |
+| M1 | Medium | RSS read from outside once a second is not what `mem_limit` counts, and misses a decode's peak | The test reads the container's cgroup `memory.peak` and the `oom_kill` line of `memory.events`, with `VmHWM` beside them; the bar of 448 MiB is set against `memory.peak` (section 7.5, item 7) |
+| M2 | Medium | The binary measured was not the deployed one (glibc against the release's musl) | The test builds `--target x86_64-unknown-linux-musl` as `release.yml` does and copies it into the image (section 7.5, item 7) |
+| M3 | Medium | The honest device would be turned away at the bound; setting the default needed a sweep | The honest device and the listed relay connect first, and the bound less two hostile connections follow; the default is found by stepping down by 8 from the formula's 48 until the run holds (section 7.5, item 7) |
+| L1 | Low | The test's addresses and pace were not said | At least ten addresses across three /24s on the runner, which the relay's host network allows; each connection and address under half of every count; twenty minutes, so that the relay asks each peer at least once (section 7.5, item 7) |
+| L2 | Low | Section 11 said stages 100 and 190 do not wait on change D, yet runs them on a build with it | Said plainly: they wait on it (section 7, its opening; section 7.2; section 11's last paragraph points here) |
+| L3 | Low | "A personal node accepts no inbound connection in any case" contradicts change B | The clause is dropped; "no address held, so no dial" carries the point (section 7.6) |
+| L4 | Low | B gives a relay's default to bootnodes and listening personal nodes, which have no W of their own | One sentence: the default holds there because change D bounds what such a node reads, on the streams it opens and on those a peer opens (section 7.5, item 2) |
