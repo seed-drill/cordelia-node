@@ -5326,7 +5326,13 @@ async fn answer_sync_with_nothing(
             break;
         };
         let nothing = nothing_for(&asked);
-        // What was asked is dropped before the answer is written.
+        // What was asked is dropped before the answer is written: the
+        // request (a channel's ID of up to a message, as the peer wrote
+        // it) is not held through `write_frame`, which may wait up to
+        // STREAM_TIMEOUT for a peer that does not read. It is untested: a
+        // test would need a counting allocator and a stream whose write
+        // waits, as `test_a_fetch_request_is_not_held_while_the_node_waits`
+        // has for the sync of a node that carries the older kind.
         drop(asked);
         let Some(nothing) = nothing else {
             break;
