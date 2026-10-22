@@ -1,7 +1,7 @@
 # Decision: a scale test for R1
 
 **Date**: 2026-10-22
-**Status**: Proposed. Not built. Revised three times after its reviews (sections 9 and 10 for the first two). Change C is built (cordelia-node #187); change D is being built.
+**Status**: Proposed. Not built. Revised three times after its reviews (sections 9, 10 and 11). Change C is built (cordelia-node #187); change D is being built.
 **Cited as**: "decision 2026-10-22 §3, rule 4". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -547,3 +547,21 @@ The second review read the record at its second revision against the code and ag
 | L7 | Low | Bar 5 did not treat the carry apart | It does (bar 5) |
 
 Nothing of this review is left unsettled. Some answers to the first review are replaced by these: W and the bound (finding 2 of section 9), and change A's sparing of devices and listed relays alone (findings 1 and 9 of section 9), which is now no closing by warm churn at all.
+
+## 11. The narrow check, and how each finding is settled
+
+The narrow check read the record at its third revision against the code and quinn-proto 0.11.14, and measured the memory of a decode with a counting allocator: high 1, medium 3, low 5. Since it, change C was built as cordelia-node #187, and change D is being built. Section 7 was renumbered: C 7.1, D 7.2, the counters 7.3, the harness 7.4, B 7.5, A 7.6.
+
+| # | Severity | Finding | How it is settled |
+|---|---|---|---|
+| F1 | High | W left out decoding: a tagged enum buffers a frame as generic values (about 32 bytes a byte); one older-kind path holds about 32 MiB a connection across its awaits; each decode peaks at up to 64 MiB | Change D (section 7.2), being built: decode by the protocol byte into the type, bound every sequence as it is decoded, drop a decoded request before any await, and a measured decode row in the rationale §1. W counts the held decode (45.9 MiB today, 38.4 with C alone), and the peak as P beside K (section 2.5). Today's bound is unsafe by some twenty-five times in the container of `compose.yml` (section 0, item 1) |
+| F2 | Medium | Change C's test passed with or without C: a cordelia peer's own credit stops the writes | Settled by #187's test: a quinn peer with large windows that drops its acknowledgements; it failed on main (section 7.1) |
+| F3 | Medium | K and the connection's state were allowances, measured only under honest load | Change B's test measures the relay's RSS with its default number of hostile connections (pull and never acknowledge; the held case) in the container of `compose.yml`, and the default and the connection's state row are set from it (section 7.5, item 7). Until then the default, 56 on today's figures, is not claimed safe |
+| F4 | Medium | Fly's 512 MB held 56 with no margin; `compose.yml` had no CPU limit | `compose.yml` gains `cpus: 1`, so P is one worker's peak; Fly goes to 1 GB, about 125 on today's figures, a margin of more than two to one (section 2.5; section 7.5, item 5) |
+| F5 | Low | Change A's reasoning does not hold at a bootnode, which shares peers and dials what it learns | Change A is limited to the relay role, and says why not a bootnode (section 7.6) |
+| F6 | Low | Say why no mesh link depends on warm churn, and that the branch dials no cold peer | Said: listed relays are dialled every second on their own loop, relays share no peers, and with `warm_max` 50 no promotion dials; at a relay warm churn closes nothing and dials nothing (section 7.6) |
+| F7 | Low | A personal node with `listen = true` or `trusted_peers` takes inbound connections; `ConnectionTracker::new()` and `rate_limiting.rs` use the constant | The setting is read, and refused above the cap or at 0, wherever `accepts_inbound()` is true; the code and tests that use the constant are named (section 7.5, item 2) |
+| F8 | Low | Bar 14 conflicted with the outage; an office person could be drawn for a removal | Bar 14 exempts the relay's outage and the 120 s after its start; removals are drawn among people not in the office (bar 10; section 4.2, step 8) |
+| F9 | Low | The proofs row was low (48 KiB) | 66 KiB: 2,048 buckets of 33 bytes (section 2.5); no bound changes by it |
+
+**What waits on change D:** W's decode row and P; change B's default and cap, and the claim that the default is safe; so change B, and stages 250 and 500. Change C, the counters, the harness and stages 100 and 190 do not wait on it, but stages 100 and 190 are run on a build with it, so that they measure the relays as they will be.
