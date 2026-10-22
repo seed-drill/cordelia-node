@@ -31,7 +31,7 @@ pub enum PeerSharingError {
 }
 
 /// Send a peer-sharing request (client side).
-pub async fn request_peers<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn request_peers<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     max_peers: u16,
 ) -> Result<Vec<PeerAddress>, PeerSharingError> {
@@ -47,7 +47,7 @@ pub async fn request_peers<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// `known_peers` should be pre-filtered by the caller (recent, diverse subnets,
 /// not banned).
-pub async fn handle_peer_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn handle_peer_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     known_peers: &[PeerAddress],
 ) -> Result<(), PeerSharingError> {

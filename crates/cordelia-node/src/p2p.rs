@@ -5292,7 +5292,7 @@ async fn handle_inbound_sync<W, R>(
     is_relay_peer: bool,
     is_swarm_peer: bool,
 ) where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
     R: tokio::io::AsyncRead + Unpin,
 {
     let msg = match cordelia_network::codec::read_frame(
@@ -5697,10 +5697,14 @@ async fn send_channel_announcements(
 
     let (mut send, _recv) = open_bi(conn).await?;
 
-    // Write protocol byte for ChannelAnnounce (0x04)
-    send.write_all(&[cordelia_network::messages::Protocol::ChannelAnnounce as u8])
-        .await
-        .map_err(|e| format!("write protocol byte: {e}"))?;
+    // The protocol byte for ChannelAnnounce (0x04), through the codec, so
+    // that it has the codec's timeout as every write does.
+    cordelia_network::codec::write_protocol_byte(
+        &mut send,
+        cordelia_network::messages::Protocol::ChannelAnnounce,
+    )
+    .await
+    .map_err(|e| format!("write protocol byte: {e}"))?;
 
     for channel_id in &channels {
         // The ID and nothing else: a relay is not told a channel's name.
@@ -6302,10 +6306,10 @@ mod tests {
 
         let state = a_state();
         let peer = NodeId([7; 32]);
-        // Small, so that what the pipe keeps for itself is small.
-        let (node, client) = tokio::io::duplex(8 * 1024);
-        let (mut node_r, mut node_w) = tokio::io::split(node);
-        let (mut client_r, mut client_w) = tokio::io::split(client);
+        // A pipe each way, small, so that what a pipe keeps for itself is
+        // small.
+        let (mut node_w, mut client_r) = tokio::io::duplex(8 * 1024);
+        let (mut client_w, mut node_r) = tokio::io::duplex(8 * 1024);
         // Each request, encoded before anything is counted.
         let sync = encode_message(&WireMessage::SyncRequest(SyncRequest {
             channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),

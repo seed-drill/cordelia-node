@@ -80,19 +80,117 @@ stream is enough. Two for the connection lets a second exchange begin
 while the first is being read. With 200 connections a relay holds at
 most 400MB unread.
 
-### What one connection can cost
+### send_window = 2MB (`QUIC_SEND_WINDOW`)
 
-A node serves one stream of a connection at a time (`handle_peer_streams`).
-What it holds for a connection, at most:
+**Rationale:** How much this node may have written on one connection,
+over all its streams, that the peer has not acknowledged. Quinn keeps
+every byte written until the peer acknowledges it, so this is what
+bounds the memory that a peer which reads and never acknowledges can
+make a node hold. Quinn's default is 8 x 1,250,000 = 10,000,000 bytes:
+a peer that pulled pages from a relay and acknowledged none could make
+it hold about ten megabytes for that connection, until it closed.
 
-| What | Most | From |
-|------|------|------|
-| Unread, on the connection | 2 MB | `receive_window` above |
-| A frame, read whole before it is decoded | 1 MB | `MAX_MESSAGE_BYTES` (§4) |
-| Decoding that frame, at its peak | 3 MB; measured, 2.0 MB at worst | the message is read by its stream, its lists bounded (below) |
-| The message, once decoded | 2 MB and 64 KB; measured, 1.97 MB at worst | its texts and bytes, each in room that grows by doubling, and its lists |
-| A frame that is refused, once refused | nothing but its error; measured, at most 1.2 MB at its peak | the same |
-| While it waits for a peer's next request | none of the request it last answered | a request is dropped before anything is awaited |
+**Derivation:** 2 x MAX_MESSAGE_BYTES = 2,097,152 bytes. The largest
+thing a node writes on one stream is one message (MAX_MESSAGE_BYTES: a
+page of entries is at most ENTRY_PAGE_MAX_BYTES = 917,504 bytes of it),
+so the window holds two whole messages. It is also what an honest peer
+lets the node send: the peer runs the same settings, and its receive
+window for the connection (QUIC_RECEIVE_WINDOW) is two messages, so a
+larger send window would let nothing more go to it.
+
+The node answers the streams that a peer opens one at a time: the
+inbound loop (`handle_peer_streams`) reads a request, answers it, and
+only then takes the next stream. The node's own streams on the same
+connection are separate tasks, and nothing keeps them from overlapping
+with the answer or with each other: between relays, a relay's passes
+(`pass_on`) and pulls (`pull_from_each`); for the older kind, the
+repush flush every five seconds, push retries and peer sharing. They all
+share the one window. A write that finds it full waits for the
+acknowledgements of what was written before it, on whichever stream.
+
+Bytes leave the window as they are acknowledged, within a round trip, so
+it limits the rate on a connection to the window per round trip: about
+20 MB/s at 100 ms and 4 MB/s at 500 ms, where STREAM_TIMEOUT (§6) needs
+only 100 KB/s to move a whole message. A write to a peer that
+acknowledges waits for it a round trip at a time at most.
+
+**A write that meets it** waits for acknowledgements. Every write on a
+stream goes through the codec, which gives it STREAM_TIMEOUT_SECS (§6).
+A write that is still waiting then fails, and the codec resets the
+stream with ERR_STREAM_TIMEOUT, so QUIC lets go of what it held for the
+stream and sends none of it again. A stream that was only dropped would
+be finished instead, and QUIC would go on holding what it had not sent
+until the connection closed. For a peer that does not acknowledge, this
+is the right outcome: what it has not acknowledged it may never have
+received, and while the write waits the node holds no more than the
+window for the connection.
+
+**If you increase it:** Nothing goes faster to an honest peer, whose
+receive window is two messages, and a peer that does not acknowledge
+can make a node hold more.
+
+**If you decrease it below one message:** A full page or push cannot be
+written whole before its first acknowledgement, and each one takes a
+round trip more.
+
+### What one connection can make a node hold
+
+An estimate, each part at its largest, of what one connection can make a
+node hold: QUIC's windows and what quinn may allocate beyond them, and
+what the inbound loop holds for the one stream it answers. The node
+answers the streams a peer opens one at a time (`handle_peer_streams`),
+so these parts are of one request and its answer. It leaves out what the
+node's own streams on the connection hold (listed below the table), so it
+is not every buffer.
+
+| Part | At most |
+|------|---------|
+| Receive windows: what the peer sent and the node has not read (`stream_receive_window` lies within `receive_window`) | 2 MiB |
+| Quinn's reassembly beyond them: a stream's received buffers are compacted only once they exceed what is buffered by max(32 KiB, 1.5 x it), so 2.5 x 2 MiB and 32 KiB on each of 64 streams, less the 2 MiB above. Read from quinn-proto 0.11's source (`assembler.rs`), not measured; only a peer that sends tiny frames comes near it | 5 MiB |
+| Send window: what the node wrote and the peer has not acknowledged (`QUIC_SEND_WINDOW`) | 2 MiB |
+| Datagrams: none, since `datagram_receive_buffer_size` is off and a peer is told it may send none (quinn's default kept 1.25 MB of them unread) | 0 |
+| The frame of the request being answered (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES) | 1 MiB |
+| The request, decoded: read by its stream into its own type, every list bounded (below). 3 x MAX_MESSAGE_BYTES at the decode's peak, and at most 2 x MAX_MESSAGE_BYTES and 64 KiB once decoded; measured, 2.0 MB and 1.97 MB at worst | 3 MiB |
+| The answer being built (a page of entries, or a show's answer) | 1 MiB |
+| The answer, encoded, before it is copied into the send window (`write_frame`) | 1 MiB |
+| **One connection, as counted** | **15 MiB** |
+
+At the bound of 200 inbound connections (MAX_INBOUND_CONNECTIONS, §5)
+that is 3,000 MiB, about 3.1 GB. Without the reassembly row, which needs
+a peer that sends tiny frames on purpose, it is 10 MiB a connection and
+2,000 MiB at the bound. The count is an upper bound on each part: the
+decode's peak passes before the answer is built, a request is small when
+its answer is large (a pull of pages), and the other way round (a push).
+Before the send window was set, datagrams were turned off and a message
+was read by its stream, the same count was about 101 MiB a connection:
+the send window at quinn's default (9.5 MiB), 1.2 MiB of datagrams, and a
+request read through the enum of every message at up to 80 MiB at its
+peak and 32 MiB held (below).
+
+A request is dropped, with all it holds, before its answer is written: a
+node does not keep it through the write of the answer and the read of the
+next request, up to STREAM_TIMEOUT_SECS each (§6). The streams of entries
+(`relay_entries`) keep the frame and the request through the one write of
+their answer, which is small whenever the request is large.
+
+What it leaves out:
+
+- The node's own streams on the connection. Each holds the request it
+  writes, encoded (up to a message), for as long as its write waits, at
+  most STREAM_TIMEOUT_SECS; a pull also holds the frame of its answer (a
+  message) and its decoding (as for a request above: at most three
+  messages at its peak) while it reads it. They are as many as the node
+  starts, up to the streams the peer lets it open at once
+  (QUIC_MAX_BIDI_STREAMS between nodes). What they write is still within
+  the one send window above; what they hold in their own memory is not.
+  A repush that fails is queued again as a retry of each item, which
+  starts more of them.
+- Quinn's own state for the connection beyond the data of its streams:
+  its packets, its crypto buffer (16 KiB) and its tables.
+- What the node stores of what the connection brought, in its database.
+
+The bound on connections is §5's, and is not changed here; on a relay
+host with less memory than this, it is that bound that has to come down.
 
 **Decode, measured** (with a counting allocator, of the bytes asked for:
 `crates/cordelia-network/tests/decode_cost.rs`). A message is read by the
@@ -611,9 +709,9 @@ push holds fewer than 200 entries, and the item bound is not reached.
 
 ### max_inbound_connections = 200
 
-**Rationale:** Maximum simultaneous inbound QUIC connections. At ~50KB
-memory per connection, 200 connections = ~10MB. Prevents memory exhaustion
-from connection flood attacks.
+**Rationale:** Maximum simultaneous inbound QUIC connections. Prevents memory
+exhaustion from connection flood attacks. What one connection can cost at
+most, and what that gives at this bound, is counted in §1.
 
 **Reference:** Cardano relay nodes accept ~3000 connections. We use 200
 as a conservative Phase 1 default.

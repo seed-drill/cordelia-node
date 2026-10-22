@@ -130,22 +130,62 @@ async fn read_exact_guarded<R: AsyncRead + Unpin>(
     }
 }
 
-/// Write all bytes with STREAM_TIMEOUT.
-async fn write_all_guarded<W: AsyncWrite + Unpin>(
+/// What the codec does to a stream whose write did not end within
+/// STREAM_TIMEOUT: give it up, so that what was written and not yet
+/// acknowledged is let go (parameter-rationale.md §1, send_window).
+///
+/// A QUIC stream is reset with ERR_STREAM_TIMEOUT: QUIC then drops what it
+/// held for the stream and sends none of it again. A stream that is only
+/// dropped is finished instead, and QUIC goes on holding what it has not
+/// sent for as long as the connection lasts. A stream in memory, as the
+/// tests use, has nothing to let go.
+pub trait GiveUp {
+    /// Give the stream up. Nothing more is written on it.
+    fn give_up(&mut self) {}
+}
+
+impl GiveUp for quinn::SendStream {
+    fn give_up(&mut self) {
+        let _ = self.reset(quinn::VarInt::from_u32(protocol::ERR_STREAM_TIMEOUT));
+    }
+}
+
+impl<R: AsyncRead, W: AsyncWrite + GiveUp> GiveUp for tokio::io::Join<R, W> {
+    fn give_up(&mut self) {
+        self.writer_mut().give_up()
+    }
+}
+
+impl<T: GiveUp + ?Sized> GiveUp for &mut T {
+    fn give_up(&mut self) {
+        (**self).give_up()
+    }
+}
+
+impl GiveUp for tokio::io::DuplexStream {}
+
+impl GiveUp for Vec<u8> {}
+
+/// Write all bytes with STREAM_TIMEOUT. A write that does not end within it
+/// gives the stream up ([`GiveUp`]).
+async fn write_all_guarded<W: AsyncWrite + Unpin + GiveUp>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), CodecError> {
     match tokio::time::timeout(STREAM_TIMEOUT, writer.write_all(data)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(CodecError::Io(e)),
-        Err(_) => Err(CodecError::Timeout(STREAM_TIMEOUT.as_secs())),
+        Err(_) => {
+            writer.give_up();
+            Err(CodecError::Timeout(STREAM_TIMEOUT.as_secs()))
+        }
     }
 }
 
 // ── Protocol byte ────────────────────────────────────────────────
 
 /// Write the protocol byte as the first byte of a new QUIC stream.
-pub async fn write_protocol_byte<W: AsyncWrite + Unpin>(
+pub async fn write_protocol_byte<W: AsyncWrite + Unpin + GiveUp>(
     writer: &mut W,
     protocol: Protocol,
 ) -> Result<(), CodecError> {
@@ -166,7 +206,7 @@ pub async fn read_protocol_byte<R: AsyncRead + Unpin>(
 /// Write a length-prefixed CBOR frame.
 ///
 /// Format: [4-byte big-endian length][CBOR payload]
-pub async fn write_frame<W: AsyncWrite + Unpin>(
+pub async fn write_frame<W: AsyncWrite + Unpin + GiveUp>(
     writer: &mut W,
     msg: &WireMessage,
 ) -> Result<(), CodecError> {
@@ -202,7 +242,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 // ── Raw frame read/write (pre-encoded CBOR) ──────────────────────
 
 /// Write a raw CBOR-encoded frame (pre-encoded payload).
-pub async fn write_raw_frame<W: AsyncWrite + Unpin>(
+pub async fn write_raw_frame<W: AsyncWrite + Unpin + GiveUp>(
     writer: &mut W,
     payload: &[u8],
 ) -> Result<(), CodecError> {
@@ -236,7 +276,7 @@ pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<
 ///
 /// Combines: write_protocol_byte + write_frame(request) + read_frame -> response.
 /// All three steps use STREAM_TIMEOUT internally.
-pub async fn send_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn send_request<S: AsyncRead + AsyncWrite + Unpin + GiveUp>(
     stream: &mut S,
     protocol: Protocol,
     request: &WireMessage,

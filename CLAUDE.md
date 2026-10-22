@@ -165,6 +165,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
 | `QUIC_MAX_BIDI_STREAMS` | 64 | parameter-rationale.md §1 |
 | `QUIC_RECEIVE_WINDOW` | 2MB a connection | parameter-rationale.md §1 |
+| `QUIC_SEND_WINDOW` | 2MB a connection (derived: 2 x `MAX_MESSAGE_BYTES`; a write beyond it waits for acknowledgements, and fails after `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §1 |
 | `PUSH_BYTES_PER_PEER_PER_MINUTE` | 2MB | parameter-rationale.md §4 |
 | `MAX_CHANNEL_BYTES_AT_RELAY` | 16MB | parameter-rationale.md §4 |
 | `NEW_CHANNELS_PER_ADDRESS_PER_HOUR` | 16 | parameter-rationale.md §4 |

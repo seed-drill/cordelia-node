@@ -30,7 +30,7 @@ pub const REASON_NOT_AVAILABLE: &str = cordelia_core::protocol::REASON_NOT_AVAIL
 /// Request a PSK from a peer (subscriber side).
 ///
 /// `subscriber_xpk` is the subscriber's X25519 public key for ECIES envelope.
-pub async fn request_psk<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn request_psk<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     channel_id: &str,
     subscriber_xpk: &[u8; 32],
@@ -55,7 +55,7 @@ pub async fn request_psk<S: AsyncRead + AsyncWrite + Unpin>(
 /// Handle a PSK request (holder side).
 ///
 /// `evaluate` receives (channel_id, subscriber_xpk) and returns a PskResponse.
-pub async fn handle_psk_request<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn handle_psk_request<S: AsyncRead + AsyncWrite + Unpin + crate::codec::GiveUp>(
     stream: &mut S,
     evaluate: impl FnOnce(&str, &[u8]) -> PskResponse,
 ) -> Result<String, PskExchangeError> {
