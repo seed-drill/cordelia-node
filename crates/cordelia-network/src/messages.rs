@@ -305,7 +305,8 @@ pub struct ItemHeader {
     #[serde(deserialize_with = "a_time")]
     pub published_at: String,
     pub is_tombstone: bool,
-    #[serde(deserialize_with = "a_parent")]
+    /// Read as none where it is left out, as before it was bounded.
+    #[serde(default, deserialize_with = "a_parent")]
     pub parent_id: Option<String>,
     /// Replaceable-item slot (32 bytes) and revision (decision 2026-09-30
     /// §4.3). Both present or both absent; omitted from the encoding when
@@ -4041,6 +4042,44 @@ mod tests {
             let mut one = at_bounds.clone();
             change(&mut one);
             assert!(read(&one).is_err(), "a header with {what} was read");
+        }
+    }
+
+    /// A header that leaves out its parent is read with none, as it was
+    /// before the parent was bounded where it is read.
+    #[test]
+    fn a_header_that_leaves_out_its_parent_reads_as_none() {
+        let WireMessage::SyncResponse(page) = every_message()
+            .into_iter()
+            .find(|message| name_of(message) == "SyncResponse")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let mut header = ciborium::Value::serialized(&page.items[0]).unwrap();
+        let ciborium::Value::Map(fields) = &mut header else {
+            unreachable!()
+        };
+        fields.retain(|(key, _)| key.as_text() != Some("parent_id"));
+        let mut message =
+            ciborium::Value::serialized(&WireMessage::SyncResponse(page.clone())).unwrap();
+        let ciborium::Value::Map(pairs) = &mut message else {
+            unreachable!()
+        };
+        for (key, value) in pairs.iter_mut() {
+            if key.as_text() == Some("items") {
+                *value = ciborium::Value::Array(vec![header.clone()]);
+            }
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&message, &mut bytes).unwrap();
+        match crate::codec::decode_message(Protocol::ItemSync, &bytes) {
+            Ok(WireMessage::SyncResponse(read)) => {
+                assert_eq!(read.items.len(), 1);
+                assert_eq!(read.items[0].parent_id, None);
+                assert_eq!(read.items[0].item_id, page.items[0].item_id);
+            }
+            other => panic!("a header with no parent was not read: {other:?}"),
         }
     }
 }
