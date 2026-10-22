@@ -690,14 +690,19 @@ pub const MAX_SHARED_PEER_ADDRS: u32 = 8;
 
 /// The length of the shortest ID of a channel of the older kind that a
 /// node makes: `grp_` and a UUID. Every other kind is longer
-/// (channel-naming.md).
+/// (channel-naming.md). It is not the shortest a relay stores and lists:
+/// an ID that others sent may be 1 to MAX_CHANNEL_ID_LEN bytes.
 pub const SHORTEST_CHANNEL_ID_LEN: u32 = 40;
 
-/// The most channel IDs that a node may list when it is asked which
-/// channels it holds (network-protocol.md §4.5). A relay lists another
-/// relay that it works with every channel it holds, with no other limit
-/// than the message's. Derived: as many of the shortest IDs as fit in one
-/// message, each with the two bytes that say a text and its length.
+/// The most channel IDs that a node keeps of a list of those a peer holds
+/// (network-protocol.md §4.5); the rest of the list is passed over, not
+/// refused. A relay lists another relay that it works with every channel
+/// it holds, with no other limit than the message's, and the IDs it holds
+/// are what others sent it: an honest relay can list more than this, of
+/// IDs shorter than a node makes. Derived: as many IDs of the length that
+/// a node makes as fit in one message, each with the two bytes that say a
+/// text and its length. Whoever asks a peer it is held to takes at most
+/// MAX_CHANNELS_ASKED_OF_A_PEER of them in any case.
 pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID_LEN + 2);
 
 /// The most items one push may hold, and the most its answer may list as

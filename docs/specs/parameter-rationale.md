@@ -206,11 +206,13 @@ that a peer chose, before and after:
 | A fetch of about 1M empty IDs | 80 MB, 32 MB | 4.6 KB, nothing (refused) |
 | One peer with about 1M empty addresses | 80 MB, 32 MB | 320 bytes, nothing (refused) |
 | About 200K peers, each written as an array | 42 MB, 16 MB | 206 bytes, nothing (refused) |
-| A list of about 1M empty channel IDs | 80 MB, 32 MB | 1.2 MB, nothing (refused) |
+| A list of about 1M empty channel IDs | 80 MB, 32 MB | 1.2 MB, 786 KB (the first 24,966 kept) |
 | A page of fifteen entries of the largest size | 2.0 MB, 1.97 MB | 2.0 MB, 1.97 MB |
 
-**The bounds of the lists**, each at least what a node of any version
-sends, so that none of it is refused:
+**The bounds of the lists.** Each but one is at least what a node of any
+version sends, whatever others sent it, and a longer list is refused. The
+channel IDs a relay lists are what others sent it, from 1 to 96 bytes
+each: of those, the first are kept and the rest passed over.
 
 | List | Bound | Why |
 |------|-------|-----|
@@ -218,7 +220,7 @@ sends, so that none of it is refused:
 | Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
 | Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
 | Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
-| Channel IDs listed | `MAX_LISTED_CHANNEL_IDS` = 24,966 | Derived: as many of the shortest ID a node makes (`grp_` and a UUID, `SHORTEST_CHANNEL_ID_LEN` = 40) as fit in one message. A relay lists a relay it works with every channel it holds |
+| Channel IDs listed, the first kept | `MAX_LISTED_CHANNEL_IDS` = 24,966 | Derived: as many IDs of the shortest length a node makes (`grp_` and a UUID, `SHORTEST_CHANNEL_ID_LEN` = 40) as fit in one message. A relay lists a relay it works with every channel it holds, and stores IDs others sent of 1 to 96 bytes, so an honest list can be longer: the rest are passed over, not refused. Whoever asks a peer it is held to takes at most `MAX_CHANNELS_ASKED_OF_A_PEER` of them |
 | Headers of a page | `DEFAULT_SYNC_LIMIT` = 100 | The most a node asks for |
 | IDs of a fetch, items handed for it | `MAX_FETCH_ITEMS` = 100 | A fetch is of the IDs of one page |
 | Items of a push, and those it refused | `MAX_PUSHED_ITEMS` = 2048 | Derived: as many entries of no ciphertext as one peer's allowance for a minute takes (`PUSH_BYTES_PER_PEER_PER_MINUTE`, each at `ENTRY_OVERHEAD_BYTES`). A node's outbox pushes at most `OUTBOX_BATCH_MAX_ITEMS` = 500, and a version before may have pushed more: a push of more than this is over any limited peer's allowance, and is refused whole |
