@@ -3507,8 +3507,7 @@ mod tests {
     fn each_list_of_the_older_streams_is_bounded_where_it_is_read() {
         use cordelia_core::protocol::{
             DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, MAX_CHANNELS_ASKED_OF_A_PEER,
-            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS, MAX_PUSHED_ITEMS,
-            MAX_SHARED_PEER_ADDRS,
+            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS,
         };
         let messages = every_message();
         let first = |name: &str| {
