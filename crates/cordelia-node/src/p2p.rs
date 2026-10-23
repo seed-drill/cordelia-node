@@ -1398,6 +1398,12 @@ where
             Answer::Message(WireMessage::SyncChannelListResponse(resp), permit) => {
                 (resp.channel_ids, permit)
             }
+            // A list with no permit fails the whole fetch, whoever the
+            // peer: also a relay configured by address alone, which is not
+            // `limited` and whose list that could not be read otherwise
+            // leaves the fetch to go on with this node's own channels. The
+            // stream has been refused, so nothing more can be asked on it;
+            // the peer is asked again a rate window later.
             Answer::LargeLater => {
                 tracing::debug!(peer = %target, "a channel list over a small message, and no permit for now; the fetch fails");
                 refuse_large_later(send, recv);
