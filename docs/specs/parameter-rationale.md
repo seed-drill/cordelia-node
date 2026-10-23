@@ -178,16 +178,19 @@ byte on a stream the node is not reading then keeps the whole batch,
 about 64 KiB, where the reassembler counts about 1.4 KiB, and it
 compacts only once what it counts passes 32 KiB on that stream: up to
 about 2 MiB on each such stream. Measured on loopback, with the windows
-of this table and 64 streams, one such connection took a node's live
-heap to 82,467 KiB with the option on, and 2,262 KiB with it off. So a
+of this table and 64 streams, and a peer whose quinn sends in batches
+of 44 datagrams (GSO), one such connection took a node's live heap to
+82,467 KiB with the option on, and 2,262 KiB with it off. A peer on a
+stock quinn, which sends at most 10 datagrams a batch, showed no
+consistent gap between the two. So a
 node turns `UDP_GRO` off on its socket, after quinn wraps it, since the
 wrap turns it on (`endpoint_on` in `transport.rs`; decision 2026-10-22,
 memory across connections, rule 10). Each frame then keeps its own datagram, at most 1,472 bytes.
 Sending in batches (GSO) is kept. **Its cost:** the kernel hands the
-socket each datagram apart (still up to 32 at a call); measured on loopback, about 2.3 times the
-CPU for each byte received in bulk (325 MiB for each CPU-second, where it
-was 733), and nothing that can be seen at a node's pace, at most
-PUSH_BYTES_PER_PEER_PER_MINUTE a connection. **Elsewhere:** on Linux a
+socket each datagram apart (still up to 32 at a call); measured on
+loopback, about 2.3 times the CPU for each byte received in bulk (325 MiB
+for each CPU-second, where it was 733), and nothing that can be seen at
+a node's pace, at most PUSH_BYTES_PER_PEER_PER_MINUTE a connection. **Elsewhere:** on Linux a
 kernel without the option (before 5.0) never batched; macOS and the BSDs
 have no such option and hand a socket one datagram at a time; on Windows
 quinn-udp leaves receive coalescing off.
