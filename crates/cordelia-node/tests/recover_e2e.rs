@@ -2372,6 +2372,40 @@ fn entries_at(relay: &Node) -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether the store of `relay` holds each entry that `device` signed
+/// (`signer` is its key), at the revision at which the store of `device`
+/// holds it or a later one: what the device wrote has been sent to the
+/// relay, and is not only in its own store. `false` where the device holds
+/// nothing that it signed.
+fn holds_what_it_signed(relay: &Node, device: &Node, signer: &[u8; 32]) -> bool {
+    let signed: Vec<(Vec<u8>, Vec<u8>, i64)> = {
+        let held = store_of(device);
+        let Ok(mut rows) =
+            held.prepare("SELECT channel_id, slot, rev FROM entries WHERE author = ?1")
+        else {
+            return false;
+        };
+        let read = rows.query_map(rusqlite::params![signer.as_slice()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
+        match read.and_then(|read| read.collect()) {
+            Ok(signed) => signed,
+            Err(_) => return false,
+        }
+    };
+    let at = store_of(relay);
+    !signed.is_empty()
+        && signed.iter().all(|(channel, slot, rev)| {
+            at.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE channel_id = ?1 AND slot = ?2 \
+                 AND author = ?3 AND rev >= ?4)",
+                rusqlite::params![channel, slot, signer.as_slice(), rev],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
+        })
+}
+
 /// **A recovery says before its yes where what was carried is at a relay
 /// that it did not read** (decision 2026-10-19 §4, rule 10, case 3). A
 /// laptop with relays A and B, which their operator lists together,
@@ -2428,6 +2462,18 @@ fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_no
     );
     assert_eq!(word["keys"], json!([a_key]), "{word}");
     assert_eq!(word["not_yet"], 1, "{word}");
+    // The laptop's own view shows the word once its store holds it, and
+    // the word is sent to A after that; `renew` may have ended before the
+    // word was written, as end 3 asks nothing of it. So the laptop stops
+    // only once A holds the word, and all else that it signed: what B is
+    // to pull from A.
+    let signer = cordelia_crypto::bech32::decode_public_key(&own).unwrap();
+    wait_for(
+        "A holds what the laptop signed, its carried word among it",
+        &[&a, &two.laptop],
+        60,
+        || holds_what_it_signed(&a, &two.laptop, &signer).then_some(()),
+    );
     two.laptop.stop();
 
     // B, started again, pulls what A holds.
