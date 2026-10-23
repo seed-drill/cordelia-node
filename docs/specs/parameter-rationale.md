@@ -2592,7 +2592,11 @@ fetch asks as it did, up to 100 headers a page and the entries of a page
 in one request, since a header carries no size to fit a request to; it fails where no permit comes within
 `STREAM_TIMEOUT_SECS`, refusing the stream with
 `ERR_LARGE_MESSAGE_LATER`, and the peer is asked again a rate window
-later, as after any failed fetch. There is no budget of its own over the
+later, as after any failed fetch. That holds for a list too, from any
+peer: a relay configured by address alone, which is not held to what it
+lists, used to go on with the node's own channels where its list could
+not be read, but a list with no permit has its stream refused, so nothing
+more can be asked on it. There is no budget of its own over the
 relay's fetches: a peer can keep its fetch going for as long as it likes,
 so a few peers would hold every permit of one; there is one fetch from
 each peer at a time. A device of this version never needs a permit
