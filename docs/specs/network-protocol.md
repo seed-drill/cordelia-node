@@ -116,6 +116,49 @@ cordelia-core (pre-pivot) switched from QUIC/UDP to TCP+Noise+yamux over firewal
 - P2P listen: `9474/UDP` (configurable)
 - Local API: `9473/TCP` (HTTP, localhost only -- not part of this spec, see channels-api.md)
 
+**Windows and streams** (decision 2026-10-22, memory across connections,
+rules 8 to 12; parameter-rationale.md §1 and §13). They bound what one
+connection's peer can make a node hold. Every connection of every node,
+in either direction, carries these transport settings (`transport_config`
+in `transport.rs`):
+
+| Setting | Value | Reason |
+|---|---|---|
+| Receive window of a connection (`QUIC_RECEIVE_WINDOW`) | 294,912 bytes, two small messages (288 KiB) | The largest message a device of this version sends is one small message (`SMALL_MESSAGE_BYTES`, 144 KiB, §9.3). A second can arrive while the first is read |
+| Receive window of a stream (`QUIC_STREAM_RECEIVE_WINDOW`) | 36,864 bytes, an eighth of the connection's | The connection's window divided by the streams a peer may open (checked at compile time). A node reads the streams a peer opens one at a time. Because every stream a peer may have open fits the connection's window, the streams queued behind the one being read cannot hold all of its credit. A message larger than this arrives a window at a time as the node reads it; a small message takes four round trips |
+| Send window (`QUIC_SEND_WINDOW`) | 294,912 bytes, two small messages | A write beyond it waits for acknowledgements, and the codec gives it up after `STREAM_TIMEOUT_SECS` |
+| Bidirectional streams a peer may have open (`QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS`) | 8 | The inbound loop serves one stream at a time, so a stream beyond the first only waits. Each open stream may hold up to 32 KiB of quinn's reassembly beyond its data |
+| Unidirectional streams, datagrams | none | No node uses them; quinn's default would keep 1.25 MB of datagrams unread |
+
+**A connection with a relay configured by key keeps the settings that
+every connection had before alpha.16:** 1 MiB a stream, 2 MiB a
+connection and 2 MiB unacknowledged (`QUIC_LISTED_STREAM_RECEIVE_WINDOW`,
+`QUIC_LISTED_RECEIVE_WINDOW`, `QUIC_LISTED_SEND_WINDOW`), and 64 streams
+(`QUIC_LISTED_MAX_BIDI_STREAMS`). Passes and pulls between relays go a
+full page (896 KiB) at a time, and at the settings above a pull of ten
+pages would take longer than the 10 s between pulls. Quinn fixes a
+connection's settings when the connection is made, so:
+
+- A node dials a relay configured by key with `Endpoint::connect_with`
+  and those settings. A device does the same; the default relays have
+  compiled keys.
+- A node accepts a connection with `Incoming::accept_with` and those
+  settings where the connection comes from the address and port of a
+  relay configured by key. Once TLS completes, it closes the connection if
+  the certificate's key is not that relay's, before it reads anything on
+  it.
+- A relay configured by address alone gets the settings of every peer.
+
+The windows announced are the receiver's own. So a device that dials its
+relay by key may be sent full windows, while what it sends the relay is
+held to the relay's windows for an unlisted peer.
+
+**The kernel's receive batching of UDP (`UDP_GRO`) is off** on every
+node's endpoint socket. It is turned off after quinn wraps the socket,
+because quinn-udp turns it on when it wraps a socket (rule 10). With it
+on, a stream frame of one byte keeps the whole batch of datagrams it
+arrived in, which quinn's reassembler counts as one packet.
+
 ### 2.2 TLS 1.3 Identity Binding
 
 QUIC mandates TLS 1.3. Cordelia binds TLS certificates to Ed25519 node identities:
@@ -230,6 +273,8 @@ All wire messages use CBOR (Concise Binary Object Representation) with determini
 **Implementation**: `ciborium` (Rust). Note: `ciborium` with serde derive emits plain text strings (major type 3) for `String` fields; adding tag 0 requires a custom serde wrapper or explicit `ciborium::Value::Tag(0, ...)` construction.
 
 **Forward-compatibility rules:** Unknown fields within a known message type MUST be logged at DEBUG level and ignored (forward-compatible). Unknown message types (unknown protocol byte or unknown serde variant) MUST be rejected at the dispatch layer -- stream reset for unknown protocol byte (application error `0x02`), decode error for unknown variant. New capabilities are added as new protocol bytes (§3.3), not as new variants within existing protocol message sets. The handshake version negotiation (§4.1.4) ensures both sides speak the same protocol version.
+
+**A bound on a list or a message is raised on the receiving side one release before any sender relies on it.** Every list and every message is bounded where it is read (below; §9.3). A release that would send more raises the bound in the release before it, so a receiver that has that bound is already deployed when the first sender uses it. Lowering what a sender sends needs no such step: a release may do it by itself, as alpha.16 does for its pages and pushes to an unlisted peer (§9.3).
 
 **How a message is read:** a message is a CBOR map whose first key is
 `msg_type`, the message's name, followed by its fields; every version
@@ -2151,7 +2196,7 @@ node_id = "cordelia_pk1..."
 | Max inbound connections | 200 | Prevent connection exhaustion |
 | Max connections per IP | 5 | Block naive Sybil from single host |
 | Max connections per /24 subnet | 20 | Block Sybil from single subnet |
-| Max concurrent streams per connection | 64 | Prevent stream exhaustion |
+| Max concurrent streams per connection | 8 (64 with a relay configured by key, §2.1) | Prevent stream exhaustion; bound quinn's reassembly on each connection |
 
 The `max_inbound_connections` (200) is the hard cap. Once reached, all further inbound connections are rejected regardless of per-IP/subnet headroom. Per-IP and per-subnet limits are evaluated first: a connection from a /24 with 20 existing connections is rejected even if the global count is below 200.
 
@@ -2194,11 +2239,22 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 | an entry of a channel from its secret | A content that is a power of two from 256 bytes to 64 KB, and 237 bytes beside it | Whoever writes it, each relay, the device that receives it (§4.9, data-formats.md §9.2) |
 | a text and its name in such an entry | 60 KB together (`MAX_ENTRY_NAME_AND_VALUE_BYTES`) | The device that writes it; one that is over is no version to a device that reads it |
-| a page, and a push, of such entries | 100 entries; 896 KB of entries | 100: sender and receiver (a message that holds more is not read). 896 KB: whoever builds the page or the push; a receiver's bound on bytes is the 1 MB message |
+| a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) between relays listed by key | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push. A page that stops at its bytes says there is more, and its reader reads on |
+| a small message (`SMALL_MESSAGE_BYTES`) | 144 KiB (147,456): a small page and 16 KiB | Every message a device of alpha.16 sends or is sent fits one. A node reads a longer frame from a peer that is not a relay listed by key only under a large permit (below) |
 
 Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
 
 The `max_message_bytes` of 1 MB accommodates 14 max-size items with their headers, or ~100 typical items (~10 KB each). A sender keeps a push to what three entries of the largest size cost, 195 KB (`OUTBOX_BATCH_MAX_BYTES`), and a node that fetches asks for fewer items when a page's would not fit (`SYNC_PAGE_STEPS`). The wire codec rejects messages exceeding this before any parsing occurs.
+
+**Large messages, under a permit** (decision 2026-10-22, memory across connections, rules 2, 6 and 7; parameter-rationale.md §13). A node reads a frame's protocol byte and length first. A frame from a peer that is not a relay listed by key whose length is over `SMALL_MESSAGE_BYTES` is read only under a large permit, which the node takes before it allocates the payload. The same holds for a stream's requests, for the older kind's fetch answers over `SMALL_PAGE_BYTES`, and for the answers to a relay's own fetch from such a peer.
+
+- A node holds at most `LARGE_MESSAGES_AT_ONCE` (4) permits across all its connections.
+- It holds at most one for each /24 (IPv4) or /48 (IPv6) of the peers' addresses.
+- It holds one for each stream at a time, from before the large frame is read until its answer is written.
+- While a stream waits for a permit, it stays unread within the connection's window (§2.1).
+- A stream with no permit after `STREAM_TIMEOUT_SECS` is refused with `ERR_LARGE_MESSAGE_LATER` (0x05, §9.5). This counts no breach.
+
+A relay listed by key is read whatever the size. A relay configured by address alone is not exempt. A device of alpha.16 never needs a permit, because each of its messages fits a small message.
 
 ### 9.4 Backpressure Model
 
@@ -2216,6 +2272,26 @@ Bounded inbound queue per protocol type:
 When a queue is full, the node does not accept new streams for that protocol type. QUIC flow control handles the rest -- the sender's `open_bi()` blocks until the receiver is ready.
 
 **Per-peer fairness:** Each peer's share of queue capacity is `queue_capacity / active_peers`. No single peer can consume more than their share.
+
+### 9.5 Application Error Codes
+
+The QUIC application error codes a node closes a connection or resets a stream with (`ERR_*` in `protocol.rs`):
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0x01` | `ERR_CAPACITY` | The node holds no room for the connection (§9.1) |
+| `0x02` | `ERR_UNKNOWN_PROTOCOL` | Unknown protocol byte (§3.3) |
+| `0x03` | `ERR_RATE_LIMIT` | Over a rate limit: a stream is reset with it where a request is over, and the connection is closed with it where the peer keeps going over (§9.2) |
+| `0x04` | `ERR_STREAM_TIMEOUT` | A write that did not end within `STREAM_TIMEOUT_SECS`: the stream is reset, so that what was written and not acknowledged is let go |
+| `0x05` | `ERR_LARGE_MESSAGE_LATER` | A frame longer than a small message that the node could not take a large permit for within `STREAM_TIMEOUT_SECS` (§9.3). The node stops the stream's receive side and resets its send side with it. It counts no breach, and the same frame may be sent again as it is, a little later |
+
+`0x05` is new in alpha.16. `0x01` says the node has no room for the connection; `0x05` says this one stream may be sent again.
+
+**What a node of alpha.15 or alpha.14 meets from one of alpha.16.** Nothing changes on the wire for a message that fits a small message.
+
+- **A stop with `0x05`.** It comes on a push of over 144 KiB (a device of those versions pushes up to 896 KiB) while every permit it could take is held. A relay of those versions can also meet it on an older kind's fetch answer or channel list over that size, sent to a relay of alpha.16 that does not list it by key. A sender blocked in its write of the payload sees the stop (`WriteError::Stopped(0x05)`), not the reset. Those versions match only `ERR_RATE_LIMIT` (`refused_for_now`), so they take `0x05` as a request not answered and send the same batch again at their next send. Nothing else in their handling changes.
+- **Smaller windows and 8 streams,** announced by QUIC itself. A large message arrives a window at a time. A relay of those versions retries the older kind's pushes one stream for each item, and against a relay of alpha.16 that does not list it by key, most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1).
+- **Small pages.** A page from a relay of alpha.16 holds at most 128 KiB of entries and says there is more. Those versions read on from such a page as from any other, except `cordelia accept`, which reads one page of the pair channel. Where an entry of the largest size comes before the typed key's hand-over, an older device does not find the hand-over. The device being added runs alpha.16, and it reads on.
 
 ---
 
