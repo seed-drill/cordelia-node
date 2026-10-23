@@ -142,17 +142,28 @@ async fn read_exact_guarded<R: AsyncRead + Unpin>(
 pub trait GiveUp {
     /// Give the stream up. Nothing more is written on it.
     fn give_up(&mut self) {}
+
+    /// Finish the stream cleanly: what was written is sent, and the peer
+    /// sees its end. A no-op where there is nothing to finish (a stream in
+    /// memory, as the tests use).
+    fn finish_up(&mut self) {}
 }
 
 impl GiveUp for quinn::SendStream {
     fn give_up(&mut self) {
         let _ = self.reset(quinn::VarInt::from_u32(protocol::ERR_STREAM_TIMEOUT));
     }
+    fn finish_up(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 impl<R: AsyncRead, W: AsyncWrite + GiveUp> GiveUp for tokio::io::Join<R, W> {
     fn give_up(&mut self) {
         self.writer_mut().give_up()
+    }
+    fn finish_up(&mut self) {
+        self.writer_mut().finish_up()
     }
 }
 
@@ -219,23 +230,64 @@ pub async fn write_frame<W: AsyncWrite + Unpin + GiveUp>(
     write_all_guarded(writer, &payload).await
 }
 
+/// Read the four-byte length that prefixes a frame, apart from its
+/// payload, so that a caller can decide what to do by the length before
+/// the payload is read or allocated (decision 2026-10-22 (memory), rule
+/// 2): a frame longer than a small message, from an unlisted peer, is
+/// read only under a large permit. The length is bounded by
+/// MAX_MESSAGE_BYTES here, as it is for a whole-frame read, so a caller
+/// never allocates by a length straight off the wire (CLAUDE.md).
+pub async fn read_frame_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u32, CodecError> {
+    let mut len_buf = [0u8; 4];
+    read_exact_guarded(reader, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_MESSAGE_BYTES {
+        return Err(CodecError::MessageTooLarge { size: len });
+    }
+    Ok(len)
+}
+
+/// Read the payload of a frame whose length [`read_frame_len`] already
+/// read and bounded. It allocates `len` bytes: `len` is what
+/// [`read_frame_len`] returned, never a length taken straight off the
+/// wire.
+pub async fn read_frame_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: u32,
+) -> Result<Vec<u8>, CodecError> {
+    let mut payload = vec![0u8; len as usize];
+    read_exact_guarded(reader, &mut payload).await?;
+    Ok(payload)
+}
+
 /// Read a length-prefixed CBOR frame on a stream of `protocol`, and decode
 /// it as one of that stream's messages ([`decode_message`]).
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     protocol: Protocol,
 ) -> Result<WireMessage, CodecError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_guarded(reader, &mut len_buf).await?;
+    let len = read_frame_len(reader).await?;
+    let payload = read_frame_body(reader, len).await?;
+    decode_message(protocol, &payload)
+}
 
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
+/// Read a frame on a stream whose honest messages are all within a small
+/// message, refusing a longer one at its length before the payload is
+/// read or allocated (decision 2026-10-22 (memory), rule 2). On these
+/// streams (peer-sharing, channel-announce, and the older kind's sync as
+/// a node that carries none answers it) no honest message of any version
+/// is over `SMALL_MESSAGE_BYTES`, so there is no permit to wait for: a
+/// longer frame is a `MessageTooLarge`, which the caller ends the stream
+/// on.
+pub async fn read_small_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    protocol: Protocol,
+) -> Result<WireMessage, CodecError> {
+    let len = read_frame_len(reader).await?;
+    if len > protocol::SMALL_MESSAGE_BYTES {
         return Err(CodecError::MessageTooLarge { size: len });
     }
-
-    let mut payload = vec![0u8; len as usize];
-    read_exact_guarded(reader, &mut payload).await?;
-
+    let payload = read_frame_body(reader, len).await?;
     decode_message(protocol, &payload)
 }
 
@@ -254,20 +306,13 @@ pub async fn write_raw_frame<W: AsyncWrite + Unpin + GiveUp>(
     write_all_guarded(writer, payload).await
 }
 
-/// Read a raw frame, returning the CBOR bytes without decoding.
+/// Read a raw frame, returning the CBOR bytes without decoding. The length
+/// and the payload are read together ([`read_frame_len`] then
+/// [`read_frame_body`]); a caller that must decide by the length before it
+/// reads the payload reads the two apart.
 pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, CodecError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_guarded(reader, &mut len_buf).await?;
-
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
-        return Err(CodecError::MessageTooLarge { size: len });
-    }
-
-    let mut payload = vec![0u8; len as usize];
-    read_exact_guarded(reader, &mut payload).await?;
-
-    Ok(payload)
+    let len = read_frame_len(reader).await?;
+    read_frame_body(reader, len).await
 }
 
 // ── Request-response helper ──────────────────────────────────────
@@ -608,6 +653,106 @@ mod tests {
         match decoded {
             WireMessage::Pong(p) => assert_eq!(p.seq, 1),
             other => panic!("expected Pong, got {:?}", other),
+        }
+    }
+
+    /// The length of a frame can be read apart from its payload, and the
+    /// two together read the same frame as `read_raw_frame` (decision
+    /// 2026-10-22 (memory), rule 2): a caller can look at the length and
+    /// decide before it reads the payload.
+    #[tokio::test]
+    async fn a_frames_length_is_read_apart_from_its_payload() {
+        let payload = vec![0xABu8; 50_000];
+        let mut buf = Vec::new();
+        write_raw_frame(&mut buf, &payload).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let len = read_frame_len(&mut cursor).await.unwrap();
+        assert_eq!(len as usize, payload.len());
+        // Nothing of the payload has been read yet: the body is read only
+        // now, by the length just read.
+        let body = read_frame_body(&mut cursor, len).await.unwrap();
+        assert_eq!(body, payload);
+    }
+
+    /// Every message a device of this version sends or is sent fits a
+    /// small message once framed (decision 2026-10-22 (memory), rule 1):
+    /// a whole show (and a hand-over, an entry of the largest size on the
+    /// wire), and a full page or push of SMALL_PAGE_BYTES of entries with
+    /// the length of each entry around them. This is the framing the 16
+    /// KiB over a page leaves room for.
+    #[tokio::test]
+    async fn every_message_of_this_version_fits_a_small_message_framed() {
+        use protocol::{
+            ENTRY_PAGE_MAX_ENTRIES, MAX_ENTRY_WIRE_BYTES, SMALL_MESSAGE_BYTES, SMALL_PAGE_BYTES,
+        };
+        let fits = |msg: &WireMessage| {
+            let frame = encode_message(msg).unwrap().len() + 4;
+            assert!(
+                frame <= SMALL_MESSAGE_BYTES as usize,
+                "a message framed as {frame} bytes is over a small message"
+            );
+        };
+        // A whole show of an entry of the largest size on the wire (also
+        // the shape of a hand-over).
+        fits(&WireMessage::EntryShow(EntryShow {
+            entry: vec![0u8; MAX_ENTRY_WIRE_BYTES],
+        }));
+        // A full page: ENTRY_PAGE_MAX_ENTRIES entries whose wire bytes sum
+        // to a small page, each carried with its own length.
+        let each = SMALL_PAGE_BYTES / ENTRY_PAGE_MAX_ENTRIES as usize;
+        let entries: Vec<_> = (0..ENTRY_PAGE_MAX_ENTRIES)
+            .map(|_| vec![0u8; each].into())
+            .collect();
+        assert!(
+            entries.len() * each >= SMALL_PAGE_BYTES - each,
+            "the page was meant to be full"
+        );
+        fits(&WireMessage::EntryPulled(EntryPulled {
+            entries: entries.clone(),
+            next: 0,
+            mark: [0u8; 8],
+        }));
+        fits(&WireMessage::EntryPush(EntryPush { entries }));
+    }
+
+    /// On a stream whose honest messages fit a small message, a longer
+    /// frame is refused at its length, before the body is read, and one
+    /// within a small message is read as usual (decision 2026-10-22
+    /// (memory), rule 2).
+    #[tokio::test]
+    async fn a_small_frame_read_refuses_a_frame_over_a_small_message() {
+        let small = protocol::SMALL_MESSAGE_BYTES;
+        // One byte over a small message: refused at the length.
+        let mut over = Vec::new();
+        over.extend_from_slice(&(small + 1).to_be_bytes());
+        over.extend_from_slice(&[0u8; 16]); // only part of the body is present
+        let mut cursor = std::io::Cursor::new(over);
+        match read_small_frame(&mut cursor, Protocol::PeerSharing).await {
+            Err(CodecError::MessageTooLarge { size }) => assert_eq!(size, small + 1),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+        // A real, small message is read.
+        let msg = WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 });
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            read_small_frame(&mut cursor, Protocol::PeerSharing).await,
+            Ok(WireMessage::PeerShareRequest(_))
+        ));
+    }
+
+    /// A length over MAX_MESSAGE_BYTES is refused at the length, before a
+    /// payload is allocated.
+    #[tokio::test]
+    async fn a_length_over_the_most_is_refused_at_the_length() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(MAX_MESSAGE_BYTES + 1).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        match read_frame_len(&mut cursor).await {
+            Err(CodecError::MessageTooLarge { size }) => assert_eq!(size, MAX_MESSAGE_BYTES + 1),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
         }
     }
 

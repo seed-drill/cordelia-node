@@ -256,6 +256,20 @@ What it leaves out:
   answers each with an empty page, the fetch holds 19,104 bytes less at
   the last than at the first, the IDs it has let go
   (`test_each_channel_is_let_go_once_it_has_been_gone_through`).
+  **The frame it reads** (§13, decision 2026-10-22 rule 6): each answer
+  is read by its length, as a request is. Within a small message it is
+  read at once, so through the wait for its rest the fetch holds at most
+  `SMALL_MESSAGE_BYTES`; a longer one, from a peer that is not a relay
+  listed by key, only under a large permit, and while the fetch waits for
+  one it holds nothing of the frame beyond its length. Measured with a
+  counting allocator, while every permit is held and the peer has sent
+  the length of a list of a small message and one byte, and as much of
+  the rest as its pipe takes
+  (`a_long_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one`):
+  16,412 bytes, the test's pipes, where reading the answer whole, as
+  before, held 155,649: the frame's 147,457 bytes allocated at its
+  length, and the pipes. A large answer read under a permit is in the
+  permits' budget, not the connection's.
 - Quinn's own state for the connection beyond the data of its streams:
   its packets, its crypto buffer (16 KiB) and its tables.
 - What the node stores of what the connection brought, in its database.
@@ -1691,7 +1705,9 @@ left for what is around the entries, as it is around a push of the older
 kind. A page always has room for one entry, whatever its size, so a channel
 is never stuck behind an entry that fits no page. And a full page, counted
 as entries are counted, is within what one connection may be handed in a
-minute. `protocol.rs` asserts both.
+minute. `protocol.rs` asserts both. Since change F, a full page goes only
+to a relay listed by key; any other peer is given a page of at most
+`SMALL_PAGE_BYTES` (§13, decision 2026-10-22 rule 3).
 
 #### RELAY_CHANNELS_PAGE_MAX = 1000
 
@@ -2486,7 +2502,131 @@ it. An honest device sending 60 an hour never comes near it.
 
 ---
 
-*Spec version: 1.5*
+## 13. Memory Across Connections (Change F)
+
+These bound what one connection of an unlisted peer can make a relay hold,
+so that a container of 1 GiB holds a relay's whole bound of connections
+(decision 2026-10-22, "what a relay holds across its connections"). The
+rule 10 part (GRO off) is in §1 above. Its first slice added the small
+message and the large permits; its second, the small pages and the reads
+that follow them (rule 3); its third, the relay's own fetch, whose answers
+are read by their length (rule 6).
+
+### SMALL_PAGE_BYTES = 131,072 (128 KiB)
+
+**Derivation:** the least power of two that is at least
+`MAX_ENTRY_WIRE_BYTES` (65,773, an entry of the largest size on the wire).
+
+**Rationale:** the most entries, on the wire, that a page for an unlisted
+peer holds (rule 3), and that a device of this version puts in one push
+(rule 5). It holds one entry of the largest size, with smaller ones beside
+it, and not two (131,546 would not fit), so a page always has room for one
+whole entry while a page stays small. A relay gives a listed relay full
+pages (`ENTRY_PAGE_MAX_BYTES`, 896 KiB) still.
+
+**If you lower it:** fewer entries a page, so more round trips to catch a
+channel up, and at some point a single entry no longer fits (the
+compile-time check `MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES` forbids
+that). **If you raise it:** a connection holds more unread, and W grows.
+
+**What a small page costs a reader** (rule 3). `relay::pull` is given the
+most bytes by whom it answers: `SMALL_PAGE_BYTES` for a peer that is not a
+relay listed by key, `ENTRY_PAGE_MAX_BYTES` for a listed relay, on the
+stream of entries and between relays. A page that stops at its bytes holds
+at least one entry, and its place is that of its last entry, so it says
+there is more as a full page does. Every reader of a page reads on from
+the place a page reaches until a page holds nothing or leaves the place
+where it was: a device's pass (up to `RELAY_ENTRY_PULL_PAGES` pages a pass,
+on from its kept place at the next), its read with places of its own, the
+reads of a carry and a recovery (until their time is gone), the read of a
+pair channel at `cordelia accept` (up to `RELAY_ENTRY_PULL_PAGES` pages,
+from this version on) and a relay's pull from a listed relay (full pages).
+Small entries are unchanged: a page of them stops at
+`ENTRY_PAGE_MAX_ENTRIES` (100, about 49 KB) before either bound. Entries
+of the largest size go one a page where they went 13: a channel at its
+cap (`MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 252 such entries) takes 252 round
+trips where it took 20, about 50 s at 200 ms where it took 4 s. That is
+within what the pace allows: a relay hands a connection at most 30 such
+entries a minute (`PUSH_BYTES_PER_PEER_PER_MINUTE` less the room kept for
+a show), so the channel takes over 8 minutes whatever the page, and its
+round trips are 6 s of each minute.
+
+### SMALL_MESSAGE_BYTES = 147,456 (144 KiB)
+
+**Derivation:** `SMALL_PAGE_BYTES` and 16 KiB more.
+
+**Rationale:** nothing a device of this version sends or is sent is larger
+(rule 1), so a relay reads any such frame at once and its receive windows
+and reassembler are sized from it (rules 8 to 10, change F's later
+slices). A frame from an unlisted peer that is longer is read only under a
+large permit (rule 2). The 16 KiB over a page covers a page's own fields
+and the length of each of its entries, which come to well under 1 KiB for
+100 entries; it also leaves room for the other messages a device sends,
+each checked at compile time to fit: a whole show (a change entry, 32 KiB,
+and its wire overhead), a show's answer (`SHOW_ANSWER_ROOM_BYTES`, one
+entry of the largest size), and a hand-over (`MAX_ENTRY_WIRE_BYTES` on the
+wire).
+
+**If you lower it below a page plus its overhead:** a device's own page
+would need a permit, which rule 2 is built to make unnecessary.
+
+### LARGE_MESSAGES_AT_ONCE = 4
+
+**Rationale:** the large permits a node holds across all its connections
+(rule 2). A frame from an unlisted peer that is longer than a small
+message is read only under one, and at most one is held for each /24
+(IPv4) or /48 (IPv6) of the peers' addresses (`rate_limit::subnet_key`),
+so that one address cannot hold them all. A permit is held for one stream
+at a time, from before its large frame is read until its answer is
+written, at most about 20 s (10 s to read the payload and 10 s for the
+write), and let go before the stream waits for its next frame. Who needs
+one: devices of the version before, whose pushes are up to
+`ENTRY_PAGE_MAX_BYTES` (896 KiB), the older kind's larger pushes, and the
+older kind's fetch answers over `SMALL_PAGE_BYTES`, for which the permit
+is taken before the items are loaded (rule 3), and the answers to a
+relay's own fetch from a peer that is not a relay listed by key that are
+over a small message (rule 6): an honest peer's list of every channel it
+holds, past about 1,500 of them, and the entries of a page fetched from
+a relay it does not list by key, whose answer is up to a message. That
+fetch asks as it did, up to 100 headers
+a page and the entries of a page in one request, since a header carries
+no size to fit a request to; it fails where no permit comes within
+`STREAM_TIMEOUT_SECS`, refusing the stream with
+`ERR_LARGE_MESSAGE_LATER`, and the peer is asked again a rate window
+later, as after any failed fetch. There is no budget of its own over the
+relay's fetches: a peer can keep its fetch going for as long as it likes,
+so a few peers would hold every permit of one; there is one fetch from
+each peer at a time. A device of this version never needs a permit
+(rules 3 and 5).
+
+**Chosen as four:** a relay at R1 carries few devices of the version
+before, and each sends a large message only when a batch has built up;
+four let four of them go at full pace at once. Each permit holds at most a
+frame (1 MiB) while it is read, a request or page decoded where a handler
+awaits with it, and an answer encoded while it is written, so the budget
+holds about 16.25 MiB in all.
+
+**If you raise it:** more memory held for the version before, no gain once
+the older versions are gone. **If you lower it to zero:** a device of the
+version before could never push a full batch; its outbox would not drain.
+
+### ERR_LARGE_MESSAGE_LATER = 0x05
+
+**Rationale:** the QUIC application error a node resets a stream with when
+it could not take a large permit for the stream's frame within
+`STREAM_TIMEOUT_SECS` (rule 2; network-protocol.md §9). The node stops its
+receive side and resets its send side; the peer may send the same frame
+again as it is, a little later. A code of its own, because `ERR_CAPACITY`
+(0x01) says the node holds no room for the connection, which is not true
+here. It counts no breach: the peer did nothing over a limit. A device of
+the version before, blocked in its write of the payload, sees the stop
+(`WriteError::Stopped(0x05)`); it matches only `ERR_RATE_LIMIT` and so
+takes any other code, this one included, as a request not answered, and
+sends the batch again later. Nothing else in its handling changes.
+
+---
+
+*Spec version: 1.6*
 *Created: 2026-03-16*
-*Updated: 2026-10-09*
+*Updated: 2026-10-22*
 *Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md; decisions/2026-10-09-messages-between-your-own-agents.md*

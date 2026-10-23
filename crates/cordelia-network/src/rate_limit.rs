@@ -330,9 +330,16 @@ impl ConnectionTracker {
     }
 }
 
-/// Compute subnet key: /24 for IPv4, /48 for IPv6.
-fn subnet_key(addr: IpAddr) -> String {
-    match addr {
+/// Compute subnet key: /24 for IPv4, /48 for IPv6. This is how the large
+/// permits group peers' addresses too (decision 2026-10-22 (memory), rule
+/// 2): at most one permit is held for each subnet.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as a dual-stack socket
+/// hands every IPv4 peer, is canonicalised to its IPv4 form first, so
+/// that such peers are grouped by their /24 and not all lumped into one
+/// /48. This is right for the connection tracker that also calls this.
+pub fn subnet_key(addr: IpAddr) -> String {
+    match addr.to_canonical() {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
             format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])
@@ -347,6 +354,20 @@ fn subnet_key(addr: IpAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IPv4-mapped IPv6 address is grouped by its IPv4 /24, the same as
+    /// the bare IPv4 address, not lumped into one IPv6 /48 (decision
+    /// 2026-10-22 (memory), rule 2).
+    #[test]
+    fn an_ipv4_mapped_address_is_grouped_by_its_ipv4_subnet() {
+        let four: IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(subnet_key(mapped), subnet_key(four));
+        assert_eq!(subnet_key(four), "203.0.113.0/24");
+        // Two IPv4-mapped addresses in different /24s do not share a key.
+        let other: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+        assert_ne!(subnet_key(mapped), subnet_key(other));
+    }
 
     #[test]
     fn test_rate_counter_allows_within_limit() {
