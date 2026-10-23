@@ -1150,8 +1150,15 @@ pub fn prove(
 /// is held, so the same connection could have asked that.)
 ///
 /// A page holds at most ENTRY_PAGE_MAX_ENTRIES entries, and at most
-/// ENTRY_PAGE_MAX_BYTES of them as they travel, so that it fits one
-/// message. It always holds the first entry there is, whatever its size.
+/// `most_bytes` of them as they travel, and never more than
+/// ENTRY_PAGE_MAX_BYTES, so that it fits one message. The caller gives
+/// the bytes by whom it answers (decision 2026-10-22 (memory), rule 3):
+/// SMALL_PAGE_BYTES for a peer that is not a relay listed by key, so that
+/// the page fits a small message, and ENTRY_PAGE_MAX_BYTES for a listed
+/// relay. It always holds the first entry there is, whatever its size,
+/// and a page that stops at the bytes says there is more as a full page
+/// does: its place is that of the last entry it holds, and the next page
+/// starts at the entry it left out.
 pub fn pull(
     conn: &Connection,
     channel: &[u8; 32],
@@ -1159,6 +1166,7 @@ pub fn pull(
     mark: &Mark,
     after: u64,
     limit: u32,
+    most_bytes: usize,
 ) -> Result<Page, CordeliaError> {
     let mut page = Page {
         entries: Vec::new(),
@@ -1181,6 +1189,7 @@ pub fn pull(
     page.mark = holding.mark;
     page.next = after;
     let most = limit.min(ENTRY_PAGE_MAX_ENTRIES) as usize;
+    let most_bytes = most_bytes.min(ENTRY_PAGE_MAX_BYTES);
     let mut place = i64::try_from(after).unwrap_or(i64::MAX);
     let mut bytes = 0;
     while page.entries.len() < most {
@@ -1189,7 +1198,7 @@ pub fn pull(
         let last = read.len() < ask;
         for held in read {
             let travels = ENTRY_WIRE_OVERHEAD_BYTES + held.entry.content.len();
-            if !page.entries.is_empty() && bytes + travels > ENTRY_PAGE_MAX_BYTES {
+            if !page.entries.is_empty() && bytes + travels > most_bytes {
                 return Ok(page);
             }
             bytes += travels;
@@ -1482,7 +1491,7 @@ mod tests {
     use crate::{channels, db, items};
     use cordelia_core::protocol::{
         LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, MAX_ENTRY_NAME_AND_VALUE_BYTES,
-        MAX_ENTRY_WIRE_BYTES, MAX_ITEM_BYTES,
+        MAX_ENTRY_WIRE_BYTES, MAX_ITEM_BYTES, SMALL_PAGE_BYTES,
     };
     use cordelia_crypto::derive;
     use cordelia_crypto::entry::{Inside, Value};
@@ -1560,7 +1569,16 @@ mod tests {
     /// A page of channel `c`, for an asker whose place is in the holding
     /// that the relay has of it now.
     fn paged(conn: &Connection, c: u16, proved: bool, after: u64, limit: u32) -> Page {
-        pull(conn, &channel(c), proved, &mark_of(conn, c), after, limit).unwrap()
+        pull(
+            conn,
+            &channel(c),
+            proved,
+            &mark_of(conn, c),
+            after,
+            limit,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap()
     }
 
     /// An entry of channel `c` that device `d` made of `said` under `name`
@@ -2009,7 +2027,16 @@ mod tests {
             // Whatever mark it asks with: none, one it made up, and the
             // mark of the relay's holding, which it has no way to know.
             for mark in [NO_MARK, [0x4d; 8], mark_of(&conn, 1)] {
-                let unproved = pull(&conn, &channel(1), false, &mark, after, 100).unwrap();
+                let unproved = pull(
+                    &conn,
+                    &channel(1),
+                    false,
+                    &mark,
+                    after,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES,
+                )
+                .unwrap();
                 assert_eq!(
                     unproved,
                     Page {
@@ -2021,12 +2048,30 @@ mod tests {
                 );
                 assert_eq!(
                     unproved,
-                    pull(&conn, &channel(2), false, &mark, after, 100).unwrap()
+                    pull(
+                        &conn,
+                        &channel(2),
+                        false,
+                        &mark,
+                        after,
+                        100,
+                        ENTRY_PAGE_MAX_BYTES
+                    )
+                    .unwrap()
                 );
                 // Only a connection that proved a channel is told that it
                 // is not held: by the mark of no holding, and the start.
                 assert_eq!(
-                    pull(&conn, &channel(2), true, &mark, after, 100).unwrap(),
+                    pull(
+                        &conn,
+                        &channel(2),
+                        true,
+                        &mark,
+                        after,
+                        100,
+                        ENTRY_PAGE_MAX_BYTES
+                    )
+                    .unwrap(),
                     Page {
                         entries: Vec::new(),
                         next: 0,
@@ -4234,7 +4279,16 @@ mod tests {
         // asks with the mark of no holding, as it did before, and is told
         // the mark of the holding there is now.
         assert_eq!(
-            pull(&conn, &channel(3), proved, &NO_MARK, 0, 100).unwrap(),
+            pull(
+                &conn,
+                &channel(3),
+                proved,
+                &NO_MARK,
+                0,
+                100,
+                ENTRY_PAGE_MAX_BYTES
+            )
+            .unwrap(),
             Page {
                 entries: vec![(*entry).clone()],
                 next: 1,
@@ -4261,7 +4315,16 @@ mod tests {
         assert_eq!(fails, Proof::Fails);
         assert!(!fails.holds() && !fails.answer());
         assert_eq!(
-            pull(&conn, &channel(3), fails.holds(), &NO_MARK, 0, 100).unwrap(),
+            pull(
+                &conn,
+                &channel(3),
+                fails.holds(),
+                &NO_MARK,
+                0,
+                100,
+                ENTRY_PAGE_MAX_BYTES
+            )
+            .unwrap(),
             nothing
         );
         assert_eq!(used_at(&conn, 3), Some(NOW + 60));
@@ -4354,11 +4417,29 @@ mod tests {
         for after in [0, 2, 5] {
             assert_eq!(paged(&conn, 1, false, after, 100), nothing(after));
             assert_eq!(
-                pull(&conn, &channel(3), false, &mark, after, 100).unwrap(),
+                pull(
+                    &conn,
+                    &channel(3),
+                    false,
+                    &mark,
+                    after,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES
+                )
+                .unwrap(),
                 nothing(after)
             );
             assert_eq!(
-                pull(&conn, &channel(3), true, &mark, after, 100).unwrap(),
+                pull(
+                    &conn,
+                    &channel(3),
+                    true,
+                    &mark,
+                    after,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES
+                )
+                .unwrap(),
                 Page {
                     entries: Vec::new(),
                     next: 0,
@@ -4482,11 +4563,29 @@ mod tests {
         // A holder of the key pulls all of it, and keeps its place: the
         // fifth, in the holding marked so.
         let first = mark_of(&conn, 1);
-        let all = pull(&conn, &channel(1), true, &NO_MARK, 0, 100).unwrap();
+        let all = pull(
+            &conn,
+            &channel(1),
+            true,
+            &NO_MARK,
+            0,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!((all.entries.len(), all.next, all.mark), (5, 5, first));
         // With that mark and that place there is nothing more, and the
         // place and the mark stay.
-        let nothing_more = pull(&conn, &channel(1), true, &first, 5, 100).unwrap();
+        let nothing_more = pull(
+            &conn,
+            &channel(1),
+            true,
+            &first,
+            5,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             nothing_more,
             Page {
@@ -4509,7 +4608,16 @@ mod tests {
 
         // The holder asks from its place in the earlier holding. It is
         // handed the channel from the start, and told the new mark.
-        let again = pull(&conn, &channel(1), true, &first, 5, 100).unwrap();
+        let again = pull(
+            &conn,
+            &channel(1),
+            true,
+            &first,
+            5,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             again,
             Page {
@@ -4522,27 +4630,54 @@ mod tests {
         // From a place that the new count has not reached, and from one
         // that it has passed: the same, since neither is a place here.
         for after in [1, 2, 3, 5, 100, u64::MAX] {
-            let page = pull(&conn, &channel(1), true, &first, after, 100).unwrap();
+            let page = pull(
+                &conn,
+                &channel(1),
+                true,
+                &first,
+                after,
+                100,
+                ENTRY_PAGE_MAX_BYTES,
+            )
+            .unwrap();
             assert_eq!(page, again, "{after}");
         }
         // So is it for an asker with no mark, whatever place it says, and
         // for one with a mark that is no holding's.
         for mark in [NO_MARK, [0x4d; 8]] {
             for after in [0, 1, 2, 7] {
-                let page = pull(&conn, &channel(1), true, &mark, after, 100).unwrap();
+                let page = pull(
+                    &conn,
+                    &channel(1),
+                    true,
+                    &mark,
+                    after,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES,
+                )
+                .unwrap();
                 assert_eq!(page, again, "{mark:?} {after}");
             }
         }
         // And where no entry is asked for, the place that is said is the
         // start of this holding, not the place in the other.
-        let none = pull(&conn, &channel(1), true, &first, 5, 0).unwrap();
+        let none = pull(&conn, &channel(1), true, &first, 5, 0, ENTRY_PAGE_MAX_BYTES).unwrap();
         assert_eq!((none.entries.len(), none.next, none.mark), (0, 0, second));
         // In pages, the first of them from the start whatever was asked.
-        let one = pull(&conn, &channel(1), true, &first, 5, 1).unwrap();
+        let one = pull(&conn, &channel(1), true, &first, 5, 1, ENTRY_PAGE_MAX_BYTES).unwrap();
         assert_eq!((one.entries.len(), one.next, one.mark), (1, 1, second));
         // With the mark it was told, the holder goes on from its place in
         // this holding.
-        let rest = pull(&conn, &channel(1), true, &one.mark, one.next, 100).unwrap();
+        let rest = pull(
+            &conn,
+            &channel(1),
+            true,
+            &one.mark,
+            one.next,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             rest,
             Page {
@@ -4552,14 +4687,32 @@ mod tests {
                 mark: second,
             }
         );
-        let caught_up = pull(&conn, &channel(1), true, &second, 2, 100).unwrap();
+        let caught_up = pull(
+            &conn,
+            &channel(1),
+            true,
+            &second,
+            2,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             (caught_up.entries.len(), caught_up.next, caught_up.mark),
             (0, 2, second)
         );
         // A place beyond the count, in this holding, is that place still:
         // nothing is handed, and nothing is said of the start.
-        let beyond = pull(&conn, &channel(1), true, &second, 9, 100).unwrap();
+        let beyond = pull(
+            &conn,
+            &channel(1),
+            true,
+            &second,
+            9,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!((beyond.entries.len(), beyond.next), (0, 9));
 
         // A holding keeps its mark for as long as it lasts: through an
@@ -4580,7 +4733,16 @@ mod tests {
         take(&conn, &mut room, &entries[4], &from(2), NOW + 366 * DAY).unwrap();
         let third = mark_of(&conn, 1);
         assert!(third != first && third != second && third != NO_MARK);
-        let from_the_start = pull(&conn, &channel(1), true, &second, 4, 100).unwrap();
+        let from_the_start = pull(
+            &conn,
+            &channel(1),
+            true,
+            &second,
+            4,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             (
                 from_the_start.entries,
@@ -4598,7 +4760,16 @@ mod tests {
         assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
         for c in [1, 7] {
             assert_eq!(
-                pull(&conn, &channel(c), true, &third, 4, 100).unwrap(),
+                pull(
+                    &conn,
+                    &channel(c),
+                    true,
+                    &third,
+                    4,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES
+                )
+                .unwrap(),
                 Page {
                     entries: Vec::new(),
                     next: 0,
@@ -4608,7 +4779,16 @@ mod tests {
                 "{c}"
             );
             assert_eq!(
-                pull(&conn, &channel(c), false, &third, 4, 100).unwrap(),
+                pull(
+                    &conn,
+                    &channel(c),
+                    false,
+                    &third,
+                    4,
+                    100,
+                    ENTRY_PAGE_MAX_BYTES
+                )
+                .unwrap(),
                 Page {
                     entries: Vec::new(),
                     next: 4,
@@ -4699,6 +4879,88 @@ mod tests {
         assert_eq!(one.entries[0].author, device(17).public_key());
     }
 
+    /// A page holds at most the bytes it is given (decision 2026-10-22
+    /// (memory), rule 3), and at least one entry whatever its size. A
+    /// small page of a channel of the largest entries holds one; of small
+    /// entries and then large ones, it ends before the large entry that
+    /// would take it over. Where it ends, its place is that of the last
+    /// entry it holds, so the next page starts at the one it left out and
+    /// nothing is passed over. Given more than ENTRY_PAGE_MAX_BYTES, a page
+    /// is still no more than that.
+    #[test]
+    fn a_page_holds_at_most_its_bytes_and_at_least_one_entry_and_says_there_is_more() {
+        let (conn, mut room) = relay();
+        let longest = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - 1);
+        for d in 1..=13u8 {
+            let entry = made(1, d, 5, "n", &longest);
+            take(&conn, &mut room, &entry, &from(1), NOW).unwrap();
+        }
+        let travels =
+            |page: &Page| -> usize { page.entries.iter().map(|entry| entry.to_wire().len()).sum() };
+        let small_page = |c: u16, after: u64| {
+            pull(
+                &conn,
+                &channel(c),
+                true,
+                &mark_of(&conn, c),
+                after,
+                100,
+                SMALL_PAGE_BYTES,
+            )
+            .unwrap()
+        };
+        // Page after page, one entry of the largest size each, each from
+        // the place the last reached: all 13, in order.
+        let (mut after, mut read) = (0, Vec::new());
+        loop {
+            let page = small_page(1, after);
+            if page.entries.is_empty() {
+                break;
+            }
+            assert_eq!(page.entries.len(), 1);
+            assert!(travels(&page) <= SMALL_PAGE_BYTES);
+            assert_eq!(page.next, after + 1, "the page said no more than it held");
+            assert_eq!(page.cost, entry_cost(MAX_ITEM_BYTES));
+            read.extend(page.entries.iter().map(|entry| entry.author));
+            after = page.next;
+        }
+        let authors: Vec<[u8; 32]> = (1..=13).map(|d| device(d).public_key()).collect();
+        assert_eq!(read, authors);
+
+        // Small entries, then large ones: the first page holds the small
+        // ones and one large one, and ends before the next.
+        for d in 1..=3u8 {
+            take(&conn, &mut room, &small(2, d, 5), &from(1), NOW).unwrap();
+        }
+        for d in 4..=6u8 {
+            let entry = made(2, d, 5, "n", &longest);
+            take(&conn, &mut room, &entry, &from(1), NOW).unwrap();
+        }
+        let first = small_page(2, 0);
+        assert_eq!((first.entries.len(), first.next), (4, 4));
+        assert!(travels(&first) <= SMALL_PAGE_BYTES);
+        assert!(travels(&first) + MAX_ENTRY_WIRE_BYTES > SMALL_PAGE_BYTES);
+        let second = small_page(2, first.next);
+        assert_eq!(second.entries[0].author, device(5).public_key());
+
+        // Given no room at all, one entry all the same; given more than a
+        // message holds, a full page and no more.
+        let none = pull(&conn, &channel(1), true, &mark_of(&conn, 1), 0, 100, 0).unwrap();
+        assert_eq!((none.entries.len(), none.next), (1, 1));
+        let most = pull(
+            &conn,
+            &channel(1),
+            true,
+            &mark_of(&conn, 1),
+            0,
+            100,
+            usize::MAX,
+        );
+        let most = most.unwrap();
+        assert_eq!(most.entries.len(), 13);
+        assert!(travels(&most) <= ENTRY_PAGE_MAX_BYTES);
+    }
+
     // ── Old deletes ──────────────────────────────────────────────────
 
     /// A delete that the relay has held for 90 days is dropped, and one
@@ -4787,7 +5049,16 @@ mod tests {
         assert_eq!((swept.entries, swept.channels.len()), (1, 0));
         // The holding is the one it was, and the reader is handed
         // nothing more from the place it kept.
-        let nothing = pull(&conn, &channel(1), true, &mark, place, 100).unwrap();
+        let nothing = pull(
+            &conn,
+            &channel(1),
+            true,
+            &mark,
+            place,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!((nothing.entries.len(), nothing.next), (0, place));
         assert_eq!(nothing.mark, mark);
         // The next entry that is stored is handed to the reader, from
@@ -4795,14 +5066,32 @@ mod tests {
         let new = made(1, 2, 1, "new.md", "written after the sweep");
         let taken = take(&conn, &mut room, &new, &from(1), NOW + 91 * DAY).unwrap();
         assert_eq!(taken, Taken::Stored);
-        let next = pull(&conn, &channel(1), true, &mark, place, 100).unwrap();
+        let next = pull(
+            &conn,
+            &channel(1),
+            true,
+            &mark,
+            place,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(next.mark, mark, "a sweep leaves the holding its mark");
         let handed: Vec<[u8; 32]> = next.entries.iter().map(Entry::id).collect();
         assert_eq!(handed, [new.id()]);
         assert_eq!(next.next, place + 1, "above the highest place there was");
         // The reader that stood below what was swept is handed the last
         // entry that was left, and the new one: nothing is passed over.
-        let later = pull(&conn, &channel(1), true, &early.mark, early.next, 100).unwrap();
+        let later = pull(
+            &conn,
+            &channel(1),
+            true,
+            &early.mark,
+            early.next,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         let handed: Vec<[u8; 32]> = later.entries.iter().map(Entry::id).collect();
         assert_eq!(handed, [text.id(), new.id()]);
         // And whoever reads from the start is handed each entry once, in
@@ -4822,7 +5111,16 @@ mod tests {
         let read = paged(&conn, 2, true, 0, 100);
         assert_eq!((read.entries.len(), read.next), (2, 2));
         assert_eq!(sweep_deletes(&conn, NOW + 90 * DAY).unwrap().entries, 1);
-        let after = pull(&conn, &channel(2), true, &read.mark, 1, 100).unwrap();
+        let after = pull(
+            &conn,
+            &channel(2),
+            true,
+            &read.mark,
+            1,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         let handed: Vec<[u8; 32]> = after.entries.iter().map(Entry::id).collect();
         assert_eq!((handed, after.next), (vec![stays.id()], 2));
     }

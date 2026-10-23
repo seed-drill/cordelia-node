@@ -36,7 +36,8 @@ use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
     OWN_ENTRY_REQUESTS_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE, SHOW_ANSWER_ROOM_BYTES,
-    SHOW_LEAVE_SECS, SMALL_MESSAGE_BYTES, STATUS_AMBER_WAIT_SECS, WAKE_WAIT_SECS, entry_cost,
+    SHOW_LEAVE_SECS, SMALL_MESSAGE_BYTES, SMALL_PAGE_BYTES, STATUS_AMBER_WAIT_SECS, WAKE_WAIT_SECS,
+    entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -3690,6 +3691,55 @@ async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
     assert_eq!(passes(&device), (before + 1, before));
 }
 
+/// A device's pass reads a channel on from the place each page reaches
+/// (decision 2026-10-22 (memory), rule 3): from a relay of this version,
+/// which hands a device small pages of one entry of the largest size each,
+/// a channel of 13 such entries is read in 10 pages in one pass, and to
+/// its end in the next. Each page was a small one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_reads_a_channel_of_the_largest_entries_in_small_pages_to_its_end() {
+    use cordelia_core::protocol::{MAX_ENTRY_NAME_AND_VALUE_BYTES, RELAY_ENTRY_PULL_PAGES};
+    let relay = relay_started("relay", None);
+    let (mut writer, mut reader) = (Device::new("desktop"), Device::new("laptop"));
+    writer.makes_the_phrase(&phrase());
+    writer.adds(&reader);
+    for device in [&mut writer, &mut reader] {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&writer, &reader], 3).await;
+    let notes = writer.channel("notes");
+    let written: BTreeSet<[u8; 32]> = (0..13)
+        .map(|n| {
+            let file = format!("{n:02}.md");
+            let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - file.len());
+            writer.writes("notes", &file, &text).id()
+        })
+        .collect();
+    for _ in 0..10 {
+        if held_at(&relay, &notes).len() == 13 {
+            break;
+        }
+        writer.passes().await;
+    }
+    assert_eq!(held_at(&relay, &notes).len(), 13);
+
+    // One pass reads as many pages as a pass reads, one entry each.
+    let before = reader.counts("relay");
+    reader.passes().await;
+    let read = reader.counts("relay");
+    assert_eq!(RELAY_ENTRY_PULL_PAGES, 10);
+    assert_eq!(read.pulled - before.pulled, 10, "the pages were not small");
+    assert_eq!(read.pages - before.pages, 10);
+    // The next reads on from where it stopped, to the end.
+    reader.passes().await;
+    let read = reader.counts("relay");
+    assert_eq!(read.pulled - before.pulled, 13);
+    assert_eq!(read.pages - before.pages, 13);
+    assert_eq!(reader.place("relay", &notes).1, 13);
+    assert!(written.is_subset(&reader.holds_of(&notes)));
+}
+
 /// What a device takes from one relay in a minute is bounded at what a
 /// relay may hand a connection, and is counted for the relay, not for the
 /// connection: a relay that hands page after page of the largest entries
@@ -4877,8 +4927,8 @@ async fn a_hand_over_is_a_change_of_settings_only_where_it_is_taken() {
 /// The door for a typed key can do nothing else. It asks the relay
 /// nothing for a key that the device does not keep as typed, or whose
 /// hour has gone. For one it keeps, it proves the pair channel of that
-/// key and this device, and pulls that channel's first page, and makes
-/// no other request. Of what comes back, only an entry of that channel
+/// key and this device, and pulls that channel's pages from the start,
+/// and makes no other request. Of what comes back, only an entry of that channel
 /// that the typed key signed is given to `accept`: anything else is
 /// dropped, and nothing is stored. What it asks is counted with what
 /// the device asks of a relay in a minute.
@@ -4988,27 +5038,41 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
         vec![1, 2, 3],
     ]));
     let hands = handed.clone();
-    relay.pulls(move |pull| EntryPulled {
-        entries: hands
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|bytes| bytes.clone().into())
-            .collect(),
-        next: 3,
-        mark: pull.mark,
+    // All of it on the first page, and nothing after it.
+    relay.pulls(move |pull| {
+        let handed = hands.lock().unwrap();
+        match pull.after {
+            0 => EntryPulled {
+                entries: handed.iter().map(|bytes| bytes.clone().into()).collect(),
+                next: handed.len() as u64,
+                mark: [3; 8],
+            },
+            after => EntryPulled {
+                entries: Vec::new(),
+                next: after,
+                mark: [3; 8],
+            },
+        }
     });
     assert_eq!(
         asks_for_hand_over(&new, "relay", &typed).await,
         Ok(PairRead::Read(Vec::new()))
     );
+    // The proof, the first page from the start, and the next from the
+    // place the first reached, which says there is no more.
     let asked = relay.requests();
-    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked.len(), 3, "{asked:?}");
     assert!(matches!(&asked[0], WireMessage::ChannelProve(prove) if prove.channel == pair));
     match &asked[1] {
         WireMessage::EntryPull(pull) => {
             assert_eq!((pull.channel, pull.after), (pair, 0));
             assert_eq!(pull.mark, [0u8; 8], "from the start, under no mark");
+        }
+        other => panic!("not a pull: {other:?}"),
+    }
+    match &asked[2] {
+        WireMessage::EntryPull(pull) => {
+            assert_eq!((pull.channel, pull.mark, pull.after), (pair, [3; 8], 3));
         }
         other => panic!("not a pull: {other:?}"),
     }
@@ -5058,6 +5122,221 @@ async fn the_door_for_a_typed_key_proves_and_pulls_that_keys_pair_channel_and_no
     }
     assert_eq!(refused, Some(Refused::AskedEnough));
     assert!(relay.requests().len() <= OWN_ENTRY_REQUESTS_PER_MINUTE as usize);
+}
+
+/// The read of a pair channel at `accept` follows "more" (decision
+/// 2026-10-22 (memory), rule 3). A page for a device holds one entry of
+/// the largest size, and a hand-over is padded to that size: here the pair
+/// channel holds an entry of the largest size by another key ahead of the
+/// typed key's hand-over, and the stand-in pages as a relay of this
+/// version pages for a device, within SMALL_PAGE_BYTES. The hand-over is
+/// on the second page, and is found and accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pair_read_at_accept_finds_a_hand_over_behind_an_entry_of_the_largest_size() {
+    use cordelia_core::protocol::{MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ENTRY_WIRE_BYTES};
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let now = adder.now();
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        now,
+    );
+    let hand_over = added.unwrap().hand_over;
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    // Ahead of it, an entry of the largest size by another key: a small
+    // page holds it, and not the hand-over beside it.
+    let ahead = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "n",
+        Value::Text("x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - 1)),
+    );
+    let held = vec![ahead.to_wire(), hand_over.to_wire()];
+    assert_eq!(held[0].len(), MAX_ENTRY_WIRE_BYTES);
+    assert_eq!(held[1].len(), MAX_ENTRY_WIRE_BYTES, "a hand-over is padded");
+    assert!(held[0].len() + held[1].len() > SMALL_PAGE_BYTES);
+    relay.holds_what_is_proved(true);
+    relay.pulls(move |pull| small_page(&held, pull));
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    let typed = types(&new, &adder);
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    let Ok(PairRead::Read(read)) = read else {
+        panic!("{read:?}");
+    };
+    assert!(
+        matches!(read.as_slice(), [Accepted::Joined(_)]),
+        "the hand-over on the second page was not found: {read:?}"
+    );
+    assert_eq!(new.stands(), Stands::Applied);
+    // The proof, the first page, and the second from where the first
+    // ended: the key is then spent, and nothing more is asked.
+    let pulls: Vec<u64> = relay
+        .requests()
+        .iter()
+        .filter_map(|request| match request {
+            WireMessage::EntryPull(pull) => Some(pull.after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pulls, [0, 1]);
+}
+
+/// The pulls that a stand-in saw, by the place each asked after.
+fn pulls_seen(relay: &StandIn) -> Vec<u64> {
+    relay
+        .requests()
+        .iter()
+        .filter_map(|request| match request {
+            WireMessage::EntryPull(pull) => Some(pull.after),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pair read at accept stops at a page that holds entries and leaves
+/// the place where it was (decision 2026-10-22 (memory), rule 3): a relay
+/// that hands the same page whatever place is asked after is asked once,
+/// and not RELAY_ENTRY_PULL_PAGES times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pair_read_at_accept_stops_at_a_page_that_does_not_move_the_place() {
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    added.unwrap();
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    let by_another = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "n",
+        Value::Text("not by the typed key".into()),
+    )
+    .to_wire();
+    relay.holds_what_is_proved(true);
+    // The same page, under the mark and at the place that were asked
+    // with: it holds an entry, and moves nothing.
+    relay.pulls(move |pull| EntryPulled {
+        entries: vec![by_another.clone().into()],
+        next: pull.after,
+        mark: pull.mark,
+    });
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    let typed = types(&new, &adder);
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::Read(Vec::new()))
+    );
+    assert_eq!(
+        pulls_seen(&relay),
+        [0],
+        "a page that moved nothing was asked again"
+    );
+}
+
+/// Where a page of the pair read after the first fails (decision
+/// 2026-10-22 (memory), rule 3), the read ends. With nothing accepted
+/// before it, the failure is said, as the first page's would be. With a
+/// hand-over already judged, what was judged is kept and said: it is not
+/// undone. Here the hand-over is refused (the device made a phrase of its
+/// own after the key was typed), so the key still reads, and the next
+/// page is asked for, and fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pair_read_at_accept_ends_where_a_later_page_fails() {
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    let hand_over = added.unwrap().hand_over.to_wire();
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    let by_another = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "n",
+        Value::Text("not by the typed key".into()),
+    )
+    .to_wire();
+    relay.holds_what_is_proved(true);
+    // The first page holds what the test puts there; the next is reset.
+    let first = Arc::new(Mutex::new(by_another));
+    let page = first.clone();
+    relay.pulls(move |_| EntryPulled {
+        entries: vec![page.lock().unwrap().clone().into()],
+        next: 1,
+        mark: [6; 8],
+    });
+    relay.hook(|request| match request {
+        WireMessage::EntryPull(pull) if pull.after >= 1 => Some(Say::Reset),
+        _ => None,
+    });
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    // Nothing for the key on the first page: the failure of the second
+    // is said.
+    let typed = types(&new, &adder);
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    assert!(matches!(read, Err(Refused::NotAnswered(_))), "{read:?}");
+    assert_eq!(pulls_seen(&relay), [0, 1]);
+
+    // The hand-over on the first page, judged and refused: that is kept,
+    // and said, though the second page fails.
+    *first.lock().unwrap() = hand_over;
+    new.makes_the_phrase(&Phrase::parse(OTHER_WORDS).unwrap());
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    let Ok(PairRead::Read(read)) = read else {
+        panic!("what was judged before the failure was not said: {read:?}");
+    };
+    assert!(
+        matches!(read.as_slice(), [Accepted::Refused(_)]),
+        "{read:?}"
+    );
+    assert_eq!(pulls_seen(&relay), [0, 1]);
+}
+
+/// A page of `held` as a relay of this version hands one to a device
+/// (decision 2026-10-22 (memory), rule 3): from the place asked after, as
+/// many as fit SMALL_PAGE_BYTES on the wire, and at least one.
+fn small_page(held: &[Vec<u8>], pull: &EntryPull) -> EntryPulled {
+    let mark = [4; 8];
+    let after = if pull.mark == mark { pull.after } else { 0 };
+    let mut bytes = 0;
+    let entries: Vec<_> = held
+        .iter()
+        .skip(after as usize)
+        .take_while(|entry| {
+            bytes += entry.len();
+            bytes == entry.len() || bytes <= SMALL_PAGE_BYTES
+        })
+        .map(|entry| entry.clone().into())
+        .collect();
+    EntryPulled {
+        next: after + entries.len() as u64,
+        entries,
+        mark,
+    }
 }
 
 // ── The door for a carry that a person asked for ─────────────────────

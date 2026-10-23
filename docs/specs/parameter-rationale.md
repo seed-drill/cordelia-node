@@ -1691,7 +1691,9 @@ left for what is around the entries, as it is around a push of the older
 kind. A page always has room for one entry, whatever its size, so a channel
 is never stuck behind an entry that fits no page. And a full page, counted
 as entries are counted, is within what one connection may be handed in a
-minute. `protocol.rs` asserts both.
+minute. `protocol.rs` asserts both. Since change F, a full page goes only
+to a relay listed by key; any other peer is given a page of at most
+`SMALL_PAGE_BYTES` (§13, decision 2026-10-22 rule 3).
 
 #### RELAY_CHANNELS_PAGE_MAX = 1000
 
@@ -2491,8 +2493,9 @@ it. An honest device sending 60 an hour never comes near it.
 These bound what one connection of an unlisted peer can make a relay hold,
 so that a container of 1 GiB holds a relay's whole bound of connections
 (decision 2026-10-22, "what a relay holds across its connections"). The
-rule 10 part (GRO off) is in §1 above. This slice adds the small message
-and the large permits.
+rule 10 part (GRO off) is in §1 above. Its first slice added the small
+message and the large permits; its second, the small pages and the reads
+that follow them (rule 3).
 
 ### SMALL_PAGE_BYTES = 131,072 (128 KiB)
 
@@ -2510,6 +2513,28 @@ pages (`ENTRY_PAGE_MAX_BYTES`, 896 KiB) still.
 channel up, and at some point a single entry no longer fits (the
 compile-time check `MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES` forbids
 that). **If you raise it:** a connection holds more unread, and W grows.
+
+**What a small page costs a reader** (rule 3). `relay::pull` is given the
+most bytes by whom it answers: `SMALL_PAGE_BYTES` for a peer that is not a
+relay listed by key, `ENTRY_PAGE_MAX_BYTES` for a listed relay, on the
+stream of entries and between relays. A page that stops at its bytes holds
+at least one entry, and its place is that of its last entry, so it says
+there is more as a full page does. Every reader of a page reads on from
+the place a page reaches until a page holds nothing or leaves the place
+where it was: a device's pass (up to `RELAY_ENTRY_PULL_PAGES` pages a pass,
+on from its kept place at the next), its read with places of its own, the
+reads of a carry and a recovery (until their time is gone), the read of a
+pair channel at `cordelia accept` (up to `RELAY_ENTRY_PULL_PAGES` pages,
+from this version on) and a relay's pull from a listed relay (full pages).
+Small entries are unchanged: a page of them stops at
+`ENTRY_PAGE_MAX_ENTRIES` (100, about 49 KB) before either bound. Entries
+of the largest size go one a page where they went 13: a channel at its
+cap (`MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`, 252 such entries) takes 252 round
+trips where it took 20, about 50 s at 200 ms where it took 4 s. That is
+within what the pace allows: a relay hands a connection at most 30 such
+entries a minute (`PUSH_BYTES_PER_PEER_PER_MINUTE` less the room kept for
+a show), so the channel takes over 8 minutes whatever the page, and its
+round trips are 6 s of each minute.
 
 ### SMALL_MESSAGE_BYTES = 147,456 (144 KiB)
 
@@ -2541,8 +2566,10 @@ at a time, from before its large frame is read until its answer is
 written, at most about 20 s (10 s to read the payload and 10 s for the
 write), and let go before the stream waits for its next frame. Who needs
 one: devices of the version before, whose pushes are up to
-`ENTRY_PAGE_MAX_BYTES` (896 KiB), and the older kind's larger pushes. A
-device of this version never does (rules 3 and 5).
+`ENTRY_PAGE_MAX_BYTES` (896 KiB), the older kind's larger pushes, and the
+older kind's fetch answers over `SMALL_PAGE_BYTES`, for which the permit
+is taken before the items are loaded (rule 3). A device of this version
+never does (rules 3 and 5).
 
 **Chosen as four:** a relay at R1 carries few devices of the version
 before, and each sends a large message only when a batch has built up;

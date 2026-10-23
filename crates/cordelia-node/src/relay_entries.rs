@@ -38,7 +38,11 @@
 //!   channel: no entries, and the place and the mark that were asked
 //!   with. A channel that was proved and is not held is answered as no
 //!   holding, by the mark of none: whoever holds its key then knows that
-//!   nothing it sent is there.
+//!   nothing it sent is there. A page for a peer that is not a relay
+//!   listed by key holds at most SMALL_PAGE_BYTES of entries, and at least
+//!   one, so that it fits a small message; it says there is more as a
+//!   full page does (decision 2026-10-22 (memory), rule 3). A listed relay
+//!   is given full pages.
 //! - **Push** (§2.4 items 1 and 2). Each entry is checked and taken by the
 //!   store's rule, and each is answered for.
 //!
@@ -114,7 +118,7 @@ use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
     MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX,
-    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, entry_cost,
+    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
@@ -908,7 +912,25 @@ impl RelayEntries {
             return Answer::Nothing;
         };
         let limit = room.map_or(pull.limit, |room| page_limit(pull.limit, room));
-        let page = match relay::pull(&db, &pull.channel, proved, &pull.mark, pull.after, limit) {
+        // A page for a peer that is not a relay listed by key is a small
+        // one (decision 2026-10-22 (memory), rule 3): it holds at most
+        // SMALL_PAGE_BYTES of entries, so that it fits a small message, and
+        // says there is more as a full page does. A listed relay is given
+        // full pages (rule 7).
+        let most_bytes = match who.listed {
+            true => ENTRY_PAGE_MAX_BYTES,
+            false => SMALL_PAGE_BYTES,
+        };
+        let page = relay::pull(
+            &db,
+            &pull.channel,
+            proved,
+            &pull.mark,
+            pull.after,
+            limit,
+            most_bytes,
+        );
+        let page = match page {
             Ok(page) => page,
             Err(e) => {
                 tracing::warn!(peer = %who.peer, error = %e, "could not read a page of entries");
@@ -1082,12 +1104,22 @@ impl RelayEntries {
                 }
             }
             // Without the proof: the page is the one for a channel that
-            // was proved.
+            // was proved, and a full one, as for any listed relay
+            // (decision 2026-10-22 (memory), rule 7).
             WireMessage::RelayPull(pull) => {
                 let Ok(db) = db.lock() else {
                     return Answer::Nothing;
                 };
-                match relay::pull(&db, &pull.channel, true, &pull.mark, pull.after, pull.limit) {
+                let page = relay::pull(
+                    &db,
+                    &pull.channel,
+                    true,
+                    &pull.mark,
+                    pull.after,
+                    pull.limit,
+                    ENTRY_PAGE_MAX_BYTES,
+                );
+                match page {
                     Ok(page) => Answer::of(WireMessage::EntryPulled((&page).into())),
                     Err(e) => {
                         tracing::warn!(error = %e, "could not read a page of entries");
@@ -1756,6 +1788,7 @@ mod tests {
     use cordelia_core::protocol::{
         BAN_THRESHOLD, MAX_CONNECTIONS_PER_IP, MAX_ENTRY_NAME_AND_VALUE_BYTES,
         NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, PUSH_BYTES_PER_PEER_PER_MINUTE,
+        SMALL_MESSAGE_BYTES,
     };
     use cordelia_crypto::derive;
     use cordelia_crypto::entry::{Entry, Inside, Value};
@@ -3121,6 +3154,85 @@ mod tests {
         assert!(page(at.pull(2, 1, &nothing, mark, 0)).entries.is_empty());
     }
 
+    /// A page for a peer that is not a relay listed by key is a small one
+    /// (decision 2026-10-22 (memory), rule 3). Of a channel that holds 13
+    /// entries of the largest size, each page to a device holds at most
+    /// SMALL_PAGE_BYTES of entries, and at least one; its place is that of
+    /// its last entry, so the next starts at the one it left out; and its
+    /// answer fits a small message. Read on page after page, the channel
+    /// is handed whole, in order, with nothing passed over. A relay
+    /// configured by its address alone is no relay listed by key, and is
+    /// given small pages too.
+    #[test]
+    fn a_page_for_an_unlisted_peer_holds_at_most_a_small_page_and_says_there_is_more() {
+        let at = relay_of(u64::MAX, &[8]);
+        let held: Vec<CheckedEntry> = (1..=13).map(|d| largest(1, d)).collect();
+        for entry in &held {
+            at.hold(entry, NOW);
+        }
+        let mark = at.held(1).unwrap().mark;
+        let proved = having_proved(&[1]);
+        // A device, and the relay at address 200, configured by address
+        // alone.
+        for n in [1, 200] {
+            let (mut after, mut read) = (0, Vec::new());
+            loop {
+                let answer = said(at.pull(n, 1, &proved, mark, after));
+                let wire = codec::encode_message(&answer).unwrap();
+                let WireMessage::EntryPulled(page) = answer else {
+                    panic!("not a page");
+                };
+                if page.entries.is_empty() {
+                    break;
+                }
+                let bytes: usize = page.entries.iter().map(|entry| entry.len()).sum();
+                assert!(bytes <= SMALL_PAGE_BYTES, "a page of {bytes} bytes to {n}");
+                assert!(wire.len() <= SMALL_MESSAGE_BYTES as usize, "{}", wire.len());
+                // One entry of the largest size, and not two.
+                assert_eq!(page.entries.len(), 1);
+                // It says there is more: its place is its last entry's.
+                assert_eq!(page.next, after + 1);
+                read.extend(page.entries.iter().map(|entry| entry.to_vec()));
+                after = page.next;
+            }
+            let stored: Vec<Vec<u8>> = held.iter().map(|entry| entry.to_wire()).collect();
+            assert_eq!(read, stored, "the channel was not handed whole to {n}");
+        }
+    }
+
+    /// A relay listed by key keeps full pages (decision 2026-10-22
+    /// (memory), rules 3 and 7): of a channel of 13 entries of the largest
+    /// size, a pull on the stream of entries and a pull between relays
+    /// each hand all 13 in one page, up to ENTRY_PAGE_MAX_BYTES, and not a
+    /// small page.
+    #[test]
+    fn a_page_for_a_relay_listed_by_key_is_not_cut_to_a_small_page() {
+        let at = relay_of(u64::MAX, &[8]);
+        for d in 1..=13 {
+            at.hold(&largest(1, d), NOW);
+        }
+        let mark = at.held(1).unwrap().mark;
+        let pulled = page(at.pull(8, 1, &having_proved(&[1]), mark, 0));
+        let between = page(at.answer(
+            8,
+            Protocol::RelayEntries,
+            WireMessage::RelayPull(RelayPull {
+                channel: channel(1),
+                mark,
+                after: 0,
+                limit: 100,
+            }),
+            None,
+            &mut Proved::default(),
+        ));
+        for page in [pulled, between] {
+            let bytes: usize = page.entries.iter().map(|entry| entry.len()).sum();
+            assert_eq!(page.entries.len(), 13, "a listed relay's page was cut");
+            assert!(bytes > SMALL_PAGE_BYTES && bytes <= ENTRY_PAGE_MAX_BYTES);
+            assert_eq!(page.next, 13);
+        }
+    }
+
     /// A pull of a channel that was not proved on the connection is
     /// answered from the connection's memory, and the store is not asked:
     /// the answer comes while the database is held by another. It is the
@@ -3168,7 +3280,16 @@ mod tests {
 
         // And the answer is the one that the store gives for a channel
         // that is not held, or was not proved.
-        let stores = relay::pull(&lock(&at.db), &channel(1), false, &[9; 8], 7, 100).unwrap();
+        let stores = relay::pull(
+            &lock(&at.db),
+            &channel(1),
+            false,
+            &[9; 8],
+            7,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             page(at.pull(1, 1, &nothing_proved, [9; 8], 7)),
             EntryPulled::from(&stores)
@@ -3303,16 +3424,17 @@ mod tests {
         let mut mark = relay::NO_MARK;
         let mut after = 0;
         let mut handed = Vec::new();
-        // Whole pages while there is room for the most a page can be
-        // counted at: 13 of the largest are what one message holds.
-        // Then as many as fit beside the room that is left for the
-        // answer to a show, which is one entry of the largest size.
-        for _ in 0..3 {
+        // A page for a device is a small one, which holds one of the
+        // largest (decision 2026-10-22 (memory), rule 3). Pages are handed
+        // until what is left of the minute, beside the room that is left
+        // for the answer to a show (one entry of the largest size), holds
+        // no other.
+        for _ in 0..30 {
             let page = page(at.pull(1, 1, &proved, mark, after));
             handed.push(page.entries.len());
             (mark, after) = (page.mark, page.next);
         }
-        assert_eq!(handed, [13, 13, 4]);
+        assert_eq!(handed, [1; 30]);
         assert_eq!(at.fetch_room(1), MINUTE - 30 * LARGEST);
         assert!(at.fetch_room(1) >= LARGEST);
         assert!(at.fetch_room(1) < 2 * LARGEST);
@@ -3344,7 +3466,7 @@ mod tests {
 
         // Another connection, at another address, has an allowance of its
         // own.
-        assert_eq!(page(at.pull(2, 1, &proved, mark, after)).entries.len(), 10);
+        assert_eq!(page(at.pull(2, 1, &proved, mark, after)).entries.len(), 1);
     }
 
     /// A pull leaves room for the answer to a show (decision 2026-10-04
@@ -4291,8 +4413,16 @@ mod tests {
         this.entries.pull_from(&link, peer(8), &this.db).await;
         assert_eq!(link.pulls(), [(channel(2), other.held(2).unwrap().mark, 2)]);
         assert_eq!(this.held(2).unwrap().bytes, 3 * SMALL);
-        let here =
-            relay::pull(&lock(&this.db), &channel(2), true, &relay::NO_MARK, 0, 100).unwrap();
+        let here = relay::pull(
+            &lock(&this.db),
+            &channel(2),
+            true,
+            &relay::NO_MARK,
+            0,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         let mut revs: Vec<u64> = here.entries.iter().map(|entry| entry.rev).collect();
         revs.sort();
         assert_eq!(revs, [5, 5, 6]);
@@ -4381,8 +4511,16 @@ mod tests {
         // entry.
         this.entries.pull_from(&link, peer(8), &this.db).await;
         assert_eq!(link.pulls(), [(channel(1), mark, 2)]);
-        let here =
-            relay::pull(&lock(&this.db), &channel(1), true, &relay::NO_MARK, 0, 100).unwrap();
+        let here = relay::pull(
+            &lock(&this.db),
+            &channel(1),
+            true,
+            &relay::NO_MARK,
+            0,
+            100,
+            ENTRY_PAGE_MAX_BYTES,
+        )
+        .unwrap();
         assert!(here.entries.iter().any(|entry| entry.id() == new.id()));
     }
 
@@ -5188,7 +5326,9 @@ mod tests {
             Ok(WireMessage::EntryPull(_))
         ));
         // A pull of a channel that was proved, whose answer is a page of
-        // twelve entries of the largest size.
+        // twelve entries of the largest size: asked by a relay listed by
+        // key, which is given full pages (decision 2026-10-22 (memory),
+        // rule 7). Anyone else is given a small one.
         let full = pull_of(1);
         // A push of twelve entries of the largest size, whose answer says
         // one word of each.
@@ -5221,7 +5361,11 @@ mod tests {
                 true,
             ),
         ] {
-            let relay = relay();
+            // The asker of the full page is listed by key.
+            let relay = match large {
+                true => relay_of(u64::MAX, &[1]),
+                false => relay(),
+            };
             for d in 1..=12 {
                 relay.hold(&largest(1, d), NOW);
             }
