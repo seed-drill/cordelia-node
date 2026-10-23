@@ -2467,9 +2467,12 @@ mod tests {
         assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, 36_864);
         assert_eq!(QUIC_RECEIVE_WINDOW, 294_912);
         assert_eq!(QUIC_RECEIVE_WINDOW, 2 * SMALL_MESSAGE_BYTES);
-        // Enforced at compile time beside the constants; restated here.
-        const _: () =
-            assert!(QUIC_STREAM_RECEIVE_WINDOW * QUIC_MAX_BIDI_STREAMS <= QUIC_RECEIVE_WINDOW);
+        // Every stream within the connection's window together, which is
+        // enforced at compile time beside the constants, and here exactly.
+        assert_eq!(
+            QUIC_STREAM_RECEIVE_WINDOW * QUIC_MAX_BIDI_STREAMS,
+            QUIC_RECEIVE_WINDOW
+        );
     }
 
     #[test]
