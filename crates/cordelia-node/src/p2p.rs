@@ -1182,6 +1182,86 @@ struct FetchFrom {
     kept: std::sync::Arc<std::sync::Mutex<Kept>>,
     repush_tx: tokio::sync::mpsc::UnboundedSender<(cordelia_network::messages::Item, NodeId)>,
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
+    /// The node's large permits, under which an answer longer than a small
+    /// message is read (decision 2026-10-22 (memory), rule 6). `None` for
+    /// a test that does not exercise them.
+    permits: Option<std::sync::Arc<LargePermits>>,
+    /// Whether the peer is a relay this node lists by key, whose answers
+    /// are read whole whatever their size (rule 7). A relay configured by
+    /// address alone is not: it is not `limited`, but its large answers
+    /// still wait for a permit, since an address is not an identity.
+    listed_by_key: bool,
+}
+
+/// One answer read on the relay's own fetch (decision 2026-10-22 (memory),
+/// rule 6).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one answer at a time, taken apart where it is read: a box would cost an allocation an answer"
+)]
+enum Answer<'p> {
+    /// The answer, with the large permit held for a frame longer than a
+    /// small message. The caller lets the permit go once it is done with
+    /// the answer, before it writes its next request: one for the stream at
+    /// a time.
+    Message(
+        cordelia_network::messages::WireMessage,
+        Option<LargePermit<'p>>,
+    ),
+    /// A frame longer than a small message, and no permit within
+    /// STREAM_TIMEOUT: the fetch fails, and the peer is asked again as
+    /// after any failed fetch.
+    LargeLater,
+    /// The request could not be written.
+    Unsent,
+    /// The answer could not be read, or decoded.
+    Failed,
+}
+
+/// Write one request of the relay's own fetch, and read its answer by its
+/// length (decision 2026-10-22 (memory), rule 6), as rule 2 reads a
+/// request: a frame within a small message is read at once; a longer one,
+/// from a peer that is not a relay listed by key, only under a large
+/// permit, the stream waiting unread meanwhile. The request is encoded and
+/// dropped before it is written, and the encoding dropped before the
+/// answer is waited for: through each wait the fetch holds the frame being
+/// read, a small message, or nothing while it waits for a permit.
+async fn ask<'p, W, R>(
+    send: &mut W,
+    recv: &mut R,
+    request: cordelia_network::messages::WireMessage,
+    permits: Option<&'p LargePermits>,
+    address: std::net::IpAddr,
+    listed_by_key: bool,
+) -> Answer<'p>
+where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let written = cordelia_network::codec::encode_message(&request);
+    drop(request);
+    let Ok(written) = written else {
+        return Answer::Unsent;
+    };
+    if cordelia_network::codec::write_raw_frame(send, &written)
+        .await
+        .is_err()
+    {
+        return Answer::Unsent;
+    }
+    drop(written);
+    let (frame, permit) = match read_under_permit(recv, permits, address, listed_by_key).await {
+        Framed::Frame(frame, permit) => (frame, permit),
+        Framed::LargeLater => return Answer::LargeLater,
+        Framed::Ended => return Answer::Failed,
+    };
+    match cordelia_network::codec::decode_message(
+        cordelia_network::messages::Protocol::ItemSync,
+        &frame,
+    ) {
+        Ok(answer) => Answer::Message(answer, permit),
+        Err(_) => Answer::Failed,
+    }
 }
 
 /// Fetch from one peer what this node lacks: one stream, every channel in
@@ -1215,13 +1295,31 @@ async fn fetch_from(conn: quinn::Connection, from: FetchFrom) -> (Fetched, u64) 
 /// anything and has more). The page itself is dropped before the fetch is
 /// sent: a peer can make each wait up to STREAM_TIMEOUT_SECS on the length
 /// and as long again on the rest, and be asked again at the next cycle.
+///
+/// Each answer is read by its length (decision 2026-10-22 (memory), rule
+/// 6, [`ask`]): within a small message at once, and a longer one, from a
+/// peer that is not a relay listed by key, only under a large permit. So
+/// through a wait the fetch holds the frame of a small message at most, or
+/// nothing while it waits for a permit; a large answer is in G, the
+/// permits' budget. Where no permit comes within STREAM_TIMEOUT, the
+/// stream is refused with ERR_LARGE_MESSAGE_LATER, as rule 2 refuses a
+/// request, and the fetch fails: the peer is asked again as after any
+/// failed fetch ([`next_ask`]). It asks as before: up to 100 headers a
+/// page, and the entries of a page in one fetch, since a header carries no
+/// size to fit a request to.
 async fn fetch_on<W, R>(send: &mut W, recv: &mut R, from: FetchFrom) -> (Fetched, u64)
 where
-    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
-    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite
+        + Unpin
+        + cordelia_network::codec::GiveUp
+        + crate::relay_entries::Refuse,
+    R: tokio::io::AsyncRead + Unpin + crate::relay_entries::Refuse,
 {
     use cordelia_core::protocol::{MAX_ITEM_BYTES, SYNC_PAGE_STEPS, entry_cost};
     use cordelia_network::item_sync;
+    use cordelia_network::messages::{
+        FetchRequest, SyncChannelListRequest, SyncRequest, WireMessage,
+    };
     const PAGES: usize = 10;
 
     let FetchFrom {
@@ -1236,10 +1334,21 @@ where
         kept,
         repush_tx,
         seen_table,
+        permits,
+        listed_by_key,
     } = from;
+    let permits = permits.as_deref();
     let is_relay_node = role == "relay";
     let lock_rates = || rates.lock().unwrap_or_else(|e| e.into_inner());
     let lock_kept = || kept.lock().unwrap_or_else(|e| e.into_inner());
+    // How many channels of this peer are asked about, and a place and a
+    // page size kept for. A relay it lists holds as many channels as this
+    // node does.
+    let most = if limited {
+        cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER
+    } else {
+        usize::MAX
+    };
 
     if let Err(e) = cordelia_network::codec::write_protocol_byte(
         &mut *send,
@@ -1251,24 +1360,34 @@ where
         return (Fetched::Failed, 0);
     }
 
-    // Phase 0 (§4.5): a relay asks the peer which channels it holds.
+    // Phase 0 (§4.5): a relay asks the peer which channels it holds. An
+    // honest peer lists every channel it holds, which can be over a small
+    // message: read under a permit, its first `most` are kept (rule 6).
     let channels = if ask_what_it_holds {
-        let listed = match item_sync::send_channel_list_request(&mut *send, &mut *recv).await {
-            Ok(resp) => resp.channel_ids,
-            Err(e) => {
-                tracing::debug!(peer = %target, error = %e, "phase0 channel list request failed");
+        let request = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
+        let (listed, permit) = match ask(send, recv, request, permits, address, listed_by_key).await
+        {
+            Answer::Message(WireMessage::SyncChannelListResponse(resp), permit) => {
+                (resp.channel_ids, permit)
+            }
+            Answer::LargeLater => {
+                tracing::debug!(peer = %target, "a channel list over a small message, and no permit for now; the fetch fails");
+                refuse_large_later(send, recv);
+                return (Fetched::Failed, 0);
+            }
+            _ => {
+                tracing::debug!(peer = %target, "phase0 channel list request failed");
                 if limited {
                     return (Fetched::Failed, 0);
                 }
-                Vec::new()
+                (Vec::new(), None)
             }
         };
-        let most = if limited {
-            cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER
-        } else {
-            usize::MAX
-        };
-        channels_to_ask(channels, listed, most)
+        let channels = channels_to_ask(channels, listed, most);
+        // The list is let go, and its permit with it, before the first
+        // page is asked for.
+        drop(permit);
+        channels
     } else {
         channels
     };
@@ -1280,13 +1399,6 @@ where
     let max_bytes = lock_rates().relay_max_bytes;
     let mut fetched = Fetched::All;
     let mut total_stored: u64 = 0;
-    // How many channels of this peer a place, and a page size, is kept
-    // for. A relay it lists holds as many channels as this node does.
-    let most = if limited {
-        cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER
-    } else {
-        usize::MAX
-    };
     // Each channel's ID is let go once it has been gone through.
     'channels: for ch_id in channels {
         let ch_id: &str = &ch_id;
@@ -1336,12 +1448,24 @@ where
                 break 'channels;
             }
             let limit = SYNC_PAGE_STEPS[step].min(u32::try_from(fit).unwrap_or(u32::MAX));
-            let resp = match item_sync::send_sync_page(&mut *send, &mut *recv, ch_id, after, limit)
+            let request = WireMessage::SyncRequest(SyncRequest {
+                channel_id: ch_id.to_string(),
+                since: None,
+                limit,
+                after_seq: Some(after),
+            });
+            let (resp, permit) = match ask(send, recv, request, permits, address, listed_by_key)
                 .await
             {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(peer = %target, channel = %ch_id, error = %e, "sync request failed");
+                Answer::Message(WireMessage::SyncResponse(resp), permit) => (resp, permit),
+                Answer::LargeLater => {
+                    tracing::debug!(peer = %target, channel = %ch_id, "a page over a small message, and no permit for now; the fetch fails");
+                    refuse_large_later(send, recv);
+                    fetched = Fetched::Failed;
+                    break 'channels;
+                }
+                _ => {
+                    tracing::debug!(peer = %target, channel = %ch_id, "sync request failed");
                     fetched = Fetched::Failed;
                     break 'channels;
                 }
@@ -1411,24 +1535,53 @@ where
                     }
                 }
             }
+            // The page's permit, where it was over a small message, goes
+            // with it: one for the stream at a time.
             drop(resp);
+            drop(permit);
             fetch_ids.shrink_to_fit();
 
             // The page is not passed if the relay had no room for the
             // channel: it is asked for again.
             let mut not_taken = false;
             if !fetch_ids.is_empty() {
-                if let Err(e) = item_sync::send_fetch_request(&mut *send, &fetch_ids).await {
-                    tracing::debug!(peer = %target, error = %e, "fetch request failed");
-                    fetched = Fetched::Failed;
-                    break 'channels; // Stream corrupted
-                }
-                let mut items = match item_sync::read_fetch_response(&mut *recv).await {
-                    Ok(items) => items,
-                    Err(e) => {
+                // The entries of the page in one fetch, however many: a
+                // fetch of small entries is one small message, and only a
+                // large answer waits for a permit (rule 6).
+                let request = WireMessage::FetchRequest(FetchRequest {
+                    item_ids: fetch_ids.clone(),
+                });
+                // The permit, where the answer is over a small message, is
+                // held while its entries are stored, and let go at the end
+                // of this block, before the next page is asked for.
+                let (mut items, _permit) = match ask(
+                    send,
+                    recv,
+                    request,
+                    permits,
+                    address,
+                    listed_by_key,
+                )
+                .await
+                {
+                    Answer::Message(WireMessage::FetchResponse(answer), permit) => {
+                        (answer.items, permit)
+                    }
+                    Answer::Unsent => {
+                        tracing::debug!(peer = %target, "fetch request failed");
+                        fetched = Fetched::Failed;
+                        break 'channels; // Stream corrupted
+                    }
+                    Answer::LargeLater => {
+                        tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), "a fetch answer over a small message, and no permit for now; the fetch fails");
+                        refuse_large_later(send, recv);
+                        fetched = Fetched::Failed;
+                        break 'channels;
+                    }
+                    _ => {
                         // The page's entries could not be fetched in
                         // one message: ask for fewer next time.
-                        tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), error = %e, "fetch response failed; asking for fewer next time");
+                        tracing::debug!(peer = %target, channel = %ch_id, asked = fetch_ids.len(), "fetch response failed; asking for fewer next time");
                         step = (step + 1).min(SYNC_PAGE_STEPS.len() - 1);
                         let place = Place {
                             after,
@@ -3422,6 +3575,14 @@ pub async fn p2p_loop(
                         kept: sync_kept.clone(),
                         repush_tx: repush_tx.clone(),
                         seen_table: seen_table.clone(),
+                        // Its answers longer than a small message are read
+                        // under the large permits, unless it is a relay
+                        // listed by key (decision 2026-10-22 (memory),
+                        // rules 6 and 7).
+                        permits: Some(large_permits.clone()),
+                        listed_by_key: relay_entries
+                            .as_ref()
+                            .is_some_and(|entries| entries.lists(target)),
                     };
                     let conn = conn.clone();
                     let gtx = gov_tx.clone();
@@ -6940,6 +7101,8 @@ mod tests {
             kept: Default::default(),
             repush_tx,
             seen_table: Default::default(),
+            permits: None,
+            listed_by_key: false,
         };
         // A pipe each way, small, so that what a pipe keeps for itself is
         // small.
@@ -7041,6 +7204,8 @@ mod tests {
             kept: Default::default(),
             repush_tx,
             seen_table: Default::default(),
+            permits: None,
+            listed_by_key: false,
         };
         let (mut node_w, mut peer_r) = tokio::io::duplex(8 * 1024);
         let (mut peer_w, mut node_r) = tokio::io::duplex(8 * 1024);
@@ -7072,6 +7237,323 @@ mod tests {
             held <= -let_go + 4 * 1024,
             "the relay holds {held} bytes more at the last channel than at the first"
         );
+    }
+
+    // ── The relay's own fetch (decision 2026-10-22 (memory), rule 6) ──
+
+    /// A relay's fetch from a peer at 192.0.2.9, which it asks which
+    /// channels it holds.
+    fn a_relays_fetch(
+        permits: &std::sync::Arc<LargePermits>,
+        limited: bool,
+        listed_by_key: bool,
+    ) -> FetchFrom {
+        let (repush_tx, _repush_rx) = tokio::sync::mpsc::unbounded_channel();
+        FetchFrom {
+            target: NodeId([9; 32]),
+            state: a_state(),
+            role: "relay".into(),
+            channels: Vec::new(),
+            ask_what_it_holds: true,
+            limited,
+            address: std::net::IpAddr::from([192, 0, 2, 9]),
+            rates: std::sync::Arc::new(std::sync::Mutex::new(Rates::new(u64::MAX))),
+            kept: Default::default(),
+            repush_tx,
+            seen_table: Default::default(),
+            permits: Some(permits.clone()),
+            listed_by_key,
+        }
+    }
+
+    /// Every large permit, each held from a /24 of its own, none the
+    /// fetched peer's.
+    fn every_permit_held(permits: &LargePermits) -> Vec<LargePermit<'_>> {
+        (0..cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE)
+            .map(|n| {
+                futures_lite_block(permits.take(std::net::IpAddr::from([10, n as u8, 0, 1])))
+                    .expect("a permit free")
+            })
+            .collect()
+    }
+
+    /// What a peer saw of a relay's fetch from it.
+    struct Asked {
+        /// How the fetch ended.
+        fetched: Fetched,
+        /// How long it took, on the test's clock.
+        took: std::time::Duration,
+        /// The channels it asked a page of, in order.
+        pages: Vec<String>,
+        /// How many IDs each of its fetches asked for, in order.
+        fetches: Vec<usize>,
+    }
+
+    /// Run `from` against a peer that answers it: with `listed` for the
+    /// channel list, a page of 100 small headers for the first channel
+    /// asked about and an empty page for every other, and an empty answer
+    /// to each fetch. Each answer is within a small message, but for a list
+    /// that is not.
+    async fn a_peer_answers(from: FetchFrom, listed: &[String]) -> Asked {
+        use cordelia_network::codec::{encode_message, read_frame, write_raw_frame};
+        use cordelia_network::messages::{
+            FetchResponse, ItemHeader, Protocol, SyncChannelListResponse, SyncResponse, WireMessage,
+        };
+        use tokio::io::AsyncReadExt;
+
+        let (mut node_w, mut peer_r) = tokio::io::duplex(8 * 1024);
+        let (mut peer_w, mut node_r) = tokio::io::duplex(8 * 1024);
+        let start = tokio::time::Instant::now();
+        let node = fetch_on(&mut node_w, &mut node_r, from);
+        tokio::pin!(node);
+        let pages = std::cell::RefCell::new(Vec::<String>::new());
+        let fetches = std::cell::RefCell::new(Vec::<usize>::new());
+        let peer = async {
+            assert_eq!(peer_r.read_u8().await.unwrap(), 0x05);
+            loop {
+                let answer = match read_frame(&mut peer_r, Protocol::ItemSync).await {
+                    Ok(WireMessage::SyncChannelListRequest(_)) => {
+                        WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                            channel_ids: listed.to_vec(),
+                        })
+                    }
+                    Ok(WireMessage::SyncRequest(asked)) => {
+                        let first = pages.borrow().is_empty();
+                        pages.borrow_mut().push(asked.channel_id.clone());
+                        let items = if first {
+                            (0..100)
+                                .map(|i| ItemHeader {
+                                    item_id: format!("ci_{i:0>60}"),
+                                    channel_id: asked.channel_id.clone(),
+                                    item_type: "memory".into(),
+                                    content_hash: vec![0xa1; 32],
+                                    author_id: vec![0xa2; 32],
+                                    signature: vec![0xa3; 64],
+                                    key_version: 1,
+                                    published_at: "2026-10-22T00:00:00Z".into(),
+                                    is_tombstone: false,
+                                    parent_id: None,
+                                    slot: None,
+                                    rev: None,
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        WireMessage::SyncResponse(SyncResponse {
+                            items,
+                            has_more: false,
+                            last_seq: Some(100),
+                        })
+                    }
+                    Ok(WireMessage::FetchRequest(asked)) => {
+                        fetches.borrow_mut().push(asked.item_ids.len());
+                        WireMessage::FetchResponse(FetchResponse { items: vec![] })
+                    }
+                    other => panic!("the relay asked what a fetch does not: {other:?}"),
+                };
+                let answer = encode_message(&answer).unwrap();
+                write_raw_frame(&mut peer_w, &answer).await.unwrap();
+            }
+        };
+        let fetched = tokio::select! {
+            ended = &mut node => ended.0,
+            () = peer => unreachable!("the peer answers until the fetch ends"),
+        };
+        Asked {
+            fetched,
+            took: start.elapsed(),
+            pages: pages.into_inner(),
+            fetches: fetches.into_inner(),
+        }
+    }
+
+    /// An answer within a small message is read at once, with every large
+    /// permit held (decision 2026-10-22 (memory), rule 6): the fetch reads
+    /// its answers by their length, and a list, a page of 100 headers and
+    /// a fetch's answer each fit a small message.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_reads_an_answer_within_a_small_message_with_every_permit_held() {
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let _held = every_permit_held(&permits);
+        let channel = "grp_00000000-0000-4000-8000-00000000000a".to_string();
+        let asked = a_peer_answers(a_relays_fetch(&permits, true, false), &[channel]).await;
+        assert_eq!(
+            asked.fetched,
+            Fetched::All,
+            "the fetch did not read its answers"
+        );
+        assert!(
+            asked.took < cordelia_network::codec::STREAM_TIMEOUT,
+            "the fetch waited {:?} for answers within a small message",
+            asked.took
+        );
+        assert_eq!(
+            asked.fetches,
+            vec![100],
+            "the page's entries were not fetched"
+        );
+    }
+
+    /// The fetch asks as it did before rule 6: up to 100 headers a page,
+    /// and the entries of a page in one fetch, not one entry a request
+    /// (decision 2026-10-22 (memory), rule 6). A header carries no size, so
+    /// a request cannot be fitted to the sizes of what it asks; read by its
+    /// length, a fetch of small entries stays one small message.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_of_100_headers_is_fetched_in_one_request() {
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let channel = "grp_00000000-0000-4000-8000-00000000000a".to_string();
+        let asked = a_peer_answers(a_relays_fetch(&permits, true, false), &[channel]).await;
+        assert_eq!(asked.fetched, Fetched::All);
+        assert_eq!(
+            asked.fetches,
+            vec![100],
+            "a page of 100 headers was not fetched in one request of 100"
+        );
+    }
+
+    /// A channel list longer than a small message, from a peer that is
+    /// not a relay listed by key, waits unread for a large permit
+    /// (decision 2026-10-22 (memory), rules 2 and 6). With every permit
+    /// held, the fetch reads the list's length and nothing of its body:
+    /// nothing of the frame's size is allocated while it waits. After
+    /// STREAM_TIMEOUT it fails, and the peer is asked again as after any
+    /// failed fetch, a rate window later.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one() {
+        use cordelia_core::protocol::{RATE_WINDOW_SECS, SMALL_MESSAGE_BYTES};
+        use cordelia_network::codec::{STREAM_TIMEOUT, read_raw_frame, write_raw_frame};
+        use tokio::io::AsyncReadExt;
+
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let _held = every_permit_held(&permits);
+        // A frame of a small message and one byte, made before anything
+        // is counted.
+        let long = vec![0x5a; SMALL_MESSAGE_BYTES as usize + 1];
+
+        let (mut node_w, mut peer_r) = tokio::io::duplex(8 * 1024);
+        let (mut peer_w, mut node_r) = tokio::io::duplex(8 * 1024);
+        let start = tokio::time::Instant::now();
+        let node = fetch_on(
+            &mut node_w,
+            &mut node_r,
+            a_relays_fetch(&permits, true, false),
+        );
+        let peer = async {
+            assert_eq!(peer_r.read_u8().await.unwrap(), 0x05);
+            let _ = read_raw_frame(&mut peer_r).await.unwrap();
+            let before = counting::live();
+            // The length, and as much of the rest as the pipe takes: the
+            // relay has read the length and is waiting for a permit.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                write_raw_frame(&mut peer_w, &long),
+            )
+            .await;
+            counting::live() - before
+        };
+        // Both on this thread, polled in turn.
+        let ((fetched, _), held) = tokio::join!(node, peer);
+        let took = start.elapsed();
+        println!("held while the relay waits for a permit: {held} bytes");
+        assert!(
+            held < 32 * 1024,
+            "the relay holds {held} bytes of an answer it has no permit for"
+        );
+        assert_eq!(
+            fetched,
+            Fetched::Failed,
+            "a fetch with no permit did not fail"
+        );
+        assert!(
+            took >= STREAM_TIMEOUT,
+            "the fetch gave up after {took:?}, before STREAM_TIMEOUT"
+        );
+        let now = std::time::Instant::now();
+        assert_eq!(
+            next_ask(fetched, std::time::Duration::from_secs(600), now),
+            Some(now + std::time::Duration::from_secs(RATE_WINDOW_SECS)),
+            "the peer is not asked again as after a failed fetch"
+        );
+    }
+
+    /// The channel IDs a peer lists, each of the longest length: 1,600 of
+    /// them, which with their lengths are longer than a small message.
+    fn a_long_list() -> Vec<String> {
+        use cordelia_core::protocol::{MAX_CHANNEL_ID_LEN, SMALL_MESSAGE_BYTES};
+        use cordelia_network::messages::{SyncChannelListResponse, WireMessage};
+        let ids: Vec<String> = (0..1600)
+            .map(|n| format!("grp_{n:0>width$}", width = MAX_CHANNEL_ID_LEN - 4))
+            .collect();
+        let encoded = cordelia_network::codec::encode_message(
+            &WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                channel_ids: ids.clone(),
+            }),
+        )
+        .unwrap();
+        assert!(encoded.len() > SMALL_MESSAGE_BYTES as usize);
+        ids
+    }
+
+    /// An honest peer lists every channel it holds, which can be longer
+    /// than a small message (decision 2026-10-22 (memory), rule 6): with a
+    /// permit free, the list is read under it, the first
+    /// MAX_CHANNELS_ASKED_OF_A_PEER of the IDs are kept and asked about,
+    /// each once, and the permit is given back.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_channel_list_is_read_under_a_permit_and_its_first_are_kept() {
+        use cordelia_core::protocol::{LARGE_MESSAGES_AT_ONCE, MAX_CHANNELS_ASKED_OF_A_PEER};
+        let permits = std::sync::Arc::new(LargePermits::new(LARGE_MESSAGES_AT_ONCE));
+        let listed = a_long_list();
+        let asked = a_peer_answers(a_relays_fetch(&permits, true, false), &listed).await;
+        assert_eq!(asked.fetched, Fetched::All, "the long list was not read");
+        let distinct: std::collections::HashSet<&String> = asked.pages.iter().collect();
+        assert_eq!(
+            asked.pages.len(),
+            MAX_CHANNELS_ASKED_OF_A_PEER,
+            "the relay asked about {} of the {} channels listed",
+            asked.pages.len(),
+            listed.len()
+        );
+        assert_eq!(distinct.len(), asked.pages.len(), "a channel asked twice");
+        assert!(asked.pages.iter().all(|asked| listed.contains(asked)));
+        // Every permit is free again: the list's was let go.
+        let all: Vec<_> = (0..LARGE_MESSAGES_AT_ONCE)
+            .map(|n| std::net::IpAddr::from([10, n as u8, 0, 1]))
+            .collect();
+        for address in all {
+            assert!(
+                permits.take(address).await.is_some(),
+                "the list's permit was not given back"
+            );
+        }
+    }
+
+    /// A relay listed by key is outside rule 6 (rule 7): its list longer
+    /// than a small message is read at once with every permit held, and
+    /// every channel in it is asked about.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_listed_by_key_has_its_long_list_read_with_every_permit_held() {
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let _held = every_permit_held(&permits);
+        let listed = a_long_list();
+        let asked = a_peer_answers(a_relays_fetch(&permits, false, true), &listed).await;
+        assert_eq!(
+            asked.fetched,
+            Fetched::All,
+            "a listed relay's long list waited for a permit"
+        );
+        assert!(asked.took < cordelia_network::codec::STREAM_TIMEOUT);
+        assert_eq!(asked.pages.len(), listed.len());
     }
 
     // ── The large permits (decision 2026-10-22 (memory), rule 2) ──────
