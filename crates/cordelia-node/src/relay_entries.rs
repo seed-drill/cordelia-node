@@ -1364,11 +1364,37 @@ async fn ask(
 /// What a stream is served with: the connection it is on, and what the
 /// node holds.
 pub struct Serving<'a> {
-    pub conn: &'a quinn::Connection,
+    /// The connection, whose session a proof is checked against. None in
+    /// a test over streams in memory: no proof holds there.
+    pub conn: Option<&'a quinn::Connection>,
     pub peer: &'a NodeId,
     pub address: IpAddr,
     pub db: &'a Mutex<Connection>,
     pub rates: &'a Mutex<Rates>,
+}
+
+/// An end of a stream that can be refused with a code: a QUIC stream's is
+/// reset or stopped. A stream in memory, as the tests use, has nothing to
+/// refuse.
+pub trait Refuse {
+    fn refuse(&mut self, code: quinn::VarInt);
+}
+
+impl Refuse for quinn::SendStream {
+    fn refuse(&mut self, code: quinn::VarInt) {
+        let _ = self.reset(code);
+    }
+}
+
+impl Refuse for quinn::RecvStream {
+    fn refuse(&mut self, code: quinn::VarInt) {
+        let _ = self.stop(code);
+    }
+}
+
+#[cfg(test)]
+impl Refuse for tokio::io::DuplexStream {
+    fn refuse(&mut self, _code: quinn::VarInt) {}
 }
 
 impl RelayEntries {
@@ -1379,15 +1405,25 @@ impl RelayEntries {
     ///
     /// Returns the breach where the request was over a limit: the stream
     /// was refused, and the caller cuts the peer off where it says so.
-    pub async fn serve(
+    ///
+    /// Through the write of its answer, which a peer that does not read
+    /// can make wait up to STREAM_TIMEOUT_SECS, it holds the answer as it
+    /// is written and nothing else: the frame of the request, the request
+    /// and the answer as a message are dropped before it
+    /// (parameter-rationale.md §1).
+    pub async fn serve<W, R>(
         &self,
         protocol: Protocol,
-        send: &mut quinn::SendStream,
-        recv: &mut quinn::RecvStream,
+        send: &mut W,
+        recv: &mut R,
         serving: &Serving<'_>,
         proved: &mut Proved,
         whole: &mut ShownWhole,
-    ) -> Option<OverLimit> {
+    ) -> Option<OverLimit>
+    where
+        W: tokio::io::AsyncWrite + Unpin + codec::GiveUp + Refuse,
+        R: tokio::io::AsyncRead + Unpin + Refuse,
+    {
         let who = Who {
             peer: serving.peer,
             address: serving.address,
@@ -1413,7 +1449,7 @@ impl RelayEntries {
         // What a proof is checked against is this connection's own: the
         // value of its TLS session, and the key in the peer's certificate.
         let session = (protocol == Protocol::ChannelProve)
-            .then(|| Session::of(serving.conn))
+            .then(|| serving.conn.and_then(Session::of))
             .flatten();
         let answer = self.answer(
             protocol,
@@ -1426,31 +1462,42 @@ impl RelayEntries {
             serving.rates,
             unix_now(),
         );
-        match answer {
-            Answer::Message(answer) => {
-                let _ = codec::write_frame(send, &answer).await;
-                None
-            }
+        // The answer is made, and needs nothing more of the request, which
+        // is large where its answer is small (a push of a page of
+        // entries), nor of its frame, which a pull may pad to a message
+        // with fields that are not read.
+        drop(request);
+        let answer = match answer {
+            Answer::Message(answer) => answer,
             Answer::Over(over) => {
                 tracing::warn!(peer = %who.peer, ?protocol, cut_off = over.cut_off, "a request for entries over the byte allowance; refused");
                 let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
-                let _ = send.reset(code);
-                let _ = recv.stop(code);
-                Some(over)
+                send.refuse(code);
+                recv.refuse(code);
+                return Some(over);
             }
             Answer::NotNow => {
                 tracing::debug!(peer = %who.peer, ?protocol, "a pull for more than the peer may be handed for now; refused, and no breach");
                 let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
-                let _ = send.reset(code);
-                let _ = recv.stop(code);
-                None
+                send.refuse(code);
+                recv.refuse(code);
+                return None;
             }
-            Answer::Nothing => None,
+            Answer::Nothing => return None,
             Answer::Stray => {
                 tracing::debug!(peer = %who.peer, ?protocol, "a request that is not for this stream");
-                Self::no_request(send, recv, &who, serving.rates, &frame)
+                return Self::no_request(send, recv, &who, serving.rates, &frame);
             }
+        };
+        drop(frame);
+        // The answer is encoded, and the message dropped, before the write:
+        // what is held through it is the answer as it is written.
+        let written = codec::encode_message(&answer);
+        drop(answer);
+        if let Ok(written) = written {
+            let _ = codec::write_raw_frame(send, &written).await;
         }
+        None
     }
 
     /// A frame that was read and is no request for its stream: bytes that
@@ -1459,16 +1506,16 @@ impl RelayEntries {
     /// answered. Its bytes count as pushed, and where they are over what
     /// the peer may push the stream is refused: returns the breach.
     fn no_request(
-        send: &mut quinn::SendStream,
-        recv: &mut quinn::RecvStream,
+        send: &mut impl Refuse,
+        recv: &mut impl Refuse,
         who: &Who,
         rates: &Mutex<Rates>,
         frame: &[u8],
     ) -> Option<OverLimit> {
         let over = Self::counted_as_pushed(rates, who, frame)?;
         let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_RATE_LIMIT);
-        let _ = send.reset(code);
-        let _ = recv.stop(code);
+        send.refuse(code);
+        recv.refuse(code);
         Some(over)
     }
 
@@ -4881,5 +4928,154 @@ mod tests {
         at.entries.sweep_at(&at.db, NOW + 365 * DAY);
         assert_eq!(at.used(), 0);
         assert_eq!(older(), 60_000 + 1024);
+    }
+
+    /// What `relay` holds through the write of its answer to `request`,
+    /// made on a stream of `protocol` on a connection that has proved
+    /// `proved`: its bytes over
+    /// what it held before the request was sent, and the length of the
+    /// answer. The answer is not read past its length, so the relay is in
+    /// its write when this is measured, as it is for a peer that does not
+    /// read, up to STREAM_TIMEOUT_SECS.
+    async fn held_through_the_write(
+        relay: &Relay,
+        protocol: Protocol,
+        proved: &mut Proved,
+        request: &[u8],
+    ) -> (isize, usize) {
+        use cordelia_network::codec::write_raw_frame;
+        use tokio::io::AsyncReadExt;
+
+        let peer = peer(1);
+        let serving = Serving {
+            conn: None,
+            peer: &peer,
+            address: address(1),
+            db: &relay.db,
+            rates: &relay.rates,
+        };
+        let mut whole = ShownWhole::default();
+        // Small pipes, so that what a pipe keeps for itself is small: the
+        // answer's waits after its first byte.
+        let (mut relay_w, mut peer_r) = tokio::io::duplex(1);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1024);
+        let serve = relay.entries.serve(
+            protocol,
+            &mut relay_w,
+            &mut relay_r,
+            &serving,
+            proved,
+            &mut whole,
+        );
+        tokio::pin!(serve);
+        let asker = async {
+            let before = crate::counting::live();
+            write_raw_frame(&mut peer_w, request).await.unwrap();
+            let length = peer_r.read_u32().await.unwrap() as usize;
+            (crate::counting::live() - before, length)
+        };
+        // Both on this thread, polled in turn.
+        tokio::select! {
+            biased;
+            measured = asker => measured,
+            served = &mut serve => panic!("the answer was written whole: {served:?}"),
+        }
+    }
+
+    /// Through the write of its answer, a relay holds the answer as it is
+    /// written and nothing else: not the request's frame, which a pull may
+    /// pad to a message with fields that are not read, nor the request (a
+    /// push of a page of entries), nor the answer as a message (a page). At most the answer's bytes, in the
+    /// room they were written into, which grows by doubling, and 4 KiB.
+    /// Each request is made twice, and measured the second time, so that
+    /// what the relay keeps from the first on (its statements, the
+    /// asker's allowance) is not counted.
+    #[tokio::test]
+    async fn a_request_is_not_held_while_its_answer_is_written() {
+        use cordelia_core::protocol::MAX_MESSAGE_BYTES;
+        use cordelia_network::codec::encode_message;
+        const SLACK: isize = 4 * 1024;
+
+        let pull_of = |c: u16| {
+            encode_message(&WireMessage::EntryPull(EntryPull {
+                channel: channel(c),
+                mark: [0; 8],
+                after: 0,
+                limit: 100,
+            }))
+            .unwrap()
+        };
+        // A pull padded to a message with a field that is not read: of a
+        // channel that was not proved, so its answer is small.
+        let padded = {
+            let mut pull = pull_of(2);
+            // A map of the name and the four fields, and one field more.
+            assert_eq!(pull[0], 0xa5);
+            pull[0] = 0xa6;
+            pull.extend([0x67]);
+            pull.extend(b"padding");
+            let room = MAX_MESSAGE_BYTES as usize - pull.len() - 5;
+            pull.push(0x5a);
+            pull.extend((room as u32).to_be_bytes());
+            pull.extend(std::iter::repeat_n(0x70, room));
+            pull
+        };
+        assert_eq!(padded.len(), MAX_MESSAGE_BYTES as usize);
+        assert!(matches!(
+            cordelia_network::codec::decode_message(Protocol::EntryPull, &padded),
+            Ok(WireMessage::EntryPull(_))
+        ));
+        // A pull of a channel that was proved, whose answer is a page of
+        // twelve entries of the largest size.
+        let full = pull_of(1);
+        // A push of twelve entries of the largest size, whose answer says
+        // one word of each.
+        let push = encode_message(&WireMessage::EntryPush(EntryPush {
+            entries: (1..=12).map(|d| largest(3, d).to_wire().into()).collect(),
+        }))
+        .unwrap();
+        assert!(push.len() > 700_000, "{}", push.len());
+
+        for (what, protocol, request, proved, large) in [
+            (
+                "a pull padded to a message",
+                Protocol::EntryPull,
+                &padded,
+                &[][..],
+                false,
+            ),
+            (
+                "a push of a page",
+                Protocol::EntryPush,
+                &push,
+                &[][..],
+                false,
+            ),
+            (
+                "a pull answered with a page",
+                Protocol::EntryPull,
+                &full,
+                &[1][..],
+                true,
+            ),
+        ] {
+            let relay = relay();
+            for d in 1..=12 {
+                relay.hold(&largest(1, d), NOW);
+            }
+            let mut proved = having_proved(proved);
+            let _ = held_through_the_write(&relay, protocol, &mut proved, request).await;
+            let (held, answer) =
+                held_through_the_write(&relay, protocol, &mut proved, request).await;
+            println!(
+                "{what}, {} bytes: {held} bytes held through the write of an answer of {answer}",
+                request.len()
+            );
+            assert!(
+                held <= 2 * answer as isize + SLACK,
+                "{what}: {held} bytes held through the write of an answer of {answer}"
+            );
+            assert_eq!(answer > 700_000, large, "{what}: an answer of {answer}");
+        }
     }
 }
