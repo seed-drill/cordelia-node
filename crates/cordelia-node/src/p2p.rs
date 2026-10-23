@@ -405,7 +405,8 @@ impl Rates {
 /// permits.
 pub struct LargePermits {
     inner: std::sync::Mutex<Permits>,
-    /// Woken when a permit, or a subnet's hold, is let go.
+    /// Woken when a permit is let go, a subnet's hold is let go, or a
+    /// waiter leaves the queue: every waiter then re-checks.
     freed: tokio::sync::Notify,
 }
 
@@ -414,6 +415,33 @@ struct Permits {
     free: usize,
     /// The subnets that hold a permit: at most one each.
     held: std::collections::HashSet<String>,
+    /// The waiters, each a ticket and the subnet it waits for, in the
+    /// order they asked. The first to ask is the first served (decision
+    /// 2026-10-22 (memory), rule 2): a waiter is granted a free permit
+    /// only when no earlier waiter's subnet is free, so a holder that
+    /// lets go and asks again (a new ticket at the back) cannot jump an
+    /// older waiter.
+    waiting: std::collections::VecDeque<(u64, String)>,
+    /// The next ticket to hand out.
+    next_ticket: u64,
+}
+
+impl Permits {
+    /// Whether the waiter `ticket` for `subnet` may take a permit now: one
+    /// is free, its subnet holds none, and no waiter that asked earlier
+    /// has a free subnet (so the earlier one goes first).
+    fn may_grant(&self, ticket: u64, subnet: &str) -> bool {
+        self.free > 0
+            && !self.held.contains(subnet)
+            && !self
+                .waiting
+                .iter()
+                .any(|(t, s)| *t < ticket && !self.held.contains(s))
+    }
+
+    fn drop_waiter(&mut self, ticket: u64) {
+        self.waiting.retain(|(t, _)| *t != ticket);
+    }
 }
 
 /// A held large permit. Dropping it gives the permit back and lets go of
@@ -431,8 +459,7 @@ impl Drop for LargePermit<'_> {
             p.free += 1;
             p.held.remove(&self.subnet);
         }
-        // Every waiter re-checks: the one whose subnet this was, and any
-        // that was only waiting for a free permit.
+        // Every waiter re-checks: the earliest eligible one takes it.
         self.permits.freed.notify_waiters();
     }
 }
@@ -443,6 +470,8 @@ impl LargePermits {
             inner: std::sync::Mutex::new(Permits {
                 free: budget,
                 held: std::collections::HashSet::new(),
+                waiting: std::collections::VecDeque::new(),
+                next_ticket: 0,
             }),
             freed: tokio::sync::Notify::new(),
         }
@@ -452,10 +481,19 @@ impl LargePermits {
     /// `STREAM_TIMEOUT` for one. `None` where none came in time: the
     /// caller refuses the stream with `ERR_LARGE_MESSAGE_LATER`, and
     /// counts no breach. A permit is given for a subnet that holds none,
-    /// while one of `LARGE_MESSAGES_AT_ONCE` is free; a waiter whose
-    /// subnet already holds a permit waits for that one.
-    async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
+    /// while one of `LARGE_MESSAGES_AT_ONCE` is free and no earlier waiter
+    /// is eligible; a waiter whose subnet already holds a permit waits for
+    /// that one.
+    pub(crate) async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
         let subnet = cordelia_network::rate_limit::subnet_key(address);
+        // Join the queue, in the order of asking.
+        let ticket = {
+            let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let ticket = p.next_ticket;
+            p.next_ticket += 1;
+            p.waiting.push_back((ticket, subnet.clone()));
+            ticket
+        };
         let wait = tokio::time::timeout(cordelia_network::codec::STREAM_TIMEOUT, async {
             loop {
                 // Register for a wake before the state is read, so a
@@ -466,9 +504,14 @@ impl LargePermits {
                 woken.as_mut().enable();
                 {
                     let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if p.free > 0 && !p.held.contains(&subnet) {
+                    if p.may_grant(ticket, &subnet) {
                         p.free -= 1;
                         p.held.insert(subnet.clone());
+                        p.drop_waiter(ticket);
+                        // Another permit may now be free for a later
+                        // waiter; let them re-check.
+                        drop(p);
+                        self.freed.notify_waiters();
                         return;
                     }
                 }
@@ -476,10 +519,22 @@ impl LargePermits {
             }
         })
         .await;
-        wait.ok().map(|()| LargePermit {
-            permits: self,
-            subnet,
-        })
+        match wait {
+            Ok(()) => Some(LargePermit {
+                permits: self,
+                subnet,
+            }),
+            Err(_) => {
+                // Timed out: leave the queue, and let a waiter whom this
+                // one was holding back re-check.
+                {
+                    let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    p.drop_waiter(ticket);
+                }
+                self.freed.notify_waiters();
+                None
+            }
+        }
     }
 }
 
@@ -4992,6 +5047,14 @@ pub async fn handle_peer_streams(
             .ok()
             .is_some_and(|relays| relays.contains(&peer_id));
         let unlimited = own_relay && node_role == "relay";
+        // Whether the peer is a relay this node lists by key, which is
+        // outside rule 2 (rule 7). Only a relay keeps `relay_entries`, so
+        // on a bootnode or a personal node this is always false and
+        // nothing is exempt from the permits. That does not matter: a
+        // bootnode answers only peer-sharing (small), and the one case it
+        // leaves is a relay listed by key pushing the older kind over a
+        // small message to a bootnode, which does not happen between
+        // R1's nodes.
         let listed_by_key = relay_entries
             .as_ref()
             .is_some_and(|entries| entries.lists(&peer_id));
@@ -5156,6 +5219,7 @@ pub async fn handle_peer_streams(
                     address,
                     db: &state.db,
                     rates: &peer_rates,
+                    permits: Some(&large_permits),
                 };
                 let over = entries
                     .serve(
@@ -5192,7 +5256,7 @@ pub async fn handle_peer_streams(
 /// side reset with ERR_LARGE_MESSAGE_LATER, so a peer of the version
 /// before, blocked in its write, learns to send the same frame again
 /// later. No breach is counted: the peer did nothing over a limit.
-fn refuse_large_later(
+pub(crate) fn refuse_large_later(
     send: &mut impl crate::relay_entries::Refuse,
     recv: &mut impl crate::relay_entries::Refuse,
 ) {
@@ -5203,7 +5267,7 @@ fn refuse_large_later(
 
 /// One outcome of reading a frame on a stream from a peer (decision
 /// 2026-10-22 (memory), rules 2 and 7).
-enum Framed<'p> {
+pub(crate) enum Framed<'p> {
     /// The frame's bytes, with the large permit held for it (None where it
     /// is within a small message, where the peer is a listed relay, or
     /// where the node keeps no budget). The caller drops the permit once
@@ -5224,7 +5288,7 @@ enum Framed<'p> {
 /// whether the peer is a relay listed by key, whose frames are read at
 /// once whatever their size; `permits` is `None` for a node that keeps no
 /// budget, or a test that does not exercise one.
-async fn read_under_permit<'p, R>(
+pub(crate) async fn read_under_permit<'p, R>(
     recv: &mut R,
     permits: Option<&'p LargePermits>,
     address: std::net::IpAddr,
@@ -5553,13 +5617,16 @@ fn nothing_for(
 /// the peer has no more. The node's database is not read: a personal
 /// node carries no channel of that kind, whatever its database once
 /// held.
-async fn answer_sync_with_nothing(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
-    peer_id: &NodeId,
-) {
+async fn answer_sync_with_nothing<W, R>(send: &mut W, recv: &mut R, peer_id: &NodeId)
+where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
     for _ in 0..NOTHING_ANSWERED_AT_MOST {
-        let Ok(asked) = cordelia_network::codec::read_frame(
+        // No honest older-kind request to a node that carries none is over
+        // a small message (rule 2): a longer frame is refused at its
+        // length, before its body is read.
+        let Ok(asked) = cordelia_network::codec::read_small_frame(
             recv,
             cordelia_network::messages::Protocol::ItemSync,
         )
@@ -5587,7 +5654,7 @@ async fn answer_sync_with_nothing(
         }
     }
     tracing::debug!(peer = %peer_id, "answered a sync of the older kind with nothing: a personal node carries no channel of that kind");
-    let _ = send.finish();
+    send.finish_up();
 }
 
 #[expect(
@@ -5832,14 +5899,20 @@ where
     }
 }
 
-async fn handle_inbound_peer_share(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+async fn handle_inbound_peer_share<W, R>(
+    send: &mut W,
+    recv: &mut R,
     peer_id: &NodeId,
     shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: &str,
-) {
-    let msg = match cordelia_network::codec::read_frame(
+) where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // A peer-share request is tiny (a count of peers), so no honest frame
+    // is over a small message (rule 2): a longer one is refused at its
+    // length.
+    let msg = match cordelia_network::codec::read_small_frame(
         recv,
         cordelia_network::messages::Protocol::PeerSharing,
     )
@@ -5887,7 +5960,12 @@ async fn handle_inbound_peer_share(
                 peers: current_peers,
             },
         );
-        let _ = cordelia_network::codec::write_frame(send, &resp).await;
+        // Encoded, and the message dropped, before the write (rule 4).
+        let written = cordelia_network::codec::encode_message(&resp);
+        drop(resp);
+        if let Ok(written) = written {
+            let _ = cordelia_network::codec::write_raw_frame(send, &written).await;
+        }
         tracing::debug!(peer = %peer_id, count, "served peer-share request");
     }
 }
@@ -5908,14 +5986,19 @@ fn as_a_peer_sent_it(text: &str) -> String {
 ///
 /// A channel's ID is logged for debugging only. What a node logs as a
 /// matter of course is how many channels a peer announced, not which.
-async fn handle_inbound_channel_announce(
-    recv: &mut quinn::RecvStream,
+async fn handle_inbound_channel_announce<R>(
+    recv: &mut R,
     peer_id: &NodeId,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
-) {
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let (mut announced, mut withdrawn) = (0u64, 0u64);
     loop {
-        let msg = match cordelia_network::codec::read_frame(
+        // A channel announcement carries a descriptor of short fields, so
+        // no honest frame is over a small message (rule 2): a longer one
+        // is refused at its length.
+        let msg = match cordelia_network::codec::read_small_frame(
             recv,
             cordelia_network::messages::Protocol::ChannelAnnounce,
         )
@@ -7033,6 +7116,103 @@ mod tests {
         }
     }
 
+    /// The first to ask is the first served (decision 2026-10-22 (memory),
+    /// rule 2): when a permit frees, the waiter that asked earliest, whose
+    /// subnet holds none, takes it, not a later asker.
+    /// Take a permit in a task, report through `tx` whether one came, and
+    /// hold it (so a permit a task wins is not let go while the test reads
+    /// who won).
+    fn asks_and_holds(
+        permits: std::sync::Arc<LargePermits>,
+        address: &str,
+        tx: tokio::sync::oneshot::Sender<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let address: std::net::IpAddr = address.parse().unwrap();
+        tokio::spawn(async move {
+            let got = permits.take(address).await;
+            let _ = tx.send(got.is_some());
+            if got.is_some() {
+                // Hold the permit until the task is dropped at test end.
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+
+    /// The first to ask is the first served (decision 2026-10-22 (memory),
+    /// rule 2): when a permit frees, the waiter that asked earliest, whose
+    /// subnet holds none, takes it, not a later asker.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_asked_first_is_served_first() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let held = permits
+            .take("10.0.0.1".parse::<IpAddr>().unwrap())
+            .await
+            .expect("the one permit");
+        // B asks first, then C; each from a subnet of its own.
+        let (btx, brx) = tokio::sync::oneshot::channel();
+        let _b = asks_and_holds(permits.clone(), "198.51.100.1", btx);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (ctx, crx) = tokio::sync::oneshot::channel();
+        let _c = asks_and_holds(permits.clone(), "203.0.113.1", ctx);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // One permit frees: B, which asked first, takes it; C, with none
+        // left, waits and times out.
+        drop(held);
+        assert!(brx.await.unwrap(), "the earliest waiter was not served");
+        assert!(!crx.await.unwrap(), "a later asker took the permit");
+    }
+
+    /// A holder that lets go and at once asks again does not starve a
+    /// waiter that asked earlier (decision 2026-10-22 (memory), rule 2):
+    /// its new ask joins the back of the queue. The holder retakes in a
+    /// tight loop that never yields to the waiter of its own accord, so
+    /// without the queue it would take a free permit on the spot every
+    /// time, before the woken waiter runs, and starve it. With the queue
+    /// its first re-take must wait behind the waiter, which then runs and
+    /// is served.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_retakes_does_not_starve_a_waiter() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let mut held = Some(
+            permits
+                .take("10.0.0.1".parse::<IpAddr>().unwrap())
+                .await
+                .expect("the one permit"),
+        );
+        // The waiter asks from a subnet of its own and signals when served.
+        let (served_tx, mut served_rx) = tokio::sync::oneshot::channel();
+        let pw = permits.clone();
+        let waiter = tokio::spawn(async move {
+            let got = pw.take("198.51.100.1".parse().unwrap()).await;
+            let _ = served_tx.send(got.is_some());
+        });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // The holder retakes in a tight loop, never yielding to the waiter
+        // on its own.
+        for _ in 0..10 {
+            drop(held.take());
+            held = permits.take("10.0.0.1".parse().unwrap()).await;
+            if held.is_none() {
+                break;
+            }
+        }
+        drop(held.take());
+        assert_eq!(
+            served_rx.try_recv(),
+            Ok(true),
+            "a retaking holder starved the waiter that asked first"
+        );
+        let _ = waiter.await;
+    }
+
     /// A frame longer than a small message from an unlisted peer is not
     /// read until a permit is free (decision 2026-10-22 (memory), rule 2):
     /// the permit is taken before the payload is read or allocated, so
@@ -7251,9 +7431,9 @@ mod tests {
             .unwrap();
         // A frame of a megabyte: longer than a small message. It fits the
         // stream's window, so the write finishes though the node reads
-        // none of the body.
+        // none of the body. The send is left open (not finished), so the
+        // node's stop of the receive side is seen on it.
         let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
-        let _ = csend.finish();
 
         // The node resets the send side with ERR_LARGE_MESSAGE_LATER
         // (0x05), which the peer learns when it reads the stream.
@@ -7270,6 +7450,18 @@ mod tests {
                 "the stream was reset with another code"
             ),
             other => panic!("the stream was not reset with ERR_LARGE_MESSAGE_LATER: {other:?}"),
+        }
+        // The node also stops the receive side with the same code, which
+        // the peer learns as its own send being stopped.
+        match csend.stopped().await {
+            Ok(Some(code)) => assert_eq!(
+                code,
+                quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER),
+                "the receive side was stopped with another code"
+            ),
+            other => {
+                panic!("the receive side was not stopped with ERR_LARGE_MESSAGE_LATER: {other:?}")
+            }
         }
         // It was refused, not stored, and counts no breach.
         let (over, _conn) = serving.await.unwrap();
@@ -7383,6 +7575,287 @@ mod tests {
         assert!(
             held > 600_000,
             "the answer of a megabyte was not built: {held} bytes"
+        );
+    }
+
+    /// Which inbound handler to run over a pair of pipes.
+    enum Handler {
+        PeerShare,
+        ChannelAnnounce,
+        SyncNothing,
+    }
+
+    /// Whether the handler reads the body of a frame larger than a small
+    /// message (decision 2026-10-22 (memory), rule 2): the pipe is too
+    /// small to hold the frame, so the peer's write finishes only if the
+    /// handler drains the body. A handler that refuses at the length
+    /// leaves it blocked. `false` means the body was not read.
+    async fn handler_drains_a_large_frame(which: Handler) -> bool {
+        let (mut peer_w, mut node_r) = tokio::io::duplex(64 * 1024);
+        let (mut node_w, _peer_r) = tokio::io::duplex(64 * 1024);
+        let peer = NodeId([9; 32]);
+        // 200,000 bytes: longer than a small message (147,456).
+        let frame = vec![0x5au8; 200_000];
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w = wrote.clone();
+        let writer = async {
+            let _ = cordelia_network::codec::write_raw_frame(&mut peer_w, &frame).await;
+            w.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let handler = async {
+            match which {
+                Handler::PeerShare => {
+                    let shared = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+                    handle_inbound_peer_share(&mut node_w, &mut node_r, &peer, &shared, "relay")
+                        .await;
+                }
+                Handler::ChannelAnnounce => {
+                    let (gov_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    handle_inbound_channel_announce(&mut node_r, &peer, &gov_tx).await;
+                }
+                Handler::SyncNothing => {
+                    answer_sync_with_nothing(&mut node_w, &mut node_r, &peer).await;
+                }
+            }
+        };
+        // The handler that refuses at the length returns at once and the
+        // write stays blocked, so the join never finishes: the timeout
+        // then leaves `wrote` false. A handler that drains the body lets
+        // the write finish, and the join returns with `wrote` true.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            tokio::join!(handler, writer)
+        })
+        .await;
+        wrote.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The peer-share, channel-announce and older-kind-sync handlers read a
+    /// frame only within a small message (decision 2026-10-22 (memory),
+    /// rule 2): no honest message of any version on these streams is
+    /// larger, so a longer frame is refused at its length and its body is
+    /// not read.
+    #[tokio::test]
+    async fn the_small_streams_do_not_read_a_frame_over_a_small_message() {
+        assert!(
+            !handler_drains_a_large_frame(Handler::PeerShare).await,
+            "peer-share read a frame over a small message"
+        );
+        assert!(
+            !handler_drains_a_large_frame(Handler::ChannelAnnounce).await,
+            "channel-announce read a frame over a small message"
+        );
+        assert!(
+            !handler_drains_a_large_frame(Handler::SyncNothing).await,
+            "the older kind's answer-nothing read a frame over a small message"
+        );
+    }
+
+    /// Whether a relay reads and answers a large push (longer than a small
+    /// message) from a client, run through the live inbound loop
+    /// (`handle_peer_streams`). The client is listed by key iff `listed`,
+    /// and is in `peer_relays` (a relay configured by address alone) iff
+    /// `addressed`; the large-permit budget is `budget`. A permit is read
+    /// and answered within two seconds, or it is not.
+    async fn large_push_answered(listed: bool, addressed: bool, budget: usize) -> bool {
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::messages::{Item, Protocol, PushPayload, WireMessage};
+        use cordelia_network::{codec, connection, transport};
+        use std::collections::{HashMap, HashSet};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, RwLock};
+
+        let id =
+            |s: u8| Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([s; 32]).unwrap());
+        let here: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (node, client) = (id(1), id(2));
+        let client_key = NodeId(client.public_key());
+        let node_end = transport::create_endpoint(&node, here).unwrap();
+        let node_addr = node_end.local_addr().unwrap();
+        let node_mgr = connection::ConnectionManager::new(
+            node.clone(),
+            node_end,
+            vec![],
+            vec!["relay".into()],
+            node_addr.port(),
+        );
+        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+
+        // The relay lists the client by key iff `listed`.
+        let relays = if listed {
+            vec![RelayAddr {
+                host: "listed.example:9474".into(),
+                addr: SocketAddr::new("127.0.0.1".parse().unwrap(), 9474),
+                key: Some(client_key.0),
+            }]
+        } else {
+            vec![]
+        };
+        let relay_entries = Some(Arc::new(crate::relay_entries::RelayEntries::new(
+            u64::MAX,
+            Arc::new(RwLock::new(relays)),
+            std::time::Duration::from_secs(600),
+        )));
+        // It is a relay configured by address alone (in peer_relays, not
+        // listed by key) iff `addressed`.
+        let peer_relays = Arc::new(RwLock::new(HashSet::new()));
+        if addressed {
+            peer_relays.write().unwrap().insert(client_key.clone());
+        }
+        let peer_states = Arc::new(RwLock::new(HashMap::from([(client_key.clone(), 1u8)])));
+        let permits = Arc::new(LargePermits::new(budget));
+        let state = a_state();
+        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+        let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
+        let shared_peers = Arc::new(RwLock::new(Vec::new()));
+        let swarm = Arc::new(RwLock::new(HashSet::new()));
+        let seen = Arc::new(RwLock::new(
+            cordelia_network::seen_table::SeenTable::default(),
+        ));
+        let peer_rates = Arc::new(std::sync::Mutex::new(Rates::default()));
+
+        let node_conn = {
+            let as_node = as_node.clone();
+            tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_node, incoming)
+                    .await
+                    .unwrap()
+                    .conn
+            })
+        };
+        let mut client_mgr = connection::ConnectionManager::new(
+            client.clone(),
+            transport::create_endpoint(&client, here).unwrap(),
+            vec![],
+            vec![],
+            9474,
+        );
+        client_mgr.connect_to(node_addr).await.unwrap();
+        let conn = client_mgr
+            .get_connection(&NodeId(node.public_key()))
+            .unwrap()
+            .clone();
+        let node_conn = node_conn.await.unwrap();
+
+        let loop_task = tokio::spawn(handle_peer_streams(
+            node_conn,
+            client_key,
+            "127.0.0.1".parse().unwrap(),
+            state,
+            shared_peers,
+            "relay".into(),
+            repush_tx,
+            delivery_tx,
+            peer_rates,
+            peer_states,
+            peer_relays,
+            gov_tx,
+            swarm,
+            seen,
+            relay_entries,
+            permits,
+        ));
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        codec::write_protocol_byte(&mut send, Protocol::ItemPush)
+            .await
+            .unwrap();
+        // A push of one big item: longer than a small message.
+        let item = Item {
+            item_id: "ci_big".into(),
+            channel_id: "grp_x".into(),
+            item_type: "memory".into(),
+            encrypted_blob: vec![0u8; 200_000],
+            content_hash: vec![0u8; 32],
+            content_length: 200_000,
+            author_id: vec![0u8; 32],
+            signature: vec![0u8; 64],
+            key_version: 1,
+            published_at: "2026-10-22T00:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
+        let frame = codec::encode_message(&push).unwrap();
+        assert!(
+            frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
+            "the push was meant to be over a small message"
+        );
+        let _ = codec::write_raw_frame(&mut send, &frame).await;
+        // An answer (a push ack) within two seconds means it was read.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            codec::read_frame(&mut recv, Protocol::ItemPush),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
+        loop_task.abort();
+        answered
+    }
+
+    /// The live inbound loop reads a large frame only under the permits,
+    /// and exempts a relay listed by key alone, not one configured by
+    /// address (decision 2026-10-22 (memory), rules 2 and 7). With no
+    /// permit free, a listed relay's large push is read, an unlisted
+    /// peer's and a relay-by-address's are not; with a permit free, an
+    /// unlisted peer's is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_inbound_loop_takes_permits_and_exempts_only_listed_relays() {
+        // A relay listed by key: read though no permit is free (rule 7).
+        assert!(
+            large_push_answered(true, false, 0).await,
+            "a listed relay's large push was not read"
+        );
+        // A peer that is not listed: not read with no permit (rule 2).
+        assert!(
+            !large_push_answered(false, false, 0).await,
+            "an unlisted peer's large push was read with no permit"
+        );
+        // A relay configured by address alone is unlisted for F: it waits.
+        assert!(
+            !large_push_answered(false, true, 0).await,
+            "a relay configured by address alone was exempted"
+        );
+        // With a permit free, an unlisted peer's push is read.
+        assert!(
+            large_push_answered(false, false, 1).await,
+            "an unlisted peer's large push was not read when a permit was free"
+        );
+    }
+
+    /// A permit a stream held and then failed on is given back (decision
+    /// 2026-10-22 (memory), rule 2): five streams fail in turn, and then
+    /// four permits can be taken at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_a_failed_stream_held_is_given_back() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        // Five streams each take a permit and fail, one after another.
+        for n in 0..5u8 {
+            let g = permits
+                .take(IpAddr::from([10, n, 0, 1]))
+                .await
+                .expect("a permit for a failing stream");
+            drop(g);
+        }
+        // All four permits are free again.
+        let mut held = Vec::new();
+        for n in 0..cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE as u8 {
+            held.push(
+                permits
+                    .take(IpAddr::from([172, 16, n, 1]))
+                    .await
+                    .expect("four permits after five failed"),
+            );
+        }
+        assert!(
+            permits.take(IpAddr::from([192, 0, 2, 1])).await.is_none(),
+            "a fifth permit was held past the budget"
         );
     }
 
