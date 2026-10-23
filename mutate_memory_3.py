@@ -18,7 +18,10 @@ def p2p(test): return (NODE, "p2p::tests::" + test)
 
 SMALL_AT_ONCE = p2p("a_fetch_reads_an_answer_within_a_small_message_with_every_permit_held")
 WAITS_AND_FAILS = p2p("a_long_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one")
-LONG_LIST = p2p("a_long_channel_list_is_read_under_a_permit_and_its_first_are_kept")
+PAGE_FAILS = p2p("a_long_page_waits_unread_for_a_permit_and_the_fetch_fails_without_one")
+FETCH_FAILS = p2p("a_long_fetch_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one")
+PAGE_LET_GO = p2p("a_pages_permit_is_let_go_before_its_entries_are_fetched")
+LONG_LIST = p2p("a_long_channel_list_is_read_under_a_permit_and_the_channels_asked_of_a_peer_are_kept_a_different_part_each_time")
 ONE_REQUEST = p2p("a_page_of_100_headers_is_fetched_in_one_request")
 LISTED = p2p("a_relay_listed_by_key_has_its_long_list_read_with_every_permit_held")
 
@@ -31,11 +34,27 @@ MUTATIONS = [
      '''    let permit = if len > cordelia_core::protocol::SMALL_MESSAGE_BYTES && !listed {''',
      '''    let permit = if !listed {''',
      [SMALL_AT_ONCE]),
-    ("OF2 the permit for a large one: the fetch reads a long answer whole, with no permit", P2P,
-     '''read_under_permit(recv, permits, address, listed_by_key)''',
-     '''read_under_permit(recv, None, address, listed_by_key)''',
+    ("OF2a the permit for a large one, at the list: read whole, with no permit", P2P,
+     '''let (listed, permit) = match ask(send, recv, request, permits, address, listed_by_key).await''',
+     '''let (listed, permit) = match ask(send, recv, request, None, address, listed_by_key).await''',
      [WAITS_AND_FAILS]),
-    ("OF3 the fetch failed and asked again without one: it ends as if there were more, and is asked again at once", P2P,
+    ("OF2b the permit for a large one, at a page: read whole, with no permit", P2P,
+     '''let (resp, permit) = match ask(send, recv, request, permits, address, listed_by_key)''',
+     '''let (resp, permit) = match ask(send, recv, request, None, address, listed_by_key)''',
+     [PAGE_FAILS]),
+    ("OF2c the permit for a large one, at a fetch's answer: read whole, with no permit", P2P,
+     '''                    request,
+                    permits,
+                    address,
+                    listed_by_key,
+                )''',
+     '''                    request,
+                    None,
+                    address,
+                    listed_by_key,
+                )''',
+     [FETCH_FAILS]),
+    ("OF3a the fetch failed and asked again without one, at the list: it ends as if there were more, and is asked again at once", P2P,
      '''                tracing::debug!(peer = %target, "a channel list over a small message, and no permit for now; the fetch fails");
                 refuse_large_later(send, recv);
                 return (Fetched::Failed, 0);''',
@@ -43,6 +62,43 @@ MUTATIONS = [
                 refuse_large_later(send, recv);
                 return (Fetched::More, 0);''',
      [WAITS_AND_FAILS]),
+    ("OF3b the fetch failed and asked again without one, at a page: it ends as if there were more", P2P,
+     '''"a page over a small message, and no permit for now; the fetch fails");
+                    refuse_large_later(send, recv);
+                    fetched = Fetched::Failed;''',
+     '''"a page over a small message, and no permit for now; the fetch fails");
+                    refuse_large_later(send, recv);
+                    fetched = Fetched::More;''',
+     [PAGE_FAILS]),
+    ("OF3c the fetch failed and asked again without one, at a fetch's answer: it ends as if there were more", P2P,
+     '''"a fetch answer over a small message, and no permit for now; the fetch fails");
+                        refuse_large_later(send, recv);
+                        fetched = Fetched::Failed;''',
+     '''"a fetch answer over a small message, and no permit for now; the fetch fails");
+                        refuse_large_later(send, recv);
+                        fetched = Fetched::More;''',
+     [FETCH_FAILS]),
+    ("OF7 the page's permit let go before its fetch: held through the fetch and its answer", P2P,
+     '''            drop(resp);
+            drop(permit);''',
+     '''            drop(resp);
+            let _page_permit = permit;''',
+     [PAGE_LET_GO]),
+    ("OF8a the refusal with ERR_LARGE_MESSAGE_LATER, at the list: the stream is left as it is", P2P,
+     '''"a channel list over a small message, and no permit for now; the fetch fails");
+                refuse_large_later(send, recv);''',
+     '''"a channel list over a small message, and no permit for now; the fetch fails");''',
+     [WAITS_AND_FAILS]),
+    ("OF8b the refusal with ERR_LARGE_MESSAGE_LATER, at a page: the stream is left as it is", P2P,
+     '''"a page over a small message, and no permit for now; the fetch fails");
+                    refuse_large_later(send, recv);''',
+     '''"a page over a small message, and no permit for now; the fetch fails");''',
+     [PAGE_FAILS]),
+    ("OF8c the refusal with ERR_LARGE_MESSAGE_LATER, at a fetch's answer: the stream is left as it is", P2P,
+     '''"a fetch answer over a small message, and no permit for now; the fetch fails");
+                        refuse_large_later(send, recv);''',
+     '''"a fetch answer over a small message, and no permit for now; the fetch fails");''',
+     [FETCH_FAILS]),
     ("OF4 the first MAX_CHANNELS_ASKED_OF_A_PEER kept of a long list: every channel listed is kept", P2P,
      '''channels_to_ask(channels, listed, most)''',
      '''channels_to_ask(channels, listed, usize::MAX)''',
