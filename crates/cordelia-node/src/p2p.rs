@@ -7668,16 +7668,84 @@ mod tests {
         (channel, ids)
     }
 
+    /// One end of a pipe in memory that keeps the code it was refused
+    /// with, where a stream of QUIC would be stopped or reset with it.
+    struct Refusable {
+        pipe: tokio::io::DuplexStream,
+        refused: Option<u64>,
+    }
+
+    impl Refusable {
+        fn new(pipe: tokio::io::DuplexStream) -> Self {
+            Self {
+                pipe,
+                refused: None,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for Refusable {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.pipe).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Refusable {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.pipe).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.pipe).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.pipe).poll_shutdown(cx)
+        }
+    }
+
+    impl cordelia_network::codec::GiveUp for Refusable {}
+
+    impl crate::relay_entries::Refuse for Refusable {
+        fn refuse(&mut self, code: quinn::VarInt) {
+            self.refused = Some(code.into_inner());
+        }
+    }
+
     /// The older kind's fetch answer over SMALL_PAGE_BYTES is loaded and
     /// written to a peer that is not a relay listed by key only under a
-    /// large permit (decision 2026-10-22 (memory), rules 2 and 3). With
-    /// every permit held, a fetch of two items, within a small page, is
-    /// answered at once; a fetch of fourteen is not answered while the
-    /// permits are held, and is answered once one is let go. Where none
-    /// comes within STREAM_TIMEOUT, the stream ends unanswered. A relay
-    /// listed by key is answered at once whatever the size (rule 7).
+    /// large permit (decision 2026-10-22 (memory), rules 2 and 3).
+    ///
+    /// - With every permit held, a fetch of two items, within a small
+    ///   page, is answered at once.
+    /// - A fetch of fourteen is not answered while the permits are held,
+    ///   and the items are not loaded meanwhile: what the node's thread
+    ///   holds grows by far less than the answer's 840 KB. It is answered
+    ///   once a permit is let go.
+    /// - A relay listed by key is answered at once whatever the size (rule
+    ///   7).
+    /// - A fetch whose own frame is over a small message, read under the
+    ///   one permit there is, is answered under that permit with no wait:
+    ///   one permit a stream (rule 2).
+    /// - Where no permit comes within STREAM_TIMEOUT, the stream is
+    ///   stopped and reset with ERR_LARGE_MESSAGE_LATER, unanswered.
     #[tokio::test(start_paused = true)]
     async fn an_older_kind_fetch_answer_over_a_small_page_waits_for_a_large_permit() {
+        use cordelia_core::protocol::{ERR_LARGE_MESSAGE_LATER, SMALL_MESSAGE_BYTES};
         use cordelia_network::codec::{STREAM_TIMEOUT, read_frame, write_raw_frame};
         use cordelia_network::messages::{FetchRequest, Protocol, SyncRequest, WireMessage};
 
@@ -7716,8 +7784,9 @@ mod tests {
             let permits = LargePermits::new(1);
             let held = permits.take("203.0.113.1".parse().unwrap()).await;
             assert!(held.is_some(), "the one permit");
-            let (client_w, mut node_r) = tokio::io::duplex(64 * 1024);
-            let (mut node_w, mut client_r) = tokio::io::duplex(2 * 1024 * 1024);
+            let (client_w, node_r) = tokio::io::duplex(64 * 1024);
+            let (node_w, mut client_r) = tokio::io::duplex(2 * 1024 * 1024);
+            let (mut node_w, mut node_r) = (Refusable::new(node_w), Refusable::new(node_r));
             let node = handle_inbound_sync(
                 &mut node_w,
                 &mut node_r,
@@ -7746,6 +7815,11 @@ mod tests {
                 // permits are held, unless the peer is a listed relay.
                 write_raw_frame(&mut client_w, &sync).await.unwrap();
                 let _ = read_frame(&mut client_r, Protocol::ItemSync).await.unwrap();
+                // The node and this client run on this one thread, which
+                // the counting allocator counts: what it comes to hold
+                // while the permit is awaited is the request, not the
+                // items.
+                let before = crate::counting::live();
                 write_raw_frame(&mut client_w, &fetch(&ids)).await.unwrap();
                 let at_once = fetched(&mut client_r, two_seconds).await;
                 if listed {
@@ -7755,6 +7829,11 @@ mod tests {
                 assert_eq!(
                     at_once, None,
                     "a fetch over a small page was answered with no permit"
+                );
+                let waiting = crate::counting::live() - before;
+                assert!(
+                    waiting < 64 * 1024,
+                    "the items were loaded before a permit came: {waiting} bytes held"
                 );
                 held.take();
                 assert_eq!(fetched(&mut client_r, two_seconds).await, Some(14));
@@ -7766,13 +7845,63 @@ mod tests {
                 },
                 client
             );
+            assert_eq!((node_w.refused, node_r.refused), (None, None));
         }
 
-        // No permit within STREAM_TIMEOUT: the stream ends unanswered.
+        // A fetch whose own frame is over a small message, with a budget of
+        // one permit: the frame is read under it, and the answer, over a
+        // small page, is written under the same permit at once. (Asked for
+        // a second, the stream would wait for its own subnet's.)
+        let mut asked = ids.clone();
+        asked.extend((0..86).map(|n| format!("absent_{n:0>1992}")));
+        let large = fetch(&asked);
+        assert!(
+            large.len() > SMALL_MESSAGE_BYTES as usize,
+            "{}",
+            large.len()
+        );
+        let permits = LargePermits::new(1);
+        let (mut client_w, node_r) = tokio::io::duplex(64 * 1024);
+        let (node_w, mut client_r) = tokio::io::duplex(2 * 1024 * 1024);
+        let (mut node_w, mut node_r) = (Refusable::new(node_w), Refusable::new(node_r));
+        let node = handle_inbound_sync(
+            &mut node_w,
+            &mut node_r,
+            &peer,
+            &state,
+            true,
+            false,
+            Some(&permits),
+            address,
+            false,
+        );
+        let client = async {
+            write_raw_frame(&mut client_w, &sync).await.unwrap();
+            let _ = read_frame(&mut client_r, Protocol::ItemSync).await.unwrap();
+            write_raw_frame(&mut client_w, &large).await.unwrap();
+            let answered = fetched(&mut client_r, two_seconds).await;
+            assert_eq!(
+                answered,
+                Some(14),
+                "the answer waited for a second permit beside the frame's"
+            );
+            drop(client_w);
+        };
+        let ((), ()) = tokio::join!(
+            async {
+                node.await;
+            },
+            client
+        );
+        assert_eq!((node_w.refused, node_r.refused), (None, None));
+
+        // No permit within STREAM_TIMEOUT: the stream is stopped and reset
+        // with ERR_LARGE_MESSAGE_LATER, and ends unanswered.
         let permits = LargePermits::new(1);
         let _held = permits.take("203.0.113.1".parse().unwrap()).await;
-        let (mut client_w, mut node_r) = tokio::io::duplex(64 * 1024);
-        let (mut node_w, mut client_r) = tokio::io::duplex(2 * 1024 * 1024);
+        let (mut client_w, node_r) = tokio::io::duplex(64 * 1024);
+        let (node_w, mut client_r) = tokio::io::duplex(2 * 1024 * 1024);
+        let (mut node_w, mut node_r) = (Refusable::new(node_w), Refusable::new(node_r));
         write_raw_frame(&mut client_w, &sync).await.unwrap();
         write_raw_frame(&mut client_w, &fetch(&ids)).await.unwrap();
         let node = handle_inbound_sync(
@@ -7789,6 +7918,12 @@ mod tests {
         tokio::time::timeout(STREAM_TIMEOUT + two_seconds, node)
             .await
             .expect("the stream was not given up when no permit came");
+        let later = Some(u64::from(ERR_LARGE_MESSAGE_LATER));
+        assert_eq!(
+            (node_w.refused, node_r.refused),
+            (later, later),
+            "the stream was not refused with ERR_LARGE_MESSAGE_LATER"
+        );
         let _ = read_frame(&mut client_r, Protocol::ItemSync).await.unwrap();
         assert_eq!(fetched(&mut client_r, two_seconds).await, None);
     }
