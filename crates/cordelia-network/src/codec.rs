@@ -142,17 +142,28 @@ async fn read_exact_guarded<R: AsyncRead + Unpin>(
 pub trait GiveUp {
     /// Give the stream up. Nothing more is written on it.
     fn give_up(&mut self) {}
+
+    /// Finish the stream cleanly: what was written is sent, and the peer
+    /// sees its end. A no-op where there is nothing to finish (a stream in
+    /// memory, as the tests use).
+    fn finish_up(&mut self) {}
 }
 
 impl GiveUp for quinn::SendStream {
     fn give_up(&mut self) {
         let _ = self.reset(quinn::VarInt::from_u32(protocol::ERR_STREAM_TIMEOUT));
     }
+    fn finish_up(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 impl<R: AsyncRead, W: AsyncWrite + GiveUp> GiveUp for tokio::io::Join<R, W> {
     fn give_up(&mut self) {
         self.writer_mut().give_up()
+    }
+    fn finish_up(&mut self) {
+        self.writer_mut().finish_up()
     }
 }
 
@@ -256,6 +267,26 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     protocol: Protocol,
 ) -> Result<WireMessage, CodecError> {
     let len = read_frame_len(reader).await?;
+    let payload = read_frame_body(reader, len).await?;
+    decode_message(protocol, &payload)
+}
+
+/// Read a frame on a stream whose honest messages are all within a small
+/// message, refusing a longer one at its length before the payload is
+/// read or allocated (decision 2026-10-22 (memory), rule 2). On these
+/// streams (peer-sharing, channel-announce, and the older kind's sync as
+/// a node that carries none answers it) no honest message of any version
+/// is over `SMALL_MESSAGE_BYTES`, so there is no permit to wait for: a
+/// longer frame is a `MessageTooLarge`, which the caller ends the stream
+/// on.
+pub async fn read_small_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    protocol: Protocol,
+) -> Result<WireMessage, CodecError> {
+    let len = read_frame_len(reader).await?;
+    if len > protocol::SMALL_MESSAGE_BYTES {
+        return Err(CodecError::MessageTooLarge { size: len });
+    }
     let payload = read_frame_body(reader, len).await?;
     decode_message(protocol, &payload)
 }
@@ -642,6 +673,33 @@ mod tests {
         // now, by the length just read.
         let body = read_frame_body(&mut cursor, len).await.unwrap();
         assert_eq!(body, payload);
+    }
+
+    /// On a stream whose honest messages fit a small message, a longer
+    /// frame is refused at its length, before the body is read, and one
+    /// within a small message is read as usual (decision 2026-10-22
+    /// (memory), rule 2).
+    #[tokio::test]
+    async fn a_small_frame_read_refuses_a_frame_over_a_small_message() {
+        let small = protocol::SMALL_MESSAGE_BYTES;
+        // One byte over a small message: refused at the length.
+        let mut over = Vec::new();
+        over.extend_from_slice(&(small + 1).to_be_bytes());
+        over.extend_from_slice(&vec![0u8; 16]); // only part of the body is present
+        let mut cursor = std::io::Cursor::new(over);
+        match read_small_frame(&mut cursor, Protocol::PeerSharing).await {
+            Err(CodecError::MessageTooLarge { size }) => assert_eq!(size, small + 1),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+        // A real, small message is read.
+        let msg = WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 });
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            read_small_frame(&mut cursor, Protocol::PeerSharing).await,
+            Ok(WireMessage::PeerShareRequest(_))
+        ));
     }
 
     /// A length over MAX_MESSAGE_BYTES is refused at the length, before a

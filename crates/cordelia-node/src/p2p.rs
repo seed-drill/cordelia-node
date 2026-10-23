@@ -5609,13 +5609,16 @@ fn nothing_for(
 /// the peer has no more. The node's database is not read: a personal
 /// node carries no channel of that kind, whatever its database once
 /// held.
-async fn answer_sync_with_nothing(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
-    peer_id: &NodeId,
-) {
+async fn answer_sync_with_nothing<W, R>(send: &mut W, recv: &mut R, peer_id: &NodeId)
+where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
     for _ in 0..NOTHING_ANSWERED_AT_MOST {
-        let Ok(asked) = cordelia_network::codec::read_frame(
+        // No honest older-kind request to a node that carries none is over
+        // a small message (rule 2): a longer frame is refused at its
+        // length, before its body is read.
+        let Ok(asked) = cordelia_network::codec::read_small_frame(
             recv,
             cordelia_network::messages::Protocol::ItemSync,
         )
@@ -5643,7 +5646,7 @@ async fn answer_sync_with_nothing(
         }
     }
     tracing::debug!(peer = %peer_id, "answered a sync of the older kind with nothing: a personal node carries no channel of that kind");
-    let _ = send.finish();
+    send.finish_up();
 }
 
 #[expect(
@@ -5888,14 +5891,20 @@ where
     }
 }
 
-async fn handle_inbound_peer_share(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+async fn handle_inbound_peer_share<W, R>(
+    send: &mut W,
+    recv: &mut R,
     peer_id: &NodeId,
     shared_peers: &std::sync::Arc<std::sync::RwLock<Vec<cordelia_network::messages::PeerAddress>>>,
     node_role: &str,
-) {
-    let msg = match cordelia_network::codec::read_frame(
+) where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // A peer-share request is tiny (a count of peers), so no honest frame
+    // is over a small message (rule 2): a longer one is refused at its
+    // length.
+    let msg = match cordelia_network::codec::read_small_frame(
         recv,
         cordelia_network::messages::Protocol::PeerSharing,
     )
@@ -5943,7 +5952,12 @@ async fn handle_inbound_peer_share(
                 peers: current_peers,
             },
         );
-        let _ = cordelia_network::codec::write_frame(send, &resp).await;
+        // Encoded, and the message dropped, before the write (rule 4).
+        let written = cordelia_network::codec::encode_message(&resp);
+        drop(resp);
+        if let Ok(written) = written {
+            let _ = cordelia_network::codec::write_raw_frame(send, &written).await;
+        }
         tracing::debug!(peer = %peer_id, count, "served peer-share request");
     }
 }
@@ -5964,14 +5978,19 @@ fn as_a_peer_sent_it(text: &str) -> String {
 ///
 /// A channel's ID is logged for debugging only. What a node logs as a
 /// matter of course is how many channels a peer announced, not which.
-async fn handle_inbound_channel_announce(
-    recv: &mut quinn::RecvStream,
+async fn handle_inbound_channel_announce<R>(
+    recv: &mut R,
     peer_id: &NodeId,
     gov_tx: &tokio::sync::mpsc::UnboundedSender<GovEvent>,
-) {
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let (mut announced, mut withdrawn) = (0u64, 0u64);
     loop {
-        let msg = match cordelia_network::codec::read_frame(
+        // A channel announcement carries a descriptor of short fields, so
+        // no honest frame is over a small message (rule 2): a longer one
+        // is refused at its length.
+        let msg = match cordelia_network::codec::read_small_frame(
             recv,
             cordelia_network::messages::Protocol::ChannelAnnounce,
         )
@@ -7516,6 +7535,78 @@ mod tests {
         assert!(
             held > 600_000,
             "the answer of a megabyte was not built: {held} bytes"
+        );
+    }
+
+    /// Which inbound handler to run over a pair of pipes.
+    enum Handler {
+        PeerShare,
+        ChannelAnnounce,
+        SyncNothing,
+    }
+
+    /// Whether the handler reads the body of a frame larger than a small
+    /// message (decision 2026-10-22 (memory), rule 2): the pipe is too
+    /// small to hold the frame, so the peer's write finishes only if the
+    /// handler drains the body. A handler that refuses at the length
+    /// leaves it blocked. `false` means the body was not read.
+    async fn handler_drains_a_large_frame(which: Handler) -> bool {
+        let (mut peer_w, mut node_r) = tokio::io::duplex(64 * 1024);
+        let (mut node_w, _peer_r) = tokio::io::duplex(64 * 1024);
+        let peer = NodeId([9; 32]);
+        // 200,000 bytes: longer than a small message (147,456).
+        let frame = vec![0x5au8; 200_000];
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w = wrote.clone();
+        let writer = async {
+            let _ = cordelia_network::codec::write_raw_frame(&mut peer_w, &frame).await;
+            w.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let handler = async {
+            match which {
+                Handler::PeerShare => {
+                    let shared = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+                    handle_inbound_peer_share(&mut node_w, &mut node_r, &peer, &shared, "relay")
+                        .await;
+                }
+                Handler::ChannelAnnounce => {
+                    let (gov_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    handle_inbound_channel_announce(&mut node_r, &peer, &gov_tx).await;
+                }
+                Handler::SyncNothing => {
+                    answer_sync_with_nothing(&mut node_w, &mut node_r, &peer).await;
+                }
+            }
+        };
+        // The handler that refuses at the length returns at once and the
+        // write stays blocked, so the join never finishes: the timeout
+        // then leaves `wrote` false. A handler that drains the body lets
+        // the write finish, and the join returns with `wrote` true.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            tokio::join!(handler, writer)
+        })
+        .await;
+        wrote.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The peer-share, channel-announce and older-kind-sync handlers read a
+    /// frame only within a small message (decision 2026-10-22 (memory),
+    /// rule 2): no honest message of any version on these streams is
+    /// larger, so a longer frame is refused at its length and its body is
+    /// not read.
+    #[tokio::test]
+    async fn the_small_streams_do_not_read_a_frame_over_a_small_message() {
+        assert!(
+            !handler_drains_a_large_frame(Handler::PeerShare).await,
+            "peer-share read a frame over a small message"
+        );
+        assert!(
+            !handler_drains_a_large_frame(Handler::ChannelAnnounce).await,
+            "channel-announce read a frame over a small message"
+        );
+        assert!(
+            !handler_drains_a_large_frame(Handler::SyncNothing).await,
+            "the older kind's answer-nothing read a frame over a small message"
         );
     }
 
