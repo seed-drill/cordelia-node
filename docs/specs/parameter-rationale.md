@@ -2588,9 +2588,8 @@ relay's own fetch from a peer that is not a relay listed by key that are
 over a small message (rule 6): an honest peer's list of every channel it
 holds, past about 1,500 of them, and the entries of a page fetched from
 a relay it does not list by key, whose answer is up to a message. That
-fetch asks as it did, up to 100 headers
-a page and the entries of a page in one request, since a header carries
-no size to fit a request to; it fails where no permit comes within
+fetch asks as it did, up to 100 headers a page and the entries of a page
+in one request, since a header carries no size to fit a request to; it fails where no permit comes within
 `STREAM_TIMEOUT_SECS`, refusing the stream with
 `ERR_LARGE_MESSAGE_LATER`, and the peer is asked again a rate window
 later, as after any failed fetch. There is no budget of its own over the
