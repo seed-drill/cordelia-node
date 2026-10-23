@@ -2435,10 +2435,28 @@ pub fn post_connect(
         let st = seen_table.clone();
         let entries = relay_entries.clone();
         let permits = large_permits.clone();
+        // Whether a listed relay's connection carries the listed settings
+        // at this end, by which it is given full pages (rule 12).
+        let listed_settings = conn_mgr.carries_listed_settings(node_id);
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, made_from, db_state, peers_ref, role, rtx, dtx, rates, states,
-                relays, gtx, sm, st, entries, permits,
+                conn,
+                peer_id,
+                made_from,
+                db_state,
+                peers_ref,
+                role,
+                rtx,
+                dtx,
+                rates,
+                states,
+                relays,
+                gtx,
+                sm,
+                st,
+                entries,
+                permits,
+                listed_settings,
             )
             .await;
         });
@@ -5354,6 +5372,7 @@ pub async fn handle_peer_streams(
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
     large_permits: std::sync::Arc<LargePermits>,
+    listed_settings: bool,
 ) {
     let mut stream_count: u64 = 0;
     // The channels of entries whose keys were proved on this connection
@@ -5599,6 +5618,7 @@ pub async fn handle_peer_streams(
                     db: &state.db,
                     rates: &peer_rates,
                     permits: Some(&large_permits),
+                    listed_settings,
                 };
                 let over = entries
                     .serve(
@@ -8962,6 +8982,7 @@ mod tests {
             seen,
             relay_entries,
             permits,
+            listed,
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -13041,6 +13062,10 @@ mod tests {
             (listed_window, listed_streams),
             "a connection dialled to a relay configured by key has another's windows"
         );
+        assert!(
+            dialled.listed_settings,
+            "a dial to a relay configured by key does not say it has the listed settings"
+        );
         drop(dialled);
 
         // Accepted from the relay's address, with its key.
@@ -13054,7 +13079,11 @@ mod tests {
         let from_relay = connection::outbound_connect(&relay_ctx, node_addr)
             .await
             .unwrap();
-        let _accepted = at_node.await.unwrap().unwrap();
+        let accepted = at_node.await.unwrap().unwrap();
+        assert!(
+            accepted.listed_settings,
+            "a connection accepted from a listed relay does not say it has the listed settings"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             what_it_may_send(&from_relay.conn, 1).await,
@@ -13077,6 +13106,10 @@ mod tests {
             from_other.is_ok() && accepted.is_ok(),
             "a peer from another address than a listed relay's was not accepted: {:?}",
             accepted.err()
+        );
+        assert!(
+            !accepted.as_ref().unwrap().listed_settings,
+            "a peer from another address is said to have the listed settings"
         );
         let from_other = from_other.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -13223,6 +13256,7 @@ mod tests {
             )),
             relay_entries,
             permits.clone(),
+            false,
         ));
 
         let item = |n: usize, bytes: usize| Item {
