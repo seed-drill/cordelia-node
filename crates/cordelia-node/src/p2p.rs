@@ -12975,8 +12975,9 @@ mod tests {
     /// configured by key keeps today's windows and streams in both
     /// directions: dialled to it, and accepted from its address with its
     /// key, the relay may send 1 MiB unread on a stream and have 64
-    /// streams open. A peer accepted from another address may send one
-    /// small message on a stream and have QUIC_MAX_BIDI_STREAMS open. One
+    /// streams open. A peer accepted from another address may send
+    /// QUIC_STREAM_RECEIVE_WINDOW on a stream and have
+    /// QUIC_MAX_BIDI_STREAMS open. One
     /// accepted from the relay's address with another key is closed once
     /// its TLS completes, before its handshake is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13116,5 +13117,274 @@ mod tests {
             dialled_by_impostor.is_err(),
             "the impostor's handshake was read"
         );
+    }
+
+    /// What a relay's own fetch from a relay configured by address alone,
+    /// of the version before, and that relay's large pushes on the same
+    /// connection come to (decision 2026-10-22 (memory), rules 2, 6 and 8):
+    /// how the fetch ended and how long it took, and how many of the
+    /// pushes were answered, with the time of the last.
+    struct Contended {
+        fetched: Fetched,
+        fetch_took: std::time::Duration,
+        pushes_answered: usize,
+        pushes_took: std::time::Duration,
+    }
+
+    /// A relay fetches from a peer it is connected to, which answers the
+    /// fetch of a page's entries with `fetched_bytes` of items, while the
+    /// peer pushes `pushes` frames of `push_bytes` each, each on a stream of
+    /// its own, all begun before the fetch's answer is written.
+    async fn a_fetch_beside_large_pushes(
+        pushes: usize,
+        push_bytes: usize,
+        fetched_bytes: usize,
+    ) -> Contended {
+        use cordelia_network::codec::{self, encode_message, write_raw_frame};
+        use cordelia_network::messages::{
+            FetchResponse, Item, ItemHeader, Protocol, PushPayload, SyncChannelListResponse,
+            SyncResponse, WireMessage,
+        };
+        use cordelia_network::{connection, transport};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{Arc, RwLock};
+
+        let id = |seed: u8| {
+            Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap())
+        };
+        let (node, peer) = (id(41), id(42));
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node_end = transport::create_endpoint(&node, here).unwrap();
+        let node_addr = node_end.local_addr().unwrap();
+        let node_mgr = connection::ConnectionManager::new(
+            node.clone(),
+            node_end,
+            vec![],
+            vec!["relay".into()],
+            node_addr.port(),
+        );
+        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+        let peer_key = NodeId(peer.public_key());
+        // A relay configured by address alone: in peer_relays, listed by
+        // no key.
+        let relay_entries = Some(Arc::new(crate::relay_entries::RelayEntries::new(
+            u64::MAX,
+            Arc::new(RwLock::new(Vec::new())),
+            std::time::Duration::from_secs(600),
+        )));
+        let peer_relays = Arc::new(RwLock::new(HashSet::from([peer_key.clone()])));
+        let peer_states = Arc::new(RwLock::new(HashMap::from([(peer_key.clone(), 2u8)])));
+        let permits = Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let state = a_state();
+        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+        let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
+        let peer_rates = Arc::new(std::sync::Mutex::new(Rates::new(u64::MAX)));
+
+        let node_conn = tokio::spawn(async move {
+            let incoming = accepts.accept().await.unwrap();
+            connection::inbound_accept(&as_node, incoming)
+                .await
+                .unwrap()
+                .conn
+        });
+        let mut peer_mgr = connection::ConnectionManager::new(
+            peer.clone(),
+            transport::create_endpoint(&peer, here).unwrap(),
+            vec![],
+            vec!["relay".into()],
+            9474,
+        );
+        peer_mgr.connect_to(node_addr).await.unwrap();
+        let at_peer = peer_mgr
+            .get_connection(&NodeId(node.public_key()))
+            .unwrap()
+            .clone();
+        let node_conn = node_conn.await.unwrap();
+
+        let loop_task = tokio::spawn(handle_peer_streams(
+            node_conn.clone(),
+            peer_key.clone(),
+            "127.0.0.1".parse().unwrap(),
+            state.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            "relay".into(),
+            repush_tx.clone(),
+            delivery_tx,
+            peer_rates.clone(),
+            peer_states,
+            peer_relays,
+            gov_tx,
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(
+                cordelia_network::seen_table::SeenTable::default(),
+            )),
+            relay_entries,
+            permits.clone(),
+        ));
+
+        let item = |n: usize, bytes: usize| Item {
+            item_id: format!("ci_{n:0>26}"),
+            channel_id: "grp_00000000-0000-4000-8000-00000000000c".into(),
+            item_type: "memory".into(),
+            encrypted_blob: vec![n as u8; bytes],
+            content_hash: vec![0u8; 32],
+            content_length: bytes as u32,
+            author_id: vec![0u8; 32],
+            signature: vec![0u8; 64],
+            key_version: 1,
+            published_at: "2026-10-22T00:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        let began = tokio::time::Instant::now();
+        let answered = Arc::new(std::sync::Mutex::new(Vec::<std::time::Duration>::new()));
+
+        // The peer: it answers the relay's fetch, and when the fetch asks
+        // for a page's entries it begins its pushes, then writes the
+        // answer.
+        let serving = {
+            let (at_peer, answered) = (at_peer.clone(), answered.clone());
+            tokio::spawn(async move {
+                let (mut send, mut recv) = at_peer.accept_bi().await.unwrap();
+                let _ = codec::read_protocol_byte(&mut recv).await;
+                let channel = "grp_00000000-0000-4000-8000-00000000000c".to_string();
+                let mut first = true;
+                loop {
+                    let answer = match codec::read_frame(&mut recv, Protocol::ItemSync).await {
+                        Ok(WireMessage::SyncChannelListRequest(_)) => {
+                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                                channel_ids: vec![channel.clone()],
+                            })
+                        }
+                        Ok(WireMessage::SyncRequest(_)) => {
+                            let items = if first {
+                                first = false;
+                                (0..4)
+                                    .map(|n| ItemHeader {
+                                        item_id: format!("ci_{n:0>26}"),
+                                        channel_id: channel.clone(),
+                                        item_type: "memory".into(),
+                                        content_hash: vec![0u8; 32],
+                                        author_id: vec![0u8; 32],
+                                        signature: vec![0u8; 64],
+                                        key_version: 1,
+                                        published_at: "2026-10-22T00:00:00Z".into(),
+                                        is_tombstone: false,
+                                        parent_id: None,
+                                        slot: None,
+                                        rev: None,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            WireMessage::SyncResponse(SyncResponse {
+                                items,
+                                has_more: false,
+                                last_seq: Some(4),
+                            })
+                        }
+                        Ok(WireMessage::FetchRequest(_)) => {
+                            for n in 0..pushes {
+                                let (at_peer, answered) = (at_peer.clone(), answered.clone());
+                                tokio::spawn(async move {
+                                    let (mut send, mut recv) = at_peer.open_bi().await.unwrap();
+                                    let push = WireMessage::PushPayload(PushPayload {
+                                        items: vec![item(1000 + n, push_bytes)],
+                                    });
+                                    let mut stream = tokio::io::join(&mut recv, &mut send);
+                                    let sent =
+                                        codec::send_request(&mut stream, Protocol::ItemPush, &push)
+                                            .await;
+                                    if sent.is_ok() {
+                                        answered.lock().unwrap().push(began.elapsed());
+                                    }
+                                });
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            WireMessage::FetchResponse(FetchResponse {
+                                items: (0..4).map(|n| item(n, fetched_bytes / 4)).collect(),
+                            })
+                        }
+                        _ => break,
+                    };
+                    if write_raw_frame(&mut send, &encode_message(&answer).unwrap())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let from = FetchFrom {
+            target: peer_key,
+            state,
+            role: "relay".into(),
+            channels: Vec::new(),
+            ask_what_it_holds: true,
+            limited: false,
+            address: "127.0.0.1".parse().unwrap(),
+            rates: peer_rates,
+            kept: Default::default(),
+            repush_tx,
+            seen_table: Default::default(),
+            permits: Some(permits),
+            listed_by_key: false,
+        };
+        let (fetched, _) = fetch_from(node_conn, from).await;
+        let fetch_took = began.elapsed();
+        // The pushes have until a stream timeout and a half after the fetch.
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while answered.lock().unwrap().len() < pushes && tokio::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let answered = answered.lock().unwrap().clone();
+        loop_task.abort();
+        serving.abort();
+        Contended {
+            fetched,
+            fetch_took,
+            pushes_answered: answered.len(),
+            pushes_took: answered.iter().max().copied().unwrap_or_default(),
+        }
+    }
+
+    /// Decision 2026-10-22 (memory), rule 8. A relay's own fetch from a
+    /// relay configured by address alone, and that relay's large pushes on
+    /// the same connection, all end: the fetch within two seconds and every
+    /// push answered. The relay reads the streams the peer opens one at a
+    /// time; at a stream window of a small message, two pushes queued
+    /// behind the one being read held the whole connection's window, and
+    /// the push being read, the fetch and the other pushes waited out
+    /// STREAM_TIMEOUT. Each stream's window an eighth of the connection's,
+    /// the streams queued cannot hold all of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other() {
+        for (pushes, push_bytes, fetched_bytes) in [
+            (3, 300_000, 400_000),
+            (5, 300_000, 100_000),
+            (3, 900_000, 100_000),
+            (7, 140_000, 100_000),
+        ] {
+            let ended = a_fetch_beside_large_pushes(pushes, push_bytes, fetched_bytes).await;
+            assert!(
+                ended.fetched == Fetched::All
+                    && ended.fetch_took < std::time::Duration::from_secs(2)
+                    && ended.pushes_answered == pushes,
+                "{pushes} pushes of {push_bytes} bytes beside a fetch of {fetched_bytes}: \
+                 the fetch ended {:?} after {:?}, and {} pushes were answered, the last after {:?}",
+                ended.fetched,
+                ended.fetch_took,
+                ended.pushes_answered,
+                ended.pushes_took
+            );
+        }
     }
 }

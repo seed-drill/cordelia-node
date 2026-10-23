@@ -113,10 +113,13 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 ///
 /// - A peer may have QUIC_MAX_BIDI_STREAMS (8) streams open at once, and
 ///   no unidirectional ones.
-/// - It may send one small message's worth on a stream, and two on the
-///   whole connection, before this node has read it. So one connection
-///   can make a node buffer 288 KiB unread, whatever the peer does. A
-///   larger message arrives a window at a time, as the node reads it.
+/// - It may send two small messages' worth on the whole connection before
+///   this node has read it, and an eighth of that on a stream, so that
+///   every stream it may have open fits the connection's window together:
+///   the streams queued behind the one the node reads cannot take the
+///   credit that one needs. So one connection can make a node buffer
+///   288 KiB unread, whatever the peer does. A message larger than a
+///   stream's window arrives a window at a time, as the node reads it.
 /// - This node may have written two small messages' worth on the
 ///   connection that the peer has not acknowledged (QUIC_SEND_WINDOW). A
 ///   write beyond it waits for acknowledgements, and the codec gives it up
@@ -786,29 +789,12 @@ mod tests {
     /// T3. One connection cannot make a node hold more than two small
     /// messages' worth that it has not read, however many streams the peer
     /// uses (decision 2026-10-22, memory across connections, rule 8): a
-    /// small message on a stream, and QUIC_RECEIVE_WINDOW on them all.
+    /// stream's window on each stream it may open, which together are
+    /// QUIC_RECEIVE_WINDOW.
     #[tokio::test]
     async fn a_connection_buffers_at_most_two_unread_messages() {
-        let (client, _server_reads_nothing, _c, _s) = connected().await;
-        let message = vec![0u8; protocol::SMALL_MESSAGE_BYTES as usize];
-
-        // Four streams, a small message's worth on each: four offered.
-        let mut streams = Vec::new();
-        let mut taken = 0;
-        for _ in 0..4 {
-            let (mut send, recv) = client.open_bi().await.unwrap();
-            let sent =
-                tokio::time::timeout(Duration::from_millis(1500), send.write_all(&message)).await;
-            taken += usize::from(matches!(sent, Ok(Ok(()))));
-            streams.push((send, recv));
-        }
-        assert_eq!(
-            taken, 2,
-            "the connection took {taken} small messages unread"
-        );
-
         // On every stream it may open, as much as each takes: no more than
-        // the window in all, and no more than a small message on one.
+        // the window in all, and no more than a stream's window on one.
         let (client, _server_reads_nothing, _c, _s) = connected().await;
         let chunk = vec![0u8; 16 * 1024];
         let (mut in_all, mut most) = (0usize, 0usize);
@@ -924,14 +910,14 @@ mod tests {
 
     /// Decision 2026-10-22, memory across connections, rules 8, 9 and 11.
     /// The configs of every connection but one with a relay listed by key
-    /// carry a small message on a stream, two on the connection each way,
-    /// and 8 streams, as the client that dials and as the server that is
-    /// dialled.
+    /// carry two small messages on the connection each way, an eighth of
+    /// that on a stream, and 8 streams, as the client that dials and as
+    /// the server that is dialled.
     #[test]
     fn the_windows_and_streams_are_set_from_a_small_message() {
         let id = NodeIdentity::generate().unwrap();
         let small = u64::from(protocol::SMALL_MESSAGE_BYTES);
-        let set = (small, 2 * small, 2 * small, 8);
+        let set = (2 * small / 8, 2 * small, 2 * small, 8);
         assert_eq!(limits_of(&transport_config()), set);
         assert_eq!(limits_of(&client_config(&id).unwrap()), set);
         assert_eq!(limits_of(&server_config(&id).unwrap().transport), set);
@@ -1477,5 +1463,218 @@ mod tests {
         let cc = client_config(&id).expect("client config should build with keepalive");
         // If keep_alive_interval or max_idle_timeout were invalid, these would fail
         let _ = (sc, cc);
+    }
+
+    /// A path to `server` over UDP that delays every datagram `each_way`
+    /// in each direction, in order: the address to dial.
+    async fn delayed_path_to(server: SocketAddr, each_way: Duration) -> SocketAddr {
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(server).await.unwrap();
+        let addr = front.local_addr().unwrap();
+        let client = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
+        // Each direction: a reader that stamps each datagram, and a sender
+        // that sends it once its time has come.
+        let (up_tx, mut up_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        let (down_tx, mut down_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        {
+            let (front, client) = (front.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client.lock().unwrap() = Some(from);
+                    let _ = up_tx.send((tokio::time::Instant::now() + each_way, buf[..n].to_vec()));
+                }
+            });
+        }
+        {
+            let back = back.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let _ =
+                        down_tx.send((tokio::time::Instant::now() + each_way, buf[..n].to_vec()));
+                }
+            });
+        }
+        {
+            let back = back.clone();
+            tokio::spawn(async move {
+                while let Some((at, datagram)) = up_rx.recv().await {
+                    tokio::time::sleep_until(at).await;
+                    let _ = back.send(&datagram).await;
+                }
+            });
+        }
+        tokio::spawn(async move {
+            while let Some((at, datagram)) = down_rx.recv().await {
+                tokio::time::sleep_until(at).await;
+                let to = *client.lock().unwrap();
+                if let Some(to) = to {
+                    let _ = front.send_to(&datagram, to).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// One exchange: the client writes `asked` bytes on a stream it opens
+    /// and finishes it, the server reads them to the end and answers with
+    /// `answered` bytes; the time from the first byte written to the last
+    /// byte of the answer read.
+    async fn exchange(
+        client: &quinn::Connection,
+        server: &quinn::Connection,
+        asked: usize,
+        answered: usize,
+    ) -> Duration {
+        let serving = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let (mut send, mut recv) = server.accept_bi().await.unwrap();
+                recv.read_to_end(4 << 20).await.unwrap();
+                send.write_all(&vec![1u8; answered]).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            })
+        };
+        let began = std::time::Instant::now();
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        send.write_all(&vec![2u8; asked.max(1)]).await.unwrap();
+        send.finish().unwrap();
+        let got = recv.read_to_end(4 << 20).await.unwrap();
+        let took = began.elapsed();
+        assert_eq!(got.len(), answered);
+        serving.await.unwrap();
+        took
+    }
+
+    /// The windows and streams of a config to measure: what a peer may send
+    /// on a stream, on the connection, what this end may write unacknowledged,
+    /// and how many streams the peer may open.
+    fn limits(
+        stream_window: u32,
+        window: u32,
+        send_window: u64,
+        streams: u32,
+    ) -> quinn::TransportConfig {
+        transport_with(Limits {
+            streams,
+            stream_window,
+            window,
+            send_window,
+        })
+    }
+
+    /// What each exchange of an honest peer takes at a round trip of 200 ms
+    /// (decision 2026-10-22, memory across connections, §2.3), with each
+    /// end's settings as named. Printed; run by hand:
+    /// `cargo test -p cordelia-network --lib what_each_exchange_takes -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement, printed: run by hand"]
+    async fn what_each_exchange_takes_at_a_round_trip_of_200_ms() {
+        let mib = 1u32 << 20;
+        let today = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
+        let small = protocol::SMALL_MESSAGE_BYTES;
+        let branch = move || limits(small, 2 * small, 2 * u64::from(small), 8);
+        let quarter =
+            move |stream_window: u32| limits(stream_window, 2 * small, 2 * u64::from(small), 8);
+        let listed = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
+        // Each end's settings, made afresh for each connection.
+        type Settings = Box<dyn Fn() -> quinn::TransportConfig>;
+        let cases: Vec<(&str, Settings, Settings)> = vec![
+            (
+                "before change F: 1 MiB a stream, 2 MiB, 64 streams",
+                Box::new(today),
+                Box::new(today),
+            ),
+            (
+                "a small message a stream at the relay; the device listed",
+                Box::new(branch),
+                Box::new(listed),
+            ),
+            (
+                "a small message a stream at both",
+                Box::new(branch),
+                Box::new(branch),
+            ),
+            (
+                "36 KiB a stream at the relay; the device listed",
+                Box::new(move || quarter(36_864)),
+                Box::new(listed),
+            ),
+            (
+                "36 KiB a stream at both",
+                Box::new(move || quarter(36_864)),
+                Box::new(move || quarter(36_864)),
+            ),
+            (
+                "32 KiB a stream at both",
+                Box::new(move || quarter(32_768)),
+                Box::new(move || quarter(32_768)),
+            ),
+        ];
+        for (name, at_server, at_client) in cases {
+            let server_id = NodeIdentity::generate().unwrap();
+            let client_id = NodeIdentity::generate().unwrap();
+            let (cert, key) = generate_self_signed_cert(&server_id).unwrap();
+            let server_end = Endpoint::server(
+                server_config_with(cert, key, at_server()).unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            let dial =
+                delayed_path_to(server_end.local_addr().unwrap(), Duration::from_millis(100)).await;
+            let (cert, key) = generate_self_signed_cert(&client_id).unwrap();
+            let mut client_end = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client_end
+                .set_default_client_config(client_config_with(cert, key, at_client()).unwrap());
+            let accepting = {
+                let server_end = server_end.clone();
+                tokio::spawn(async move { server_end.accept().await.unwrap().await.unwrap() })
+            };
+            let client = client_end.connect(dial, "cordelia").unwrap().await.unwrap();
+            let server = accepting.await.unwrap();
+            // Past slow start: 4 MiB each way, on 4 streams at once.
+            let mut warming = Vec::new();
+            for _ in 0..4 {
+                let (c, s) = (client.clone(), server.clone());
+                warming.push(tokio::spawn(async move {
+                    exchange(&c, &s, 1 << 20, 1 << 20).await
+                }));
+            }
+            for w in warming {
+                w.await.unwrap();
+            }
+            let median = |mut v: Vec<Duration>| {
+                v.sort();
+                v[v.len() / 2]
+            };
+            let mut line = Vec::new();
+            for (what, asked, answered) in [
+                ("push 128 KiB", 128 * 1024, 16),
+                ("page 128 KiB", 64, 128 * 1024),
+                ("show 33 KiB, answer 66 KB", 33 * 1024, 66_560),
+                ("fetch answer 1 MiB", 64, 1 << 20),
+            ] {
+                let mut took = Vec::new();
+                for _ in 0..3 {
+                    took.push(exchange(&client, &server, asked, answered).await);
+                }
+                line.push(format!("{what}: {:.2} s", median(took).as_secs_f64()));
+            }
+            let began = std::time::Instant::now();
+            for _ in 0..10 {
+                exchange(&client, &server, 64, 128 * 1024).await;
+            }
+            line.push(format!(
+                "pass of 10 pages of 128 KiB: {:.2} s",
+                began.elapsed().as_secs_f64()
+            ));
+            println!("{name}: {}", line.join("; "));
+            client.close(0u32.into(), b"done");
+        }
     }
 }

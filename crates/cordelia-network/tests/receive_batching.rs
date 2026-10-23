@@ -108,8 +108,9 @@ fn peak() -> isize {
 const GATHERED: usize = 44;
 
 /// How long a datagram may wait to be gathered before it is sent with
-/// those beside it.
-const GATHER_WAIT: Duration = Duration::from_millis(3);
+/// those beside it: long enough that the bulk of one stream, a stream's
+/// window at a time, fills batches of `GATHERED`.
+const GATHER_WAIT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Default)]
 struct Gathering {
@@ -339,14 +340,13 @@ fn held_by_the_node(node: Node, pace: Duration, lasting: Duration) -> isize {
 }
 
 /// The most one connection may make the node's thread hold over its
-/// level here: 1.5 MiB. Measured on loopback, on change F's windows and 8
-/// streams, at five pacings of the one-byte writes (1 to 16 ms), four
-/// times each: GRO off 416 to 517 KiB, GRO on 4,601 to 6,627 KiB. The
-/// threshold lies between the two, at about their geometric mean; the
-/// bound read from quinn's source for this traffic with GRO off, the
-/// receive windows and the reassembly beyond them, 976 KiB, is below it
-/// too.
-const THRESHOLD_BYTES: isize = 1536 * 1024;
+/// level here: 1,200 KiB. Measured on loopback, on change F's windows (36
+/// KiB a stream) and 8 streams, at five pacings of the one-byte writes (1
+/// to 16 ms), three times each: GRO off 357 to 656 KiB, GRO on 2,238 to
+/// 3,292 KiB. The threshold lies between the two, at about their geometric
+/// mean. (At a small message a stream, four times each: 416 to 517 KiB
+/// and 4,601 to 6,627 KiB.)
+const THRESHOLD_BYTES: isize = 1200 * 1024;
 
 /// Decision 2026-10-22, memory across connections, rule 10. A peer that
 /// sends its datagrams in large GSO batches, bulk on a stream the node

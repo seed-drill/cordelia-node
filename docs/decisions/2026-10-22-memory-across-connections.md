@@ -124,7 +124,7 @@ Two parts: (a) a budget across all connections for the application's buffers; (b
 
 ### 2.2 Part (b): QUIC's windows and streams, and the reassembler
 
-8. **The receive windows: one small message on a stream, two on a connection.** `QUIC_STREAM_RECEIVE_WINDOW` = `SMALL_MESSAGE_BYTES` (144 KiB), and `QUIC_RECEIVE_WINDOW` = 2 × it (288 KiB). Reason: the largest thing a device of this version sends is one small message; two on the connection let a second request arrive while the first is read, as two messages did. A large message still arrives, a window at a time: the node reads as it arrives and quinn grants more. Its cost is in section 2.3.
+8. **The receive windows: two small messages on a connection, and an eighth of that on a stream.** `QUIC_RECEIVE_WINDOW` = 2 × `SMALL_MESSAGE_BYTES` (288 KiB), and `QUIC_STREAM_RECEIVE_WINDOW` = `QUIC_RECEIVE_WINDOW` / `QUIC_MAX_BIDI_STREAMS` (36,864 bytes, 36 KiB), checked at compile time: the stream window times the streams is within the connection's. Reason: the largest thing a device of this version sends is one small message, and two on the connection let a second request arrive while the first is read, as two messages did. **Why a stream's window is not a small message** (section 8.3): a node reads the streams a peer opens one at a time, and at a stream window of a small message two streams queued behind the one being read could hold all the connection's credit, so that the stream being read, and the relay's own fetch on the same connection, waited out `STREAM_TIMEOUT_SECS`. With every stream a peer may open within the connection's window together, the streams queued can never take all of it, and the stream being read has the credit its own reads give back; quinn announces it once an eighth of either window has come back (`MAX_STREAM_DATA`, `MAX_DATA`), which the stream being read always reaches. The connection's window, and so W, is unchanged. A message larger than a stream's window arrives a window at a time: a small message in four round trips. Its cost is in section 2.3.
 
 9. **A peer may have 8 streams open on a connection, not 64.** `QUIC_MAX_BIDI_STREAMS` = 8, and `MAX_CONCURRENT_STREAMS` in `protocol.rs` follows it.
    - **Reason:** the inbound loop serves one stream at a time, so a stream beyond the first only waits; and each open stream may hold 32 KiB of quinn's reassembly beyond its data (section 1.3), so 64 streams floor that row at 2 MiB a connection and 8 at 256 KiB.
@@ -171,7 +171,21 @@ What that means for each exchange:
 - **A push, from a device of this version.** At most 128 KiB, one round trip. A device sends a relay at most 1.5 MiB a minute (`OUTBOX_BYTES_PER_MINUTE`), so at least 12 pushes a minute (24 of entries of the largest size), up to 4.8 s of a minute in round trips. A carry of 4 MB is about 31 pushes of small entries, or about 61 of the largest, where it was 5; it takes the same time, which the pace sets.
 - **A pull or a pass between relays listed by key.** As today: rule 12 keeps today's windows, so a full page takes 0.24 s, and a relay's pull of a channel (up to 10 full pages a pass) about 2.4 s. **Catching up after a restart,** by full pages: 1 GiB is about 1,170 pages of 896 KiB, about 4.7 minutes at 0.24 s a page. With F's windows it would be about 28 minutes (1.43 s a page), and a pull of 10 full pages would take about 14.3 s, longer than the 10 s between pulls: that is what rule 12 keeps away. The scale record's stage 190 asks under 1 MiB a minute between relays.
 - **A device of the version before.** Its pushes of up to 896 KiB take 1.43 s, and a large permit (rule 2); its pages from a relay of this version are small (it reads a page that says there is more, as any page, but at accept, end of section 2.2). Its own pace bounds it, as above.
-- **The longest round trip that still works.** A small message arrives in one round trip, and works at any round trip under the 10 s timeout. A message of 1 MiB took 8 round trips; it arrives within 10 s at round trips under about 1.2 s (derived). Today it took about one round trip.
+- **The longest round trip that still works.** A small message arrives in one round trip, and works at any round trip under the 10 s timeout. A message of 1 MiB took 8 round trips; it arrives within 10 s at round trips under about 1.2 s (derived). Today it took about one round trip. (Before a stream's window became an eighth of the connection's, below.)
+
+**With a stream's window an eighth of the connection's** (rule 8, section 8.3). Measured by slice 4 the same way (in-process endpoints of this build through a line that delays each datagram 100 ms each way, past slow start; the median of three; `what_each_exchange_takes_at_a_round_trip_of_200_ms` in `transport.rs`, ignored and run by hand). A device dials a relay configured by key with the settings of rule 12 (`dial_relay`, for every role; the default relays have their keys), so what a relay sends a device is not held by the stream window; what a device sends a relay is.
+
+| What crosses | Before F | A small message a stream | 36 KiB a stream |
+|---|---|---|---|
+| A device's push of 128 KiB to its relay | 0.21 s | 0.23 s | 0.82 s |
+| A page of 128 KiB to a device dialling a relay configured by key | 0.21 s | 0.27 s | 0.26 s |
+| The same page to a device on F's windows (a relay configured by address alone) | 0.21 s | 0.23 s | 0.83 s |
+| A show (33 KiB) and its answer (66 KB), to a device dialling by key | 0.21 s | 0.24 s | 0.24 s |
+| An older kind's fetch answer of 1 MiB, between relays not listed by key | 0.32 s | 1.65 s | 5.92 s |
+| A pass of 10 pages of 128 KiB, to a device on F's windows | 3.23 s | 3.35 s | 9.25 s |
+
+- **A device of this version** is still held by its pace, not by the window: at most 1.5 MiB a minute pushed, about 12 pushes of 128 KiB, 9.8 s of each minute; and at most 2 MiB a minute handed, which a device dialling by key takes at the listed windows. A small message arrives within the 10 s timeout at round trips under about 2.4 s (four round trips and the send).
+- **What it costs:** a message larger than a small message takes about one round trip for each 36 KiB. A message of 1 MiB arrives within 10 s at round trips under about 0.34 s (derived from 5.92 s at 0.2 s), where it was 1.2 s: that falls on the pushes of a device of the version before (up to 896 KiB, about 5.2 s at 200 ms) and on the older kind's fetch answers between relays that are not listed by key. Between relays listed by key, rule 12 keeps today's windows.
 
 ## 3. W again, with E and F
 
@@ -226,7 +240,7 @@ The container of 512 MiB on main does not hold the bound of 200 at worst on any 
 | `LARGE_MESSAGES_AT_ONCE` (new) | 4 | Chosen: rule 2. At most one for each subnet |
 | `ERR_LARGE_MESSAGE_LATER` (new) | 0x05 | Rule 2: a large message the node could not take within `STREAM_TIMEOUT_SECS`, to be sent again |
 | `PUSH_RETRY_STREAMS_AT_ONCE` (new) | 4 | Derived: half of `QUIC_MAX_BIDI_STREAMS` (rule 9) |
-| `QUIC_STREAM_RECEIVE_WINDOW` | 147,456 (was 1,048,576) | Derived: one small message (rule 8) |
+| `QUIC_STREAM_RECEIVE_WINDOW` | 36,864 (was 1,048,576) | Derived: `QUIC_RECEIVE_WINDOW` / `QUIC_MAX_BIDI_STREAMS`, so that every stream a peer may open fits the connection's window (rule 8, section 8.3); checked at compile time |
 | `QUIC_RECEIVE_WINDOW` | 294,912 (was 2,097,152) | Derived: two small messages (rule 8) |
 | `QUIC_SEND_WINDOW` | 294,912 (was 2,097,152) | Derived: two small messages (rule 11) |
 | `QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS` | 8 (was 64) | Chosen: rule 9 |
@@ -380,6 +394,14 @@ The narrow check read the record at its second commit against main (with E) and 
 | 5 | Low | Rule 4, §1.1 and §4.3 credited F with what E already does | §1.1 says the 2,048 holds through the older kind's handlers; rule 4 says E does it on the streams of entries and F in the older kind's handlers; test 4 is of the older kind; §4.3's sentence for §7.7 credits #194 |
 | 6 | Low | Three figures for the same GRO-on cost, none a worst case | One figure, the review's at 44 datagrams a batch (about 4.6 MiB a connection more, W about 6.5 MiB), said to grow with the batch up to 64 (section 1.3, section 3 condition 1, section 5, section 8.1) |
 | 7 | Low | 0x05: the node stops the receive side and resets the send side; an older device blocked in its write sees the stop | Rule 2 says both sides, what a device of the version before sees (`WriteError::Stopped(0x05)`), that it matches only `ERR_RATE_LIMIT`, and that nothing else in its handling changes |
+
+### 8.3 Slice 4's check
+
+Slice 4 measured, over in-process QUIC, a relay's own fetch from a relay configured by address alone (of the version before) while that relay pushes large frames on several streams of the same connection, as its review asked.
+
+| # | Severity | Finding | How it is settled |
+|---|---|---|---|
+| 1 | Medium | At a stream window of a small message, the streams queued behind the one a node reads took the whole connection's window: the stream being read, the fetch and the queued pushes all waited out `STREAM_TIMEOUT_SECS`. Ten runs each: 3 pushes of 300 KB beside a fetch answer of 400 KB ended 5 times in 10; 5 of 300 KB, 0; 3 of 900 KB, 0; 7 of 140 KB (no permit at all), 3. Widening the connection's window while a large permit is held did not settle it (the review's case still stalled 3 runs in 10, before any permit was asked) | Rule 8: a stream's window is an eighth of the connection's, so every stream a peer may open fits it together. Every case ended in 10 of 10 runs, and so did 7, 8 and 9 pushes of 300 KB beside the fetch, and 8 of 900 KB beside a fetch of 900 KB (the slowest fetch 91 ms). The connection's window and W are unchanged; the cost is in section 2.3. Test: `a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other` (`p2p.rs`) |
 
 ## 9. The slices, in the order they go in
 
