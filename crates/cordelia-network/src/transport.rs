@@ -249,7 +249,9 @@ pub fn create_client_endpoint(
 ///
 /// quinn-udp turns GRO on when quinn wraps the socket, so it is turned
 /// off after the wrap, on the same socket (a second descriptor of it).
-/// Sending in batches (GSO) is kept.
+/// Sending in batches (GSO) is kept. A node never rebinds an endpoint; a
+/// rebind (`Endpoint::rebind`) would wrap a new socket and so turn GRO on
+/// again, and must go through `receive_batching_off` after its wrap too.
 fn endpoint_on(
     socket: std::net::UdpSocket,
     server: Option<ServerConfig>,
