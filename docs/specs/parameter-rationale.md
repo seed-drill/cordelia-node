@@ -230,7 +230,8 @@ What it leaves out:
   (QUIC_MAX_BIDI_STREAMS between nodes). What they write is still within
   the one send window above; what they hold in their own memory is not.
   A repush that fails is queued again as a retry of each item, which
-  starts more of them.
+  starts more of them: at most `PUSH_RETRY_STREAMS_AT_ONCE` to one peer
+  at once (§13).
 - A relay's fetch of the older kind from a peer (`fetch_on`), on a stream
   it opens itself to each connected peer that is not hot. Beyond its
   request and the frame it reads, it holds the channels it has still to
@@ -2510,7 +2511,8 @@ so that a container of 1 GiB holds a relay's whole bound of connections
 rule 10 part (GRO off) is in §1 above. Its first slice added the small
 message and the large permits; its second, the small pages and the reads
 that follow them (rule 3); its third, the relay's own fetch, whose answers
-are read by their length (rule 6).
+are read by their length (rule 6); its fourth, QUIC's windows and streams
+(rules 8, 9, 11 and 12), with the push retries' bound before them.
 
 ### SMALL_PAGE_BYTES = 131,072 (128 KiB)
 
@@ -2622,6 +2624,29 @@ the version before, blocked in its write of the payload, sees the stop
 (`WriteError::Stopped(0x05)`); it matches only `ERR_RATE_LIMIT` and so
 takes any other code, this one included, as a request not answered, and
 sends the batch again later. Nothing else in its handling changes.
+
+### PUSH_RETRY_STREAMS_AT_ONCE = 4
+
+**Rationale:** the older kind's push retries open a stream for each item
+(`PushRetries` in `p2p.rs`), and after a failed repush of up to
+`MAX_PUSHED_ITEMS` items they would open them all at once (rule 9). Against
+a peer that lets 8 streams be open, most of them would wait for a stream,
+time out after `STREAM_TIMEOUT_SECS` and use up their `PUSH_RETRY_MAX`
+tries. So a node runs at most 4 to one peer at once. The others wait in the
+retry queue for a later round (every 2 s), and are not counted as a try
+until they are tried; the backoff of 2, 4 and 8 s between an item's tries
+is unchanged. What is still lost to the retries the older kind's fetch
+brings later, as before.
+
+**Derivation:** half of the 8 streams a peer that is not a relay listed by
+key may have open (`QUIC_MAX_BIDI_STREAMS`), so that the retries leave
+room for the node's other streams on the connection: a pass, a pull, a
+fetch of the older kind and the repush.
+
+**If you raise it to the streams' count:** the retries take every stream a
+peer allows, and the node's other streams on that connection wait for them.
+**If you lower it to one:** a repush of many items drains one item a round
+trip, which the backoff and the pull make up for, more slowly.
 
 ---
 

@@ -292,6 +292,7 @@ The constants of what a relay holds across its connections (decision
 | `SMALL_MESSAGE_BYTES` | 147,456 (derived: `SMALL_PAGE_BYTES` and 16 KiB for what is around the entries; nothing a device of this version sends or is sent is larger) | parameter-rationale.md §13 |
 | `LARGE_MESSAGES_AT_ONCE` | 4 (the large permits a node holds across all its connections; at most one for each /24 or /48) | parameter-rationale.md §13 |
 | `ERR_LARGE_MESSAGE_LATER` | 0x05 (a large message the node could not take within `STREAM_TIMEOUT_SECS`, to be sent again) | parameter-rationale.md §13 |
+| `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
 
 ## Running Tests
 

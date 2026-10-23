@@ -1546,6 +1546,16 @@ const _: () =
 /// and 5).
 pub const LARGE_MESSAGES_AT_ONCE: usize = 4;
 
+/// How many of the older kind's push retries a node runs to one peer at
+/// once (decision 2026-10-22 (memory), rule 9): 4. Each retry is a stream
+/// of its own, and a failed repush of up to `MAX_PUSHED_ITEMS` items would
+/// otherwise open them all at once; against a peer that lets 8 streams be
+/// open, most would wait for a stream, time out and use up their tries.
+/// The others wait for a later round, and are not counted as a try until
+/// they are tried. Derived: half of the 8 streams that a peer that is not
+/// a relay listed by key may have open (rule 9).
+pub const PUSH_RETRY_STREAMS_AT_ONCE: usize = 4;
+
 /// The most one channel from its secret may hold at a relay (decision
 /// 2026-10-04 §2.5), in bytes as entries are counted ([`entry_cost`]).
 /// Derived: what a channel of the older kind may hold. The two kinds are
@@ -2448,6 +2458,13 @@ mod tests {
     #[test]
     fn the_large_permit_budget_is_four() {
         assert_eq!(LARGE_MESSAGES_AT_ONCE, 4);
+    }
+
+    /// A node runs at most four push retries to one peer at once (decision
+    /// 2026-10-22 (memory), rule 9).
+    #[test]
+    fn at_most_four_push_retries_run_to_a_peer_at_once() {
+        assert_eq!(PUSH_RETRY_STREAMS_AT_ONCE, 4);
     }
 
     /// Two messages, as much as a peer may have unread on a connection.

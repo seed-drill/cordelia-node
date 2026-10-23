@@ -2439,6 +2439,198 @@ pub fn post_connect(
     }
 }
 
+/// How many times an item of the older kind is pushed again to a peer
+/// after a push of it failed (2 s, 4 s and 8 s apart). After that, the
+/// pull is the safety net.
+const PUSH_RETRY_MAX: u8 = 3;
+
+/// An item of the older kind whose push to a peer failed, waiting to be
+/// pushed to it again.
+struct RetryEntry {
+    item: cordelia_network::messages::Item,
+    peer_id: NodeId,
+    channel_id: String,
+    exclude_peer: Option<NodeId>,
+    /// The tries made of it so far.
+    attempt: u8,
+    retry_at: tokio::time::Instant,
+}
+
+/// The older kind's push retries: sender-side, one stream for each item,
+/// with backoff. A push that fails reports each of its items through
+/// [`PushRetries::failed`], and each round tries again those that are due.
+/// Silent drop on the receiver's side stays: no NACK (a DoS amplification
+/// vector).
+///
+/// **At most `PUSH_RETRY_STREAMS_AT_ONCE` to one peer at once** (decision
+/// 2026-10-22 (memory), rule 9). A failed repush of up to
+/// `MAX_PUSHED_ITEMS` items would otherwise open a stream for each at
+/// once, and against a peer that lets a few streams be open, most of them
+/// would wait for a stream, time out and use up their tries. An item held
+/// back stays waiting for a later round, and is not counted as a try
+/// until it is tried.
+struct PushRetries {
+    waiting: Vec<RetryEntry>,
+    failed_tx: tokio::sync::mpsc::UnboundedSender<RetryEntry>,
+    failed_rx: tokio::sync::mpsc::UnboundedReceiver<RetryEntry>,
+    /// How many retries are running to each peer.
+    running: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<NodeId, usize>>>,
+}
+
+/// One retry running to a peer, counted for as long as it runs.
+struct RetryRunning {
+    peer: NodeId,
+    running: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<NodeId, usize>>>,
+}
+
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = running.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                running.remove(&self.peer);
+            }
+        }
+    }
+}
+
+impl PushRetries {
+    fn new() -> Self {
+        let (failed_tx, failed_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            waiting: Vec::new(),
+            failed_tx,
+            failed_rx,
+            running: Default::default(),
+        }
+    }
+
+    /// Where a push that failed reports each of its items.
+    fn failed(&self) -> tokio::sync::mpsc::UnboundedSender<RetryEntry> {
+        self.failed_tx.clone()
+    }
+
+    /// One round, at `now`: each item that is due is pushed again on a
+    /// stream of its own, to its peer if `hot` holds of it and it has a
+    /// connection (`connection_of`), within `PUSH_RETRY_STREAMS_AT_ONCE`
+    /// running to that peer. One that has had its tries, or whose peer is
+    /// no longer hot or connected, is dropped.
+    fn round(
+        &mut self,
+        now: tokio::time::Instant,
+        hot: &dyn Fn(&NodeId) -> bool,
+        connection_of: &dyn Fn(&NodeId) -> Option<quinn::Connection>,
+    ) {
+        while let Ok(entry) = self.failed_rx.try_recv() {
+            self.waiting.push(entry);
+        }
+        if self.waiting.is_empty() {
+            return;
+        }
+        let mut to_try = Vec::new();
+        {
+            let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            let mut remaining = Vec::new();
+            for entry in self.waiting.drain(..) {
+                if entry.retry_at > now {
+                    remaining.push(entry);
+                    continue;
+                }
+                if entry.attempt >= PUSH_RETRY_MAX {
+                    tracing::warn!(
+                        peer = %entry.peer_id, channel = %entry.channel_id,
+                        attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
+                    );
+                    continue;
+                }
+                // Only retry if peer is still hot
+                if !hot(&entry.peer_id) {
+                    tracing::debug!(
+                        peer = %entry.peer_id, "push retry skipped: peer no longer hot"
+                    );
+                    continue;
+                }
+                let Some(conn) = connection_of(&entry.peer_id) else {
+                    continue;
+                };
+                // Held back for a later round, its tries unspent.
+                let at_once = running.entry(entry.peer_id.clone()).or_default();
+                if *at_once >= cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE {
+                    remaining.push(entry);
+                    continue;
+                }
+                *at_once += 1;
+                to_try.push((conn, entry));
+            }
+            self.waiting = remaining;
+        }
+        for (conn, entry) in to_try {
+            let running = RetryRunning {
+                peer: entry.peer_id.clone(),
+                running: self.running.clone(),
+            };
+            tokio::spawn(push_again(conn, entry, self.failed_tx.clone(), running));
+        }
+    }
+
+    /// Whether no item waits and no retry runs.
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.waiting.is_empty()
+            && self.failed_rx.is_empty()
+            && self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+}
+
+/// Push `entry`'s item to its peer again, on a stream of its own, as its
+/// next try; where it fails, report it to `failed` with a backoff that
+/// doubles with each try.
+async fn push_again(
+    conn: quinn::Connection,
+    entry: RetryEntry,
+    failed: tokio::sync::mpsc::UnboundedSender<RetryEntry>,
+    _running: RetryRunning,
+) {
+    let pid = entry.peer_id;
+    let attempt = entry.attempt + 1;
+    let again = |item, peer_id, channel_id, exclude_peer| {
+        let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+        let _ = failed.send(RetryEntry {
+            item,
+            peer_id,
+            channel_id,
+            exclude_peer,
+            attempt,
+            retry_at: tokio::time::Instant::now() + backoff,
+        });
+    };
+    tracing::debug!(peer = %pid, attempt, "push retry");
+    let (mut send, mut recv) = match open_bi(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
+            again(entry.item, pid, entry.channel_id, entry.exclude_peer);
+            return;
+        }
+    };
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let items = std::slice::from_ref(&entry.item);
+    match cordelia_network::item_sync::send_push(&mut stream, items).await {
+        Ok(ack) => {
+            tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered")
+        }
+        Err(e) => {
+            tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
+            again(entry.item, pid, entry.channel_id, entry.exclude_peer);
+        }
+    }
+}
+
 /// Background task that accepts incoming QUIC connections, handles
 /// outbound item pushes, and manages peer lifecycle.
 #[expect(
@@ -2646,22 +2838,10 @@ pub async fn p2p_loop(
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 
-    // Push retry queue: sender-side retry with exponential backoff.
-    // Spawned push tasks report failures via retry_fail_tx. The select loop
-    // drains failures into retry_queue and re-attempts on a 2s timer.
-    // Max 3 retries (2s, 4s, 8s backoff). After that, pull-sync is the safety net.
-    // Silent drop on receiver side stays -- no NACK (DoS amplification vector).
-    const PUSH_RETRY_MAX: u8 = 3;
-    struct RetryEntry {
-        item: cordelia_network::messages::Item,
-        peer_id: NodeId,
-        channel_id: String,
-        exclude_peer: Option<NodeId>,
-        attempt: u8,
-        retry_at: tokio::time::Instant,
-    }
-    let (retry_fail_tx, mut retry_fail_rx) = tokio::sync::mpsc::unbounded_channel::<RetryEntry>();
-    let mut retry_queue: Vec<RetryEntry> = Vec::new();
+    // Push retries (`PushRetries`): spawned pushes report failures to it,
+    // and the select loop tries them again on a 2s timer.
+    let mut push_retries = PushRetries::new();
+    let retry_fail_tx = push_retries.failed();
     let mut retry_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
@@ -3317,74 +3497,12 @@ pub async fn p2p_loop(
 
             // ── Push retry processing ─────────────────────────────────
             _ = retry_interval.tick() => {
-                // Drain failure reports into retry queue
-                while let Ok(entry) = retry_fail_rx.try_recv() {
-                    retry_queue.push(entry);
-                }
-                if retry_queue.is_empty() { continue; }
-
-                let now = tokio::time::Instant::now();
-                let mut remaining = Vec::new();
-                for entry in retry_queue.drain(..) {
-                    if entry.retry_at > now {
-                        remaining.push(entry);
-                        continue;
-                    }
-                    if entry.attempt >= PUSH_RETRY_MAX {
-                        tracing::warn!(
-                            peer = %entry.peer_id, channel = %entry.channel_id,
-                            attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
-                        );
-                        continue;
-                    }
-                    // Only retry if peer is still hot
-                    if !governor.hot_peers().contains(&entry.peer_id) {
-                        tracing::debug!(
-                            peer = %entry.peer_id, "push retry skipped: peer no longer hot"
-                        );
-                        continue;
-                    }
-                    if let Some(conn) = conn_mgr.get_connection(&entry.peer_id) {
-                        let conn = conn.clone();
-                        let items = vec![entry.item.clone()];
-                        let pid = entry.peer_id.clone();
-                        let attempt = entry.attempt + 1;
-                        let rtx = retry_fail_tx.clone();
-                        let retry_item = entry.item;
-                        let retry_ch = entry.channel_id;
-                        let retry_ex = entry.exclude_peer;
-                        tracing::debug!(peer = %pid, attempt, "push retry");
-                        tokio::spawn(async move {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
-                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
-                                    let _ = rtx.send(RetryEntry {
-                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
-                                        exclude_peer: retry_ex, attempt,
-                                        retry_at: tokio::time::Instant::now() + backoff,
-                                    });
-                                    return;
-                                }
-                            };
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
-                                Ok(ack) => tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered"),
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
-                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
-                                    let _ = rtx.send(RetryEntry {
-                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
-                                        exclude_peer: retry_ex, attempt,
-                                        retry_at: tokio::time::Instant::now() + backoff,
-                                    });
-                                }
-                            }
-                        });
-                    }
-                }
-                retry_queue = remaining;
+                let hot = governor.hot_peers();
+                push_retries.round(
+                    tokio::time::Instant::now(),
+                    &|peer| hot.contains(peer),
+                    &|peer| conn_mgr.get_connection(peer).cloned(),
+                );
             }
 
             // ── Relay re-push flush (batched, de-duped) ───────────────
@@ -12433,5 +12551,132 @@ mod tests {
             both,
             "a bootnode shares the relays it knows"
         );
+    }
+
+    /// Decision 2026-10-22 (memory), rule 9. A failed repush of 100 items
+    /// to a peer is tried again at most PUSH_RETRY_STREAMS_AT_ONCE streams
+    /// at once, and every item is tried at least once and at most
+    /// PUSH_RETRY_MAX times: an item held back for a later round has spent
+    /// none of its tries. The peer fails every push, after holding its
+    /// stream a moment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_repush_is_tried_again_a_few_streams_at_a_time() {
+        use cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE;
+        use cordelia_network::codec;
+        use cordelia_network::messages::{Protocol, WireMessage};
+        use cordelia_network::transport;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let id = |seed: u8| cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap();
+        let (node_key, peer_key) = (id(8), id(9));
+        let peer_end =
+            transport::create_endpoint(&peer_key, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let peer_addr = peer_end.local_addr().unwrap();
+        let node_end =
+            transport::create_client_endpoint(&node_key, "127.0.0.1".parse().unwrap()).unwrap();
+
+        // The peer: each push it is sent counts its stream as open while it
+        // holds it, notes the item, and fails it with a reset.
+        let open = std::sync::Arc::new(AtomicUsize::new(0));
+        let most = std::sync::Arc::new(AtomicUsize::new(0));
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
+        let peer = {
+            let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
+            tokio::spawn(async move {
+                let conn = peer_end.accept().await.unwrap().await.unwrap();
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
+                    tokio::spawn(async move {
+                        let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        let _ = codec::read_protocol_byte(&mut recv).await;
+                        if let Ok(WireMessage::PushPayload(push)) =
+                            codec::read_frame(&mut recv, Protocol::ItemPush).await
+                        {
+                            let mut tried = tried.lock().unwrap();
+                            for item in push.items {
+                                *tried.entry(item.item_id).or_default() += 1;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        open.fetch_sub(1, Ordering::SeqCst);
+                        let _ = send.reset(0u32.into());
+                        let _ = recv.stop(0u32.into());
+                    });
+                }
+            })
+        };
+        let conn = node_end
+            .connect(peer_addr, "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let to = NodeId(peer_key.public_key());
+
+        // A repush of 100 items failed: each is reported for a retry.
+        let mut retries = PushRetries::new();
+        let failed = retries.failed();
+        for n in 0..100 {
+            let item = cordelia_network::messages::Item {
+                item_id: format!("ci_{n}"),
+                channel_id: "grp_retries".into(),
+                item_type: "note".into(),
+                encrypted_blob: vec![n as u8; 64],
+                content_hash: vec![0; 32],
+                content_length: 64,
+                author_id: vec![0; 32],
+                signature: vec![0; 64],
+                key_version: 1,
+                published_at: "2026-10-22T00:00:00Z".into(),
+                is_tombstone: false,
+                parent_id: None,
+                slot: None,
+                rev: None,
+            };
+            failed
+                .send(RetryEntry {
+                    item,
+                    peer_id: to.clone(),
+                    channel_id: "grp_retries".into(),
+                    exclude_peer: None,
+                    attempt: 0,
+                    retry_at: tokio::time::Instant::now(),
+                })
+                .unwrap();
+        }
+
+        // Rounds in quick succession, each with every backoff passed,
+        // until nothing waits and nothing runs.
+        let began = std::time::Instant::now();
+        loop {
+            let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+            retries.round(later, &|_| true, &|_| Some(conn.clone()));
+            if retries.is_idle() {
+                break;
+            }
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "the retries did not end"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let most = most.load(Ordering::SeqCst);
+        assert!(
+            most <= PUSH_RETRY_STREAMS_AT_ONCE,
+            "{most} retries ran to the peer at once"
+        );
+        let tried = tried.lock().unwrap().clone();
+        for n in 0..100 {
+            let times = tried.get(&format!("ci_{n}")).copied().unwrap_or(0);
+            assert!(
+                (1..=PUSH_RETRY_MAX as usize).contains(&times),
+                "item {n} was tried {times} times"
+            );
+        }
+        peer.abort();
     }
 }
