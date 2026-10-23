@@ -255,8 +255,8 @@ fn dialling_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 }
 
 /// A node's endpoint over `socket`, with the kernel's receive batching of
-/// UDP (GRO) turned off (decision 2026-10-22, rule 10;
-/// parameter-rationale.md §1).
+/// UDP (GRO) turned off (decision 2026-10-22, memory across connections,
+/// rule 10; parameter-rationale.md §1).
 ///
 /// With GRO on, the kernel hands the socket a batch of a peer's datagrams
 /// in one buffer, and quinn splits it into packets that share that
@@ -1077,7 +1077,7 @@ mod tests {
         Some(value)
     }
 
-    /// Decision 2026-10-22, rule 10. A node's socket takes no batches of
+    /// Decision 2026-10-22, memory across connections, rule 10. A node's socket takes no batches of
     /// datagrams: `UDP_GRO` reads as off on the socket of an endpoint as
     /// `create_endpoint` and `create_client_endpoint` make it. An endpoint
     /// that quinn makes by itself has it on, so the option is read from

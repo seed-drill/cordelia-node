@@ -182,7 +182,7 @@ of this table and 64 streams, one such connection took a node's live
 heap to 82,467 KiB with the option on, and 2,262 KiB with it off. So a
 node turns `UDP_GRO` off on its socket, after quinn wraps it, since the
 wrap turns it on (`endpoint_on` in `transport.rs`; decision 2026-10-22,
-rule 10). Each frame then keeps its own datagram, at most 1,472 bytes.
+memory across connections, rule 10). Each frame then keeps its own datagram, at most 1,472 bytes.
 Sending in batches (GSO) is kept. **Its cost:** the kernel hands the
 socket each datagram apart (still up to 32 at a call); measured on loopback, about 2.3 times the
 CPU for each byte received in bulk (325 MiB for each CPU-second, where it
