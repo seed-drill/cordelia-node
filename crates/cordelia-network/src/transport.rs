@@ -231,10 +231,27 @@ pub fn create_client_endpoint(
     identity: &NodeIdentity,
     bind_ip: std::net::IpAddr,
 ) -> Result<Endpoint, TransportError> {
-    let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))?;
+    let socket = dialling_socket(SocketAddr::new(bind_ip, 0))?;
     let mut endpoint = endpoint_on(socket, None)?;
     endpoint.set_default_client_config(client_config(identity)?);
     Ok(endpoint)
+}
+
+/// The socket of an endpoint that only dials, bound to `addr` as quinn's
+/// `Endpoint::client` binds it: on an IPv6 address it is made dual-stack
+/// where the system allows, so that it can dial IPv4 peers too, whatever
+/// the host's default (`net.ipv6.bindv6only`). Where the system does not
+/// allow it, it dials IPv6 alone, as quinn's did.
+fn dialling_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6()
+        && let Err(e) = socket.set_only_v6(false)
+    {
+        tracing::debug!(%e, "unable to make socket dual-stack");
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// A node's endpoint over `socket`, with the kernel's receive batching of
@@ -1121,6 +1138,30 @@ mod tests {
         assert_eq!(back, sent);
         conn.close(0u32.into(), b"done");
         let _ = accepting.await;
+    }
+
+    /// An endpoint that only dials, bound to an IPv6 address, is
+    /// dual-stack, as quinn's `Endpoint::client` made it; on an IPv4
+    /// address it is IPv4 alone. Where the system has no IPv6, there is
+    /// nothing to check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dialling_socket_on_ipv6_is_dual_stack() {
+        let v4 = dialling_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(v4.local_addr().unwrap().is_ipv4());
+        let v6 = match dialling_socket("[::]:0".parse().unwrap()) {
+            Ok(socket) => socket,
+            Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                eprintln!("no IPv6 on this system: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let v6 = socket2::Socket::from(v6);
+        assert!(
+            !v6.only_v6().unwrap(),
+            "an IPv6 dialling socket is IPv6 alone"
+        );
     }
 
     #[test]
