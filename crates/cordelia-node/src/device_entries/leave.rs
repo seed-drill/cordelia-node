@@ -64,9 +64,10 @@
 //! request: the key must be one that the device keeps as typed within
 //! the last hour, with no hand-over taken since, which is read from the
 //! database here. The channel is derived here, from that key and the
-//! device's own. The two requests are made here: a proof of that
-//! channel's key, and a pull of its first page. Nothing is pushed, and no
-//! place is kept. What comes back is given to
+//! device's own. The requests are made here: a proof of that channel's
+//! key, and pulls of its pages from the start, each on from the place the
+//! last reached, until one says there is no more (at most
+//! RELAY_ENTRY_PULL_PAGES). Nothing is pushed, and no place is kept. What comes back is given to
 //! [`cordelia_api::adding::accept_typed`], which judges a hand-over by
 //! the state the device is in, and to nothing else.
 //!
@@ -109,7 +110,8 @@ use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::protocol::{
     BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
+    WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -809,10 +811,13 @@ impl Leave {
     ///   nothing.
     /// - The channel is this device's pair channel with that key, derived
     ///   here. No caller names a channel.
-    /// - Two requests are made, each built here: a proof of the
-    ///   channel's key, and a pull of its first page, from the start.
-    ///   Each counts against what the device asks of a relay in a
-    ///   minute. Nothing is pushed.
+    /// - The requests are made, each built here: a proof of the channel's
+    ///   key, and pulls of its pages, from the start and on from the place
+    ///   that each page reaches, until a page holds nothing or leaves the
+    ///   place where it was, the key reads nothing more, or
+    ///   RELAY_ENTRY_PULL_PAGES pages were read (decision 2026-10-22
+    ///   (memory), rule 3). Each counts against what the device asks of a
+    ///   relay in a minute. Nothing is pushed.
     /// - Of what comes back, each entry of that channel that the typed
     ///   key signed is given to [`adding::accept_typed`], under the
     ///   database's lock, and to nothing else: none is stored, and no
@@ -862,54 +867,80 @@ impl Leave {
         if !proved {
             return Ok(PairRead::NotHeld);
         }
-        let pull = WireMessage::EntryPull(EntryPull {
-            channel,
-            mark: NO_MARK,
-            after: 0,
-            limit: ENTRY_PAGE_MAX_ENTRIES,
-        });
-        let page = match self.asks(link, Protocol::EntryPull, &pull).await? {
-            WireMessage::EntryPulled(page) => page,
-            _ => return Err(not("a pull was not answered with a page")),
-        };
-        // Each entry is checked as whatever a device is sent is checked,
-        // with no database held.
-        let handed: Vec<CheckedEntry> = page
-            .entries
-            .iter()
-            .take(ENTRY_PAGE_MAX_ENTRIES as usize)
-            .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
-            .filter(|entry| entry.channel == channel && entry.author == typed.key)
-            .collect();
         let set_up = state.own_channels.relays_set_up_as();
         let mut read = Vec::new();
-        for entry in &handed {
-            let now = unix();
-            // It is a change of settings only where the hand-over was
-            // taken: a statement was applied, or the device's state
-            // changed. A device that is moved has left the phrase it
-            // followed: the node then keeps no note of which relays had
-            // handed the channels it held.
-            let (accepted, _) = state.as_a_change_where(
-                |conn| {
-                    at_relays::telling_a_change(conn, |conn| {
-                        let sync_on = sync_on(conn);
-                        adding::accept_typed(conn, identity, typed, sync_on, entry, &set_up, now)
-                    })
-                },
-                |(accepted, changed)| match accepted {
-                    Ok(Some(Accepted::Moved(_))) => Came::Left,
-                    _ if *changed => Came::Changed,
-                    _ => Came::Nothing,
-                },
-            );
-            match accepted {
-                Ok(Some(accepted)) => read.push(accepted),
-                // The key reads nothing more: it was spent, or typed
-                // again, or its hour went by.
-                Ok(None) => break,
-                Err(e) => return Err(not(&format!("could not judge a hand-over: {e}"))),
+        // The channel is read from the start, and on from the place that
+        // each page reaches, until a page says there is no more (decision
+        // 2026-10-22 (memory), rule 3): a page for a device holds one entry
+        // of the largest size, and a pair channel can hold more than one (a
+        // hand-over is padded to that size), so the typed key's hand-over
+        // may be on a later page. At most RELAY_ENTRY_PULL_PAGES pages are
+        // read, and none once the key reads nothing more.
+        let mut place = (NO_MARK, 0);
+        for _ in 0..RELAY_ENTRY_PULL_PAGES {
+            let pull = WireMessage::EntryPull(EntryPull {
+                channel,
+                mark: place.0,
+                after: place.1,
+                limit: ENTRY_PAGE_MAX_ENTRIES,
+            });
+            // A page that fails after another was read ends the read with
+            // what that one gave: what was accepted is not undone.
+            let page = match self.asks(link, Protocol::EntryPull, &pull).await {
+                Ok(WireMessage::EntryPulled(page)) => page,
+                Ok(_) if read.is_empty() => {
+                    return Err(not("a pull was not answered with a page"));
+                }
+                Err(refused) if read.is_empty() => return Err(refused),
+                _ => break,
+            };
+            // Each entry is checked as whatever a device is sent is checked,
+            // with no database held.
+            let handed: Vec<CheckedEntry> = page
+                .entries
+                .iter()
+                .take(ENTRY_PAGE_MAX_ENTRIES as usize)
+                .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+                .filter(|entry| entry.channel == channel && entry.author == typed.key)
+                .collect();
+            for entry in &handed {
+                let now = unix();
+                // It is a change of settings only where the hand-over was
+                // taken: a statement was applied, or the device's state
+                // changed. A device that is moved has left the phrase it
+                // followed: the node then keeps no note of which relays had
+                // handed the channels it held.
+                let (accepted, _) = state.as_a_change_where(
+                    |conn| {
+                        at_relays::telling_a_change(conn, |conn| {
+                            let sync_on = sync_on(conn);
+                            adding::accept_typed(
+                                conn, identity, typed, sync_on, entry, &set_up, now,
+                            )
+                        })
+                    },
+                    |(accepted, changed)| match accepted {
+                        Ok(Some(Accepted::Moved(_))) => Came::Left,
+                        _ if *changed => Came::Changed,
+                        _ => Came::Nothing,
+                    },
+                );
+                match accepted {
+                    Ok(Some(accepted)) => read.push(accepted),
+                    // The key reads nothing more: it was spent, or typed
+                    // again, or its hour went by.
+                    Ok(None) => return Ok(PairRead::Read(read)),
+                    Err(e) => return Err(not(&format!("could not judge a hand-over: {e}"))),
+                }
             }
+            // A page that holds nothing, or that leaves the place where it
+            // was, is the channel's end. And a key that was spent by what
+            // this page held reads nothing more.
+            let reached = (page.mark, page.next);
+            if page.entries.is_empty() || reached == place || !reads(&lock(db), unix()) {
+                break;
+            }
+            place = reached;
         }
         Ok(PairRead::Read(read))
     }
