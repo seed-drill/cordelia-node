@@ -272,7 +272,14 @@ about 2 MiB on each such stream. Measured on loopback, with the windows
 before change F and 64 streams, and a peer whose quinn sends in batches
 of 44 datagrams (GSO), one such connection took a node's live heap to
 82,467 KiB with the option on, and 2,262 KiB with it off; with F's
-windows and 8 streams, 5,067 KiB and 422 KiB. A peer on a
+windows and 8 streams, 5,067 KiB and 422 KiB. Measured again on F's
+windows by the test of it by memory
+(`crates/cordelia-network/tests/receive_batching.rs`: a client that
+gathers quinn's datagrams into GSO sends of 44, bulk on a stream the node
+reads and a byte at a time on its other streams, the node on a thread of
+its own whose heap alone is counted), at five pacings four times each:
+416 to 517 KiB with the option off, 4,601 to 6,627 KiB with it on. The
+test holds a node under 1.5 MiB. A peer on a
 stock quinn, which sends at most 10 datagrams a batch, showed no
 consistent gap between the two. So a
 node turns `UDP_GRO` off on its socket, after quinn wraps it, since the
