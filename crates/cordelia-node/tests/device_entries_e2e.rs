@@ -36,7 +36,7 @@ use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, ENTRY_PAGE_MAX_ENTRIES, HAND_OVER_KEPT_SECS,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS,
     OWN_ENTRY_REQUESTS_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE, SHOW_ANSWER_ROOM_BYTES,
-    SHOW_LEAVE_SECS, STATUS_AMBER_WAIT_SECS, WAKE_WAIT_SECS, entry_cost,
+    SHOW_LEAVE_SECS, SMALL_MESSAGE_BYTES, STATUS_AMBER_WAIT_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::derive;
@@ -1213,6 +1213,58 @@ async fn the_timer_that_sends_and_a_publish_show_again_where_they_find_no_leave(
     assert_eq!(again.pushes, sent.pushes + 1);
     assert_eq!(again.pushed, sent.pushed + 1);
     assert_eq!(device.has_leave("relay"), Ok(()));
+}
+
+/// A device of this version puts no more than a small message in one push
+/// (decision 2026-10-22 (memory), rule 5): with megabytes of entries
+/// waiting, every push frame it sends is within SMALL_MESSAGE_BYTES, so it
+/// never needs a large permit at a relay. The stand-in records each push,
+/// and the frame it would be on the wire is measured from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_of_this_version_pushes_no_message_over_a_small_message() {
+    let relay = StandIn::started().await;
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+
+    // About 2 MiB waiting, as entries near the largest a device writes:
+    // many of them, so a single push of the old bound would hold a dozen
+    // at once and go well over a small message.
+    let body = "m".repeat(59_000);
+    for n in 0..40 {
+        device.writes("notes", &format!("f{n}.md"), &body);
+    }
+    assert!(
+        40 * body.len() >= 2 * 1024 * 1024,
+        "the entries were meant to be about 2 MiB"
+    );
+    let _ = relay.requests();
+
+    // It sends, within its pace, and every push frame is a small message.
+    device.sends().await;
+    let pushes: Vec<EntryPush> = relay
+        .requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            WireMessage::EntryPush(push) => Some(push),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        pushes.len() >= 2,
+        "a backlog of 2 MiB made {} push(es)",
+        pushes.len()
+    );
+    for push in &pushes {
+        let frame = codec::encode_message(&WireMessage::EntryPush(push.clone())).unwrap();
+        assert!(
+            frame.len() + 4 <= SMALL_MESSAGE_BYTES as usize,
+            "a push frame of {} bytes is over a small message ({} entries)",
+            frame.len() + 4,
+            push.entries.len(),
+        );
+    }
 }
 
 /// Leave ends at once, at every relay, when the entry that the device

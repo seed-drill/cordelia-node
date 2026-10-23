@@ -866,6 +866,15 @@ pub const ERR_RATE_LIMIT: u32 = 0x03;
 /// written on it and not acknowledged is let go (parameter-rationale.md §1).
 pub const ERR_STREAM_TIMEOUT: u32 = 0x04;
 
+/// QUIC application error: a frame longer than a small message that a node
+/// could not take a large permit for within STREAM_TIMEOUT_SECS (decision
+/// 2026-10-22 (memory) §2.1, rule 2; network-protocol.md §9). The node
+/// stops its receive side and resets its send side with it. Apart from
+/// [`ERR_CAPACITY`] (the node holds no room for the connection), this says
+/// the stream may be sent again as it is, a little later. It counts no
+/// breach: the peer did nothing over a limit.
+pub const ERR_LARGE_MESSAGE_LATER: u32 = 0x05;
+
 // ── Bootstrap ────────────────────────────────────────────────────────
 
 /// The default relays, compiled into the binary (decision
@@ -1481,6 +1490,61 @@ const _: () = assert!(
     ENTRY_PAGE_MAX_BYTES as u64 + ENTRY_PAGE_MAX_ENTRIES as u64 * ENTRY_OVERHEAD_BYTES as u64
         <= PUSH_BYTES_PER_PEER_PER_MINUTE
 );
+
+// ── The small message, and the large permits (decision 2026-10-22) ────
+
+/// The most entries, on the wire, that a page for an unlisted peer holds,
+/// and that a device of this version puts in one push (decision
+/// 2026-10-22 (memory) §2.1, rule 1): 128 KiB. Chosen: the least power of
+/// two that holds an entry of the largest size on the wire
+/// ([`MAX_ENTRY_WIRE_BYTES`], 65,773) and others beside it. It holds one
+/// such entry, not two, so a channel is never stuck behind an entry that
+/// fits no page while a page still stays small.
+pub const SMALL_PAGE_BYTES: usize = 128 * 1024;
+
+// Checked at compile time: a small page holds one entry of the largest
+// size, is a power of two, and does not hold two.
+const _: () = assert!(SMALL_PAGE_BYTES.is_power_of_two());
+const _: () = assert!(MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+const _: () = assert!(SMALL_PAGE_BYTES < 2 * MAX_ENTRY_WIRE_BYTES);
+const _: () = assert!(SMALL_PAGE_BYTES <= ENTRY_PAGE_MAX_BYTES);
+
+/// A small message (decision 2026-10-22 (memory) §2.1, rule 1): 144 KiB.
+/// Nothing a device of this version sends or is sent is larger; a longer
+/// frame from an unlisted peer is read only under a large permit (rule
+/// 2). Derived: [`SMALL_PAGE_BYTES`] and 16 KiB more for a page's own
+/// fields and the length of each of its entries, which come to well under
+/// that for 100 entries.
+pub const SMALL_MESSAGE_BYTES: u32 = SMALL_PAGE_BYTES as u32 + 16 * 1024;
+
+// Checked at compile time: every message a device of this version sends
+// or is sent fits a small message (rule 1): a page or a push
+// (SMALL_PAGE_BYTES of entries, with room around them), a whole show (a
+// change entry and its wire overhead), a show's answer (one entry of the
+// largest size), a hand-over (an entry of the largest size on the wire).
+const _: () = assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
+// The room over a page holds a page's own fields and the length prefix of
+// each entry: a CBOR byte-string header is at most 9 bytes, and a page
+// carries at most ENTRY_PAGE_MAX_ENTRIES of them, with a little over for
+// the message's own fields (the mark, the next place, the array header).
+const _: () = assert!(
+    SMALL_MESSAGE_BYTES as usize - SMALL_PAGE_BYTES >= ENTRY_PAGE_MAX_ENTRIES as usize * 9 + 64
+);
+const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u64 <= SMALL_MESSAGE_BYTES as u64);
+const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
+const _: () =
+    assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
+
+/// How many large messages a node reads at once, across all its
+/// connections (decision 2026-10-22 (memory) §2.1, rule 2): 4. A frame
+/// from an unlisted peer that is longer than a small message is read only
+/// under one of these large permits, and at most one is held for each /24
+/// (IPv4) or /48 (IPv6) of the peers' addresses. Chosen: a relay at R1
+/// carries few devices of the version before, and each sends a large
+/// message only when a batch has built up; four let four of them go at
+/// full pace at once. A device of this version never needs one (rules 3
+/// and 5).
+pub const LARGE_MESSAGES_AT_ONCE: usize = 4;
 
 /// The most one channel from its secret may hold at a relay (decision
 /// 2026-10-04 §2.5), in bytes as entries are counted ([`entry_cost`]).
@@ -2339,6 +2403,51 @@ mod tests {
         for other in [ERR_CAPACITY, ERR_UNKNOWN_PROTOCOL, ERR_RATE_LIMIT] {
             assert_ne!(ERR_STREAM_TIMEOUT, other);
         }
+    }
+
+    /// A frame too long to take a permit for in time is refused with a
+    /// code of its own (decision 2026-10-22 (memory), rule 2), which no
+    /// other error uses: it says the stream may be sent again, where
+    /// ERR_CAPACITY says the node holds no room for the connection.
+    #[test]
+    fn the_large_message_later_code_is_its_own() {
+        assert_eq!(ERR_LARGE_MESSAGE_LATER, 0x05);
+        for other in [
+            ERR_CAPACITY,
+            ERR_UNKNOWN_PROTOCOL,
+            ERR_RATE_LIMIT,
+            ERR_STREAM_TIMEOUT,
+        ] {
+            assert_ne!(ERR_LARGE_MESSAGE_LATER, other);
+        }
+    }
+
+    /// A small page holds one entry of the largest size and not two, and a
+    /// small message holds a page with room around it and every message a
+    /// device of this version sends (decision 2026-10-22 (memory), rule
+    /// 1).
+    #[test]
+    fn a_small_message_holds_every_message_of_this_version() {
+        assert_eq!(SMALL_PAGE_BYTES, 131_072);
+        assert_eq!(SMALL_MESSAGE_BYTES, 147_456);
+        // These relations are enforced at compile time beside the
+        // constants; restated here as what the rule asks.
+        const _: () = assert!(SMALL_PAGE_BYTES.is_power_of_two());
+        const _: () = assert!(MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+        const _: () = assert!(SMALL_PAGE_BYTES < 2 * MAX_ENTRY_WIRE_BYTES);
+        const _: () = assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
+        // A whole show, a show's answer, and a hand-over on the wire.
+        const _: () =
+            assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
+        const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
+        const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u32 <= SMALL_MESSAGE_BYTES);
+    }
+
+    /// The budget of large permits is four (decision 2026-10-22 (memory),
+    /// rule 2).
+    #[test]
+    fn the_large_permit_budget_is_four() {
+        assert_eq!(LARGE_MESSAGES_AT_ONCE, 4);
     }
 
     /// Two messages, as much as a peer may have unread on a connection.

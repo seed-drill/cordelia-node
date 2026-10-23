@@ -283,6 +283,16 @@ each with its reason in parameter-rationale.md §12.12:
 | `AGENT_MESSAGE_MARKER_BYTES`, `AGENT_MESSAGE_CLEAR_INTERVAL_SECS` | 6, 3600s (derived) | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_NUMBER_MAX` | 2^42 - 1 (derived: a clearing's revision stays below `REV_BAND_HALF`) | parameter-rationale.md §12.12 |
 
+The constants of what a relay holds across its connections (decision
+2026-10-22, change F), each with its reason in parameter-rationale.md §13:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `SMALL_PAGE_BYTES` | 131,072 (the most entries in a page for an unlisted peer and in a device's push; the least power of two that holds one entry of the largest size) | parameter-rationale.md §13 |
+| `SMALL_MESSAGE_BYTES` | 147,456 (derived: `SMALL_PAGE_BYTES` and 16 KiB for what is around the entries; nothing a device of this version sends or is sent is larger) | parameter-rationale.md §13 |
+| `LARGE_MESSAGES_AT_ONCE` | 4 (the large permits a node holds across all its connections; at most one for each /24 or /48) | parameter-rationale.md §13 |
+| `ERR_LARGE_MESSAGE_LATER` | 0x05 (a large message the node could not take within `STREAM_TIMEOUT_SECS`, to be sent again) | parameter-rationale.md §13 |
+
 ## Running Tests
 
 See **[TESTING.md](TESTING.md)** for the full testing guide: pre-flight checks, Docker cleanup,

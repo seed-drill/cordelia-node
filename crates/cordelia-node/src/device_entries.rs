@@ -132,10 +132,10 @@ use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
-    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
-    OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, entry_cost, left_proofs_kept_back,
+    ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION,
+    MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS,
+    OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES,
+    SHOW_ANSWER_ROOM_BYTES, SMALL_PAGE_BYTES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -2834,10 +2834,15 @@ impl DeviceEntries {
     /// How many bytes may go to the relay at `link` in the next push,
     /// given what went to it in the last minute. `None` where there is
     /// not room for one entry of the largest size.
+    ///
+    /// A push is at most a small message (decision 2026-10-22 (memory),
+    /// rule 5): a device of this version puts no more than SMALL_PAGE_BYTES
+    /// of entries in one, so it never needs a large permit at a relay of
+    /// this version or of the version before.
     fn room_to_push(&self, link: &Link) -> Option<usize> {
         let mut kept = lock(&self.kept);
         let room = paced(kept.relays.entry(link.name().to_string()).or_default()).room();
-        (room >= entry_cost(MAX_ITEM_BYTES)).then(|| ENTRY_PAGE_MAX_BYTES.min(room as usize))
+        (room >= entry_cost(MAX_ITEM_BYTES)).then(|| SMALL_PAGE_BYTES.min(room as usize))
     }
 
     /// Whether something of `part` is left for now: the relay found no
