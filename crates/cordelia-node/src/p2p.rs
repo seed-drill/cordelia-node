@@ -405,7 +405,8 @@ impl Rates {
 /// permits.
 pub struct LargePermits {
     inner: std::sync::Mutex<Permits>,
-    /// Woken when a permit, or a subnet's hold, is let go.
+    /// Woken when a permit is let go, a subnet's hold is let go, or a
+    /// waiter leaves the queue: every waiter then re-checks.
     freed: tokio::sync::Notify,
 }
 
@@ -414,6 +415,33 @@ struct Permits {
     free: usize,
     /// The subnets that hold a permit: at most one each.
     held: std::collections::HashSet<String>,
+    /// The waiters, each a ticket and the subnet it waits for, in the
+    /// order they asked. The first to ask is the first served (decision
+    /// 2026-10-22 (memory), rule 2): a waiter is granted a free permit
+    /// only when no earlier waiter's subnet is free, so a holder that
+    /// lets go and asks again (a new ticket at the back) cannot jump an
+    /// older waiter.
+    waiting: std::collections::VecDeque<(u64, String)>,
+    /// The next ticket to hand out.
+    next_ticket: u64,
+}
+
+impl Permits {
+    /// Whether the waiter `ticket` for `subnet` may take a permit now: one
+    /// is free, its subnet holds none, and no waiter that asked earlier
+    /// has a free subnet (so the earlier one goes first).
+    fn may_grant(&self, ticket: u64, subnet: &str) -> bool {
+        self.free > 0
+            && !self.held.contains(subnet)
+            && !self
+                .waiting
+                .iter()
+                .any(|(t, s)| *t < ticket && !self.held.contains(s))
+    }
+
+    fn drop_waiter(&mut self, ticket: u64) {
+        self.waiting.retain(|(t, _)| *t != ticket);
+    }
 }
 
 /// A held large permit. Dropping it gives the permit back and lets go of
@@ -431,8 +459,7 @@ impl Drop for LargePermit<'_> {
             p.free += 1;
             p.held.remove(&self.subnet);
         }
-        // Every waiter re-checks: the one whose subnet this was, and any
-        // that was only waiting for a free permit.
+        // Every waiter re-checks: the earliest eligible one takes it.
         self.permits.freed.notify_waiters();
     }
 }
@@ -443,6 +470,8 @@ impl LargePermits {
             inner: std::sync::Mutex::new(Permits {
                 free: budget,
                 held: std::collections::HashSet::new(),
+                waiting: std::collections::VecDeque::new(),
+                next_ticket: 0,
             }),
             freed: tokio::sync::Notify::new(),
         }
@@ -452,10 +481,19 @@ impl LargePermits {
     /// `STREAM_TIMEOUT` for one. `None` where none came in time: the
     /// caller refuses the stream with `ERR_LARGE_MESSAGE_LATER`, and
     /// counts no breach. A permit is given for a subnet that holds none,
-    /// while one of `LARGE_MESSAGES_AT_ONCE` is free; a waiter whose
-    /// subnet already holds a permit waits for that one.
+    /// while one of `LARGE_MESSAGES_AT_ONCE` is free and no earlier waiter
+    /// is eligible; a waiter whose subnet already holds a permit waits for
+    /// that one.
     async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
         let subnet = cordelia_network::rate_limit::subnet_key(address);
+        // Join the queue, in the order of asking.
+        let ticket = {
+            let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let ticket = p.next_ticket;
+            p.next_ticket += 1;
+            p.waiting.push_back((ticket, subnet.clone()));
+            ticket
+        };
         let wait = tokio::time::timeout(cordelia_network::codec::STREAM_TIMEOUT, async {
             loop {
                 // Register for a wake before the state is read, so a
@@ -466,9 +504,14 @@ impl LargePermits {
                 woken.as_mut().enable();
                 {
                     let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if p.free > 0 && !p.held.contains(&subnet) {
+                    if p.may_grant(ticket, &subnet) {
                         p.free -= 1;
                         p.held.insert(subnet.clone());
+                        p.drop_waiter(ticket);
+                        // Another permit may now be free for a later
+                        // waiter; let them re-check.
+                        drop(p);
+                        self.freed.notify_waiters();
                         return;
                     }
                 }
@@ -476,10 +519,22 @@ impl LargePermits {
             }
         })
         .await;
-        wait.ok().map(|()| LargePermit {
-            permits: self,
-            subnet,
-        })
+        match wait {
+            Ok(()) => Some(LargePermit {
+                permits: self,
+                subnet,
+            }),
+            Err(_) => {
+                // Timed out: leave the queue, and let a waiter whom this
+                // one was holding back re-check.
+                {
+                    let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    p.drop_waiter(ticket);
+                }
+                self.freed.notify_waiters();
+                None
+            }
+        }
     }
 }
 
@@ -7031,6 +7086,83 @@ mod tests {
                 return out;
             }
         }
+    }
+
+    /// The first to ask is the first served (decision 2026-10-22 (memory),
+    /// rule 2): when a permit frees, the waiter that asked earliest, whose
+    /// subnet holds none, takes it, not a later asker.
+    /// Take a permit in a task, report through `tx` whether one came, and
+    /// hold it (so a permit a task wins is not let go while the test reads
+    /// who won).
+    fn asks_and_holds(
+        permits: std::sync::Arc<LargePermits>,
+        address: &str,
+        tx: tokio::sync::oneshot::Sender<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let address: std::net::IpAddr = address.parse().unwrap();
+        tokio::spawn(async move {
+            let got = permits.take(address).await;
+            let _ = tx.send(got.is_some());
+            if got.is_some() {
+                // Hold the permit until the task is dropped at test end.
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+
+    /// The first to ask is the first served (decision 2026-10-22 (memory),
+    /// rule 2): when a permit frees, the waiter that asked earliest, whose
+    /// subnet holds none, takes it, not a later asker.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_asked_first_is_served_first() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let held = permits
+            .take("10.0.0.1".parse::<IpAddr>().unwrap())
+            .await
+            .expect("the one permit");
+        // B asks first, then C; each from a subnet of its own.
+        let (btx, brx) = tokio::sync::oneshot::channel();
+        let _b = asks_and_holds(permits.clone(), "198.51.100.1", btx);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (ctx, crx) = tokio::sync::oneshot::channel();
+        let _c = asks_and_holds(permits.clone(), "203.0.113.1", ctx);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // One permit frees: B, which asked first, takes it; C, with none
+        // left, waits and times out.
+        drop(held);
+        assert!(brx.await.unwrap(), "the earliest waiter was not served");
+        assert!(!crx.await.unwrap(), "a later asker took the permit");
+    }
+
+    /// A holder that lets go and asks again does not jump a waiter that
+    /// asked earlier (decision 2026-10-22 (memory), rule 2): its new ask
+    /// joins the back of the queue, so the older waiter is served.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_retakes_does_not_jump_a_waiter() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let held = permits
+            .take("10.0.0.1".parse::<IpAddr>().unwrap())
+            .await
+            .expect("the one permit");
+        let (btx, brx) = tokio::sync::oneshot::channel();
+        let _b = asks_and_holds(permits.clone(), "198.51.100.1", btx);
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // The holder lets go and at once asks again, from its own subnet.
+        drop(held);
+        let (atx, arx) = tokio::sync::oneshot::channel();
+        let _a = asks_and_holds(permits.clone(), "10.0.0.1", atx);
+        // The waiter that asked earlier is served; the retake waits behind
+        // it and times out.
+        assert!(brx.await.unwrap(), "the waiter was starved by a retaking holder");
+        assert!(!arx.await.unwrap(), "the retaking holder jumped the waiter");
     }
 
     /// A frame longer than a small message from an unlisted peer is not
