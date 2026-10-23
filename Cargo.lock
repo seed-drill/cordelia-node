@@ -765,6 +765,7 @@ dependencies = [
  "quinn",
  "rusqlite",
  "rustix",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "tokio",

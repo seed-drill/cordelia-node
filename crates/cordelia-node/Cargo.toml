@@ -52,3 +52,5 @@ tempfile = { workspace = true }
 rustix = { version = "1", features = ["pty"] }
 # A clock that tests can run ahead, for the waits in a node's stopping.
 tokio = { workspace = true, features = ["test-util"] }
+# To build a wire entry (a ByteBuf) in a test of the streams of entries.
+serde_bytes = { workspace = true }

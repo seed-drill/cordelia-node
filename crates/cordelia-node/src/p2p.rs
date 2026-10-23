@@ -7680,13 +7680,21 @@ mod tests {
 
     /// Whether a relay reads and answers a large push (longer than a small
     /// message) from a client, run through the live inbound loop
-    /// (`handle_peer_streams`). The client is listed by key iff `listed`,
-    /// and is in `peer_relays` (a relay configured by address alone) iff
-    /// `addressed`; the large-permit budget is `budget`. A permit is read
-    /// and answered within two seconds, or it is not.
-    async fn large_push_answered(listed: bool, addressed: bool, budget: usize) -> bool {
+    /// (`handle_peer_streams`). `proto` is the stream: `ItemPush` (0x01) of
+    /// the older kind, or `EntryPush` (0x13) of the streams of entries,
+    /// whose permits the loop hands to `serve` in the `Serving` it builds.
+    /// The client is listed by key iff `listed`, and is in `peer_relays` (a
+    /// relay configured by address alone) iff `addressed`; the large-permit
+    /// budget is `budget`. A permit is read and answered within two seconds,
+    /// or it is not.
+    async fn large_push_answered(
+        proto: cordelia_network::messages::Protocol,
+        listed: bool,
+        addressed: bool,
+        budget: usize,
+    ) -> bool {
         use cordelia_network::bootstrap::RelayAddr;
-        use cordelia_network::messages::{Item, Protocol, PushPayload, WireMessage};
+        use cordelia_network::messages::{EntryPush, Item, Protocol, PushPayload, WireMessage};
         use cordelia_network::{codec, connection, transport};
         use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
@@ -7786,37 +7794,49 @@ mod tests {
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        codec::write_protocol_byte(&mut send, Protocol::ItemPush)
-            .await
-            .unwrap();
-        // A push of one big item: longer than a small message.
-        let item = Item {
-            item_id: "ci_big".into(),
-            channel_id: "grp_x".into(),
-            item_type: "memory".into(),
-            encrypted_blob: vec![0u8; 200_000],
-            content_hash: vec![0u8; 32],
-            content_length: 200_000,
-            author_id: vec![0u8; 32],
-            signature: vec![0u8; 64],
-            key_version: 1,
-            published_at: "2026-10-22T00:00:00Z".into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
+        codec::write_protocol_byte(&mut send, proto).await.unwrap();
+        // A push longer than a small message, in the shape the stream
+        // carries: a payload of one big item for the older kind, a push of
+        // one big entry for the streams of entries. Each is a valid message,
+        // so a relay that reads it answers (a push ack, or the per-entry
+        // word), and a relay that does not read it does not.
+        let frame = match proto {
+            Protocol::EntryPush => {
+                let push = WireMessage::EntryPush(EntryPush {
+                    entries: vec![serde_bytes::ByteBuf::from(vec![0u8; 200_000])],
+                });
+                codec::encode_message(&push).unwrap()
+            }
+            _ => {
+                let item = Item {
+                    item_id: "ci_big".into(),
+                    channel_id: "grp_x".into(),
+                    item_type: "memory".into(),
+                    encrypted_blob: vec![0u8; 200_000],
+                    content_hash: vec![0u8; 32],
+                    content_length: 200_000,
+                    author_id: vec![0u8; 32],
+                    signature: vec![0u8; 64],
+                    key_version: 1,
+                    published_at: "2026-10-22T00:00:00Z".into(),
+                    is_tombstone: false,
+                    parent_id: None,
+                    slot: None,
+                    rev: None,
+                };
+                let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
+                codec::encode_message(&push).unwrap()
+            }
         };
-        let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
-        let frame = codec::encode_message(&push).unwrap();
         assert!(
             frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
             "the push was meant to be over a small message"
         );
         let _ = codec::write_raw_frame(&mut send, &frame).await;
-        // An answer (a push ack) within two seconds means it was read.
+        // An answer within two seconds means it was read.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            codec::read_frame(&mut recv, Protocol::ItemPush),
+            codec::read_frame(&mut recv, proto),
         )
         .await
         .is_ok_and(|r| r.is_ok());
@@ -7832,25 +7852,53 @@ mod tests {
     /// unlisted peer's is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_inbound_loop_takes_permits_and_exempts_only_listed_relays() {
+        use cordelia_network::messages::Protocol::ItemPush;
         // A relay listed by key: read though no permit is free (rule 7).
         assert!(
-            large_push_answered(true, false, 0).await,
+            large_push_answered(ItemPush, true, false, 0).await,
             "a listed relay's large push was not read"
         );
         // A peer that is not listed: not read with no permit (rule 2).
         assert!(
-            !large_push_answered(false, false, 0).await,
+            !large_push_answered(ItemPush, false, false, 0).await,
             "an unlisted peer's large push was read with no permit"
         );
         // A relay configured by address alone is unlisted for F: it waits.
         assert!(
-            !large_push_answered(false, true, 0).await,
+            !large_push_answered(ItemPush, false, true, 0).await,
             "a relay configured by address alone was exempted"
         );
         // With a permit free, an unlisted peer's push is read.
         assert!(
-            large_push_answered(false, false, 1).await,
+            large_push_answered(ItemPush, false, false, 1).await,
             "an unlisted peer's large push was not read when a permit was free"
+        );
+    }
+
+    /// The live inbound loop hands the permits to the streams of entries
+    /// too (decision 2026-10-22 (memory), rules 2 and 7; the high finding).
+    /// On a 0x13 EntryPush stream the loop builds a `Serving` with the
+    /// permits, so a frame longer than a small message from an unlisted
+    /// peer is read only under a permit, and a relay listed by key is read
+    /// at once. This catches `permits: None` in that `Serving`, which the
+    /// older-kind loop test above cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_inbound_loop_takes_permits_on_the_streams_of_entries() {
+        use cordelia_network::messages::Protocol::EntryPush;
+        // A relay listed by key: read though no permit is free (rule 7).
+        assert!(
+            large_push_answered(EntryPush, true, false, 0).await,
+            "a listed relay's large entry push was not read"
+        );
+        // An unlisted peer: not read with no permit (rule 2).
+        assert!(
+            !large_push_answered(EntryPush, false, false, 0).await,
+            "an unlisted peer's large entry push was read with no permit"
+        );
+        // With a permit free, an unlisted peer's entry push is read.
+        assert!(
+            large_push_answered(EntryPush, false, false, 1).await,
+            "an unlisted peer's large entry push was not read when a permit was free"
         );
     }
 
