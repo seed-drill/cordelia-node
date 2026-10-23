@@ -256,6 +256,20 @@ What it leaves out:
   answers each with an empty page, the fetch holds 19,104 bytes less at
   the last than at the first, the IDs it has let go
   (`test_each_channel_is_let_go_once_it_has_been_gone_through`).
+  **The frame it reads** (§13, decision 2026-10-22 rule 6): each answer
+  is read by its length, as a request is. Within a small message it is
+  read at once, so through the wait for its rest the fetch holds at most
+  `SMALL_MESSAGE_BYTES`; a longer one, from a peer that is not a relay
+  listed by key, only under a large permit, and while the fetch waits for
+  one it holds nothing of the frame beyond its length. Measured with a
+  counting allocator, while every permit is held and the peer has sent
+  the length of a list of a small message and one byte, and as much of
+  the rest as its pipe takes
+  (`a_long_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one`):
+  16,412 bytes, the test's pipes, where reading the answer whole, as
+  before, held 155,649: the frame's 147,457 bytes allocated at its
+  length, and the pipes. A large answer read under a permit is in the
+  permits' budget, not the connection's.
 - Quinn's own state for the connection beyond the data of its streams:
   its packets, its crypto buffer (16 KiB) and its tables.
 - What the node stores of what the connection brought, in its database.
@@ -2495,7 +2509,8 @@ so that a container of 1 GiB holds a relay's whole bound of connections
 (decision 2026-10-22, "what a relay holds across its connections"). The
 rule 10 part (GRO off) is in §1 above. Its first slice added the small
 message and the large permits; its second, the small pages and the reads
-that follow them (rule 3).
+that follow them (rule 3); its third, the relay's own fetch, whose answers
+are read by their length (rule 6).
 
 ### SMALL_PAGE_BYTES = 131,072 (128 KiB)
 
@@ -2568,8 +2583,24 @@ write), and let go before the stream waits for its next frame. Who needs
 one: devices of the version before, whose pushes are up to
 `ENTRY_PAGE_MAX_BYTES` (896 KiB), the older kind's larger pushes, and the
 older kind's fetch answers over `SMALL_PAGE_BYTES`, for which the permit
-is taken before the items are loaded (rule 3). A device of this version
-never does (rules 3 and 5).
+is taken before the items are loaded (rule 3), and the answers to a
+relay's own fetch from a peer that is not a relay listed by key that are
+over a small message (rule 6): an honest peer's list of every channel it
+holds, past about 1,500 of them, and the entries of a page fetched from
+a relay it does not list by key, whose answer is up to a message. That
+fetch asks as it did, up to 100 headers a page and the entries of a page
+in one request, since a header carries no size to fit a request to; it fails where no permit comes within
+`STREAM_TIMEOUT_SECS`, refusing the stream with
+`ERR_LARGE_MESSAGE_LATER`, and the peer is asked again a rate window
+later, as after any failed fetch. That holds for a list too, from any
+peer: a relay configured by address alone, which is not held to what it
+lists, used to go on with the node's own channels where its list could
+not be read, but a list with no permit has its stream refused, so nothing
+more can be asked on it. There is no budget of its own over the
+relay's fetches: a peer can keep its fetch going for as long as it likes,
+so a few peers would hold every permit of one; there is one fetch from
+each peer at a time. A device of this version never needs a permit
+(rules 3 and 5).
 
 **Chosen as four:** a relay at R1 carries few devices of the version
 before, and each sends a large message only when a batch has built up;
