@@ -377,6 +377,19 @@ pub const MAX_ITEM_TYPE_LEN: usize = 32;
 /// nanoseconds and an offset is 35.
 pub const MAX_TIMESTAMP_LEN: usize = 40;
 
+/// The size of an entry's content hash, in bytes: a SHA-256.
+pub const ITEM_HASH_BYTES: usize = 32;
+
+/// The size of an entry's author, in bytes: an Ed25519 public key.
+pub const ITEM_AUTHOR_BYTES: usize = 32;
+
+/// The size of an entry's signature, in bytes: an Ed25519 signature.
+pub const ITEM_SIGNATURE_BYTES: usize = 64;
+
+/// The size of a replaceable entry's slot, in bytes (decision 2026-09-30
+/// §4.3).
+pub const ITEM_SLOT_BYTES: usize = 32;
+
 // Checked at compile time: the fields of the largest entry, with what
 // encoding them adds (their names and lengths, 256 bytes), fit in the
 // overhead.
@@ -385,7 +398,7 @@ const _: () = assert!(
         + MAX_CHANNEL_ID_LEN
         + MAX_ITEM_TYPE_LEN
         + MAX_TIMESTAMP_LEN
-        + 32 + 32 + 64 + 32  // hash, author, signature, name
+        + ITEM_HASH_BYTES + ITEM_AUTHOR_BYTES + ITEM_SIGNATURE_BYTES + ITEM_SLOT_BYTES
         + 3 * 9 + 2          // key version, revision, length; two flags
         + 256
         <= ENTRY_OVERHEAD_BYTES

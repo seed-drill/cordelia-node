@@ -13,6 +13,8 @@ use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
 use cordelia_crypto::identity::NodeIdentity;
 
 mod carry_cmd;
+#[cfg(test)]
+mod counting;
 mod history_cmd;
 mod indicator;
 mod msg_cmd;

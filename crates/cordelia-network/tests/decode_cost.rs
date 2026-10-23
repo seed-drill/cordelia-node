@@ -22,12 +22,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use cordelia_core::protocol::{
-    ENTRY_PAGE_MAX_ENTRIES, MAX_ENTRY_WIRE_BYTES, MAX_HANDSHAKE_ROLES, MAX_LISTED_CHANNEL_IDS,
-    MAX_MESSAGE_BYTES, SHORTEST_CHANNEL_ID_LEN,
+    DEFAULT_SYNC_LIMIT, ENTRY_PAGE_MAX_ENTRIES, ITEM_AUTHOR_BYTES, ITEM_HASH_BYTES,
+    ITEM_SIGNATURE_BYTES, ITEM_SLOT_BYTES, MAX_CHANNEL_ID_LEN, MAX_ENTRY_WIRE_BYTES,
+    MAX_HANDSHAKE_ROLES, MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN, MAX_LISTED_CHANNEL_IDS,
+    MAX_MESSAGE_BYTES, MAX_TIMESTAMP_LEN, SHORTEST_CHANNEL_ID_LEN,
 };
 use cordelia_network::codec::{decode_message, encode_message};
 use cordelia_network::messages::{
-    EntryPulled, Item, Protocol, PushPayload, SyncChannelListResponse, WireMessage,
+    EntryPulled, Item, ItemHeader, Protocol, PushPayload, SyncChannelListResponse, SyncResponse,
+    WireMessage,
 };
 
 // ── A counting allocator, by thread ─────────────────────────────────
@@ -351,8 +354,66 @@ fn hostile_frames() -> Vec<Frame> {
         bytes: encode_message(&ids).unwrap(),
         read: true,
     });
+    // A page of the most headers, each with a signature as long as fills
+    // the frame: refused at the first, where its signature is read.
+    let at_bounds = header_at_bounds();
+    let room = MAX_MESSAGE_BYTES as usize / DEFAULT_SYNC_LIMIT as usize
+        - encode_message(&page_of(vec![at_bounds.clone()]))
+            .unwrap()
+            .len();
+    let long = ItemHeader {
+        signature: vec![0x5a; ITEM_SIGNATURE_BYTES + room],
+        ..at_bounds
+    };
+    frames.push(Frame {
+        what: "a page of 100 headers with long signatures",
+        on: vec![Protocol::ItemSync],
+        bytes: encode_message(&page_of(vec![long; DEFAULT_SYNC_LIMIT as usize])).unwrap(),
+        read: false,
+    });
     frames
 }
+
+/// A header with each text at its bound, and its bytes of their size.
+fn header_at_bounds() -> ItemHeader {
+    ItemHeader {
+        item_id: "i".repeat(MAX_ITEM_ID_LEN),
+        channel_id: "c".repeat(MAX_CHANNEL_ID_LEN),
+        item_type: "t".repeat(MAX_ITEM_TYPE_LEN),
+        content_hash: vec![0xa1; ITEM_HASH_BYTES],
+        author_id: vec![0xa2; ITEM_AUTHOR_BYTES],
+        signature: vec![0xa3; ITEM_SIGNATURE_BYTES],
+        key_version: u32::MAX,
+        published_at: "p".repeat(MAX_TIMESTAMP_LEN),
+        is_tombstone: false,
+        parent_id: Some("q".repeat(MAX_ITEM_ID_LEN)),
+        slot: Some(vec![0xa4; ITEM_SLOT_BYTES]),
+        rev: Some(u64::MAX),
+    }
+}
+
+/// A page of `headers`.
+fn page_of(headers: Vec<ItemHeader>) -> WireMessage {
+    WireMessage::SyncResponse(SyncResponse {
+        items: headers,
+        has_more: true,
+        last_seq: Some(u64::MAX),
+    })
+}
+
+/// What a page of the most headers, each at its bounds, may hold once
+/// read: each header's fields, and its place in the list
+/// (`size_of::<ItemHeader>()`), with the list grown by doubling.
+const PAGE_OF_HEADERS_MOST: usize = DEFAULT_SYNC_LIMIT as usize
+    * (2 * size_of::<ItemHeader>()
+        + 2 * MAX_ITEM_ID_LEN
+        + MAX_CHANNEL_ID_LEN
+        + MAX_ITEM_TYPE_LEN
+        + MAX_TIMESTAMP_LEN
+        + ITEM_HASH_BYTES
+        + ITEM_AUTHOR_BYTES
+        + ITEM_SIGNATURE_BYTES
+        + ITEM_SLOT_BYTES);
 
 /// The largest frames that nodes send: read, and held.
 fn largest_frames() -> Vec<Frame> {
@@ -387,6 +448,16 @@ fn largest_frames() -> Vec<Frame> {
             on: vec![Protocol::ItemPush],
             bytes: encode_message(&WireMessage::PushPayload(PushPayload { items: vec![item] }))
                 .unwrap(),
+            read: true,
+        },
+        Frame {
+            what: "a page of 100 headers, each at its bounds",
+            on: vec![Protocol::ItemSync],
+            bytes: encode_message(&page_of(vec![
+                header_at_bounds();
+                DEFAULT_SYNC_LIMIT as usize
+            ]))
+            .unwrap(),
             read: true,
         },
         Frame {
@@ -537,4 +608,68 @@ fn a_list_of_short_channel_ids_past_its_bound_keeps_the_bound() {
         };
         assert_eq!(read.channel_ids[..], ids[..n]);
     }
+}
+
+/// A page of headers is held to what its bounds allow: the most headers,
+/// each field at its bound, are read and hold no more than
+/// PAGE_OF_HEADERS_MOST, 93,600 bytes; and so do as many, each with a type
+/// of 4,000 bytes, which are refused one by one and read as the mark of
+/// one over its size. A page of as many with signatures that fill the
+/// frame is refused at its first signature, and asks for next to nothing.
+/// Before the bounds it was read, and held 1.7 MB.
+#[test]
+fn a_page_of_headers_holds_no_more_than_its_bounds() {
+    let at_bounds = encode_message(&page_of(vec![
+        header_at_bounds();
+        DEFAULT_SYNC_LIMIT as usize
+    ]))
+    .unwrap();
+    let (read, peak, held) = measured(|| decode_message(Protocol::ItemSync, &at_bounds));
+    println!(
+        "a page at its bounds, {} bytes: peak {peak}, held {held}; the bound {PAGE_OF_HEADERS_MOST}",
+        at_bounds.len()
+    );
+    assert!(read.is_ok(), "{read:?}");
+    assert!(held <= PAGE_OF_HEADERS_MOST, "{held} bytes held");
+    assert!(peak <= PAGE_OF_HEADERS_MOST, "{peak} bytes at the peak");
+
+    let long_types = encode_message(&page_of(vec![
+        ItemHeader {
+            item_type: "t".repeat(4_000),
+            ..header_at_bounds()
+        };
+        DEFAULT_SYNC_LIMIT as usize
+    ]))
+    .unwrap();
+    let (read, peak, held) = measured(|| decode_message(Protocol::ItemSync, &long_types));
+    println!(
+        "a page of long types, {} bytes: peak {peak}, held {held}",
+        long_types.len()
+    );
+    let Ok(WireMessage::SyncResponse(page)) = read else {
+        panic!("a page of long types was not read: {read:?}");
+    };
+    assert!(
+        page.items
+            .iter()
+            .all(|h| h.item_type.len() == MAX_ITEM_TYPE_LEN + 1),
+        "a long type was kept"
+    );
+    assert!(held <= PAGE_OF_HEADERS_MOST, "{held} bytes held");
+    assert!(peak <= PAGE_OF_HEADERS_MOST, "{peak} bytes at the peak");
+
+    let long = hostile_frames()
+        .into_iter()
+        .find(|frame| frame.what == "a page of 100 headers with long signatures")
+        .unwrap();
+    assert!(long.bytes.len() > 1_000_000, "{}", long.bytes.len());
+    let (read, peak, held) = measured(|| decode_message(Protocol::ItemSync, &long.bytes));
+    println!(
+        "a page of long signatures, {} bytes: peak {peak}, held {held}",
+        long.bytes.len()
+    );
+    assert!(read.is_err(), "a page of long signatures was read");
+    // What the first header asks for before its signature is read.
+    assert!(peak <= 4 * 1024, "{peak} bytes at the peak");
+    assert!(held <= REFUSED_HOLDS_MOST, "{held} bytes held");
 }
