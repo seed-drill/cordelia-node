@@ -12,6 +12,7 @@ cordelia-storage = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+socket2 = { workspace = true }
 tokio = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
