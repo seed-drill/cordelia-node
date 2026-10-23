@@ -38,6 +38,16 @@ cargo test -p cordelia-network test_batched_sync_two_channels
 cargo test -p cordelia-network -- --nocapture
 ```
 
+**What one connection can make a node hold through the kernel's
+receive batching of UDP** is measured with a counting allocator in
+`crates/cordelia-network/tests/receive_batching.rs`: its test holds a node
+under a threshold, and its ignored measurement prints the figures with
+the batching off and on at five pacings, to set the threshold from:
+
+```bash
+cargo test -p cordelia-network --test receive_batching -- --ignored --nocapture
+```
+
 **Baseline:** every test of `cargo test --all` passes. (The count changes with
 almost every change: the pull request that changed it last says what it is.)
 
