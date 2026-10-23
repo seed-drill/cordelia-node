@@ -1403,6 +1403,11 @@ pub struct Serving<'a> {
     pub address: IpAddr,
     pub db: &'a Mutex<Connection>,
     pub rates: &'a Mutex<Rates>,
+    /// The large permits, under which a frame longer than a small message
+    /// from a peer that is not a listed relay is read (decision
+    /// 2026-10-22 (memory), rule 2). `None` in a test that does not
+    /// exercise them.
+    pub permits: Option<&'a crate::p2p::LargePermits>,
 }
 
 /// An end of a stream that can be refused with a code: a QUIC stream's is
@@ -1463,11 +1468,28 @@ impl RelayEntries {
             // known by that key.
             listed: self.lists(serving.peer),
         };
-        // The frame as its bytes: what is no request is counted by them.
-        let frame = match codec::read_raw_frame(recv).await {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::debug!(peer = %who.peer, error = %e, "failed to read a request for entries");
+        // The frame as its bytes: what is no request is counted by them. A
+        // frame longer than a small message from a peer that is not a
+        // listed relay is read only under a large permit (decision
+        // 2026-10-22 (memory), rule 2); the permit is held through the
+        // write of the answer and let go when the stream is done. A listed
+        // relay's frame is read at once (rule 7).
+        let (frame, _permit) = match crate::p2p::read_under_permit(
+            recv,
+            serving.permits,
+            who.address,
+            who.listed,
+        )
+        .await
+        {
+            crate::p2p::Framed::Frame(frame, permit) => (frame, permit),
+            crate::p2p::Framed::LargeLater => {
+                tracing::debug!(peer = %who.peer, ?protocol, "a request for entries over a small message, and no permit for now; refused");
+                crate::p2p::refuse_large_later(send, recv);
+                return None;
+            }
+            crate::p2p::Framed::Ended => {
+                tracing::debug!(peer = %who.peer, "failed to read a request for entries");
                 return None;
             }
         };
@@ -1881,6 +1903,145 @@ mod tests {
     /// A relay with room for everything, that lists nobody by key.
     fn relay() -> Relay {
         relay_of(u64::MAX, &[])
+    }
+
+    /// Whether `serve` read the body of a frame longer than a small
+    /// message, sent by the peer numbered `n` on an EntryPush (0x13)
+    /// stream, with a large-permit budget of `budget`. The pipe is too
+    /// small to hold the whole frame, so the peer's write finishes only
+    /// if the relay drains the body; a relay that parks for a permit it
+    /// cannot get leaves the write blocked.
+    async fn serve_reads_a_large_frame(n: u8, budget: usize) -> bool {
+        let relay = relay_of(u64::MAX, &[2]);
+        let permits = crate::p2p::LargePermits::new(budget);
+        let peer = peer(n);
+        let serving = Serving {
+            conn: None,
+            peer: &peer,
+            address: address(n),
+            db: &relay.db,
+            rates: &relay.rates,
+            permits: Some(&permits),
+        };
+        let mut proved = Proved::default();
+        let mut whole = ShownWhole::default();
+        let (mut relay_w, mut _peer_r) = tokio::io::duplex(64 * 1024);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(64 * 1024);
+        let serve = relay.entries.serve(
+            Protocol::EntryPush,
+            &mut relay_w,
+            &mut relay_r,
+            &serving,
+            &mut proved,
+            &mut whole,
+        );
+        tokio::pin!(serve);
+        // A frame of a megabyte: longer than a small message.
+        let frame = vec![0x5au8; 1_000_000];
+        let write = codec::write_raw_frame(&mut peer_w, &frame);
+        tokio::pin!(write);
+        tokio::select! {
+            biased;
+            _ = &mut serve => true,
+            r = &mut write => r.is_ok(),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => false,
+        }
+    }
+
+    /// Rule 2 holds on the streams of entries, which carry the pushes it
+    /// is mainly for (decision 2026-10-22 (memory), rule 2; the record's
+    /// test 2 over a 0x13 stream): a frame longer than a small message
+    /// from an unlisted peer is read only under a permit, a listed relay's
+    /// is read at once (rule 7).
+    #[tokio::test]
+    async fn a_large_frame_on_an_entry_stream_is_read_only_under_a_permit() {
+        // An unlisted peer, no permit free: its large frame is not read.
+        assert!(
+            !serve_reads_a_large_frame(1, 0).await,
+            "an unlisted peer's large frame was read on a 0x13 stream with no permit"
+        );
+        // A relay listed by key is exempt, so its large frame is read at
+        // once though no permit is free (rule 7).
+        assert!(
+            serve_reads_a_large_frame(2, 0).await,
+            "a listed relay's large frame was not read on a 0x13 stream"
+        );
+        // An unlisted peer with a permit free: read.
+        assert!(
+            serve_reads_a_large_frame(1, 1).await,
+            "an unlisted peer's large frame was not read when a permit was free"
+        );
+    }
+
+    /// Whether the one permit is free while a stream is held in the write
+    /// of its answer, having read its large frame under that permit. It
+    /// should not be: the permit is held from the read until the answer is
+    /// written (decision 2026-10-22 (memory), rule 2). `true` only if the
+    /// stream let its permit go too early.
+    async fn the_permit_is_free_while_a_stream_writes_its_answer() -> bool {
+        let relay = relay_of(u64::MAX, &[]);
+        let permits = crate::p2p::LargePermits::new(1);
+        let peer1 = peer(1);
+        let serving = Serving {
+            conn: None,
+            peer: &peer1,
+            address: address(1),
+            db: &relay.db,
+            rates: &relay.rates,
+            permits: Some(&permits),
+        };
+        // The answer goes into a one-byte pipe the peer never reads, so the
+        // write blocks and the stream stays in it, holding its permit.
+        let (mut relay_w, _peer_r) = tokio::io::duplex(1);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(64 * 1024);
+        let mut proved = Proved::default();
+        let mut whole = ShownWhole::default();
+        // A show of a large (garbage) entry: longer than a small message,
+        // and answered (with a refusal) whatever the entry, so the relay
+        // reaches the answer's write and is held in it.
+        let frame = codec::encode_message(&WireMessage::EntryShow(EntryShow {
+            entry: vec![0u8; 200_000],
+        }))
+        .unwrap();
+        let serve = relay.entries.serve(
+            Protocol::EntryShow,
+            &mut relay_w,
+            &mut relay_r,
+            &serving,
+            &mut proved,
+            &mut whole,
+        );
+        tokio::pin!(serve);
+        let write = codec::write_raw_frame(&mut peer_w, &frame);
+        tokio::pin!(write);
+        // Drive the serve and the peer's write until the serve is parked in
+        // its answer's write (it never finishes, since the peer never
+        // reads the one-byte pipe).
+        tokio::select! {
+            biased;
+            _ = &mut serve => panic!("the serve finished; it was meant to block in its write"),
+            _ = async { (&mut write).await.ok(); std::future::pending::<()>().await } => {}
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        // Now try to take the one permit from another subnet: it is free
+        // only if the stream let its permit go before its write.
+        let got = tokio::time::timeout(
+            Duration::from_millis(100),
+            permits.take("10.0.0.1".parse().unwrap()),
+        )
+        .await;
+        matches!(got, Ok(Some(_)))
+    }
+
+    /// A stream holds its permit from the read of its large frame until the
+    /// answer is written (decision 2026-10-22 (memory), rule 2): while a
+    /// stream is held in its answer's write, the one permit is not free.
+    #[tokio::test]
+    async fn a_stream_holds_its_permit_through_the_write() {
+        assert!(
+            !the_permit_is_free_while_a_stream_writes_its_answer().await,
+            "the permit was free while a stream was held in its answer's write"
+        );
     }
 
     impl Relay {
@@ -5091,6 +5252,7 @@ mod tests {
             address: address(1),
             db: &relay.db,
             rates: &relay.rates,
+            permits: None,
         };
         let mut whole = ShownWhole::default();
         // Small pipes, so that what a pipe keeps for itself is small: the
