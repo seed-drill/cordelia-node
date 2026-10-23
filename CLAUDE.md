@@ -164,7 +164,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
 | `QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS` | 8 (64 with a relay listed by key) | parameter-rationale.md §1 |
-| `QUIC_STREAM_RECEIVE_WINDOW`, `QUIC_RECEIVE_WINDOW` | 144KB a stream, 288KB a connection (derived: one and two of `SMALL_MESSAGE_BYTES`; 1MB and 2MB with a relay listed by key) | parameter-rationale.md §1 |
+| `QUIC_STREAM_RECEIVE_WINDOW`, `QUIC_RECEIVE_WINDOW` | 36KB a stream, 288KB a connection (derived: two of `SMALL_MESSAGE_BYTES` a connection, and that over `QUIC_MAX_BIDI_STREAMS` a stream, so that every stream fits the connection's window; 1MB and 2MB with a relay listed by key) | parameter-rationale.md §1 |
 | `QUIC_SEND_WINDOW` | 288KB a connection (derived: 2 x `SMALL_MESSAGE_BYTES`; 2MB to a relay listed by key; a write beyond it waits for acknowledgements, and fails after `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §1 |
 | `PUSH_BYTES_PER_PEER_PER_MINUTE` | 2MB | parameter-rationale.md §4 |
 | `MAX_CHANNEL_BYTES_AT_RELAY` | 16MB | parameter-rationale.md §4 |
