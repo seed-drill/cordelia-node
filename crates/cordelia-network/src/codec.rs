@@ -219,23 +219,44 @@ pub async fn write_frame<W: AsyncWrite + Unpin + GiveUp>(
     write_all_guarded(writer, &payload).await
 }
 
+/// Read the four-byte length that prefixes a frame, apart from its
+/// payload, so that a caller can decide what to do by the length before
+/// the payload is read or allocated (decision 2026-10-22 (memory), rule
+/// 2): a frame longer than a small message, from an unlisted peer, is
+/// read only under a large permit. The length is bounded by
+/// MAX_MESSAGE_BYTES here, as it is for a whole-frame read, so a caller
+/// never allocates by a length straight off the wire (CLAUDE.md).
+pub async fn read_frame_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u32, CodecError> {
+    let mut len_buf = [0u8; 4];
+    read_exact_guarded(reader, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_MESSAGE_BYTES {
+        return Err(CodecError::MessageTooLarge { size: len });
+    }
+    Ok(len)
+}
+
+/// Read the payload of a frame whose length [`read_frame_len`] already
+/// read and bounded. It allocates `len` bytes: `len` is what
+/// [`read_frame_len`] returned, never a length taken straight off the
+/// wire.
+pub async fn read_frame_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: u32,
+) -> Result<Vec<u8>, CodecError> {
+    let mut payload = vec![0u8; len as usize];
+    read_exact_guarded(reader, &mut payload).await?;
+    Ok(payload)
+}
+
 /// Read a length-prefixed CBOR frame on a stream of `protocol`, and decode
 /// it as one of that stream's messages ([`decode_message`]).
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     protocol: Protocol,
 ) -> Result<WireMessage, CodecError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_guarded(reader, &mut len_buf).await?;
-
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
-        return Err(CodecError::MessageTooLarge { size: len });
-    }
-
-    let mut payload = vec![0u8; len as usize];
-    read_exact_guarded(reader, &mut payload).await?;
-
+    let len = read_frame_len(reader).await?;
+    let payload = read_frame_body(reader, len).await?;
     decode_message(protocol, &payload)
 }
 
@@ -254,20 +275,13 @@ pub async fn write_raw_frame<W: AsyncWrite + Unpin + GiveUp>(
     write_all_guarded(writer, payload).await
 }
 
-/// Read a raw frame, returning the CBOR bytes without decoding.
+/// Read a raw frame, returning the CBOR bytes without decoding. The length
+/// and the payload are read together ([`read_frame_len`] then
+/// [`read_frame_body`]); a caller that must decide by the length before it
+/// reads the payload reads the two apart.
 pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, CodecError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_guarded(reader, &mut len_buf).await?;
-
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
-        return Err(CodecError::MessageTooLarge { size: len });
-    }
-
-    let mut payload = vec![0u8; len as usize];
-    read_exact_guarded(reader, &mut payload).await?;
-
-    Ok(payload)
+    let len = read_frame_len(reader).await?;
+    read_frame_body(reader, len).await
 }
 
 // ── Request-response helper ──────────────────────────────────────
@@ -608,6 +622,38 @@ mod tests {
         match decoded {
             WireMessage::Pong(p) => assert_eq!(p.seq, 1),
             other => panic!("expected Pong, got {:?}", other),
+        }
+    }
+
+    /// The length of a frame can be read apart from its payload, and the
+    /// two together read the same frame as `read_raw_frame` (decision
+    /// 2026-10-22 (memory), rule 2): a caller can look at the length and
+    /// decide before it reads the payload.
+    #[tokio::test]
+    async fn a_frames_length_is_read_apart_from_its_payload() {
+        let payload = vec![0xABu8; 50_000];
+        let mut buf = Vec::new();
+        write_raw_frame(&mut buf, &payload).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let len = read_frame_len(&mut cursor).await.unwrap();
+        assert_eq!(len as usize, payload.len());
+        // Nothing of the payload has been read yet: the body is read only
+        // now, by the length just read.
+        let body = read_frame_body(&mut cursor, len).await.unwrap();
+        assert_eq!(body, payload);
+    }
+
+    /// A length over MAX_MESSAGE_BYTES is refused at the length, before a
+    /// payload is allocated.
+    #[tokio::test]
+    async fn a_length_over_the_most_is_refused_at_the_length() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(MAX_MESSAGE_BYTES + 1).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        match read_frame_len(&mut cursor).await {
+            Err(CodecError::MessageTooLarge { size }) => assert_eq!(size, MAX_MESSAGE_BYTES + 1),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
         }
     }
 
