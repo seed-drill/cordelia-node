@@ -5211,6 +5211,7 @@ pub async fn handle_peer_streams(
                     address,
                     db: &state.db,
                     rates: &peer_rates,
+                    permits: Some(&large_permits),
                 };
                 let over = entries
                     .serve(
@@ -5247,7 +5248,7 @@ pub async fn handle_peer_streams(
 /// side reset with ERR_LARGE_MESSAGE_LATER, so a peer of the version
 /// before, blocked in its write, learns to send the same frame again
 /// later. No breach is counted: the peer did nothing over a limit.
-fn refuse_large_later(
+pub(crate) fn refuse_large_later(
     send: &mut impl crate::relay_entries::Refuse,
     recv: &mut impl crate::relay_entries::Refuse,
 ) {
@@ -5258,7 +5259,7 @@ fn refuse_large_later(
 
 /// One outcome of reading a frame on a stream from a peer (decision
 /// 2026-10-22 (memory), rules 2 and 7).
-enum Framed<'p> {
+pub(crate) enum Framed<'p> {
     /// The frame's bytes, with the large permit held for it (None where it
     /// is within a small message, where the peer is a listed relay, or
     /// where the node keeps no budget). The caller drops the permit once
@@ -5279,7 +5280,7 @@ enum Framed<'p> {
 /// whether the peer is a relay listed by key, whose frames are read at
 /// once whatever their size; `permits` is `None` for a node that keeps no
 /// budget, or a test that does not exercise one.
-async fn read_under_permit<'p, R>(
+pub(crate) async fn read_under_permit<'p, R>(
     recv: &mut R,
     permits: Option<&'p LargePermits>,
     address: std::net::IpAddr,
