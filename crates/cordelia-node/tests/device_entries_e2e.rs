@@ -5188,6 +5188,134 @@ async fn the_pair_read_at_accept_finds_a_hand_over_behind_an_entry_of_the_larges
     assert_eq!(pulls, [0, 1]);
 }
 
+/// The pulls that a stand-in saw, by the place each asked after.
+fn pulls_seen(relay: &StandIn) -> Vec<u64> {
+    relay
+        .requests()
+        .iter()
+        .filter_map(|request| match request {
+            WireMessage::EntryPull(pull) => Some(pull.after),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pair read at accept stops at a page that holds entries and leaves
+/// the place where it was (decision 2026-10-22 (memory), rule 3): a relay
+/// that hands the same page whatever place is asked after is asked once,
+/// and not RELAY_ENTRY_PULL_PAGES times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pair_read_at_accept_stops_at_a_page_that_does_not_move_the_place() {
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    added.unwrap();
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    let by_another = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "n",
+        Value::Text("not by the typed key".into()),
+    )
+    .to_wire();
+    relay.holds_what_is_proved(true);
+    // The same page, under the mark and at the place that were asked
+    // with: it holds an entry, and moves nothing.
+    relay.pulls(move |pull| EntryPulled {
+        entries: vec![by_another.clone().into()],
+        next: pull.after,
+        mark: pull.mark,
+    });
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    let typed = types(&new, &adder);
+    assert_eq!(
+        asks_for_hand_over(&new, "relay", &typed).await,
+        Ok(PairRead::Read(Vec::new()))
+    );
+    assert_eq!(
+        pulls_seen(&relay),
+        [0],
+        "a page that moved nothing was asked again"
+    );
+}
+
+/// Where a page of the pair read after the first fails (decision
+/// 2026-10-22 (memory), rule 3), the read ends. With nothing accepted
+/// before it, the failure is said, as the first page's would be. With a
+/// hand-over already judged, what was judged is kept and said: it is not
+/// undone. Here the hand-over is refused (the device made a phrase of its
+/// own after the key was typed), so the key still reads, and the next
+/// page is asked for, and fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pair_read_at_accept_ends_where_a_later_page_fails() {
+    let relay = StandIn::started().await;
+    let (adder, mut new) = (Device::new("desktop"), Device::new("laptop"));
+    adder.makes_the_phrase(&phrase());
+    let added = add_device(
+        &adder.db(),
+        &adder.state.identity,
+        &new.key(),
+        "laptop",
+        adder.now(),
+    );
+    let hand_over = added.unwrap().hand_over.to_wire();
+    let pair_secret = derive::pair_secret(&new.state.identity, &adder.key()).unwrap();
+    let by_another = sealed(
+        &new.state.identity,
+        &pair_secret,
+        9,
+        "n",
+        Value::Text("not by the typed key".into()),
+    )
+    .to_wire();
+    relay.holds_what_is_proved(true);
+    // The first page holds what the test puts there; the next is reset.
+    let first = Arc::new(Mutex::new(by_another));
+    let page = first.clone();
+    relay.pulls(move |_| EntryPulled {
+        entries: vec![page.lock().unwrap().clone().into()],
+        next: 1,
+        mark: [6; 8],
+    });
+    relay.hook(|request| match request {
+        WireMessage::EntryPull(pull) if pull.after >= 1 => Some(Say::Reset),
+        _ => None,
+    });
+    new.connects_to("relay", relay.port, relay.key).await;
+    relay.requests();
+
+    // Nothing for the key on the first page: the failure of the second
+    // is said.
+    let typed = types(&new, &adder);
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    assert!(matches!(read, Err(Refused::NotAnswered(_))), "{read:?}");
+    assert_eq!(pulls_seen(&relay), [0, 1]);
+
+    // The hand-over on the first page, judged and refused: that is kept,
+    // and said, though the second page fails.
+    *first.lock().unwrap() = hand_over;
+    new.makes_the_phrase(&Phrase::parse(OTHER_WORDS).unwrap());
+    let read = asks_for_hand_over(&new, "relay", &typed).await;
+    let Ok(PairRead::Read(read)) = read else {
+        panic!("what was judged before the failure was not said: {read:?}");
+    };
+    assert!(
+        matches!(read.as_slice(), [Accepted::Refused(_)]),
+        "{read:?}"
+    );
+    assert_eq!(pulls_seen(&relay), [0, 1]);
+}
+
 /// A page of `held` as a relay of this version hands one to a device
 /// (decision 2026-10-22 (memory), rule 3): from the place asked after, as
 /// many as fit SMALL_PAGE_BYTES on the wire, and at least one.
