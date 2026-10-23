@@ -8153,10 +8153,11 @@ mod tests {
         write_protocol_byte(&mut csend, Protocol::ItemPush)
             .await
             .unwrap();
-        // A frame of a megabyte: longer than a small message. It fits the
-        // stream's window, so the write finishes though the node reads
-        // none of the body. The send is left open (not finished), so the
-        // node's stop of the receive side is seen on it.
+        // A frame of a megabyte: longer than a small message, and than the
+        // stream's window, so the write waits while the node reads none of
+        // the body, as a device of the version before waits in its write,
+        // until the node stops the receive side. The send is left open
+        // (not finished), so the stop is seen on it.
         let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
 
         // The node resets the send side with ERR_LARGE_MESSAGE_LATER
@@ -9080,7 +9081,13 @@ mod tests {
             frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
             "the push was meant to be over a small message"
         );
-        let _ = write_raw_frame(&mut csend, &frame).await;
+        // The frame is longer than the stream's window, so its write waits
+        // while the node waits for a permit, as a device of the version
+        // before waits in its write.
+        let writing = tokio::spawn(async move {
+            let _ = write_raw_frame(&mut csend, &frame).await;
+            csend
+        });
 
         // The node is parked, waiting for a permit. Let the held one go,
         // well within the stream timeout.
@@ -9097,6 +9104,7 @@ mod tests {
             answered.is_ok_and(|r| r.is_ok()),
             "the large frame was not answered once a permit freed"
         );
+        let _ = writing.await;
         let _ = serving.await;
     }
 

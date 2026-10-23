@@ -660,7 +660,10 @@ async fn test_chaos_disconnect_during_sync() {
 }
 
 /// T14-1: Concurrent stream stress. Open 50 bidirectional streams simultaneously
-/// on a single QUIC connection. Verifies quinn handles high concurrency.
+/// on a single QUIC connection, of which the peer lets QUIC_MAX_BIDI_STREAMS
+/// be open at once (decision 2026-10-22, memory across connections, rule 9):
+/// the others wait for a stream, which each exchange gives back as it ends.
+/// Verifies quinn handles high concurrency.
 #[tokio::test]
 async fn test_stress_concurrent_streams() {
     let id_a = make_identity();
@@ -688,6 +691,21 @@ async fn test_stress_concurrent_streams() {
 
     let conn = mgr_a.get_connection(&node_b_id).unwrap().clone();
 
+    // B answers each stream: it reads it to its end and finishes its own
+    // side, so the stream is closed at both ends and B lets another open.
+    let node_a_id = cordelia_core::NodeId(id_a.public_key());
+    let at_b = mgr_b.get_connection(&node_a_id).unwrap().clone();
+    let answering = tokio::spawn(async move {
+        while let Ok((mut send, mut recv)) = at_b.accept_bi().await {
+            tokio::spawn(async move {
+                if let Ok(got) = recv.read_to_end(64).await {
+                    let _ = send.write_all(&got).await;
+                }
+                let _ = send.finish();
+            });
+        }
+    });
+
     // Open 50 streams concurrently
     let mut handles = vec![];
     for i in 0u32..50 {
@@ -695,11 +713,19 @@ async fn test_stress_concurrent_streams() {
         handles.push(tokio::spawn(async move {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), c.open_bi()).await;
             match result {
-                Ok(Ok((mut send, _recv))) => {
-                    // Write a small payload and close
+                Ok(Ok((mut send, mut recv))) => {
+                    // Write a small payload and close, and read the answer
+                    // to its end.
                     let _ = send.write_all(&i.to_be_bytes()).await;
                     let _ = send.finish();
-                    true
+                    matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            recv.read_to_end(64)
+                        )
+                        .await,
+                        Ok(Ok(got)) if got == i.to_be_bytes()
+                    )
                 }
                 _ => false,
             }
@@ -718,6 +744,7 @@ async fn test_stress_concurrent_streams() {
         "at least 45/50 concurrent streams should succeed, got {success}"
     );
 
+    answering.abort();
     mgr_a.shutdown();
 }
 

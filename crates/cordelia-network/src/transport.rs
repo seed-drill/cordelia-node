@@ -107,16 +107,21 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 /// A connection to or from a relay listed by key has those of
 /// [`listed_transport_config`] in their place.
 ///
-/// - A peer may have QUIC_MAX_BIDI_STREAMS streams open at once, and no
-///   unidirectional ones.
-/// - It may send one message's worth on a stream, and two on the whole
-///   connection, before this node has read it. So one connection can make
-///   a node buffer two megabytes, whatever the peer does.
-/// - This node may have written two messages' worth on the connection that
-///   the peer has not acknowledged (QUIC_SEND_WINDOW). A write beyond it
-///   waits for acknowledgements, and the codec gives it up after
-///   STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it is sent
-///   cannot make a node hold more than that either.
+/// Each is set from a small message, the largest thing a device of this
+/// version sends (decision 2026-10-22, memory across connections, rules
+/// 8, 9 and 11):
+///
+/// - A peer may have QUIC_MAX_BIDI_STREAMS (8) streams open at once, and
+///   no unidirectional ones.
+/// - It may send one small message's worth on a stream, and two on the
+///   whole connection, before this node has read it. So one connection
+///   can make a node buffer 288 KiB unread, whatever the peer does. A
+///   larger message arrives a window at a time, as the node reads it.
+/// - This node may have written two small messages' worth on the
+///   connection that the peer has not acknowledged (QUIC_SEND_WINDOW). A
+///   write beyond it waits for acknowledgements, and the codec gives it up
+///   after STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it
+///   is sent cannot make a node hold more than that either.
 /// - It may send no datagrams: no node sends or reads one, and quinn's
 ///   default would keep 1.25 MB of them unread on every connection.
 fn transport_config() -> quinn::TransportConfig {
@@ -740,10 +745,11 @@ mod tests {
         assert_eq!(peer_key(&client_end).unwrap(), server_id.public_key());
     }
 
-    /// T3. A peer can have 64 streams open on one connection at once. The
-    /// next one waits.
+    /// T3. A peer can have 8 streams open on one connection at once
+    /// (decision 2026-10-22, memory across connections, rule 9). The ninth
+    /// waits.
     #[tokio::test]
-    async fn a_connection_holds_at_most_64_streams_open() {
+    async fn a_connection_holds_at_most_8_streams_open() {
         let (client, server, _c, _s) = connected().await;
         // The other end takes each stream and keeps it open.
         let holding = tokio::spawn(async move {
@@ -777,14 +783,16 @@ mod tests {
         holding.abort();
     }
 
-    /// T3. One connection cannot make a node hold more than two messages'
-    /// worth that it has not read, however many streams the peer uses.
+    /// T3. One connection cannot make a node hold more than two small
+    /// messages' worth that it has not read, however many streams the peer
+    /// uses (decision 2026-10-22, memory across connections, rule 8): a
+    /// small message on a stream, and QUIC_RECEIVE_WINDOW on them all.
     #[tokio::test]
     async fn a_connection_buffers_at_most_two_unread_messages() {
         let (client, _server_reads_nothing, _c, _s) = connected().await;
-        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize];
+        let message = vec![0u8; protocol::SMALL_MESSAGE_BYTES as usize];
 
-        // Four streams, a message's worth on each: four megabytes offered.
+        // Four streams, a small message's worth on each: four offered.
         let mut streams = Vec::new();
         let mut taken = 0;
         for _ in 0..4 {
@@ -794,7 +802,39 @@ mod tests {
             taken += usize::from(matches!(sent, Ok(Ok(()))));
             streams.push((send, recv));
         }
-        assert_eq!(taken, 2, "the connection took {taken} megabytes unread");
+        assert_eq!(
+            taken, 2,
+            "the connection took {taken} small messages unread"
+        );
+
+        // On every stream it may open, as much as each takes: no more than
+        // the window in all, and no more than a small message on one.
+        let (client, _server_reads_nothing, _c, _s) = connected().await;
+        let chunk = vec![0u8; 16 * 1024];
+        let (mut in_all, mut most) = (0usize, 0usize);
+        let mut streams = Vec::new();
+        for _ in 0..protocol::QUIC_MAX_BIDI_STREAMS {
+            let (mut send, recv) = client.open_bi().await.unwrap();
+            let mut on_this = 0usize;
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(300), send.write(&chunk)).await
+            {
+                on_this += n;
+            }
+            in_all += on_this;
+            most = most.max(on_this);
+            streams.push((send, recv));
+        }
+        assert_eq!(
+            in_all,
+            protocol::QUIC_RECEIVE_WINDOW as usize,
+            "the connection took {in_all} bytes unread"
+        );
+        assert_eq!(
+            most,
+            protocol::QUIC_STREAM_RECEIVE_WINDOW as usize,
+            "a stream took {most} bytes unread"
+        );
     }
 
     /// The value of `field` in a config, as quinn shows it: quinn has no
@@ -867,17 +907,34 @@ mod tests {
 
     /// T3. What a node may have written on one connection that the peer has
     /// not acknowledged is QUIC_SEND_WINDOW, at both ends: as the client
-    /// that dials, and as the server that is dialled.
+    /// that dials, and as the server that is dialled. It is two small
+    /// messages (decision 2026-10-22, memory across connections, rule 11).
     #[test]
     fn the_send_window_is_two_messages_at_both_ends() {
         let id = NodeIdentity::generate().unwrap();
         let window = protocol::QUIC_SEND_WINDOW;
+        assert_eq!(window, 2 * u64::from(protocol::SMALL_MESSAGE_BYTES));
         assert_eq!(send_window_of(&transport_config()), window);
         assert_eq!(send_window_of(&client_config(&id).unwrap()), window);
         assert_eq!(
             send_window_of(&server_config(&id).unwrap().transport),
             window
         );
+    }
+
+    /// Decision 2026-10-22, memory across connections, rules 8, 9 and 11.
+    /// The configs of every connection but one with a relay listed by key
+    /// carry a small message on a stream, two on the connection each way,
+    /// and 8 streams, as the client that dials and as the server that is
+    /// dialled.
+    #[test]
+    fn the_windows_and_streams_are_set_from_a_small_message() {
+        let id = NodeIdentity::generate().unwrap();
+        let small = u64::from(protocol::SMALL_MESSAGE_BYTES);
+        let set = (small, 2 * small, 2 * small, 8);
+        assert_eq!(limits_of(&transport_config()), set);
+        assert_eq!(limits_of(&client_config(&id).unwrap()), set);
+        assert_eq!(limits_of(&server_config(&id).unwrap().transport), set);
     }
 
     /// A path to `server` over UDP, as a client sees it: the address to
@@ -997,8 +1054,8 @@ mod tests {
     async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
         let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
         let (mut send, mut recv) = node_end.open_bi().await.unwrap();
-        // A frame of a megabyte, its length included.
-        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize - 4];
+        // A frame of a small message, its length included.
+        let message = vec![0u8; protocol::SMALL_MESSAGE_BYTES as usize - 4];
 
         // Two fill the window, and are taken at once. The third waits.
         for _ in 0..2 {
