@@ -1992,9 +1992,11 @@ mod tests {
         }
         // Now try to take the one permit from another subnet: it is free
         // only if the stream let its permit go before its write.
-        let got =
-            tokio::time::timeout(Duration::from_millis(100), permits.take("10.0.0.1".parse().unwrap()))
-                .await;
+        let got = tokio::time::timeout(
+            Duration::from_millis(100),
+            permits.take("10.0.0.1".parse().unwrap()),
+        )
+        .await;
         matches!(got, Ok(Some(_)))
     }
 

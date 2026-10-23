@@ -1523,7 +1523,13 @@ pub const SMALL_MESSAGE_BYTES: u32 = SMALL_PAGE_BYTES as u32 + 16 * 1024;
 // change entry and its wire overhead), a show's answer (one entry of the
 // largest size), a hand-over (an entry of the largest size on the wire).
 const _: () = assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
-const _: () = assert!(SMALL_PAGE_BYTES + 16 * 1024 == SMALL_MESSAGE_BYTES as usize);
+// The room over a page holds a page's own fields and the length prefix of
+// each entry: a CBOR byte-string header is at most 9 bytes, and a page
+// carries at most ENTRY_PAGE_MAX_ENTRIES of them, with a little over for
+// the message's own fields (the mark, the next place, the array header).
+const _: () = assert!(
+    SMALL_MESSAGE_BYTES as usize - SMALL_PAGE_BYTES >= ENTRY_PAGE_MAX_ENTRIES as usize * 9 + 64
+);
 const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u64 <= SMALL_MESSAGE_BYTES as u64);
 const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
 const _: () =

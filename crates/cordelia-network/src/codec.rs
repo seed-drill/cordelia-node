@@ -675,6 +675,47 @@ mod tests {
         assert_eq!(body, payload);
     }
 
+    /// Every message a device of this version sends or is sent fits a
+    /// small message once framed (decision 2026-10-22 (memory), rule 1):
+    /// a whole show (and a hand-over, an entry of the largest size on the
+    /// wire), and a full page or push of SMALL_PAGE_BYTES of entries with
+    /// the length of each entry around them. This is the framing the 16
+    /// KiB over a page leaves room for.
+    #[tokio::test]
+    async fn every_message_of_this_version_fits_a_small_message_framed() {
+        use protocol::{
+            ENTRY_PAGE_MAX_ENTRIES, MAX_ENTRY_WIRE_BYTES, SMALL_MESSAGE_BYTES, SMALL_PAGE_BYTES,
+        };
+        let fits = |msg: &WireMessage| {
+            let frame = encode_message(msg).unwrap().len() + 4;
+            assert!(
+                frame <= SMALL_MESSAGE_BYTES as usize,
+                "a message framed as {frame} bytes is over a small message"
+            );
+        };
+        // A whole show of an entry of the largest size on the wire (also
+        // the shape of a hand-over).
+        fits(&WireMessage::EntryShow(EntryShow {
+            entry: vec![0u8; MAX_ENTRY_WIRE_BYTES],
+        }));
+        // A full page: ENTRY_PAGE_MAX_ENTRIES entries whose wire bytes sum
+        // to a small page, each carried with its own length.
+        let each = SMALL_PAGE_BYTES / ENTRY_PAGE_MAX_ENTRIES as usize;
+        let entries: Vec<_> = (0..ENTRY_PAGE_MAX_ENTRIES)
+            .map(|_| vec![0u8; each].into())
+            .collect();
+        assert!(
+            entries.len() * each >= SMALL_PAGE_BYTES - each,
+            "the page was meant to be full"
+        );
+        fits(&WireMessage::EntryPulled(EntryPulled {
+            entries: entries.clone(),
+            next: 0,
+            mark: [0u8; 8],
+        }));
+        fits(&WireMessage::EntryPush(EntryPush { entries }));
+    }
+
     /// On a stream whose honest messages fit a small message, a longer
     /// frame is refused at its length, before the body is read, and one
     /// within a small message is read as usual (decision 2026-10-22
@@ -685,7 +726,7 @@ mod tests {
         // One byte over a small message: refused at the length.
         let mut over = Vec::new();
         over.extend_from_slice(&(small + 1).to_be_bytes());
-        over.extend_from_slice(&vec![0u8; 16]); // only part of the body is present
+        over.extend_from_slice(&[0u8; 16]); // only part of the body is present
         let mut cursor = std::io::Cursor::new(over);
         match read_small_frame(&mut cursor, Protocol::PeerSharing).await {
             Err(CodecError::MessageTooLarge { size }) => assert_eq!(size, small + 1),

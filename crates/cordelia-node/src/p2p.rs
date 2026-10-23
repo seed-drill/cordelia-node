@@ -5047,6 +5047,14 @@ pub async fn handle_peer_streams(
             .ok()
             .is_some_and(|relays| relays.contains(&peer_id));
         let unlimited = own_relay && node_role == "relay";
+        // Whether the peer is a relay this node lists by key, which is
+        // outside rule 2 (rule 7). Only a relay keeps `relay_entries`, so
+        // on a bootnode or a personal node this is always false and
+        // nothing is exempt from the permits. That does not matter: a
+        // bootnode answers only peer-sharing (small), and the one case it
+        // leaves is a relay listed by key pushing the older kind over a
+        // small message to a bootnode, which does not happen between
+        // R1's nodes.
         let listed_by_key = relay_entries
             .as_ref()
             .is_some_and(|entries| entries.lists(&peer_id));
@@ -7181,7 +7189,10 @@ mod tests {
         let _a = asks_and_holds(permits.clone(), "10.0.0.1", atx);
         // The waiter that asked earlier is served; the retake waits behind
         // it and times out.
-        assert!(brx.await.unwrap(), "the waiter was starved by a retaking holder");
+        assert!(
+            brx.await.unwrap(),
+            "the waiter was starved by a retaking holder"
+        );
         assert!(!arx.await.unwrap(), "the retaking holder jumped the waiter");
     }
 
@@ -7403,9 +7414,9 @@ mod tests {
             .unwrap();
         // A frame of a megabyte: longer than a small message. It fits the
         // stream's window, so the write finishes though the node reads
-        // none of the body.
+        // none of the body. The send is left open (not finished), so the
+        // node's stop of the receive side is seen on it.
         let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
-        let _ = csend.finish();
 
         // The node resets the send side with ERR_LARGE_MESSAGE_LATER
         // (0x05), which the peer learns when it reads the stream.
@@ -7422,6 +7433,18 @@ mod tests {
                 "the stream was reset with another code"
             ),
             other => panic!("the stream was not reset with ERR_LARGE_MESSAGE_LATER: {other:?}"),
+        }
+        // The node also stops the receive side with the same code, which
+        // the peer learns as its own send being stopped.
+        match csend.stopped().await {
+            Ok(Some(code)) => assert_eq!(
+                code,
+                quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER),
+                "the receive side was stopped with another code"
+            ),
+            other => {
+                panic!("the receive side was not stopped with ERR_LARGE_MESSAGE_LATER: {other:?}")
+            }
         }
         // It was refused, not stored, and counts no breach.
         let (over, _conn) = serving.await.unwrap();
@@ -7624,9 +7647,8 @@ mod tests {
         use std::net::SocketAddr;
         use std::sync::{Arc, RwLock};
 
-        let id = |s: u8| {
-            Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([s; 32]).unwrap())
-        };
+        let id =
+            |s: u8| Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([s; 32]).unwrap());
         let here: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (node, client) = (id(1), id(2));
         let client_key = NodeId(client.public_key());
@@ -7670,14 +7692,19 @@ mod tests {
         let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
         let shared_peers = Arc::new(RwLock::new(Vec::new()));
         let swarm = Arc::new(RwLock::new(HashSet::new()));
-        let seen = Arc::new(RwLock::new(cordelia_network::seen_table::SeenTable::default()));
+        let seen = Arc::new(RwLock::new(
+            cordelia_network::seen_table::SeenTable::default(),
+        ));
         let peer_rates = Arc::new(std::sync::Mutex::new(Rates::default()));
 
         let node_conn = {
             let as_node = as_node.clone();
             tokio::spawn(async move {
                 let incoming = accepts.accept().await.unwrap();
-                connection::inbound_accept(&as_node, incoming).await.unwrap().conn
+                connection::inbound_accept(&as_node, incoming)
+                    .await
+                    .unwrap()
+                    .conn
             })
         };
         let mut client_mgr = connection::ConnectionManager::new(
@@ -7714,7 +7741,9 @@ mod tests {
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        codec::write_protocol_byte(&mut send, Protocol::ItemPush).await.unwrap();
+        codec::write_protocol_byte(&mut send, Protocol::ItemPush)
+            .await
+            .unwrap();
         // A push of one big item: longer than a small message.
         let item = Item {
             item_id: "ci_big".into(),
@@ -7740,10 +7769,12 @@ mod tests {
         );
         let _ = codec::write_raw_frame(&mut send, &frame).await;
         // An answer (a push ack) within two seconds means it was read.
-        let answered =
-            tokio::time::timeout(std::time::Duration::from_secs(2), codec::read_frame(&mut recv, Protocol::ItemPush))
-                .await
-                .is_ok_and(|r| r.is_ok());
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            codec::read_frame(&mut recv, Protocol::ItemPush),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
         loop_task.abort();
         answered
     }
