@@ -29,6 +29,8 @@ PULL_BYTES = storage("a_page_holds_at_most_its_bytes_and_at_least_one_entry_and_
 PAIR_READ = device("the_pair_read_at_accept_finds_a_hand_over_behind_an_entry_of_the_largest_size")
 PASS_READ = device("a_pass_reads_a_channel_of_the_largest_entries_in_small_pages_to_its_end")
 FETCH = p2p("an_older_kind_fetch_answer_over_a_small_page_waits_for_a_large_permit")
+PAIR_STOP = device("the_pair_read_at_accept_stops_at_a_page_that_does_not_move_the_place")
+PAIR_FAILS = device("the_pair_read_at_accept_ends_where_a_later_page_fails")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -81,6 +83,37 @@ MUTATIONS = [
      '''                    pull.limit,
                     SMALL_PAGE_BYTES,''',
      [LISTED_PAGE]),
+    ("SP10 the fetch answer with no permit in time is not refused with ERR_LARGE_MESSAGE_LATER", P2P,
+     '''                            tracing::debug!(peer = %peer_id, channel = %channel, bytes, "a fetch answer over a small page, and no permit for now; refused");
+                            refuse_large_later(send, recv);''',
+     '''                            tracing::debug!(peer = %peer_id, channel = %channel, bytes, "a fetch answer over a small page, and no permit for now; refused");''',
+     [FETCH]),
+    ("SP11 one permit a stream: the fetch answer asks for a second beside its frame's", P2P,
+     '''                    && permit.is_none()
+                    && let Some(permits) = permits''',
+     '''                    && let Some(permits) = permits''',
+     [FETCH]),
+    ("SP12 the fetch answer's items are loaded before the permit comes", P2P,
+     '''                let small = bytes <= cordelia_core::protocol::SMALL_PAGE_BYTES as u64;''',
+     '''                let small = bytes <= cordelia_core::protocol::SMALL_PAGE_BYTES as u64;
+                let _loaded = state.db.lock().ok().map(|db| cordelia_storage::items::get_items_by_ids(&db, &channel, &freq.item_ids));''',
+     [FETCH]),
+    ("SP13 the pair read does not stop at a page that leaves the place where it was", LEAVE,
+     '''page.entries.is_empty() || reached == place ||''',
+     '''page.entries.is_empty() ||''',
+     [PAIR_STOP]),
+    ("SP14 a later page's failure, with nothing judged, is not said", LEAVE,
+     '''                Err(refused) if read.is_empty() => return Err(refused),''',
+     '''                Err(refused) if false => return Err(refused),''',
+     [PAIR_FAILS]),
+    ("SP15 a later page's failure undoes what was judged before it", LEAVE,
+     '''                _ => break,
+            };
+            // Each entry is checked''',
+     '''                _ => return Err(not("a later page failed")),
+            };
+            // Each entry is checked''',
+     [PAIR_FAILS]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
