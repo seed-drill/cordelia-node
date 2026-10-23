@@ -330,8 +330,10 @@ impl ConnectionTracker {
     }
 }
 
-/// Compute subnet key: /24 for IPv4, /48 for IPv6.
-fn subnet_key(addr: IpAddr) -> String {
+/// Compute subnet key: /24 for IPv4, /48 for IPv6. This is how the large
+/// permits group peers' addresses too (decision 2026-10-22 (memory), rule
+/// 2): at most one permit is held for each subnet.
+pub fn subnet_key(addr: IpAddr) -> String {
     match addr {
         IpAddr::V4(ip) => {
             let octets = ip.octets();

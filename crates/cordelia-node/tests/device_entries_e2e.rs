@@ -1235,7 +1235,10 @@ async fn a_device_of_this_version_pushes_no_message_over_a_small_message() {
     for n in 0..40 {
         device.writes("notes", &format!("f{n}.md"), &body);
     }
-    assert!(40 * body.len() >= 2 * 1024 * 1024, "the entries were meant to be about 2 MiB");
+    assert!(
+        40 * body.len() >= 2 * 1024 * 1024,
+        "the entries were meant to be about 2 MiB"
+    );
     let _ = relay.requests();
 
     // It sends, within its pace, and every push frame is a small message.
@@ -1248,7 +1251,11 @@ async fn a_device_of_this_version_pushes_no_message_over_a_small_message() {
             _ => None,
         })
         .collect();
-    assert!(pushes.len() >= 2, "a backlog of 2 MiB made {} push(es)", pushes.len());
+    assert!(
+        pushes.len() >= 2,
+        "a backlog of 2 MiB made {} push(es)",
+        pushes.len()
+    );
     for push in &pushes {
         let frame = codec::encode_message(&WireMessage::EntryPush(push.clone())).unwrap();
         assert!(

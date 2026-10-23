@@ -1526,7 +1526,8 @@ const _: () = assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
 const _: () = assert!(SMALL_PAGE_BYTES + 16 * 1024 == SMALL_MESSAGE_BYTES as usize);
 const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u64 <= SMALL_MESSAGE_BYTES as u64);
 const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
-const _: () = assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
+const _: () =
+    assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
 
 /// How many large messages a node reads at once, across all its
 /// connections (decision 2026-10-22 (memory) §2.1, rule 2): 4. A frame
@@ -2423,14 +2424,17 @@ mod tests {
     fn a_small_message_holds_every_message_of_this_version() {
         assert_eq!(SMALL_PAGE_BYTES, 131_072);
         assert_eq!(SMALL_MESSAGE_BYTES, 147_456);
-        assert!(SMALL_PAGE_BYTES.is_power_of_two());
-        assert!(MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
-        assert!(SMALL_PAGE_BYTES < 2 * MAX_ENTRY_WIRE_BYTES);
-        assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
+        // These relations are enforced at compile time beside the
+        // constants; restated here as what the rule asks.
+        const _: () = assert!(SMALL_PAGE_BYTES.is_power_of_two());
+        const _: () = assert!(MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+        const _: () = assert!(SMALL_PAGE_BYTES < 2 * MAX_ENTRY_WIRE_BYTES);
+        const _: () = assert!(SMALL_MESSAGE_BYTES <= MAX_MESSAGE_BYTES);
         // A whole show, a show's answer, and a hand-over on the wire.
-        assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
-        assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
-        assert!(MAX_ENTRY_WIRE_BYTES as u32 <= SMALL_MESSAGE_BYTES);
+        const _: () =
+            assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
+        const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
+        const _: () = assert!(MAX_ENTRY_WIRE_BYTES as u32 <= SMALL_MESSAGE_BYTES);
     }
 
     /// The budget of large permits is four (decision 2026-10-22 (memory),

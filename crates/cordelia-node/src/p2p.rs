@@ -393,6 +393,96 @@ impl Rates {
     }
 }
 
+/// The budget, across all a node's connections, for reading a frame from
+/// an unlisted peer that is longer than a small message (decision
+/// 2026-10-22 (memory), rule 2). At most `LARGE_MESSAGES_AT_ONCE` are held
+/// at once, and at most one for each /24 (IPv4) or /48 (IPv6) of the
+/// peers' addresses: a peer needs that many subnets to hold them all.
+///
+/// A device of this version never needs one: every frame it sends fits a
+/// small message (rules 3 and 5). So no number of slow peers of the
+/// version before holds up an honest device of this version by holding
+/// permits.
+pub struct LargePermits {
+    inner: std::sync::Mutex<Permits>,
+    /// Woken when a permit, or a subnet's hold, is let go.
+    freed: tokio::sync::Notify,
+}
+
+struct Permits {
+    /// How many of `LARGE_MESSAGES_AT_ONCE` are free.
+    free: usize,
+    /// The subnets that hold a permit: at most one each.
+    held: std::collections::HashSet<String>,
+}
+
+/// A held large permit. Dropping it gives the permit back and lets go of
+/// its subnet's hold, whether the stream was answered or failed (decision
+/// 2026-10-22 (memory), rule 2).
+pub struct LargePermit<'a> {
+    permits: &'a LargePermits,
+    subnet: String,
+}
+
+impl Drop for LargePermit<'_> {
+    fn drop(&mut self) {
+        {
+            let mut p = self.permits.inner.lock().unwrap_or_else(|e| e.into_inner());
+            p.free += 1;
+            p.held.remove(&self.subnet);
+        }
+        // Every waiter re-checks: the one whose subnet this was, and any
+        // that was only waiting for a free permit.
+        self.permits.freed.notify_waiters();
+    }
+}
+
+impl LargePermits {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Permits {
+                free: budget,
+                held: std::collections::HashSet::new(),
+            }),
+            freed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Take a permit for the subnet of `address`, waiting at most
+    /// `STREAM_TIMEOUT` for one. `None` where none came in time: the
+    /// caller refuses the stream with `ERR_LARGE_MESSAGE_LATER`, and
+    /// counts no breach. A permit is given for a subnet that holds none,
+    /// while one of `LARGE_MESSAGES_AT_ONCE` is free; a waiter whose
+    /// subnet already holds a permit waits for that one.
+    async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
+        let subnet = cordelia_network::rate_limit::subnet_key(address);
+        let wait = tokio::time::timeout(cordelia_network::codec::STREAM_TIMEOUT, async {
+            loop {
+                // Register for a wake before the state is read, so a
+                // permit let go between the read and the wait is not
+                // missed.
+                let woken = self.freed.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
+                {
+                    let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if p.free > 0 && !p.held.contains(&subnet) {
+                        p.free -= 1;
+                        p.held.insert(subnet.clone());
+                        return;
+                    }
+                }
+                woken.await;
+            }
+        })
+        .await;
+        wait.ok().map(|()| LargePermit {
+            permits: self,
+            subnet,
+        })
+    }
+}
+
 /// Open a bidirectional QUIC stream with a standard 10s timeout.
 async fn open_bi(
     conn: &quinn::Connection,
@@ -1949,6 +2039,7 @@ pub fn post_connect(
     seen_table: &std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_addrs: &RelayAddrs,
     relay_entries: &Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
+    large_permits: &std::sync::Arc<LargePermits>,
 ) {
     // Step 1: Extract peer roles from handshake
     let (says_relay, is_bootnode) = conn_mgr
@@ -2101,10 +2192,11 @@ pub fn post_connect(
         let sm = swarm_members.clone();
         let st = seen_table.clone();
         let entries = relay_entries.clone();
+        let permits = large_permits.clone();
         tokio::spawn(async move {
             handle_peer_streams(
                 conn, peer_id, made_from, db_state, peers_ref, role, rtx, dtx, rates, states,
-                relays, gtx, sm, st, entries,
+                relays, gtx, sm, st, entries, permits,
             )
             .await;
         });
@@ -2225,6 +2317,13 @@ pub async fn p2p_loop(
                 .remembering_at_most(most_proved),
             )
         });
+    // The large permits, across all this node's connections (decision
+    // 2026-10-22 (memory), rule 2): under them a frame longer than a small
+    // message from an unlisted peer is read. Every node keeps them; a
+    // device of this version never needs one.
+    let large_permits = std::sync::Arc::new(LargePermits::new(
+        cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+    ));
     // The cap is read here, when the node starts, and at no other time:
     // a relay whose cap came down drops its newest channels now.
     if let Some(entries) = &relay_entries {
@@ -2285,6 +2384,7 @@ pub async fn p2p_loop(
             &seen_table,
             &relay_addrs,
             &relay_entries,
+            &large_permits,
         );
     }
     governor.tick();
@@ -2640,7 +2740,7 @@ pub async fn p2p_loop(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
                                     &peer_relays, &gov_tx, &swarm_members, &seen_table,
-                                    &relay_addrs, &relay_entries,
+                                    &relay_addrs, &relay_entries, &large_permits,
                                 );
                             }
                             Err(e) => {
@@ -4819,6 +4919,7 @@ pub async fn handle_peer_streams(
     swarm_members: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>,
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
+    large_permits: std::sync::Arc<LargePermits>,
 ) {
     let mut stream_count: u64 = 0;
     // The channels of entries whose keys were proved on this connection
@@ -4982,6 +5083,8 @@ pub async fn handle_peer_streams(
                     &peer_rates,
                     !unlimited,
                     address,
+                    Some(&large_permits),
+                    listed_by_key,
                 )
                 .await;
                 if over.is_some_and(|over| over.cut_off) && !own_relay {
@@ -5007,6 +5110,9 @@ pub async fn handle_peer_streams(
                     &state,
                     is_relay_peer,
                     is_swarm_peer,
+                    Some(&large_permits),
+                    address,
+                    listed_by_key,
                 )
                 .await;
             }
@@ -5080,38 +5186,132 @@ pub async fn handle_peer_streams(
 
 // ── Protocol handlers (extracted from handle_peer_streams) ───────
 
-/// Read the one push on a stream of Item-Push. A frame that is no push,
-/// bytes that are no message of the stream or a message that is not a
-/// push, is not answered, and its bytes count against what the peer may
-/// push, as an entry of that size would, where the peer is `limited`: the
-/// node read them, and a megabyte read for nothing is still a megabyte.
-/// `Err` holds the breach where they are over either allowance.
-async fn read_push<R>(
+/// Refuse a stream whose frame is longer than a small message, when no
+/// large permit came for it within STREAM_TIMEOUT_SECS (decision
+/// 2026-10-22 (memory), rule 2). The receive side is stopped and the send
+/// side reset with ERR_LARGE_MESSAGE_LATER, so a peer of the version
+/// before, blocked in its write, learns to send the same frame again
+/// later. No breach is counted: the peer did nothing over a limit.
+fn refuse_large_later(
+    send: &mut impl crate::relay_entries::Refuse,
+    recv: &mut impl crate::relay_entries::Refuse,
+) {
+    let code = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER);
+    send.refuse(code);
+    recv.refuse(code);
+}
+
+/// One outcome of reading a frame on a stream from a peer (decision
+/// 2026-10-22 (memory), rules 2 and 7).
+enum Framed<'p> {
+    /// The frame's bytes, with the large permit held for it (None where it
+    /// is within a small message, where the peer is a listed relay, or
+    /// where the node keeps no budget). The caller drops the permit once
+    /// it has written the answer, before it reads the next frame.
+    Frame(Vec<u8>, Option<LargePermit<'p>>),
+    /// No permit came within STREAM_TIMEOUT: the caller refuses the stream
+    /// with ERR_LARGE_MESSAGE_LATER and counts no breach.
+    LargeLater,
+    /// The stream ended, or its read failed.
+    Ended,
+}
+
+/// Read one frame from `recv`, taking a large permit where the frame is
+/// longer than a small message and the peer is not a listed relay
+/// (decision 2026-10-22 (memory), rules 2 and 7). The permit is taken
+/// before the payload is read or allocated (CLAUDE.md: a node never
+/// allocates by a length a peer chose without a bound). `listed` is
+/// whether the peer is a relay listed by key, whose frames are read at
+/// once whatever their size; `permits` is `None` for a node that keeps no
+/// budget, or a test that does not exercise one.
+async fn read_under_permit<'p, R>(
+    recv: &mut R,
+    permits: Option<&'p LargePermits>,
+    address: std::net::IpAddr,
+    listed: bool,
+) -> Framed<'p>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let len = match cordelia_network::codec::read_frame_len(recv).await {
+        Ok(len) => len,
+        Err(_) => return Framed::Ended,
+    };
+    let permit = if len > cordelia_core::protocol::SMALL_MESSAGE_BYTES && !listed {
+        match permits {
+            Some(permits) => match permits.take(address).await {
+                Some(permit) => Some(permit),
+                None => return Framed::LargeLater,
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    match cordelia_network::codec::read_frame_body(recv, len).await {
+        Ok(body) => Framed::Frame(body, permit),
+        Err(_) => Framed::Ended,
+    }
+}
+
+/// What reading the one push on a stream of Item-Push gives.
+enum PushRead<'p> {
+    /// The push, with the large permit held for a frame longer than a
+    /// small message (rule 2). The permit is held until the answer is
+    /// written.
+    Payload(
+        cordelia_network::messages::PushPayload,
+        Option<LargePermit<'p>>,
+    ),
+    /// The frame was over the push allowance: the breach, with which the
+    /// caller refuses the stream (ERR_RATE_LIMIT).
+    Over(OverLimit),
+    /// A frame longer than a small message, for which no permit came in
+    /// time (rule 2): the caller refuses it with ERR_LARGE_MESSAGE_LATER.
+    LargeLater,
+    /// The stream ended, or a frame that is no push and no breach.
+    Ended,
+}
+
+/// Read the one push on a stream of Item-Push. A frame longer than a small
+/// message is read only under a large permit (decision 2026-10-22
+/// (memory), rule 2), unless the peer is a relay listed by key (rule 7). A
+/// frame that is no push, bytes that are no message of the stream or a
+/// message that is not a push, is not answered, and its bytes count
+/// against what the peer may push, as an entry of that size would, where
+/// the peer is `limited`: the node read them, and a megabyte read for
+/// nothing is still a megabyte.
+async fn read_push<'p, R>(
     recv: &mut R,
     peer_id: &NodeId,
     peer_rates: &std::sync::Mutex<Rates>,
     limited: bool,
     address: std::net::IpAddr,
-) -> Result<cordelia_network::messages::PushPayload, Option<OverLimit>>
+    permits: Option<&'p LargePermits>,
+    listed: bool,
+) -> PushRead<'p>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let frame = match cordelia_network::codec::read_raw_frame(recv).await {
-        Ok(frame) => frame,
-        Err(e) => {
-            tracing::debug!(peer = %peer_id, error = %e, "failed to read push frame");
-            return Err(None);
+    let (frame, permit) = match read_under_permit(recv, permits, address, listed).await {
+        Framed::Frame(frame, permit) => (frame, permit),
+        Framed::LargeLater => return PushRead::LargeLater,
+        Framed::Ended => {
+            tracing::debug!(peer = %peer_id, "failed to read push frame");
+            return PushRead::Ended;
         }
     };
     match cordelia_network::codec::decode_message(
         cordelia_network::messages::Protocol::ItemPush,
         &frame,
     ) {
-        Ok(cordelia_network::messages::WireMessage::PushPayload(payload)) => Ok(payload),
+        Ok(cordelia_network::messages::WireMessage::PushPayload(payload)) => {
+            PushRead::Payload(payload, permit)
+        }
         read => {
             tracing::debug!(peer = %peer_id, bytes = frame.len(), is_message = read.is_ok(), "a frame on a push stream that is no push");
             let bytes = cordelia_core::protocol::entry_cost(frame.len());
-            Err(limited
+            let over = limited
                 .then(|| {
                     peer_rates
                         .lock()
@@ -5119,7 +5319,11 @@ where
                         .pushed(peer_id, address, bytes)
                         .err()
                 })
-                .flatten())
+                .flatten();
+            match over {
+                Some(over) => PushRead::Over(over),
+                None => PushRead::Ended,
+            }
         }
     }
 }
@@ -5140,16 +5344,25 @@ async fn handle_inbound_push(
     peer_rates: &std::sync::Arc<std::sync::Mutex<Rates>>,
     limited: bool,
     address: std::net::IpAddr,
+    permits: Option<&LargePermits>,
+    listed: bool,
 ) -> Option<OverLimit> {
-    let payload = match read_push(recv, peer_id, peer_rates, limited, address).await {
-        Ok(payload) => payload,
-        Err(over) => {
-            if over.is_some() {
+    // The permit, where this is a frame longer than a small message from a
+    // peer that is not a listed relay (rule 2), is held through the ack's
+    // write below and let go when this handler returns.
+    let (payload, _permit) =
+        match read_push(recv, peer_id, peer_rates, limited, address, permits, listed).await {
+            PushRead::Payload(payload, permit) => (payload, permit),
+            PushRead::Over(over) => {
                 refuse_stream(send, recv);
+                return Some(over);
             }
-            return over;
-        }
-    };
+            PushRead::LargeLater => {
+                refuse_large_later(send, recv);
+                return None;
+            }
+            PushRead::Ended => return None,
+        };
 
     // What this push carries counts against the connection's allowance
     // and its address's: each entry as its ciphertext and what an entry
@@ -5275,7 +5488,16 @@ async fn handle_inbound_push(
             verification_failed: rejected,
             refused,
         });
-    let _ = cordelia_network::codec::write_frame(send, &ack).await;
+    // The answer is encoded, and the message dropped, before the write
+    // (decision 2026-10-22 (memory), rule 4): a peer that grants no credit
+    // can make the write wait up to STREAM_TIMEOUT, and through it the
+    // node holds the encoding alone, not the answer (which lists what was
+    // refused).
+    let written = cordelia_network::codec::encode_message(&ack);
+    drop(ack);
+    if let Ok(written) = written {
+        let _ = cordelia_network::codec::write_raw_frame(send, &written).await;
+    }
     None
 }
 
@@ -5368,6 +5590,10 @@ async fn answer_sync_with_nothing(
     let _ = send.finish();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the permit, the address and whether the peer is listed join an already wide handler"
+)]
 async fn handle_inbound_sync<W, R>(
     send: &mut W,
     recv: &mut R,
@@ -5375,172 +5601,164 @@ async fn handle_inbound_sync<W, R>(
     state: &web::Data<cordelia_api::state::AppState>,
     is_relay_peer: bool,
     is_swarm_peer: bool,
+    permits: Option<&LargePermits>,
+    address: std::net::IpAddr,
+    listed: bool,
 ) where
-    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
-    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite
+        + Unpin
+        + cordelia_network::codec::GiveUp
+        + crate::relay_entries::Refuse,
+    R: tokio::io::AsyncRead + Unpin + crate::relay_entries::Refuse,
 {
-    let msg = match cordelia_network::codec::read_frame(
-        recv,
-        cordelia_network::messages::Protocol::ItemSync,
-    )
-    .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(peer = %peer_id, error = %e, "sync request read failed");
-            return;
-        }
-    };
-
-    // Phase 0: channel list discovery (§4.5). If the first message is
-    // SyncChannelListRequest, respond with our stored channel IDs and
-    // then read the next message as a normal SyncRequest.
-    let mut current_req = match msg {
-        cordelia_network::messages::WireMessage::SyncChannelListRequest(_) => {
-            // Which channels a node holds is told only to its own relays.
-            // Anyone else gets an empty list.
-            let channel_ids = if !(is_relay_peer || is_swarm_peer) {
-                Vec::new()
-            } else {
-                let db = match state.db.lock() {
-                    Ok(db) => db,
-                    Err(_) => return,
-                };
-                // Local-scope channels are hidden from non-swarm peers
-                // (§8.2.2), and a channel whose ID may not be told to a
-                // peer from every peer.
-                channels_it_lists(&db, is_swarm_peer)
-            };
-            tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
-            let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
-                cordelia_network::messages::SyncChannelListResponse { channel_ids },
-            );
-            let _ = cordelia_network::codec::write_frame(send, &resp).await;
-
-            // Now read the actual SyncRequest
-            match cordelia_network::codec::read_frame(
-                recv,
-                cordelia_network::messages::Protocol::ItemSync,
-            )
-            .await
-            {
-                Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => r,
-                Ok(_) => return,
-                Err(_) => return, // Peer may close after Phase 0 (no channels to sync)
-            }
-        }
-        cordelia_network::messages::WireMessage::SyncRequest(r) => r,
-        _ => return,
-    };
-
-    // Batched sync loop (§4.5): serve multiple channels on one stream.
-    // After each SyncResponse + optional FetchResponse, read the next frame.
-    // SyncRequest -> continue loop. EOF/error -> break. Backward compatible:
-    // old clients close after one channel, server reads EOF, loop breaks.
+    // Each request on the stream in turn (§4.5): the channel list, a
+    // channel's headers, and a fetch of a channel's items. A frame longer
+    // than a small message is read only under a large permit (decision
+    // 2026-10-22 (memory), rule 2), which is held through the write of its
+    // answer and let go before the next frame is read: one for the stream
+    // at a time. A listed relay's frames are read at once (rule 7). Every
+    // answer is encoded and the message dropped before it is written (rule
+    // 4), so a peer that grants no credit cannot make the node hold the
+    // answer (a page of headers, or a fetch of up to a message of items)
+    // through the write.
     let mut channels_served: u32 = 0;
+    // The channel of the last SyncRequest that was served: a FetchRequest
+    // is for it, and is honoured only right after it, as it was when each
+    // fetch was read in the branch of its own.
+    let mut fetch_channel: Option<String> = None;
+    let mut first = true;
     loop {
-        // Don't serve local-scope channel items to non-swarm peers (§8.2.2),
-        // nor to any peer the items of a channel whose ID may not be told
-        // to one: the answer is that the channel holds nothing.
-        let answers = {
-            let db = match state.db.lock() {
-                Ok(db) => db,
-                Err(_) => break,
-            };
-            answers_for(&db, &current_req.channel_id, is_swarm_peer)
-        };
-        if !answers {
-            tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "rejecting sync for a channel that is not served to this peer");
-            let resp = cordelia_network::messages::WireMessage::SyncResponse(
-                cordelia_network::messages::SyncResponse {
-                    items: vec![],
-                    has_more: false,
-                    last_seq: None,
-                },
-            );
-            let _ = cordelia_network::codec::write_frame(send, &resp).await;
-            // Don't abort stream -- read next frame to continue batch
-            match cordelia_network::codec::read_frame(
-                recv,
-                cordelia_network::messages::Protocol::ItemSync,
-            )
-            .await
-            {
-                Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
-                    current_req = r;
-                    channels_served += 1;
-                    continue;
+        let (msg, permit) = match read_under_permit(recv, permits, address, listed).await {
+            Framed::Frame(bytes, permit) => {
+                match cordelia_network::codec::decode_message(
+                    cordelia_network::messages::Protocol::ItemSync,
+                    &bytes,
+                ) {
+                    Ok(msg) => (msg, permit),
+                    Err(e) => {
+                        tracing::debug!(peer = %peer_id, error = %e, "a frame on a sync stream that is no message");
+                        break;
+                    }
                 }
-                _ => break,
             }
-        }
-
-        // Build sync response headers
-        let (headers, has_more, last_seq) = {
-            let db = match state.db.lock() {
-                Ok(db) => db,
-                Err(_) => break,
-            };
-            let items = match current_req.after_seq {
-                Some(after) => cordelia_storage::items::query_sync_after(
-                    &db,
-                    &current_req.channel_id,
-                    i64::try_from(after).unwrap_or(i64::MAX),
-                    current_req.limit,
-                ),
-                None => cordelia_storage::items::query_sync(
-                    &db,
-                    &current_req.channel_id,
-                    current_req.since.as_deref(),
-                    current_req.limit,
-                ),
+            Framed::LargeLater => {
+                tracing::debug!(peer = %peer_id, "a sync frame over a small message, and no permit for now; refused");
+                refuse_large_later(send, recv);
+                break;
             }
-            .unwrap_or_default();
-            let has_more = items.len() as u32 >= current_req.limit;
-            // Arrival paging: tell the peer where this page ended. With no
-            // items, echo its cursor so it keeps its place.
-            let last_seq = current_req
-                .after_seq
-                .map(|after| items.last().map(|i| i.seq.max(0) as u64).unwrap_or(after));
-            let headers: Vec<cordelia_network::messages::ItemHeader> = items
-                .iter()
-                .map(|si| cordelia_network::messages::ItemHeader {
-                    item_id: si.item_id.clone(),
-                    channel_id: si.channel_id.clone(),
-                    item_type: si.item_type.clone(),
-                    content_hash: si.content_hash.clone(),
-                    author_id: si.author_id.clone(),
-                    signature: si.signature.clone(),
-                    key_version: si.key_version as u32,
-                    published_at: si.published_at.clone(),
-                    is_tombstone: si.is_tombstone,
-                    parent_id: si.parent_id.clone(),
-                    slot: si.slot.clone(),
-                    rev: si.rev,
-                })
-                .collect();
-            (headers, has_more, last_seq)
+            Framed::Ended => break,
         };
-
-        let resp = cordelia_network::messages::WireMessage::SyncResponse(
-            cordelia_network::messages::SyncResponse {
-                items: headers,
-                has_more,
-                last_seq,
-            },
-        );
-        let _ = cordelia_network::codec::write_frame(send, &resp).await;
-        channels_served += 1;
-        tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "served sync request");
-
-        // Read next frame: FetchRequest (for this channel), SyncRequest (next channel), or EOF
-        match cordelia_network::codec::read_frame(
-            recv,
-            cordelia_network::messages::Protocol::ItemSync,
-        )
-        .await
-        {
-            Ok(cordelia_network::messages::WireMessage::FetchRequest(mut freq)) => {
+        match msg {
+            // Phase 0 (§4.5): which channels the node holds, told only to
+            // its own relays or swarm; anyone else gets an empty list. Only
+            // as the first frame, as it was read only before the loop.
+            cordelia_network::messages::WireMessage::SyncChannelListRequest(_) if first => {
+                let channel_ids = if !(is_relay_peer || is_swarm_peer) {
+                    Vec::new()
+                } else {
+                    let db = match state.db.lock() {
+                        Ok(db) => db,
+                        Err(_) => break,
+                    };
+                    channels_it_lists(&db, is_swarm_peer)
+                };
+                tracing::debug!(peer = %peer_id, channels = channel_ids.len(), "served channel list request");
+                let resp = cordelia_network::messages::WireMessage::SyncChannelListResponse(
+                    cordelia_network::messages::SyncChannelListResponse { channel_ids },
+                );
+                write_sync_answer(send, resp).await;
+            }
+            cordelia_network::messages::WireMessage::SyncRequest(current_req) => {
+                fetch_channel = None;
+                // Don't serve local-scope channel items to non-swarm peers
+                // (§8.2.2), nor to any peer the items of a channel whose ID
+                // may not be told to one: the answer is that it holds
+                // nothing.
+                let answers = {
+                    let db = match state.db.lock() {
+                        Ok(db) => db,
+                        Err(_) => break,
+                    };
+                    answers_for(&db, &current_req.channel_id, is_swarm_peer)
+                };
+                if !answers {
+                    tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "rejecting sync for a channel that is not served to this peer");
+                    let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                        cordelia_network::messages::SyncResponse {
+                            items: vec![],
+                            has_more: false,
+                            last_seq: None,
+                        },
+                    );
+                    write_sync_answer(send, resp).await;
+                    channels_served += 1;
+                } else {
+                    let (headers, has_more, last_seq) = {
+                        let db = match state.db.lock() {
+                            Ok(db) => db,
+                            Err(_) => break,
+                        };
+                        let items = match current_req.after_seq {
+                            Some(after) => cordelia_storage::items::query_sync_after(
+                                &db,
+                                &current_req.channel_id,
+                                i64::try_from(after).unwrap_or(i64::MAX),
+                                current_req.limit,
+                            ),
+                            None => cordelia_storage::items::query_sync(
+                                &db,
+                                &current_req.channel_id,
+                                current_req.since.as_deref(),
+                                current_req.limit,
+                            ),
+                        }
+                        .unwrap_or_default();
+                        let has_more = items.len() as u32 >= current_req.limit;
+                        // Arrival paging: tell the peer where this page
+                        // ended. With no items, echo its cursor so it keeps
+                        // its place.
+                        let last_seq = current_req.after_seq.map(|after| {
+                            items.last().map(|i| i.seq.max(0) as u64).unwrap_or(after)
+                        });
+                        let headers: Vec<cordelia_network::messages::ItemHeader> = items
+                            .iter()
+                            .map(|si| cordelia_network::messages::ItemHeader {
+                                item_id: si.item_id.clone(),
+                                channel_id: si.channel_id.clone(),
+                                item_type: si.item_type.clone(),
+                                content_hash: si.content_hash.clone(),
+                                author_id: si.author_id.clone(),
+                                signature: si.signature.clone(),
+                                key_version: si.key_version as u32,
+                                published_at: si.published_at.clone(),
+                                is_tombstone: si.is_tombstone,
+                                parent_id: si.parent_id.clone(),
+                                slot: si.slot.clone(),
+                                rev: si.rev,
+                            })
+                            .collect();
+                        (headers, has_more, last_seq)
+                    };
+                    let resp = cordelia_network::messages::WireMessage::SyncResponse(
+                        cordelia_network::messages::SyncResponse {
+                            items: headers,
+                            has_more,
+                            last_seq,
+                        },
+                    );
+                    write_sync_answer(send, resp).await;
+                    channels_served += 1;
+                    tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, "served sync request");
+                    // A fetch may follow, for this channel.
+                    fetch_channel = Some(current_req.channel_id);
+                }
+            }
+            cordelia_network::messages::WireMessage::FetchRequest(mut freq) => {
+                // A fetch is honoured only right after the channel it is
+                // for was served.
+                let Some(channel) = fetch_channel.take() else {
+                    break;
+                };
                 freq.item_ids
                     .truncate(cordelia_core::protocol::MAX_BATCH_SIZE);
                 let fetch_items = {
@@ -5552,78 +5770,66 @@ async fn handle_inbound_sync<W, R>(
                     // one, end the stream now: the peer learns at once, and
                     // asks for fewer. (Reading them all first, only to find
                     // that they cannot be sent, cost a megabyte a request.)
-                    let bytes = cordelia_storage::items::total_cost_by_ids(
-                        &db,
-                        &current_req.channel_id,
-                        &freq.item_ids,
-                    )
-                    .unwrap_or(0);
+                    let bytes =
+                        cordelia_storage::items::total_cost_by_ids(&db, &channel, &freq.item_ids)
+                            .unwrap_or(0);
                     let room = u64::from(cordelia_core::protocol::MAX_MESSAGE_BYTES);
                     if bytes > room {
-                        tracing::debug!(peer = %peer_id, channel = %current_req.channel_id, asked = freq.item_ids.len(), bytes, "fetch does not fit in one message; ending the stream");
+                        tracing::debug!(peer = %peer_id, channel = %channel, asked = freq.item_ids.len(), bytes, "fetch does not fit in one message; ending the stream");
                         break;
                     }
-                    cordelia_storage::items::get_items_by_ids(
-                        &db,
-                        &current_req.channel_id,
-                        &freq.item_ids,
-                    )
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|si| cordelia_network::messages::Item {
-                        item_id: si.item_id,
-                        channel_id: si.channel_id,
-                        item_type: si.item_type,
-                        content_length: si.encrypted_blob.len() as u32,
-                        encrypted_blob: si.encrypted_blob,
-                        content_hash: si.content_hash,
-                        author_id: si.author_id,
-                        signature: si.signature,
-                        key_version: si.key_version as u32,
-                        published_at: si.published_at,
-                        is_tombstone: si.is_tombstone,
-                        parent_id: si.parent_id,
-                        slot: si.slot,
-                        rev: si.rev,
-                    })
-                    .collect::<Vec<_>>()
+                    cordelia_storage::items::get_items_by_ids(&db, &channel, &freq.item_ids)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|si| cordelia_network::messages::Item {
+                            item_id: si.item_id,
+                            channel_id: si.channel_id,
+                            item_type: si.item_type,
+                            content_length: si.encrypted_blob.len() as u32,
+                            encrypted_blob: si.encrypted_blob,
+                            content_hash: si.content_hash,
+                            author_id: si.author_id,
+                            signature: si.signature,
+                            key_version: si.key_version as u32,
+                            published_at: si.published_at,
+                            is_tombstone: si.is_tombstone,
+                            parent_id: si.parent_id,
+                            slot: si.slot,
+                            rev: si.rev,
+                        })
+                        .collect::<Vec<_>>()
                 };
-                // The request is answered, and is dropped here with all it
-                // holds, before anything is awaited: a peer would otherwise
-                // have a node keep it through the write of the answer and
-                // the read of the next request, up to STREAM_TIMEOUT each.
                 let fetched = freq.item_ids.len();
                 drop(freq);
                 let fresp = cordelia_network::messages::WireMessage::FetchResponse(
                     cordelia_network::messages::FetchResponse { items: fetch_items },
                 );
-                let _ = cordelia_network::codec::write_frame(send, &fresp).await;
-                drop(fresp);
+                write_sync_answer(send, fresp).await;
                 tracing::debug!(peer = %peer_id, fetched, "served fetch request");
-
-                // After fetch, read next frame for potential next channel
-                match cordelia_network::codec::read_frame(
-                    recv,
-                    cordelia_network::messages::Protocol::ItemSync,
-                )
-                .await
-                {
-                    Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
-                        current_req = r;
-                        continue;
-                    }
-                    _ => break, // EOF or unexpected -> done
-                }
             }
-            Ok(cordelia_network::messages::WireMessage::SyncRequest(r)) => {
-                // No fetch for previous channel, move to next
-                current_req = r;
-                continue;
-            }
-            _ => break, // EOF or unexpected -> done
+            _ => break,
         }
+        first = false;
+        // The permit for this frame is let go before the next is read: one
+        // for the stream at a time (rule 2).
+        drop(permit);
     }
     tracing::debug!(peer = %peer_id, channels_served, "inbound sync stream complete");
+}
+
+/// Write one answer of the older kind's sync stream, encoded and the
+/// message dropped before the write (decision 2026-10-22 (memory), rule
+/// 4): through the write, which a peer that grants no credit can make wait
+/// up to STREAM_TIMEOUT, the node holds the encoding alone, not the answer.
+async fn write_sync_answer<W>(send: &mut W, answer: cordelia_network::messages::WireMessage)
+where
+    W: tokio::io::AsyncWrite + Unpin + cordelia_network::codec::GiveUp,
+{
+    let written = cordelia_network::codec::encode_message(&answer);
+    drop(answer);
+    if let Ok(written) = written {
+        let _ = cordelia_network::codec::write_raw_frame(send, &written).await;
+    }
 }
 
 async fn handle_inbound_peer_share(
@@ -6312,16 +6518,18 @@ mod tests {
         fn framed(payload: &[u8]) -> Vec<u8> {
             [&(payload.len() as u32).to_be_bytes()[..], payload].concat()
         }
-        // What `read_push` makes of `bytes` from a peer that is `limited`.
+        // What `read_push` makes of `bytes` from a peer that is `limited`,
+        // with no large-permit budget (the bytes here are read whatever
+        // their size, as a listed relay's would be).
         async fn read(
             rates: &std::sync::Mutex<Rates>,
             limited: bool,
             bytes: Vec<u8>,
-        ) -> Result<PushPayload, Option<OverLimit>> {
+        ) -> PushRead<'static> {
             let peer = NodeId([9; 32]);
             let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
             let mut cursor = std::io::Cursor::new(bytes);
-            read_push(&mut cursor, &peer, rates, limited, address).await
+            read_push(&mut cursor, &peer, rates, limited, address, None, false).await
         }
 
         // Frames of 900,000 bytes that are no message: two are within the
@@ -6333,12 +6541,12 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(
                 read(&rates, true, garbage.clone()).await,
-                Err(None)
+                PushRead::Ended
             ));
         }
         assert!(matches!(
             read(&rates, true, garbage.clone()).await,
-            Err(Some(_))
+            PushRead::Over(_)
         ));
 
         // A message of the stream that is not a push counts the same.
@@ -6346,7 +6554,7 @@ mod tests {
         let rates = std::sync::Mutex::new(Rates::default());
         let mut over = None;
         for tries in 1..=2_100 {
-            if let Err(Some(breach)) = read(&rates, true, ack.clone()).await {
+            if let PushRead::Over(breach) = read(&rates, true, ack.clone()).await {
                 over = Some((tries, breach));
                 break;
             }
@@ -6362,7 +6570,7 @@ mod tests {
         for _ in 0..4 {
             assert!(matches!(
                 read(&rates, false, garbage.clone()).await,
-                Err(None)
+                PushRead::Ended
             ));
         }
 
@@ -6372,9 +6580,15 @@ mod tests {
         );
         let rates = std::sync::Mutex::new(Rates::default());
         for _ in 0..2 {
-            assert!(read(&rates, true, garbage.clone()).await.is_err());
+            assert!(!matches!(
+                read(&rates, true, garbage.clone()).await,
+                PushRead::Payload(..)
+            ));
         }
-        assert!(read(&rates, true, push).await.is_ok());
+        assert!(matches!(
+            read(&rates, true, push).await,
+            PushRead::Payload(..)
+        ));
     }
 
     /// A relay passes items on to a peer in pushes of at most
@@ -6484,7 +6698,21 @@ mod tests {
         .unwrap();
         assert!(large.len() > 900_000, "{}", large.len());
 
-        let node = handle_inbound_sync(&mut node_w, &mut node_r, &peer, &state, true, false);
+        // No large-permit budget here: this test is of what the node
+        // holds across a wait, not of the permits. The large fetch is read
+        // as a listed relay's would be.
+        let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let node = handle_inbound_sync(
+            &mut node_w,
+            &mut node_r,
+            &peer,
+            &state,
+            true,
+            false,
+            None,
+            address,
+            false,
+        );
         tokio::pin!(node);
         let client = async {
             // A channel and a small fetch first: whatever the node keeps
@@ -6730,6 +6958,431 @@ mod tests {
         assert!(
             held <= -let_go + 4 * 1024,
             "the relay holds {held} bytes more at the last channel than at the first"
+        );
+    }
+
+    // ── The large permits (decision 2026-10-22 (memory), rule 2) ──────
+
+    /// A large permit is one for each /24 (or /48), not one for each
+    /// connection: a second address in a subnet that already holds one
+    /// waits, although permits are free, and takes it once the first is
+    /// let go.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_permit_is_one_for_each_subnet() {
+        use std::net::IpAddr;
+        let permits = LargePermits::new(cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE);
+        // One connection of a /24 takes a permit; three are still free.
+        let first = permits
+            .take(IpAddr::from([203, 0, 113, 1]))
+            .await
+            .expect("the first of a subnet takes a permit");
+        // A second address in the same /24 gets none, though permits are
+        // free: the subnet holds one already.
+        assert!(
+            permits.take(IpAddr::from([203, 0, 113, 9])).await.is_none(),
+            "two connections of one /24 held two permits"
+        );
+        // Once the first is let go, the subnet may take one again.
+        drop(first);
+        assert!(
+            permits.take(IpAddr::from([203, 0, 113, 9])).await.is_some(),
+            "the /24's permit was not free again once let go"
+        );
+    }
+
+    /// At most `LARGE_MESSAGES_AT_ONCE` are held across all connections,
+    /// and each is given back when it is dropped, whether the stream was
+    /// answered or failed.
+    #[tokio::test(start_paused = true)]
+    async fn large_permits_are_bounded_and_given_back() {
+        use std::net::IpAddr;
+        let budget = cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE;
+        let permits = LargePermits::new(budget);
+        // One subnet for each permit fills the budget.
+        let mut held: Vec<_> = (0..budget)
+            .map(|n| {
+                futures_lite_block(permits.take(IpAddr::from([10, n as u8, 0, 1])))
+                    .expect("within budget")
+            })
+            .collect();
+        // One subnet more gets none: the budget is spent.
+        assert!(
+            permits.take(IpAddr::from([10, 250, 0, 1])).await.is_none(),
+            "a permit was given past the budget of {budget}"
+        );
+        // Dropping one (as a failed stream does) gives it back.
+        held.pop();
+        assert!(
+            permits.take(IpAddr::from([10, 250, 0, 1])).await.is_some(),
+            "a permit was not given back when it was dropped"
+        );
+    }
+
+    /// Take a permit now, on this paused clock, without awaiting a timer:
+    /// used where the take must succeed at once.
+    fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
+        // The future resolves without yielding to a timer when a permit is
+        // free; a tiny executor turns it once.
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        loop {
+            if let std::task::Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+        }
+    }
+
+    /// A frame longer than a small message from an unlisted peer is not
+    /// read until a permit is free (decision 2026-10-22 (memory), rule 2):
+    /// the permit is taken before the payload is read or allocated, so
+    /// while none is free the node reads none of the body, and the peer,
+    /// which cannot push it all through the stream's window, waits. Once a
+    /// permit is free, the body is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_frame_from_an_unlisted_peer_is_not_read_without_a_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The only permit, held from another subnet.
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let held = permits
+            .take("203.0.113.1".parse().unwrap())
+            .await
+            .expect("the one permit");
+
+        // A pipe too small to hold the whole frame, so the peer's write
+        // cannot finish until the node reads the body.
+        let (mut peer_w, node_r) = tokio::io::duplex(64 * 1024);
+        let rates = std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+
+        let np = permits.clone();
+        let nr = rates.clone();
+        let node = tokio::spawn(async move {
+            let mut node_r = node_r;
+            // An unlisted peer (listed = false), with the budget full.
+            matches!(
+                read_push(
+                    &mut node_r,
+                    &NodeId([9; 32]),
+                    &nr,
+                    true,
+                    "198.51.100.1".parse().unwrap(),
+                    Some(&np),
+                    false,
+                )
+                .await,
+                PushRead::Ended | PushRead::Over(_)
+            )
+        });
+
+        // The peer writes a frame of 200,000 bytes: longer than a small
+        // message, no message of the stream.
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let wrote = done.clone();
+        let writer = tokio::spawn(async move {
+            use cordelia_network::codec::write_raw_frame;
+            let _ = write_raw_frame(&mut peer_w, &vec![0x5a; 200_000]).await;
+            wrote.store(true, Ordering::SeqCst);
+            // Keep the pipe open until the node is done.
+            peer_w
+        });
+
+        // While the permit is held, the body is not read: the peer cannot
+        // finish writing it through the window.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the body was read with no permit free"
+        );
+        // Letting the permit go lets the node read the body.
+        drop(held);
+        let read_body = tokio::time::timeout(std::time::Duration::from_secs(5), node)
+            .await
+            .expect("the node did not read the body once a permit was free")
+            .unwrap();
+        assert!(read_body, "the frame was read, but not as a push");
+        let _ = writer.await;
+    }
+
+    /// A relay listed by key is outside rule 2 (rule 7): its frame longer
+    /// than a small message is read at once, with every permit held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listed_relays_large_frame_is_read_with_every_permit_held() {
+        let permits = std::sync::Arc::new(LargePermits::new(1));
+        let _held = permits
+            .take("203.0.113.1".parse().unwrap())
+            .await
+            .expect("the one permit");
+        let (mut peer_w, node_r) = tokio::io::duplex(64 * 1024);
+        let rates = std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+        let np = permits.clone();
+        let nr = rates.clone();
+        let node = tokio::spawn(async move {
+            let mut node_r = node_r;
+            // Listed by key (rule 7): read at once.
+            read_push(
+                &mut node_r,
+                &NodeId([9; 32]),
+                &nr,
+                true,
+                "198.51.100.1".parse().unwrap(),
+                Some(&np),
+                true,
+            )
+            .await;
+        });
+        let writer = tokio::spawn(async move {
+            use cordelia_network::codec::write_raw_frame;
+            let _ = write_raw_frame(&mut peer_w, &vec![0x5a; 200_000]).await;
+            peer_w
+        });
+        // The node reads the frame although the only permit is held: it
+        // ends without waiting for one.
+        tokio::time::timeout(std::time::Duration::from_secs(5), node)
+            .await
+            .expect("a listed relay's large frame was not read with the permit held")
+            .unwrap();
+        let _ = writer.await;
+    }
+
+    /// A frame longer than a small message, for which no permit comes
+    /// within STREAM_TIMEOUT, is refused with ERR_LARGE_MESSAGE_LATER and
+    /// counts no breach (decision 2026-10-22 (memory), rule 2): the node
+    /// stops its receive side with 0x05, which the peer sees, and the
+    /// peer's push allowance is untouched. (This waits out the stream
+    /// timeout, about ten seconds.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_frame_with_no_permit_is_refused_later_and_counts_no_breach() {
+        use cordelia_network::codec::{write_protocol_byte, write_raw_frame};
+        use cordelia_network::messages::Protocol;
+        use cordelia_network::{connection, transport};
+
+        let id = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (node_id_key, client_key) = (id(1), id(2));
+        let node_end = transport::create_endpoint(&node_id_key, here).unwrap();
+        let node_addr = node_end.local_addr().unwrap();
+        let node_mgr = connection::ConnectionManager::new(
+            node_id_key.clone(),
+            node_end,
+            vec![],
+            vec!["relay".into()],
+            node_addr.port(),
+        );
+        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+
+        // Every permit held, from four other subnets.
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let mut _held = Vec::new();
+        for n in 0..cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE {
+            _held.push(
+                permits
+                    .take(std::net::IpAddr::from([10, n as u8, 0, 1]))
+                    .await
+                    .expect("budget"),
+            );
+        }
+
+        let state = a_state();
+        let rates = std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+        let peer = NodeId(client_key.public_key());
+        let address: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+
+        let serving = {
+            let (state, rates, permits, peer) =
+                (state.clone(), rates.clone(), permits.clone(), peer.clone());
+            tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                let conn = connection::inbound_accept(&as_node, incoming)
+                    .await
+                    .unwrap()
+                    .conn;
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let _ = cordelia_network::codec::read_protocol_byte(&mut recv)
+                    .await
+                    .unwrap();
+                let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+                let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+                let seen_table = std::sync::Arc::new(std::sync::RwLock::new(
+                    cordelia_network::seen_table::SeenTable::default(),
+                ));
+                let over = handle_inbound_push(
+                    &mut send,
+                    &mut recv,
+                    &peer,
+                    &state,
+                    "relay",
+                    &repush_tx,
+                    &delivery_tx,
+                    &seen_table,
+                    &rates,
+                    true,
+                    address,
+                    Some(&permits),
+                    false,
+                )
+                .await;
+                // Keep the connection alive so the reset reaches the peer
+                // before the connection closes.
+                (over, conn)
+            })
+        };
+
+        let mut client_mgr = connection::ConnectionManager::new(
+            client_key.clone(),
+            transport::create_endpoint(&client_key, here).unwrap(),
+            vec![],
+            vec![],
+            9474,
+        );
+        client_mgr.connect_to(node_addr).await.unwrap();
+        let conn = client_mgr
+            .get_connection(&NodeId(node_id_key.public_key()))
+            .unwrap()
+            .clone();
+        let (mut csend, mut crecv) = conn.open_bi().await.unwrap();
+        write_protocol_byte(&mut csend, Protocol::ItemPush)
+            .await
+            .unwrap();
+        // A frame of a megabyte: longer than a small message. It fits the
+        // stream's window, so the write finishes though the node reads
+        // none of the body.
+        let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
+        let _ = csend.finish();
+
+        // The node resets the send side with ERR_LARGE_MESSAGE_LATER
+        // (0x05), which the peer learns when it reads the stream.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crecv.read_to_end(1 << 20),
+        )
+        .await
+        .expect("the node never refused the frame");
+        match read {
+            Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => assert_eq!(
+                code,
+                quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER),
+                "the stream was reset with another code"
+            ),
+            other => panic!("the stream was not reset with ERR_LARGE_MESSAGE_LATER: {other:?}"),
+        }
+        // It was refused, not stored, and counts no breach.
+        let (over, _conn) = serving.await.unwrap();
+        assert!(over.is_none(), "a refused large frame counted a breach");
+        assert!(
+            !rates.lock().unwrap().is_counting(&peer),
+            "a refused large frame was counted against the peer's push allowance"
+        );
+    }
+
+    /// An answer of the older kind's sync stream is encoded and the
+    /// message dropped before the write (decision 2026-10-22 (memory),
+    /// rule 4): while the write waits for a peer that grants no credit, the
+    /// node holds the encoding alone, not the answer as a message beside
+    /// it. The node holds a megabyte of items; a fetch of them is answered
+    /// while the peer does not read.
+    #[tokio::test]
+    async fn an_older_kind_sync_answer_is_not_held_through_its_write() {
+        use crate::counting;
+        use cordelia_network::codec::{read_frame, write_raw_frame};
+        use cordelia_network::messages::{FetchRequest, Protocol, SyncRequest, WireMessage};
+
+        let state = a_state();
+        let channel = "grp_00000000-0000-4000-8000-00000000000f";
+        let ids: Vec<String> = (0..14u8).map(|n| format!("ci_{n:0>60}")).collect();
+        {
+            let db = state.db.lock().unwrap();
+            cordelia_storage::channels::ensure_group(&db, channel, None, "realtime", &[1u8; 32])
+                .unwrap();
+            for (n, id) in ids.iter().enumerate() {
+                let blob = vec![n as u8; 60_000];
+                let hash = {
+                    let mut h = vec![0xa1u8; 32];
+                    h[0] = n as u8;
+                    h
+                };
+                let item = cordelia_storage::items::NewItem::plain(
+                    id,
+                    channel,
+                    &[1u8; 32],
+                    "memory",
+                    "2026-10-22T00:00:00Z",
+                    1,
+                    &hash,
+                    &[0xa3u8; 64],
+                    &blob,
+                );
+                assert!(cordelia_storage::items::insert_item(&db, &item).unwrap());
+            }
+        }
+
+        // A pipe wide enough for the small headers, too small for the
+        // megabyte of items: the fetch answer's write blocks.
+        let (mut client_w, mut node_r) = tokio::io::duplex(64 * 1024);
+        let (mut node_w, mut client_r) = tokio::io::duplex(64 * 1024);
+        let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let peer = NodeId([7; 32]);
+        let node = handle_inbound_sync(
+            &mut node_w,
+            &mut node_r,
+            &peer,
+            &state,
+            true,
+            false,
+            None,
+            address,
+            false,
+        );
+        tokio::pin!(node);
+
+        let client = async {
+            let sync =
+                cordelia_network::codec::encode_message(&WireMessage::SyncRequest(SyncRequest {
+                    channel_id: channel.into(),
+                    since: None,
+                    limit: 100,
+                    after_seq: None,
+                }))
+                .unwrap();
+            let fetch =
+                cordelia_network::codec::encode_message(&WireMessage::FetchRequest(FetchRequest {
+                    item_ids: ids.clone(),
+                }))
+                .unwrap();
+            // The channel's headers first: read, so what the node keeps
+            // from then on is in the count it is measured from.
+            write_raw_frame(&mut client_w, &sync).await.unwrap();
+            let _ = read_frame(&mut client_r, Protocol::ItemSync).await.unwrap();
+            let before = counting::live();
+            // The fetch of a megabyte of items. The node builds the answer
+            // and begins to write it; the peer does not read, so the write
+            // waits.
+            write_raw_frame(&mut client_w, &fetch).await.unwrap();
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            counting::live() - before
+        };
+
+        let held = tokio::select! {
+            _ = &mut node => panic!("the node ended the stream"),
+            held = client => held,
+        };
+        println!("held while the fetch answer is written: {held} bytes");
+        // The encoded answer is about 840 KB. Holding the answer as a
+        // message beside its encoding would be about twice that.
+        assert!(
+            held < 1_300_000,
+            "the node holds {held} bytes: the answer is held as a message through its write"
+        );
+        assert!(
+            held > 600_000,
+            "the answer of a megabyte was not built: {held} bytes"
         );
     }
 
