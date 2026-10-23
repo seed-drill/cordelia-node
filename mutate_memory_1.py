@@ -115,6 +115,17 @@ MUTATIONS = [
      '                    !unlimited,\n                    address,\n                    Some(&large_permits),\n                    listed_by_key,',
      '                    !unlimited,\n                    address,\n                    Some(&large_permits),\n                    listed_by_key || own_relay,',
      [bin("p2p::tests::the_inbound_loop_takes_permits_and_exempts_only_listed_relays")]),
+    # The narrow second round. Finding 1: the live loop's Serving for the
+    # streams of entries carries the permits.
+    ("F5 the loop builds the entry Serving with no permits", P2P,
+     'permits: Some(&large_permits),',
+     'permits: None,',
+     [bin("p2p::tests::the_inbound_loop_takes_permits_on_the_streams_of_entries")]),
+    # Finding 2: the guard that leaves the queue when a take is cancelled.
+    ("F6 a cancelled waiter does not leave the queue", P2P,
+     'if self.granted {',
+     'if !self.granted {',
+     [bin("p2p::tests::a_cancelled_waiter_does_not_stall_the_queue")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
