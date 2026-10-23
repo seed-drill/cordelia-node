@@ -231,15 +231,32 @@ pub fn create_client_endpoint(
     identity: &NodeIdentity,
     bind_ip: std::net::IpAddr,
 ) -> Result<Endpoint, TransportError> {
-    let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))?;
+    let socket = dialling_socket(SocketAddr::new(bind_ip, 0))?;
     let mut endpoint = endpoint_on(socket, None)?;
     endpoint.set_default_client_config(client_config(identity)?);
     Ok(endpoint)
 }
 
+/// The socket of an endpoint that only dials, bound to `addr` as quinn's
+/// `Endpoint::client` binds it: on an IPv6 address it is made dual-stack
+/// where the system allows, so that it can dial IPv4 peers too, whatever
+/// the host's default (`net.ipv6.bindv6only`). Where the system does not
+/// allow it, it dials IPv6 alone, as quinn's did.
+fn dialling_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6()
+        && let Err(e) = socket.set_only_v6(false)
+    {
+        tracing::debug!(%e, "unable to make socket dual-stack");
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 /// A node's endpoint over `socket`, with the kernel's receive batching of
-/// UDP (GRO) turned off (decision 2026-10-22, rule 10;
-/// parameter-rationale.md §1).
+/// UDP (GRO) turned off (decision 2026-10-22, memory across connections,
+/// rule 10; parameter-rationale.md §1).
 ///
 /// With GRO on, the kernel hands the socket a batch of a peer's datagrams
 /// in one buffer, and quinn splits it into packets that share that
@@ -249,7 +266,9 @@ pub fn create_client_endpoint(
 ///
 /// quinn-udp turns GRO on when quinn wraps the socket, so it is turned
 /// off after the wrap, on the same socket (a second descriptor of it).
-/// Sending in batches (GSO) is kept.
+/// Sending in batches (GSO) is kept. A node never rebinds an endpoint; a
+/// rebind (`Endpoint::rebind`) would wrap a new socket and so turn GRO on
+/// again, and must go through `receive_batching_off` after its wrap too.
 fn endpoint_on(
     socket: std::net::UdpSocket,
     server: Option<ServerConfig>,
@@ -267,8 +286,9 @@ fn endpoint_on(
 /// Turn the kernel's receive batching of UDP off on `socket`.
 ///
 /// On Linux it is the socket option `UDP_GRO`. A kernel before 5.0 has no
-/// such option (`ENOPROTOOPT`), and so never batched: that is not an
-/// error. No other platform a node runs on batches what a socket
+/// such option (`ENOPROTOOPT`, or `EOPNOTSUPP` where a kernel or a sandbox
+/// says so; quinn-udp's own check takes both), and so never batched: that
+/// is not an error. No other platform a node runs on batches what a socket
 /// receives unless asked: macOS and the BSDs have no such option, and on
 /// Windows quinn-udp leaves receive coalescing (URO) off.
 #[cfg(target_os = "linux")]
@@ -290,7 +310,10 @@ fn receive_batching_off(socket: &std::net::UdpSocket) -> std::io::Result<()> {
         return Ok(());
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ENOPROTOOPT) {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+    ) {
         Ok(())
     } else {
         Err(err)
@@ -1042,13 +1065,19 @@ mod tests {
         };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
-            assert_eq!(err.raw_os_error(), Some(libc::ENOPROTOOPT), "{err}");
+            assert!(
+                matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+                ),
+                "{err}"
+            );
             return None;
         }
         Some(value)
     }
 
-    /// Decision 2026-10-22, rule 10. A node's socket takes no batches of
+    /// Decision 2026-10-22, memory across connections, rule 10. A node's socket takes no batches of
     /// datagrams: `UDP_GRO` reads as off on the socket of an endpoint as
     /// `create_endpoint` and `create_client_endpoint` make it. An endpoint
     /// that quinn makes by itself has it on, so the option is read from
@@ -1109,6 +1138,30 @@ mod tests {
         assert_eq!(back, sent);
         conn.close(0u32.into(), b"done");
         let _ = accepting.await;
+    }
+
+    /// An endpoint that only dials, bound to an IPv6 address, is
+    /// dual-stack, as quinn's `Endpoint::client` made it; on an IPv4
+    /// address it is IPv4 alone. Where the system has no IPv6, there is
+    /// nothing to check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dialling_socket_on_ipv6_is_dual_stack() {
+        let v4 = dialling_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(v4.local_addr().unwrap().is_ipv4());
+        let v6 = match dialling_socket("[::]:0".parse().unwrap()) {
+            Ok(socket) => socket,
+            Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                eprintln!("no IPv6 on this system: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let v6 = socket2::Socket::from(v6);
+        assert!(
+            !v6.only_v6().unwrap(),
+            "an IPv6 dialling socket is IPv6 alone"
+        );
     }
 
     #[test]
