@@ -269,8 +269,9 @@ fn endpoint_on(
 /// Turn the kernel's receive batching of UDP off on `socket`.
 ///
 /// On Linux it is the socket option `UDP_GRO`. A kernel before 5.0 has no
-/// such option (`ENOPROTOOPT`), and so never batched: that is not an
-/// error. No other platform a node runs on batches what a socket
+/// such option (`ENOPROTOOPT`, or `EOPNOTSUPP` where a kernel or a sandbox
+/// says so; quinn-udp's own check takes both), and so never batched: that
+/// is not an error. No other platform a node runs on batches what a socket
 /// receives unless asked: macOS and the BSDs have no such option, and on
 /// Windows quinn-udp leaves receive coalescing (URO) off.
 #[cfg(target_os = "linux")]
@@ -292,7 +293,10 @@ fn receive_batching_off(socket: &std::net::UdpSocket) -> std::io::Result<()> {
         return Ok(());
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ENOPROTOOPT) {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+    ) {
         Ok(())
     } else {
         Err(err)
@@ -1044,7 +1048,13 @@ mod tests {
         };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
-            assert_eq!(err.raw_os_error(), Some(libc::ENOPROTOOPT), "{err}");
+            assert!(
+                matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+                ),
+                "{err}"
+            );
             return None;
         }
         Some(value)
