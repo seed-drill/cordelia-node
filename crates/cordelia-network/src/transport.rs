@@ -218,9 +218,8 @@ pub fn create_endpoint(
     identity: &NodeIdentity,
     bind_addr: SocketAddr,
 ) -> Result<Endpoint, TransportError> {
-    let sc = server_config(identity)?;
-    let mut endpoint =
-        Endpoint::server(sc, bind_addr).map_err(|e| TransportError::Quic(e.to_string()))?;
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    let mut endpoint = endpoint_on(socket, Some(server_config(identity)?))?;
     endpoint.set_default_client_config(client_config(identity)?);
     Ok(endpoint)
 }
@@ -232,10 +231,98 @@ pub fn create_client_endpoint(
     identity: &NodeIdentity,
     bind_ip: std::net::IpAddr,
 ) -> Result<Endpoint, TransportError> {
-    let mut endpoint = Endpoint::client(SocketAddr::new(bind_ip, 0))
-        .map_err(|e| TransportError::Quic(e.to_string()))?;
+    let socket = dialling_socket(SocketAddr::new(bind_ip, 0))?;
+    let mut endpoint = endpoint_on(socket, None)?;
     endpoint.set_default_client_config(client_config(identity)?);
     Ok(endpoint)
+}
+
+/// The socket of an endpoint that only dials, bound to `addr` as quinn's
+/// `Endpoint::client` binds it: on an IPv6 address it is made dual-stack
+/// where the system allows, so that it can dial IPv4 peers too, whatever
+/// the host's default (`net.ipv6.bindv6only`). Where the system does not
+/// allow it, it dials IPv6 alone, as quinn's did.
+fn dialling_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6()
+        && let Err(e) = socket.set_only_v6(false)
+    {
+        tracing::debug!(%e, "unable to make socket dual-stack");
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// A node's endpoint over `socket`, with the kernel's receive batching of
+/// UDP (GRO) turned off (decision 2026-10-22, memory across connections,
+/// rule 10; parameter-rationale.md §1).
+///
+/// With GRO on, the kernel hands the socket a batch of a peer's datagrams
+/// in one buffer, and quinn splits it into packets that share that
+/// buffer: a stream frame of one byte that the node has not read keeps
+/// the whole batch, up to about 64 KiB, where quinn's reassembler counts
+/// one packet. With it off, each frame keeps its own datagram only.
+///
+/// quinn-udp turns GRO on when quinn wraps the socket, so it is turned
+/// off after the wrap, on the same socket (a second descriptor of it).
+/// Sending in batches (GSO) is kept. A node never rebinds an endpoint; a
+/// rebind (`Endpoint::rebind`) would wrap a new socket and so turn GRO on
+/// again, and must go through `receive_batching_off` after its wrap too.
+fn endpoint_on(
+    socket: std::net::UdpSocket,
+    server: Option<ServerConfig>,
+) -> Result<Endpoint, TransportError> {
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| TransportError::Quic("no async runtime found".into()))?;
+    let same_socket = socket.try_clone()?;
+    let wrapped = runtime.wrap_udp_socket(socket)?;
+    receive_batching_off(&same_socket)?;
+    drop(same_socket);
+    Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), server, wrapped, runtime)
+        .map_err(|e| TransportError::Quic(e.to_string()))
+}
+
+/// Turn the kernel's receive batching of UDP off on `socket`.
+///
+/// On Linux it is the socket option `UDP_GRO`. A kernel before 5.0 has no
+/// such option (`ENOPROTOOPT`, or `EOPNOTSUPP` where a kernel or a sandbox
+/// says so; quinn-udp's own check takes both), and so never batched: that
+/// is not an error. No other platform a node runs on batches what a socket
+/// receives unless asked: macOS and the BSDs have no such option, and on
+/// Windows quinn-udp leaves receive coalescing (URO) off.
+#[cfg(target_os = "linux")]
+fn receive_batching_off(socket: &std::net::UdpSocket) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let off: libc::c_int = 0;
+    // SAFETY: the descriptor is open for the call (`socket` is borrowed),
+    // and the value is a c_int, of the length given.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            (&off as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+    ) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn receive_batching_off(_socket: &std::net::UdpSocket) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Object identifier of Ed25519 keys (RFC 8410).
@@ -922,6 +1009,159 @@ mod tests {
         );
         client.close(0u32.into(), b"done");
         serving.abort();
+    }
+
+    /// The value of `UDP_GRO` on this process's UDP socket bound to
+    /// `addr`, found among its descriptors by the address it is bound to:
+    /// an endpoint does not show its socket. None if the kernel has no such
+    /// option.
+    #[cfg(target_os = "linux")]
+    fn receive_batching_at(addr: SocketAddr) -> Option<libc::c_int> {
+        use std::os::fd::RawFd;
+        let SocketAddr::V4(addr) = addr else {
+            panic!("an IPv4 address is looked for")
+        };
+        let bound_to = |fd: RawFd| {
+            // SAFETY: a sockaddr_in of the length given; getsockname
+            // fails on a descriptor that is not a socket.
+            let mut at: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockname(fd, (&mut at as *mut libc::sockaddr_in).cast(), &mut len)
+            };
+            let mut kind: libc::c_int = 0;
+            let mut kind_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: as above, a c_int of the length given.
+            let typed = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut kind as *mut libc::c_int).cast(),
+                    &mut kind_len,
+                )
+            };
+            rc == 0
+                && typed == 0
+                && kind == libc::SOCK_DGRAM
+                && at.sin_family == libc::AF_INET as libc::sa_family_t
+                && u16::from_be(at.sin_port) == addr.port()
+                && u32::from_be(at.sin_addr.s_addr) == u32::from(*addr.ip())
+        };
+        let fd = (0..65536)
+            .find(|&fd| bound_to(fd))
+            .unwrap_or_else(|| panic!("no UDP socket of this process is bound to {addr}"));
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            assert!(
+                matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+                ),
+                "{err}"
+            );
+            return None;
+        }
+        Some(value)
+    }
+
+    /// Decision 2026-10-22, memory across connections, rule 10. A node's socket takes no batches of
+    /// datagrams: `UDP_GRO` reads as off on the socket of an endpoint as
+    /// `create_endpoint` and `create_client_endpoint` make it. An endpoint
+    /// that quinn makes by itself has it on, so the option is read from
+    /// the right socket, and it is turned off after quinn wraps the
+    /// socket, not before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_nodes_socket_takes_no_batches_of_datagrams() {
+        let id = NodeIdentity::generate().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let by_quinn = Endpoint::server(server_config(&id).unwrap(), loopback).unwrap();
+        let Some(on) = receive_batching_at(by_quinn.local_addr().unwrap()) else {
+            // A kernel before 5.0 has no UDP_GRO, and never batches.
+            return;
+        };
+        assert_eq!(
+            on, 1,
+            "quinn did not turn UDP_GRO on, so this reads nothing"
+        );
+
+        let node = create_endpoint(&id, loopback).unwrap();
+        assert_eq!(
+            receive_batching_at(node.local_addr().unwrap()),
+            Some(0),
+            "a node's endpoint takes datagrams in batches"
+        );
+
+        let dialler = create_client_endpoint(&id, "127.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(
+            receive_batching_at(dialler.local_addr().unwrap()),
+            Some(0),
+            "a node's endpoint that only dials takes datagrams in batches"
+        );
+
+        // And each still connects and carries a stream both ways.
+        let accepting = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let conn = node.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let got = recv.read_to_end(1 << 20).await.unwrap();
+                send.write_all(&got).await.unwrap();
+                send.finish().unwrap();
+                conn.closed().await;
+            })
+        };
+        let conn = dialler
+            .connect(node.local_addr().unwrap(), "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let sent = vec![7u8; 256 * 1024];
+        send.write_all(&sent).await.unwrap();
+        send.finish().unwrap();
+        let back = recv.read_to_end(1 << 20).await.unwrap();
+        assert_eq!(back, sent);
+        conn.close(0u32.into(), b"done");
+        let _ = accepting.await;
+    }
+
+    /// An endpoint that only dials, bound to an IPv6 address, is
+    /// dual-stack, as quinn's `Endpoint::client` made it; on an IPv4
+    /// address it is IPv4 alone. Where the system has no IPv6, there is
+    /// nothing to check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dialling_socket_on_ipv6_is_dual_stack() {
+        let v4 = dialling_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(v4.local_addr().unwrap().is_ipv4());
+        let v6 = match dialling_socket("[::]:0".parse().unwrap()) {
+            Ok(socket) => socket,
+            Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                eprintln!("no IPv6 on this system: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let v6 = socket2::Socket::from(v6);
+        assert!(
+            !v6.only_v6().unwrap(),
+            "an IPv6 dialling socket is IPv6 alone"
+        );
     }
 
     #[test]

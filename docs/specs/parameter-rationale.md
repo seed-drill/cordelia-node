@@ -146,7 +146,7 @@ is not every buffer.
 | Part | At most |
 |------|---------|
 | Receive windows: what the peer sent and the node has not read (`stream_receive_window` lies within `receive_window`) | 2 MiB |
-| Quinn's reassembly beyond them: a stream's received buffers are compacted only once they exceed what is buffered by max(32 KiB, 1.5 x it), so 2.5 x 2 MiB and 32 KiB on each of 64 streams, less the 2 MiB above. Read from quinn-proto 0.11's source (`assembler.rs`), not measured; only a peer that sends tiny frames comes near it | 5 MiB |
+| Quinn's reassembly beyond them: a stream's received buffers are compacted only once they exceed what is buffered by max(32 KiB, 1.5 x it), so 2.5 x 2 MiB and 32 KiB on each of 64 streams, less the 2 MiB above. Read from quinn-proto 0.11's source (`assembler.rs`), not measured; only a peer that sends tiny frames comes near it. It holds because a node's socket takes no batches of datagrams (below) | 5 MiB |
 | Send window: what the node wrote and the peer has not acknowledged (`QUIC_SEND_WINDOW`) | 2 MiB |
 | Datagrams: none, since `datagram_receive_buffer_size` is off and a peer is told it may send none (quinn's default kept 1.25 MB of them unread) | 0 |
 | The frame of the request being read and answered (`read_frame`, `read_raw_frame`: up to MAX_MESSAGE_BYTES), dropped before the answer is written | 1 MiB |
@@ -166,6 +166,34 @@ was read by its stream, the same count was about 101 MiB a connection:
 the send window at quinn's default (9.5 MiB), 1.2 MiB of datagrams, and a
 request read through the enum of every message at up to 80 MiB at its
 peak and 32 MiB held (below).
+
+**A batch of datagrams, and why GRO is off.** The reassembly row counts
+each stream frame at the packet it came in, and so it holds only while a
+packet keeps nothing more than itself. With the kernel's receive batching
+of UDP (`UDP_GRO`) on, which quinn-udp turns on when quinn wraps a
+socket, the kernel hands the socket up to 64 of a peer's datagrams in
+one buffer, and quinn splits it into packets that share that buffer
+(quinn 0.11's `endpoint.rs`, `split_to(meta.stride)`). A frame of one
+byte on a stream the node is not reading then keeps the whole batch,
+about 64 KiB, where the reassembler counts about 1.4 KiB, and it
+compacts only once what it counts passes 32 KiB on that stream: up to
+about 2 MiB on each such stream. Measured on loopback, with the windows
+of this table and 64 streams, and a peer whose quinn sends in batches
+of 44 datagrams (GSO), one such connection took a node's live heap to
+82,467 KiB with the option on, and 2,262 KiB with it off. A peer on a
+stock quinn, which sends at most 10 datagrams a batch, showed no
+consistent gap between the two. So a
+node turns `UDP_GRO` off on its socket, after quinn wraps it, since the
+wrap turns it on (`endpoint_on` in `transport.rs`; decision 2026-10-22,
+memory across connections, rule 10). Each frame then keeps its own datagram, at most 1,472 bytes.
+Sending in batches (GSO) is kept. **Its cost:** the kernel hands the
+socket each datagram apart (still up to 32 at a call); measured on
+loopback, about 2.3 times the CPU for each byte received in bulk (325 MiB
+for each CPU-second, where it was 733), and nothing that can be seen at
+a node's pace, at most PUSH_BYTES_PER_PEER_PER_MINUTE a connection. **Elsewhere:** on Linux a
+kernel without the option (before 5.0) never batched; macOS and the BSDs
+have no such option and hand a socket one datagram at a time; on Windows
+quinn-udp leaves receive coalescing off.
 
 The parts of a request and its answer are held together without a wait
 on the peer: once the request is read, it is decoded and answered before
