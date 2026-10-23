@@ -494,6 +494,36 @@ impl LargePermits {
             p.waiting.push_back((ticket, subnet.clone()));
             ticket
         };
+        // Leave the queue if this future is dropped before the ticket is
+        // granted (decision 2026-10-22 (memory), rule 2). A `take` can be
+        // cancelled by an outer `timeout`, a `select!`, a task abort or a
+        // runtime shutdown; without this, the ticket would stay, and
+        // `may_grant` would hold every later waiter back for good even with
+        // permits free. The guard also serves the plain timeout below, in
+        // place of the cleanup that path once did on its own.
+        struct Leave<'a> {
+            permits: &'a LargePermits,
+            ticket: u64,
+            granted: bool,
+        }
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                if self.granted {
+                    return;
+                }
+                {
+                    let mut p = self.permits.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    p.drop_waiter(self.ticket);
+                }
+                // Let a waiter this one was holding back re-check.
+                self.permits.freed.notify_waiters();
+            }
+        }
+        let mut leave = Leave {
+            permits: self,
+            ticket,
+            granted: false,
+        };
         let wait = tokio::time::timeout(cordelia_network::codec::STREAM_TIMEOUT, async {
             loop {
                 // Register for a wake before the state is read, so a
@@ -520,20 +550,18 @@ impl LargePermits {
         })
         .await;
         match wait {
-            Ok(()) => Some(LargePermit {
-                permits: self,
-                subnet,
-            }),
-            Err(_) => {
-                // Timed out: leave the queue, and let a waiter whom this
-                // one was holding back re-check.
-                {
-                    let mut p = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    p.drop_waiter(ticket);
-                }
-                self.freed.notify_waiters();
-                None
+            Ok(()) => {
+                // Granted: the grant already took the ticket out of the
+                // queue, so the guard must leave it alone.
+                leave.granted = true;
+                Some(LargePermit {
+                    permits: self,
+                    subnet,
+                })
             }
+            // Timed out: the guard leaves the queue and wakes a waiter this
+            // one was holding back.
+            Err(_) => None,
         }
     }
 }
