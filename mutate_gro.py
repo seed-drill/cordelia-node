@@ -36,7 +36,7 @@ MUTATIONS = [
 ''',
      [GRO_TEST]),
     ("G3 an endpoint that only dials is made by quinn alone, with GRO on", TRANSPORT,
-     '''    let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))?;
+     '''    let socket = dialling_socket(SocketAddr::new(bind_ip, 0))?;
     let mut endpoint = endpoint_on(socket, None)?;
 ''',
      '''    let mut endpoint = Endpoint::client(SocketAddr::new(bind_ip, 0))?;
