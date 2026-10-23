@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mutation checks for slice 4 of change F, windows and streams: QUIC's
-windows and stream count set from a small message, the push retries
+windows and stream count set from a small message, each stream's window
+an eighth of the connection's, the push retries
 bounded, and today's windows and streams kept between relays listed by
 key (decision 2026-10-22, memory across connections, rules 8, 9, 11 and
 12, section 9 item 4), with test 8's check of rule 10 by memory. A part
@@ -36,14 +37,17 @@ LISTED_CONFIGS = net("a_relay_listed_by_key_has_the_windows_and_streams_of_befor
 # then fail). The text to take out must occur exactly once in the file.
 # Two edits in one part: give two lists of the same length.
 MUTATIONS = [
-    ("W1 a stream's receive window is a message, not a small one", PROTOCOL,
-     '''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = SMALL_MESSAGE_BYTES;''',
-     '''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;''',
-     [core("the_receive_windows_are_one_small_message_and_two"), SET_FROM_SMALL]),
+    ("W1 a stream's receive window is a small message, as the connection's half", PROTOCOL,
+     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = QUIC_RECEIVE_WINDOW / QUIC_MAX_BIDI_STREAMS;''',
+      '''    QUIC_STREAM_RECEIVE_WINDOW as u64 * QUIC_MAX_BIDI_STREAMS as u64 <= QUIC_RECEIVE_WINDOW as u64'''],
+     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = SMALL_MESSAGE_BYTES;''',
+      '''    true'''],
+     [core("the_receive_windows_hold_every_stream_within_two_small_messages"), SET_FROM_SMALL,
+      node("a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other")]),
     ("W2 a connection's receive window is two messages", PROTOCOL,
      '''pub const QUIC_RECEIVE_WINDOW: u32 = 2 * SMALL_MESSAGE_BYTES;''',
      '''pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;''',
-     [core("the_receive_windows_are_one_small_message_and_two"), SET_FROM_SMALL]),
+     [core("the_receive_windows_hold_every_stream_within_two_small_messages"), SET_FROM_SMALL]),
     ("W3 the send window is two messages", PROTOCOL,
      '''pub const QUIC_SEND_WINDOW: u64 = 2 * SMALL_MESSAGE_BYTES as u64;''',
      '''pub const QUIC_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;''',
