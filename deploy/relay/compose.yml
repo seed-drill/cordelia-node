@@ -40,6 +40,9 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # 512 MiB holds 197 connections at worst on one core, just under the
+    # bound of 200; 1 GiB holds the bound. To give it 1 GiB, use an override
+    # file: deploy/relay/README.md, section 3.
     mem_limit: 512m
     pids_limit: 512
     healthcheck:
