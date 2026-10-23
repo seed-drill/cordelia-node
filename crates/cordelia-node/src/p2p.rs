@@ -7167,33 +7167,50 @@ mod tests {
         assert!(!crx.await.unwrap(), "a later asker took the permit");
     }
 
-    /// A holder that lets go and asks again does not jump a waiter that
-    /// asked earlier (decision 2026-10-22 (memory), rule 2): its new ask
-    /// joins the back of the queue, so the older waiter is served.
+    /// A holder that lets go and at once asks again does not starve a
+    /// waiter that asked earlier (decision 2026-10-22 (memory), rule 2):
+    /// its new ask joins the back of the queue. The holder retakes in a
+    /// tight loop that never yields to the waiter of its own accord, so
+    /// without the queue it would take a free permit on the spot every
+    /// time, before the woken waiter runs, and starve it. With the queue
+    /// its first re-take must wait behind the waiter, which then runs and
+    /// is served.
     #[tokio::test(start_paused = true)]
-    async fn a_holder_that_retakes_does_not_jump_a_waiter() {
+    async fn a_holder_that_retakes_does_not_starve_a_waiter() {
         use std::net::IpAddr;
         let permits = std::sync::Arc::new(LargePermits::new(1));
-        let held = permits
-            .take("10.0.0.1".parse::<IpAddr>().unwrap())
-            .await
-            .expect("the one permit");
-        let (btx, brx) = tokio::sync::oneshot::channel();
-        let _b = asks_and_holds(permits.clone(), "198.51.100.1", btx);
+        let mut held = Some(
+            permits
+                .take("10.0.0.1".parse::<IpAddr>().unwrap())
+                .await
+                .expect("the one permit"),
+        );
+        // The waiter asks from a subnet of its own and signals when served.
+        let (served_tx, mut served_rx) = tokio::sync::oneshot::channel();
+        let pw = permits.clone();
+        let waiter = tokio::spawn(async move {
+            let got = pw.take("198.51.100.1".parse().unwrap()).await;
+            let _ = served_tx.send(got.is_some());
+        });
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        // The holder lets go and at once asks again, from its own subnet.
-        drop(held);
-        let (atx, arx) = tokio::sync::oneshot::channel();
-        let _a = asks_and_holds(permits.clone(), "10.0.0.1", atx);
-        // The waiter that asked earlier is served; the retake waits behind
-        // it and times out.
-        assert!(
-            brx.await.unwrap(),
-            "the waiter was starved by a retaking holder"
+        // The holder retakes in a tight loop, never yielding to the waiter
+        // on its own.
+        for _ in 0..10 {
+            drop(held.take());
+            held = permits.take("10.0.0.1".parse().unwrap()).await;
+            if held.is_none() {
+                break;
+            }
+        }
+        drop(held.take());
+        assert_eq!(
+            served_rx.try_recv(),
+            Ok(true),
+            "a retaking holder starved the waiter that asked first"
         );
-        assert!(!arx.await.unwrap(), "the retaking holder jumped the waiter");
+        let _ = waiter.await;
     }
 
     /// A frame longer than a small message from an unlisted peer is not
