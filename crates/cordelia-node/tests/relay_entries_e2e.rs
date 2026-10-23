@@ -1375,18 +1375,18 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
     assert_eq!(holds(&relay).0, 35 * LARGEST + SMALL);
 
     // The first connection proves the channel and pulls it. It is handed
-    // whole pages while its allowance has room for the most a page can
-    // be counted at, then as many entries as fit beside the room that a
+    // small pages, one entry of the largest size each (decision
+    // 2026-10-22 (memory), rule 3), as many as fit beside the room that a
     // pull leaves for the answer to a show: 30 in all.
     assert!(client.prove(1).await);
     let (mut mark, mut after) = (NO_MARK, 0);
     let mut handed = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..30 {
         let page = client.pull(1, mark, after).await;
         handed.push(page.entries.len());
         (mark, after) = (page.mark, page.next);
     }
-    assert_eq!(handed, [13, 13, 4]);
+    assert_eq!(handed, [1; 30]);
     // A page with nothing in it is still answered.
     assert!(client.pull(1, mark, 35).await.entries.is_empty());
 

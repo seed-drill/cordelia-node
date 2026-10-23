@@ -3691,6 +3691,55 @@ async fn a_pull_that_gets_nowhere_ends_for_the_pass() {
     assert_eq!(passes(&device), (before + 1, before));
 }
 
+/// A device's pass reads a channel on from the place each page reaches
+/// (decision 2026-10-22 (memory), rule 3): from a relay of this version,
+/// which hands a device small pages of one entry of the largest size each,
+/// a channel of 13 such entries is read in 10 pages in one pass, and to
+/// its end in the next. Each page was a small one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_reads_a_channel_of_the_largest_entries_in_small_pages_to_its_end() {
+    use cordelia_core::protocol::{MAX_ENTRY_NAME_AND_VALUE_BYTES, RELAY_ENTRY_PULL_PAGES};
+    let relay = relay_started("relay", None);
+    let (mut writer, mut reader) = (Device::new("desktop"), Device::new("laptop"));
+    writer.makes_the_phrase(&phrase());
+    writer.adds(&reader);
+    for device in [&mut writer, &mut reader] {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&writer, &reader], 3).await;
+    let notes = writer.channel("notes");
+    let written: BTreeSet<[u8; 32]> = (0..13)
+        .map(|n| {
+            let file = format!("{n:02}.md");
+            let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - file.len());
+            writer.writes("notes", &file, &text).id()
+        })
+        .collect();
+    for _ in 0..10 {
+        if held_at(&relay, &notes).len() == 13 {
+            break;
+        }
+        writer.passes().await;
+    }
+    assert_eq!(held_at(&relay, &notes).len(), 13);
+
+    // One pass reads as many pages as a pass reads, one entry each.
+    let before = reader.counts("relay");
+    reader.passes().await;
+    let read = reader.counts("relay");
+    assert_eq!(RELAY_ENTRY_PULL_PAGES, 10);
+    assert_eq!(read.pulled - before.pulled, 10, "the pages were not small");
+    assert_eq!(read.pages - before.pages, 10);
+    // The next reads on from where it stopped, to the end.
+    reader.passes().await;
+    let read = reader.counts("relay");
+    assert_eq!(read.pulled - before.pulled, 13);
+    assert_eq!(read.pages - before.pages, 13);
+    assert_eq!(reader.place("relay", &notes).1, 13);
+    assert!(written.is_subset(&reader.holds_of(&notes)));
+}
+
 /// What a device takes from one relay in a minute is bounded at what a
 /// relay may hand a connection, and is counted for the relay, not for the
 /// connection: a relay that hands page after page of the largest entries
