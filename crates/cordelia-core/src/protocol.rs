@@ -82,12 +82,19 @@ pub const QUIC_MAX_BIDI_STREAMS: u32 = MAX_CONCURRENT_STREAMS as u32;
 pub const QUIC_MAX_UNI_STREAMS: u32 = 0;
 
 /// How much a peer may send on one stream before this node has read it:
-/// one small message (decision 2026-10-22 (memory), rule 8), the largest
-/// thing a device of this version sends. A large message still arrives, a
-/// window at a time, as the node reads it. A relay listed by key may send
-/// more (QUIC_LISTED_STREAM_RECEIVE_WINDOW).
-/// Derived: SMALL_MESSAGE_BYTES.
-pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = SMALL_MESSAGE_BYTES;
+/// an eighth of the connection's window, 36 KiB (decision 2026-10-22
+/// (memory), rule 8). A node reads the streams a peer opens one at a
+/// time; with every stream the peer may have open within the connection's
+/// window together, the streams queued behind the one being read can
+/// never take all of it, and the stream being read always has the credit
+/// its own reads give back. At a stream window of a small message, two
+/// streams queued with their windows full held the whole connection, and
+/// the stream being read (and a fetch on the same connection) waited out
+/// STREAM_TIMEOUT. A message larger than the window arrives a window at a
+/// time, as the node reads it: a small message in four round trips. A
+/// relay listed by key may send more (QUIC_LISTED_STREAM_RECEIVE_WINDOW).
+/// Derived: QUIC_RECEIVE_WINDOW / QUIC_MAX_BIDI_STREAMS.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = QUIC_RECEIVE_WINDOW / QUIC_MAX_BIDI_STREAMS;
 
 /// How much a peer may send on one connection, over all its streams,
 /// before this node has read it: two small messages (rule 8), so that a
@@ -96,6 +103,13 @@ pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = SMALL_MESSAGE_BYTES;
 /// defaults there was no such bound: a thousand streams, each over a
 /// megabyte. Derived: 2 x SMALL_MESSAGE_BYTES.
 pub const QUIC_RECEIVE_WINDOW: u32 = 2 * SMALL_MESSAGE_BYTES;
+
+// Checked at compile time: every stream a peer that is not a relay listed
+// by key may have open, each with its window full, fits the connection's
+// window (rule 8), so none of them waits on credit the others hold.
+const _: () = assert!(
+    QUIC_STREAM_RECEIVE_WINDOW as u64 * QUIC_MAX_BIDI_STREAMS as u64 <= QUIC_RECEIVE_WINDOW as u64
+);
 
 /// How much this node may have written on one connection, over all its
 /// streams, that the peer has not acknowledged: two small messages (rule
@@ -2444,15 +2458,21 @@ mod tests {
         assert_eq!(MAX_CONCURRENT_STREAMS, 8);
     }
 
-    /// A peer may send one small message on a stream and two on a
-    /// connection before the node reads them (decision 2026-10-22
-    /// (memory), rule 8).
+    /// A peer may send two small messages on a connection before the
+    /// node reads them, and an eighth of that on a stream, so that every
+    /// stream it may have open fits the connection's window together
+    /// (decision 2026-10-22 (memory), rule 8).
     #[test]
-    fn the_receive_windows_are_one_small_message_and_two() {
-        assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, 147_456);
+    fn the_receive_windows_hold_every_stream_within_two_small_messages() {
+        assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, 36_864);
         assert_eq!(QUIC_RECEIVE_WINDOW, 294_912);
-        assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, SMALL_MESSAGE_BYTES);
         assert_eq!(QUIC_RECEIVE_WINDOW, 2 * SMALL_MESSAGE_BYTES);
+        // Every stream within the connection's window together, which is
+        // enforced at compile time beside the constants, and here exactly.
+        assert_eq!(
+            QUIC_STREAM_RECEIVE_WINDOW * QUIC_MAX_BIDI_STREAMS,
+            QUIC_RECEIVE_WINDOW
+        );
     }
 
     #[test]
