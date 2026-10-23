@@ -484,7 +484,7 @@ impl LargePermits {
     /// while one of `LARGE_MESSAGES_AT_ONCE` is free and no earlier waiter
     /// is eligible; a waiter whose subnet already holds a permit waits for
     /// that one.
-    async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
+    pub(crate) async fn take(&self, address: std::net::IpAddr) -> Option<LargePermit<'_>> {
         let subnet = cordelia_network::rate_limit::subnet_key(address);
         // Join the queue, in the order of asking.
         let ticket = {
@@ -7607,6 +7607,207 @@ mod tests {
         assert!(
             !handler_drains_a_large_frame(Handler::SyncNothing).await,
             "the older kind's answer-nothing read a frame over a small message"
+        );
+    }
+
+    /// Whether a relay reads and answers a large push (longer than a small
+    /// message) from a client, run through the live inbound loop
+    /// (`handle_peer_streams`). The client is listed by key iff `listed`,
+    /// and is in `peer_relays` (a relay configured by address alone) iff
+    /// `addressed`; the large-permit budget is `budget`. A permit is read
+    /// and answered within two seconds, or it is not.
+    async fn large_push_answered(listed: bool, addressed: bool, budget: usize) -> bool {
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::messages::{Item, Protocol, PushPayload, WireMessage};
+        use cordelia_network::{codec, connection, transport};
+        use std::collections::{HashMap, HashSet};
+        use std::net::SocketAddr;
+        use std::sync::{Arc, RwLock};
+
+        let id = |s: u8| {
+            Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([s; 32]).unwrap())
+        };
+        let here: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (node, client) = (id(1), id(2));
+        let client_key = NodeId(client.public_key());
+        let node_end = transport::create_endpoint(&node, here).unwrap();
+        let node_addr = node_end.local_addr().unwrap();
+        let node_mgr = connection::ConnectionManager::new(
+            node.clone(),
+            node_end,
+            vec![],
+            vec!["relay".into()],
+            node_addr.port(),
+        );
+        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+
+        // The relay lists the client by key iff `listed`.
+        let relays = if listed {
+            vec![RelayAddr {
+                host: "listed.example:9474".into(),
+                addr: SocketAddr::new("127.0.0.1".parse().unwrap(), 9474),
+                key: Some(client_key.0),
+            }]
+        } else {
+            vec![]
+        };
+        let relay_entries = Some(Arc::new(crate::relay_entries::RelayEntries::new(
+            u64::MAX,
+            Arc::new(RwLock::new(relays)),
+            std::time::Duration::from_secs(600),
+        )));
+        // It is a relay configured by address alone (in peer_relays, not
+        // listed by key) iff `addressed`.
+        let peer_relays = Arc::new(RwLock::new(HashSet::new()));
+        if addressed {
+            peer_relays.write().unwrap().insert(client_key.clone());
+        }
+        let peer_states = Arc::new(RwLock::new(HashMap::from([(client_key.clone(), 1u8)])));
+        let permits = Arc::new(LargePermits::new(budget));
+        let state = a_state();
+        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+        let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
+        let shared_peers = Arc::new(RwLock::new(Vec::new()));
+        let swarm = Arc::new(RwLock::new(HashSet::new()));
+        let seen = Arc::new(RwLock::new(cordelia_network::seen_table::SeenTable::default()));
+        let peer_rates = Arc::new(std::sync::Mutex::new(Rates::default()));
+
+        let node_conn = {
+            let as_node = as_node.clone();
+            tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_node, incoming).await.unwrap().conn
+            })
+        };
+        let mut client_mgr = connection::ConnectionManager::new(
+            client.clone(),
+            transport::create_endpoint(&client, here).unwrap(),
+            vec![],
+            vec![],
+            9474,
+        );
+        client_mgr.connect_to(node_addr).await.unwrap();
+        let conn = client_mgr
+            .get_connection(&NodeId(node.public_key()))
+            .unwrap()
+            .clone();
+        let node_conn = node_conn.await.unwrap();
+
+        let loop_task = tokio::spawn(handle_peer_streams(
+            node_conn,
+            client_key,
+            "127.0.0.1".parse().unwrap(),
+            state,
+            shared_peers,
+            "relay".into(),
+            repush_tx,
+            delivery_tx,
+            peer_rates,
+            peer_states,
+            peer_relays,
+            gov_tx,
+            swarm,
+            seen,
+            relay_entries,
+            permits,
+        ));
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        codec::write_protocol_byte(&mut send, Protocol::ItemPush).await.unwrap();
+        // A push of one big item: longer than a small message.
+        let item = Item {
+            item_id: "ci_big".into(),
+            channel_id: "grp_x".into(),
+            item_type: "memory".into(),
+            encrypted_blob: vec![0u8; 200_000],
+            content_hash: vec![0u8; 32],
+            content_length: 200_000,
+            author_id: vec![0u8; 32],
+            signature: vec![0u8; 64],
+            key_version: 1,
+            published_at: "2026-10-22T00:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
+        let frame = codec::encode_message(&push).unwrap();
+        assert!(
+            frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
+            "the push was meant to be over a small message"
+        );
+        let _ = codec::write_raw_frame(&mut send, &frame).await;
+        // An answer (a push ack) within two seconds means it was read.
+        let answered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), codec::read_frame(&mut recv, Protocol::ItemPush))
+                .await
+                .is_ok_and(|r| r.is_ok());
+        loop_task.abort();
+        answered
+    }
+
+    /// The live inbound loop reads a large frame only under the permits,
+    /// and exempts a relay listed by key alone, not one configured by
+    /// address (decision 2026-10-22 (memory), rules 2 and 7). With no
+    /// permit free, a listed relay's large push is read, an unlisted
+    /// peer's and a relay-by-address's are not; with a permit free, an
+    /// unlisted peer's is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_inbound_loop_takes_permits_and_exempts_only_listed_relays() {
+        // A relay listed by key: read though no permit is free (rule 7).
+        assert!(
+            large_push_answered(true, false, 0).await,
+            "a listed relay's large push was not read"
+        );
+        // A peer that is not listed: not read with no permit (rule 2).
+        assert!(
+            !large_push_answered(false, false, 0).await,
+            "an unlisted peer's large push was read with no permit"
+        );
+        // A relay configured by address alone is unlisted for F: it waits.
+        assert!(
+            !large_push_answered(false, true, 0).await,
+            "a relay configured by address alone was exempted"
+        );
+        // With a permit free, an unlisted peer's push is read.
+        assert!(
+            large_push_answered(false, false, 1).await,
+            "an unlisted peer's large push was not read when a permit was free"
+        );
+    }
+
+    /// A permit a stream held and then failed on is given back (decision
+    /// 2026-10-22 (memory), rule 2): five streams fail in turn, and then
+    /// four permits can be taken at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_a_failed_stream_held_is_given_back() {
+        use std::net::IpAddr;
+        let permits = std::sync::Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        // Five streams each take a permit and fail, one after another.
+        for n in 0..5u8 {
+            let g = permits
+                .take(IpAddr::from([10, n, 0, 1]))
+                .await
+                .expect("a permit for a failing stream");
+            drop(g);
+        }
+        // All four permits are free again.
+        let mut held = Vec::new();
+        for n in 0..cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE as u8 {
+            held.push(
+                permits
+                    .take(IpAddr::from([172, 16, n, 1]))
+                    .await
+                    .expect("four permits after five failed"),
+            );
+        }
+        assert!(
+            permits.take(IpAddr::from([192, 0, 2, 1])).await.is_none(),
+            "a fifth permit was held past the budget"
         );
     }
 
