@@ -3000,8 +3000,9 @@ pub async fn p2p_loop(
                         let ctx = connect_ctx.clone();
                         let tx = connect_tx.clone();
                         let arriving = arriving.clone();
+                        let relays = relay_addrs.clone();
                         tokio::spawn(async move {
-                            let accepted = cordelia_network::connection::inbound_accept(&ctx, incoming).await;
+                            let accepted = accept_incoming(&ctx, incoming, &relays).await;
                             {
                                 let mut arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(at) = arriving.iter().position(|a| *a == address) {
@@ -3233,9 +3234,10 @@ pub async fn p2p_loop(
                     let ctx = connect_ctx.clone();
                     let tx = connect_tx.clone();
                     let addr = relay.addr;
+                    let relay = relay.clone();
                     tracing::debug!(relay = %relay.host, %addr, "dialling relay");
                     tokio::spawn(async move {
-                        match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                        match dial_relay(&ctx, &relay).await {
                             Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
                             Err(e) => { let _ = tx.send(Err((addr, e.to_string()))); }
                         }
@@ -4686,6 +4688,70 @@ fn key_at(
                 .is_some_and(|conn| conn.remote_address() == addr)
         })
         .map(|peer| peer.0)
+}
+
+/// The keys of the relays configured by key at `from` (decision
+/// 2026-10-22 (memory), rule 12): a connection that arrives from there is
+/// accepted with the transport settings between relays listed by key, and
+/// closed after TLS unless it proves one of these keys. Empty for any
+/// other address. Matched by address and port, as a relay dials from the
+/// port it listens on; an IPv4 address that a dual-stack socket shows
+/// mapped into IPv6 is the same address.
+fn keys_listed_at(
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    from: std::net::SocketAddr,
+) -> Vec<[u8; 32]> {
+    let canonical = |addr: std::net::SocketAddr| {
+        std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    };
+    let mut keys: Vec<[u8; 32]> = relays
+        .iter()
+        .filter(|relay| canonical(relay.addr) == canonical(from))
+        .filter_map(|relay| relay.key)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Accept `incoming` (decision 2026-10-22 (memory), rule 12): from the
+/// address of a relay configured by key, with the transport settings
+/// between relays listed by key, and closed after TLS where the key is
+/// not that relay's; from any other, with every peer's.
+async fn accept_incoming(
+    ctx: &cordelia_network::connection::ConnectContext,
+    incoming: quinn::Incoming,
+    relays: &RelayAddrs,
+) -> Result<
+    cordelia_network::connection::ConnectOutcome,
+    cordelia_network::connection::ConnectionError,
+> {
+    let keys = relays
+        .read()
+        .map(|relays| keys_listed_at(&relays, incoming.remote_address()))
+        .unwrap_or_default();
+    if keys.is_empty() {
+        cordelia_network::connection::inbound_accept(ctx, incoming).await
+    } else {
+        cordelia_network::connection::inbound_accept_from_listed(ctx, incoming, &keys).await
+    }
+}
+
+/// Dial a configured relay (decision 2026-10-22 (memory), rule 12): one
+/// configured by key with the transport settings between relays listed by
+/// key, one configured by address alone with every peer's.
+async fn dial_relay(
+    ctx: &cordelia_network::connection::ConnectContext,
+    relay: &cordelia_network::bootstrap::RelayAddr,
+) -> Result<
+    cordelia_network::connection::ConnectOutcome,
+    cordelia_network::connection::ConnectionError,
+> {
+    if relay.key.is_some() {
+        cordelia_network::connection::outbound_connect_to_listed(ctx, relay.addr).await
+    } else {
+        cordelia_network::connection::outbound_connect(ctx, relay.addr).await
+    }
 }
 
 /// Whether a configured relay is connected: by its key if one is
@@ -12678,5 +12744,183 @@ mod tests {
             );
         }
         peer.abort();
+    }
+
+    /// What the end at `writer` may send the other end of its connection,
+    /// which reads nothing: the bytes one stream takes, and how many
+    /// streams it may have open at once, `held` of them before this.
+    ///
+    /// The end that dialled holds one already: the stream of the
+    /// connection's handshake, which the other end does not count as
+    /// closed for as long as the connection lasts (quinn frees a stream
+    /// that a peer opened once both its halves are done, and the half the
+    /// accepting end writes is stopped by the dialler after its handle has
+    /// gone, and so never is).
+    async fn what_it_may_send(writer: &quinn::Connection, held: usize) -> (usize, usize) {
+        let brief = std::time::Duration::from_millis(500);
+        let (mut send, recv) = writer.open_bi().await.unwrap();
+        let chunk = vec![0u8; 16 * 1024];
+        let mut taken = 0usize;
+        while taken < 8 << 20 {
+            match tokio::time::timeout(brief, send.write(&chunk)).await {
+                Ok(Ok(n)) => taken += n,
+                Ok(Err(e)) => panic!("a write failed: {e}"),
+                Err(_) => break,
+            }
+        }
+        let mut open = vec![(send, recv)];
+        while open.len() < 256 {
+            match tokio::time::timeout(brief, writer.open_bi()).await {
+                Ok(Ok((mut send, recv))) => {
+                    send.write_all(b"x").await.unwrap();
+                    open.push((send, recv));
+                }
+                _ => break,
+            }
+        }
+        (taken, held + open.len())
+    }
+
+    /// Decision 2026-10-22 (memory), rule 12. A connection with a relay
+    /// configured by key keeps today's windows and streams in both
+    /// directions: dialled to it, and accepted from its address with its
+    /// key, the relay may send 1 MiB unread on a stream and have 64
+    /// streams open. A peer accepted from another address may send one
+    /// small message on a stream and have QUIC_MAX_BIDI_STREAMS open. One
+    /// accepted from the relay's address with another key is closed once
+    /// its TLS completes, before its handshake is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_listed_by_key_keeps_todays_windows_and_streams() {
+        use cordelia_core::protocol::{
+            QUIC_LISTED_MAX_BIDI_STREAMS, QUIC_LISTED_STREAM_RECEIVE_WINDOW, QUIC_MAX_BIDI_STREAMS,
+            QUIC_STREAM_RECEIVE_WINDOW,
+        };
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::{connection, transport};
+
+        let id = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
+            let end = transport::create_endpoint(key, here).unwrap();
+            let port = end.local_addr().unwrap().port();
+            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
+        };
+        let (node_key, relay_key, other_key, impostor_key) = (id(21), id(22), id(23), id(24));
+        let node = manager(&node_key);
+        let node_addr = node.local_addr().unwrap();
+        let (node_end, node_ctx) = (node.endpoint(), node.connect_context());
+        // The relay sends with today's send window, so that only what the
+        // node lets it send holds it back.
+        let relay = manager(&relay_key);
+        let relay_addr = relay.local_addr().unwrap();
+        let (relay_end, mut relay_ctx) = (relay.endpoint(), relay.connect_context());
+        let listed = transport::listed_configs(&relay_key).unwrap();
+        relay_end.set_server_config(Some((*listed.server).clone()));
+        relay_ctx
+            .endpoint
+            .set_default_client_config(listed.client.clone());
+        let relays: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+            host: "relay.test:9474".into(),
+            addr: relay_addr,
+            key: Some(relay_key.public_key()),
+        }]));
+        let listed_window = QUIC_LISTED_STREAM_RECEIVE_WINDOW as usize;
+        let listed_streams = QUIC_LISTED_MAX_BIDI_STREAMS as usize;
+
+        // Dialled: the node dials the relay as a relay configured by key.
+        let at_relay = tokio::spawn({
+            let (relay_end, relay_ctx) = (relay_end.clone(), relay_ctx.clone());
+            async move {
+                let incoming = relay_end.accept().await.unwrap();
+                connection::inbound_accept(&relay_ctx, incoming)
+                    .await
+                    .unwrap()
+            }
+        });
+        let configured = relays.read().unwrap()[0].clone();
+        let dialled = dial_relay(&node_ctx, &configured).await.unwrap();
+        let relays_end = at_relay.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&relays_end.conn, 0).await,
+            (listed_window, listed_streams),
+            "a connection dialled to a relay configured by key has another's windows"
+        );
+        drop(dialled);
+
+        // Accepted from the relay's address, with its key.
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx, relays) = (node_end.clone(), node_ctx.clone(), relays.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &relays).await
+            }
+        });
+        let from_relay = connection::outbound_connect(&relay_ctx, node_addr)
+            .await
+            .unwrap();
+        let _accepted = at_node.await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&from_relay.conn, 1).await,
+            (listed_window, listed_streams),
+            "a connection accepted from a relay listed by key has another's windows"
+        );
+
+        // Accepted from another address: every peer's windows.
+        let other = manager(&other_key);
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx, relays) = (node_end.clone(), node_ctx.clone(), relays.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &relays).await
+            }
+        });
+        let from_other = connection::outbound_connect(&other.connect_context(), node_addr)
+            .await
+            .unwrap();
+        let _accepted = at_node.await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&from_other.conn, 1).await,
+            (
+                QUIC_STREAM_RECEIVE_WINDOW as usize,
+                QUIC_MAX_BIDI_STREAMS as usize
+            ),
+            "a peer from another address has the windows of a relay listed by key"
+        );
+
+        // From the relay's address with another key: here the relay is
+        // configured at the address the impostor dials from.
+        let impostor = manager(&impostor_key);
+        let at_impostor: RelayAddrs =
+            std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                host: "relay.test:9474".into(),
+                addr: impostor.local_addr().unwrap(),
+                key: Some(relay_key.public_key()),
+            }]));
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx) = (node_end.clone(), node_ctx.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &at_impostor).await
+            }
+        });
+        let dialled_by_impostor =
+            connection::outbound_connect(&impostor.connect_context(), node_addr).await;
+        let accepted = at_node.await.unwrap();
+        assert!(
+            matches!(accepted, Err(connection::ConnectionError::NotTheRelay(_))),
+            "a connection from a listed relay's address with another key was accepted: {:?}",
+            accepted.map(|outcome| outcome.node_id)
+        );
+        assert!(
+            dialled_by_impostor.is_err(),
+            "the impostor's handshake was read"
+        );
     }
 }

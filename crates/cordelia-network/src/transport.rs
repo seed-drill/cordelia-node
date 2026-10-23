@@ -104,6 +104,8 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 
 /// The transport settings of every connection, in either direction:
 /// keep-alive and idle timeout, and what a peer may make this node hold.
+/// A connection to or from a relay listed by key has those of
+/// [`listed_transport_config`] in their place.
 ///
 /// - A peer may have QUIC_MAX_BIDI_STREAMS streams open at once, and no
 ///   unidirectional ones.
@@ -118,6 +120,39 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 /// - It may send no datagrams: no node sends or reads one, and quinn's
 ///   default would keep 1.25 MB of them unread on every connection.
 fn transport_config() -> quinn::TransportConfig {
+    transport_with(Limits {
+        streams: protocol::QUIC_MAX_BIDI_STREAMS,
+        stream_window: protocol::QUIC_STREAM_RECEIVE_WINDOW,
+        window: protocol::QUIC_RECEIVE_WINDOW,
+        send_window: protocol::QUIC_SEND_WINDOW,
+    })
+}
+
+/// The transport settings of a connection between this node and a relay
+/// listed by key, in either direction (decision 2026-10-22, memory across
+/// connections, rule 12): those of [`transport_config`], with today's
+/// windows and streams, QUIC_LISTED_*. A relay's passes and pulls to the
+/// relays it works with go a full page at a time, and these keep a page a
+/// round trip.
+fn listed_transport_config() -> quinn::TransportConfig {
+    transport_with(Limits {
+        streams: protocol::QUIC_LISTED_MAX_BIDI_STREAMS,
+        stream_window: protocol::QUIC_LISTED_STREAM_RECEIVE_WINDOW,
+        window: protocol::QUIC_LISTED_RECEIVE_WINDOW,
+        send_window: protocol::QUIC_LISTED_SEND_WINDOW,
+    })
+}
+
+/// What a connection's peer may make this node hold, and what this node
+/// may write it unacknowledged.
+struct Limits {
+    streams: u32,
+    stream_window: u32,
+    window: u32,
+    send_window: u64,
+}
+
+fn transport_with(limits: Limits) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(
         protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
@@ -126,13 +161,39 @@ fn transport_config() -> quinn::TransportConfig {
         quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
             .unwrap(),
     ));
-    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_bidi_streams(limits.streams.into());
     transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
-    transport.stream_receive_window(protocol::QUIC_STREAM_RECEIVE_WINDOW.into());
-    transport.receive_window(protocol::QUIC_RECEIVE_WINDOW.into());
-    transport.send_window(protocol::QUIC_SEND_WINDOW);
+    transport.stream_receive_window(limits.stream_window.into());
+    transport.receive_window(limits.window.into());
+    transport.send_window(limits.send_window);
     transport.datagram_receive_buffer_size(None);
     transport
+}
+
+/// The configs of a connection with a relay listed by key, as this node
+/// dials it and as it accepts it (decision 2026-10-22, memory across
+/// connections, rule 12). Quinn takes a connection's transport settings
+/// when the connection is made, in either direction, and has no setter
+/// for a stream's window after, so a node picks these as it dials or
+/// accepts: `Endpoint::connect_with` and `Incoming::accept_with`.
+#[derive(Clone)]
+pub struct ListedConfigs {
+    pub client: ClientConfig,
+    pub server: Arc<ServerConfig>,
+}
+
+/// The configs of a connection with a relay listed by key, under
+/// `identity`'s certificate.
+pub fn listed_configs(identity: &NodeIdentity) -> Result<ListedConfigs, TransportError> {
+    let (cert_der, key_der) = generate_self_signed_cert(identity)?;
+    Ok(ListedConfigs {
+        client: client_config_with(cert_der.clone(), key_der.clone(), listed_transport_config())?,
+        server: Arc::new(server_config_with(
+            cert_der,
+            key_der,
+            listed_transport_config(),
+        )?),
+    })
 }
 
 /// Build a quinn ServerConfig that accepts self-signed Ed25519 certificates.
@@ -144,6 +205,14 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
 fn server_config_with_cert(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
+) -> Result<ServerConfig, TransportError> {
+    server_config_with(cert_der, key_der, transport_config())
+}
+
+fn server_config_with(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    transport: quinn::TransportConfig,
 ) -> Result<ServerConfig, TransportError> {
     let cert = CertificateDer::from(cert_der);
     let key = PrivatePkcs8KeyDer::from(key_der);
@@ -157,8 +226,6 @@ fn server_config_with_cert(
         .map_err(|e| TransportError::Tls(e.to_string()))?;
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
-
-    let transport = transport_config();
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -182,8 +249,8 @@ fn client_config_with_cert(
     client_config_with(cert_der, key_der, transport_config())
 }
 
-/// A client config with `transport` in place of a node's own. A node uses
-/// only its own; the tests give a stand-in peer other settings.
+/// A client config with `transport` in place of a node's own: a relay's
+/// listed by key ([`listed_configs`]), or, in the tests, a stand-in peer's.
 fn client_config_with(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -730,19 +797,72 @@ mod tests {
         assert_eq!(taken, 2, "the connection took {taken} megabytes unread");
     }
 
-    /// The send window that a config carries, as quinn shows it: quinn has
-    /// no getter for it, but its `Debug` names every field.
-    fn send_window_of(config: &impl std::fmt::Debug) -> u64 {
+    /// The value of `field` in a config, as quinn shows it: quinn has no
+    /// getters for its transport settings, but its `Debug` names every
+    /// field (a count of streams or a window as `VarInt(n)`).
+    fn shown_in(config: &impl std::fmt::Debug, field: &str) -> u64 {
         let shown = format!("{config:?}");
+        let named = format!(" {field}: ");
         let at = shown
-            .find("send_window: ")
-            .expect("the config shows its send window")
-            + "send_window: ".len();
+            .find(&named)
+            .unwrap_or_else(|| panic!("the config shows no {field}"))
+            + named.len();
         let digits: String = shown[at..]
             .chars()
+            .skip_while(|c| !c.is_ascii_digit())
             .take_while(char::is_ascii_digit)
             .collect();
         digits.parse().unwrap()
+    }
+
+    fn send_window_of(config: &impl std::fmt::Debug) -> u64 {
+        shown_in(config, "send_window")
+    }
+
+    /// The windows and the streams a config carries: what a peer may send
+    /// on a stream and on the connection, what this node may write it
+    /// unacknowledged, and how many streams the peer may have open.
+    fn limits_of(config: &impl std::fmt::Debug) -> (u64, u64, u64, u64) {
+        (
+            shown_in(config, "stream_receive_window"),
+            shown_in(config, "receive_window"),
+            shown_in(config, "send_window"),
+            shown_in(config, "max_concurrent_bidi_streams"),
+        )
+    }
+
+    /// Decision 2026-10-22, memory across connections, rule 12. A node's
+    /// configs of a connection with a relay listed by key carry today's
+    /// windows and 64 streams, as the client that dials the relay and as
+    /// the server it is accepted by; every other config carries the
+    /// windows and streams of every peer.
+    #[test]
+    fn a_relay_listed_by_key_has_the_windows_and_streams_of_before() {
+        let id = NodeIdentity::generate().unwrap();
+        let listed = (
+            u64::from(protocol::QUIC_LISTED_STREAM_RECEIVE_WINDOW),
+            u64::from(protocol::QUIC_LISTED_RECEIVE_WINDOW),
+            protocol::QUIC_LISTED_SEND_WINDOW,
+            u64::from(protocol::QUIC_LISTED_MAX_BIDI_STREAMS),
+        );
+        assert_eq!(listed, (1_048_576, 2_097_152, 2_097_152, 64));
+        let configs = listed_configs(&id).unwrap();
+        assert_eq!(limits_of(&listed_transport_config()), listed);
+        assert_eq!(limits_of(&configs.client), listed);
+        assert_eq!(limits_of(&configs.server.transport), listed);
+
+        let every_peer = (
+            u64::from(protocol::QUIC_STREAM_RECEIVE_WINDOW),
+            u64::from(protocol::QUIC_RECEIVE_WINDOW),
+            protocol::QUIC_SEND_WINDOW,
+            u64::from(protocol::QUIC_MAX_BIDI_STREAMS),
+        );
+        assert_eq!(limits_of(&transport_config()), every_peer);
+        assert_eq!(limits_of(&client_config(&id).unwrap()), every_peer);
+        assert_eq!(
+            limits_of(&server_config(&id).unwrap().transport),
+            every_peer
+        );
     }
 
     /// T3. What a node may have written on one connection that the peer has

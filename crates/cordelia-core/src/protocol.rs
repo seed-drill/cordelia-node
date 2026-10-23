@@ -95,6 +95,32 @@ pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
 /// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
 pub const QUIC_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
 
+/// How much a relay listed by key may send on one stream before this node
+/// has read it, on a connection between the two (decision 2026-10-22
+/// (memory), rule 12): one message, as every connection had before change
+/// F. A relay's passes and pulls to the relays it works with go a full
+/// page at a time, and at the windows of an unlisted peer a pull of ten
+/// full pages would take longer than the time between pulls.
+/// Derived: MAX_MESSAGE_BYTES.
+pub const QUIC_LISTED_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
+
+/// How much a relay listed by key may send over all its streams before
+/// this node has read it (rule 12): two messages, as before change F.
+/// Derived: 2 x MAX_MESSAGE_BYTES.
+pub const QUIC_LISTED_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
+
+/// How much this node may have written to a relay listed by key that it
+/// has not acknowledged (rule 12): two messages, as before change F.
+/// Derived: 2 x MAX_MESSAGE_BYTES, as much as the relay's
+/// QUIC_LISTED_RECEIVE_WINDOW.
+pub const QUIC_LISTED_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
+
+/// Most bidirectional streams a relay listed by key may have open on a
+/// connection with this node (rule 12): 64, as before change F. Between
+/// relays a pass, a pull, the older kind's fetch, its repush and its push
+/// retries run at once.
+pub const QUIC_LISTED_MAX_BIDI_STREAMS: u32 = 64;
+
 /// TLS certificate validity in days (network-protocol.md §2.2).
 /// Primitive: 1 year; self-signed certs, identity is the public key.
 pub const TLS_CERT_VALIDITY_DAYS: i64 = 365;
@@ -2473,6 +2499,20 @@ mod tests {
         assert_eq!(QUIC_SEND_WINDOW, 2_097_152);
         assert_eq!(QUIC_SEND_WINDOW, 2 * MAX_MESSAGE_BYTES as u64);
         assert_eq!(QUIC_SEND_WINDOW, QUIC_RECEIVE_WINDOW as u64);
+    }
+
+    /// A connection with a relay listed by key keeps the windows and
+    /// streams every connection had before change F (decision 2026-10-22
+    /// (memory), rule 12): one message on a stream, two on the connection
+    /// each way, and 64 streams.
+    #[test]
+    fn a_relay_listed_by_key_keeps_the_windows_and_streams_of_before() {
+        assert_eq!(QUIC_LISTED_STREAM_RECEIVE_WINDOW, 1_048_576);
+        assert_eq!(QUIC_LISTED_RECEIVE_WINDOW, 2_097_152);
+        assert_eq!(QUIC_LISTED_SEND_WINDOW, 2_097_152);
+        assert_eq!(QUIC_LISTED_MAX_BIDI_STREAMS, 64);
+        assert_eq!(QUIC_LISTED_STREAM_RECEIVE_WINDOW, MAX_MESSAGE_BYTES);
+        assert_eq!(QUIC_LISTED_SEND_WINDOW, QUIC_LISTED_RECEIVE_WINDOW as u64);
     }
 
     #[test]

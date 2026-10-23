@@ -2648,6 +2648,47 @@ peer allows, and the node's other streams on that connection wait for them.
 **If you lower it to one:** a repush of many items drains one item a round
 trip, which the backoff and the pull make up for, more slowly.
 
+### QUIC_LISTED_STREAM_RECEIVE_WINDOW = 1 MiB, QUIC_LISTED_RECEIVE_WINDOW = 2 MiB, QUIC_LISTED_SEND_WINDOW = 2 MiB, QUIC_LISTED_MAX_BIDI_STREAMS = 64
+
+**Rationale:** a connection between this node and a relay listed by key
+keeps the windows and streams that every connection had before change F
+(rule 12): one message on a stream and two on the connection each way,
+and 64 streams. A relay's passes on and its pulls from the relays it works
+with go a full page at a time (`ENTRY_PAGE_MAX_BYTES`, 896 KiB), and at
+the windows of every other peer (a small message on a stream, rule 8) a
+full page takes 1.43 s at a round trip of 200 ms where it takes 0.24 s:
+a pull of ten full pages would take about 14.3 s, longer than the 10 s
+between pulls, and catching up 1 GiB after a restart about 28 minutes
+where it takes 4.7. The streams stay 64 for what runs at once between
+relays: a pass, a pull, the older kind's fetch, its repush and its push
+retries.
+
+**How a connection gets them.** Quinn takes a connection's transport
+settings when it is made, in both directions, and has no setter for a
+stream's window after. So a node dials a relay configured by key with
+`Endpoint::connect_with` and a client config of these settings, and
+accepts a connection whose address (`Incoming::remote_address`, address
+and port) is that of a relay configured by key with `Incoming::accept_with`
+and a server config of them (`transport::listed_configs`). Both are
+needed: a node keeps one connection for each peer, and when two relays
+dial each other it keeps the lower key's, so one relay's pulls run on a
+connection it dialled and the other's on one it accepted. **An address is
+not an identity:** once TLS completes on a connection accepted that way,
+it is closed if the key in its certificate is not that of a relay
+configured at the address, before anything is read on it
+(`connection::inbound_accept_from_listed`).
+
+**What it costs:** whoever connects from a listed relay's address with
+another key holds a connection of these settings until its TLS completes
+and it is closed, with nothing read. A listed relay whose connection comes
+from another address than the one configured (behind a NAT that changes
+its port) gets every peer's windows, and works at their pace. What a
+listed relay's connection holds is L in the record's section 3, about
+15.3 MiB each, for one or two such connections.
+
+**Derivation:** today's values: one and two of `MAX_MESSAGE_BYTES`, and
+64 streams.
+
 ---
 
 *Spec version: 1.6*

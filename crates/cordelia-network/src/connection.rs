@@ -24,6 +24,11 @@ use tracing::{debug, info};
 const CLOSED_AS_DUPLICATE: &[u8] = b"duplicate";
 const CLOSED_AS_REPLACED: &[u8] = b"replaced";
 
+/// Why a connection accepted from the address of a relay listed by key is
+/// closed once its TLS completes: the key in its certificate is not that
+/// relay's (decision 2026-10-22, memory across connections, rule 12).
+pub const CLOSED_AS_NOT_THE_RELAY: &[u8] = b"not the relay";
+
 /// Whether the peer closed a connection because it keeps another one with
 /// this node. Two nodes that list each other both dial at start, and one of
 /// the two connections is dropped: nothing is wrong.
@@ -60,6 +65,9 @@ pub enum ConnectionError {
 
     #[error("peer already connected: {0}")]
     AlreadyConnected(NodeId),
+
+    #[error("{0} connected from a listed relay's address, with another key")]
+    NotTheRelay(NodeId),
 }
 
 /// Metadata for an active peer connection.
@@ -90,6 +98,10 @@ pub struct ConnectContext {
     pub channel_ids: Vec<String>,
     pub roles: Vec<String>,
     pub p2p_port: u16,
+    /// The configs of a connection with a relay listed by key (decision
+    /// 2026-10-22, memory across connections, rule 12); none where they
+    /// could not be made, and every connection then has the endpoint's.
+    pub listed: Option<crate::transport::ListedConfigs>,
 }
 
 /// Result of a successful connect/accept. Returned via channel to the p2p select loop.
@@ -122,6 +134,8 @@ pub struct ConnectionManager {
     roles: Vec<String>,
     /// Our P2P listening port (advertised in handshake).
     p2p_port: u16,
+    /// The configs of a connection with a relay listed by key.
+    listed: Option<crate::transport::ListedConfigs>,
 }
 
 impl ConnectionManager {
@@ -132,6 +146,13 @@ impl ConnectionManager {
         roles: Vec<String>,
         p2p_port: u16,
     ) -> Self {
+        let listed = match crate::transport::listed_configs(&identity) {
+            Ok(listed) => Some(listed),
+            Err(e) => {
+                tracing::warn!(error = %e, "no configs for the relays listed by key: they get every peer's windows");
+                None
+            }
+        };
         Self {
             identity,
             endpoint,
@@ -139,6 +160,7 @@ impl ConnectionManager {
             channel_ids,
             roles,
             p2p_port,
+            listed,
         }
     }
 
@@ -185,6 +207,7 @@ impl ConnectionManager {
             channel_ids: self.channel_ids.clone(),
             roles: self.roles.clone(),
             p2p_port: self.p2p_port,
+            listed: self.listed.clone(),
         }
     }
 
@@ -418,6 +441,34 @@ pub async fn outbound_connect(
         .endpoint
         .connect(addr, "cordelia")
         .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+    outbound_on(ctx, connecting, addr).await
+}
+
+/// Outbound connect to a relay configured by key, as [`outbound_connect`],
+/// with the transport settings of a connection between relays listed by
+/// key (decision 2026-10-22, memory across connections, rule 12): today's
+/// windows and 64 streams, where any other peer gets a small message's.
+/// Whether the key that answers is the relay's is the caller's question,
+/// as for any dial of a configured relay.
+pub async fn outbound_connect_to_listed(
+    ctx: &ConnectContext,
+    addr: SocketAddr,
+) -> Result<ConnectOutcome, ConnectionError> {
+    let connecting = match &ctx.listed {
+        Some(listed) => ctx
+            .endpoint
+            .connect_with(listed.client.clone(), addr, "cordelia"),
+        None => ctx.endpoint.connect(addr, "cordelia"),
+    }
+    .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+    outbound_on(ctx, connecting, addr).await
+}
+
+async fn outbound_on(
+    ctx: &ConnectContext,
+    connecting: quinn::Connecting,
+    addr: SocketAddr,
+) -> Result<ConnectOutcome, ConnectionError> {
     let conn = tokio::time::timeout(
         Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
         connecting,
@@ -472,9 +523,44 @@ pub async fn inbound_accept(
     incoming: quinn::Incoming,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let remote = incoming.remote_address();
+    inbound_on(ctx, remote, incoming.into_future(), None).await
+}
 
+/// Inbound accept of a connection from the address of a relay configured
+/// by key, as [`inbound_accept`], with the transport settings of a
+/// connection between relays listed by key (decision 2026-10-22, memory
+/// across connections, rule 12): today's windows and 64 streams.
+///
+/// An address is not an identity: once TLS completes, the connection is
+/// closed if the key in the peer's certificate is not `keys` (the keys of
+/// the relays configured at that address), before anything is read on it.
+/// So whoever else connects from there holds a connection of these
+/// settings for its TLS handshake only.
+pub async fn inbound_accept_from_listed(
+    ctx: &ConnectContext,
+    incoming: quinn::Incoming,
+    keys: &[[u8; 32]],
+) -> Result<ConnectOutcome, ConnectionError> {
+    let remote = incoming.remote_address();
+    let connecting = match &ctx.listed {
+        Some(listed) => incoming
+            .accept_with(listed.server.clone())
+            .map_err(|e| ConnectionError::Quinn(e.to_string()))?,
+        None => incoming
+            .accept()
+            .map_err(|e| ConnectionError::Quinn(e.to_string()))?,
+    };
+    inbound_on(ctx, remote, connecting, Some(keys)).await
+}
+
+async fn inbound_on(
+    ctx: &ConnectContext,
+    remote: SocketAddr,
+    connecting: impl std::future::Future<Output = Result<Connection, quinn::ConnectionError>>,
+    keys: Option<&[[u8; 32]]>,
+) -> Result<ConnectOutcome, ConnectionError> {
     // QUIC handshake with 10s timeout
-    let conn = tokio::time::timeout(Duration::from_secs(10), incoming)
+    let conn = tokio::time::timeout(Duration::from_secs(10), connecting)
         .await
         .map_err(|_| {
             tracing::warn!(remote = %remote, "QUIC incoming handshake timed out (10s)");
@@ -491,6 +577,14 @@ pub async fn inbound_accept(
 
     let peer_node_id = extract_node_id_from_conn(&conn)?;
     let node_id = NodeId(peer_node_id);
+
+    if let Some(keys) = keys
+        && !keys.contains(&peer_node_id)
+    {
+        tracing::warn!(peer = %node_id, remote = %remote, "closing a connection from a listed relay's address with another key");
+        conn.close(0u32.into(), CLOSED_AS_NOT_THE_RELAY);
+        return Err(ConnectionError::NotTheRelay(node_id));
+    }
 
     debug!(
         peer = %node_id,

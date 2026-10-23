@@ -559,6 +559,7 @@ async fn test_chaos_disconnect_during_handshake() {
         channel_ids: vec![],
         roles: vec!["personal".into()],
         p2p_port: 9474,
+        listed: None,
     };
     let accept_task = tokio::spawn(async move {
         let incoming = ep_b.accept().await.unwrap();
