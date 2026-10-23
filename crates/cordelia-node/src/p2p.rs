@@ -13070,10 +13070,14 @@ mod tests {
                 accept_incoming(&node_ctx, incoming, &relays).await
             }
         });
-        let from_other = connection::outbound_connect(&other.connect_context(), node_addr)
-            .await
-            .unwrap();
-        let _accepted = at_node.await.unwrap().unwrap();
+        let from_other = connection::outbound_connect(&other.connect_context(), node_addr).await;
+        let accepted = at_node.await.unwrap();
+        assert!(
+            from_other.is_ok() && accepted.is_ok(),
+            "a peer from another address than a listed relay's was not accepted: {:?}",
+            accepted.err()
+        );
+        let from_other = from_other.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             what_it_may_send(&from_other.conn, 1).await,
