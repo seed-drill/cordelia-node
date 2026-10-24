@@ -1793,7 +1793,7 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
     assert!(tooltip.contains(also), "{tooltip}");
     let plain = laptop.cli(&["status"]);
     assert!(
-        plain.contains("Memory:    memory: 1 folder stopped syncing"),
+        plain.contains("Memory:    1 folder stopped syncing"),
         "{plain}"
     );
     assert!(plain.contains(&format!("    also:     {also}")), "{plain}");

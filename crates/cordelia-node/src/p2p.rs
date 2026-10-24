@@ -5174,6 +5174,7 @@ fn relay_snapshots(
                     last_tried_secs: None,
                     error: Some(format!("the same relay as {}", set_up[first].host)),
                     tried: Default::default(),
+                    connection: None,
                 };
             }
             let found = resolved
@@ -5188,6 +5189,7 @@ fn relay_snapshots(
                     last_tried_secs: None,
                     error: Some(NAME_DOES_NOT_RESOLVE.into()),
                     tried: cordelia_api::state::Tried::LookedUp,
+                    connection: None,
                 };
             };
             let tried = tries.get(&tried_relay(relay));
@@ -5238,13 +5240,40 @@ fn relay_snapshots(
                     (false, true) => cordelia_api::state::Tried::NoKey,
                     (false, false) => cordelia_api::state::Tried::Dialled,
                 },
+                connection: None,
             }
         })
         .collect()
 }
 
+/// Where each relay that the node is set up with stands now
+/// ([`relay_snapshots`]), with the connection that the dial loop made to
+/// it and that is its own, where one is (decision 2026-10-24, rule 2): the
+/// one that a pass is given for it ([`one_relay_each_now`]). So each
+/// connection says the configured relay it was made to, a relay given no
+/// key among them, and what waits there is said by that relay's name. A
+/// relay that is the same relay as one before it has none: the first is
+/// the one named.
+fn relays_now(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> Vec<cordelia_api::state::RelaySnapshot> {
+    let (peers, one) = one_relay_each_now(set_up, resolved, conn_mgr);
+    let mut list = relay_snapshots(set_up, resolved, tries, &one, &|relay| {
+        relay_connected(conn_mgr, relay)
+    });
+    for ((relay, peer), one) in list.iter_mut().zip(peers).zip(&one) {
+        if !matches!(one, OneRelay::SameAs(_)) {
+            relay.connection = peer.map(|peer| peer.0);
+        }
+    }
+    list
+}
+
 /// Publish where each relay that the node is set up with stands
-/// ([`relay_snapshots`]).
+/// ([`relays_now`]).
 fn publish_relays(
     state: &cordelia_api::state::AppState,
     set_up: &[cordelia_network::bootstrap::Relay],
@@ -5252,10 +5281,7 @@ fn publish_relays(
     tries: &std::collections::HashMap<TriedRelay, RelayTry>,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
 ) {
-    let (_, one) = one_relay_each_now(set_up, resolved, conn_mgr);
-    let list = relay_snapshots(set_up, resolved, tries, &one, &|relay| {
-        relay_connected(conn_mgr, relay)
-    });
+    let list = relays_now(set_up, resolved, tries, conn_mgr);
     // Which of them are connected now: the node keeps since when each
     // has been, and since when none has, by its own clock.
     let connected: Vec<&str> = list
@@ -10552,6 +10578,69 @@ mod tests {
         // One of them alone is one relay, by its key.
         let one = relays_with_links(&set_up[..1], &addrs, &conn_mgr, &own);
         assert!(by_key(&one, own.relays_set_up()).is_some());
+        conn_mgr.shutdown();
+    }
+
+    /// **Each connection says the configured relay it was made to**
+    /// (decision 2026-10-24, rule 2): where each relay stands names the
+    /// connection that is its own, the one a pass is given for it. A relay
+    /// given no key has its connection by the address its name resolves
+    /// to; one that is down has none; a relay that is the same relay as one
+    /// before it has none, and the first is the one named; and a relay
+    /// given no key at a keyed relay's place has none, for the connection
+    /// there is that relay's.
+    #[tokio::test]
+    async fn each_connection_says_the_configured_relay_it_was_made_to() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let (mut conn_mgr, key, addr, _relay) = connected_to_a_relay().await;
+        let named = |host: &str, key: Option<[u8; 32]>| Relay {
+            host: host.into(),
+            key,
+        };
+        let at = |relay: &Relay, addr| RelayAddr {
+            host: relay.host.clone(),
+            addr,
+            key: relay.key,
+        };
+        let tries = std::collections::HashMap::new();
+        let made_to =
+            |set_up: &[Relay], resolved: &[RelayAddr]| -> Vec<(String, Option<[u8; 32]>)> {
+                relays_now(set_up, resolved, &tries, &conn_mgr)
+                    .into_iter()
+                    .map(|relay| (relay.host, relay.connection))
+                    .collect()
+            };
+        let keyless = named("localhost.test:9474", None);
+        let down = named("down.test:9474", None);
+        let resolved = [
+            at(&keyless, addr),
+            at(&down, "127.0.0.1:9".parse().unwrap()),
+        ];
+        assert_eq!(
+            made_to(&[keyless.clone(), down.clone()], &resolved),
+            [
+                ("localhost.test:9474".to_string(), Some(key)),
+                ("down.test:9474".to_string(), None),
+            ]
+        );
+        let keyed = named("keyed.test:9474", Some(key));
+        let again = named("again.test:9474", Some(key));
+        assert_eq!(
+            made_to(&[keyed.clone(), again], &[]),
+            [
+                ("keyed.test:9474".to_string(), Some(key)),
+                ("again.test:9474".to_string(), None),
+            ]
+        );
+        let set_up = [keyed.clone(), keyless.clone()];
+        let resolved = [at(&keyed, addr), at(&keyless, addr)];
+        assert_eq!(
+            made_to(&set_up, &resolved),
+            [
+                ("keyed.test:9474".to_string(), Some(key)),
+                ("localhost.test:9474".to_string(), None),
+            ]
+        );
         conn_mgr.shutdown();
     }
 

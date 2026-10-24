@@ -1375,6 +1375,7 @@ async fn test_the_look_carries_the_word_to_come_each_class_and_how_each_relay_is
         last_tried_secs: None,
         error: None,
         tried,
+        connection: None,
     };
     *state.relays.write().unwrap() = vec![
         known(names[0], "unreachable", Tried::LookedUp),

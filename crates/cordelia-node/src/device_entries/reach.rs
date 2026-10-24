@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cordelia_api::at_relays::known::RelayId;
-use cordelia_api::state::{Class, Holds, Reach as Reached, Waits};
+use cordelia_api::state::{Class, Holds, Reach as Reached, ReferenceBy, Waits};
 use cordelia_core::protocol::OUT_OF_REACH_SECS;
 
 use super::leave::{Clock, LinkId};
@@ -159,6 +159,15 @@ impl Of {
         }
     }
 
+    /// Which moment its reference is ([`Self::reference`]), where `common`
+    /// is `by` (decision 2026-10-24, rule 6).
+    fn reference_by(&self, common: Moment, by: ReferenceBy) -> ReferenceBy {
+        match self.last_reached {
+            Some(reached) if reached.at > common.at => ReferenceBy::Reached,
+            _ => by,
+        }
+    }
+
     /// The reference moved to `now`: the five minutes start again.
     fn starts_again(&mut self, now: Moment) {
         self.last_begun = None;
@@ -231,8 +240,9 @@ impl Of {
 #[derive(Debug)]
 struct Inner {
     /// The latest of the node's start, a sleep, and the moment the kept
-    /// entry last changed.
+    /// entry last changed; and which of them it is.
     common: Moment,
+    common_by: ReferenceBy,
     /// The kept entry, as the pass last found it: `None` before it has.
     kept: Option<Option<[u8; 32]>>,
     /// Whether the device has a change entry to show: it follows a phrase
@@ -282,6 +292,7 @@ impl Reach {
             clock,
             inner: Mutex::new(Inner {
                 common: now,
+                common_by: ReferenceBy::Start,
                 kept: None,
                 shows: false,
                 relays: HashMap::new(),
@@ -301,11 +312,20 @@ impl Reach {
 
     /// Do `work` with what is kept of `relay`, brought up to now.
     fn with<T>(&self, relay: &RelayId, work: impl FnOnce(&mut Of, Moment, Moment) -> T) -> T {
+        self.with_by(relay, |of, common, _, now| work(of, common, now))
+    }
+
+    /// [`Self::with`], told too which moment the common reference is.
+    fn with_by<T>(
+        &self,
+        relay: &RelayId,
+        work: impl FnOnce(&mut Of, Moment, ReferenceBy, Moment) -> T,
+    ) -> T {
         let now = self.now();
         let mut inner = lock(&self.inner);
-        let common = inner.common;
+        let (common, by) = (inner.common, inner.common_by);
         let of = inner.of(relay, now);
-        let done = work(of, common, now);
+        let done = work(of, common, by, now);
         of.settle(common, now);
         done
     }
@@ -357,6 +377,7 @@ impl Reach {
         let mut inner = lock(&self.inner);
         if inner.kept.is_some_and(|was| was != kept) {
             inner.common = now;
+            inner.common_by = ReferenceBy::Change;
             for of in inner.relays.values_mut() {
                 of.starts_again(now);
                 of.lacking_since = None;
@@ -408,6 +429,7 @@ impl Reach {
         let now = self.now();
         let mut inner = lock(&self.inner);
         inner.common = now;
+        inner.common_by = ReferenceBy::Sleep;
         for of in inner.relays.values_mut() {
             of.starts_again(now);
         }
@@ -590,7 +612,7 @@ impl Reach {
     /// status and the wait after a change read.
     pub fn of(&self, relay: &RelayId) -> Reached {
         let about = lock(&self.inner).kept.flatten();
-        self.with(relay, |of, common, now| {
+        self.with_by(relay, |of, common, by, now| {
             let reached = of.reached.is_some();
             let holds = of.holds.unwrap_or_default();
             let five_minutes =
@@ -628,6 +650,7 @@ impl Reach {
                 reached,
                 out_of_reach_since: of.out_since.map(|since| since.wall),
                 reference: of.reference(common).wall,
+                reference_by: of.reference_by(common, by),
                 last_reached: of.last_reached.map(|at| at.wall),
                 refused_since: refused_since.map(|since| since.wall),
                 waits,
@@ -1072,6 +1095,44 @@ mod tests {
         );
         // The last reached time is said, for a person.
         assert!(near(reach.of(&b).last_reached.unwrap() - start, 260));
+    }
+
+    /// **The reference says which moment it is** (decision 2026-10-24,
+    /// rule 6): the start, a sleep, the change of the kept entry, or the
+    /// moment the relay was last reached, whichever moved it last. A
+    /// relay reached before a sleep or a change has that as its reference,
+    /// and not the moment it was reached.
+    #[test]
+    fn the_reference_says_which_moment_it_is() {
+        let (a, b) = (relay("a"), relay("b"));
+        let (reach, clock) = started(&[(&a, Holds::Lacks), (&b, Holds::Lacks)]);
+        let by = |relay: &RelayId| reach.of(relay).reference_by;
+        assert_eq!(by(&b), ReferenceBy::Start);
+        let mut at = At::new(&clock);
+        at.to(50);
+        dial_fails(&reach, &b);
+        shown(&reach, &a, link(1), Said::Holds, Holds::Holds);
+        assert_eq!(by(&a), ReferenceBy::Reached);
+        assert_eq!(by(&b), ReferenceBy::Start, "a failed attempt moves nothing");
+        at.to(100);
+        reach.slept();
+        assert_eq!(by(&a), ReferenceBy::Sleep);
+        assert_eq!(by(&b), ReferenceBy::Sleep);
+        at.to(200);
+        observe(&reach, LATER, &[(&a, Holds::Lacks), (&b, Holds::Lacks)]);
+        assert_eq!(by(&b), ReferenceBy::Change);
+        // The same kept entry again moves nothing.
+        at.to(220);
+        observe(&reach, LATER, &[(&a, Holds::Lacks), (&b, Holds::Lacks)]);
+        assert_eq!(by(&b), ReferenceBy::Change);
+        at.to(250);
+        shown(&reach, &b, link(2), Said::Lacks, Holds::Lacks);
+        at.to(260);
+        reach.connection(&b, None);
+        assert_eq!(by(&b), ReferenceBy::Reached);
+        at.to(300);
+        reach.slept();
+        assert_eq!(by(&b), ReferenceBy::Sleep, "a sleep after it was reached");
     }
 
     /// The attempt that makes a relay out of reach must be within the

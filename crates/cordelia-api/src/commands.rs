@@ -277,16 +277,20 @@ fn relays_reached(state: &AppState) -> Vec<(String, [u8; 32])> {
         .collect()
 }
 
-/// The relays that the device is set up with, each by the key that its
-/// configuration gives for it and the name that the configuration dials
-/// it at. One that is set up with no key is not among them: which
-/// connection is its own is then known only by its address.
+/// The relays that the device is set up with, each by the name that the
+/// configuration dials it at, and by the key that its configuration gives
+/// for it; or, for one given none, by the key that answers on the
+/// connection that the dial loop made to it and that is its own, while
+/// one is (decision 2026-10-24, rule 2).
 fn relays_named(state: &AppState) -> Vec<([u8; 32], String)> {
     let known = state.relays.read().unwrap_or_else(|e| e.into_inner());
     known
         .iter()
         .filter_map(|relay| {
-            let key = decode_public_key(relay.key.as_deref()?).ok()?;
+            let key = match relay.key.as_deref() {
+                Some(key) => decode_public_key(key).ok()?,
+                None => relay.connection?,
+            };
             Some((key, relay.host.clone()))
         })
         .collect()
@@ -296,10 +300,12 @@ fn relays_named(state: &AppState) -> Vec<([u8; 32], String)> {
 /// device's channels have something that waits to be sent there.
 ///
 /// `relay` is the address that it is reached at. **`name` is the name
-/// that the device's configuration gives it,** where it answers with the
-/// key of a relay that the device is set up with ([`relays_named`]), and
-/// null where it does not: where a device stands at its relays is said by
-/// that name, and a command lists a relay once (decision 2026-10-04 §8).
+/// that the device's configuration gives it,** where the connection is
+/// that of a relay that the device is set up with ([`relays_named`]),
+/// a relay given no key among them, and null where it is not: where a
+/// device stands at its relays is said by that name, and a command lists
+/// a relay once (decision 2026-10-04 §8). No line that a person reads
+/// says `relay` (decision 2026-10-24, rule 2).
 fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
     let relays = relays_reached(state);
     let named = relays_named(state);
@@ -1774,8 +1780,9 @@ exit 0"#,
     /// device's configuration gives that relay, where it answers with the
     /// key that the configuration gives for it (decision 2026-10-04 §8):
     /// a command then lists the relay once, by its name. A relay that
-    /// answers with another key, or that is set up with none, has its
-    /// address and no name.
+    /// answers with another key has its address and no name; so has one
+    /// set up with none whose connection the dial loop has not said is its
+    /// own ([`a_relay_given_no_key_is_named_in_its_row_as_configured`]).
     #[test]
     fn test_what_waits_at_a_relay_is_said_with_the_relays_name() {
         use crate::state::RelaySnapshot;
@@ -1793,6 +1800,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried: Default::default(),
+            connection: None,
         };
         // Before the node has listed its relays, none has a name.
         let rows = waiting(&state).unwrap();
@@ -1819,6 +1827,48 @@ exit 0"#,
         );
         // What waits there is said as before.
         assert!(rows.iter().all(|row| row["waits"].is_u64()), "{rows:?}");
+    }
+
+    /// **A relay given no key is named in its row as configured**
+    /// (decision 2026-10-24, rule 2): the dial loop says which connection
+    /// is its own, and the row of what waits there names it by the name of
+    /// the configuration, never by the address it was reached at. A
+    /// connection that no relay of the configuration says is its own has
+    /// no name.
+    #[test]
+    fn a_relay_given_no_key_is_named_in_its_row_as_configured() {
+        use crate::state::RelaySnapshot;
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let (keyless, other) = ([8u8; 32], [9u8; 32]);
+        connected(&state, &keyless, "127.0.0.1:9474");
+        connected(&state, &other, "192.0.2.3:9474");
+        let set_up = |name: &str, connection: Option<[u8; 32]>| RelaySnapshot {
+            host: name.into(),
+            key: None,
+            state: "connected".into(),
+            unreachable_secs: None,
+            last_tried_secs: None,
+            error: None,
+            tried: Default::default(),
+            connection,
+        };
+        *state.relays.write().unwrap() = vec![
+            set_up("localhost:9474", Some(keyless)),
+            set_up("down.example:9474", None),
+        ];
+        let rows = waiting(&state).unwrap();
+        let said: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|row| (row["relay"].as_str().unwrap(), row["name"].as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("127.0.0.1:9474", Some("localhost:9474")),
+                ("192.0.2.3:9474", None),
+            ]
+        );
     }
 
     /// A relay that the device is set up with and that the node is not
@@ -1854,6 +1904,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried: Default::default(),
+            connection: None,
         };
         // Before the node has listed its relays, none is known to be
         // connected.
@@ -1915,6 +1966,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried,
+            connection: None,
         };
         *state.relays.write().unwrap() = vec![
             known(names[0], "connected", Tried::Dialled),

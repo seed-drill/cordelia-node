@@ -1002,6 +1002,22 @@ pub enum Class {
     Refusing,
 }
 
+/// Which moment a relay's reference is (decision 2026-10-24, rule 6):
+/// what "since" says it is since. It is shown, and nothing decides by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceBy {
+    /// The node's start.
+    #[default]
+    Start,
+    /// A sleep that the device woke from.
+    Sleep,
+    /// The change of the kept entry: when this device applied the change.
+    Change,
+    /// The moment the relay was last reached.
+    Reached,
+}
+
 /// What the device knows of one relay's reach (decision 2026-10-19 §1):
 /// what the node keeps of it, in its database and in memory. Each time is
 /// by the time of day, in seconds.
@@ -1026,6 +1042,9 @@ pub struct Reach {
     /// device woke from, the moment the kept entry last changed, and the
     /// moment the relay was last reached.
     pub reference: i64,
+    /// Which of those moments its reference is (decision 2026-10-24, rule
+    /// 6).
+    pub reference_by: ReferenceBy,
     /// When it was last reached, where it was since the node started.
     pub last_reached: Option<i64>,
     /// Since when it has lacked the change, with every show answered on
@@ -1612,6 +1631,13 @@ pub struct RelaySnapshot {
     /// that lacks the change.
     #[serde(skip)]
     pub tried: Tried,
+    /// The key of the peer on the connection that the dial loop made to
+    /// it and that is its own, where one is: by its key, or for a relay
+    /// given none by the address its name resolves to (decision
+    /// 2026-10-24, rule 2). A row of what waits at a connection names the
+    /// relay by it.
+    #[serde(skip)]
+    pub connection: Option<[u8; 32]>,
 }
 
 /// How the node tries a relay that it is not connected to.
