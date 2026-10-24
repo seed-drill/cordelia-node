@@ -2183,7 +2183,8 @@ fn claude_memory_syncs_between_two_machines() {
     // seen the note written there.
     let found = wait_for("a lists what it found", &all, 60, || {
         let out = a.cli(&["sync", "status"]);
-        out.contains("cordelia sync map ~/notes <name>").then_some(out)
+        out.contains("cordelia sync map ~/notes <name>")
+            .then_some(out)
     });
     for expected in [
         "Nothing syncs yet.",
