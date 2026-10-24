@@ -611,6 +611,7 @@ pub fn write(run: &Run) -> Outcome {
     );
     std::fs::write(run.out.join("SUMMARY.md"), &s).unwrap();
     std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
+    changes_written(run);
     let arrived = edits.pairs.iter().filter(|p| p.arrived.is_some()).count();
     let gone = edits
         .pairs
@@ -683,6 +684,37 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         ));
     }
     said
+}
+
+/// Each start, freeze, going on and stop of each node, and how each stop
+/// ended, as lines of `samples.jsonl` (§1.3): what the harness did to each
+/// process, beside what it read of it.
+fn changes_written(run: &Run) {
+    use std::io::Write as _;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(run.out.join("samples.jsonl"))
+    else {
+        return;
+    };
+    for c in run.fleet.changes.lock().unwrap().iter() {
+        let became = match c.is {
+            Is::NotStarted => "not started",
+            Is::Running => "running",
+            Is::Frozen => "frozen",
+            Is::Stopped => "stopped",
+        };
+        let mut line = serde_json::json!({
+            "t": (c.t * 10.0).round() / 10.0,
+            "node": run.fleet.made[c.node].label,
+            "became": became,
+        });
+        if let Some((took, status)) = &c.ended {
+            line["stopped_in_secs"] = ((took * 10.0).round() / 10.0).into();
+            line["status"] = status.clone().into();
+        }
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn growth_said(plan: &Plan) -> String {
@@ -1686,11 +1718,17 @@ fn bar_11(read: &Read) -> Line {
 }
 
 /// The spans between a relay's samples that `keep` keeps in the window.
+/// Pairs one after the other make one stretch, so that an edit near the
+/// end of one pair has its push counted in the next.
 fn kept_spans(series: &[&Sample], read: &Read, keep: &dyn Fn(f64, f64) -> bool) -> Vec<(f64, f64)> {
-    pairs(series, read.start, read.end)
-        .filter(|(s0, s1)| keep(s0.t, s1.t))
-        .map(|(s0, s1)| (s0.t, s1.t))
-        .collect()
+    let mut spans: Vec<(f64, f64)> = Vec::new();
+    for (s0, s1) in pairs(series, read.start, read.end).filter(|(s0, s1)| keep(s0.t, s1.t)) {
+        match spans.last_mut() {
+            Some(last) if last.1 == s0.t => last.1 = s1.t,
+            _ => spans.push((s0.t, s1.t)),
+        }
+    }
+    spans
 }
 
 /// What the model asks of relay `r` over `spans`, for the time each device
