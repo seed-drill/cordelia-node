@@ -6054,7 +6054,8 @@ mod tests {
     /// wait and its hold, and of no other (decision 2026-10-22 §1.1, rule
     /// 4): a whole show, a short show of the entry shown whole, a pull of
     /// a proved channel and a push; the stream between relays; and a
-    /// sweep of what nobody uses and of old deletes.
+    /// sweep of what nobody uses and of old deletes, and the room made at
+    /// a start within a cap that came down.
     #[test]
     fn each_take_of_the_lock_in_a_request_is_of_its_kind() {
         let at = relay_of(u64::MAX, &[9]);
@@ -6079,6 +6080,7 @@ mod tests {
         said(at.answer(9, Protocol::RelayEntries, ask, None, &mut Proved::default()));
         at.entries.sweep_at(&at.db, NOW);
         at.entries.sweep_deletes_at(&at.db, NOW);
+        at.entries.make_room(&at.db);
         assert_eq!(
             takes(&at),
             [
@@ -6087,7 +6089,7 @@ mod tests {
                 (Kind::Pull, 1),
                 (Kind::Push, 1),
                 (Kind::Relays, 1),
-                (Kind::Sweep, 2),
+                (Kind::Sweep, 3),
             ]
         );
         for kind in Kind::ALL {

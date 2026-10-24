@@ -10675,6 +10675,40 @@ async fn what_a_device_counts_it_asked_is_what_its_relay_counts_it_read() {
         ),
         0
     );
+
+    // A request of the relay's local API takes its lock as the local API:
+    // every route is wrapped so (decision 2026-10-22 §1.1, rule 4). Its
+    // status takes the lock.
+    let api = |text: &str| {
+        let line = "cordelia_lock_hold_microseconds_count{kind=\"api\"}";
+        value_of(text, line)
+    };
+    let before = api(&relay.get_text("/api/v1/metrics/load"));
+    assert!(relay.get("/api/v1/status").is_some());
+    let after = api(&relay.get_text("/api/v1/metrics/load"));
+    assert!(after > before, "{before} {after}");
+}
+
+/// A device's sync cycle takes its lock as the cycle, and a request of its
+/// local API as the local API (decision 2026-10-22 §1.1, rule 4): a device
+/// process, read through its route. Its cycle runs as it starts, and every
+/// five seconds.
+#[test]
+fn a_device_process_takes_its_lock_as_its_sync_cycle_and_its_local_api() {
+    let mut device = node("laptop", "personal", None);
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    let holds = |kind: &str| {
+        let line = format!("cordelia_lock_hold_microseconds_count{{kind=\"{kind}\"}}");
+        value_of(&device.get_text("/api/v1/metrics/load"), &line)
+    };
+    wait_for("a take of the sync cycle", &[&device], 30, || {
+        (holds("cycle") > 0).then_some(())
+    });
+    let before = holds("api");
+    assert!(device.get("/api/v1/status").is_some());
+    let after = holds("api");
+    assert!(after > before, "{before} {after}");
 }
 
 /// A relay counts a connection it turns away by why, and its churns where
