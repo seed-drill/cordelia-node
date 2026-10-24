@@ -421,6 +421,21 @@ impl<const C: usize> ByRelay<C> {
         &self.rest
     }
 
+    /// What the relay `key` has, its slots summed: two that took a slot
+    /// for it at the same moment have one each. `None` where it has none.
+    fn sum_of(&self, key: &[u8; 32]) -> Option<[u64; C]> {
+        let mut sum = None;
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == READY && slot.is_of(key) {
+                let summed = sum.get_or_insert([0; C]);
+                for (n, count) in summed.iter_mut().zip(&slot.counts) {
+                    *n += count.load(Ordering::Relaxed);
+                }
+            }
+        }
+        sum
+    }
+
     /// Count the relay `key`, so that it has a slot from now on.
     pub fn counts(&self, key: &[u8; 32]) {
         self.of(key);
@@ -578,12 +593,10 @@ impl ConnectionCounts {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// The closures of the link to the relay `key` so far: none where it
-    /// is not counted.
+    /// The closures of the link to the relay `key` so far, its slots
+    /// summed: none where it is not counted.
     pub fn closures_of(&self, key: &[u8; 32]) -> u64 {
-        self.relays
-            .find(key)
-            .map_or(0, |counts| counts[CLOSURES].load(Ordering::Relaxed))
+        self.relays.sum_of(key).map_or(0, |counts| counts[CLOSURES])
     }
 
     /// The inbound connections turned away for `why` so far.
@@ -736,13 +749,12 @@ impl DeviceCounts {
         self.relays.add(relay, REFUSED_FOR_NOW, 1);
     }
 
-    /// What is counted of the relay `key`: nothing where it has no slot.
+    /// What is counted of the relay `key`, its slots summed: nothing
+    /// where it has no slot.
     pub fn of(&self, key: &[u8; 32]) -> DeviceRead {
         self.relays
-            .find(key)
-            .map_or_else(DeviceRead::default, |counts| {
-                DeviceRead::of(std::array::from_fn(|i| counts[i].load(Ordering::Relaxed)))
-            })
+            .sum_of(key)
+            .map_or_else(DeviceRead::default, DeviceRead::of)
     }
 
     /// What is counted of each relay, by its key; and of the rest, where
@@ -1343,6 +1355,41 @@ mod tests {
         by.counts(&[9; 32]);
         by.add_where_counted(&[9; 32], 0, 1);
         assert_eq!(by.read(), (vec![([9; 32], [1])], None));
+    }
+
+    /// The relay `key`, given two slots, as two threads that count it at
+    /// the same moment may give it.
+    fn taken_twice<const C: usize>(by: &ByRelay<C>, key: &[u8; 32]) {
+        for slot in &by.slots[..2] {
+            slot.state.store(WRITING, Ordering::Release);
+            for (part, of) in slot.key.iter().zip(key.as_chunks::<8>().0) {
+                part.store(u64::from_le_bytes(*of), Ordering::Relaxed);
+            }
+            slot.state.store(READY, Ordering::Release);
+        }
+    }
+
+    /// A relay that has two slots is read with its slots summed, wherever
+    /// it is read (decision 2026-10-22 §1.2): what a device counts of it,
+    /// and the closures of its link. What is counted goes in the first.
+    #[test]
+    fn a_relay_with_two_slots_is_read_with_them_summed() {
+        let key = [5; 32];
+        let device = DeviceCounts::default();
+        taken_twice(&device.relays, &key);
+        device.held_back(&key);
+        device.relays.slots[1].counts[REFUSED_FOR_NOW].fetch_add(2, Ordering::Relaxed);
+        device.relays.slots[1].counts[HELD_BACK].fetch_add(1, Ordering::Relaxed);
+        let read = device.of(&key);
+        assert_eq!((read.held_back, read.refused_for_now), (2, 2));
+        assert_eq!(device.read().0, [(key, read)]);
+
+        let connections = ConnectionCounts::default();
+        taken_twice(&connections.relays, &key);
+        connections.closed(&key);
+        connections.relays.slots[1].counts[CLOSURES].fetch_add(2, Ordering::Relaxed);
+        assert_eq!(connections.closures_of(&key), 3);
+        assert_eq!(connections.closures_of(&[6; 32]), 0);
     }
 
     /// Relays counted from many threads at once are each counted, and
