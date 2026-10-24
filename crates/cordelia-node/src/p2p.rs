@@ -6513,6 +6513,18 @@ async fn send_channel_announcements(
 mod tests {
     use super::*;
 
+    /// A test over real QUIC, bounded as a whole: one that waits for what
+    /// never comes fails here on this assertion, with its name, and does
+    /// not hold the run of the suite until CI gives up on it. Each test
+    /// wrapped in it bounds its own waits as well; this is the bound over
+    /// all of them.
+    async fn within<T>(test: &str, secs: u64, run: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), run).await {
+            Ok(done) => done,
+            Err(_) => panic!("{test} did not end within {secs} s"),
+        }
+    }
+
     /// Every relay that a node is set up with is listed for `cordelia
     /// peers` and `cordelia status`, by its name, whether or not the name
     /// resolves (decision 2026-10-04 §16): one that does not is
@@ -8238,7 +8250,8 @@ mod tests {
     /// timeout, about ten seconds.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_large_frame_with_no_permit_is_refused_later_and_counts_no_breach() {
-        use cordelia_network::codec::{write_protocol_byte, write_raw_frame};
+        within("a_large_frame_with_no_permit_is_refused_later_and_counts_no_breach", 60, async move {
+        use cordelia_network::codec::write_protocol_byte;
         use cordelia_network::messages::Protocol;
         use cordelia_network::{connection, transport};
 
@@ -8340,7 +8353,26 @@ mod tests {
         // the body, as a device of the version before waits in its write,
         // until the node stops the receive side. The send is left open
         // (not finished), so the stop is seen on it.
-        let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
+        //
+        // The peer waits in its write for longer than the node waits for a
+        // permit, so that the node's refusal is what ends it. Written with
+        // the codec, the write gave up at its own STREAM_TIMEOUT, the same
+        // 10 s as the node's wait and begun a little before it; where it
+        // gave up first, it reset its own send side, the node's stop was
+        // never seen on it, and `stopped` below waited for ever (about one
+        // run in four with ten at once).
+        let frame = vec![0x5a; 1_000_000];
+        let written = tokio::time::timeout(2 * cordelia_network::codec::STREAM_TIMEOUT, async {
+            csend.write_all(&(frame.len() as u32).to_be_bytes()).await?;
+            csend.write_all(&frame).await
+        })
+        .await
+        .expect("the node did not stop the stream of a frame it had no permit for");
+        let later = quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER);
+        assert!(
+            matches!(written, Err(quinn::WriteError::Stopped(code)) if code == later),
+            "the peer's write was not stopped with ERR_LARGE_MESSAGE_LATER: {written:?}"
+        );
 
         // The node resets the send side with ERR_LARGE_MESSAGE_LATER
         // (0x05), which the peer learns when it reads the stream.
@@ -8360,7 +8392,10 @@ mod tests {
         }
         // The node also stops the receive side with the same code, which
         // the peer learns as its own send being stopped.
-        match csend.stopped().await {
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), csend.stopped())
+            .await
+            .expect("the peer's send was never said to be stopped");
+        match stopped {
             Ok(Some(code)) => assert_eq!(
                 code,
                 quinn::VarInt::from_u32(cordelia_core::protocol::ERR_LARGE_MESSAGE_LATER),
@@ -8371,12 +8406,17 @@ mod tests {
             }
         }
         // It was refused, not stored, and counts no breach.
-        let (over, _conn) = serving.await.unwrap();
+        let (over, _conn) = tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+            .await
+            .expect("the node's handler did not end once it had refused the frame")
+            .unwrap();
         assert!(over.is_none(), "a refused large frame counted a breach");
         assert!(
             !rates.lock().unwrap().is_counting(&peer),
             "a refused large frame was counted against the peer's push allowance"
         );
+        })
+        .await;
     }
 
     /// An answer of the older kind's sync stream is encoded and the
@@ -8835,18 +8875,25 @@ mod tests {
     /// not read.
     #[tokio::test]
     async fn the_small_streams_do_not_read_a_frame_over_a_small_message() {
-        assert!(
-            !handler_drains_a_large_frame(Handler::PeerShare).await,
-            "peer-share read a frame over a small message"
-        );
-        assert!(
-            !handler_drains_a_large_frame(Handler::ChannelAnnounce).await,
-            "channel-announce read a frame over a small message"
-        );
-        assert!(
-            !handler_drains_a_large_frame(Handler::SyncNothing).await,
-            "the older kind's answer-nothing read a frame over a small message"
-        );
+        within(
+            "the_small_streams_do_not_read_a_frame_over_a_small_message",
+            60,
+            async move {
+                assert!(
+                    !handler_drains_a_large_frame(Handler::PeerShare).await,
+                    "peer-share read a frame over a small message"
+                );
+                assert!(
+                    !handler_drains_a_large_frame(Handler::ChannelAnnounce).await,
+                    "channel-announce read a frame over a small message"
+                );
+                assert!(
+                    !handler_drains_a_large_frame(Handler::SyncNothing).await,
+                    "the older kind's answer-nothing read a frame over a small message"
+                );
+            },
+        )
+        .await;
     }
 
     /// Whether a relay reads and answers a large push (longer than a small
@@ -9023,27 +9070,34 @@ mod tests {
     /// unlisted peer's is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_inbound_loop_takes_permits_and_exempts_only_listed_relays() {
-        use cordelia_network::messages::Protocol::ItemPush;
-        // A relay listed by key: read though no permit is free (rule 7).
-        assert!(
-            large_push_answered(ItemPush, true, false, 0).await,
-            "a listed relay's large push was not read"
-        );
-        // A peer that is not listed: not read with no permit (rule 2).
-        assert!(
-            !large_push_answered(ItemPush, false, false, 0).await,
-            "an unlisted peer's large push was read with no permit"
-        );
-        // A relay configured by address alone is unlisted for F: it waits.
-        assert!(
-            !large_push_answered(ItemPush, false, true, 0).await,
-            "a relay configured by address alone was exempted"
-        );
-        // With a permit free, an unlisted peer's push is read.
-        assert!(
-            large_push_answered(ItemPush, false, false, 1).await,
-            "an unlisted peer's large push was not read when a permit was free"
-        );
+        within(
+            "the_inbound_loop_takes_permits_and_exempts_only_listed_relays",
+            60,
+            async move {
+                use cordelia_network::messages::Protocol::ItemPush;
+                // A relay listed by key: read though no permit is free (rule 7).
+                assert!(
+                    large_push_answered(ItemPush, true, false, 0).await,
+                    "a listed relay's large push was not read"
+                );
+                // A peer that is not listed: not read with no permit (rule 2).
+                assert!(
+                    !large_push_answered(ItemPush, false, false, 0).await,
+                    "an unlisted peer's large push was read with no permit"
+                );
+                // A relay configured by address alone is unlisted for F: it waits.
+                assert!(
+                    !large_push_answered(ItemPush, false, true, 0).await,
+                    "a relay configured by address alone was exempted"
+                );
+                // With a permit free, an unlisted peer's push is read.
+                assert!(
+                    large_push_answered(ItemPush, false, false, 1).await,
+                    "an unlisted peer's large push was not read when a permit was free"
+                );
+            },
+        )
+        .await;
     }
 
     /// The live inbound loop hands the permits to the streams of entries
@@ -9151,143 +9205,150 @@ mod tests {
     /// answered rather than refused with ERR_LARGE_MESSAGE_LATER.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_large_frame_is_read_once_a_permit_frees_over_quic() {
-        use cordelia_network::codec::{read_frame, write_protocol_byte, write_raw_frame};
-        use cordelia_network::messages::{Item, Protocol, PushPayload, WireMessage};
-        use cordelia_network::{connection, transport};
+        within(
+            "a_large_frame_is_read_once_a_permit_frees_over_quic",
+            60,
+            async move {
+                use cordelia_network::codec::{read_frame, write_protocol_byte, write_raw_frame};
+                use cordelia_network::messages::{Item, Protocol, PushPayload, WireMessage};
+                use cordelia_network::{connection, transport};
 
-        let id = |seed: u8| {
-            std::sync::Arc::new(
-                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
-            )
-        };
-        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (node_id_key, client_key) = (id(1), id(2));
-        let node_end = transport::create_endpoint(&node_id_key, here).unwrap();
-        let node_addr = node_end.local_addr().unwrap();
-        let node_mgr = connection::ConnectionManager::new(
-            node_id_key.clone(),
-            node_end,
-            vec![],
-            vec!["relay".into()],
-            node_addr.port(),
-        );
-        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+                let id = |seed: u8| {
+                    std::sync::Arc::new(
+                        cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+                    )
+                };
+                let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let (node_id_key, client_key) = (id(1), id(2));
+                let node_end = transport::create_endpoint(&node_id_key, here).unwrap();
+                let node_addr = node_end.local_addr().unwrap();
+                let node_mgr = connection::ConnectionManager::new(
+                    node_id_key.clone(),
+                    node_end,
+                    vec![],
+                    vec!["relay".into()],
+                    node_addr.port(),
+                );
+                let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
 
-        // One permit, held from another subnet, so the push must wait.
-        let permits = std::sync::Arc::new(LargePermits::new(1));
-        let held = permits
-            .take(std::net::IpAddr::from([10, 0, 0, 1]))
-            .await
-            .expect("the one permit");
-
-        let state = a_state();
-        let rates = std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
-        let peer = NodeId(client_key.public_key());
-        let address: std::net::IpAddr = "198.51.100.7".parse().unwrap();
-
-        let serving = {
-            let (state, rates, permits, peer) =
-                (state.clone(), rates.clone(), permits.clone(), peer.clone());
-            tokio::spawn(async move {
-                let incoming = accepts.accept().await.unwrap();
-                let conn = connection::inbound_accept(&as_node, incoming)
+                // One permit, held from another subnet, so the push must wait.
+                let permits = std::sync::Arc::new(LargePermits::new(1));
+                let held = permits
+                    .take(std::net::IpAddr::from([10, 0, 0, 1]))
                     .await
+                    .expect("the one permit");
+
+                let state = a_state();
+                let rates = std::sync::Arc::new(std::sync::Mutex::new(Rates::default()));
+                let peer = NodeId(client_key.public_key());
+                let address: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+
+                let serving = {
+                    let (state, rates, permits, peer) =
+                        (state.clone(), rates.clone(), permits.clone(), peer.clone());
+                    tokio::spawn(async move {
+                        let incoming = accepts.accept().await.unwrap();
+                        let conn = connection::inbound_accept(&as_node, incoming)
+                            .await
+                            .unwrap()
+                            .conn;
+                        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                        let _ = cordelia_network::codec::read_protocol_byte(&mut recv)
+                            .await
+                            .unwrap();
+                        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+                        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+                        let seen_table = std::sync::Arc::new(std::sync::RwLock::new(
+                            cordelia_network::seen_table::SeenTable::default(),
+                        ));
+                        handle_inbound_push(
+                            &mut send,
+                            &mut recv,
+                            &peer,
+                            &state,
+                            "relay",
+                            &repush_tx,
+                            &delivery_tx,
+                            &seen_table,
+                            &rates,
+                            true,
+                            address,
+                            Some(&permits),
+                            false,
+                        )
+                        .await;
+                        // Keep the connection alive while the client reads the answer.
+                        conn
+                    })
+                };
+
+                let mut client_mgr = connection::ConnectionManager::new(
+                    client_key.clone(),
+                    transport::create_endpoint(&client_key, here).unwrap(),
+                    vec![],
+                    vec![],
+                    9474,
+                );
+                client_mgr.connect_to(node_addr).await.unwrap();
+                let conn = client_mgr
+                    .get_connection(&NodeId(node_id_key.public_key()))
                     .unwrap()
-                    .conn;
-                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-                let _ = cordelia_network::codec::read_protocol_byte(&mut recv)
+                    .clone();
+                let (mut csend, mut crecv) = conn.open_bi().await.unwrap();
+                write_protocol_byte(&mut csend, Protocol::ItemPush)
                     .await
                     .unwrap();
-                let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
-                let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
-                let seen_table = std::sync::Arc::new(std::sync::RwLock::new(
-                    cordelia_network::seen_table::SeenTable::default(),
-                ));
-                handle_inbound_push(
-                    &mut send,
-                    &mut recv,
-                    &peer,
-                    &state,
-                    "relay",
-                    &repush_tx,
-                    &delivery_tx,
-                    &seen_table,
-                    &rates,
-                    true,
-                    address,
-                    Some(&permits),
-                    false,
+                // A valid push longer than a small message.
+                let item = Item {
+                    item_id: "ci_frees".into(),
+                    channel_id: "grp_x".into(),
+                    item_type: "memory".into(),
+                    encrypted_blob: vec![0u8; 200_000],
+                    content_hash: vec![0u8; 32],
+                    content_length: 200_000,
+                    author_id: vec![0u8; 32],
+                    signature: vec![0u8; 64],
+                    key_version: 1,
+                    published_at: "2026-10-22T00:00:00Z".into(),
+                    is_tombstone: false,
+                    parent_id: None,
+                    slot: None,
+                    rev: None,
+                };
+                let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
+                let frame = cordelia_network::codec::encode_message(&push).unwrap();
+                assert!(
+                    frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
+                    "the push was meant to be over a small message"
+                );
+                // The frame is longer than the stream's window, so its write waits
+                // while the node waits for a permit, as a device of the version
+                // before waits in its write.
+                let writing = tokio::spawn(async move {
+                    let _ = write_raw_frame(&mut csend, &frame).await;
+                    csend
+                });
+
+                // The node is parked, waiting for a permit. Let the held one go,
+                // well within the stream timeout.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(held);
+
+                // The push is answered, not refused.
+                let answered = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    read_frame(&mut crecv, Protocol::ItemPush),
                 )
                 .await;
-                // Keep the connection alive while the client reads the answer.
-                conn
-            })
-        };
-
-        let mut client_mgr = connection::ConnectionManager::new(
-            client_key.clone(),
-            transport::create_endpoint(&client_key, here).unwrap(),
-            vec![],
-            vec![],
-            9474,
-        );
-        client_mgr.connect_to(node_addr).await.unwrap();
-        let conn = client_mgr
-            .get_connection(&NodeId(node_id_key.public_key()))
-            .unwrap()
-            .clone();
-        let (mut csend, mut crecv) = conn.open_bi().await.unwrap();
-        write_protocol_byte(&mut csend, Protocol::ItemPush)
-            .await
-            .unwrap();
-        // A valid push longer than a small message.
-        let item = Item {
-            item_id: "ci_frees".into(),
-            channel_id: "grp_x".into(),
-            item_type: "memory".into(),
-            encrypted_blob: vec![0u8; 200_000],
-            content_hash: vec![0u8; 32],
-            content_length: 200_000,
-            author_id: vec![0u8; 32],
-            signature: vec![0u8; 64],
-            key_version: 1,
-            published_at: "2026-10-22T00:00:00Z".into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        };
-        let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
-        let frame = cordelia_network::codec::encode_message(&push).unwrap();
-        assert!(
-            frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
-            "the push was meant to be over a small message"
-        );
-        // The frame is longer than the stream's window, so its write waits
-        // while the node waits for a permit, as a device of the version
-        // before waits in its write.
-        let writing = tokio::spawn(async move {
-            let _ = write_raw_frame(&mut csend, &frame).await;
-            csend
-        });
-
-        // The node is parked, waiting for a permit. Let the held one go,
-        // well within the stream timeout.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        drop(held);
-
-        // The push is answered, not refused.
-        let answered = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_frame(&mut crecv, Protocol::ItemPush),
+                assert!(
+                    answered.is_ok_and(|r| r.is_ok()),
+                    "the large frame was not answered once a permit freed"
+                );
+                let _ = writing.await;
+                let _ = serving.await;
+            },
         )
         .await;
-        assert!(
-            answered.is_ok_and(|r| r.is_ok()),
-            "the large frame was not answered once a permit freed"
-        );
-        let _ = writing.await;
-        let _ = serving.await;
     }
 
     /// The peer-share answer is encoded and the message dropped before the
@@ -12817,123 +12878,134 @@ mod tests {
     /// stream a moment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failed_repush_is_tried_again_a_few_streams_at_a_time() {
-        use cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE;
-        use cordelia_network::codec;
-        use cordelia_network::messages::{Protocol, WireMessage};
-        use cordelia_network::transport;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        within(
+            "a_failed_repush_is_tried_again_a_few_streams_at_a_time",
+            60,
+            async move {
+                use cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE;
+                use cordelia_network::codec;
+                use cordelia_network::messages::{Protocol, WireMessage};
+                use cordelia_network::transport;
+                use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let id = |seed: u8| cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap();
-        let (node_key, peer_key) = (id(8), id(9));
-        let peer_end =
-            transport::create_endpoint(&peer_key, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let peer_addr = peer_end.local_addr().unwrap();
-        let node_end =
-            transport::create_client_endpoint(&node_key, "127.0.0.1".parse().unwrap()).unwrap();
+                let id = |seed: u8| {
+                    cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap()
+                };
+                let (node_key, peer_key) = (id(8), id(9));
+                let peer_end =
+                    transport::create_endpoint(&peer_key, "127.0.0.1:0".parse().unwrap()).unwrap();
+                let peer_addr = peer_end.local_addr().unwrap();
+                let node_end =
+                    transport::create_client_endpoint(&node_key, "127.0.0.1".parse().unwrap())
+                        .unwrap();
 
-        // The peer: each push it is sent counts its stream as open while it
-        // holds it, notes the item, and fails it with a reset.
-        let open = std::sync::Arc::new(AtomicUsize::new(0));
-        let most = std::sync::Arc::new(AtomicUsize::new(0));
-        let tried = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-            String,
-            usize,
-        >::new()));
-        let peer = {
-            let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
-            tokio::spawn(async move {
-                let conn = peer_end.accept().await.unwrap().await.unwrap();
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                // The peer: each push it is sent counts its stream as open while it
+                // holds it, notes the item, and fails it with a reset.
+                let open = std::sync::Arc::new(AtomicUsize::new(0));
+                let most = std::sync::Arc::new(AtomicUsize::new(0));
+                let tried =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                        String,
+                        usize,
+                    >::new()));
+                let peer = {
                     let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
                     tokio::spawn(async move {
-                        let now = open.fetch_add(1, Ordering::SeqCst) + 1;
-                        most.fetch_max(now, Ordering::SeqCst);
-                        let _ = codec::read_protocol_byte(&mut recv).await;
-                        if let Ok(WireMessage::PushPayload(push)) =
-                            codec::read_frame(&mut recv, Protocol::ItemPush).await
-                        {
-                            let mut tried = tried.lock().unwrap();
-                            for item in push.items {
-                                *tried.entry(item.item_id).or_default() += 1;
-                            }
+                        let conn = peer_end.accept().await.unwrap().await.unwrap();
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
+                            tokio::spawn(async move {
+                                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                                most.fetch_max(now, Ordering::SeqCst);
+                                let _ = codec::read_protocol_byte(&mut recv).await;
+                                if let Ok(WireMessage::PushPayload(push)) =
+                                    codec::read_frame(&mut recv, Protocol::ItemPush).await
+                                {
+                                    let mut tried = tried.lock().unwrap();
+                                    for item in push.items {
+                                        *tried.entry(item.item_id).or_default() += 1;
+                                    }
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                open.fetch_sub(1, Ordering::SeqCst);
+                                let _ = send.reset(0u32.into());
+                                let _ = recv.stop(0u32.into());
+                            });
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        open.fetch_sub(1, Ordering::SeqCst);
-                        let _ = send.reset(0u32.into());
-                        let _ = recv.stop(0u32.into());
-                    });
+                    })
+                };
+                let conn = node_end
+                    .connect(peer_addr, "cordelia")
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let to = NodeId(peer_key.public_key());
+
+                // A repush of 100 items failed: each is reported for a retry.
+                let mut retries = PushRetries::new();
+                let failed = retries.failed();
+                for n in 0..100 {
+                    let item = cordelia_network::messages::Item {
+                        item_id: format!("ci_{n}"),
+                        channel_id: "grp_retries".into(),
+                        item_type: "note".into(),
+                        encrypted_blob: vec![n as u8; 64],
+                        content_hash: vec![0; 32],
+                        content_length: 64,
+                        author_id: vec![0; 32],
+                        signature: vec![0; 64],
+                        key_version: 1,
+                        published_at: "2026-10-22T00:00:00Z".into(),
+                        is_tombstone: false,
+                        parent_id: None,
+                        slot: None,
+                        rev: None,
+                    };
+                    failed
+                        .send(RetryEntry {
+                            item,
+                            peer_id: to.clone(),
+                            channel_id: "grp_retries".into(),
+                            exclude_peer: None,
+                            attempt: 0,
+                            retry_at: tokio::time::Instant::now(),
+                        })
+                        .unwrap();
                 }
-            })
-        };
-        let conn = node_end
-            .connect(peer_addr, "cordelia")
-            .unwrap()
-            .await
-            .unwrap();
-        let to = NodeId(peer_key.public_key());
 
-        // A repush of 100 items failed: each is reported for a retry.
-        let mut retries = PushRetries::new();
-        let failed = retries.failed();
-        for n in 0..100 {
-            let item = cordelia_network::messages::Item {
-                item_id: format!("ci_{n}"),
-                channel_id: "grp_retries".into(),
-                item_type: "note".into(),
-                encrypted_blob: vec![n as u8; 64],
-                content_hash: vec![0; 32],
-                content_length: 64,
-                author_id: vec![0; 32],
-                signature: vec![0; 64],
-                key_version: 1,
-                published_at: "2026-10-22T00:00:00Z".into(),
-                is_tombstone: false,
-                parent_id: None,
-                slot: None,
-                rev: None,
-            };
-            failed
-                .send(RetryEntry {
-                    item,
-                    peer_id: to.clone(),
-                    channel_id: "grp_retries".into(),
-                    exclude_peer: None,
-                    attempt: 0,
-                    retry_at: tokio::time::Instant::now(),
-                })
-                .unwrap();
-        }
+                // Rounds in quick succession, each with every backoff passed,
+                // until nothing waits and nothing runs.
+                let began = std::time::Instant::now();
+                loop {
+                    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+                    retries.round(later, &|_| true, &|_| Some(conn.clone()));
+                    if retries.is_idle() {
+                        break;
+                    }
+                    assert!(
+                        began.elapsed() < std::time::Duration::from_secs(60),
+                        "the retries did not end"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
 
-        // Rounds in quick succession, each with every backoff passed,
-        // until nothing waits and nothing runs.
-        let began = std::time::Instant::now();
-        loop {
-            let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
-            retries.round(later, &|_| true, &|_| Some(conn.clone()));
-            if retries.is_idle() {
-                break;
-            }
-            assert!(
-                began.elapsed() < std::time::Duration::from_secs(60),
-                "the retries did not end"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let most = most.load(Ordering::SeqCst);
-        assert!(
-            most <= PUSH_RETRY_STREAMS_AT_ONCE,
-            "{most} retries ran to the peer at once"
-        );
-        let tried = tried.lock().unwrap().clone();
-        for n in 0..100 {
-            let times = tried.get(&format!("ci_{n}")).copied().unwrap_or(0);
-            assert!(
-                (1..=PUSH_RETRY_MAX as usize).contains(&times),
-                "item {n} was tried {times} times"
-            );
-        }
-        peer.abort();
+                let most = most.load(Ordering::SeqCst);
+                assert!(
+                    most <= PUSH_RETRY_STREAMS_AT_ONCE,
+                    "{most} retries ran to the peer at once"
+                );
+                let tried = tried.lock().unwrap().clone();
+                for n in 0..100 {
+                    let times = tried.get(&format!("ci_{n}")).copied().unwrap_or(0);
+                    assert!(
+                        (1..=PUSH_RETRY_MAX as usize).contains(&times),
+                        "item {n} was tried {times} times"
+                    );
+                }
+                peer.abort();
+            },
+        )
+        .await;
     }
 
     /// Decision 2026-10-22 (memory), rule 12. The keys listed at an
@@ -13012,6 +13084,7 @@ mod tests {
     /// its TLS completes, before its handshake is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_relay_listed_by_key_keeps_todays_windows_and_streams() {
+        within("a_relay_listed_by_key_keeps_todays_windows_and_streams", 60, async move {
         use cordelia_core::protocol::{
             QUIC_LISTED_MAX_BIDI_STREAMS, QUIC_LISTED_STREAM_RECEIVE_WINDOW, QUIC_MAX_BIDI_STREAMS,
             QUIC_STREAM_RECEIVE_WINDOW,
@@ -13159,6 +13232,8 @@ mod tests {
             dialled_by_impostor.is_err(),
             "the impostor's handshake was read"
         );
+        })
+        .await;
     }
 
     /// Decision 2026-10-22 (memory), rule 12, the check's NAT case: relay B
@@ -13169,76 +13244,89 @@ mod tests {
     /// worst case is a small page, B for full ones.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn behind_a_nat_each_relay_asks_for_pages_by_its_own_ends_settings() {
-        use cordelia_network::bootstrap::RelayAddr;
-        use cordelia_network::{connection, transport};
-
-        let id = |seed: u8| {
-            std::sync::Arc::new(
-                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
-            )
-        };
-        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
-            let end = transport::create_endpoint(key, here).unwrap();
-            let port = end.local_addr().unwrap().port();
-            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
-        };
-        let listing = |addr: std::net::SocketAddr, key: [u8; 32]| -> RelayAddrs {
-            std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
-                host: "relay.test:9474".into(),
-                addr,
-                key: Some(key),
-            }]))
-        };
-        let (a_key, b_key) = (id(31), id(32));
-        let (mut a, mut b) = (manager(&a_key), manager(&b_key));
-        // A lists B by key at an address that B does not dial from: B is
-        // behind a NAT. B lists A by key at A's address.
-        let at_a = listing("127.0.0.1:9".parse().unwrap(), b_key.public_key());
-        let at_b = listing(a.local_addr().unwrap(), a_key.public_key());
-
-        let accepting = tokio::spawn({
-            let (end, ctx, relays) = (a.endpoint(), a.connect_context(), at_a.clone());
+        within(
+            "behind_a_nat_each_relay_asks_for_pages_by_its_own_ends_settings",
+            60,
             async move {
-                let incoming = end.accept().await.unwrap();
-                accept_incoming(&ctx, incoming, &relays).await
-            }
-        });
-        let configured = at_b.read().unwrap()[0].clone();
-        let dialled = dial_relay(&b.connect_context(), &configured).await.unwrap();
-        let accepted = accepting.await.unwrap().unwrap();
-        b.register(dialled).unwrap();
-        a.register(accepted).unwrap();
+                use cordelia_network::bootstrap::RelayAddr;
+                use cordelia_network::{connection, transport};
 
-        let entries_with = |relays: &RelayAddrs| {
-            crate::relay_entries::RelayEntries::new(
-                u64::MAX,
-                relays.clone(),
-                std::time::Duration::from_secs(600),
-            )
-        };
-        let at_a = crate::relay_entries::listed_links(&entries_with(&at_a), &a);
-        let at_b = crate::relay_entries::listed_links(&entries_with(&at_b), &b);
-        assert_eq!(
-            at_a.iter()
-                .map(|(relay, _)| relay.clone())
-                .collect::<Vec<_>>(),
-            [NodeId(b_key.public_key())]
-        );
-        assert!(
-            at_a[0].1.small_windows,
-            "A, on every peer's windows, would ask B for full pages"
-        );
-        assert_eq!(
-            at_b.iter()
-                .map(|(relay, _)| relay.clone())
-                .collect::<Vec<_>>(),
-            [NodeId(a_key.public_key())]
-        );
-        assert!(
-            !at_b[0].1.small_windows,
-            "B, which carries the listed settings, would ask A for small pages"
-        );
+                let id = |seed: u8| {
+                    std::sync::Arc::new(
+                        cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+                    )
+                };
+                let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
+                    let end = transport::create_endpoint(key, here).unwrap();
+                    let port = end.local_addr().unwrap().port();
+                    connection::ConnectionManager::new(
+                        key.clone(),
+                        end,
+                        vec![],
+                        vec!["relay".into()],
+                        port,
+                    )
+                };
+                let listing = |addr: std::net::SocketAddr, key: [u8; 32]| -> RelayAddrs {
+                    std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                        host: "relay.test:9474".into(),
+                        addr,
+                        key: Some(key),
+                    }]))
+                };
+                let (a_key, b_key) = (id(31), id(32));
+                let (mut a, mut b) = (manager(&a_key), manager(&b_key));
+                // A lists B by key at an address that B does not dial from: B is
+                // behind a NAT. B lists A by key at A's address.
+                let at_a = listing("127.0.0.1:9".parse().unwrap(), b_key.public_key());
+                let at_b = listing(a.local_addr().unwrap(), a_key.public_key());
+
+                let accepting = tokio::spawn({
+                    let (end, ctx, relays) = (a.endpoint(), a.connect_context(), at_a.clone());
+                    async move {
+                        let incoming = end.accept().await.unwrap();
+                        accept_incoming(&ctx, incoming, &relays).await
+                    }
+                });
+                let configured = at_b.read().unwrap()[0].clone();
+                let dialled = dial_relay(&b.connect_context(), &configured).await.unwrap();
+                let accepted = accepting.await.unwrap().unwrap();
+                b.register(dialled).unwrap();
+                a.register(accepted).unwrap();
+
+                let entries_with = |relays: &RelayAddrs| {
+                    crate::relay_entries::RelayEntries::new(
+                        u64::MAX,
+                        relays.clone(),
+                        std::time::Duration::from_secs(600),
+                    )
+                };
+                let at_a = crate::relay_entries::listed_links(&entries_with(&at_a), &a);
+                let at_b = crate::relay_entries::listed_links(&entries_with(&at_b), &b);
+                assert_eq!(
+                    at_a.iter()
+                        .map(|(relay, _)| relay.clone())
+                        .collect::<Vec<_>>(),
+                    [NodeId(b_key.public_key())]
+                );
+                assert!(
+                    at_a[0].1.small_windows,
+                    "A, on every peer's windows, would ask B for full pages"
+                );
+                assert_eq!(
+                    at_b.iter()
+                        .map(|(relay, _)| relay.clone())
+                        .collect::<Vec<_>>(),
+                    [NodeId(a_key.public_key())]
+                );
+                assert!(
+                    !at_b[0].1.small_windows,
+                    "B, which carries the listed settings, would ask A for small pages"
+                );
+            },
+        )
+        .await;
     }
 
     /// What a relay's own fetch from a relay configured by address alone,
@@ -13522,6 +13610,7 @@ mod tests {
     /// where the peer may open all 8 of its streams.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other() {
+        within("a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other", 300, async move {
         for (pushes, push_bytes, fetched_bytes) in [
             (3, 300_000, 400_000),
             (5, 300_000, 100_000),
@@ -13547,5 +13636,7 @@ mod tests {
                 );
             }
         }
+        })
+        .await;
     }
 }

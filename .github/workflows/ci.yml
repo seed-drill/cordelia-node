@@ -20,6 +20,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # About twice what the job takes on main (43 minutes). A test that waits
+    # for ever then fails the job in this time, where it held it until
+    # GitHub's limit of six hours; each test over real QUIC is bounded too.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
