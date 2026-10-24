@@ -2594,8 +2594,10 @@ fn waits_for_the_change(
     node: &impl AfterTheChange,
     mut say: impl FnMut(String),
 ) -> anyhow::Result<Recovered> {
-    // What the wait has said, from R0 on; none before it is said.
+    // What the wait has said, from its first look on; and whether it said
+    // R0, and so is a wait that has begun.
     let mut told: Option<wait::Told> = None;
+    let mut begun = false;
     loop {
         // A node of another version, put in this one's place during the
         // wait, may say what this command reads otherwise.
@@ -2604,32 +2606,31 @@ fn waits_for_the_change(
         }
         let at = node.now();
         // Each end of a wait that has begun begins with a line of its own.
-        let ended = |told: &Option<wait::Told>| told.as_ref().map(|_| wait::Told::ended(at));
+        let ended = |begun: bool| begun.then(|| wait::Told::ended(at));
         if seen["change"].as_u64() != Some(number) {
-            ended(&told).into_iter().for_each(&mut say);
+            ended(begun).into_iter().for_each(&mut say);
             say("This device has since applied another change: `cordelia devices` says.".into());
             return Ok(Recovered::Another);
         }
         if let Some(line) = wait::no_longer_stands(&seen) {
-            ended(&told).into_iter().for_each(&mut say);
+            ended(begun).into_iter().for_each(&mut say);
             say(line);
             return Ok(Recovered::NoLongerStands);
         }
         let (relays, end) = wait::recovery_end_of_look(&seen)?;
         if told.is_none() && end != Some(RecoveryEnd::Recovered) {
             say(format!("\n{}", wait::recovery_first_line()));
-            told = Some(wait::Told::from(at));
+            begun = true;
         }
+        let told = told.get_or_insert_with(|| wait::Told::from(at));
         let now: Vec<String> = relays
             .iter()
             .filter(|relay| relay.out_of_reach() && wait::is_about_the_kept_entry(relay, &seen))
             .map(|relay| wait::out_of_reach_line(relay, at))
             .collect();
-        if let Some(told) = told.as_mut() {
-            told.of_look(now, at).into_iter().for_each(&mut say);
-        }
+        told.of_look(now, at).into_iter().for_each(&mut say);
         if let Some(end) = end {
-            ended(&told).into_iter().for_each(&mut say);
+            ended(begun).into_iter().for_each(&mut say);
             for line in wait::recovery_end_lines(end, &relays, at) {
                 say(line);
             }
@@ -6143,6 +6144,15 @@ mod tests {
         assert_eq!(said.last().unwrap(), "Every relay holds the change.");
         assert!(
             !said.iter().any(|line| line.contains("The wait has ended.")),
+            "{said:?}"
+        );
+        // S3 of the relay that holds the change and cannot be reached is
+        // said before R1 as it was, with its time.
+        assert!(
+            said.iter().any(|line| line.starts_with(
+                "  10:53:01  relay-1.example:9474 holds the \
+                                                   change, and cannot be reached from here"
+            )),
             "{said:?}"
         );
     }
