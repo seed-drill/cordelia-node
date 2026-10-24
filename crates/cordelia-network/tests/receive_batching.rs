@@ -359,10 +359,14 @@ const THRESHOLD_BYTES: isize = 1200 * 1024;
 /// that the peer loads them.
 ///
 /// Where the control stays under the threshold, the test checks nothing,
-/// and says so loudly on its output; it is not failed, since that is a
-/// property of the host (a kernel without GRO, a loopback that does not
-/// coalesce, or a runner too loaded for the peer to fill its batches) and
-/// not of the node, and a node on such a host takes no batches either.
+/// and says so loudly on its output. Off CI it is not failed, since that
+/// is a property of the host (a kernel without GRO, a loopback that does
+/// not coalesce, or a machine too loaded for the peer to fill its batches)
+/// and not of the node, and a node on such a host takes no batches either.
+/// On CI (where `CI` is set, as GitHub Actions sets it) it fails: CI is
+/// where rule 10 is held to, and a run there that checked nothing must not
+/// pass as one that did, as `msg_e2e.rs` fails without the binary of the
+/// version before.
 #[test]
 fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
     let lasting = Duration::from_secs(3);
@@ -379,6 +383,10 @@ fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
         // is captured.
         println!("{said}");
         eprintln!("{said}");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "test 8 checked nothing on CI: {said}"
+        );
         return;
     }
     for pace in [2u64, 8] {
