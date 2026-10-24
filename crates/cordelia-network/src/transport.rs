@@ -597,6 +597,16 @@ impl rustls::server::danger::ClientCertVerifier for CordeliaClientVerifier {
 mod tests {
     use super::*;
 
+    /// A test over real QUIC, bounded as a whole: one that waits for what
+    /// never comes fails here on this assertion, with its name, and does
+    /// not hold the run of the suite until CI gives up on it.
+    async fn within<T>(test: &str, secs: u64, run: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(Duration::from_secs(secs), run).await {
+            Ok(done) => done,
+            Err(_) => panic!("{test} did not end within {secs} s"),
+        }
+    }
+
     #[test]
     fn test_generate_cert() {
         let id = NodeIdentity::generate().unwrap();
@@ -753,37 +763,44 @@ mod tests {
     /// waits.
     #[tokio::test]
     async fn a_connection_holds_at_most_8_streams_open() {
-        let (client, server, _c, _s) = connected().await;
-        // The other end takes each stream and keeps it open.
-        let holding = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok(stream) = server.accept_bi().await {
-                held.push(stream);
-            }
-        });
+        within(
+            "a_connection_holds_at_most_8_streams_open",
+            60,
+            async move {
+                let (client, server, _c, _s) = connected().await;
+                // The other end takes each stream and keeps it open.
+                let holding = tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Ok(stream) = server.accept_bi().await {
+                        held.push(stream);
+                    }
+                });
 
-        let brief = Duration::from_millis(500);
-        let mut open = Vec::new();
-        for n in 0..protocol::QUIC_MAX_BIDI_STREAMS {
-            let (mut send, recv) = tokio::time::timeout(brief, client.open_bi())
-                .await
-                .unwrap_or_else(|_| panic!("stream {n} did not open"))
-                .unwrap();
-            send.write_all(b"x").await.unwrap();
-            open.push((send, recv));
-        }
-        assert!(
-            tokio::time::timeout(brief, client.open_bi()).await.is_err(),
-            "one more stream than the limit opened"
-        );
-        // Nor a unidirectional one: the protocol has none.
-        assert!(
-            tokio::time::timeout(brief, client.open_uni())
-                .await
-                .is_err(),
-            "a unidirectional stream opened"
-        );
-        holding.abort();
+                let brief = Duration::from_millis(500);
+                let mut open = Vec::new();
+                for n in 0..protocol::QUIC_MAX_BIDI_STREAMS {
+                    let (mut send, recv) = tokio::time::timeout(brief, client.open_bi())
+                        .await
+                        .unwrap_or_else(|_| panic!("stream {n} did not open"))
+                        .unwrap();
+                    send.write_all(b"x").await.unwrap();
+                    open.push((send, recv));
+                }
+                assert!(
+                    tokio::time::timeout(brief, client.open_bi()).await.is_err(),
+                    "one more stream than the limit opened"
+                );
+                // Nor a unidirectional one: the protocol has none.
+                assert!(
+                    tokio::time::timeout(brief, client.open_uni())
+                        .await
+                        .is_err(),
+                    "a unidirectional stream opened"
+                );
+                holding.abort();
+            },
+        )
+        .await;
     }
 
     /// T3. One connection cannot make a node hold more than two small
@@ -793,36 +810,44 @@ mod tests {
     /// seven eighths of QUIC_RECEIVE_WINDOW.
     #[tokio::test]
     async fn a_connection_buffers_at_most_two_unread_messages() {
-        // On every stream it may open, as much as each takes: no more than
-        // the window in all, and no more than a stream's window on one.
-        let (client, _server_reads_nothing, _c, _s) = connected().await;
-        let chunk = vec![0u8; 16 * 1024];
-        let (mut in_all, mut most) = (0usize, 0usize);
-        let mut streams = Vec::new();
-        for _ in 0..protocol::QUIC_MAX_BIDI_STREAMS {
-            let (mut send, recv) = client.open_bi().await.unwrap();
-            let mut on_this = 0usize;
-            // A write waits for credit; one that waits this long has none.
-            while let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_millis(1500), send.write(&chunk)).await
-            {
-                on_this += n;
-            }
-            in_all += on_this;
-            most = most.max(on_this);
-            streams.push((send, recv));
-        }
-        assert_eq!(
-            in_all,
-            (protocol::QUIC_STREAM_RECEIVE_WINDOW * protocol::QUIC_MAX_BIDI_STREAMS) as usize,
-            "the connection took {in_all} bytes unread"
-        );
-        assert!(in_all <= protocol::QUIC_RECEIVE_WINDOW as usize);
-        assert_eq!(
-            most,
-            protocol::QUIC_STREAM_RECEIVE_WINDOW as usize,
-            "a stream took {most} bytes unread"
-        );
+        within(
+            "a_connection_buffers_at_most_two_unread_messages",
+            60,
+            async move {
+                // On every stream it may open, as much as each takes: no more than
+                // the window in all, and no more than a stream's window on one.
+                let (client, _server_reads_nothing, _c, _s) = connected().await;
+                let chunk = vec![0u8; 16 * 1024];
+                let (mut in_all, mut most) = (0usize, 0usize);
+                let mut streams = Vec::new();
+                for _ in 0..protocol::QUIC_MAX_BIDI_STREAMS {
+                    let (mut send, recv) = client.open_bi().await.unwrap();
+                    let mut on_this = 0usize;
+                    // A write waits for credit; one that waits this long has none.
+                    while let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(1500), send.write(&chunk)).await
+                    {
+                        on_this += n;
+                    }
+                    in_all += on_this;
+                    most = most.max(on_this);
+                    streams.push((send, recv));
+                }
+                assert_eq!(
+                    in_all,
+                    (protocol::QUIC_STREAM_RECEIVE_WINDOW * protocol::QUIC_MAX_BIDI_STREAMS)
+                        as usize,
+                    "the connection took {in_all} bytes unread"
+                );
+                assert!(in_all <= protocol::QUIC_RECEIVE_WINDOW as usize);
+                assert_eq!(
+                    most,
+                    protocol::QUIC_STREAM_RECEIVE_WINDOW as usize,
+                    "a stream took {most} bytes unread"
+                );
+            },
+        )
+        .await;
     }
 
     /// The value of `field` in a config, as quinn shows it: quinn has no
