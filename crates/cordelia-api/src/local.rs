@@ -338,7 +338,10 @@ mod tests {
 
     fn node() -> web::Data<AppState> {
         web::Data::new(AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: TOKEN.into(),
             home_dir: std::env::temp_dir().join("cordelia-local-api-test-no-such-directory"),
@@ -682,5 +685,88 @@ mod tests {
         );
         let (_, held) = lists(&state).await;
         assert_eq!(held["entries"].as_array().map(Vec::len), Some(1));
+    }
+    // ── GET /api/v1/metrics/load (decision 2026-10-22 §1.1, rule 3) ───
+
+    /// The text the route answers with, and its status.
+    async fn load_of(state: web::Data<AppState>, request: HttpRequest) -> (u16, String) {
+        let response = match crate::handlers::metrics_load(request, state).await {
+            Ok(response) => response,
+            Err(e) => actix_web::ResponseError::error_response(&e),
+        };
+        let status = response.status().as_u16();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The route of the counters takes no lock (decision 2026-10-22
+    /// §1.1, rule 3; §7.3): while this test holds the node's lock on its
+    /// database, and the locks of its peers, its relays, the entries a
+    /// relay refused, the channels to list again and whether it is held
+    /// up, a read of the route on another thread returns, with the
+    /// counters.
+    #[test]
+    fn the_route_of_the_counters_takes_no_lock() {
+        let state = node();
+        let _db = state.db.lock().unwrap();
+        let _peers = state.peers.write().unwrap();
+        let _relays = state.relays.write().unwrap();
+        let _refused = state.outbox_refused.write().unwrap();
+        let _relist = state.relist.lock().unwrap();
+        let _held = state.held.locked();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reading = state.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let read = runtime.block_on(load_of(reading, asked()));
+            let _ = tx.send(read);
+        });
+        let read = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let (status, text) =
+            read.expect("the read of the route did not return while the lock was held");
+        assert_eq!(status, 200);
+        assert!(text.contains("cordelia_connections_open 0\n"), "{text}");
+    }
+
+    /// The route asks for the node's token, and is answered while the
+    /// node is held up, as every GET is; it says the lock's waits and
+    /// holds by kind and every counter, each as it moved (decision
+    /// 2026-10-22 §1.2, §7.3).
+    #[actix_rt::test]
+    async fn the_route_of_the_counters_says_each_as_it_moved_to_whoever_has_the_token() {
+        let state = node();
+        let (status, _) = load_of(state.clone(), TestRequest::default().to_http_request()).await;
+        assert_eq!(status, 401);
+        let wrong = TestRequest::default()
+            .insert_header(("Authorization", "Bearer not-the-token"))
+            .to_http_request();
+        assert_eq!(load_of(state.clone(), wrong).await.0, 401);
+
+        {
+            let _api = cordelia_core::lock::taking(cordelia_core::load::Kind::Api);
+            drop(state.db.lock().unwrap());
+        }
+        state
+            .load
+            .streams
+            .read(cordelia_core::load::Stream::Pull, 60);
+        state.load.governor.churned();
+        state
+            .held
+            .hold(crate::state::Held::LaterDatabase("later".into()));
+        let (status, text) = load_of(state.clone(), asked()).await;
+        assert_eq!(status, 200, "{text}");
+        for line in [
+            "cordelia_lock_hold_microseconds_count{kind=\"api\"} 1\n",
+            "cordelia_lock_wait_microseconds_count{kind=\"api\"} 1\n",
+            "cordelia_lock_hold_microseconds_count{kind=\"pull\"} 0\n",
+            "cordelia_requests_total{kind=\"pull\"} 1\n",
+            "cordelia_stream_bytes_total{kind=\"pull\",direction=\"in\"} 60\n",
+            "cordelia_churns_total 1\n",
+        ] {
+            assert!(text.contains(line), "{line} not in {text}");
+        }
     }
 }

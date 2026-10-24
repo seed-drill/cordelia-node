@@ -2674,7 +2674,15 @@ pub async fn p2p_loop(
 
     let our_node_id = NodeId(state.identity.public_key());
 
-    let mut governor = governor_for(&node_role, &gov_config, &trusted_peer_ids);
+    // The node's counters (decision 2026-10-22 §7.3): its connections, the
+    // closures of the link to each relay it is set up with, and its
+    // governor count in them.
+    conn_mgr.count_into(state.load.connections.clone());
+    for key in relays_set_up.iter().filter_map(|relay| relay.key) {
+        state.load.connections.counts_relay(&key);
+    }
+    let mut governor = governor_for(&node_role, &gov_config, &trusted_peer_ids)
+        .counting(state.load.governor.clone());
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
@@ -2748,7 +2756,8 @@ pub async fn p2p_loop(
                     relay_addrs.clone(),
                     relay_ask_again,
                 )
-                .remembering_at_most(most_proved),
+                .remembering_at_most(most_proved)
+                .counting(state.load.streams.clone()),
             )
         });
     // The large permits, across all this node's connections (decision
@@ -2987,17 +2996,22 @@ pub async fn p2p_loop(
                         let refused = refused_addresses
                             .get(&address)
                             .is_some_and(|until| *until > std::time::Instant::now());
-                        let room = {
-                            let arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
-                            cordelia_network::rate_limit::ConnectionTracker::from_ips(
-                                conn_mgr
-                                    .inbound_ips(&NodeId([0u8; 32]))
-                                    .into_iter()
-                                    .chain(arriving.iter().copied()),
-                            )
-                            .would_allow(address)
+                        let turned_away = match refused {
+                            true => Some(cordelia_core::load::TurnedAway::RefusedForATime),
+                            false => {
+                                let arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
+                                cordelia_network::rate_limit::ConnectionTracker::from_ips(
+                                    conn_mgr
+                                        .inbound_ips(&NodeId([0u8; 32]))
+                                        .into_iter()
+                                        .chain(arriving.iter().copied()),
+                                )
+                                .turns_away(address)
+                            }
                         };
-                        if refused || !room {
+                        if let Some(why) = turned_away {
+                            // Counted by why (decision 2026-10-22 §1.2).
+                            state.load.connections.turned_away(why);
                             tracing::debug!(%address, refused, "turning an inbound connection away before the handshake");
                             incoming.refuse();
                             continue;
@@ -3069,7 +3083,8 @@ pub async fn p2p_loop(
                             let open = cordelia_network::rate_limit::ConnectionTracker::from_ips(
                                 conn_mgr.inbound_ips(&outcome.node_id),
                             );
-                            if !open.would_allow(ip) {
+                            if let Some(why) = open.turns_away(ip) {
+                                state.load.connections.turned_away(why);
                                 tracing::warn!(peer = %outcome.node_id, ip = %ip, "rejecting: connection limit exceeded");
                                 outcome.conn.close(0u32.into(), b"limit");
                                 continue;
@@ -7147,7 +7162,10 @@ mod tests {
     /// A node's state over a database in memory, with no network.
     fn a_state() -> web::Data<cordelia_api::state::AppState> {
         web::Data::new(cordelia_api::state::AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: std::env::temp_dir().join("cordelia-p2p-test-no-such-directory"),

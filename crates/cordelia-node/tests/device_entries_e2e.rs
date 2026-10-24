@@ -15,7 +15,7 @@ mod common;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordelia_api::adding::{Accepted, accept, add_device};
@@ -121,7 +121,10 @@ impl Device {
             port,
         );
         let state = Arc::new(AppState {
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity,
             bearer_token: "t".into(),
             home_dir: dir.path().to_path_buf(),
@@ -153,7 +156,7 @@ impl Device {
         }
     }
 
-    fn db(&self) -> MutexGuard<'_, rusqlite::Connection> {
+    fn db(&self) -> cordelia_core::lock::TimedGuard<'_, rusqlite::Connection> {
         self.state.db.lock().unwrap()
     }
 
@@ -10590,4 +10593,139 @@ async fn an_answer_that_it_lacks_the_change_is_believed_though_it_was_not_writte
         "not written down"
     );
     assert_eq!(reach.holds, Holds::Lacks, "{reach:?}");
+}
+
+// ── The counters (decision 2026-10-22 §1.2, §7.3) ────────────────────
+
+/// The value of the line `name` in `text`, the text of
+/// `/api/v1/metrics/load`.
+fn value_of(text: &str, name: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no line {name} in {text}"))
+        .parse()
+        .unwrap()
+}
+
+/// What a device counts it asked a relay is what the relay counts it
+/// read, kind by kind and byte by byte (decision 2026-10-22 §1.2; §6, the
+/// second check of a run): a device that makes its phrase, holds a name,
+/// passes and sends, against a relay process read through its route. The
+/// relay answered every request, counts the device's one connection open,
+/// and its takes of the lock are of the kinds of what it was asked; the
+/// device's takes in a pass are of a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_device_counts_it_asked_is_what_its_relay_counts_it_read() {
+    use cordelia_core::load::{Kind, Stream};
+    let relay = relay_started("relay", None);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    device.connects("relay", &relay).await;
+    device.passes().await;
+    device.writes("notes", "a.md", "the first");
+    device.sends().await;
+    // Each take of the device's own lock in a pass is of a pass, those in
+    // the task of each relay's turn too (decision 2026-10-22 §1.1, rule 4).
+    let takes = |device: &Device| {
+        let times = device.state.db.times();
+        (times.hold(Kind::Pass).count, times.hold(Kind::Other).count)
+    };
+    let before = takes(&device);
+    device.passes().await;
+    let after = takes(&device);
+    assert!(after.0 > before.0, "{before:?} {after:?}");
+    assert_eq!(after.1, before.1, "a take in a pass that is not of a pass");
+
+    let asked = device.state.load.device.of(&key_of(&relay));
+    let text = relay.get_text("/api/v1/metrics/load");
+    for stream in Stream::ALL {
+        let (i, kind) = (stream as usize, stream.name());
+        let read = value_of(
+            &text,
+            &format!("cordelia_requests_total{{kind=\"{kind}\"}}"),
+        );
+        assert_eq!(read, asked.asked[i], "{kind}");
+        let bytes = format!("cordelia_stream_bytes_total{{kind=\"{kind}\",direction=\"in\"}}");
+        assert_eq!(value_of(&text, &bytes), asked.asked_bytes[i], "{kind}");
+        let answered = format!("cordelia_answers_total{{kind=\"{kind}\",answer=\"answered\"}}");
+        assert_eq!(value_of(&text, &answered), read, "{kind}");
+    }
+    for stream in [
+        Stream::ShowWhole,
+        Stream::ShowShort,
+        Stream::Proof,
+        Stream::Pull,
+        Stream::Push,
+    ] {
+        assert!(asked.asked[stream as usize] > 0, "{stream:?}: {asked:?}");
+        let held = format!(
+            "cordelia_lock_hold_microseconds_count{{kind=\"{}\"}}",
+            stream.name()
+        );
+        assert!(value_of(&text, &held) > 0, "{held}");
+    }
+    assert_eq!(asked.asked[Stream::Relays as usize], 0);
+    assert_eq!((asked.held_back, asked.refused_for_rate), (0, 0));
+    assert_eq!(value_of(&text, "cordelia_connections_open"), 1);
+    assert_eq!(
+        value_of(
+            &text,
+            "cordelia_lock_hold_microseconds_count{kind=\"relays\"}"
+        ),
+        0
+    );
+}
+
+/// A relay counts a connection it turns away by why, and its churns where
+/// warm churn closes nothing, and says its governor's peers apart from its
+/// connections (decision 2026-10-22 §1.2): a relay that churns every two
+/// seconds, with five devices from one address and no cold peer. A sixth
+/// device from that address is turned away for the address; each churn is
+/// counted, and nothing as closed by warm churn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_counts_who_it_turns_away_and_each_churn_where_warm_churn_closes_nothing() {
+    let mut relay = node("relay", "relay", None);
+    relay.churn_every_secs(2);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let mut devices = Vec::new();
+    for _ in 0..cordelia_core::protocol::MAX_CONNECTIONS_PER_IP {
+        let mut device = Device::new("laptop");
+        device.connects("relay", &relay).await;
+        devices.push(device);
+    }
+    let mut sixth = Device::new("desktop");
+    let at = format!("127.0.0.1:{}", relay.p2p).parse().unwrap();
+    assert!(sixth.manager.connect_to(at).await.is_err());
+
+    let text = || relay.get_text("/api/v1/metrics/load");
+    wait_for("three churns", &[&relay], 30, || {
+        (value_of(&text(), "cordelia_churns_total") >= 3).then_some(())
+    });
+    let said = text();
+    let away = |why: &str| {
+        value_of(
+            &said,
+            &format!("cordelia_connections_turned_away_total{{why=\"{why}\"}}"),
+        )
+    };
+    assert_eq!(away("address"), 1);
+    assert_eq!(
+        (away("bound"), away("subnet"), away("refused_for_a_time")),
+        (0, 0, 0)
+    );
+    for peer in ["device", "relay"] {
+        let closed = format!("cordelia_closed_by_warm_churn_total{{peer=\"{peer}\"}}");
+        assert_eq!(value_of(&said, &closed), 0, "{peer}");
+    }
+    assert_eq!(value_of(&said, "cordelia_connections_open"), 5);
+    let peers = |state: &str| {
+        value_of(
+            &said,
+            &format!("cordelia_governor_peers{{state=\"{state}\"}}"),
+        )
+    };
+    assert_eq!((peers("hot") + peers("warm"), peers("cold")), (5, 0));
+    assert_eq!(value_of(&said, "cordelia_connections_closed_total"), 0);
 }

@@ -447,7 +447,7 @@ fn summary_wait(within_ms: u64) -> Duration {
 async fn db_by(
     state: &AppState,
     deadline: Instant,
-) -> Option<std::sync::MutexGuard<'_, Connection>> {
+) -> Option<cordelia_core::lock::TimedGuard<'_, Connection>> {
     loop {
         match state.db.try_lock() {
             Ok(db) => return Some(db),
@@ -1789,7 +1789,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
 
 // ── Plumbing ─────────────────────────────────────────────────────────
 
-fn db_of(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
+fn db_of(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
 }
 

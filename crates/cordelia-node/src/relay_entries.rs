@@ -110,10 +110,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cordelia_core::NodeId;
+use cordelia_core::load::{Answered, Kind, Refusal, Stream, StreamCounts};
+use cordelia_core::lock::{LockWhole, Nested, TimedLock, take_as, taking};
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
@@ -125,8 +127,8 @@ use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
 use cordelia_network::codec;
 use cordelia_network::messages::{
-    ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryShow,
-    EntryShowShort, EntryShown, Protocol, PushAnswer, RelayChannel, RelayChannelsAsk,
+    ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryRefused,
+    EntryShow, EntryShowShort, EntryShown, Protocol, PushAnswer, RelayChannel, RelayChannelsAsk,
     RelayChannelsHeld, RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
 };
 use cordelia_network::transport;
@@ -148,8 +150,8 @@ const _: () = assert!(FULL_PAGE_COST <= cordelia_core::protocol::PUSH_BYTES_PER_
 
 /// Lock a mutex, also one whose holder panicked: what it guards is counts
 /// and places, which are whole after any one step.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<L: LockWhole + ?Sized>(mutex: &L) -> L::Guard<'_> {
+    mutex.lock_whole()
 }
 
 /// This relay's time, in seconds, in UTC.
@@ -355,6 +357,50 @@ impl Answer {
     fn of(message: WireMessage) -> Self {
         Self::Message(Box::new(message))
     }
+
+    /// What became of the request, as it is counted (decision 2026-10-22
+    /// §1.2).
+    fn counted(&self) -> Answered {
+        match self {
+            Answer::Message(_) => Answered::Answered,
+            Answer::Over(_) => Answered::RefusedForRate,
+            Answer::NotNow => Answered::NotNow,
+            Answer::Nothing => Answered::NotServed,
+            Answer::Stray => Answered::Stray,
+        }
+    }
+}
+
+/// The bytes of a frame's length, before its message: a frame is counted
+/// with them, as it is read and written.
+const FRAME_LENGTH_BYTES: usize = 4;
+
+/// The entries refused in an answer, for room or for the allowance of new
+/// channels (decision 2026-10-22 §1.2): an entry shown, or each entry
+/// pushed or passed on. One refused as not signed is neither.
+fn refusals(answer: &WireMessage) -> Vec<Refusal> {
+    let refused: Vec<EntryRefused> = match answer {
+        WireMessage::EntryShown(EntryShown {
+            answer: ShowAnswer::Refused(why),
+        }) => vec![*why],
+        WireMessage::EntryPushed(pushed) => pushed
+            .answers
+            .iter()
+            .filter_map(|answer| match answer {
+                PushAnswer::Refused(why) => Some(*why),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    refused
+        .into_iter()
+        .filter_map(|why| match why {
+            EntryRefused::NoRoom => Some(Refusal::Room),
+            EntryRefused::OverLimit => Some(Refusal::NewChannels),
+            EntryRefused::NotSigned => None,
+        })
+        .collect()
 }
 
 /// An entry that this relay took, to be passed on.
@@ -494,6 +540,10 @@ pub struct RelayEntries {
     ask_again: Duration,
     /// The most channels whose proofs it remembers for one connection.
     most_proved: usize,
+    /// What it is asked on the streams, by stream kind, and what became of
+    /// each request: counted, and read by nothing it does (decision
+    /// 2026-10-22 §1.2, §7.3).
+    counts: Arc<StreamCounts>,
 }
 
 impl RelayEntries {
@@ -509,7 +559,15 @@ impl RelayEntries {
             stopped_at: Mutex::default(),
             ask_again,
             most_proved: MAX_CHANNELS_PROVED_ON_A_CONNECTION,
+            counts: Arc::default(),
         }
+    }
+
+    /// The same relay, counting what it is asked in `counts`: the node's
+    /// counters (decision 2026-10-22 §7.3).
+    pub fn counting(mut self, counts: Arc<StreamCounts>) -> Self {
+        self.counts = counts;
+        self
     }
 
     /// The same relay, remembering the proofs of `most` channels for one
@@ -552,9 +610,10 @@ impl RelayEntries {
     /// relay whose cap came down (decision 2026-10-04 §2.5). The cap is
     /// read when the node starts and at no other time, so this is run
     /// then. No write takes a relay past its cap.
-    pub fn make_room(&self, db: &Mutex<Connection>) {
+    pub fn make_room(&self, db: &TimedLock<Connection>) {
+        let _sweep = taking(Kind::Sweep);
         let Ok(db) = db.lock() else { return };
-        let max_bytes = lock(&self.room).max_bytes;
+        let max_bytes = db.nested(Nested::Room, &self.room).max_bytes;
         match relay::make_room(&db, max_bytes) {
             Ok(dropped) => self.dropped(&dropped, "to be within the cap"),
             Err(e) => tracing::warn!(error = %e, "could not make room for entries"),
@@ -564,12 +623,13 @@ impl RelayEntries {
     /// Drop each channel that nobody has used for 90 days (decision
     /// 2026-10-04 §2.5), and forget each address that has made the relay
     /// take no channel within the hour.
-    pub fn sweep(&self, db: &Mutex<Connection>) {
+    pub fn sweep(&self, db: &TimedLock<Connection>) {
         self.sweep_at(db, unix_now());
     }
 
     /// [`Self::sweep`], at `now`, this relay's time in seconds.
-    fn sweep_at(&self, db: &Mutex<Connection>, now: i64) {
+    fn sweep_at(&self, db: &TimedLock<Connection>, now: i64) {
+        let _sweep = taking(Kind::Sweep);
         lock(&self.room).forget_old(now);
         let Ok(db) = db.lock() else { return };
         match relay::sweep_unused(&db, now) {
@@ -582,12 +642,13 @@ impl RelayEntries {
     /// held for 90 days (decision 2026-10-04 §2.3, §7.3): the channel's
     /// count of its room follows, and a channel of which nothing is left
     /// is held no more.
-    pub fn sweep_deletes(&self, db: &Mutex<Connection>) {
+    pub fn sweep_deletes(&self, db: &TimedLock<Connection>) {
         self.sweep_deletes_at(db, unix_now());
     }
 
     /// [`Self::sweep_deletes`], at `now`, this relay's time in seconds.
-    fn sweep_deletes_at(&self, db: &Mutex<Connection>, now: i64) {
+    fn sweep_deletes_at(&self, db: &TimedLock<Connection>, now: i64) {
+        let _sweep = taking(Kind::Sweep);
         let Ok(db) = db.lock() else { return };
         match relay::sweep_deletes(&db, now) {
             Ok(swept) => {
@@ -640,10 +701,17 @@ impl RelayEntries {
         session: Option<&Session>,
         proved: &mut Proved,
         whole: &mut ShownWhole,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         rates: &Mutex<Rates>,
         now: i64,
     ) -> Answer {
+        // Each take of the lock in it is of the request's kind (decision
+        // 2026-10-22 §1.1, rule 4).
+        let _kind = taking(
+            protocol
+                .counted_as(Some(request))
+                .map_or(Kind::Other, Stream::kind),
+        );
         match (protocol, request) {
             (Protocol::EntryShow, WireMessage::EntryShow(show)) => {
                 self.shown(db, rates, who, whole, show, now)
@@ -673,7 +741,7 @@ impl RelayEntries {
     /// `whole` is what the connection has shown so.
     fn shown(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         rates: &Mutex<Rates>,
         who: &Who,
         whole: &mut ShownWhole,
@@ -705,7 +773,7 @@ impl RelayEntries {
                 return Answer::Nothing;
             };
             let found = {
-                let mut room = lock(&self.room);
+                let mut room = db.nested(Nested::Room, &self.room);
                 relay::show(&db, &mut room, &entry, &who.asker(), now)
             };
             let found = match found {
@@ -725,7 +793,7 @@ impl RelayEntries {
             if !who.listed
                 && let Shown::Another { cost, .. } = &found
             {
-                let mut rates = lock(rates);
+                let mut rates = db.nested(Nested::Rates, rates);
                 if rates.fetch_room(who.peer, who.address) == 0 {
                     return Answer::NotNow;
                 }
@@ -757,7 +825,7 @@ impl RelayEntries {
     /// nothing counts as fetched.
     fn shown_short(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         rates: &Mutex<Rates>,
         who: &Who,
         whole: &ShownWhole,
@@ -811,7 +879,7 @@ impl RelayEntries {
     /// holds.
     fn proving(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         session: Option<&Session>,
         proved: &mut Proved,
         prove: &ChannelProve,
@@ -885,7 +953,7 @@ impl RelayEntries {
     /// that tells it of a removal.
     fn pulling(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         rates: &Mutex<Rates>,
         who: &Who,
         proved: &Proved,
@@ -943,7 +1011,11 @@ impl RelayEntries {
         // sized to the room there is, so this is over only where not even
         // the first entry fits: then nothing is handed, and nothing is
         // counted. The asker could not know: it is no breach.
-        if room.is_some() && !lock(rates).handed(who.peer, who.address, page.cost) {
+        if room.is_some()
+            && !db
+                .nested(Nested::Rates, rates)
+                .handed(who.peer, who.address, page.cost)
+        {
             return Answer::NotNow;
         }
         Answer::of(WireMessage::EntryPulled((&page).into()))
@@ -953,7 +1025,7 @@ impl RelayEntries {
     /// items 1 and 2), and answer for each.
     fn pushing(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         rates: &Mutex<Rates>,
         who: &Who,
         push: &EntryPush,
@@ -1006,14 +1078,14 @@ impl RelayEntries {
     /// the relay take.
     fn take_all<'a>(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         entries: impl Iterator<Item = (&'a Result<CheckedEntry, Refused>, &'a Asker)>,
         from: Option<&NodeId>,
         now: i64,
     ) -> Option<Vec<Taken>> {
         let (all, stored) = {
             let db = db.lock().ok()?;
-            let mut room = lock(&self.room);
+            let mut room = db.nested(Nested::Room, &self.room);
             let written = Self::written_as_one(&db, &mut room, entries, now);
             // An address is counted for the channels it made the relay
             // take once they are written for good, and for none where
@@ -1085,7 +1157,7 @@ impl RelayEntries {
     /// item 6). The caller has made sure that `from` is one.
     fn asked_by_a_relay(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         who: &Who,
         request: &WireMessage,
         now: i64,
@@ -1166,7 +1238,7 @@ impl RelayEntries {
     /// later "last used".
     fn wants(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         relay: &NodeId,
         told: &RelayChannel,
         now: i64,
@@ -1203,7 +1275,7 @@ impl RelayEntries {
             // of is not asked for: every entry of it would be refused.
             let used = relay::used_bytes(&db).ok()?;
             let smallest = entry_cost(MIN_ENTRY_CONTENT_BYTES);
-            if used.saturating_add(smallest) > lock(&self.room).max_bytes {
+            if used.saturating_add(smallest) > db.nested(Nested::Room, &self.room).max_bytes {
                 return None;
             }
         }
@@ -1215,7 +1287,7 @@ impl RelayEntries {
     /// Returns how it ended, and how many of its entries were stored.
     fn pulled(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         relay: &NodeId,
         told: &RelayChannel,
         asked: (Mark, u64),
@@ -1312,7 +1384,7 @@ impl RelayEntries {
     /// past a round trip of about 0.33 s.
     fn to_pass_on(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         relays: &[NodeId],
     ) -> Vec<(NodeId, Vec<RelayPush>)> {
         let taken = std::mem::take(&mut *lock(&self.taken));
@@ -1432,7 +1504,7 @@ pub struct Serving<'a> {
     pub conn: Option<&'a quinn::Connection>,
     pub peer: &'a NodeId,
     pub address: IpAddr,
-    pub db: &'a Mutex<Connection>,
+    pub db: &'a TimedLock<Connection>,
     pub rates: &'a Mutex<Rates>,
     /// The large permits, under which a frame longer than a small message
     /// from a peer that is not a listed relay is read (decision
@@ -1528,9 +1600,12 @@ impl RelayEntries {
             Ok(request) => request,
             Err(e) => {
                 tracing::debug!(peer = %who.peer, error = %e, "a frame on a stream of entries that is no message");
+                self.count(protocol, None, &frame, Answered::Stray);
                 return Self::no_request(send, recv, &who, serving.rates, &frame);
             }
         };
+        // Counted as it is read, by its kind (decision 2026-10-22 §1.2).
+        let stream = protocol.counted_as(Some(&request));
         // What a proof is checked against is this connection's own: the
         // value of its TLS session, and the key in the peer's certificate.
         let session = (protocol == Protocol::ChannelProve)
@@ -1552,6 +1627,7 @@ impl RelayEntries {
         // entries), nor of its frame, which a pull may pad to a message
         // with fields that are not read.
         drop(request);
+        self.count(protocol, stream, &frame, answer.counted());
         let answer = match answer {
             Answer::Message(answer) => answer,
             Answer::Over(over) => {
@@ -1575,14 +1651,34 @@ impl RelayEntries {
             }
         };
         drop(frame);
+        if let Some(stream) = stream {
+            for why in refusals(&answer) {
+                self.counts.refused(stream, why);
+            }
+        }
         // The answer is encoded, and the message dropped, before the write:
         // what is held through it is the answer as it is written.
         let written = codec::encode_message(&answer);
         drop(answer);
-        if let Ok(written) = written {
-            let _ = codec::write_raw_frame(send, &written).await;
+        if let Ok(written) = written
+            && codec::write_raw_frame(send, &written).await.is_ok()
+            && let Some(stream) = stream
+        {
+            self.counts
+                .wrote(stream, FRAME_LENGTH_BYTES + written.len());
         }
         None
+    }
+
+    /// Count a request of `protocol` read in `frame`, of the kind
+    /// `stream` where it decoded as one and otherwise of its stream's
+    /// first kind, and what became of it (decision 2026-10-22 §1.2).
+    fn count(&self, protocol: Protocol, stream: Option<Stream>, frame: &[u8], answered: Answered) {
+        let Some(stream) = stream.or_else(|| protocol.counted_as(None)) else {
+            return;
+        };
+        self.counts.read(stream, FRAME_LENGTH_BYTES + frame.len());
+        self.counts.answered(stream, answered);
     }
 
     /// A frame that was read and is no request for its stream: bytes that
@@ -1622,7 +1718,8 @@ impl RelayEntries {
     /// Pass the entries that wait on to `relays`, the listed relays that
     /// are connected, each on its connection. What a relay does not take
     /// is not tried again: it pulls what it lacks.
-    pub fn pass_on(&self, db: &Mutex<Connection>, relays: Vec<(NodeId, quinn::Connection)>) {
+    pub fn pass_on(&self, db: &TimedLock<Connection>, relays: Vec<(NodeId, quinn::Connection)>) {
+        let _relays = taking(Kind::Relays);
         let keys: Vec<NodeId> = relays.iter().map(|(relay, _)| relay.clone()).collect();
         for (relay, messages) in self.to_pass_on(db, &keys) {
             let Some((_, conn)) = relays.iter().find(|(key, _)| *key == relay) else {
@@ -1675,7 +1772,14 @@ impl RelayEntries {
     /// stored, or was not answered, is left where it was, and the pass
     /// goes on with the next channel: one channel does not keep those
     /// after it waiting.
-    pub async fn pull_from(&self, link: &impl Asked, relay: NodeId, db: &Mutex<Connection>) {
+    pub async fn pull_from(&self, link: &impl Asked, relay: NodeId, db: &TimedLock<Connection>) {
+        // Each take of the lock in it is of the stream between relays
+        // (decision 2026-10-22 §1.1, rule 4).
+        take_as(Kind::Relays, self.pulling_from(link, relay, db)).await
+    }
+
+    /// [`Self::pull_from`], whose takes of the lock are said as its own.
+    async fn pulling_from(&self, link: &impl Asked, relay: NodeId, db: &TimedLock<Connection>) {
         let Some(_pulling) = Pulling::begin(&self.pulling, &relay) else {
             return;
         };
@@ -1752,7 +1856,7 @@ impl RelayEntries {
         &self,
         link: &impl Asked,
         relay: &NodeId,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         told: &RelayChannel,
     ) -> Result<usize, String> {
         let Some((mut mark, mut after)) = self.wants(db, relay, told, unix_now()) else {
@@ -1931,7 +2035,7 @@ mod tests {
     /// A relay, its database, and what its peers have sent lately.
     struct Relay {
         entries: RelayEntries,
-        db: Mutex<Connection>,
+        db: TimedLock<Connection>,
         rates: Mutex<Rates>,
     }
 
@@ -1958,7 +2062,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(relays)),
                 Duration::from_secs(600),
             ),
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            db: TimedLock::new(cordelia_storage::db::open_in_memory().unwrap()),
             rates: Mutex::new(Rates::default()),
         }
     }
@@ -5538,5 +5642,335 @@ mod tests {
             );
             assert_eq!(answer > 700_000, large, "{what}: an answer of {answer}");
         }
+    }
+    // ── The counters (decision 2026-10-22 §1.2, §7.3) ─────────────────
+
+    /// What `at` counts of its streams, by the route's text: each line
+    /// of the requests, the answers, the entries refused and the bytes.
+    fn counts_of(at: &Relay) -> std::collections::BTreeMap<String, u64> {
+        let load = cordelia_core::load::Load {
+            streams: at.entries.counts.clone(),
+            ..Default::default()
+        };
+        cordelia_core::load::render(&load, &cordelia_core::lock::LockTimes::default(), 0.0)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.rsplit_once(' '))
+            .filter(|(name, _)| {
+                ["requests", "answers", "entries_refused", "stream_bytes"]
+                    .iter()
+                    .any(|of| name.starts_with(&format!("cordelia_{of}")))
+            })
+            .map(|(name, value)| (name.to_string(), value.parse().unwrap()))
+            .collect()
+    }
+
+    /// The lines that moved from `before` to `after`, with how far.
+    fn moved(
+        before: &std::collections::BTreeMap<String, u64>,
+        after: &std::collections::BTreeMap<String, u64>,
+    ) -> Vec<(String, u64)> {
+        after
+            .iter()
+            .filter(|(name, n)| before[*name] != **n)
+            .map(|(name, n)| (name.clone(), n - before[name]))
+            .collect()
+    }
+
+    /// Serve one stream of `protocol` for the peer numbered `n`, on a
+    /// connection that has proved `proved`, with `frame` as its request.
+    /// Returns the bytes written back.
+    async fn served(
+        at: &Relay,
+        n: u8,
+        protocol: Protocol,
+        proved: &mut Proved,
+        frame: &[u8],
+    ) -> Vec<u8> {
+        let peer = peer(n);
+        let serving = Serving {
+            conn: None,
+            peer: &peer,
+            address: address(n),
+            db: &at.db,
+            rates: &at.rates,
+            permits: None,
+        };
+        let (mut relay_w, mut peer_r) = tokio::io::duplex(1 << 21);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 21);
+        codec::write_raw_frame(&mut peer_w, frame).await.unwrap();
+        drop(peer_w);
+        let mut whole = ShownWhole::default();
+        let _ = at
+            .entries
+            .serve(
+                protocol,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                proved,
+                &mut whole,
+            )
+            .await;
+        drop(relay_w);
+        let mut back = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut peer_r, &mut back)
+            .await
+            .unwrap();
+        back
+    }
+
+    /// The lines of a request of `kind` read, with `bytes` in, and what
+    /// became of it.
+    fn read_as(kind: &str, bytes: usize, answer: &str) -> Vec<(String, u64)> {
+        vec![
+            (
+                format!("cordelia_answers_total{{kind=\"{kind}\",answer=\"{answer}\"}}"),
+                1,
+            ),
+            (format!("cordelia_requests_total{{kind=\"{kind}\"}}"), 1),
+            (
+                format!("cordelia_stream_bytes_total{{kind=\"{kind}\",direction=\"in\"}}"),
+                4 + bytes as u64,
+            ),
+        ]
+    }
+
+    /// With the bytes of the answer written, `back`.
+    fn and_written(mut lines: Vec<(String, u64)>, kind: &str, back: &[u8]) -> Vec<(String, u64)> {
+        lines.push((
+            format!("cordelia_stream_bytes_total{{kind=\"{kind}\",direction=\"out\"}}"),
+            back.len() as u64,
+        ));
+        lines.sort();
+        lines
+    }
+
+    /// Each request a relay serves is counted as it is read, by its kind
+    /// and with the bytes of its frame; what became of it is counted; and
+    /// the bytes of its answer as it is written (decision 2026-10-22
+    /// §1.2). Each moves for its own request, and nothing else moves: a
+    /// short show and a pull answered; a frame on the stream of shows that
+    /// is no message, counted as a whole show and stray; the stream
+    /// between relays from a peer it does not list, stray; a push whose
+    /// entry found no room, answered with the refusal counted; a push
+    /// over the peer's bytes, refused for rate; and a pull for more than
+    /// the peer may be handed for now, not now.
+    #[tokio::test]
+    async fn each_request_served_is_counted_by_its_kind_with_its_bytes_and_what_became_of_it() {
+        let at = relay_of(SMALL - 1, &[]);
+        let frame = |message: &WireMessage| codec::encode_message(message).unwrap();
+        let entry = small(1, 1, 1);
+
+        let short = frame(&short_of(&entry));
+        let before = counts_of(&at);
+        let back = served(&at, 1, Protocol::EntryShow, &mut Proved::default(), &short).await;
+        assert!(!back.is_empty());
+        let want = and_written(
+            read_as("show_short", short.len(), "answered"),
+            "show_short",
+            &back,
+        );
+        assert_eq!(moved(&before, &counts_of(&at)), want);
+
+        let pull = frame(&WireMessage::EntryPull(EntryPull {
+            channel: channel(1),
+            mark: relay::NO_MARK,
+            after: 0,
+            limit: 100,
+        }));
+        let before = counts_of(&at);
+        let back = served(&at, 1, Protocol::EntryPull, &mut Proved::default(), &pull).await;
+        let want = and_written(read_as("pull", pull.len(), "answered"), "pull", &back);
+        assert_eq!(moved(&before, &counts_of(&at)), want);
+
+        let nothing = vec![0xffu8; 40];
+        let before = counts_of(&at);
+        let back = served(
+            &at,
+            1,
+            Protocol::EntryShow,
+            &mut Proved::default(),
+            &nothing,
+        )
+        .await;
+        assert!(back.is_empty());
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("show_whole", 40, "stray")
+        );
+
+        let ask = frame(&WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+            after: [0; 32],
+            limit: 10,
+        }));
+        let before = counts_of(&at);
+        let back = served(&at, 1, Protocol::RelayEntries, &mut Proved::default(), &ask).await;
+        assert!(back.is_empty());
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("relays", ask.len(), "stray")
+        );
+
+        let push = frame(&WireMessage::EntryPush(EntryPush {
+            entries: vec![entry.to_wire().into()],
+        }));
+        let before = counts_of(&at);
+        let back = served(&at, 2, Protocol::EntryPush, &mut Proved::default(), &push).await;
+        let mut want = read_as("push", push.len(), "answered");
+        want.push((
+            "cordelia_entries_refused_total{kind=\"push\",answer=\"refused_for_room\"}".into(),
+            1,
+        ));
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            and_written(want, "push", &back)
+        );
+
+        lock(&at.rates).count_pushed(&peer(3), address(3), MINUTE);
+        let before = counts_of(&at);
+        let back = served(&at, 3, Protocol::EntryPush, &mut Proved::default(), &push).await;
+        assert!(back.is_empty());
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("push", push.len(), "refused_for_rate")
+        );
+
+        lock(&at.rates).fetched(&peer(4), address(4), MINUTE);
+        let before = counts_of(&at);
+        let back = served(&at, 4, Protocol::EntryPull, &mut having_proved(&[1]), &pull).await;
+        assert!(back.is_empty());
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("pull", pull.len(), "not_now")
+        );
+    }
+
+    /// The entries refused in an answer are counted for room and for the
+    /// allowance of new channels; one refused as not signed is neither,
+    /// and an answer that refuses nothing counts none (decision
+    /// 2026-10-22 §1.2).
+    #[test]
+    fn the_entries_refused_for_room_and_for_new_channels_are_told_from_an_answer() {
+        let pushed = |answers: Vec<PushAnswer>| WireMessage::EntryPushed(EntryPushed { answers });
+        assert_eq!(
+            refusals(&pushed(vec![
+                PushAnswer::Stored,
+                PushAnswer::Refused(EntryRefused::NoRoom),
+                PushAnswer::Refused(EntryRefused::NotSigned),
+                PushAnswer::Refused(EntryRefused::OverLimit),
+                PushAnswer::Refused(EntryRefused::NoRoom),
+            ])),
+            [Refusal::Room, Refusal::NewChannels, Refusal::Room]
+        );
+        let shown = |answer| WireMessage::EntryShown(EntryShown { answer });
+        assert_eq!(
+            refusals(&shown(ShowAnswer::Refused(EntryRefused::OverLimit))),
+            [Refusal::NewChannels]
+        );
+        assert_eq!(refusals(&shown(ShowAnswer::Taken)), []);
+        assert_eq!(refusals(&pushed(vec![PushAnswer::Held])), []);
+    }
+
+    /// The kinds whose takes of the lock moved, and how many each.
+    fn takes(at: &Relay) -> Vec<(Kind, u64)> {
+        Kind::ALL
+            .into_iter()
+            .map(|kind| (kind, at.db.times().hold(kind).count))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// Each take of the lock in a request is of the request's kind, its
+    /// wait and its hold, and of no other (decision 2026-10-22 §1.1, rule
+    /// 4): a whole show, a short show of the entry shown whole, a pull of
+    /// a proved channel and a push; the stream between relays; and a
+    /// sweep of what nobody uses and of old deletes.
+    #[test]
+    fn each_take_of_the_lock_in_a_request_is_of_its_kind() {
+        let at = relay_of(u64::MAX, &[9]);
+        let entry = small(1, 1, 1);
+        let mut whole = ShownWhole::default();
+        at.show_on(1, &mut whole, whole_of(&entry));
+        assert_eq!(takes(&at), [(Kind::ShowWhole, 1)]);
+        at.show_on(1, &mut whole, short_of(&entry));
+        assert_eq!(takes(&at), [(Kind::ShowWhole, 1), (Kind::ShowShort, 1)]);
+        let pull = WireMessage::EntryPull(EntryPull {
+            channel: channel(1),
+            mark: relay::NO_MARK,
+            after: 0,
+            limit: 100,
+        });
+        page(at.answer(1, Protocol::EntryPull, pull, None, &mut having_proved(&[1])));
+        pushed(at.push(2, vec![small(2, 2, 1).to_wire()]));
+        let ask = WireMessage::RelayChannelsAsk(RelayChannelsAsk {
+            after: [0; 32],
+            limit: 10,
+        });
+        said(at.answer(9, Protocol::RelayEntries, ask, None, &mut Proved::default()));
+        at.entries.sweep_at(&at.db, NOW);
+        at.entries.sweep_deletes_at(&at.db, NOW);
+        assert_eq!(
+            takes(&at),
+            [
+                (Kind::ShowWhole, 1),
+                (Kind::ShowShort, 1),
+                (Kind::Pull, 1),
+                (Kind::Push, 1),
+                (Kind::Relays, 1),
+                (Kind::Sweep, 2),
+            ]
+        );
+        for kind in Kind::ALL {
+            assert_eq!(
+                at.db.times().wait(kind).count,
+                at.db.times().hold(kind).count,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A relay's own pull from a relay it lists takes the lock as the
+    /// stream between relays, and as nothing else (decision 2026-10-22
+    /// §1.1, rule 4).
+    #[tokio::test]
+    async fn a_relays_pull_from_a_listed_relay_takes_the_lock_as_the_stream_between_relays() {
+        let other = relay_of(u64::MAX, &[9]);
+        let this = relay_of(u64::MAX, &[8]);
+        other.hold(&small(1, 1, 5), now());
+        this.entries
+            .pull_from(&Link::to(&other), peer(8), &this.db)
+            .await;
+        let taken = takes(&this);
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(taken[0].0, Kind::Relays);
+        assert!(this.held(1).is_some(), "the pull took what it lacked");
+    }
+
+    /// The waits for the rates and for the room, each taken while the
+    /// lock is held, are timed apart as the one each is (decision
+    /// 2026-10-22 §1.1, rule 4): a push takes the room under the lock and
+    /// not the rates; a pull of a proved channel by a peer that is not
+    /// listed takes the rates under it to count what it is handed, and
+    /// not the room; a whole show that is taken takes the room.
+    #[test]
+    fn a_wait_for_the_rates_or_the_room_under_the_lock_is_timed_apart() {
+        let at = relay();
+        let nested = |at: &Relay| {
+            let times = at.db.times();
+            (
+                times.nested(Nested::Rates).count,
+                times.nested(Nested::Room).count,
+            )
+        };
+        pushed(at.push(1, vec![small(1, 1, 1).to_wire()]));
+        assert_eq!(nested(&at), (0, 1));
+        page(at.pull(2, 1, &having_proved(&[1]), relay::NO_MARK, 0));
+        assert_eq!(nested(&at), (1, 1));
+        assert_eq!(
+            shown(at.show(3, small(2, 3, 1).to_wire())),
+            ShowAnswer::Taken
+        );
+        assert_eq!(nested(&at), (1, 2));
     }
 }

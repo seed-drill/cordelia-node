@@ -19,6 +19,7 @@
 //! without the proof, and passes on what it took, each with how long it
 //! has held the channel and when the channel was last used.
 
+use cordelia_core::load::Stream;
 use cordelia_core::protocol::{
     CHANNEL_MARK_BYTES, DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, ENTRY_PAGE_MAX_ENTRIES,
     ITEM_AUTHOR_BYTES, ITEM_HASH_BYTES, ITEM_SIGNATURE_BYTES, ITEM_SLOT_BYTES, MAX_CHANNEL_ID_LEN,
@@ -86,6 +87,25 @@ impl Protocol {
 
     pub fn as_byte(self) -> u8 {
         self as u8
+    }
+
+    /// The kind of a request on a stream of this protocol, as the
+    /// counters count it (decision 2026-10-22 §1.2): by its message where
+    /// it has one, a show being whole or in short; a frame that is no
+    /// message, as the stream's first kind, a whole show on the stream of
+    /// shows. `None` for a stream that is not one of entries.
+    pub fn counted_as(self, request: Option<&WireMessage>) -> Option<Stream> {
+        match self {
+            Self::EntryShow => match request {
+                Some(WireMessage::EntryShowShort(_)) => Some(Stream::ShowShort),
+                _ => Some(Stream::ShowWhole),
+            },
+            Self::ChannelProve => Some(Stream::Proof),
+            Self::EntryPull => Some(Stream::Pull),
+            Self::EntryPush => Some(Stream::Push),
+            Self::RelayEntries => Some(Stream::Relays),
+            _ => None,
+        }
     }
 }
 
@@ -4082,5 +4102,41 @@ mod tests {
             }
             other => panic!("a header with no parent was not read: {other:?}"),
         }
+    }
+    /// Each request on a stream of entries is counted as its kind, a
+    /// show as whole or in short by its message, and a frame on the
+    /// stream of shows that is no message as a whole show; a stream that
+    /// is not one of entries counts as none (decision 2026-10-22 §1.2).
+    #[test]
+    fn each_request_on_a_stream_of_entries_is_counted_as_its_kind() {
+        let short = WireMessage::EntryShowShort(EntryShowShort {
+            channel: [1; 32],
+            slot: [2; 32],
+            author: [3; 32],
+            rev: 4,
+            id: [5; 32],
+        });
+        let whole = WireMessage::EntryShow(EntryShow { entry: vec![1] });
+        assert_eq!(
+            Protocol::EntryShow.counted_as(Some(&short)),
+            Some(Stream::ShowShort)
+        );
+        assert_eq!(
+            Protocol::EntryShow.counted_as(Some(&whole)),
+            Some(Stream::ShowWhole)
+        );
+        assert_eq!(
+            Protocol::EntryShow.counted_as(None),
+            Some(Stream::ShowWhole)
+        );
+        assert_eq!(Protocol::ChannelProve.counted_as(None), Some(Stream::Proof));
+        assert_eq!(Protocol::EntryPull.counted_as(None), Some(Stream::Pull));
+        assert_eq!(Protocol::EntryPush.counted_as(None), Some(Stream::Push));
+        assert_eq!(
+            Protocol::RelayEntries.counted_as(None),
+            Some(Stream::Relays)
+        );
+        assert_eq!(Protocol::ItemSync.counted_as(None), None);
+        assert_eq!(Protocol::Handshake.counted_as(Some(&whole)), None);
     }
 }

@@ -7,7 +7,6 @@
 //! same storage rule the network path uses. A personal node carries no
 //! channel of this kind (decision 2026-10-04 §10).
 
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use serde_json::json;
@@ -27,7 +26,8 @@ struct Node {
 fn node() -> Node {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState {
-        db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(cordelia_storage::db::open_in_memory().unwrap()),
         identity: NodeIdentity::generate().unwrap(),
         bearer_token: "t".into(),
         home_dir: dir.path().to_path_buf(),

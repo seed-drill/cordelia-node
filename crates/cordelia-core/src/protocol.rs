@@ -2405,6 +2405,41 @@ const _: () = assert!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR < AGENT_MESSAGE_RING);
 // The clearing of the highest number is in the bottom half of band 0.
 const _: () = assert!(2 * AGENT_MESSAGE_NUMBER_MAX + 1 < REV_BAND_HALF);
 
+// ── The counters of the scale test (decision 2026-10-22 §1, §7.3) ────
+
+/// The buckets of each histogram of the counters, each an upper bound in
+/// microseconds that is a power of two, from 1 µs (2^0) to 16 s (2^24,
+/// about 16.8 s); what is longer goes in one bucket more (decision
+/// 2026-10-22 §1.2, the lock's wait and hold).
+pub const LOAD_HISTOGRAM_BUCKETS: usize = 25;
+
+/// The lengths, in milliseconds, past which a wait or a hold of the lock
+/// is counted apart (decision 2026-10-22 §1.2): 5 and 50 ms, the counts
+/// of §1.2 and bar 4 (c); 100 ms, a device's waits of bar 5; and 250 ms,
+/// which bar 4 (c) holds every write under.
+pub const LOCK_COUNTED_OVER_MS: [u64; 4] = [5, 50, 100, 250];
+
+/// The relays that a node counts apart, each by its key (decision
+/// 2026-10-22 §1.2): a device's requests to each relay, and the closures
+/// of the link to each relay it is set up with or lists. Twice
+/// REACHED_WORD_MAX_RELAYS; past it the rest are counted together.
+/// Derived: 2 × REACHED_WORD_MAX_RELAYS.
+pub const LOAD_RELAYS_COUNTED: usize = 2 * REACHED_WORD_MAX_RELAYS;
+
+/// The median hold of a relay's lock that decision 2026-10-22 §1.4
+/// measured: an idle pull, 12 µs.
+pub const LOCK_HOLD_MEDIAN_NANOS: u64 = 12_000;
+
+/// The most that timing one take of the lock may cost (decision
+/// 2026-10-22 §1.1, rule 5): under it, every take is timed.
+/// Derived: 1% of LOCK_HOLD_MEDIAN_NANOS.
+pub const LOCK_TIMING_COST_MAX_NANOS: u64 = LOCK_HOLD_MEDIAN_NANOS / 100;
+
+// The largest bucket is 16 s and more (decision 2026-10-22 §1.2): 2^24 µs
+// is over 16 s, and 2^23 µs is not.
+const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 1) >= 16_000_000);
+const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 2) < 16_000_000);
+
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 28] = [
     LABEL_ENTRY_KEY,
@@ -3785,5 +3820,27 @@ mod tests {
             AGENT_MESSAGE_CLEAR_INTERVAL_SECS,
             ENTRY_CHANNEL_SWEEP_INTERVAL_SECS
         );
+    }
+
+    /// The counters of the scale test (decision 2026-10-22 §1.1, §1.2):
+    /// histograms from 1 µs to 16 s by powers of two; the waits and holds
+    /// counted past 5, 50, 100 and 250 ms; the relays counted apart; and
+    /// the bar on what timing a take costs, 1% of the median hold.
+    #[test]
+    fn test_the_counters_of_the_scale_test_decision_2026_10_22_1_2() {
+        assert_eq!(LOAD_HISTOGRAM_BUCKETS, 25);
+        assert_eq!(LOCK_COUNTED_OVER_MS, [5, 50, 100, 250]);
+        assert_eq!(LOAD_RELAYS_COUNTED, 16);
+        assert_eq!(LOCK_HOLD_MEDIAN_NANOS, 12_000);
+        assert_eq!(LOCK_TIMING_COST_MAX_NANOS, 120);
+        // Each length counted apart is within the histogram, and they
+        // rise.
+        for ms in LOCK_COUNTED_OVER_MS {
+            assert!(ms * 1000 < 1 << (LOAD_HISTOGRAM_BUCKETS - 1));
+        }
+        assert!(LOCK_COUNTED_OVER_MS.windows(2).all(|w| w[0] < w[1]));
+        // A device's relays by default, and those a word names, are
+        // counted apart.
+        const { assert!(REACHED_WORD_MAX_RELAYS < LOAD_RELAYS_COUNTED) };
     }
 }

@@ -73,7 +73,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn db(state: &AppState) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+fn db(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, rusqlite::Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
 }
 

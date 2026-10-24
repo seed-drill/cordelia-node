@@ -101,13 +101,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted};
 use cordelia_api::at_relays::{self, Stands};
 use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
+use cordelia_core::load::DeviceCounts;
+use cordelia_core::lock::{LockWhole, TimedLock};
 use cordelia_core::protocol::{
     BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT,
     OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
@@ -138,8 +140,8 @@ const WAKE_WAIT: Duration = Duration::from_secs(WAKE_WAIT_SECS);
 
 /// Lock a mutex, also one whose holder panicked: what it guards is times
 /// and names, which are whole after any one step.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<L: LockWhole + ?Sized>(mutex: &L) -> L::Guard<'_> {
+    mutex.lock_whole()
 }
 
 /// The time, as a device's side of its relays reads it: the system's, and
@@ -518,6 +520,10 @@ impl Inner {
 pub struct Leave {
     clock: Clock,
     inner: Mutex<Inner>,
+    /// What the device asked of each relay, held back and was refused for
+    /// rate: counted, and read by nothing here (decision 2026-10-22 §1.2,
+    /// §7.3).
+    counts: Arc<DeviceCounts>,
 }
 
 impl Leave {
@@ -527,7 +533,48 @@ impl Leave {
         Self {
             clock,
             inner: Mutex::default(),
+            counts: Arc::default(),
         }
+    }
+
+    /// The same leave, counting what the device asks in `counts`: the
+    /// node's counters (decision 2026-10-22 §7.3).
+    pub fn counting(mut self, counts: Arc<DeviceCounts>) -> Self {
+        self.counts = counts;
+        self
+    }
+
+    /// What the device asks of `link`'s relay is counted as `protocol`'s
+    /// kind, with the bytes of its frame, as it is written (decision
+    /// 2026-10-22 §1.2): what `exchange` calls once the request is sent.
+    fn counts_as_sent<'a>(
+        &'a self,
+        link: &'a Link,
+        protocol: Protocol,
+        request: &'a WireMessage,
+    ) -> impl FnOnce(usize) + 'a {
+        move |bytes| {
+            if let Some(stream) = protocol.counted_as(Some(request)) {
+                self.counts.asked(&link.relay().0, stream, bytes);
+            }
+        }
+    }
+
+    /// May one thing more be asked of `link`'s relay in this minute?
+    /// Where it may not, the request is held back by the device's own
+    /// pace, and that is counted (decision 2026-10-22 §1.2).
+    fn may_ask_of(&self, link: &Link) -> bool {
+        self.may_ask_of_relay(link.name(), link.relay())
+    }
+
+    /// [`Self::may_ask_of`], of the relay called `name` whose node key is
+    /// `relay`.
+    fn may_ask_of_relay(&self, name: &str, relay: &NodeId) -> bool {
+        let may = lock(&self.inner).may_ask(name);
+        if !may {
+            self.counts.held_back(&relay.0);
+        }
+        may
     }
 
     /// What the node reaches now: `set_up_with` is every relay it is set
@@ -740,7 +787,7 @@ impl Leave {
     /// change was applied.
     pub async fn open<R, T>(
         &self,
-        db: &Mutex<Connection>,
+        db: &TimedLock<Connection>,
         link: &Link,
         asked: Asked<'_>,
         opened: impl FnOnce(&Connection),
@@ -767,7 +814,7 @@ impl Leave {
             if gated && self.at_its_count(&link.relay().0) {
                 return Err(Refused::RefusedEnough);
             }
-            if !lock(&self.inner).may_ask(link.name()) {
+            if !self.may_ask_of(link) {
                 return Err(Refused::AskedEnough);
             }
             opened(&conn);
@@ -786,9 +833,15 @@ impl Leave {
         }
         // A request that the relay refused for now is said so, and
         // counted for the relay; any other failure is said as it was.
-        let answer = exchange(send, recv, protocol, request)
-            .await
-            .map_err(|e| self.refused(link, &e))?;
+        let answer = exchange(
+            send,
+            recv,
+            protocol,
+            request,
+            self.counts_as_sent(link, protocol, request),
+        )
+        .await
+        .map_err(|e| self.refused(link, &e))?;
         let answer = read(answer);
         let conn = lock(db);
         self.may_use(&conn, link, under)?;
@@ -1066,13 +1119,20 @@ impl Leave {
         protocol: Protocol,
         request: &WireMessage,
     ) -> Result<WireMessage, Refused> {
-        if !lock(&self.inner).may_ask(link.name()) {
+        if !self.may_ask_of(link) {
             return Err(Refused::AskedEnough);
         }
         let (send, recv) = open_stream(&link.conn)
             .await
             .map_err(Refused::NotAnswered)?;
-        let answer = exchange(send, recv, protocol, request).await;
+        let answer = exchange(
+            send,
+            recv,
+            protocol,
+            request,
+            self.counts_as_sent(link, protocol, request),
+        )
+        .await;
         answer.map_err(|e| self.refused(link, &e))
     }
 
@@ -1102,12 +1162,15 @@ impl Leave {
         request: &WireMessage,
     ) -> Result<WireMessage, String> {
         let (send, recv) = open_stream(&link.conn).await?;
-        exchange(send, recv, protocol, request).await.map_err(|e| {
-            if refused_for_now(&e) {
-                self.refused_at(link);
-            }
-            e.to_string()
-        })
+        let sent = self.counts_as_sent(link, protocol, request);
+        exchange(send, recv, protocol, request, sent)
+            .await
+            .map_err(|e| {
+                if refused_for_now(&e) {
+                    self.refused_at(link);
+                }
+                e.to_string()
+            })
     }
 
     /// Whether the relay whose node key is `relay` has refused for now as
@@ -1128,6 +1191,7 @@ impl Leave {
     /// The relay whose node key is `relay` refused a request for now
     /// ([`Self::refused_at`]).
     fn refused_by(&self, relay: [u8; 32]) {
+        self.counts.refused_for_rate(&relay);
         let now = self.clock.now();
         let mut inner = lock(&self.inner);
         // Those older than the window are forgotten first, so that a relay
@@ -1195,18 +1259,32 @@ async fn open_stream(
 }
 
 /// Ask one thing on a stream that is open, of `protocol`, and read its
-/// answer.
+/// answer: what `codec::send_request` does, with `sent` called once the
+/// request is written, with the bytes of its frame (decision 2026-10-22
+/// §1.2). The bytes on the wire are the same.
 async fn exchange(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     protocol: Protocol,
     request: &WireMessage,
+    sent: impl FnOnce(usize),
 ) -> Result<WireMessage, codec::CodecError> {
     let mut stream = tokio::io::join(&mut recv, &mut send);
-    let answer = codec::send_request(&mut stream, protocol, request).await;
+    let answer = async {
+        let frame = codec::encode_message(request)?;
+        codec::write_protocol_byte(&mut stream, protocol).await?;
+        codec::write_raw_frame(&mut stream, &frame).await?;
+        sent(FRAME_LENGTH_BYTES + frame.len());
+        codec::read_frame(&mut stream, protocol).await
+    }
+    .await;
     let _ = send.finish();
     answer
 }
+
+/// The bytes of a frame's length, before its message: a request is counted
+/// with them, as a relay counts what it reads.
+const FRAME_LENGTH_BYTES: usize = 4;
 
 /// Whether a request failed because the relay reset its stream with
 /// ERR_RATE_LIMIT: the answer, or the request, was cut off with that
@@ -1477,5 +1555,43 @@ mod tests {
         inner.set_up_with.clear();
         inner.woke = Some(woke(&[]));
         assert!(!inner.is_waking(now));
+    }
+    /// A request held back by the device's own pace is counted for its
+    /// relay, and a request that may be asked is not (decision 2026-10-22
+    /// §1.2): a relay asked as much as a device asks in a minute holds
+    /// back the next, and another relay's are its own.
+    #[test]
+    fn a_request_held_back_by_the_devices_own_pace_is_counted_for_its_relay() {
+        let counts = Arc::new(DeviceCounts::default());
+        let leave = Leave::new(Clock::system()).counting(counts.clone());
+        let (one, other) = (NodeId([1; 32]), NodeId([2; 32]));
+        for n in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+            assert!(leave.may_ask_of_relay("one", &one), "{n}");
+        }
+        assert_eq!(counts.of(&one.0).held_back, 0);
+        assert!(!leave.may_ask_of_relay("one", &one));
+        assert!(!leave.may_ask_of_relay("one", &one));
+        assert!(leave.may_ask_of_relay("other", &other));
+        assert_eq!(counts.of(&one.0).held_back, 2);
+        assert_eq!(counts.of(&other.0).held_back, 0);
+        assert_eq!(
+            counts.of(&one.0).asked,
+            [0; 6],
+            "nothing held back is asked"
+        );
+    }
+
+    /// A request that a relay refused for rate is counted for that relay
+    /// (decision 2026-10-22 §1.2), and for no other.
+    #[test]
+    fn a_request_refused_for_rate_is_counted_for_its_relay() {
+        let counts = Arc::new(DeviceCounts::default());
+        let leave = Leave::new(Clock::system()).counting(counts.clone());
+        leave.refused_by([1; 32]);
+        leave.refused_by([1; 32]);
+        leave.refused_by([2; 32]);
+        assert_eq!(counts.of(&[1; 32]).refused_for_rate, 2);
+        assert_eq!(counts.of(&[2; 32]).refused_for_rate, 1);
+        assert_eq!(counts.of(&[1; 32]).held_back, 0);
     }
 }

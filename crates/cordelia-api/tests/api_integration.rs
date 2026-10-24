@@ -5,7 +5,6 @@
 
 use actix_web::{App, test, web};
 use serde_json::json;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use cordelia_api::state::AppState;
@@ -19,7 +18,8 @@ fn test_state() -> web::Data<AppState> {
     let identity = NodeIdentity::generate().unwrap();
 
     web::Data::new(AppState {
-        db: Mutex::new(conn),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(conn),
         identity,
         bearer_token: TEST_TOKEN.into(),
         home_dir: dir.keep(),

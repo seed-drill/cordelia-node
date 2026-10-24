@@ -15,6 +15,15 @@ use crate::state::AppState;
 /// refuse_while_held`], decision 2026-10-04 §10.1): every handler comes
 /// through here before it does anything.
 pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
+    check_token(req, state)?;
+    crate::first_start::refuse_while_held(req, state)
+}
+
+/// Verify the bearer token from the Authorization header, and nothing
+/// else: no lock is taken. For a route that is answered whether or not the
+/// node is held up, and that must take no lock (decision 2026-10-22 §1.1,
+/// rule 3): whether a node is held up is read under a lock.
+pub fn check_token(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     let header = req
         .headers()
         .get("authorization")
@@ -30,8 +39,7 @@ pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
     if !is_the_token(token, &state.bearer_token) {
         return Err(ApiError::Unauthorized);
     }
-
-    crate::first_start::refuse_while_held(req, state)
+    Ok(())
 }
 
 /// Whether `given` is the node's token, compared in constant time: how
@@ -46,13 +54,14 @@ fn is_the_token(given: &str, token: &str) -> bool {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-
     const TOKEN: &str = "a-token-of-the-node-0123456789";
 
     fn state() -> AppState {
         AppState {
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: TOKEN.into(),
             home_dir: std::env::temp_dir().join("cordelia-auth-test-no-such-directory"),

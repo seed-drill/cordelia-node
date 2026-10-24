@@ -2885,9 +2885,84 @@ listed relay's connection holds is L in the record's section 3, about
 **Derivation:** today's values: one and two of `MAX_MESSAGE_BYTES`, and
 64 streams.
 
+## 14. The Counters of the Scale Test
+
+These are the counters' piece of the scale test of R1's gate 10
+([decision 2026-10-22](../decisions/2026-10-22-a-scale-test-for-r1.md) §1,
+§7.3): atomic counters and fixed histograms inside a node, read through the
+local API's `/api/v1/metrics/load`, which takes no lock. The node's one lock
+on its database is a timed lock (`cordelia_core::lock::TimedLock`): each
+take's wait and hold are recorded by the kind of the request or task it is
+in. None of them changes what a node does.
+
+### LOAD_HISTOGRAM_BUCKETS = 25
+
+**Rationale:** each histogram's buckets are powers of two of microseconds,
+from 1 µs (2^0) to 16 s (2^24, about 16.8 s), as the record's §1.2 gives
+them, and one bucket more for what is longer. A relay's idle pull holds the
+lock for about 12 µs (§1.4) and the stream timeout is 10 s, so both ends of
+what the bars of §3 read are inside the buckets.
+
+**Derivation:** the least count of powers of two from 1 µs whose last is at
+least 16 s; checked at compile time.
+
+**If you change it:** the route's buckets change, and a harness that reads
+them reads other bounds. A power of two a bucket keeps a percentile within
+a factor of two; finer buckets cost an atomic each.
+
+### LOCK_COUNTED_OVER_MS = [5, 50, 100, 250]
+
+**Rationale:** the lengths past which a wait or a hold is counted apart,
+for the bars that a histogram of powers of two cannot read exactly: 5 ms
+and 50 ms, the counts of §1.2 and bar 4 (c) (at most ten holds over 50 ms);
+100 ms, the waits of a device that bar 5 counts (`cordelia msg summary`
+tries the lock for `AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms,
+which bar 4 (c) holds every write under. 250 ms falls inside the bucket of
+131 to 262 ms, so it is counted by itself.
+
+**If you change it:** a bar that reads one of these reads another count.
+
+### LOAD_RELAYS_COUNTED = 16
+
+**Rationale:** the relays a node counts apart, each by its key: a device's
+requests to each relay, those it held back and those refused for rate, and
+the closures of the link to each relay a node is set up with. A slot is
+taken the first time a relay is counted, with no lock, and kept while the
+node runs; past the last, relays are counted together, as "rest". A device
+is set up with two relays by default, and the carried word names at most
+`REACHED_WORD_MAX_RELAYS` (8).
+
+**Derivation:** 2 × `REACHED_WORD_MAX_RELAYS`.
+
+**If you lower it:** a device set up with more relays counts the rest
+together, and its figures for each cannot be checked against each relay's.
+
+### LOCK_HOLD_MEDIAN_NANOS = 12,000 and LOCK_TIMING_COST_MAX_NANOS = 120
+
+**Rationale:** the record's §1.1, rule 5: timing a take must cost under 1%
+of the median hold that §1.4 measured (an idle pull, 12 µs), or the timing
+is sampled. A take that finds the lock free reads the monotonic clock once
+as it is taken and records a wait of none; one that waits reads it as it
+asks too; and the hold is read and recorded as the guard is dropped, after
+the lock is let go. Each record is two atomic additions and a load (the
+longest is written only when it is longer).
+
+**Measured** (`lock::tests::timing_a_take_costs_under_one_hundredth_of_the_median_hold`,
+a million takes of a timed lock against a million of the `Mutex` it wraps,
+the least of eleven rounds each): about 15 ns a take untimed and 83 ns
+timed, so timing costs about 68 ns, under the 120 ns bar, on a machine of 4
+vCPU. So every take is timed, and none is sampled. `cordelia-core` is
+optimised in every build (`Cargo.toml`), so the test measures the timing as
+a relay runs it.
+
+**Derivation:** `LOCK_HOLD_MEDIAN_NANOS / 100`.
+
+**If the cost passes the bar:** time one take in sixteen, as rule 5 says,
+and count the rest only.
+
 ---
 
-*Spec version: 1.6*
+*Spec version: 1.7*
 *Created: 2026-03-16*
-*Updated: 2026-10-22*
+*Updated: 2026-10-24*
 *Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md; decisions/2026-10-09-messages-between-your-own-agents.md*

@@ -107,6 +107,12 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/api/v1/status", web::get().to(handlers::status));
     // Prometheus metrics (GET, outside /channels scope per spec §3.15)
     cfg.route("/api/v1/metrics", web::get().to(handlers::metrics));
+    // The counters of the scale test, read with no lock (decision
+    // 2026-10-22 §1.1, rule 3).
+    cfg.route(
+        "/api/v1/metrics/load",
+        web::get().to(handlers::metrics_load),
+    );
     shared_routes(cfg);
 }
 
@@ -134,6 +140,10 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
     // channels, and of nothing of the older kind.
     cfg.route("/api/v1/status", web::get().to(local::status));
     cfg.route("/api/v1/metrics", web::get().to(local::metrics));
+    cfg.route(
+        "/api/v1/metrics/load",
+        web::get().to(handlers::metrics_load),
+    );
     // Messages between the person's own agents (decision 2026-10-09
     // §4.2): each needs the node's token, and is a personal node's.
     cfg.service(

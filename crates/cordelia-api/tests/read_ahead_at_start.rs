@@ -6,7 +6,6 @@
 //! process's, so this test is a binary of its own: no other test reads
 //! another channel beside it.
 
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use cordelia_api::names::{listed, not_read_ahead, read_ahead_at_start, say};
@@ -35,7 +34,8 @@ fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
     assert!(stored >= names.len(), "{stored}");
 
     let state = std::sync::Arc::new(AppState {
-        db: Mutex::new(conn),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(conn),
         identity,
         bearer_token: "t".into(),
         home_dir: std::env::temp_dir().join("cordelia-read-ahead-test-no-such-directory"),

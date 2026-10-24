@@ -1226,6 +1226,30 @@ pub async fn search_handler(
     }))
 }
 
+// ── GET /api/v1/metrics/load ───────────────────────────────────────
+
+/// The counters of the scale test (decision 2026-10-22 §1.1, rule 3;
+/// §7.3), in the text form of `/api/v1/metrics`: what a relay is asked,
+/// the waits and holds of the lock by kind, the connections, the governor,
+/// and what a device asked of each relay.
+///
+/// **It takes no lock.** The bearer token is checked, and nothing else: a
+/// GET is answered whether or not the node is held up, and whether it is
+/// is read under a lock. Then the atomics are read. So a read neither
+/// waits for the node's work nor holds it up, and reading it once a minute
+/// changes nothing it measures; `/api/v1/metrics` takes the store's lock
+/// to count channels and items, and is not used for this.
+pub async fn metrics_load(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    auth::check_token(&req, &state)?;
+    let body = cordelia_core::load::render(&state.load, state.db.times(), state.uptime_secs());
+    Ok(HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(body))
+}
+
 // ── GET /api/v1/metrics ────────────────────────────────────────────
 
 pub async fn metrics(

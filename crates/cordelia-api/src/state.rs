@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use cordelia_core::load::Load;
+use cordelia_core::lock::TimedLock;
 use cordelia_crypto::identity::NodeIdentity;
 use rusqlite::Connection;
 
@@ -33,7 +35,13 @@ pub struct PushItem {
 
 /// Shared state accessible from all request handlers.
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    /// The node's one lock on its database: every take is timed, by the
+    /// kind of the request or task it is in (decision 2026-10-22 §1.1,
+    /// rule 4).
+    pub db: TimedLock<Connection>,
+    /// The counters of the scale test, served with the lock's times at
+    /// `/api/v1/metrics/load` (decision 2026-10-22 §7.3).
+    pub load: Load,
     pub identity: NodeIdentity,
     pub bearer_token: String,
     pub home_dir: PathBuf,
@@ -148,6 +156,12 @@ impl HeldUp {
     /// Why the node is held up, where it is.
     pub fn why(&self) -> Option<Held> {
         self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Its lock, held: for a test that a read takes no lock.
+    #[cfg(test)]
+    pub(crate) fn locked(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
+        self.why.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The node is held up, by `why`.
@@ -1737,7 +1751,10 @@ mod tests {
     /// A node's state over a database in memory, with no network.
     fn test_state() -> AppState {
         AppState {
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: std::env::temp_dir().join("cordelia-state-test-no-such-directory"),

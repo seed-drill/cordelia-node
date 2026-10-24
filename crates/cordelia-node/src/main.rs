@@ -2146,7 +2146,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let (announce_tx, announce_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = web::Data::new(cordelia_api::state::AppState {
-        db: Mutex::new(conn),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(conn),
         identity: NodeIdentity::from_seed(*identity_arc.seed())?,
         bearer_token,
         home_dir: data_dir,
@@ -2338,6 +2339,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(state.clone())
+                // Each take of the lock by a request of the local API is of
+                // its kind (decision 2026-10-22 §1.1, rule 4).
+                .wrap_fn(|request, service| {
+                    use actix_web::dev::Service;
+                    cordelia_core::lock::take_as(
+                        cordelia_core::load::Kind::Api,
+                        service.call(request),
+                    )
+                })
                 .configure(match serves_a_device {
                     true => cordelia_api::configure_device_routes,
                     false => cordelia_api::configure_routes,
@@ -2686,6 +2696,9 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
         // not, and a command that waited for it is told so (decision
         // 2026-10-04 §7.1, step 1).
         let to_its_end = tokio::task::spawn_blocking(move || {
+            // Each take of the lock in a turn is of the sync cycle
+            // (decision 2026-10-22 §1.1, rule 4).
+            let _cycle = cordelia_core::lock::taking(cordelia_core::load::Kind::Cycle);
             // In its own turn, whether or not sync is on: history ages
             // either way.
             if sweep {

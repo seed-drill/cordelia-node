@@ -122,3 +122,9 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.subtle]
 opt-level = 3
+# The counters of the scale test are optimised in every build, as a relay
+# runs them (decision 2026-10-22 §1.1, rule 5): their test holds what
+# timing one take of the node's lock costs under 1% of the median hold, and
+# measures it in the build that `cargo test` makes.
+[profile.dev.package.cordelia-core]
+opt-level = 3
