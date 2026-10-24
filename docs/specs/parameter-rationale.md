@@ -2804,6 +2804,37 @@ peer allows, and the node's other streams on that connection wait for them.
 **If you lower it to one:** a repush of many items drains one item a round
 trip, which the backoff and the pull make up for, more slowly.
 
+### SMALL_WINDOWS_PULL_ENTRIES = 1
+
+**Rationale:** a receive window bounds what the other end of a connection
+may send, so whether a full page crosses in time is decided by the
+windows at the end that asks for it, and only that end can see them
+(quinn shows neither end the other's settings). A relay asks a relay it
+lists by key for full pages where its own end of their connection
+carries the listed settings (rule 12), and for this many entries a page
+where it does not: where the listed relay dialled it from an address
+other than the one it is configured at (behind a NAT), so that this end
+has every peer's windows. The relay that serves a listed relay gives it
+what it asks for, up to a full page, since it cannot see the asker's
+windows.
+
+**Derivation:** as many entries of the largest size on the wire
+(`MAX_ENTRY_WIRE_BYTES`, 65,773) as a small page (`SMALL_PAGE_BYTES`,
+128 KiB) holds: one. So the page asked for is never larger than a small
+page, whatever its entries' sizes, since an entry's size is not known
+until it is handed.
+
+**What it costs:** a relay on every peer's windows pulls one entry a
+page, `RELAY_ENTRY_PULL_PAGES` (10) a pass of a channel, where at full
+pages it would pull up to 100 a page: a channel of small entries catches
+up there up to 100 times more slowly, one of entries of the largest size
+(13 to a full page) 13 times. A page of one entry of the largest size takes
+about 0.73 s at a round trip of 200 ms on every peer's windows, and fails
+the stream timeout only past about 2.7 s. What is passed on to it as it is taken
+(`to_pass_on`, a small page a message) is not slowed. **If you raise it
+to two:** the worst case of a page is two entries of the largest size,
+131,546 bytes, over a small page by 474 bytes, and still a small message.
+
 ### QUIC_LISTED_STREAM_RECEIVE_WINDOW = 1 MiB, QUIC_LISTED_RECEIVE_WINDOW = 2 MiB, QUIC_LISTED_SEND_WINDOW = 2 MiB, QUIC_LISTED_MAX_BIDI_STREAMS = 64
 
 **Rationale:** a connection between this node and a relay listed by key
@@ -2816,12 +2847,15 @@ full page takes about 6.0 s at a round trip of 200 ms, and fails the
 stream timeout past about 0.33 s, where at these settings it takes about
 0.4 s (1.43 s at a small message a stream): a pull of ten full pages
 would take about 60 s, six times the 10 s between pulls, and catching up
-1 GiB after a restart about 117 minutes where it takes 4.7. **A listed
-relay whose connection lacks these settings** at this end (it arrived
-from another address than the one configured, behind a NAT) is given
-small pages (`Serving::listed_settings`); what it sends this node at full
-size, it cannot tell needs smaller, since quinn shows neither end the
-other's settings. The streams stay 64 for what runs at once between
+1 GiB after a restart about 117 minutes where it takes 4.7. **Where the
+two ends disagree** (a listed relay dialled from another address than the
+one it is configured at, behind a NAT: its end carries these settings,
+the other's every peer's), what crosses the end of every peer's windows
+is bounded by the end that can see them: a relay on every peer's windows
+asks for `SMALL_WINDOWS_PULL_ENTRIES` (1) entry a page, and every relay
+passes entries on a small page to a message (`to_pass_on`), since it
+cannot see the other end's windows. A relay serves a listed relay the
+full page it asks for. The streams stay 64 for what runs at once between
 relays: a pass, a pull, the older kind's fetch, its repush and its push
 retries.
 

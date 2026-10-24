@@ -1587,9 +1587,10 @@ mod tests {
         let every_peer: fn() -> quinn::TransportConfig = transport_config;
         let listed: fn() -> quinn::TransportConfig = listed_transport_config;
         // What crosses: its name, the settings at each end, the bytes the
-        // client writes and the bytes it is answered with, and how many
-        // exchanges in turn make it.
-        let cases: Vec<(&str, Settings, Settings, usize, usize, usize)> = vec![
+        // asker writes and the bytes it is answered with, how many
+        // exchanges in turn make it, and whether the end that was dialled
+        // asks (the client answering it).
+        let cases: Vec<(&str, Settings, Settings, usize, usize, usize, bool)> = vec![
             (
                 "a device's push of 128 KiB to its relay",
                 Box::new(every_peer),
@@ -1597,6 +1598,7 @@ mod tests {
                 128 * 1024,
                 16,
                 1,
+                false,
             ),
             (
                 "a device's pass of 10 pages of 128 KiB, dialling by key",
@@ -1605,6 +1607,7 @@ mod tests {
                 64,
                 128 * 1024,
                 10,
+                false,
             ),
             (
                 "a device's pass of 10 pages of 128 KiB, on every peer's windows",
@@ -1613,6 +1616,7 @@ mod tests {
                 64,
                 128 * 1024,
                 10,
+                false,
             ),
             (
                 "a device of the version before pushes 896 KiB",
@@ -1621,6 +1625,7 @@ mod tests {
                 896 * 1024,
                 16,
                 1,
+                false,
             ),
             (
                 "an older kind's fetch answer of 1 MiB, relays not listed by key",
@@ -1629,6 +1634,7 @@ mod tests {
                 64,
                 1 << 20,
                 1,
+                false,
             ),
             (
                 "a full page of 896 KiB between relays listed by key",
@@ -1637,10 +1643,41 @@ mod tests {
                 64,
                 896 * 1024,
                 1,
+                false,
+            ),
+            // The check's NAT case (rule 12): relay B dials relay A by key
+            // from an address that A has not configured. B's end carries
+            // the listed settings, A's every peer's.
+            (
+                "NAT: B pulls a full page of 896 KiB from A",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
+                false,
+            ),
+            (
+                "NAT: A pulls from B, a full page of 896 KiB (as asked before)",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
+                true,
+            ),
+            (
+                "NAT: A pulls from B, 10 pages of one entry of 65,773 B (as A asks)",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                65_773,
+                10,
+                true,
             ),
         ];
         for rtt_ms in [200u64, 300, 400] {
-            for (name, at_server, at_client, asked, answered, times) in &cases {
+            for (name, at_server, at_client, asked, answered, times, dialled_asks) in &cases {
                 let server_id = NodeIdentity::generate().unwrap();
                 let client_id = NodeIdentity::generate().unwrap();
                 let (cert, key) = generate_self_signed_cert(&server_id).unwrap();
@@ -1680,7 +1717,10 @@ mod tests {
                 for _ in 0..3 {
                     let began = std::time::Instant::now();
                     for _ in 0..*times {
-                        exchange(&client, &server, *asked, *answered).await;
+                        match dialled_asks {
+                            false => exchange(&client, &server, *asked, *answered).await,
+                            true => exchange(&server, &client, *asked, *answered).await,
+                        };
                     }
                     took.push(began.elapsed());
                 }
