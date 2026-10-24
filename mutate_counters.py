@@ -4,9 +4,12 @@ timed by kind, with the waits for the rates and the room apart; what a
 relay is asked, by stream kind, with its answers and bytes; its
 connections and those it turned away; its governor's churns, closures and
 peers; what a device asked and held back; and the route that reads them
-with no lock (decision 2026-10-22 §1.1, §1.2, §7.3). A part for each rule
-of the slice: put each fault in, and confirm the test named for it fails
-on an assertion. Run from the root of a checkout that nothing else edits."""
+with no lock (decision 2026-10-22 §1.1, §1.2, §7.3); and, from the fix
+round, a wait that tries until a deadline, when a relay counts a request,
+each kind of take that no test checked, and a relay's slots summed. A part
+for each rule of the slice: put each fault in, and confirm the test named
+for it fails on an assertion. Run from the root of a checkout that nothing
+else edits."""
 import re, subprocess, sys
 
 # One name for each file a part edits.
@@ -22,8 +25,12 @@ P2P = 'crates/cordelia-node/src/p2p.rs'
 DEVICE = 'crates/cordelia-node/src/device_entries.rs'
 LEAVE = 'crates/cordelia-node/src/device_entries/leave.rs'
 HANDLERS = 'crates/cordelia-api/src/handlers.rs'
+API_MESSAGES = 'crates/cordelia-api/src/messages.rs'
+HISTORY = 'crates/cordelia-api/src/history.rs'
+MAIN = 'crates/cordelia-node/src/main.rs'
 ORIG = {f: open(f).read() for f in (PROTOCOL, LOAD, LOCK, GOVERNOR, CONNECTION, RATE_LIMIT,
-                                    MESSAGES, RELAY, P2P, DEVICE, LEAVE, HANDLERS)}
+                                    MESSAGES, RELAY, P2P, DEVICE, LEAVE, HANDLERS,
+                                    API_MESSAGES, HISTORY, MAIN)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 CORE = ("cordelia-core", ["--lib"])
@@ -38,6 +45,10 @@ def relay(test): return (NODE_BIN, "relay_entries::tests::" + test)
 def leave(test): return (NODE_LIB, "device_entries::leave::tests::" + test)
 def e2e(test): return (NODE_E2E, test)
 def api(test): return (API, "local::tests::" + test)
+def summary(test): return (API, "messages::tests::" + test)
+def history(test): return (API, "history::tests::" + test)
+def device(test): return (NODE_LIB, "device_entries::tests::" + test)
+def p2p(test): return (NODE_BIN, "p2p::tests::" + test)
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -46,8 +57,8 @@ def api(test): return (API, "local::tests::" + test)
 MUTATIONS = [
     # ── The lock, timed by kind (§1.1, rule 4) ──
     ("L1 a hold is recorded as no kind but Other", LOCK,
-     '''        self.times.hold[self.kind as usize].record(self.since.elapsed());''',
-     '''        self.times.hold[Kind::Other as usize].record(self.since.elapsed());''',
+     '''        self.times.hold[self.kind as usize].record(held);''',
+     '''        self.times.hold[Kind::Other as usize].record(held);''',
      [core("lock::tests::a_take_is_recorded_as_the_kind_said_for_it_and_as_no_other")]),
     ("L2 a take that waits records no wait", LOCK,
      '''                let taken = self.inner.lock();
@@ -65,8 +76,8 @@ MUTATIONS = [
         self.future.as_mut().poll(cx)''',
      [core("lock::tests::a_futures_takes_are_of_its_kind_and_not_of_what_runs_between_its_polls")]),
     ("L4 a wait for a mutex taken under the lock is not recorded", LOCK,
-     '''        self.times.nested[which as usize].record(asked.elapsed());''',
-     '''        let _ = (which, asked);''',
+     '''        self.times.nested[which as usize].record(waited);''',
+     '''        let _ = (which, waited);''',
      [core("lock::tests::a_wait_for_a_mutex_taken_under_the_lock_is_recorded_apart")]),
     ("L5 a try that finds the lock held records a take", LOCK,
      '''            Err(TryLockError::WouldBlock) => return Err(TryLockError::WouldBlock),''',
@@ -129,25 +140,27 @@ MUTATIONS = [
      '''            && !lock(rates).handed(who.peer, who.address, page.cost)''',
      [relay("a_wait_for_the_rates_or_the_room_under_the_lock_is_timed_apart")]),
     ("S6 a request's bytes in are counted without the frame's length", RELAY,
-     '''        self.counts.read(stream, FRAME_LENGTH_BYTES + frame.len());''',
-     '''        self.counts.read(stream, frame.len());''',
+     '''        let stream = protocol.counted_as(Some(&request));
+        self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());''',
+     '''        let stream = protocol.counted_as(Some(&request));
+        self.count_read(stream, frame.len());''',
      [relay("each_request_served_is_counted_by_its_kind_with_its_bytes_and_what_became_of_it")]),
     ("S7 a pull refused for now is counted as not served", RELAY,
      '''            Answer::NotNow => Answered::NotNow,''',
      '''            Answer::NotNow => Answered::NotServed,''',
      [relay("each_request_served_is_counted_by_its_kind_with_its_bytes_and_what_became_of_it")]),
     ("S8 the bytes of an answer written are not counted", RELAY,
-     '''            self.counts
-                .wrote(stream, FRAME_LENGTH_BYTES + written.len());''',
-     '''            let _ = (stream, written.len());''',
+     '''                self.counts.wrote(stream, FRAME_LENGTH_BYTES + bytes);''',
+     '''                let _ = bytes;''',
      [relay("each_request_served_is_counted_by_its_kind_with_its_bytes_and_what_became_of_it")]),
     ("S9 an entry refused for new channels is counted as for room", RELAY,
      '''            EntryRefused::OverLimit => Some(Refusal::NewChannels),''',
      '''            EntryRefused::OverLimit => Some(Refusal::Room),''',
      [relay("the_entries_refused_for_room_and_for_new_channels_are_told_from_an_answer")]),
     ("S10 a frame that is no message is not counted", RELAY,
-     '''                self.count(protocol, None, &frame, Answered::Stray);''',
-     '''                let _ = Answered::Stray;''',
+     '''                self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());
+                self.count_answered(stream, Answered::Stray);''',
+     '''                let _ = (stream, Answered::Stray);''',
      [relay("each_request_served_is_counted_by_its_kind_with_its_bytes_and_what_became_of_it")]),
     ("S11 a short show is counted as a whole one", MESSAGES,
      '''                Some(WireMessage::EntryShowShort(_)) => Some(Stream::ShowShort),''',
@@ -200,10 +213,10 @@ MUTATIONS = [
         }''',
      '''        let _ = relay;''',
      [leave("a_request_held_back_by_the_devices_own_pace_is_counted_for_its_relay")]),
-    ("D2 a request refused for rate is not counted", LEAVE,
-     '''        self.counts.refused_for_rate(&relay);''',
+    ("D2 a request refused for now is not counted", LEAVE,
+     '''        self.counts.refused_for_now(&relay);''',
      '''        let _ = &relay;''',
-     [leave("a_request_refused_for_rate_is_counted_for_its_relay")]),
+     [leave("a_request_refused_for_now_is_counted_for_its_relay")]),
     ("D3 a request is counted without its frame's length", LEAVE,
      '''        sent(FRAME_LENGTH_BYTES + frame.len());''',
      '''        sent(frame.len());''',
@@ -234,6 +247,108 @@ MUTATIONS = [
      '''    let _ = &req;
     let body = cordelia_core::load::render(&state.load, state.db.times(), state.uptime_secs());''',
      [api("the_route_of_the_counters_says_each_as_it_moved_to_whoever_has_the_token")]),
+    # ── The fix round: a wait that tries, bar 5 (§1.2) ──
+    ("W1 a take that tries until a deadline records its wait from its last try", LOCK,
+     '''            self.times.wait[kind as usize].record(since - first_try);''',
+     '''            self.times.wait[kind as usize].record(since - since);
+            let _ = first_try;''',
+     [core("lock::tests::a_take_that_tries_until_a_deadline_records_its_wait_from_its_first_try"),
+      summary("a_wait_that_tries_for_the_store_is_recorded_and_a_summary_that_gives_up_is_counted")]),
+    ("W2 a take that gives up at its deadline is not counted", LOCK,
+     '''                    self.times.given_up[kind as usize].fetch_add(1, Ordering::Relaxed);''',
+     '''                    let _ = kind;''',
+     [core("lock::tests::a_take_that_tries_until_a_deadline_records_its_wait_from_its_first_try"),
+      summary("a_wait_that_tries_for_the_store_is_recorded_and_a_summary_that_gives_up_is_counted")]),
+    ("W3 a summary tries the store's lock a try at a time, as before", API_MESSAGES,
+     '''    state.db.try_lock_until(deadline, pause).await''',
+     '''    loop {
+        match state.db.try_lock() {
+            Ok(db) => return Some(db),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => pause().await,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }''',
+     [summary("a_wait_that_tries_for_the_store_is_recorded_and_a_summary_that_gives_up_is_counted")]),
+    # ── The fix round: when a relay counts a request (§1.2) ──
+    ("S12 a request is counted once its answer is made, not as it is read", RELAY,
+     ['''        let stream = protocol.counted_as(Some(&request));
+        self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());''',
+      '''        drop(request);
+        // What became of it, where it is not answered; an answer is'''],
+     ['''        let stream = protocol.counted_as(Some(&request));''',
+      '''        drop(request);
+        self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());
+        // What became of it, where it is not answered; an answer is'''],
+     [relay("a_request_is_counted_as_it_is_read_before_its_answer_is_made")]),
+    ("S13 an answer whose write failed is counted as answered", RELAY,
+     '''            (None, stream) => self.count_answered(stream, Answered::NotServed),''',
+     '''            (None, stream) => self.count_answered(stream, Answered::Answered),''',
+     [relay("a_request_whose_answer_could_not_be_written_is_not_served")]),
+    ("S14 a request refused at its length for want of a permit is not counted", RELAY,
+     '''                let stream = protocol.counted_as(None);
+                self.count_read(stream, FRAME_LENGTH_BYTES);
+                self.count_answered(stream, Answered::LargeLater);''',
+     '''                let _ = Answered::LargeLater;''',
+     [relay("a_request_refused_at_its_length_for_want_of_a_permit_is_counted")]),
+    # ── The fix round: each kind of take that no test checked (§1.1, rule 4) ──
+    ("K1 the room made at a relay's start is not said as a sweep", RELAY,
+     '''    pub fn make_room(&self, db: &TimedLock<Connection>) {
+        let _sweep = taking(Kind::Sweep);''',
+     '''    pub fn make_room(&self, db: &TimedLock<Connection>) {''',
+     [relay("each_take_of_the_lock_in_a_request_is_of_its_kind")]),
+    ("K2 a device's sweep of old deletes is not said as a sweep", DEVICE,
+     '''    pub fn sweep_deletes(&self) {
+        let _sweep = taking(TakeKind::Sweep);''',
+     '''    pub fn sweep_deletes(&self) {''',
+     [device("a_devices_sweep_and_its_hourly_task_take_the_lock_each_as_its_kind")]),
+    ("K3 a device's hourly task is not said as the checkpoint", DEVICE,
+     '''        let _checkpoint = taking(TakeKind::Checkpoint);''',
+     '''        let _checkpoint = ();''',
+     [device("a_devices_sweep_and_its_hourly_task_take_the_lock_each_as_its_kind")]),
+    ("K4 the work of a route of history is not said as the local API", HISTORY,
+     '''        let _api = cordelia_core::lock::taking(cordelia_core::load::Kind::Api);
+        work(&state)''',
+     '''        work(&state)''',
+     [history("the_work_of_a_route_of_history_takes_the_lock_as_the_local_api")]),
+    ("K5 the routes of the local API are not wrapped as the local API", MAIN,
+     '''                .wrap_fn(|request, service| {
+                    use actix_web::dev::Service;
+                    cordelia_core::lock::take_as(
+                        cordelia_core::load::Kind::Api,
+                        service.call(request),
+                    )
+                })
+''',
+     '''''',
+     [e2e("what_a_device_counts_it_asked_is_what_its_relay_counts_it_read"),
+      e2e("a_device_process_takes_its_lock_as_its_sync_cycle_and_its_local_api")]),
+    ("K6 a device's sync cycle is not said as the cycle", MAIN,
+     '''            let _cycle = cordelia_core::lock::taking(cordelia_core::load::Kind::Cycle);''',
+     '''            let _cycle = ();''',
+     [e2e("a_device_process_takes_its_lock_as_its_sync_cycle_and_its_local_api")]),
+    ("K7 the older kind's sweep of deletes is not said as a sweep", P2P,
+     '''    let _sweep = cordelia_core::lock::taking(cordelia_core::load::Kind::Sweep);
+    let Ok(db) = db.lock() else { return };
+    let members_known = false;''',
+     '''    let Ok(db) = db.lock() else { return };
+    let members_known = false;''',
+     [p2p("the_sweep_of_the_older_kinds_deletes_takes_the_lock_as_a_sweep")]),
+    # ── The fix round: a relay's slots, summed where it is read (§1.2) ──
+    ("B1 what a device counts of a relay reads its first slot only", LOAD,
+     '''        self.relays
+            .sum_of(key)
+            .map_or_else(DeviceRead::default, DeviceRead::of)''',
+     '''        self.relays.find(key).map_or_else(DeviceRead::default, |counts| {
+            DeviceRead::of(std::array::from_fn(|i| counts[i].load(Ordering::Relaxed)))
+        })''',
+     [core("load::tests::a_relay_with_two_slots_is_read_with_them_summed")]),
+    ("B2 the closures of a relay's link read its first slot only", LOAD,
+     '''        self.relays.sum_of(key).map_or(0, |counts| counts[CLOSURES])''',
+     '''        self.relays
+            .find(key)
+            .map_or(0, |counts| counts[CLOSURES].load(Ordering::Relaxed))''',
+     [core("load::tests::a_relay_with_two_slots_is_read_with_them_summed")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
