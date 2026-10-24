@@ -5350,7 +5350,9 @@ mod tests {
             db: &relay.db,
             rates: &relay.rates,
             permits: None,
-            listed_settings: false,
+            // A listed relay's connection, where it is one, with the
+            // listed settings.
+            listed_settings: relay.entries.lists(&peer),
         };
         let mut whole = ShownWhole::default();
         // Small pipes, so that what a pipe keeps for itself is small: the
