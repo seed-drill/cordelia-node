@@ -1812,10 +1812,14 @@ async fn a_request_is_not_written_once_the_entry_it_was_built_under_is_kept_no_m
         assert!(relay.seen().is_empty());
         // The device applies a change: it keeps another entry now.
         device.changes(&phrase(), &[&device], &[]);
-        // One stream is let go, and the relay lets another be opened.
-        let (mut send, mut recv) = held.pop().unwrap();
-        let _ = send.reset(0u32.into());
-        let _ = recv.stop(0u32.into());
+        // Two streams are let go, and the relay lets another be opened:
+        // quinn gives a peer streams back once more than an eighth of its
+        // limit is free, so at QUIC_MAX_BIDI_STREAMS (8) two at a time.
+        for _ in 0..2 {
+            let (mut send, mut recv) = held.pop().unwrap();
+            let _ = send.reset(0u32.into());
+            let _ = recv.stop(0u32.into());
+        }
     };
     let (asked, ()) = tokio::join!(asks, meanwhile);
     assert_eq!(asked, Err(Refused::KeptAnother));

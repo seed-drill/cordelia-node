@@ -118,7 +118,8 @@ use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
     MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX,
-    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, entry_cost,
+    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, SMALL_WINDOWS_PULL_ENTRIES,
+    entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
@@ -660,7 +661,7 @@ impl RelayEntries {
                 self.pushing(db, rates, who, push, now)
             }
             (Protocol::RelayEntries, request) if who.listed => {
-                self.asked_by_a_relay(db, who.peer, request, now)
+                self.asked_by_a_relay(db, who, request, now)
             }
             _ => Answer::Stray,
         }
@@ -916,7 +917,8 @@ impl RelayEntries {
         // one (decision 2026-10-22 (memory), rule 3): it holds at most
         // SMALL_PAGE_BYTES of entries, so that it fits a small message, and
         // says there is more as a full page does. A listed relay is given
-        // full pages (rule 7).
+        // full pages (rule 7); where its own end of the connection does not
+        // carry the listed settings, it asks for fewer (rule 12).
         let most_bytes = match who.listed {
             true => ENTRY_PAGE_MAX_BYTES,
             false => SMALL_PAGE_BYTES,
@@ -1084,10 +1086,11 @@ impl RelayEntries {
     fn asked_by_a_relay(
         &self,
         db: &Mutex<Connection>,
-        from: &NodeId,
+        who: &Who,
         request: &WireMessage,
         now: i64,
     ) -> Answer {
+        let from = who.peer;
         match request {
             WireMessage::RelayChannelsAsk(RelayChannelsAsk { after, limit }) => {
                 let Ok(db) = db.lock() else {
@@ -1105,7 +1108,10 @@ impl RelayEntries {
             }
             // Without the proof: the page is the one for a channel that
             // was proved, and a full one, as for any listed relay
-            // (decision 2026-10-22 (memory), rule 7).
+            // (decision 2026-10-22 (memory), rule 7). The asker bounds it
+            // by its limit where its own end does not carry the listed
+            // settings (rule 12): the windows a page crosses are the
+            // asker's, and this end cannot see them.
             WireMessage::RelayPull(pull) => {
                 let Ok(db) = db.lock() else {
                     return Answer::Nothing;
@@ -1295,8 +1301,15 @@ impl RelayEntries {
 
     /// The entries that wait to be passed on, as the messages for each of
     /// `relays`: every entry but those that came from that relay, each
-    /// with the two times of its channel as this relay holds it, a page's
-    /// worth to a message. Nothing waits afterwards.
+    /// with the two times of its channel as this relay holds it, a small
+    /// page's worth to a message. Nothing waits afterwards.
+    ///
+    /// A small page, not a full one (decision 2026-10-22 (memory), rule
+    /// 12): a push crosses the other relay's receive windows, which this
+    /// end cannot see. A listed relay whose connection came from another
+    /// address than the one it is configured at has every peer's windows
+    /// at its end, at which a message of 896 KiB fails the stream timeout
+    /// past a round trip of about 0.33 s.
     fn to_pass_on(
         &self,
         db: &Mutex<Connection>,
@@ -1335,7 +1348,7 @@ impl RelayEntries {
                     };
                     let full = messages.last().is_none_or(|message| {
                         message.entries.len() >= ENTRY_PAGE_MAX_ENTRIES as usize
-                            || bytes + entry.bytes.len() > ENTRY_PAGE_MAX_BYTES
+                            || bytes + entry.bytes.len() > SMALL_PAGE_BYTES
                     });
                     if full {
                         messages.push(RelayPush {
@@ -1365,11 +1378,29 @@ pub trait Asked {
         &self,
         request: WireMessage,
     ) -> impl std::future::Future<Output = Result<WireMessage, String>> + Send;
+
+    /// Whether this end of the connection has every peer's windows: it
+    /// does not carry the listed settings (decision 2026-10-22 (memory),
+    /// rule 12), as where the listed relay dialled from another address
+    /// than the one configured. Then a full page would cross this end's
+    /// windows a stream window at a time, and is not asked for.
+    fn small_windows(&self) -> bool;
 }
 
-impl Asked for quinn::Connection {
+/// A listed relay's connection, as this relay asks it, and whether this
+/// end of it has every peer's windows.
+pub struct RelayLink {
+    pub conn: quinn::Connection,
+    pub small_windows: bool,
+}
+
+impl Asked for RelayLink {
     async fn ask(&self, request: WireMessage) -> Result<WireMessage, String> {
-        ask(self, Protocol::RelayEntries, &request).await
+        ask(&self.conn, Protocol::RelayEntries, &request).await
+    }
+
+    fn small_windows(&self) -> bool {
+        self.small_windows
     }
 }
 
@@ -1728,12 +1759,22 @@ impl RelayEntries {
             return Ok(0);
         };
         let mut stored = 0;
+        // A receive window bounds what the other end may send, so it is
+        // this end's windows that a page crosses (decision 2026-10-22
+        // (memory), rule 12). Where they are every peer's, the page asked
+        // for is a small page at worst, whatever its entries' sizes: the
+        // relay that serves it cannot see this end's windows.
+        let limit = if link.small_windows() {
+            SMALL_WINDOWS_PULL_ENTRIES
+        } else {
+            ENTRY_PAGE_MAX_ENTRIES
+        };
         for _ in 0..RELAY_ENTRY_PULL_PAGES {
             let asked = WireMessage::RelayPull(RelayPull {
                 channel: told.channel,
                 mark,
                 after,
-                limit: ENTRY_PAGE_MAX_ENTRIES,
+                limit,
             });
             let WireMessage::EntryPulled(page) = link.ask(asked).await? else {
                 return Err("a request for a page was not answered with one".into());
@@ -1768,16 +1809,38 @@ pub fn listed_and_connected(
         .collect()
 }
 
+/// The listed relays that are connected, each with its connection as this
+/// relay asks it: whether this end of it carries the listed settings
+/// (decision 2026-10-22 (memory), rule 12) decides the pages it asks for.
+pub fn listed_links(
+    entries: &RelayEntries,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> Vec<(NodeId, RelayLink)> {
+    listed_and_connected(entries, conn_mgr)
+        .into_iter()
+        .map(|(relay, conn)| {
+            let small_windows = !conn_mgr.carries_listed_settings(&relay);
+            (
+                relay,
+                RelayLink {
+                    conn,
+                    small_windows,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Run `entries.pull_from` for each of `relays`, each in a task of its own.
 pub fn pull_from_each(
     entries: &Arc<RelayEntries>,
     state: &actix_web::web::Data<cordelia_api::state::AppState>,
-    relays: Vec<(NodeId, quinn::Connection)>,
+    relays: Vec<(NodeId, RelayLink)>,
 ) {
-    for (relay, conn) in relays {
+    for (relay, link) in relays {
         let (entries, state) = (entries.clone(), state.clone());
         tokio::spawn(async move {
-            entries.pull_from(&conn, relay, &state.db).await;
+            entries.pull_from(&link, relay, &state.db).await;
         });
     }
 }
@@ -3233,6 +3296,84 @@ mod tests {
         }
     }
 
+    /// A relay asks a relay it lists by key for pages whose worst case is a
+    /// small page where its own end of their connection has every peer's
+    /// windows, and for full pages where it carries the listed settings
+    /// (decision 2026-10-22 (memory), rule 12). A receive window bounds
+    /// what the other end may send, so it is the asker's windows that a
+    /// page crosses, and only the asker can see them; the relay that
+    /// serves a listed relay gives it what it asks for, up to a full page.
+    ///
+    /// The check's NAT case: relay B dials relay A by key from an address
+    /// that A has not configured, so A's end has every peer's windows and
+    /// B's the listed ones. Each holds a channel of 13 entries of the
+    /// largest size. A pulls from B one entry a page, ten in a pass; B
+    /// pulls from A the whole channel in one full page.
+    #[tokio::test]
+    async fn a_relay_on_every_peers_windows_asks_a_listed_relay_for_small_pages() {
+        let pages_asked = |link: &Link| -> Vec<u32> {
+            lock(&link.asked)
+                .iter()
+                .filter_map(|request| match request {
+                    WireMessage::RelayPull(pull) => Some(pull.limit),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Each serves the other as a relay it lists (number 9), and each
+        // pulls from the other as number 8.
+        let (a, b) = (relay_of(u64::MAX, &[8, 9]), relay_of(u64::MAX, &[8, 9]));
+        for d in 1..=13 {
+            a.hold(&largest(1, d), NOW);
+            b.hold(&largest(2, d), NOW);
+        }
+
+        // A pulls from B: A's end has every peer's windows.
+        let from_b = Link {
+            small_windows: true,
+            ..Link::to(&b)
+        };
+        a.entries.pull_from(&from_b, peer(8), &a.db).await;
+        let asked = pages_asked(&from_b);
+        assert_eq!(
+            asked,
+            vec![SMALL_WINDOWS_PULL_ENTRIES; RELAY_ENTRY_PULL_PAGES],
+            "a relay on every peer's windows asked for pages larger than a small page"
+        );
+        assert_eq!(
+            a.held(2).unwrap().bytes,
+            RELAY_ENTRY_PULL_PAGES as u64 * LARGEST,
+            "a pass of pages of one entry did not store one entry a page"
+        );
+        // The next pass goes on, and the channel is had whole.
+        a.entries.pull_from(&from_b, peer(8), &a.db).await;
+        assert_eq!(a.held(2).unwrap().bytes, 13 * LARGEST);
+
+        // B pulls from A: B's end carries the listed settings, and A, which
+        // cannot see B's windows, hands the full page it is asked for: the
+        // channel whole, in one page.
+        let from_a = Link::to(&a);
+        b.entries.pull_from(&from_a, peer(8), &b.db).await;
+        // Of each channel A holds (channel 2 too, which A had of B), a
+        // full page.
+        let asked = pages_asked(&from_a);
+        assert!(
+            !asked.is_empty() && asked.iter().all(|limit| *limit == ENTRY_PAGE_MAX_ENTRIES),
+            "a relay that carries the listed settings did not ask for full pages: {asked:?}"
+        );
+        let of_one = from_a
+            .pulls()
+            .iter()
+            .filter(|(c, ..)| *c == channel(1))
+            .count();
+        assert_eq!(of_one, 1, "the channel was not had in one full page");
+        assert_eq!(
+            b.held(1).unwrap().bytes,
+            13 * LARGEST,
+            "a listed relay was not handed the full page it asked for"
+        );
+    }
+
     /// A pull of a channel that was not proved on the connection is
     /// answered from the connection's memory, and the store is not asked:
     /// the answer comes while the database is held by another. It is the
@@ -4249,8 +4390,8 @@ mod tests {
         relay::make_room(&lock(&at.db), 0).unwrap();
         assert!(at.entries.to_pass_on(&at.db, &both).is_empty());
 
-        // A page's worth to a message: 150 small entries are two, and 20
-        // of the largest are two, 13 and 7.
+        // A small page's worth to a message: 150 small entries are two,
+        // and 20 of the largest are twenty, one each.
         for from in [0u8, 100] {
             let entries = (from..(from + 100).min(150))
                 .map(|d| made(10, d, 5, "notes.md", "a small text").to_wire())
@@ -4264,12 +4405,15 @@ mod tests {
         pushed(at.push(8, (14..=20).map(|d| largest(11, d).to_wire()).collect()));
         let waiting = at.entries.to_pass_on(&at.db, &both);
         let sizes: Vec<usize> = waiting_for(&waiting, 9).iter().map(Vec::len).collect();
-        assert_eq!(sizes, [13, 7]);
+        assert_eq!(
+            sizes, [1; 20],
+            "entries of the largest size were passed on more than a small page to a message"
+        );
         for message in &waiting[0].1 {
             let bytes: usize = message.entries.iter().map(|e| e.entry.len()).sum();
-            assert!(bytes <= ENTRY_PAGE_MAX_BYTES);
+            assert!(bytes <= SMALL_PAGE_BYTES);
             let travels = codec::encode_message(&WireMessage::RelayPush(message.clone()));
-            assert!(travels.unwrap().len() <= codec::MAX_MESSAGE_BYTES as usize);
+            assert!(travels.unwrap().len() <= SMALL_MESSAGE_BYTES as usize);
         }
 
         // A relay whose operator lists no relay by key keeps nothing to
@@ -4289,6 +4433,8 @@ mod tests {
         /// The requests that are not answered at all, as where the relay
         /// is too slow: asking fails.
         unanswered: Option<fn(&WireMessage) -> bool>,
+        /// Whether this end of the connection has every peer's windows.
+        small_windows: bool,
     }
 
     impl<'a> Link<'a> {
@@ -4298,6 +4444,7 @@ mod tests {
                 asked: Mutex::default(),
                 spoil: None,
                 unanswered: None,
+                small_windows: false,
             }
         }
 
@@ -4337,6 +4484,10 @@ mod tests {
                 }
                 _ => Err("not answered".into()),
             }
+        }
+
+        fn small_windows(&self) -> bool {
+            self.small_windows
         }
     }
 
@@ -4989,6 +5140,10 @@ mod tests {
                     }
                     _ => Err("not answered".into()),
                 }
+            }
+
+            fn small_windows(&self) -> bool {
+                false
             }
         }
         assert_eq!(RELAY_CHANNEL_PAGES_PER_PASS, 10);

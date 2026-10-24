@@ -2445,6 +2445,198 @@ pub fn post_connect(
     }
 }
 
+/// How many times an item of the older kind is pushed again to a peer
+/// after a push of it failed (2 s, 4 s and 8 s apart). After that, the
+/// pull is the safety net.
+const PUSH_RETRY_MAX: u8 = 3;
+
+/// An item of the older kind whose push to a peer failed, waiting to be
+/// pushed to it again.
+struct RetryEntry {
+    item: cordelia_network::messages::Item,
+    peer_id: NodeId,
+    channel_id: String,
+    exclude_peer: Option<NodeId>,
+    /// The tries made of it so far.
+    attempt: u8,
+    retry_at: tokio::time::Instant,
+}
+
+/// The older kind's push retries: sender-side, one stream for each item,
+/// with backoff. A push that fails reports each of its items through
+/// [`PushRetries::failed`], and each round tries again those that are due.
+/// Silent drop on the receiver's side stays: no NACK (a DoS amplification
+/// vector).
+///
+/// **At most `PUSH_RETRY_STREAMS_AT_ONCE` to one peer at once** (decision
+/// 2026-10-22 (memory), rule 9). A failed repush of up to
+/// `MAX_PUSHED_ITEMS` items would otherwise open a stream for each at
+/// once, and against a peer that lets a few streams be open, most of them
+/// would wait for a stream, time out and use up their tries. An item held
+/// back stays waiting for a later round, and is not counted as a try
+/// until it is tried.
+struct PushRetries {
+    waiting: Vec<RetryEntry>,
+    failed_tx: tokio::sync::mpsc::UnboundedSender<RetryEntry>,
+    failed_rx: tokio::sync::mpsc::UnboundedReceiver<RetryEntry>,
+    /// How many retries are running to each peer.
+    running: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<NodeId, usize>>>,
+}
+
+/// One retry running to a peer, counted for as long as it runs.
+struct RetryRunning {
+    peer: NodeId,
+    running: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<NodeId, usize>>>,
+}
+
+impl Drop for RetryRunning {
+    fn drop(&mut self) {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = running.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                running.remove(&self.peer);
+            }
+        }
+    }
+}
+
+impl PushRetries {
+    fn new() -> Self {
+        let (failed_tx, failed_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            waiting: Vec::new(),
+            failed_tx,
+            failed_rx,
+            running: Default::default(),
+        }
+    }
+
+    /// Where a push that failed reports each of its items.
+    fn failed(&self) -> tokio::sync::mpsc::UnboundedSender<RetryEntry> {
+        self.failed_tx.clone()
+    }
+
+    /// One round, at `now`: each item that is due is pushed again on a
+    /// stream of its own, to its peer if `hot` holds of it and it has a
+    /// connection (`connection_of`), within `PUSH_RETRY_STREAMS_AT_ONCE`
+    /// running to that peer. One that has had its tries, or whose peer is
+    /// no longer hot or connected, is dropped.
+    fn round(
+        &mut self,
+        now: tokio::time::Instant,
+        hot: &dyn Fn(&NodeId) -> bool,
+        connection_of: &dyn Fn(&NodeId) -> Option<quinn::Connection>,
+    ) {
+        while let Ok(entry) = self.failed_rx.try_recv() {
+            self.waiting.push(entry);
+        }
+        if self.waiting.is_empty() {
+            return;
+        }
+        let mut to_try = Vec::new();
+        {
+            let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            let mut remaining = Vec::new();
+            for entry in self.waiting.drain(..) {
+                if entry.retry_at > now {
+                    remaining.push(entry);
+                    continue;
+                }
+                if entry.attempt >= PUSH_RETRY_MAX {
+                    tracing::warn!(
+                        peer = %entry.peer_id, channel = %entry.channel_id,
+                        attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
+                    );
+                    continue;
+                }
+                // Only retry if peer is still hot
+                if !hot(&entry.peer_id) {
+                    tracing::debug!(
+                        peer = %entry.peer_id, "push retry skipped: peer no longer hot"
+                    );
+                    continue;
+                }
+                let Some(conn) = connection_of(&entry.peer_id) else {
+                    continue;
+                };
+                // Held back for a later round, its tries unspent.
+                let at_once = running.entry(entry.peer_id.clone()).or_default();
+                if *at_once >= cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE {
+                    remaining.push(entry);
+                    continue;
+                }
+                *at_once += 1;
+                to_try.push((conn, entry));
+            }
+            self.waiting = remaining;
+        }
+        for (conn, entry) in to_try {
+            let running = RetryRunning {
+                peer: entry.peer_id.clone(),
+                running: self.running.clone(),
+            };
+            tokio::spawn(push_again(conn, entry, self.failed_tx.clone(), running));
+        }
+    }
+
+    /// Whether no item waits and no retry runs.
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.waiting.is_empty()
+            && self.failed_rx.is_empty()
+            && self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+}
+
+/// Push `entry`'s item to its peer again, on a stream of its own, as its
+/// next try; where it fails, report it to `failed` with a backoff that
+/// doubles with each try.
+async fn push_again(
+    conn: quinn::Connection,
+    entry: RetryEntry,
+    failed: tokio::sync::mpsc::UnboundedSender<RetryEntry>,
+    _running: RetryRunning,
+) {
+    let pid = entry.peer_id;
+    let attempt = entry.attempt + 1;
+    let again = |item, peer_id, channel_id, exclude_peer| {
+        let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
+        let _ = failed.send(RetryEntry {
+            item,
+            peer_id,
+            channel_id,
+            exclude_peer,
+            attempt,
+            retry_at: tokio::time::Instant::now() + backoff,
+        });
+    };
+    tracing::debug!(peer = %pid, attempt, "push retry");
+    let (mut send, mut recv) = match open_bi(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
+            again(entry.item, pid, entry.channel_id, entry.exclude_peer);
+            return;
+        }
+    };
+    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let items = std::slice::from_ref(&entry.item);
+    match cordelia_network::item_sync::send_push(&mut stream, items).await {
+        Ok(ack) => {
+            tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered")
+        }
+        Err(e) => {
+            tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
+            again(entry.item, pid, entry.channel_id, entry.exclude_peer);
+        }
+    }
+}
+
 /// Background task that accepts incoming QUIC connections, handles
 /// outbound item pushes, and manages peer lifecycle.
 #[expect(
@@ -2652,22 +2844,10 @@ pub async fn p2p_loop(
     gov_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gov_interval.tick().await;
 
-    // Push retry queue: sender-side retry with exponential backoff.
-    // Spawned push tasks report failures via retry_fail_tx. The select loop
-    // drains failures into retry_queue and re-attempts on a 2s timer.
-    // Max 3 retries (2s, 4s, 8s backoff). After that, pull-sync is the safety net.
-    // Silent drop on receiver side stays -- no NACK (DoS amplification vector).
-    const PUSH_RETRY_MAX: u8 = 3;
-    struct RetryEntry {
-        item: cordelia_network::messages::Item,
-        peer_id: NodeId,
-        channel_id: String,
-        exclude_peer: Option<NodeId>,
-        attempt: u8,
-        retry_at: tokio::time::Instant,
-    }
-    let (retry_fail_tx, mut retry_fail_rx) = tokio::sync::mpsc::unbounded_channel::<RetryEntry>();
-    let mut retry_queue: Vec<RetryEntry> = Vec::new();
+    // Push retries (`PushRetries`): spawned pushes report failures to it,
+    // and the select loop tries them again on a 2s timer.
+    let mut push_retries = PushRetries::new();
+    let retry_fail_tx = push_retries.failed();
     let mut retry_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retry_interval.tick().await;
@@ -2826,8 +3006,9 @@ pub async fn p2p_loop(
                         let ctx = connect_ctx.clone();
                         let tx = connect_tx.clone();
                         let arriving = arriving.clone();
+                        let relays = relay_addrs.clone();
                         tokio::spawn(async move {
-                            let accepted = cordelia_network::connection::inbound_accept(&ctx, incoming).await;
+                            let accepted = accept_incoming(&ctx, incoming, &relays).await;
                             {
                                 let mut arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(at) = arriving.iter().position(|a| *a == address) {
@@ -3059,9 +3240,10 @@ pub async fn p2p_loop(
                     let ctx = connect_ctx.clone();
                     let tx = connect_tx.clone();
                     let addr = relay.addr;
+                    let relay = relay.clone();
                     tracing::debug!(relay = %relay.host, %addr, "dialling relay");
                     tokio::spawn(async move {
-                        match cordelia_network::connection::outbound_connect(&ctx, addr).await {
+                        match dial_relay(&ctx, &relay).await {
                             Ok(outcome) => { let _ = tx.send(Ok(outcome)); }
                             Err(e) => { let _ = tx.send(Err((addr, e.to_string()))); }
                         }
@@ -3282,7 +3464,7 @@ pub async fn p2p_loop(
             // lacks.
             _ = entry_pull_interval.tick(), if relay_entries.is_some() => {
                 if let Some(entries) = &relay_entries {
-                    let relays = crate::relay_entries::listed_and_connected(entries, &conn_mgr);
+                    let relays = crate::relay_entries::listed_links(entries, &conn_mgr);
                     crate::relay_entries::pull_from_each(entries, &state, relays);
                 }
             }
@@ -3323,74 +3505,12 @@ pub async fn p2p_loop(
 
             // ── Push retry processing ─────────────────────────────────
             _ = retry_interval.tick() => {
-                // Drain failure reports into retry queue
-                while let Ok(entry) = retry_fail_rx.try_recv() {
-                    retry_queue.push(entry);
-                }
-                if retry_queue.is_empty() { continue; }
-
-                let now = tokio::time::Instant::now();
-                let mut remaining = Vec::new();
-                for entry in retry_queue.drain(..) {
-                    if entry.retry_at > now {
-                        remaining.push(entry);
-                        continue;
-                    }
-                    if entry.attempt >= PUSH_RETRY_MAX {
-                        tracing::warn!(
-                            peer = %entry.peer_id, channel = %entry.channel_id,
-                            attempts = entry.attempt, "push retry exhausted, relying on pull-sync"
-                        );
-                        continue;
-                    }
-                    // Only retry if peer is still hot
-                    if !governor.hot_peers().contains(&entry.peer_id) {
-                        tracing::debug!(
-                            peer = %entry.peer_id, "push retry skipped: peer no longer hot"
-                        );
-                        continue;
-                    }
-                    if let Some(conn) = conn_mgr.get_connection(&entry.peer_id) {
-                        let conn = conn.clone();
-                        let items = vec![entry.item.clone()];
-                        let pid = entry.peer_id.clone();
-                        let attempt = entry.attempt + 1;
-                        let rtx = retry_fail_tx.clone();
-                        let retry_item = entry.item;
-                        let retry_ch = entry.channel_id;
-                        let retry_ex = entry.exclude_peer;
-                        tracing::debug!(peer = %pid, attempt, "push retry");
-                        tokio::spawn(async move {
-                            let (mut send, mut recv) = match open_bi(&conn).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry open_bi failed");
-                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
-                                    let _ = rtx.send(RetryEntry {
-                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
-                                        exclude_peer: retry_ex, attempt,
-                                        retry_at: tokio::time::Instant::now() + backoff,
-                                    });
-                                    return;
-                                }
-                            };
-                            let mut stream = tokio::io::join(&mut recv, &mut send);
-                            match cordelia_network::item_sync::send_push(&mut stream, &items).await {
-                                Ok(ack) => tracing::debug!(peer = %pid, attempt, stored = ack.stored, "push retry delivered"),
-                                Err(e) => {
-                                    tracing::debug!(peer = %pid, attempt, error = %e, "push retry failed");
-                                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt as u32));
-                                    let _ = rtx.send(RetryEntry {
-                                        item: retry_item, peer_id: pid, channel_id: retry_ch,
-                                        exclude_peer: retry_ex, attempt,
-                                        retry_at: tokio::time::Instant::now() + backoff,
-                                    });
-                                }
-                            }
-                        });
-                    }
-                }
-                retry_queue = remaining;
+                let hot = governor.hot_peers();
+                push_retries.round(
+                    tokio::time::Instant::now(),
+                    &|peer| hot.contains(peer),
+                    &|peer| conn_mgr.get_connection(peer).cloned(),
+                );
             }
 
             // ── Relay re-push flush (batched, de-duped) ───────────────
@@ -4574,6 +4694,70 @@ fn key_at(
                 .is_some_and(|conn| conn.remote_address() == addr)
         })
         .map(|peer| peer.0)
+}
+
+/// The keys of the relays configured by key at `from` (decision
+/// 2026-10-22 (memory), rule 12): a connection that arrives from there is
+/// accepted with the transport settings between relays listed by key, and
+/// closed after TLS unless it proves one of these keys. Empty for any
+/// other address. Matched by address and port, as a relay dials from the
+/// port it listens on; an IPv4 address that a dual-stack socket shows
+/// mapped into IPv6 is the same address.
+fn keys_listed_at(
+    relays: &[cordelia_network::bootstrap::RelayAddr],
+    from: std::net::SocketAddr,
+) -> Vec<[u8; 32]> {
+    let canonical = |addr: std::net::SocketAddr| {
+        std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    };
+    let mut keys: Vec<[u8; 32]> = relays
+        .iter()
+        .filter(|relay| canonical(relay.addr) == canonical(from))
+        .filter_map(|relay| relay.key)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Accept `incoming` (decision 2026-10-22 (memory), rule 12): from the
+/// address of a relay configured by key, with the transport settings
+/// between relays listed by key, and closed after TLS where the key is
+/// not that relay's; from any other, with every peer's.
+async fn accept_incoming(
+    ctx: &cordelia_network::connection::ConnectContext,
+    incoming: quinn::Incoming,
+    relays: &RelayAddrs,
+) -> Result<
+    cordelia_network::connection::ConnectOutcome,
+    cordelia_network::connection::ConnectionError,
+> {
+    let keys = relays
+        .read()
+        .map(|relays| keys_listed_at(&relays, incoming.remote_address()))
+        .unwrap_or_default();
+    if keys.is_empty() {
+        cordelia_network::connection::inbound_accept(ctx, incoming).await
+    } else {
+        cordelia_network::connection::inbound_accept_from_listed(ctx, incoming, &keys).await
+    }
+}
+
+/// Dial a configured relay (decision 2026-10-22 (memory), rule 12): one
+/// configured by key with the transport settings between relays listed by
+/// key, one configured by address alone with every peer's.
+async fn dial_relay(
+    ctx: &cordelia_network::connection::ConnectContext,
+    relay: &cordelia_network::bootstrap::RelayAddr,
+) -> Result<
+    cordelia_network::connection::ConnectOutcome,
+    cordelia_network::connection::ConnectionError,
+> {
+    if relay.key.is_some() {
+        cordelia_network::connection::outbound_connect_to_listed(ctx, relay.addr).await
+    } else {
+        cordelia_network::connection::outbound_connect(ctx, relay.addr).await
+    }
 }
 
 /// Whether a configured relay is connected: by its key if one is
@@ -8151,10 +8335,11 @@ mod tests {
         write_protocol_byte(&mut csend, Protocol::ItemPush)
             .await
             .unwrap();
-        // A frame of a megabyte: longer than a small message. It fits the
-        // stream's window, so the write finishes though the node reads
-        // none of the body. The send is left open (not finished), so the
-        // node's stop of the receive side is seen on it.
+        // A frame of a megabyte: longer than a small message, and than the
+        // stream's window, so the write waits while the node reads none of
+        // the body, as a device of the version before waits in its write,
+        // until the node stops the receive side. The send is left open
+        // (not finished), so the stop is seen on it.
         let _ = write_raw_frame(&mut csend, &vec![0x5a; 1_000_000]).await;
 
         // The node resets the send side with ERR_LARGE_MESSAGE_LATER
@@ -9078,7 +9263,13 @@ mod tests {
             frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
             "the push was meant to be over a small message"
         );
-        let _ = write_raw_frame(&mut csend, &frame).await;
+        // The frame is longer than the stream's window, so its write waits
+        // while the node waits for a permit, as a device of the version
+        // before waits in its write.
+        let writing = tokio::spawn(async move {
+            let _ = write_raw_frame(&mut csend, &frame).await;
+            csend
+        });
 
         // The node is parked, waiting for a permit. Let the held one go,
         // well within the stream timeout.
@@ -9095,6 +9286,7 @@ mod tests {
             answered.is_ok_and(|r| r.is_ok()),
             "the large frame was not answered once a permit freed"
         );
+        let _ = writing.await;
         let _ = serving.await;
     }
 
@@ -12615,5 +12807,745 @@ mod tests {
             both,
             "a bootnode shares the relays it knows"
         );
+    }
+
+    /// Decision 2026-10-22 (memory), rule 9. A failed repush of 100 items
+    /// to a peer is tried again at most PUSH_RETRY_STREAMS_AT_ONCE streams
+    /// at once, and every item is tried at least once and at most
+    /// PUSH_RETRY_MAX times: an item held back for a later round has spent
+    /// none of its tries. The peer fails every push, after holding its
+    /// stream a moment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_repush_is_tried_again_a_few_streams_at_a_time() {
+        use cordelia_core::protocol::PUSH_RETRY_STREAMS_AT_ONCE;
+        use cordelia_network::codec;
+        use cordelia_network::messages::{Protocol, WireMessage};
+        use cordelia_network::transport;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let id = |seed: u8| cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap();
+        let (node_key, peer_key) = (id(8), id(9));
+        let peer_end =
+            transport::create_endpoint(&peer_key, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let peer_addr = peer_end.local_addr().unwrap();
+        let node_end =
+            transport::create_client_endpoint(&node_key, "127.0.0.1".parse().unwrap()).unwrap();
+
+        // The peer: each push it is sent counts its stream as open while it
+        // holds it, notes the item, and fails it with a reset.
+        let open = std::sync::Arc::new(AtomicUsize::new(0));
+        let most = std::sync::Arc::new(AtomicUsize::new(0));
+        let tried = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
+        let peer = {
+            let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
+            tokio::spawn(async move {
+                let conn = peer_end.accept().await.unwrap().await.unwrap();
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let (open, most, tried) = (open.clone(), most.clone(), tried.clone());
+                    tokio::spawn(async move {
+                        let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        let _ = codec::read_protocol_byte(&mut recv).await;
+                        if let Ok(WireMessage::PushPayload(push)) =
+                            codec::read_frame(&mut recv, Protocol::ItemPush).await
+                        {
+                            let mut tried = tried.lock().unwrap();
+                            for item in push.items {
+                                *tried.entry(item.item_id).or_default() += 1;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        open.fetch_sub(1, Ordering::SeqCst);
+                        let _ = send.reset(0u32.into());
+                        let _ = recv.stop(0u32.into());
+                    });
+                }
+            })
+        };
+        let conn = node_end
+            .connect(peer_addr, "cordelia")
+            .unwrap()
+            .await
+            .unwrap();
+        let to = NodeId(peer_key.public_key());
+
+        // A repush of 100 items failed: each is reported for a retry.
+        let mut retries = PushRetries::new();
+        let failed = retries.failed();
+        for n in 0..100 {
+            let item = cordelia_network::messages::Item {
+                item_id: format!("ci_{n}"),
+                channel_id: "grp_retries".into(),
+                item_type: "note".into(),
+                encrypted_blob: vec![n as u8; 64],
+                content_hash: vec![0; 32],
+                content_length: 64,
+                author_id: vec![0; 32],
+                signature: vec![0; 64],
+                key_version: 1,
+                published_at: "2026-10-22T00:00:00Z".into(),
+                is_tombstone: false,
+                parent_id: None,
+                slot: None,
+                rev: None,
+            };
+            failed
+                .send(RetryEntry {
+                    item,
+                    peer_id: to.clone(),
+                    channel_id: "grp_retries".into(),
+                    exclude_peer: None,
+                    attempt: 0,
+                    retry_at: tokio::time::Instant::now(),
+                })
+                .unwrap();
+        }
+
+        // Rounds in quick succession, each with every backoff passed,
+        // until nothing waits and nothing runs.
+        let began = std::time::Instant::now();
+        loop {
+            let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+            retries.round(later, &|_| true, &|_| Some(conn.clone()));
+            if retries.is_idle() {
+                break;
+            }
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "the retries did not end"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let most = most.load(Ordering::SeqCst);
+        assert!(
+            most <= PUSH_RETRY_STREAMS_AT_ONCE,
+            "{most} retries ran to the peer at once"
+        );
+        let tried = tried.lock().unwrap().clone();
+        for n in 0..100 {
+            let times = tried.get(&format!("ci_{n}")).copied().unwrap_or(0);
+            assert!(
+                (1..=PUSH_RETRY_MAX as usize).contains(&times),
+                "item {n} was tried {times} times"
+            );
+        }
+        peer.abort();
+    }
+
+    /// Decision 2026-10-22 (memory), rule 12. The keys listed at an
+    /// address are those of the relays configured by key at that address
+    /// and port; an IPv4 address that a dual-stack socket shows mapped into
+    /// IPv6 is the same address. Another port, and a relay configured by
+    /// address alone, list nothing.
+    #[test]
+    fn a_listed_relays_address_is_found_when_shown_mapped_into_ipv6() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let at = |addr: &str, key: Option<[u8; 32]>| RelayAddr {
+            host: "relay.test:9474".into(),
+            addr: addr.parse().unwrap(),
+            key,
+        };
+        let relays = [
+            at("192.0.2.7:9474", Some([7; 32])),
+            at("192.0.2.8:9474", None),
+        ];
+        let from = |addr: &str| keys_listed_at(&relays, addr.parse().unwrap());
+        assert_eq!(from("192.0.2.7:9474"), vec![[7; 32]]);
+        assert_eq!(
+            from("[::ffff:192.0.2.7]:9474"),
+            vec![[7; 32]],
+            "a listed relay's address shown mapped into IPv6 was not found"
+        );
+        assert!(from("192.0.2.7:9475").is_empty());
+        assert!(from("[::ffff:192.0.2.8]:9474").is_empty());
+    }
+
+    /// What the end at `writer` may send the other end of its connection,
+    /// which reads nothing: the bytes one stream takes, and how many
+    /// streams it may have open at once, `held` of them before this.
+    ///
+    /// The end that dialled holds one already: the stream of the
+    /// connection's handshake, which the other end does not count as
+    /// closed for as long as the connection lasts (quinn frees a stream
+    /// that a peer opened once both its halves are done, and the half the
+    /// accepting end writes is stopped by the dialler after its handle has
+    /// gone, and so never is).
+    async fn what_it_may_send(writer: &quinn::Connection, held: usize) -> (usize, usize) {
+        // A write or an opening waits for credit; one that waits this long
+        // has none.
+        let brief = std::time::Duration::from_millis(1500);
+        let (mut send, recv) = writer.open_bi().await.unwrap();
+        let chunk = vec![0u8; 16 * 1024];
+        let mut taken = 0usize;
+        while taken < 8 << 20 {
+            match tokio::time::timeout(brief, send.write(&chunk)).await {
+                Ok(Ok(n)) => taken += n,
+                Ok(Err(e)) => panic!("a write failed: {e}"),
+                Err(_) => break,
+            }
+        }
+        let mut open = vec![(send, recv)];
+        while open.len() < 256 {
+            match tokio::time::timeout(brief, writer.open_bi()).await {
+                Ok(Ok((mut send, recv))) => {
+                    send.write_all(b"x").await.unwrap();
+                    open.push((send, recv));
+                }
+                _ => break,
+            }
+        }
+        (taken, held + open.len())
+    }
+
+    /// Decision 2026-10-22 (memory), rule 12. A connection with a relay
+    /// configured by key keeps today's windows and streams in both
+    /// directions: dialled to it, and accepted from its address with its
+    /// key, the relay may send 1 MiB unread on a stream and have 64
+    /// streams open. A peer accepted from another address may send
+    /// QUIC_STREAM_RECEIVE_WINDOW on a stream and have
+    /// QUIC_MAX_BIDI_STREAMS open. One
+    /// accepted from the relay's address with another key is closed once
+    /// its TLS completes, before its handshake is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_listed_by_key_keeps_todays_windows_and_streams() {
+        use cordelia_core::protocol::{
+            QUIC_LISTED_MAX_BIDI_STREAMS, QUIC_LISTED_STREAM_RECEIVE_WINDOW, QUIC_MAX_BIDI_STREAMS,
+            QUIC_STREAM_RECEIVE_WINDOW,
+        };
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::{connection, transport};
+
+        let id = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
+            let end = transport::create_endpoint(key, here).unwrap();
+            let port = end.local_addr().unwrap().port();
+            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
+        };
+        let (node_key, relay_key, other_key, impostor_key) = (id(21), id(22), id(23), id(24));
+        let node = manager(&node_key);
+        let node_addr = node.local_addr().unwrap();
+        let (node_end, node_ctx) = (node.endpoint(), node.connect_context());
+        // The relay sends with today's send window, so that only what the
+        // node lets it send holds it back.
+        let relay = manager(&relay_key);
+        let relay_addr = relay.local_addr().unwrap();
+        let (relay_end, mut relay_ctx) = (relay.endpoint(), relay.connect_context());
+        let listed = transport::listed_configs(&relay_key).unwrap();
+        relay_end.set_server_config(Some((*listed.server).clone()));
+        relay_ctx
+            .endpoint
+            .set_default_client_config(listed.client.clone());
+        let relays: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+            host: "relay.test:9474".into(),
+            addr: relay_addr,
+            key: Some(relay_key.public_key()),
+        }]));
+        let listed_window = QUIC_LISTED_STREAM_RECEIVE_WINDOW as usize;
+        let listed_streams = QUIC_LISTED_MAX_BIDI_STREAMS as usize;
+
+        // Dialled: the node dials the relay as a relay configured by key.
+        let at_relay = tokio::spawn({
+            let (relay_end, relay_ctx) = (relay_end.clone(), relay_ctx.clone());
+            async move {
+                let incoming = relay_end.accept().await.unwrap();
+                connection::inbound_accept(&relay_ctx, incoming)
+                    .await
+                    .unwrap()
+            }
+        });
+        let configured = relays.read().unwrap()[0].clone();
+        let dialled = dial_relay(&node_ctx, &configured).await.unwrap();
+        let relays_end = at_relay.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&relays_end.conn, 0).await,
+            (listed_window, listed_streams),
+            "a connection dialled to a relay configured by key has another's windows"
+        );
+        assert!(
+            dialled.listed_settings,
+            "a dial to a relay configured by key does not say it has the listed settings"
+        );
+        drop(dialled);
+
+        // Accepted from the relay's address, with its key.
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx, relays) = (node_end.clone(), node_ctx.clone(), relays.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &relays).await
+            }
+        });
+        let from_relay = connection::outbound_connect(&relay_ctx, node_addr)
+            .await
+            .unwrap();
+        let accepted = at_node.await.unwrap().unwrap();
+        assert!(
+            accepted.listed_settings,
+            "a connection accepted from a listed relay does not say it has the listed settings"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&from_relay.conn, 1).await,
+            (listed_window, listed_streams),
+            "a connection accepted from a relay listed by key has another's windows"
+        );
+
+        // Accepted from another address: every peer's windows.
+        let other = manager(&other_key);
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx, relays) = (node_end.clone(), node_ctx.clone(), relays.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &relays).await
+            }
+        });
+        let from_other = connection::outbound_connect(&other.connect_context(), node_addr).await;
+        let accepted = at_node.await.unwrap();
+        assert!(
+            from_other.is_ok() && accepted.is_ok(),
+            "a peer from another address than a listed relay's was not accepted: {:?}",
+            accepted.err()
+        );
+        assert!(
+            !accepted.as_ref().unwrap().listed_settings,
+            "a peer from another address is said to have the listed settings"
+        );
+        let from_other = from_other.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            what_it_may_send(&from_other.conn, 1).await,
+            (
+                QUIC_STREAM_RECEIVE_WINDOW as usize,
+                QUIC_MAX_BIDI_STREAMS as usize
+            ),
+            "a peer from another address has the windows of a relay listed by key"
+        );
+
+        // From the relay's address with another key: here the relay is
+        // configured at the address the impostor dials from.
+        let impostor = manager(&impostor_key);
+        let at_impostor: RelayAddrs =
+            std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                host: "relay.test:9474".into(),
+                addr: impostor.local_addr().unwrap(),
+                key: Some(relay_key.public_key()),
+            }]));
+        let at_node = tokio::spawn({
+            let (node_end, node_ctx) = (node_end.clone(), node_ctx.clone());
+            async move {
+                let incoming = node_end.accept().await.unwrap();
+                accept_incoming(&node_ctx, incoming, &at_impostor).await
+            }
+        });
+        let dialled_by_impostor =
+            connection::outbound_connect(&impostor.connect_context(), node_addr).await;
+        let accepted = at_node.await.unwrap();
+        assert!(
+            matches!(accepted, Err(connection::ConnectionError::NotTheRelay(_))),
+            "a connection from a listed relay's address with another key was accepted: {:?}",
+            accepted.map(|outcome| outcome.node_id)
+        );
+        assert!(
+            dialled_by_impostor.is_err(),
+            "the impostor's handshake was read"
+        );
+    }
+
+    /// Decision 2026-10-22 (memory), rule 12, the check's NAT case: relay B
+    /// dials relay A by key from an address that A has not configured. B's
+    /// end of their connection carries the listed settings, and A's every
+    /// peer's. A receive window bounds what the other end may send, so each
+    /// asks for its pages by its own end's settings: A for pages whose
+    /// worst case is a small page, B for full ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn behind_a_nat_each_relay_asks_for_pages_by_its_own_ends_settings() {
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::{connection, transport};
+
+        let id = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
+            let end = transport::create_endpoint(key, here).unwrap();
+            let port = end.local_addr().unwrap().port();
+            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
+        };
+        let listing = |addr: std::net::SocketAddr, key: [u8; 32]| -> RelayAddrs {
+            std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                host: "relay.test:9474".into(),
+                addr,
+                key: Some(key),
+            }]))
+        };
+        let (a_key, b_key) = (id(31), id(32));
+        let (mut a, mut b) = (manager(&a_key), manager(&b_key));
+        // A lists B by key at an address that B does not dial from: B is
+        // behind a NAT. B lists A by key at A's address.
+        let at_a = listing("127.0.0.1:9".parse().unwrap(), b_key.public_key());
+        let at_b = listing(a.local_addr().unwrap(), a_key.public_key());
+
+        let accepting = tokio::spawn({
+            let (end, ctx, relays) = (a.endpoint(), a.connect_context(), at_a.clone());
+            async move {
+                let incoming = end.accept().await.unwrap();
+                accept_incoming(&ctx, incoming, &relays).await
+            }
+        });
+        let configured = at_b.read().unwrap()[0].clone();
+        let dialled = dial_relay(&b.connect_context(), &configured).await.unwrap();
+        let accepted = accepting.await.unwrap().unwrap();
+        b.register(dialled).unwrap();
+        a.register(accepted).unwrap();
+
+        let entries_with = |relays: &RelayAddrs| {
+            crate::relay_entries::RelayEntries::new(
+                u64::MAX,
+                relays.clone(),
+                std::time::Duration::from_secs(600),
+            )
+        };
+        let at_a = crate::relay_entries::listed_links(&entries_with(&at_a), &a);
+        let at_b = crate::relay_entries::listed_links(&entries_with(&at_b), &b);
+        assert_eq!(
+            at_a.iter()
+                .map(|(relay, _)| relay.clone())
+                .collect::<Vec<_>>(),
+            [NodeId(b_key.public_key())]
+        );
+        assert!(
+            at_a[0].1.small_windows,
+            "A, on every peer's windows, would ask B for full pages"
+        );
+        assert_eq!(
+            at_b.iter()
+                .map(|(relay, _)| relay.clone())
+                .collect::<Vec<_>>(),
+            [NodeId(a_key.public_key())]
+        );
+        assert!(
+            !at_b[0].1.small_windows,
+            "B, which carries the listed settings, would ask A for small pages"
+        );
+    }
+
+    /// What a relay's own fetch from a relay configured by address alone,
+    /// of the version before, and that relay's large pushes on the same
+    /// connection come to (decision 2026-10-22 (memory), rules 2, 6 and 8):
+    /// how the fetch ended and how long it took, and how many of the
+    /// pushes were answered, with the time of the last.
+    struct Contended {
+        fetched: Fetched,
+        fetch_took: std::time::Duration,
+        pushes_answered: usize,
+        pushes_took: std::time::Duration,
+    }
+
+    /// A relay fetches from a peer it is connected to, which answers the
+    /// fetch of a page's entries with `fetched_bytes` of items, while the
+    /// peer pushes `pushes` frames of `push_bytes` each, each on a stream of
+    /// its own, all begun as the fetch's answer is written. The relay
+    /// dialled the peer where `node_dials`, and the peer dialled it
+    /// otherwise: the end that dials holds one of its streams for the
+    /// handshake for as long as the connection lasts, so a peer that was
+    /// dialled may open one stream more.
+    async fn a_fetch_beside_large_pushes(
+        pushes: usize,
+        push_bytes: usize,
+        fetched_bytes: usize,
+        node_dials: bool,
+    ) -> Contended {
+        use cordelia_network::codec::{self, encode_message, write_raw_frame};
+        use cordelia_network::messages::{
+            FetchResponse, Item, ItemHeader, Protocol, PushPayload, SyncChannelListResponse,
+            SyncResponse, WireMessage,
+        };
+        use cordelia_network::{connection, transport};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{Arc, RwLock};
+
+        let id = |seed: u8| {
+            Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap())
+        };
+        let (node, peer) = (id(41), id(42));
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node_end = transport::create_endpoint(&node, here).unwrap();
+        let node_addr = node_end.local_addr().unwrap();
+        let node_mgr = connection::ConnectionManager::new(
+            node.clone(),
+            node_end,
+            vec![],
+            vec!["relay".into()],
+            node_addr.port(),
+        );
+        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
+        let peer_key = NodeId(peer.public_key());
+        // A relay configured by address alone: in peer_relays, listed by
+        // no key.
+        let relay_entries = Some(Arc::new(crate::relay_entries::RelayEntries::new(
+            u64::MAX,
+            Arc::new(RwLock::new(Vec::new())),
+            std::time::Duration::from_secs(600),
+        )));
+        let peer_relays = Arc::new(RwLock::new(HashSet::from([peer_key.clone()])));
+        let peer_states = Arc::new(RwLock::new(HashMap::from([(peer_key.clone(), 2u8)])));
+        let permits = Arc::new(LargePermits::new(
+            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
+        ));
+        let state = a_state();
+        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
+        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
+        let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
+        let peer_rates = Arc::new(std::sync::Mutex::new(Rates::new(u64::MAX)));
+
+        let peer_end = transport::create_endpoint(&peer, here).unwrap();
+        let peer_addr = peer_end.local_addr().unwrap();
+        let peer_mgr = connection::ConnectionManager::new(
+            peer.clone(),
+            peer_end,
+            vec![],
+            vec!["relay".into()],
+            peer_addr.port(),
+        );
+        let (node_conn, at_peer) = if node_dials {
+            let (peer_accepts, as_peer) = (peer_mgr.endpoint(), peer_mgr.connect_context());
+            let at_peer = tokio::spawn(async move {
+                let incoming = peer_accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_peer, incoming)
+                    .await
+                    .unwrap()
+                    .conn
+            });
+            let dialled = connection::outbound_connect(&as_node, peer_addr)
+                .await
+                .unwrap()
+                .conn;
+            drop(accepts);
+            (dialled, at_peer.await.unwrap())
+        } else {
+            let node_conn = tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_node, incoming)
+                    .await
+                    .unwrap()
+                    .conn
+            });
+            let dialled = connection::outbound_connect(&peer_mgr.connect_context(), node_addr)
+                .await
+                .unwrap()
+                .conn;
+            (node_conn.await.unwrap(), dialled)
+        };
+
+        let loop_task = tokio::spawn(handle_peer_streams(
+            node_conn.clone(),
+            peer_key.clone(),
+            "127.0.0.1".parse().unwrap(),
+            state.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            "relay".into(),
+            repush_tx.clone(),
+            delivery_tx,
+            peer_rates.clone(),
+            peer_states,
+            peer_relays,
+            gov_tx,
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(RwLock::new(
+                cordelia_network::seen_table::SeenTable::default(),
+            )),
+            relay_entries,
+            permits.clone(),
+        ));
+
+        let item = |n: usize, bytes: usize| Item {
+            item_id: format!("ci_{n:0>26}"),
+            channel_id: "grp_00000000-0000-4000-8000-00000000000c".into(),
+            item_type: "memory".into(),
+            encrypted_blob: vec![n as u8; bytes],
+            content_hash: vec![0u8; 32],
+            content_length: bytes as u32,
+            author_id: vec![0u8; 32],
+            signature: vec![0u8; 64],
+            key_version: 1,
+            published_at: "2026-10-22T00:00:00Z".into(),
+            is_tombstone: false,
+            parent_id: None,
+            slot: None,
+            rev: None,
+        };
+        let began = tokio::time::Instant::now();
+        let answered = Arc::new(std::sync::Mutex::new(Vec::<std::time::Duration>::new()));
+
+        // The peer: it answers the relay's fetch, and when the fetch asks
+        // for a page's entries it begins its pushes, then writes the
+        // answer.
+        let serving = {
+            let (at_peer, answered) = (at_peer.clone(), answered.clone());
+            tokio::spawn(async move {
+                let (mut send, mut recv) = at_peer.accept_bi().await.unwrap();
+                let _ = codec::read_protocol_byte(&mut recv).await;
+                let channel = "grp_00000000-0000-4000-8000-00000000000c".to_string();
+                let mut first = true;
+                loop {
+                    let answer = match codec::read_frame(&mut recv, Protocol::ItemSync).await {
+                        Ok(WireMessage::SyncChannelListRequest(_)) => {
+                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
+                                channel_ids: vec![channel.clone()],
+                            })
+                        }
+                        Ok(WireMessage::SyncRequest(_)) => {
+                            let items = if first {
+                                first = false;
+                                (0..4)
+                                    .map(|n| ItemHeader {
+                                        item_id: format!("ci_{n:0>26}"),
+                                        channel_id: channel.clone(),
+                                        item_type: "memory".into(),
+                                        content_hash: vec![0u8; 32],
+                                        author_id: vec![0u8; 32],
+                                        signature: vec![0u8; 64],
+                                        key_version: 1,
+                                        published_at: "2026-10-22T00:00:00Z".into(),
+                                        is_tombstone: false,
+                                        parent_id: None,
+                                        slot: None,
+                                        rev: None,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            WireMessage::SyncResponse(SyncResponse {
+                                items,
+                                has_more: false,
+                                last_seq: Some(4),
+                            })
+                        }
+                        Ok(WireMessage::FetchRequest(_)) => {
+                            for n in 0..pushes {
+                                let (at_peer, answered) = (at_peer.clone(), answered.clone());
+                                tokio::spawn(async move {
+                                    let (mut send, mut recv) = at_peer.open_bi().await.unwrap();
+                                    let push = WireMessage::PushPayload(PushPayload {
+                                        items: vec![item(1000 + n, push_bytes)],
+                                    });
+                                    let mut stream = tokio::io::join(&mut recv, &mut send);
+                                    let sent =
+                                        codec::send_request(&mut stream, Protocol::ItemPush, &push)
+                                            .await;
+                                    if sent.is_ok() {
+                                        answered.lock().unwrap().push(began.elapsed());
+                                    }
+                                });
+                            }
+                            WireMessage::FetchResponse(FetchResponse {
+                                items: (0..4).map(|n| item(n, fetched_bytes / 4)).collect(),
+                            })
+                        }
+                        _ => break,
+                    };
+                    if write_raw_frame(&mut send, &encode_message(&answer).unwrap())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let from = FetchFrom {
+            target: peer_key,
+            state,
+            role: "relay".into(),
+            channels: Vec::new(),
+            ask_what_it_holds: true,
+            limited: false,
+            address: "127.0.0.1".parse().unwrap(),
+            rates: peer_rates,
+            kept: Default::default(),
+            repush_tx,
+            seen_table: Default::default(),
+            permits: Some(permits),
+            listed_by_key: false,
+        };
+        let (fetched, _) = fetch_from(node_conn, from).await;
+        let fetch_took = began.elapsed();
+        // The pushes have until a stream timeout and a half after the fetch.
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while answered.lock().unwrap().len() < pushes && tokio::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let answered = answered.lock().unwrap().clone();
+        loop_task.abort();
+        serving.abort();
+        // Close both ends, so that nothing of this run (a push still
+        // waiting in its write) is left beside the next.
+        at_peer.close(0u32.into(), b"done");
+        node_mgr.endpoint().close(0u32.into(), b"done");
+        peer_mgr.endpoint().close(0u32.into(), b"done");
+        node_mgr.endpoint().wait_idle().await;
+        peer_mgr.endpoint().wait_idle().await;
+        Contended {
+            fetched,
+            fetch_took,
+            pushes_answered: answered.len(),
+            pushes_took: answered.iter().max().copied().unwrap_or_default(),
+        }
+    }
+
+    /// Decision 2026-10-22 (memory), rule 8. A relay's own fetch from a
+    /// relay configured by address alone, and that relay's large pushes on
+    /// the same connection, all end: the fetch within two seconds and every
+    /// push answered. The relay reads the streams the peer opens one at a
+    /// time; at a stream window of a small message, two pushes queued
+    /// behind the one being read held the whole connection's window, and
+    /// the push being read, the fetch and the other pushes waited out
+    /// STREAM_TIMEOUT. With every stream the peer may open within seven
+    /// eighths of the connection's window, the streams queued cannot hold
+    /// all of it, and the fetch, on a stream the relay opened, has an
+    /// eighth to read back, which is when quinn announces more. Both ways
+    /// round: the relay dialled by the peer, and the relay dialling it,
+    /// where the peer may open all 8 of its streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other() {
+        for (pushes, push_bytes, fetched_bytes) in [
+            (3, 300_000, 400_000),
+            (5, 300_000, 100_000),
+            (3, 900_000, 100_000),
+            (7, 140_000, 100_000),
+            (8, 300_000, 400_000),
+            (8, 900_000, 900_000),
+        ] {
+            for node_dials in [false, true] {
+                let ended =
+                    a_fetch_beside_large_pushes(pushes, push_bytes, fetched_bytes, node_dials)
+                        .await;
+                assert!(
+                    ended.fetched == Fetched::All
+                        && ended.fetch_took < std::time::Duration::from_secs(2)
+                        && ended.pushes_answered == pushes,
+                    "{pushes} pushes of {push_bytes} bytes beside a fetch of {fetched_bytes}, the relay dialling: {node_dials}: \
+                 the fetch ended {:?} after {:?}, and {} pushes were answered, the last after {:?}",
+                    ended.fetched,
+                    ended.fetch_took,
+                    ended.pushes_answered,
+                    ended.pushes_took
+                );
+            }
+        }
     }
 }

@@ -67,9 +67,14 @@ pub const QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Most bidirectional QUIC streams a peer may have open on one connection
-/// at once (network-protocol.md §2.1): MAX_CONCURRENT_STREAMS. A node
-/// handles one stream of a connection at a time, and each exchange is one
-/// stream, so real use is a handful.
+/// at once (network-protocol.md §2.1): MAX_CONCURRENT_STREAMS, 8 (decision
+/// 2026-10-22 (memory), rule 9). A node handles one stream of a connection
+/// at a time, so a stream beyond the first only waits, and each open
+/// stream may hold 32 KiB of quinn's reassembly beyond its data. What
+/// opens streams on one connection at once is a handful: a device's pass,
+/// a waking show, a hand-over ask and a command's read; a relay's fetch;
+/// between relays, which keep 64 (QUIC_LISTED_MAX_BIDI_STREAMS), a pass, a
+/// pull, the older kind's fetch, repush and push retries.
 pub const QUIC_MAX_BIDI_STREAMS: u32 = MAX_CONCURRENT_STREAMS as u32;
 
 /// Unidirectional QUIC streams a peer may open: none. The protocol uses
@@ -77,23 +82,79 @@ pub const QUIC_MAX_BIDI_STREAMS: u32 = MAX_CONCURRENT_STREAMS as u32;
 pub const QUIC_MAX_UNI_STREAMS: u32 = 0;
 
 /// How much a peer may send on one stream before this node has read it:
-/// one message.
-pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
+/// 32,256 bytes (decision 2026-10-22 (memory), rule 8). A node reads the
+/// streams a peer opens one at a time; with every stream the peer may have
+/// open within seven eighths of the connection's window together, the
+/// streams queued behind the one being read can never take all of it, and
+/// a stream this node opened itself (the relay's own fetch) always has the
+/// eighth left to read back, which is when quinn announces more credit
+/// (MAX_DATA, at an eighth of the window). At a stream window of a small
+/// message, two streams queued with their windows full held the whole
+/// connection, and the stream being read, and a fetch on the same
+/// connection, waited out STREAM_TIMEOUT; at an eighth of the window, a
+/// peer that was dialled, which may open all its eight streams, held it
+/// all while the fetch waited for its eighth. A message larger than the
+/// window arrives a window at a time, as the node reads it: a small
+/// message in five round trips. A relay listed by key may send more
+/// (QUIC_LISTED_STREAM_RECEIVE_WINDOW).
+/// Derived: (QUIC_RECEIVE_WINDOW - QUIC_RECEIVE_WINDOW / 8) / QUIC_MAX_BIDI_STREAMS.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 =
+    (QUIC_RECEIVE_WINDOW - QUIC_RECEIVE_WINDOW / 8) / QUIC_MAX_BIDI_STREAMS;
 
 /// How much a peer may send on one connection, over all its streams,
-/// before this node has read it: two messages. This is what bounds the
-/// memory one connection can make a node hold. Left to QUIC's defaults
-/// there was no such bound: a thousand streams, each over a megabyte.
-pub const QUIC_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
+/// before this node has read it: two small messages (rule 8), so that a
+/// second request can arrive while the first is read. This is what bounds
+/// the memory one connection can make a node hold unread. Left to QUIC's
+/// defaults there was no such bound: a thousand streams, each over a
+/// megabyte. Derived: 2 x SMALL_MESSAGE_BYTES.
+pub const QUIC_RECEIVE_WINDOW: u32 = 2 * SMALL_MESSAGE_BYTES;
+
+// Checked at compile time: every stream a peer that is not a relay listed
+// by key may have open, each with its window full, fits seven eighths of
+// the connection's window (rule 8), so none of them, and no stream this
+// node opened, waits on credit the others hold: the eighth left is what
+// quinn waits to have read back before it announces more.
+const _: () = assert!(
+    QUIC_STREAM_RECEIVE_WINDOW as u64 * QUIC_MAX_BIDI_STREAMS as u64
+        <= QUIC_RECEIVE_WINDOW as u64 - QUIC_RECEIVE_WINDOW as u64 / 8
+);
 
 /// How much this node may have written on one connection, over all its
-/// streams, that the peer has not acknowledged: two messages. A write
-/// beyond it waits for acknowledgements, for STREAM_TIMEOUT_SECS, and then
-/// fails, and its stream is reset (ERR_STREAM_TIMEOUT). This is what bounds the memory a peer that reads and never
-/// acknowledges can make a node hold. Left to QUIC's default it was ten
-/// megabytes. Rationale: parameter-rationale.md §1.
-/// Derived: 2 x MAX_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
-pub const QUIC_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
+/// streams, that the peer has not acknowledged: two small messages (rule
+/// 11), so that an answer goes whole and the next before the first is
+/// acknowledged. A write beyond it waits for acknowledgements, for
+/// STREAM_TIMEOUT_SECS, and then fails, and its stream is reset
+/// (ERR_STREAM_TIMEOUT). This is what bounds the memory a peer that reads
+/// and never acknowledges can make a node hold. Left to QUIC's default it
+/// was ten megabytes. Rationale: parameter-rationale.md §1.
+/// Derived: 2 x SMALL_MESSAGE_BYTES, as much as a peer's QUIC_RECEIVE_WINDOW.
+pub const QUIC_SEND_WINDOW: u64 = 2 * SMALL_MESSAGE_BYTES as u64;
+
+/// How much a relay listed by key may send on one stream before this node
+/// has read it, on a connection between the two (decision 2026-10-22
+/// (memory), rule 12): one message, as every connection had before change
+/// F. A relay's passes and pulls to the relays it works with go a full
+/// page at a time, and at the windows of an unlisted peer a pull of ten
+/// full pages would take longer than the time between pulls.
+/// Derived: MAX_MESSAGE_BYTES.
+pub const QUIC_LISTED_STREAM_RECEIVE_WINDOW: u32 = MAX_MESSAGE_BYTES;
+
+/// How much a relay listed by key may send over all its streams before
+/// this node has read it (rule 12): two messages, as before change F.
+/// Derived: 2 x MAX_MESSAGE_BYTES.
+pub const QUIC_LISTED_RECEIVE_WINDOW: u32 = 2 * MAX_MESSAGE_BYTES;
+
+/// How much this node may have written to a relay listed by key that it
+/// has not acknowledged (rule 12): two messages, as before change F.
+/// Derived: 2 x MAX_MESSAGE_BYTES, as much as the relay's
+/// QUIC_LISTED_RECEIVE_WINDOW.
+pub const QUIC_LISTED_SEND_WINDOW: u64 = 2 * MAX_MESSAGE_BYTES as u64;
+
+/// Most bidirectional streams a relay listed by key may have open on a
+/// connection with this node (rule 12): 64, as before change F. Between
+/// relays a pass, a pull, the older kind's fetch, its repush and its push
+/// retries run at once.
+pub const QUIC_LISTED_MAX_BIDI_STREAMS: u32 = 64;
 
 /// TLS certificate validity in days (network-protocol.md §2.2).
 /// Primitive: 1 year; self-signed certs, identity is the public key.
@@ -508,9 +569,11 @@ pub const MAX_CONNECTIONS_PER_IP: usize = 5;
 /// Primitive: 20 per subnet; anti-Sybil at the network level.
 pub const MAX_CONNECTIONS_PER_SUBNET: usize = 20;
 
-/// Maximum concurrent QUIC streams per connection.
-/// Primitive: 64 concurrent streams; bounds per-peer resource use.
-pub const MAX_CONCURRENT_STREAMS: usize = 64;
+/// Maximum concurrent QUIC streams per connection: 8 (decision 2026-10-22
+/// (memory), rule 9). Chosen: a node serves one stream of a connection at
+/// a time, and 8 floors quinn's reassembly beyond the data at 256 KiB a
+/// connection where 64 floored it at 2 MiB.
+pub const MAX_CONCURRENT_STREAMS: usize = 8;
 
 // ── Rate limits (network-protocol.md §9.2) ──────────────────────────
 
@@ -1535,6 +1598,24 @@ const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
 const _: () =
     assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
 
+/// How many entries a relay asks for in a page from a relay it lists by
+/// key, where its own end of their connection does not carry the listed
+/// settings (decision 2026-10-22 (memory), rule 12): 1. A receive window
+/// bounds what the other end may send, so the asker's end decides whether
+/// a full page crosses in time, and only the asker can see it: on every
+/// peer's windows a full page of 896 KiB fails the stream timeout past a
+/// round trip of about 0.33 s. Derived: as many entries of the largest
+/// size on the wire as a small page holds, so that the page asked for is
+/// never larger than a small page, whatever its entries' sizes.
+pub const SMALL_WINDOWS_PULL_ENTRIES: u32 = (SMALL_PAGE_BYTES / MAX_ENTRY_WIRE_BYTES) as u32;
+
+// Checked at compile time: a page asked for on every peer's windows holds
+// at least one entry, and its worst case fits a small page.
+const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES >= 1);
+const _: () =
+    assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES <= ENTRY_PAGE_MAX_ENTRIES);
+
 /// How many large messages a node reads at once, across all its
 /// connections (decision 2026-10-22 (memory) §2.1, rule 2): 4. A frame
 /// from an unlisted peer that is longer than a small message is read only
@@ -1545,6 +1626,16 @@ const _: () =
 /// full pace at once. A device of this version never needs one (rules 3
 /// and 5).
 pub const LARGE_MESSAGES_AT_ONCE: usize = 4;
+
+/// How many of the older kind's push retries a node runs to one peer at
+/// once (decision 2026-10-22 (memory), rule 9): 4. Each retry is a stream
+/// of its own, and a failed repush of up to `MAX_PUSHED_ITEMS` items would
+/// otherwise open them all at once; against a peer that lets 8 streams be
+/// open, most would wait for a stream, time out and use up their tries.
+/// The others wait for a later round, and are not counted as a try until
+/// they are tried. Derived: half of the streams that a peer that is not a
+/// relay listed by key may have open (QUIC_MAX_BIDI_STREAMS, rule 9).
+pub const PUSH_RETRY_STREAMS_AT_ONCE: usize = QUIC_MAX_BIDI_STREAMS as usize / 2;
 
 /// The most one channel from its secret may hold at a relay (decision
 /// 2026-10-04 §2.5), in bytes as entries are counted ([`entry_cost`]).
@@ -2385,9 +2476,30 @@ mod tests {
         assert_eq!(QUIC_MAX_IDLE_TIMEOUT_SECS, 60);
     }
 
+    /// A peer that is not a relay listed by key may have 8 streams open
+    /// (decision 2026-10-22 (memory), rule 9).
     #[test]
     fn test_quic_max_bidi_streams_network_protocol_2_1() {
-        assert_eq!(QUIC_MAX_BIDI_STREAMS, 64);
+        assert_eq!(QUIC_MAX_BIDI_STREAMS, 8);
+        assert_eq!(MAX_CONCURRENT_STREAMS, 8);
+    }
+
+    /// A peer may send two small messages on a connection before the
+    /// node reads them, and on a stream as much as leaves every stream it
+    /// may have open within seven eighths of that together (decision
+    /// 2026-10-22 (memory), rule 8).
+    #[test]
+    fn the_receive_windows_hold_every_stream_within_two_small_messages() {
+        assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, 32_256);
+        assert_eq!(QUIC_RECEIVE_WINDOW, 294_912);
+        assert_eq!(QUIC_RECEIVE_WINDOW, 2 * SMALL_MESSAGE_BYTES);
+        // Every stream within seven eighths of the connection's window,
+        // which is enforced at compile time beside the constants, and here
+        // exactly.
+        assert_eq!(
+            QUIC_STREAM_RECEIVE_WINDOW * QUIC_MAX_BIDI_STREAMS,
+            QUIC_RECEIVE_WINDOW - QUIC_RECEIVE_WINDOW / 8
+        );
     }
 
     #[test]
@@ -2450,12 +2562,43 @@ mod tests {
         assert_eq!(LARGE_MESSAGES_AT_ONCE, 4);
     }
 
-    /// Two messages, as much as a peer may have unread on a connection.
+    /// A node runs at most four push retries to one peer at once (decision
+    /// 2026-10-22 (memory), rule 9).
+    #[test]
+    fn at_most_four_push_retries_run_to_a_peer_at_once() {
+        assert_eq!(PUSH_RETRY_STREAMS_AT_ONCE, 4);
+    }
+
+    /// A relay whose own end of a listed relay's connection does not carry
+    /// the listed settings asks for one entry a page, a small page at worst
+    /// (decision 2026-10-22 (memory), rule 12).
+    #[test]
+    fn a_relay_on_every_peers_windows_asks_for_one_entry_a_page() {
+        assert_eq!(SMALL_WINDOWS_PULL_ENTRIES, 1);
+        assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+    }
+
+    /// Two small messages, as much as a peer may have unread on a
+    /// connection (decision 2026-10-22 (memory), rule 11).
     #[test]
     fn test_quic_send_window_parameter_rationale_1() {
-        assert_eq!(QUIC_SEND_WINDOW, 2_097_152);
-        assert_eq!(QUIC_SEND_WINDOW, 2 * MAX_MESSAGE_BYTES as u64);
+        assert_eq!(QUIC_SEND_WINDOW, 294_912);
+        assert_eq!(QUIC_SEND_WINDOW, 2 * SMALL_MESSAGE_BYTES as u64);
         assert_eq!(QUIC_SEND_WINDOW, QUIC_RECEIVE_WINDOW as u64);
+    }
+
+    /// A connection with a relay listed by key keeps the windows and
+    /// streams every connection had before change F (decision 2026-10-22
+    /// (memory), rule 12): one message on a stream, two on the connection
+    /// each way, and 64 streams.
+    #[test]
+    fn a_relay_listed_by_key_keeps_the_windows_and_streams_of_before() {
+        assert_eq!(QUIC_LISTED_STREAM_RECEIVE_WINDOW, 1_048_576);
+        assert_eq!(QUIC_LISTED_RECEIVE_WINDOW, 2_097_152);
+        assert_eq!(QUIC_LISTED_SEND_WINDOW, 2_097_152);
+        assert_eq!(QUIC_LISTED_MAX_BIDI_STREAMS, 64);
+        assert_eq!(QUIC_LISTED_STREAM_RECEIVE_WINDOW, MAX_MESSAGE_BYTES);
+        assert_eq!(QUIC_LISTED_SEND_WINDOW, QUIC_LISTED_RECEIVE_WINDOW as u64);
     }
 
     #[test]

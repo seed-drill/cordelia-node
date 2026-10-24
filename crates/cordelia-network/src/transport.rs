@@ -104,20 +104,63 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 
 /// The transport settings of every connection, in either direction:
 /// keep-alive and idle timeout, and what a peer may make this node hold.
+/// A connection to or from a relay listed by key has those of
+/// [`listed_transport_config`] in their place.
 ///
-/// - A peer may have QUIC_MAX_BIDI_STREAMS streams open at once, and no
-///   unidirectional ones.
-/// - It may send one message's worth on a stream, and two on the whole
-///   connection, before this node has read it. So one connection can make
-///   a node buffer two megabytes, whatever the peer does.
-/// - This node may have written two messages' worth on the connection that
-///   the peer has not acknowledged (QUIC_SEND_WINDOW). A write beyond it
-///   waits for acknowledgements, and the codec gives it up after
-///   STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it is sent
-///   cannot make a node hold more than that either.
+/// Each is set from a small message, the largest thing a device of this
+/// version sends (decision 2026-10-22, memory across connections, rules
+/// 8, 9 and 11):
+///
+/// - A peer may have QUIC_MAX_BIDI_STREAMS (8) streams open at once, and
+///   no unidirectional ones.
+/// - It may send two small messages' worth on the whole connection before
+///   this node has read it, and on a stream as much as leaves every stream
+///   it may have open within seven eighths of that together: the streams
+///   queued behind the one the node reads cannot take the credit that one,
+///   or a stream this node opened, needs. So one connection can make a node buffer
+///   288 KiB unread, whatever the peer does. A message larger than a
+///   stream's window arrives a window at a time, as the node reads it.
+/// - This node may have written two small messages' worth on the
+///   connection that the peer has not acknowledged (QUIC_SEND_WINDOW). A
+///   write beyond it waits for acknowledgements, and the codec gives it up
+///   after STREAM_TIMEOUT_SECS. So a peer that never acknowledges what it
+///   is sent cannot make a node hold more than that either.
 /// - It may send no datagrams: no node sends or reads one, and quinn's
 ///   default would keep 1.25 MB of them unread on every connection.
 fn transport_config() -> quinn::TransportConfig {
+    transport_with(Limits {
+        streams: protocol::QUIC_MAX_BIDI_STREAMS,
+        stream_window: protocol::QUIC_STREAM_RECEIVE_WINDOW,
+        window: protocol::QUIC_RECEIVE_WINDOW,
+        send_window: protocol::QUIC_SEND_WINDOW,
+    })
+}
+
+/// The transport settings of a connection between this node and a relay
+/// listed by key, in either direction (decision 2026-10-22, memory across
+/// connections, rule 12): those of [`transport_config`], with today's
+/// windows and streams, QUIC_LISTED_*. A relay's passes and pulls to the
+/// relays it works with go a full page at a time, and these keep a page a
+/// round trip.
+fn listed_transport_config() -> quinn::TransportConfig {
+    transport_with(Limits {
+        streams: protocol::QUIC_LISTED_MAX_BIDI_STREAMS,
+        stream_window: protocol::QUIC_LISTED_STREAM_RECEIVE_WINDOW,
+        window: protocol::QUIC_LISTED_RECEIVE_WINDOW,
+        send_window: protocol::QUIC_LISTED_SEND_WINDOW,
+    })
+}
+
+/// What a connection's peer may make this node hold, and what this node
+/// may write it unacknowledged.
+struct Limits {
+    streams: u32,
+    stream_window: u32,
+    window: u32,
+    send_window: u64,
+}
+
+fn transport_with(limits: Limits) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(
         protocol::QUIC_KEEPALIVE_INTERVAL_SECS,
@@ -126,13 +169,39 @@ fn transport_config() -> quinn::TransportConfig {
         quinn::IdleTimeout::try_from(Duration::from_secs(protocol::QUIC_MAX_IDLE_TIMEOUT_SECS))
             .unwrap(),
     ));
-    transport.max_concurrent_bidi_streams(protocol::QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_bidi_streams(limits.streams.into());
     transport.max_concurrent_uni_streams(protocol::QUIC_MAX_UNI_STREAMS.into());
-    transport.stream_receive_window(protocol::QUIC_STREAM_RECEIVE_WINDOW.into());
-    transport.receive_window(protocol::QUIC_RECEIVE_WINDOW.into());
-    transport.send_window(protocol::QUIC_SEND_WINDOW);
+    transport.stream_receive_window(limits.stream_window.into());
+    transport.receive_window(limits.window.into());
+    transport.send_window(limits.send_window);
     transport.datagram_receive_buffer_size(None);
     transport
+}
+
+/// The configs of a connection with a relay listed by key, as this node
+/// dials it and as it accepts it (decision 2026-10-22, memory across
+/// connections, rule 12). Quinn takes a connection's transport settings
+/// when the connection is made, in either direction, and has no setter
+/// for a stream's window after, so a node picks these as it dials or
+/// accepts: `Endpoint::connect_with` and `Incoming::accept_with`.
+#[derive(Clone)]
+pub struct ListedConfigs {
+    pub client: ClientConfig,
+    pub server: Arc<ServerConfig>,
+}
+
+/// The configs of a connection with a relay listed by key, under
+/// `identity`'s certificate.
+pub fn listed_configs(identity: &NodeIdentity) -> Result<ListedConfigs, TransportError> {
+    let (cert_der, key_der) = generate_self_signed_cert(identity)?;
+    Ok(ListedConfigs {
+        client: client_config_with(cert_der.clone(), key_der.clone(), listed_transport_config())?,
+        server: Arc::new(server_config_with(
+            cert_der,
+            key_der,
+            listed_transport_config(),
+        )?),
+    })
 }
 
 /// Build a quinn ServerConfig that accepts self-signed Ed25519 certificates.
@@ -144,6 +213,14 @@ pub fn server_config(identity: &NodeIdentity) -> Result<ServerConfig, TransportE
 fn server_config_with_cert(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
+) -> Result<ServerConfig, TransportError> {
+    server_config_with(cert_der, key_der, transport_config())
+}
+
+fn server_config_with(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    transport: quinn::TransportConfig,
 ) -> Result<ServerConfig, TransportError> {
     let cert = CertificateDer::from(cert_der);
     let key = PrivatePkcs8KeyDer::from(key_der);
@@ -157,8 +234,6 @@ fn server_config_with_cert(
         .map_err(|e| TransportError::Tls(e.to_string()))?;
 
     tls_config.alpn_protocols = vec![b"cordelia/1".to_vec()];
-
-    let transport = transport_config();
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -182,8 +257,8 @@ fn client_config_with_cert(
     client_config_with(cert_der, key_der, transport_config())
 }
 
-/// A client config with `transport` in place of a node's own. A node uses
-/// only its own; the tests give a stand-in peer other settings.
+/// A client config with `transport` in place of a node's own: a relay's
+/// listed by key ([`listed_configs`]), or, in the tests, a stand-in peer's.
 fn client_config_with(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -673,10 +748,11 @@ mod tests {
         assert_eq!(peer_key(&client_end).unwrap(), server_id.public_key());
     }
 
-    /// T3. A peer can have 64 streams open on one connection at once. The
-    /// next one waits.
+    /// T3. A peer can have 8 streams open on one connection at once
+    /// (decision 2026-10-22, memory across connections, rule 9). The ninth
+    /// waits.
     #[tokio::test]
-    async fn a_connection_holds_at_most_64_streams_open() {
+    async fn a_connection_holds_at_most_8_streams_open() {
         let (client, server, _c, _s) = connected().await;
         // The other end takes each stream and keeps it open.
         let holding = tokio::spawn(async move {
@@ -710,54 +786,143 @@ mod tests {
         holding.abort();
     }
 
-    /// T3. One connection cannot make a node hold more than two messages'
-    /// worth that it has not read, however many streams the peer uses.
+    /// T3. One connection cannot make a node hold more than two small
+    /// messages' worth that it has not read, however many streams the peer
+    /// uses (decision 2026-10-22, memory across connections, rule 8): a
+    /// stream's window on each stream it may open, which together are
+    /// seven eighths of QUIC_RECEIVE_WINDOW.
     #[tokio::test]
     async fn a_connection_buffers_at_most_two_unread_messages() {
+        // On every stream it may open, as much as each takes: no more than
+        // the window in all, and no more than a stream's window on one.
         let (client, _server_reads_nothing, _c, _s) = connected().await;
-        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize];
-
-        // Four streams, a message's worth on each: four megabytes offered.
+        let chunk = vec![0u8; 16 * 1024];
+        let (mut in_all, mut most) = (0usize, 0usize);
         let mut streams = Vec::new();
-        let mut taken = 0;
-        for _ in 0..4 {
+        for _ in 0..protocol::QUIC_MAX_BIDI_STREAMS {
             let (mut send, recv) = client.open_bi().await.unwrap();
-            let sent =
-                tokio::time::timeout(Duration::from_millis(1500), send.write_all(&message)).await;
-            taken += usize::from(matches!(sent, Ok(Ok(()))));
+            let mut on_this = 0usize;
+            // A write waits for credit; one that waits this long has none.
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(1500), send.write(&chunk)).await
+            {
+                on_this += n;
+            }
+            in_all += on_this;
+            most = most.max(on_this);
             streams.push((send, recv));
         }
-        assert_eq!(taken, 2, "the connection took {taken} megabytes unread");
+        assert_eq!(
+            in_all,
+            (protocol::QUIC_STREAM_RECEIVE_WINDOW * protocol::QUIC_MAX_BIDI_STREAMS) as usize,
+            "the connection took {in_all} bytes unread"
+        );
+        assert!(in_all <= protocol::QUIC_RECEIVE_WINDOW as usize);
+        assert_eq!(
+            most,
+            protocol::QUIC_STREAM_RECEIVE_WINDOW as usize,
+            "a stream took {most} bytes unread"
+        );
     }
 
-    /// The send window that a config carries, as quinn shows it: quinn has
-    /// no getter for it, but its `Debug` names every field.
-    fn send_window_of(config: &impl std::fmt::Debug) -> u64 {
+    /// The value of `field` in a config, as quinn shows it: quinn has no
+    /// getters for its transport settings, but its `Debug` names every
+    /// field (a count of streams or a window as `VarInt(n)`).
+    fn shown_in(config: &impl std::fmt::Debug, field: &str) -> u64 {
         let shown = format!("{config:?}");
+        let named = format!(" {field}: ");
         let at = shown
-            .find("send_window: ")
-            .expect("the config shows its send window")
-            + "send_window: ".len();
+            .find(&named)
+            .unwrap_or_else(|| panic!("the config shows no {field}"))
+            + named.len();
         let digits: String = shown[at..]
             .chars()
+            .skip_while(|c| !c.is_ascii_digit())
             .take_while(char::is_ascii_digit)
             .collect();
         digits.parse().unwrap()
     }
 
+    fn send_window_of(config: &impl std::fmt::Debug) -> u64 {
+        shown_in(config, "send_window")
+    }
+
+    /// The windows and the streams a config carries: what a peer may send
+    /// on a stream and on the connection, what this node may write it
+    /// unacknowledged, and how many streams the peer may have open.
+    fn limits_of(config: &impl std::fmt::Debug) -> (u64, u64, u64, u64) {
+        (
+            shown_in(config, "stream_receive_window"),
+            shown_in(config, "receive_window"),
+            shown_in(config, "send_window"),
+            shown_in(config, "max_concurrent_bidi_streams"),
+        )
+    }
+
+    /// Decision 2026-10-22, memory across connections, rule 12. A node's
+    /// configs of a connection with a relay listed by key carry today's
+    /// windows and 64 streams, as the client that dials the relay and as
+    /// the server it is accepted by; every other config carries the
+    /// windows and streams of every peer.
+    #[test]
+    fn a_relay_listed_by_key_has_the_windows_and_streams_of_before() {
+        let id = NodeIdentity::generate().unwrap();
+        let listed = (
+            u64::from(protocol::QUIC_LISTED_STREAM_RECEIVE_WINDOW),
+            u64::from(protocol::QUIC_LISTED_RECEIVE_WINDOW),
+            protocol::QUIC_LISTED_SEND_WINDOW,
+            u64::from(protocol::QUIC_LISTED_MAX_BIDI_STREAMS),
+        );
+        assert_eq!(listed, (1_048_576, 2_097_152, 2_097_152, 64));
+        let configs = listed_configs(&id).unwrap();
+        assert_eq!(limits_of(&listed_transport_config()), listed);
+        assert_eq!(limits_of(&configs.client), listed);
+        assert_eq!(limits_of(&configs.server.transport), listed);
+
+        let every_peer = (
+            u64::from(protocol::QUIC_STREAM_RECEIVE_WINDOW),
+            u64::from(protocol::QUIC_RECEIVE_WINDOW),
+            protocol::QUIC_SEND_WINDOW,
+            u64::from(protocol::QUIC_MAX_BIDI_STREAMS),
+        );
+        assert_eq!(limits_of(&transport_config()), every_peer);
+        assert_eq!(limits_of(&client_config(&id).unwrap()), every_peer);
+        assert_eq!(
+            limits_of(&server_config(&id).unwrap().transport),
+            every_peer
+        );
+    }
+
     /// T3. What a node may have written on one connection that the peer has
     /// not acknowledged is QUIC_SEND_WINDOW, at both ends: as the client
-    /// that dials, and as the server that is dialled.
+    /// that dials, and as the server that is dialled. It is two small
+    /// messages (decision 2026-10-22, memory across connections, rule 11).
     #[test]
     fn the_send_window_is_two_messages_at_both_ends() {
         let id = NodeIdentity::generate().unwrap();
         let window = protocol::QUIC_SEND_WINDOW;
+        assert_eq!(window, 2 * u64::from(protocol::SMALL_MESSAGE_BYTES));
         assert_eq!(send_window_of(&transport_config()), window);
         assert_eq!(send_window_of(&client_config(&id).unwrap()), window);
         assert_eq!(
             send_window_of(&server_config(&id).unwrap().transport),
             window
         );
+    }
+
+    /// Decision 2026-10-22, memory across connections, rules 8, 9 and 11.
+    /// The configs of every connection but one with a relay listed by key
+    /// carry two small messages on the connection each way, an eighth of
+    /// seven eighths of that on a stream, and 8 streams, as the client that
+    /// dials and as the server that is dialled.
+    #[test]
+    fn the_windows_and_streams_are_set_from_a_small_message() {
+        let id = NodeIdentity::generate().unwrap();
+        let small = u64::from(protocol::SMALL_MESSAGE_BYTES);
+        let set = ((2 * small - 2 * small / 8) / 8, 2 * small, 2 * small, 8);
+        assert_eq!(limits_of(&transport_config()), set);
+        assert_eq!(limits_of(&client_config(&id).unwrap()), set);
+        assert_eq!(limits_of(&server_config(&id).unwrap().transport), set);
     }
 
     /// A path to `server` over UDP, as a client sees it: the address to
@@ -877,8 +1042,8 @@ mod tests {
     async fn a_message_that_meets_the_send_window_fails_after_the_stream_timeout() {
         let (node_end, _peer_end, _cut, _held) = a_peer_that_stops_acknowledging().await;
         let (mut send, mut recv) = node_end.open_bi().await.unwrap();
-        // A frame of a megabyte, its length included.
-        let message = vec![0u8; protocol::MAX_MESSAGE_BYTES as usize - 4];
+        // A frame of a small message, its length included.
+        let message = vec![0u8; protocol::SMALL_MESSAGE_BYTES as usize - 4];
 
         // Two fill the window, and are taken at once. The third waits.
         for _ in 0..2 {
@@ -1300,5 +1465,276 @@ mod tests {
         let cc = client_config(&id).expect("client config should build with keepalive");
         // If keep_alive_interval or max_idle_timeout were invalid, these would fail
         let _ = (sc, cc);
+    }
+
+    /// A path to `server` over UDP that delays every datagram `each_way`
+    /// in each direction, in order: the address to dial.
+    async fn delayed_path_to(server: SocketAddr, each_way: Duration) -> SocketAddr {
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(server).await.unwrap();
+        let addr = front.local_addr().unwrap();
+        let client = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
+        // Each direction: a reader that stamps each datagram, and a sender
+        // that sends it once its time has come.
+        let (up_tx, mut up_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        let (down_tx, mut down_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        {
+            let (front, client) = (front.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client.lock().unwrap() = Some(from);
+                    let _ = up_tx.send((tokio::time::Instant::now() + each_way, buf[..n].to_vec()));
+                }
+            });
+        }
+        {
+            let back = back.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let _ =
+                        down_tx.send((tokio::time::Instant::now() + each_way, buf[..n].to_vec()));
+                }
+            });
+        }
+        {
+            let back = back.clone();
+            tokio::spawn(async move {
+                while let Some((at, datagram)) = up_rx.recv().await {
+                    tokio::time::sleep_until(at).await;
+                    let _ = back.send(&datagram).await;
+                }
+            });
+        }
+        tokio::spawn(async move {
+            while let Some((at, datagram)) = down_rx.recv().await {
+                tokio::time::sleep_until(at).await;
+                let to = *client.lock().unwrap();
+                if let Some(to) = to {
+                    let _ = front.send_to(&datagram, to).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// One exchange: the client writes `asked` bytes on a stream it opens
+    /// and finishes it, the server reads them to the end and answers with
+    /// `answered` bytes; the time from the first byte written to the last
+    /// byte of the answer read.
+    async fn exchange(
+        client: &quinn::Connection,
+        server: &quinn::Connection,
+        asked: usize,
+        answered: usize,
+    ) -> Duration {
+        let serving = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let (mut send, mut recv) = server.accept_bi().await.unwrap();
+                recv.read_to_end(4 << 20).await.unwrap();
+                send.write_all(&vec![1u8; answered]).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            })
+        };
+        let began = std::time::Instant::now();
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        send.write_all(&vec![2u8; asked.max(1)]).await.unwrap();
+        send.finish().unwrap();
+        let got = recv.read_to_end(4 << 20).await.unwrap();
+        let took = began.elapsed();
+        assert_eq!(got.len(), answered);
+        serving.await.unwrap();
+        took
+    }
+
+    /// The windows and streams of a config to measure: what a peer may send
+    /// on a stream, on the connection, what this end may write unacknowledged,
+    /// and how many streams the peer may open.
+    fn limits(
+        stream_window: u32,
+        window: u32,
+        send_window: u64,
+        streams: u32,
+    ) -> quinn::TransportConfig {
+        transport_with(Limits {
+            streams,
+            stream_window,
+            window,
+            send_window,
+        })
+    }
+
+    /// What each exchange takes at round trips of 200, 300 and 400 ms
+    /// (decision 2026-10-22, memory across connections, §2.3), with each
+    /// end's settings as a node of this version gives them, or as one of
+    /// the version before has them. Printed; run by hand:
+    /// `cargo test -p cordelia-network --lib what_each_exchange_takes -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement, printed: run by hand"]
+    async fn what_each_exchange_takes_at_a_round_trip_of_200_ms() {
+        let mib = 1u32 << 20;
+        // A node of the version before, on every connection.
+        let before = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
+        // Each end's settings, made afresh for each connection: the
+        // server's (the end that is dialled), the client's.
+        type Settings<'a> = Box<dyn Fn() -> quinn::TransportConfig + 'a>;
+        let every_peer: fn() -> quinn::TransportConfig = transport_config;
+        let listed: fn() -> quinn::TransportConfig = listed_transport_config;
+        // What crosses: its name, the settings at each end, the bytes the
+        // asker writes and the bytes it is answered with, how many
+        // exchanges in turn make it, and whether the end that was dialled
+        // asks (the client answering it).
+        let cases: Vec<(&str, Settings, Settings, usize, usize, usize, bool)> = vec![
+            (
+                "a device's push of 128 KiB to its relay",
+                Box::new(every_peer),
+                Box::new(listed),
+                128 * 1024,
+                16,
+                1,
+                false,
+            ),
+            (
+                "a device's pass of 10 pages of 128 KiB, dialling by key",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                128 * 1024,
+                10,
+                false,
+            ),
+            (
+                "a device's pass of 10 pages of 128 KiB, on every peer's windows",
+                Box::new(every_peer),
+                Box::new(every_peer),
+                64,
+                128 * 1024,
+                10,
+                false,
+            ),
+            (
+                "a device of the version before pushes 896 KiB",
+                Box::new(every_peer),
+                Box::new(before),
+                896 * 1024,
+                16,
+                1,
+                false,
+            ),
+            (
+                "an older kind's fetch answer of 1 MiB, relays not listed by key",
+                Box::new(every_peer),
+                Box::new(every_peer),
+                64,
+                1 << 20,
+                1,
+                false,
+            ),
+            (
+                "a full page of 896 KiB between relays listed by key",
+                Box::new(listed),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
+                false,
+            ),
+            // The check's NAT case (rule 12): relay B dials relay A by key
+            // from an address that A has not configured. B's end carries
+            // the listed settings, A's every peer's.
+            (
+                "NAT: B pulls a full page of 896 KiB from A",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
+                false,
+            ),
+            (
+                "NAT: A pulls from B, a full page of 896 KiB (as asked before)",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
+                true,
+            ),
+            (
+                "NAT: A pulls from B, 10 pages of one entry of 65,773 B (as A asks)",
+                Box::new(every_peer),
+                Box::new(listed),
+                64,
+                65_773,
+                10,
+                true,
+            ),
+        ];
+        for rtt_ms in [200u64, 300, 400] {
+            for (name, at_server, at_client, asked, answered, times, dialled_asks) in &cases {
+                let server_id = NodeIdentity::generate().unwrap();
+                let client_id = NodeIdentity::generate().unwrap();
+                let (cert, key) = generate_self_signed_cert(&server_id).unwrap();
+                let server_end = Endpoint::server(
+                    server_config_with(cert, key, at_server()).unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .unwrap();
+                let dial = delayed_path_to(
+                    server_end.local_addr().unwrap(),
+                    Duration::from_millis(rtt_ms / 2),
+                )
+                .await;
+                let (cert, key) = generate_self_signed_cert(&client_id).unwrap();
+                let mut client_end = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                client_end
+                    .set_default_client_config(client_config_with(cert, key, at_client()).unwrap());
+                let accepting = {
+                    let server_end = server_end.clone();
+                    tokio::spawn(async move { server_end.accept().await.unwrap().await.unwrap() })
+                };
+                let client = client_end.connect(dial, "cordelia").unwrap().await.unwrap();
+                let server = accepting.await.unwrap();
+                // Past slow start: 4 MiB each way, on 4 streams at once.
+                let mut warming = Vec::new();
+                for _ in 0..4 {
+                    let (c, s) = (client.clone(), server.clone());
+                    warming.push(tokio::spawn(async move {
+                        exchange(&c, &s, 1 << 20, 1 << 20).await
+                    }));
+                }
+                for w in warming {
+                    w.await.unwrap();
+                }
+                // The median of three.
+                let mut took = Vec::new();
+                for _ in 0..3 {
+                    let began = std::time::Instant::now();
+                    for _ in 0..*times {
+                        match dialled_asks {
+                            false => exchange(&client, &server, *asked, *answered).await,
+                            true => exchange(&server, &client, *asked, *answered).await,
+                        };
+                    }
+                    took.push(began.elapsed());
+                }
+                took.sort();
+                let took = took[1].as_secs_f64();
+                // An exchange takes about a number of round trips; it fails
+                // STREAM_TIMEOUT where one of its messages takes 10 s.
+                let one = took / *times as f64;
+                let fails_at = protocol::STREAM_TIMEOUT_SECS as f64 * rtt_ms as f64 / one / 1000.0;
+                println!(
+                    "{rtt_ms} ms | {name} | {took:.2} s | fails past about {fails_at:.2} s a round trip"
+                );
+                client.close(0u32.into(), b"done");
+            }
+        }
     }
 }

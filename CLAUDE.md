@@ -163,9 +163,9 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `CHURN_INTERVAL_SECS` | 3600s | parameter-rationale.md §3 |
 | `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
 | `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
-| `QUIC_MAX_BIDI_STREAMS` | 64 | parameter-rationale.md §1 |
-| `QUIC_RECEIVE_WINDOW` | 2MB a connection | parameter-rationale.md §1 |
-| `QUIC_SEND_WINDOW` | 2MB a connection (derived: 2 x `MAX_MESSAGE_BYTES`; a write beyond it waits for acknowledgements, and fails after `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §1 |
+| `QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS` | 8 (64 with a relay listed by key) | parameter-rationale.md §1 |
+| `QUIC_STREAM_RECEIVE_WINDOW`, `QUIC_RECEIVE_WINDOW` | 32,256 bytes a stream, 288KB a connection (derived: two of `SMALL_MESSAGE_BYTES` a connection, and seven eighths of that over `QUIC_MAX_BIDI_STREAMS` a stream, so that every stream fits within the connection's window with the eighth quinn waits for left; 1MB and 2MB with a relay listed by key) | parameter-rationale.md §1 |
+| `QUIC_SEND_WINDOW` | 288KB a connection (derived: 2 x `SMALL_MESSAGE_BYTES`; 2MB to a relay listed by key; a write beyond it waits for acknowledgements, and fails after `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §1 |
 | `PUSH_BYTES_PER_PEER_PER_MINUTE` | 2MB | parameter-rationale.md §4 |
 | `MAX_CHANNEL_BYTES_AT_RELAY` | 16MB | parameter-rationale.md §4 |
 | `NEW_CHANNELS_PER_ADDRESS_PER_HOUR` | 16 | parameter-rationale.md §4 |
@@ -292,6 +292,9 @@ The constants of what a relay holds across its connections (decision
 | `SMALL_MESSAGE_BYTES` | 147,456 (derived: `SMALL_PAGE_BYTES` and 16 KiB for what is around the entries; nothing a device of this version sends or is sent is larger) | parameter-rationale.md §13 |
 | `LARGE_MESSAGES_AT_ONCE` | 4 (the large permits a node holds across all its connections; at most one for each /24 or /48) | parameter-rationale.md §13 |
 | `ERR_LARGE_MESSAGE_LATER` | 0x05 (a large message the node could not take within `STREAM_TIMEOUT_SECS`, to be sent again) | parameter-rationale.md §13 |
+| `QUIC_LISTED_STREAM_RECEIVE_WINDOW`, `QUIC_LISTED_RECEIVE_WINDOW`, `QUIC_LISTED_SEND_WINDOW`, `QUIC_LISTED_MAX_BIDI_STREAMS` | 1MB, 2MB, 2MB, 64 (derived: today's values, for a connection with a relay listed by key, dialled with `connect_with` and accepted with `accept_with`) | parameter-rationale.md §13 |
+| `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
+| `SMALL_WINDOWS_PULL_ENTRIES` | 1 (derived: the entries of the largest size on the wire that a small page holds; what a relay asks a listed relay for in a page where its own end of their connection has every peer's windows, as behind a NAT) | parameter-rationale.md §13 |
 
 ## Running Tests
 
