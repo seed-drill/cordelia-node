@@ -109,7 +109,8 @@ impl Histogram {
 /// stream between relays and a relay's own pull and passing on), and the
 /// sweeps. On a device: its passes, its sync cycle, its local API, its
 /// sweep and its hourly task, which ends with the checkpoint. Any other is
-/// `Other`.
+/// `Other`, which is declared last: a kind is added before it, and in
+/// [`Kind::ALL`] at its place, or the build fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     ShowWhole,
@@ -161,6 +162,19 @@ impl Kind {
         }
     }
 }
+
+// Kind::ALL holds every kind, each at its own place (`kind as usize`, by
+// which the lock's histograms are indexed), and ends with Other, the kind
+// declared last: so a kind declared and left out of it, or put at another
+// place, fails the build.
+const _: () = {
+    let mut i = 0;
+    while i < Kind::ALL.len() {
+        assert!(Kind::ALL[i] as usize == i);
+        i += 1;
+    }
+    assert!(Kind::Other as usize == Kind::ALL.len() - 1);
+};
 
 /// A kind of request on the streams of entries (decision 2026-10-22
 /// §1.2): a show, whole or in short; a proof; a pull; a push; and the
