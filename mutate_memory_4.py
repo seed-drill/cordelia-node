@@ -15,7 +15,8 @@ PROTOCOL = 'crates/cordelia-core/src/protocol.rs'
 TRANSPORT = 'crates/cordelia-network/src/transport.rs'
 CONNECTION = 'crates/cordelia-network/src/connection.rs'
 P2P = 'crates/cordelia-node/src/p2p.rs'
-ORIG = {f: open(f).read() for f in (PROTOCOL, TRANSPORT, CONNECTION, P2P)}
+RELAY_ENTRIES = 'crates/cordelia-node/src/relay_entries.rs'
+ORIG = {f: open(f).read() for f in (PROTOCOL, TRANSPORT, CONNECTION, P2P, RELAY_ENTRIES)}
 
 # Where a test lives: (crate, the arguments cargo test needs to find it).
 CORE = ("cordelia-core", ["--lib"])
@@ -26,6 +27,7 @@ def core(test): return (CORE, "protocol::tests::" + test)
 def net(test): return (NET, "transport::tests::" + test)
 def batching(test): return (BATCHING, test)
 def node(test): return (NODE, "p2p::tests::" + test)
+def entries(test): return (NODE, "relay_entries::tests::" + test)
 
 LISTED = node("a_relay_listed_by_key_keeps_todays_windows_and_streams")
 RETRIES = node("a_failed_repush_is_tried_again_a_few_streams_at_a_time")
@@ -38,10 +40,21 @@ LISTED_CONFIGS = net("a_relay_listed_by_key_has_the_windows_and_streams_of_befor
 # Two edits in one part: give two lists of the same length.
 MUTATIONS = [
     ("W1 a stream's receive window is a small message, as the connection's half", PROTOCOL,
-     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = QUIC_RECEIVE_WINDOW / QUIC_MAX_BIDI_STREAMS;''',
-      '''    QUIC_STREAM_RECEIVE_WINDOW as u64 * QUIC_MAX_BIDI_STREAMS as u64 <= QUIC_RECEIVE_WINDOW as u64'''],
+     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 =
+    (QUIC_RECEIVE_WINDOW - QUIC_RECEIVE_WINDOW / 8) / QUIC_MAX_BIDI_STREAMS;''',
+      '''        <= QUIC_RECEIVE_WINDOW as u64 - QUIC_RECEIVE_WINDOW as u64 / 8
+'''],
      ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = SMALL_MESSAGE_BYTES;''',
-      '''    true'''],
+      '''        <= u64::MAX\n'''],
+     [core("the_receive_windows_hold_every_stream_within_two_small_messages"), SET_FROM_SMALL,
+      node("a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other")]),
+    ("W5 a stream's receive window is an eighth of the connection's, none left for its own", PROTOCOL,
+     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 =
+    (QUIC_RECEIVE_WINDOW - QUIC_RECEIVE_WINDOW / 8) / QUIC_MAX_BIDI_STREAMS;''',
+      '''        <= QUIC_RECEIVE_WINDOW as u64 - QUIC_RECEIVE_WINDOW as u64 / 8
+'''],
+     ['''pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = QUIC_RECEIVE_WINDOW / QUIC_MAX_BIDI_STREAMS;''',
+      '''        <= QUIC_RECEIVE_WINDOW as u64\n'''],
      [core("the_receive_windows_hold_every_stream_within_two_small_messages"), SET_FROM_SMALL,
       node("a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other")]),
     ("W2 a connection's receive window is two messages", PROTOCOL,
@@ -132,6 +145,20 @@ MUTATIONS = [
      '''    let _ = &same_socket;''',
      [batching("a_peer_cannot_make_a_node_hold_its_batches_of_datagrams"),
       net("a_nodes_socket_takes_no_batches_of_datagrams")]),
+    ("S1 a listed relay is given full pages by its key alone", RELAY_ENTRIES,
+     '''            full_pages: self.lists(serving.peer) && serving.listed_settings,''',
+     '''            full_pages: self.lists(serving.peer),''',
+     [entries("a_relay_listed_by_key_on_a_connection_without_its_settings_is_given_small_pages")]),
+    ("S2 every accepted connection says it has the listed settings", CONNECTION,
+     '''        listed_settings: keys.is_some() && ctx.listed.is_some(),''',
+     '''        listed_settings: true,''',
+     [LISTED]),
+    ("K1 an IPv4 address mapped into IPv6 is not taken for itself", P2P,
+     '''    let canonical = |addr: std::net::SocketAddr| {
+        std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    };''',
+     '''    let canonical = |addr: std::net::SocketAddr| addr;''',
+     [node("a_listed_relays_address_is_found_when_shown_mapped_into_ipv6")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
