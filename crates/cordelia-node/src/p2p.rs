@@ -2435,9 +2435,6 @@ pub fn post_connect(
         let st = seen_table.clone();
         let entries = relay_entries.clone();
         let permits = large_permits.clone();
-        // Whether a listed relay's connection carries the listed settings
-        // at this end, by which it is given full pages (rule 12).
-        let listed_settings = conn_mgr.carries_listed_settings(node_id);
         tokio::spawn(async move {
             handle_peer_streams(
                 conn,
@@ -2456,7 +2453,6 @@ pub fn post_connect(
                 st,
                 entries,
                 permits,
-                listed_settings,
             )
             .await;
         });
@@ -3482,7 +3478,7 @@ pub async fn p2p_loop(
             // lacks.
             _ = entry_pull_interval.tick(), if relay_entries.is_some() => {
                 if let Some(entries) = &relay_entries {
-                    let relays = crate::relay_entries::listed_and_connected(entries, &conn_mgr);
+                    let relays = crate::relay_entries::listed_links(entries, &conn_mgr);
                     crate::relay_entries::pull_from_each(entries, &state, relays);
                 }
             }
@@ -5372,7 +5368,6 @@ pub async fn handle_peer_streams(
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
     large_permits: std::sync::Arc<LargePermits>,
-    listed_settings: bool,
 ) {
     let mut stream_count: u64 = 0;
     // The channels of entries whose keys were proved on this connection
@@ -5618,7 +5613,6 @@ pub async fn handle_peer_streams(
                     db: &state.db,
                     rates: &peer_rates,
                     permits: Some(&large_permits),
-                    listed_settings,
                 };
                 let over = entries
                     .serve(
@@ -8982,7 +8976,6 @@ mod tests {
             seen,
             relay_entries,
             permits,
-            listed,
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -13182,6 +13175,82 @@ mod tests {
         );
     }
 
+    /// Decision 2026-10-22 (memory), rule 12, the check's NAT case: relay B
+    /// dials relay A by key from an address that A has not configured. B's
+    /// end of their connection carries the listed settings, and A's every
+    /// peer's. A receive window bounds what the other end may send, so each
+    /// asks for its pages by its own end's settings: A for pages whose
+    /// worst case is a small page, B for full ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn behind_a_nat_each_relay_asks_for_pages_by_its_own_ends_settings() {
+        use cordelia_network::bootstrap::RelayAddr;
+        use cordelia_network::{connection, transport};
+
+        let id = |seed: u8| {
+            std::sync::Arc::new(
+                cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap(),
+            )
+        };
+        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
+            let end = transport::create_endpoint(key, here).unwrap();
+            let port = end.local_addr().unwrap().port();
+            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
+        };
+        let listing = |addr: std::net::SocketAddr, key: [u8; 32]| -> RelayAddrs {
+            std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                host: "relay.test:9474".into(),
+                addr,
+                key: Some(key),
+            }]))
+        };
+        let (a_key, b_key) = (id(31), id(32));
+        let (mut a, mut b) = (manager(&a_key), manager(&b_key));
+        // A lists B by key at an address that B does not dial from: B is
+        // behind a NAT. B lists A by key at A's address.
+        let at_a = listing("127.0.0.1:9".parse().unwrap(), b_key.public_key());
+        let at_b = listing(a.local_addr().unwrap(), a_key.public_key());
+
+        let accepting = tokio::spawn({
+            let (end, ctx, relays) = (a.endpoint(), a.connect_context(), at_a.clone());
+            async move {
+                let incoming = end.accept().await.unwrap();
+                accept_incoming(&ctx, incoming, &relays).await
+            }
+        });
+        let configured = at_b.read().unwrap()[0].clone();
+        let dialled = dial_relay(&b.connect_context(), &configured).await.unwrap();
+        let accepted = accepting.await.unwrap().unwrap();
+        b.register(dialled).unwrap();
+        a.register(accepted).unwrap();
+
+        let entries_with = |relays: &RelayAddrs| {
+            crate::relay_entries::RelayEntries::new(
+                u64::MAX,
+                relays.clone(),
+                std::time::Duration::from_secs(600),
+            )
+        };
+        let at_a = crate::relay_entries::listed_links(&entries_with(&at_a), &a);
+        let at_b = crate::relay_entries::listed_links(&entries_with(&at_b), &b);
+        assert_eq!(
+            at_a.iter().map(|(relay, _)| relay.clone()).collect::<Vec<_>>(),
+            [NodeId(b_key.public_key())]
+        );
+        assert!(
+            at_a[0].1.small_windows,
+            "A, on every peer's windows, would ask B for full pages"
+        );
+        assert_eq!(
+            at_b.iter().map(|(relay, _)| relay.clone()).collect::<Vec<_>>(),
+            [NodeId(a_key.public_key())]
+        );
+        assert!(
+            !at_b[0].1.small_windows,
+            "B, which carries the listed settings, would ask A for small pages"
+        );
+    }
+
     /// What a relay's own fetch from a relay configured by address alone,
     /// of the version before, and that relay's large pushes on the same
     /// connection come to (decision 2026-10-22 (memory), rules 2, 6 and 8):
@@ -13309,7 +13378,6 @@ mod tests {
             )),
             relay_entries,
             permits.clone(),
-            false,
         ));
 
         let item = |n: usize, bytes: usize| Item {
