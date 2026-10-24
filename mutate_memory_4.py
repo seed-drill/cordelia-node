@@ -3,8 +3,10 @@
 windows and stream count set from a small message, each stream's window
 an eighth of the connection's, the push retries
 bounded, and today's windows and streams kept between relays listed by
-key (decision 2026-10-22, memory across connections, rules 8, 9, 11 and
-12, section 9 item 4), with test 8's check of rule 10 by memory. A part
+key, with what crosses the windows of every peer bounded by the end that
+has them where the two ends of a listed relay's connection disagree
+(decision 2026-10-22, memory across connections, rules 8, 9, 11 and 12,
+section 9 item 4), with test 8's check of rule 10 by memory. A part
 for each rule of the slice: put each fault in, and confirm the test named
 for it fails on an assertion. Run from the root of a checkout that
 nothing else edits."""
@@ -33,6 +35,7 @@ LISTED = node("a_relay_listed_by_key_keeps_todays_windows_and_streams")
 RETRIES = node("a_failed_repush_is_tried_again_a_few_streams_at_a_time")
 SET_FROM_SMALL = net("the_windows_and_streams_are_set_from_a_small_message")
 LISTED_CONFIGS = net("a_relay_listed_by_key_has_the_windows_and_streams_of_before")
+SMALL_ASKED = entries("a_relay_on_every_peers_windows_asks_a_listed_relay_for_small_pages")
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -145,10 +148,33 @@ MUTATIONS = [
      '''    let _ = &same_socket;''',
      [batching("a_peer_cannot_make_a_node_hold_its_batches_of_datagrams"),
       net("a_nodes_socket_takes_no_batches_of_datagrams")]),
-    ("S1 a listed relay is given full pages by its key alone", RELAY_ENTRIES,
-     '''            full_pages: self.lists(serving.peer) && serving.listed_settings,''',
-     '''            full_pages: self.lists(serving.peer),''',
-     [entries("a_relay_listed_by_key_on_a_connection_without_its_settings_is_given_small_pages")]),
+    ("S1 a relay on every peer's windows asks a listed relay for full pages", RELAY_ENTRIES,
+     '''        let limit = if link.small_windows() {''',
+     '''        let limit = if false {''',
+     [SMALL_ASKED]),
+    ("S3 a relay's links say the opposite of its own end's settings", RELAY_ENTRIES,
+     '''            let small_windows = !conn_mgr.carries_listed_settings(&relay);''',
+     '''            let small_windows = conn_mgr.carries_listed_settings(&relay);''',
+     [node("behind_a_nat_each_relay_asks_for_pages_by_its_own_ends_settings")]),
+    ("S4 a listed relay is served small pages", RELAY_ENTRIES,
+     '''                    pull.limit,
+                    ENTRY_PAGE_MAX_BYTES,
+                );''',
+     '''                    pull.limit,
+                    SMALL_PAGE_BYTES,
+                );''',
+     [SMALL_ASKED]),
+    ("S5 the entries a page on every peer's windows asks for are two", PROTOCOL,
+     ['''pub const SMALL_WINDOWS_PULL_ENTRIES: u32 = (SMALL_PAGE_BYTES / MAX_ENTRY_WIRE_BYTES) as u32;''',
+      '''const _: () =
+    assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);'''],
+     ['''pub const SMALL_WINDOWS_PULL_ENTRIES: u32 = 2;''',
+      '''const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= usize::MAX);'''],
+     [core("a_relay_on_every_peers_windows_asks_for_one_entry_a_page"), SMALL_ASKED]),
+    ("P1 entries are passed on to a listed relay a full page to a message", RELAY_ENTRIES,
+     '''                            || bytes + entry.bytes.len() > SMALL_PAGE_BYTES''',
+     '''                            || bytes + entry.bytes.len() > ENTRY_PAGE_MAX_BYTES''',
+     [entries("an_entry_that_is_taken_is_passed_on_to_the_listed_relays_but_not_back")]),
     ("S2 every accepted connection says it has the listed settings", CONNECTION,
      '''        listed_settings: keys.is_some() && ctx.listed.is_some(),''',
      '''        listed_settings: true,''',
