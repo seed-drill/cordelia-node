@@ -1570,113 +1570,131 @@ mod tests {
         })
     }
 
-    /// What each exchange of an honest peer takes at a round trip of 200 ms
+    /// What each exchange takes at round trips of 200, 300 and 400 ms
     /// (decision 2026-10-22, memory across connections, §2.3), with each
-    /// end's settings as named. Printed; run by hand:
+    /// end's settings as a node of this version gives them, or as one of
+    /// the version before has them. Printed; run by hand:
     /// `cargo test -p cordelia-network --lib what_each_exchange_takes -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "a measurement, printed: run by hand"]
     async fn what_each_exchange_takes_at_a_round_trip_of_200_ms() {
         let mib = 1u32 << 20;
-        let today = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
-        let small = protocol::SMALL_MESSAGE_BYTES;
-        let branch = move || limits(small, 2 * small, 2 * u64::from(small), 8);
-        let quarter =
-            move |stream_window: u32| limits(stream_window, 2 * small, 2 * u64::from(small), 8);
-        let listed = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
-        // Each end's settings, made afresh for each connection.
-        type Settings = Box<dyn Fn() -> quinn::TransportConfig>;
-        let cases: Vec<(&str, Settings, Settings)> = vec![
+        // A node of the version before, on every connection.
+        let before = move || limits(mib, 2 * mib, 2 * u64::from(mib), 64);
+        // Each end's settings, made afresh for each connection: the
+        // server's (the end that is dialled), the client's.
+        type Settings<'a> = Box<dyn Fn() -> quinn::TransportConfig + 'a>;
+        let every_peer: fn() -> quinn::TransportConfig = transport_config;
+        let listed: fn() -> quinn::TransportConfig = listed_transport_config;
+        // What crosses: its name, the settings at each end, the bytes the
+        // client writes and the bytes it is answered with, and how many
+        // exchanges in turn make it.
+        let cases: Vec<(&str, Settings, Settings, usize, usize, usize)> = vec![
             (
-                "before change F: 1 MiB a stream, 2 MiB, 64 streams",
-                Box::new(today),
-                Box::new(today),
-            ),
-            (
-                "a small message a stream at the relay; the device listed",
-                Box::new(branch),
+                "a device's push of 128 KiB to its relay",
+                Box::new(every_peer),
                 Box::new(listed),
+                128 * 1024,
+                16,
+                1,
             ),
             (
-                "a small message a stream at both",
-                Box::new(branch),
-                Box::new(branch),
-            ),
-            (
-                "36 KiB a stream at the relay; the device listed",
-                Box::new(move || quarter(36_864)),
+                "a device's pass of 10 pages of 128 KiB, dialling by key",
+                Box::new(every_peer),
                 Box::new(listed),
+                64,
+                128 * 1024,
+                10,
             ),
             (
-                "36 KiB a stream at both",
-                Box::new(move || quarter(36_864)),
-                Box::new(move || quarter(36_864)),
+                "a device's pass of 10 pages of 128 KiB, on every peer's windows",
+                Box::new(every_peer),
+                Box::new(every_peer),
+                64,
+                128 * 1024,
+                10,
             ),
             (
-                "32 KiB a stream at both",
-                Box::new(move || quarter(32_768)),
-                Box::new(move || quarter(32_768)),
+                "a device of the version before pushes 896 KiB",
+                Box::new(every_peer),
+                Box::new(before),
+                896 * 1024,
+                16,
+                1,
+            ),
+            (
+                "an older kind's fetch answer of 1 MiB, relays not listed by key",
+                Box::new(every_peer),
+                Box::new(every_peer),
+                64,
+                1 << 20,
+                1,
+            ),
+            (
+                "a full page of 896 KiB between relays listed by key",
+                Box::new(listed),
+                Box::new(listed),
+                64,
+                896 * 1024,
+                1,
             ),
         ];
-        for (name, at_server, at_client) in cases {
-            let server_id = NodeIdentity::generate().unwrap();
-            let client_id = NodeIdentity::generate().unwrap();
-            let (cert, key) = generate_self_signed_cert(&server_id).unwrap();
-            let server_end = Endpoint::server(
-                server_config_with(cert, key, at_server()).unwrap(),
-                "127.0.0.1:0".parse().unwrap(),
-            )
-            .unwrap();
-            let dial =
-                delayed_path_to(server_end.local_addr().unwrap(), Duration::from_millis(100)).await;
-            let (cert, key) = generate_self_signed_cert(&client_id).unwrap();
-            let mut client_end = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client_end
-                .set_default_client_config(client_config_with(cert, key, at_client()).unwrap());
-            let accepting = {
-                let server_end = server_end.clone();
-                tokio::spawn(async move { server_end.accept().await.unwrap().await.unwrap() })
-            };
-            let client = client_end.connect(dial, "cordelia").unwrap().await.unwrap();
-            let server = accepting.await.unwrap();
-            // Past slow start: 4 MiB each way, on 4 streams at once.
-            let mut warming = Vec::new();
-            for _ in 0..4 {
-                let (c, s) = (client.clone(), server.clone());
-                warming.push(tokio::spawn(async move {
-                    exchange(&c, &s, 1 << 20, 1 << 20).await
-                }));
-            }
-            for w in warming {
-                w.await.unwrap();
-            }
-            let median = |mut v: Vec<Duration>| {
-                v.sort();
-                v[v.len() / 2]
-            };
-            let mut line = Vec::new();
-            for (what, asked, answered) in [
-                ("push 128 KiB", 128 * 1024, 16),
-                ("page 128 KiB", 64, 128 * 1024),
-                ("show 33 KiB, answer 66 KB", 33 * 1024, 66_560),
-                ("fetch answer 1 MiB", 64, 1 << 20),
-            ] {
+        for rtt_ms in [200u64, 300, 400] {
+            for (name, at_server, at_client, asked, answered, times) in &cases {
+                let server_id = NodeIdentity::generate().unwrap();
+                let client_id = NodeIdentity::generate().unwrap();
+                let (cert, key) = generate_self_signed_cert(&server_id).unwrap();
+                let server_end = Endpoint::server(
+                    server_config_with(cert, key, at_server()).unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .unwrap();
+                let dial = delayed_path_to(
+                    server_end.local_addr().unwrap(),
+                    Duration::from_millis(rtt_ms / 2),
+                )
+                .await;
+                let (cert, key) = generate_self_signed_cert(&client_id).unwrap();
+                let mut client_end = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                client_end
+                    .set_default_client_config(client_config_with(cert, key, at_client()).unwrap());
+                let accepting = {
+                    let server_end = server_end.clone();
+                    tokio::spawn(async move { server_end.accept().await.unwrap().await.unwrap() })
+                };
+                let client = client_end.connect(dial, "cordelia").unwrap().await.unwrap();
+                let server = accepting.await.unwrap();
+                // Past slow start: 4 MiB each way, on 4 streams at once.
+                let mut warming = Vec::new();
+                for _ in 0..4 {
+                    let (c, s) = (client.clone(), server.clone());
+                    warming.push(tokio::spawn(async move {
+                        exchange(&c, &s, 1 << 20, 1 << 20).await
+                    }));
+                }
+                for w in warming {
+                    w.await.unwrap();
+                }
+                // The median of three.
                 let mut took = Vec::new();
                 for _ in 0..3 {
-                    took.push(exchange(&client, &server, asked, answered).await);
+                    let began = std::time::Instant::now();
+                    for _ in 0..*times {
+                        exchange(&client, &server, *asked, *answered).await;
+                    }
+                    took.push(began.elapsed());
                 }
-                line.push(format!("{what}: {:.2} s", median(took).as_secs_f64()));
+                took.sort();
+                let took = took[1].as_secs_f64();
+                // An exchange takes about a number of round trips; it fails
+                // STREAM_TIMEOUT where one of its messages takes 10 s.
+                let one = took / *times as f64;
+                let fails_at = protocol::STREAM_TIMEOUT_SECS as f64 * rtt_ms as f64 / one / 1000.0;
+                println!(
+                    "{rtt_ms} ms | {name} | {took:.2} s | fails past about {fails_at:.2} s a round trip"
+                );
+                client.close(0u32.into(), b"done");
             }
-            let began = std::time::Instant::now();
-            for _ in 0..10 {
-                exchange(&client, &server, 64, 128 * 1024).await;
-            }
-            line.push(format!(
-                "pass of 10 pages of 128 KiB: {:.2} s",
-                began.elapsed().as_secs_f64()
-            ));
-            println!("{name}: {}", line.join("; "));
-            client.close(0u32.into(), b"done");
         }
     }
 }

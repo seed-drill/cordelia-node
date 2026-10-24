@@ -340,12 +340,13 @@ fn held_by_the_node(node: Node, pace: Duration, lasting: Duration) -> isize {
 }
 
 /// The most one connection may make the node's thread hold over its
-/// level here: 1,200 KiB. Measured on loopback, on change F's windows (36
-/// KiB a stream) and 8 streams, at five pacings of the one-byte writes (1
-/// to 16 ms), three times each: GRO off 357 to 656 KiB, GRO on 2,238 to
-/// 3,292 KiB. The threshold lies between the two, at about their geometric
-/// mean. (At a small message a stream, four times each: 416 to 517 KiB
-/// and 4,601 to 6,627 KiB.)
+/// level here: 1,200 KiB. Measured on loopback, on change F's windows
+/// (31.5 KiB a stream) and 8 streams, at five pacings of the one-byte
+/// writes (1 to 16 ms), three times each: GRO off 330 to 711 KiB, GRO on
+/// 1,828 to 3,022 KiB. The threshold lies between the two, near their
+/// geometric mean. (At 36 KiB a stream: 357 to 656 and 2,238 to 3,292
+/// KiB; at a small message a stream, four times each, 416 to 517 and
+/// 4,601 to 6,627 KiB.)
 const THRESHOLD_BYTES: isize = 1200 * 1024;
 
 /// Decision 2026-10-22, memory across connections, rule 10. A peer that

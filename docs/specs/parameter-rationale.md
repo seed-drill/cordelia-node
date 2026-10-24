@@ -145,35 +145,43 @@ always there to read back: every case ended in 10 of 10 runs in both
 directions, each run in a process of its own
 (`a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other`).
 
-**What it costs an honest peer, at a round trip of 200 ms.** Measured for
-the decision record (its section 2.3): one connection through a path that
-delays each datagram 100 ms each way, past slow start, no loss; from the
-first byte written to the last byte read; the median of three
+**What it costs an honest peer, at round trips of 200, 300 and 400 ms.**
+Measured for the decision record (its section 2.3): one connection
+through a path that delays each datagram half the round trip each way,
+past slow start, no loss; from the first byte written to the last byte
+read; the median of three
 (`what_each_exchange_takes_at_a_round_trip_of_200_ms` in `transport.rs`,
 run by hand). A device dials a relay configured by key with the settings
 of §13 (rule 12), so what a relay sends a device is not held by the
-stream window; what a device sends a relay is.
+stream window; what a device sends a relay is. The last column is the
+round trip past which the exchange (for a pass, one of its pages) takes
+longer than STREAM_TIMEOUT, derived from the times.
 
-| What crosses | Before F | A small message a stream | 36 KiB a stream |
-|---|---|---|---|
-| A device's push of 128 KiB to its relay | 0.21 s | 0.23 s | 0.82 s |
-| A page of 128 KiB to a device dialling a relay configured by key | 0.21 s | 0.27 s | 0.26 s |
-| The same page to a device on these windows | 0.21 s | 0.23 s | 0.83 s |
-| A show (33 KiB) and its answer (66 KB), to a device dialling by key | 0.21 s | 0.24 s | 0.24 s |
-| An older kind's fetch answer of 1 MiB, between relays not listed by key | 0.32 s | 1.65 s | 5.92 s |
-| A pass of 10 pages of 128 KiB, to a device on these windows | 3.23 s | 3.35 s | 9.25 s |
+| What crosses | 200 ms | 300 ms | 400 ms | Fails past |
+|---|---|---|---|---|
+| A device's push of 128 KiB to its relay | 1.15 s | 1.70 s | 2.25 s | about 1.7 s |
+| A device's pass of 10 pages of 128 KiB, dialling by key | 3.64 s | 5.37 s | 7.20 s | about 5.5 s |
+| The same pass, on these windows | 11.2 s | 16.7 s | 22.2 s | about 1.8 s |
+| A device of the version before pushes 896 KiB | 6.03 s | 8.99 s | 12.0 s | about 0.33 s |
+| An older kind's fetch answer of 1 MiB, between relays not listed by key | 6.85 s | 10.2 s | 13.6 s | about 0.29 s |
+| A full page of 896 KiB between relays listed by key | 0.41 s | 0.61 s | 0.80 s | about 4.9 s |
+
+At 200 ms before change F: 0.21 s for the push, 3.23 s for a pass, 0.32 s
+for an answer of 1 MiB; at a small message a stream, 0.23 s, 3.35 s and
+1.65 s.
 
 A device of this version is held by its pace, not by the window: it sends
-at most `OUTBOX_BYTES_PER_MINUTE`, about 12 pushes of 128 KiB, 9.8 s of
-each minute, and is handed at most `PUSH_BYTES_PER_PEER_PER_MINUTE`. A
-small message arrives within `STREAM_TIMEOUT_SECS` at round trips under
-about 2.4 s. A message of 1 MiB takes about one round trip for each
-36 KiB, and arrives within it at round trips under about 0.34 s (it was
-1.2 s at a small message a stream): that falls on a device of the version
-before, whose pushes are up to 896 KiB (about 5.2 s at 200 ms) and need a
+at most `OUTBOX_BYTES_PER_MINUTE`, about 12 pushes of 128 KiB, 14 s of
+each minute at 200 ms, and is handed at most
+`PUSH_BYTES_PER_PEER_PER_MINUTE`. A message larger than a stream's window
+takes about one round trip for each 31.5 KiB: a message of 1 MiB fails
+STREAM_TIMEOUT past round trips of about 0.3 s (it was 1.2 s at a small
+message a stream). That falls on a device of the version before, whose
+pushes of up to 896 KiB fail on every try past about 0.33 s, and need a
 large permit, and on the older kind's fetch answers between relays not
-listed by key. Between relays listed by key a full page still takes
-0.24 s (rule 12, §13).
+listed by key, past about 0.29 s, after which the fetcher asks for fewer
+items (`SYNC_PAGE_STEPS`). Between relays listed by key a full page takes
+under a second (rule 12, §13).
 
 **If you raise them:** each connection can make a node hold more, and W
 grows (below). **If you raise the stream's alone:** the streams queued
@@ -311,9 +319,11 @@ windows by the test of it by memory
 gathers quinn's datagrams into GSO sends of 44, bulk on a stream the node
 reads and a byte at a time on its other streams, the node on a thread of
 its own whose heap alone is counted), at five pacings three times each,
-at 36 KiB a stream: 357 to 656 KiB with the option off, 2,238 to 3,292
+at 31.5 KiB a stream: 330 to 711 KiB with the option off, 1,828 to 3,022
 KiB with it on (at a small message a stream, 416 to 517 and 4,601 to
-6,627 KiB). The test holds a node under 1,200 KiB. A peer on a
+6,627 KiB). The test holds a node under 1,200 KiB, and says loudly that
+it checked nothing where its control with the option on stays under
+that. A peer on a
 stock quinn, which sends at most 10 datagrams a batch, showed no
 consistent gap between the two. So a
 node turns `UDP_GRO` off on its socket, after quinn wraps it, since the
@@ -2802,10 +2812,16 @@ keeps the windows and streams that every connection had before change F
 and 64 streams. A relay's passes on and its pulls from the relays it works
 with go a full page at a time (`ENTRY_PAGE_MAX_BYTES`, 896 KiB), and at
 the windows of every other peer (31.5 KiB on a stream, rule 8) a
-full page takes about 5.2 s at a round trip of 200 ms where it takes
-0.24 s (1.43 s at a small message a stream): a pull of ten full pages
-would take about 52 s, five times the 10 s between pulls, and catching up
-1 GiB after a restart about 100 minutes where it takes 4.7. The streams stay 64 for what runs at once between
+full page takes about 6.0 s at a round trip of 200 ms, and fails the
+stream timeout past about 0.33 s, where at these settings it takes about
+0.4 s (1.43 s at a small message a stream): a pull of ten full pages
+would take about 60 s, six times the 10 s between pulls, and catching up
+1 GiB after a restart about 117 minutes where it takes 4.7. **A listed
+relay whose connection lacks these settings** at this end (it arrived
+from another address than the one configured, behind a NAT) is given
+small pages (`Serving::listed_settings`); what it sends this node at full
+size, it cannot tell needs smaller, since quinn shows neither end the
+other's settings. The streams stay 64 for what runs at once between
 relays: a pass, a pull, the older kind's fetch, its repush and its push
 retries.
 
