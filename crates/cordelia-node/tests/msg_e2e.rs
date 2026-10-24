@@ -2792,14 +2792,13 @@ fn the_summarys_help_prints_the_hook_and_the_instructions_line_and_exits_0() {
 #[test]
 fn log_outside_a_terminal_shows_only_the_folders_agent() {
     let mut two = Two::new();
-    // With nothing to show, it asks nothing.
+    // With nothing to show, it says so in one line, and asks nothing.
     let at = two.desktop.at_terminal(&["msg", "log"]);
     let shown = at.done();
-    assert!(
-        shown.contains("No message was printed with what it says, so none is marked."),
-        "{shown}"
+    assert_eq!(
+        shown.replace("\r\n", "\n"),
+        format!("{FOR_A_PERSON}\nNo message of any agent is held on this device.\n")
     );
-    assert!(!shown.contains("Mark these"), "{shown}");
     let to_work = sent(
         &two.all(),
         &two.laptop,
@@ -2977,8 +2976,19 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
         "{}",
         err(&freed)
     );
+    // Of work's, only the new one is listed: the eleven a person read are
+    // counted.
+    let freed = out(&freed).split_whitespace().nth(1).unwrap().to_string();
     let printed = logged(laptop, "work");
-    assert!(printed.contains("Read by a person here."), "{printed}");
+    assert!(
+        block_of(&printed, &freed).contains("Not read by a person here."),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("\nYou have read 11 older messages here, so they are not shown.\n"),
+        "{printed}"
+    );
+    assert_eq!(printed.matches("\nThread ").count(), 1, "{printed}");
 }
 
 /// `log` at a terminal prints nine messages of a pair and asks; a tenth
@@ -3027,6 +3037,7 @@ fn a_message_that_arrives_during_logs_question_is_not_marked() {
     let messages = &status_of(&two.desktop)["messages"];
     assert_eq!(messages["unread_by_a_person"], 1, "{messages}");
 
+    // The tenth is listed, and the nine a person read are counted.
     let printed = logged(&two.desktop, "work");
     assert!(
         block_of(&printed, &tenth).contains("Not read by a person here."),
@@ -3034,10 +3045,14 @@ fn a_message_that_arrives_during_logs_question_is_not_marked() {
     );
     for id in &nine {
         assert!(
-            block_of(&printed, id).contains("Read by a person here."),
+            !printed.contains(&format!("\nMessage {id}")),
             "{id}: {printed}"
         );
     }
+    assert!(
+        printed.contains("\nYou have read 9 older messages here, so they are not shown.\n"),
+        "{printed}"
+    );
     let shown = out(&read(&two.desktop, "work", &tenth));
     assert!(
         shown.contains(
@@ -3192,7 +3207,16 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
         shown.contains("Marked 1 message as read by a person on this device."),
         "{shown}"
     );
-    assert!(block_of(&logged(desktop, "work"), &id).contains("Read by a person here."));
+    // A person has read it here: `log` lists it no more, and counts it.
+    let after = logged(desktop, "work");
+    assert!(!after.contains(&id), "{after}");
+    assert!(
+        after.contains(
+            "\nNo new message of the agent work is held on this device. You have read the older \
+             one here.\n"
+        ),
+        "{after}"
+    );
     assert!(out(&read(desktop, "work", &id)).contains(&header(0)));
     assert_eq!(unread_by_a_person(), 0);
     // A person's mark is the device's own: on laptop it is not read by a
@@ -3201,6 +3225,112 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
     assert!(
         block_of(&there, &id).contains("Not read by a person here."),
         "{there}"
+    );
+}
+
+/// `log` at a terminal shows, and asks about, only what no person has read
+/// on this device, and says in one line how many a person has; where
+/// nothing is new it says so in one line, asks nothing and exits 0; and
+/// its yes marks only what it showed: with `--since`, an older message it
+/// did not show stays unread (decision 2026-10-09 §4.1, §7.2).
+#[test]
+fn log_shows_and_marks_only_what_no_person_has_read_here() {
+    let (relay, laptop) = alone("laptop", &NAMES, "");
+    let all = [&relay, &laptop];
+    let to_work = |body: &str| sent(&all, &laptop, "notes", &["--to", "work"], body);
+    // Once the relay took each, no line says that one waits to be sent.
+    let nothing_waits = || {
+        wait_for("the relay takes each", &all, 120, || {
+            (status_of(&laptop)["messages"]["waiting"] == 0).then_some(())
+        })
+    };
+    // What `log` printed of bodies: each in a frame of two lines.
+    let frames = |shown: &str| shown.matches("----- [").count() / 2;
+    to_work("body one\n");
+    to_work("body two\n");
+    let shown = log_at_a_terminal(&laptop, 2, "yes");
+    assert!(
+        shown.ends_with("Marked 2 messages as read by a person on this device.\r\n"),
+        "{shown:?}"
+    );
+
+    // Nothing new: one line, no question, and it exits 0.
+    nothing_waits();
+    let mut at = laptop.at_terminal(&["msg", "log"]);
+    let heard = at.hears_for(Duration::from_secs(3)).to_string();
+    assert!(!heard.contains("Type yes"), "it asked: {heard}");
+    let (status, said) = at.ends_with_status_within(Duration::from_secs(60));
+    assert_eq!(status, Some(0), "{said}");
+    assert_eq!(
+        said.replace("\r\n", "\n"),
+        format!(
+            "{FOR_A_PERSON}\nNo new message of any agent is held on this device. You have read \
+             the 2 older ones here.\n"
+        )
+    );
+
+    // One new: it alone is shown and asked about, and the two are counted.
+    let three = to_work("body three\n");
+    nothing_waits();
+    let shown = log_at_a_terminal(&laptop, 1, "yes").replace("\r\n", "\n");
+    assert!(shown.contains(&format!("\nMessage {three}")), "{shown}");
+    assert!(shown.contains("\nbody three\n"), "{shown}");
+    assert!(
+        !shown.contains("body one") && !shown.contains("body two"),
+        "{shown}"
+    );
+    assert_eq!(frames(&shown), 1, "{shown}");
+    assert!(
+        shown.contains("\nYou have read 2 older messages here, so they are not shown.\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.ends_with("Marked 1 message as read by a person on this device.\n"),
+        "{shown}"
+    );
+
+    // With `--since`, its yes marks the one it showed, and not the older
+    // one it did not show.
+    let four = to_work("body four\n");
+    let unix = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let since = unix() + 2;
+    while unix() < since {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    to_work("body five\n");
+    nothing_waits();
+    let at = chrono::DateTime::from_timestamp(since, 0)
+        .unwrap()
+        .to_rfc3339();
+    let mut asks = laptop.at_terminal(&["msg", "log", "--since", &at]);
+    asks.says(
+        "Mark this message as read by a person on this device? Older messages are not shown \
+         here and stay unread, so a hold may stay.",
+    );
+    asks.says("Type yes to mark it: ");
+    asks.types("yes");
+    let shown = asks.done().replace("\r\n", "\n");
+    assert!(shown.contains("\nbody five\n"), "{shown}");
+    assert!(!shown.contains("body four"), "{shown}");
+    assert_eq!(frames(&shown), 1, "{shown}");
+    assert!(!shown.contains("You have read"), "{shown}");
+    assert!(
+        shown.ends_with("Marked 1 message as read by a person on this device.\n"),
+        "{shown}"
+    );
+    // The fourth is still unread, and is all that `log` shows now.
+    let shown = log_at_a_terminal(&laptop, 1, "no").replace("\r\n", "\n");
+    assert!(shown.contains(&format!("\nMessage {four}")), "{shown}");
+    assert!(shown.contains("\nbody four\n"), "{shown}");
+    assert_eq!(frames(&shown), 1, "{shown}");
+    assert!(
+        shown.contains("\nYou have read 4 older messages here, so they are not shown.\n"),
+        "{shown}"
     );
 }
 

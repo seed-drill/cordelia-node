@@ -473,11 +473,13 @@ enum MsgCommand {
     },
     /// For a person at a terminal
     ///
-    /// At a terminal it shows every message of every agent of yours that
-    /// this device holds, with on which devices an agent read it, and asks
-    /// whether to mark them read by a person here: that ends any hold
-    /// between the agents they are between. Anywhere else it shows only
-    /// the messages of this folder's agent, and marks nothing.
+    /// It shows only the messages you have not read here yet, and says how
+    /// many older ones you have read. At a terminal it shows those of every
+    /// agent of yours on this device, with on which devices an agent read
+    /// each, and asks whether to mark them read by a person here: that ends
+    /// any hold between the agents they are between. Where there is
+    /// nothing new, it says so and asks nothing. Anywhere else it shows
+    /// only those of this folder's agent, and marks nothing.
     Log {
         /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
         /// the last while (30m, 2h, 3d)
