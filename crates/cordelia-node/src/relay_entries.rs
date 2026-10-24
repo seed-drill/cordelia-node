@@ -1588,6 +1588,12 @@ impl RelayEntries {
             crate::p2p::Framed::Frame(frame, permit) => (frame, permit),
             crate::p2p::Framed::LargeLater => {
                 tracing::debug!(peer = %who.peer, ?protocol, "a request for entries over a small message, and no permit for now; refused");
+                // Counted as a request of its stream's first kind, of
+                // which its length alone was read, refused to be sent
+                // again later (decision 2026-10-22 §1.2).
+                let stream = protocol.counted_as(None);
+                self.count_read(stream, FRAME_LENGTH_BYTES);
+                self.count_answered(stream, Answered::LargeLater);
                 crate::p2p::refuse_large_later(send, recv);
                 return None;
             }
@@ -1600,12 +1606,18 @@ impl RelayEntries {
             Ok(request) => request,
             Err(e) => {
                 tracing::debug!(peer = %who.peer, error = %e, "a frame on a stream of entries that is no message");
-                self.count(protocol, None, &frame, Answered::Stray);
+                // Counted as a request of its stream's first kind.
+                let stream = protocol.counted_as(None);
+                self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());
+                self.count_answered(stream, Answered::Stray);
                 return Self::no_request(send, recv, &who, serving.rates, &frame);
             }
         };
-        // Counted as it is read, by its kind (decision 2026-10-22 §1.2).
+        // Counted as it is read, by its kind, with the bytes of its frame
+        // and its length (decision 2026-10-22 §1.2): before its answer is
+        // made, which may wait for the lock.
         let stream = protocol.counted_as(Some(&request));
+        self.count_read(stream, FRAME_LENGTH_BYTES + frame.len());
         // What a proof is checked against is this connection's own: the
         // value of its TLS session, and the key in the peer's certificate.
         let session = (protocol == Protocol::ChannelProve)
@@ -1627,7 +1639,11 @@ impl RelayEntries {
         // entries), nor of its frame, which a pull may pad to a message
         // with fields that are not read.
         drop(request);
-        self.count(protocol, stream, &frame, answer.counted());
+        // What became of it, where it is not answered; an answer is
+        // counted once it is written.
+        if !matches!(answer, Answer::Message(_)) {
+            self.count_answered(stream, answer.counted());
+        }
         let answer = match answer {
             Answer::Message(answer) => answer,
             Answer::Over(over) => {
@@ -1660,25 +1676,41 @@ impl RelayEntries {
         // what is held through it is the answer as it is written.
         let written = codec::encode_message(&answer);
         drop(answer);
-        if let Ok(written) = written
-            && codec::write_raw_frame(send, &written).await.is_ok()
-            && let Some(stream) = stream
-        {
-            self.counts
-                .wrote(stream, FRAME_LENGTH_BYTES + written.len());
+        // Answered once its answer is written, with the bytes of its frame;
+        // one whose answer could not be written was not served: nothing
+        // was said (decision 2026-10-22 §1.2).
+        let wrote = match written {
+            Ok(written) => codec::write_raw_frame(send, &written)
+                .await
+                .is_ok()
+                .then_some(written.len()),
+            Err(_) => None,
+        };
+        match (wrote, stream) {
+            (Some(bytes), Some(stream)) => {
+                self.counts.wrote(stream, FRAME_LENGTH_BYTES + bytes);
+                self.counts.answered(stream, Answered::Answered);
+            }
+            (None, stream) => self.count_answered(stream, Answered::NotServed),
+            (Some(_), None) => {}
         }
         None
     }
 
-    /// Count a request of `protocol` read in `frame`, of the kind
-    /// `stream` where it decoded as one and otherwise of its stream's
-    /// first kind, and what became of it (decision 2026-10-22 §1.2).
-    fn count(&self, protocol: Protocol, stream: Option<Stream>, frame: &[u8], answered: Answered) {
-        let Some(stream) = stream.or_else(|| protocol.counted_as(None)) else {
-            return;
-        };
-        self.counts.read(stream, FRAME_LENGTH_BYTES + frame.len());
-        self.counts.answered(stream, answered);
+    /// A request of `stream` was read, in `bytes` with its frame's length
+    /// (decision 2026-10-22 §1.2). Nothing is counted of a stream that is
+    /// not one of entries.
+    fn count_read(&self, stream: Option<Stream>, bytes: usize) {
+        if let Some(stream) = stream {
+            self.counts.read(stream, bytes);
+        }
+    }
+
+    /// What became of a request of `stream` (decision 2026-10-22 §1.2).
+    fn count_answered(&self, stream: Option<Stream>, answered: Answered) {
+        if let Some(stream) = stream {
+            self.counts.answered(stream, answered);
+        }
     }
 
     /// A frame that was read and is no request for its stream: bytes that
@@ -5844,6 +5876,143 @@ mod tests {
             moved(&before, &counts_of(&at)),
             read_as("pull", pull.len(), "not_now")
         );
+    }
+
+    /// A pull of channel 1, from its start, as its frame.
+    fn pull_frame() -> Vec<u8> {
+        codec::encode_message(&WireMessage::EntryPull(EntryPull {
+            channel: channel(1),
+            mark: relay::NO_MARK,
+            after: 0,
+            limit: 100,
+        }))
+        .unwrap()
+    }
+
+    /// A request is counted as it is read, with its bytes, before its
+    /// answer is made; what became of it, once it is (decision 2026-10-22
+    /// §1.2). While the lock is held, a pull waits for it: it is counted
+    /// read, and not yet answered; once the lock is let go, it is
+    /// answered.
+    #[test]
+    fn a_request_is_counted_as_it_is_read_before_its_answer_is_made() {
+        let at = relay();
+        let pull = pull_frame();
+        let read = "cordelia_requests_total{kind=\"pull\"}";
+        let answered = "cordelia_answers_total{kind=\"pull\",answer=\"answered\"}";
+        let before = counts_of(&at);
+        let held = at.db.lock().unwrap();
+        let back = std::thread::scope(|scope| {
+            let serving = scope.spawn(|| {
+                let mut proved = having_proved(&[1]);
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(served(&at, 1, Protocol::EntryPull, &mut proved, &pull))
+            });
+            let waited = Instant::now();
+            while counts_of(&at)[read] == before[read] {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "a request waiting for the lock was not counted as read"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(counts_of(&at)[answered], before[answered]);
+            drop(held);
+            serving.join().unwrap()
+        });
+        assert!(!back.is_empty());
+        let want = and_written(read_as("pull", pull.len(), "answered"), "pull", &back);
+        assert_eq!(moved(&before, &counts_of(&at)), want);
+    }
+
+    /// An answer that could not be written is no answer: its request is
+    /// counted as read and as not served, and no byte as written (decision
+    /// 2026-10-22 §1.2). The peer's end is gone before the relay writes.
+    #[tokio::test]
+    async fn a_request_whose_answer_could_not_be_written_is_not_served() {
+        let at = relay();
+        let pull = pull_frame();
+        let peer = peer(1);
+        let serving = Serving {
+            conn: None,
+            peer: &peer,
+            address: address(1),
+            db: &at.db,
+            rates: &at.rates,
+            permits: None,
+        };
+        let (mut relay_w, peer_r) = tokio::io::duplex(1 << 21);
+        drop(peer_r);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 21);
+        codec::write_raw_frame(&mut peer_w, &pull).await.unwrap();
+        drop(peer_w);
+        let before = counts_of(&at);
+        let mut proved = having_proved(&[1]);
+        let mut whole = ShownWhole::default();
+        let over = at
+            .entries
+            .serve(
+                Protocol::EntryPull,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                &mut proved,
+                &mut whole,
+            )
+            .await;
+        assert!(over.is_none());
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("pull", pull.len(), "not_served")
+        );
+    }
+
+    /// A request whose frame is longer than a small message, from a peer
+    /// that is not a listed relay, for which no large permit came within
+    /// STREAM_TIMEOUT_SECS, is counted: a request of its stream, of the
+    /// bytes of its length, which alone were read, refused to be sent
+    /// again later, and no breach (decision 2026-10-22 §1.2).
+    #[tokio::test(start_paused = true)]
+    async fn a_request_refused_at_its_length_for_want_of_a_permit_is_counted() {
+        let at = relay();
+        let permits = crate::p2p::LargePermits::new(0);
+        let peer = peer(1);
+        let serving = Serving {
+            conn: None,
+            peer: &peer,
+            address: address(1),
+            db: &at.db,
+            rates: &at.rates,
+            permits: Some(&permits),
+        };
+        let (mut relay_w, _peer_r) = tokio::io::duplex(1 << 16);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 16);
+        let length = (cordelia_core::protocol::SMALL_MESSAGE_BYTES + 1).to_be_bytes();
+        tokio::io::AsyncWriteExt::write_all(&mut peer_w, &length)
+            .await
+            .unwrap();
+        let before = counts_of(&at);
+        let mut whole = ShownWhole::default();
+        let over = at
+            .entries
+            .serve(
+                Protocol::EntryPush,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                &mut Proved::default(),
+                &mut whole,
+            )
+            .await;
+        assert!(over.is_none(), "no breach");
+        assert_eq!(
+            moved(&before, &counts_of(&at)),
+            read_as("push", 0, "large_later")
+        );
+        drop(peer_w);
     }
 
     /// The entries refused in an answer are counted for room and for the

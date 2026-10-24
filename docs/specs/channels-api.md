@@ -1007,11 +1007,15 @@ gauge is what it was when last set.
 - `cordelia_lock_nested_wait_microseconds{mutex="rates"|"room"}`: the waits
   for a relay's rates and room while the lock is held.
 - `cordelia_requests_total{kind}`, `cordelia_answers_total{kind,answer}`
-  (`answered`, `not_now`, `refused_for_rate`, `not_served`, `stray`),
+  (`answered`, once the answer is written; `not_now`, `refused_for_rate`,
+  `not_served`, `stray`, and `large_later`, a frame over a small message for
+  which no large permit came, of which only the length was read),
   `cordelia_entries_refused_total{kind,answer}` (`refused_for_room`,
-  `refused_for_new_channels`) and `cordelia_stream_bytes_total{kind,direction}`:
-  what a relay is asked on the streams of entries.
-- `cordelia_connections_open`, `cordelia_connections_closed_total`,
+  `refused_for_new_channels`, each entry refused in an answer given) and
+  `cordelia_stream_bytes_total{kind,direction}`: what a relay is asked on the
+  streams of entries. A request is counted as it is read, with its bytes in.
+- `cordelia_connections_open`, `cordelia_connections_closed_total` (gone for
+  any reason, warm churn's among them),
   `cordelia_connections_turned_away_total{why="bound"|"address"|"subnet"|"refused_for_a_time"}`
   and `cordelia_relay_link_closures_total{relay}`.
 - `cordelia_churns_total`, `cordelia_closed_by_warm_churn_total{peer="device"|"relay"}`

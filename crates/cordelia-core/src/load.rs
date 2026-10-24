@@ -208,7 +208,7 @@ impl Stream {
 /// §1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answered {
-    /// An answer was written.
+    /// An answer was written: counted once it is.
     Answered,
     /// It asked for more than the asker may be handed for now: refused,
     /// and no breach.
@@ -216,20 +216,28 @@ pub enum Answered {
     /// It was over the connection's or the address's count: refused, a
     /// breach.
     RefusedForRate,
-    /// It could not be served: nothing was said.
+    /// It could not be served, or its answer could not be written:
+    /// nothing was said.
     NotServed,
     /// It was no request for the stream it came on.
     Stray,
+    /// It was longer than a small message, from a peer that is not a
+    /// listed relay, and no large permit came for it within
+    /// STREAM_TIMEOUT_SECS: refused with ERR_LARGE_MESSAGE_LATER, to be
+    /// sent again, and no breach. Its frame was not read: the bytes in
+    /// counted for it are its length's.
+    LargeLater,
 }
 
 impl Answered {
     /// Every answer, in the order they are served.
-    pub const ALL: [Answered; 5] = [
+    pub const ALL: [Answered; 6] = [
         Answered::Answered,
         Answered::NotNow,
         Answered::RefusedForRate,
         Answered::NotServed,
         Answered::Stray,
+        Answered::LargeLater,
     ];
 
     /// Its name, as the route serves it.
@@ -240,6 +248,7 @@ impl Answered {
             Answered::RefusedForRate => "refused_for_rate",
             Answered::NotServed => "not_served",
             Answered::Stray => "stray",
+            Answered::LargeLater => "large_later",
         }
     }
 }
@@ -441,9 +450,9 @@ impl<const C: usize> ByRelay<C> {
 
 /// What a relay is asked on the streams of entries, by stream kind
 /// (decision 2026-10-22 §1.2): the requests, counted when each is read;
-/// what became of each; the entries it refused in the answers it gave,
-/// for room and for the allowance of new channels; and the bytes in and
-/// out, as each frame is read and written.
+/// what became of each, an answer once it is written; each entry it
+/// refused in the answers it gave, for room and for the allowance of new
+/// channels; and the bytes in and out, as each frame is read and written.
 #[derive(Debug, Default)]
 pub struct StreamCounts {
     requests: [AtomicU64; Stream::ALL.len()],
@@ -507,9 +516,11 @@ impl StreamCounts {
 const CLOSURES: usize = 0;
 
 /// A node's connections (decision 2026-10-22 §1.2): how many are open, as
-/// a gauge set each time one is made or goes; how many have gone; those it
-/// turned away, by why; and the closures of the link to each relay that
-/// it is set up with or lists by key.
+/// a gauge set each time one is made or goes; how many have gone, for any
+/// reason, those warm churn closed among them (the governor counts those
+/// apart, so the rest are the difference); those it turned away, by why;
+/// and the closures of the link to each relay that it is set up with or
+/// lists by key.
 #[derive(Debug, Default)]
 pub struct ConnectionCounts {
     open: AtomicU64,
@@ -898,7 +909,7 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
         &mut out,
         "cordelia_connections_closed_total",
         "counter",
-        "Connections gone, for any reason",
+        "Connections gone, for any reason, warm churn's among them",
     );
     let closed = connections.closed.load(Ordering::Relaxed);
     let _ = writeln!(out, "cordelia_connections_closed_total {closed}");
