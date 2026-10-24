@@ -1598,6 +1598,24 @@ const _: () = assert!(SHOW_ANSWER_ROOM_BYTES <= SMALL_MESSAGE_BYTES as u64);
 const _: () =
     assert!((CHANGE_ENTRY_BYTES + ENTRY_WIRE_OVERHEAD_BYTES) as u32 <= SMALL_MESSAGE_BYTES);
 
+/// How many entries a relay asks for in a page from a relay it lists by
+/// key, where its own end of their connection does not carry the listed
+/// settings (decision 2026-10-22 (memory), rule 12): 1. A receive window
+/// bounds what the other end may send, so the asker's end decides whether
+/// a full page crosses in time, and only the asker can see it: on every
+/// peer's windows a full page of 896 KiB fails the stream timeout past a
+/// round trip of about 0.33 s. Derived: as many entries of the largest
+/// size on the wire as a small page holds, so that the page asked for is
+/// never larger than a small page, whatever its entries' sizes.
+pub const SMALL_WINDOWS_PULL_ENTRIES: u32 = (SMALL_PAGE_BYTES / MAX_ENTRY_WIRE_BYTES) as u32;
+
+// Checked at compile time: a page asked for on every peer's windows holds
+// at least one entry, and its worst case fits a small page.
+const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES >= 1);
+const _: () =
+    assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES <= ENTRY_PAGE_MAX_ENTRIES);
+
 /// How many large messages a node reads at once, across all its
 /// connections (decision 2026-10-22 (memory) §2.1, rule 2): 4. A frame
 /// from an unlisted peer that is longer than a small message is read only
@@ -2549,6 +2567,15 @@ mod tests {
     #[test]
     fn at_most_four_push_retries_run_to_a_peer_at_once() {
         assert_eq!(PUSH_RETRY_STREAMS_AT_ONCE, 4);
+    }
+
+    /// A relay whose own end of a listed relay's connection does not carry
+    /// the listed settings asks for one entry a page, a small page at worst
+    /// (decision 2026-10-22 (memory), rule 12).
+    #[test]
+    fn a_relay_on_every_peers_windows_asks_for_one_entry_a_page() {
+        assert_eq!(SMALL_WINDOWS_PULL_ENTRIES, 1);
+        assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
     }
 
     /// Two small messages, as much as a peer may have unread on a
