@@ -151,12 +151,37 @@ connection's settings when the connection is made, so:
 
 The windows announced are the receiver's own. So a device that dials its
 relay by key may be sent full windows, while what it sends the relay is
-held to the relay's windows for an unlisted peer. A relay listed by key
-is sent full pages, and the older kind's full fetch answers, only on a
-connection that carries these settings at the sending end
-(`carries_listed_settings`), not by its key alone. A listed relay whose
-connection comes from another address than the one configured gets
-small pages.
+held to the relay's windows for an unlisted peer.
+
+**Pages between relays listed by key.** A receive window limits what the
+*other* end may send, and quinn shows neither end the other's settings,
+so the end that asks for a page bounds it:
+
+- **A relay serves every relay listed by key the full page it asks for**
+  (up to `ENTRY_PAGE_MAX_BYTES`, 896 KiB). It does so by the key in the
+  peer's certificate, whatever the settings of the connection. The same
+  holds for the older kind's full fetch answers.
+- **A relay asks a listed relay for `SMALL_WINDOWS_PULL_ENTRIES` (1)
+  entry a page** where its own end of their connection does not carry the
+  listed settings (`carries_listed_settings`). That happens when the
+  listed relay's connection arrives from another address than the one
+  configured, for example behind a NAT that changes its port. Such a page
+  is at most one entry of the largest size, 65,773 bytes on the wire,
+  within a small page. A full page across every peer's windows takes about
+  6.0 s at a round trip of 200 ms and fails the stream timeout past about
+  0.33 s. A page of one entry of the largest size takes about 0.73 s at
+  200 ms, so a pass of ten such pages fits the 10 s between pulls.
+- **Entries passed on to a listed relay go a small page to a message**
+  (`to_pass_on`, at most `SMALL_PAGE_BYTES` of entries), since the pusher
+  cannot see the other end's windows.
+- **The older kind's fetch between relays** asks for fewer items after an
+  answer it could not read (`SYNC_PAGE_STEPS`). An item's header carries
+  no size, so a request cannot be fitted to the windows beforehand.
+
+Where a relay's NAT keeps the port (a static or one-to-one NAT), its
+operator should configure it at the relays it works with at the public
+address it dials from: it then gets the listed settings at both ends and
+full pages both ways. A relay dials from the port it listens on.
 
 **What each exchange takes at a round trip of 200, 300 and 400 ms,** at
 these windows. These are the decision record's §2.3 figures, measured
@@ -2268,7 +2293,7 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 | an entry of a channel from its secret | A content that is a power of two from 256 bytes to 64 KB, and 237 bytes beside it | Whoever writes it, each relay, the device that receives it (§4.9, data-formats.md §9.2) |
 | a text and its name in such an entry | 60 KB together (`MAX_ENTRY_NAME_AND_VALUE_BYTES`) | The device that writes it; one that is over is no version to a device that reads it |
-| a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) to a relay listed by key, on a connection that carries the listed settings (§2.1) | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push. A page that stops at its bytes says there is more, and its reader reads on |
+| a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) to a relay listed by key, served by its key; a listed relay asks for 1 entry a page (`SMALL_WINDOWS_PULL_ENTRIES`) where its own end of the connection lacks the listed settings (§2.1); entries passed on to a listed relay go `SMALL_PAGE_BYTES` to a message | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push; the entries a page holds, the asker. A page that stops at its bytes says there is more, and its reader reads on |
 | a small message (`SMALL_MESSAGE_BYTES`) | 144 KiB (147,456): a small page and 16 KiB | Every message a device of alpha.16 sends or is sent fits one. A node reads a longer frame from a peer that is not a relay listed by key only under a large permit (below) |
 
 Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
@@ -2323,7 +2348,9 @@ The QUIC application error codes a node closes a connection or resets a stream w
 - **At round trips above about 0.3 s, its large messages fail the stream timeout** (§2.1's table).
   - Its pushes of up to 896 KiB to a relay of alpha.16 take about 6.0 s at 200 ms, 9.0 s at 300 ms and 12.0 s at 400 ms. They fail on every try past about 0.33 s, so its outbox does not drain at that relay over such a link.
   - An older kind's fetch answer of 1 MiB between relays not listed by key takes 6.85 s at 200 ms, 10.2 s at 300 ms and 13.6 s at 400 ms. It fails past about 0.29 s, and the fetcher then asks for fewer items (`SYNC_PAGE_STEPS`).
-  - A node of alpha.16 does not meet this. Its pushes and pages are small messages: a push of 128 KiB fails only past about 1.7 s. Between relays listed by key, which keep the windows from before, a full page fails only past about 4.9 s. A relay of those versions retries the older kind's pushes one stream for each item, and against a relay of alpha.16 that does not list it by key, most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1).
+  - A node of alpha.16 does not meet this. Its pushes and pages are small messages: a push of 128 KiB fails only past about 1.7 s. Between relays listed by key, which keep the windows from before, a full page fails only past about 4.9 s.
+  - **What to do.** A person whose device runs alpha.15 or alpha.14 over a link of more than about 0.33 s should upgrade the device. An operator whose relays carry the older kind between them without listing each other by key should list them by key (each relay's key in the other's configuration), so that they keep the windows from before (§2.1).
+- **8 streams, against a relay of alpha.16 that does not list it by key.** A relay of those versions retries the older kind's pushes one stream for each item, and most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1), so listing them by key removes this as well.
 - **Small pages.** A page from a relay of alpha.16 holds at most 128 KiB of entries and says there is more. Those versions read on from such a page as from any other, except `cordelia accept`, which reads one page of the pair channel. Where an entry of the largest size comes before the typed key's hand-over, an older device does not find the hand-over. The device being added runs alpha.16, and it reads on.
 
 ---
