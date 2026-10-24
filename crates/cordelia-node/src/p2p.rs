@@ -12957,6 +12957,34 @@ mod tests {
         peer.abort();
     }
 
+    /// Decision 2026-10-22 (memory), rule 12. The keys listed at an
+    /// address are those of the relays configured by key at that address
+    /// and port; an IPv4 address that a dual-stack socket shows mapped into
+    /// IPv6 is the same address. Another port, and a relay configured by
+    /// address alone, list nothing.
+    #[test]
+    fn a_listed_relays_address_is_found_when_shown_mapped_into_ipv6() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let at = |addr: &str, key: Option<[u8; 32]>| RelayAddr {
+            host: "relay.test:9474".into(),
+            addr: addr.parse().unwrap(),
+            key,
+        };
+        let relays = [
+            at("192.0.2.7:9474", Some([7; 32])),
+            at("192.0.2.8:9474", None),
+        ];
+        let from = |addr: &str| keys_listed_at(&relays, addr.parse().unwrap());
+        assert_eq!(from("192.0.2.7:9474"), vec![[7; 32]]);
+        assert_eq!(
+            from("[::ffff:192.0.2.7]:9474"),
+            vec![[7; 32]],
+            "a listed relay's address shown mapped into IPv6 was not found"
+        );
+        assert!(from("192.0.2.7:9475").is_empty());
+        assert!(from("[::ffff:192.0.2.8]:9474").is_empty());
+    }
+
     /// What the end at `writer` may send the other end of its connection,
     /// which reads nothing: the bytes one stream takes, and how many
     /// streams it may have open at once, `held` of them before this.
