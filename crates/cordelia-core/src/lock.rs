@@ -549,7 +549,15 @@ mod tests {
     /// 1% of the median hold that §1.4 measured
     /// (LOCK_TIMING_COST_MAX_NANOS), so every take is timed and none is
     /// sampled. It prints both, for the record.
+    ///
+    /// Not under coverage (CI's coverage job builds with `--cfg
+    /// coverage`): there a counter of coverage is added to each branch of
+    /// what it times, and the cost measured is theirs.
     #[test]
+    #[cfg_attr(
+        coverage,
+        ignore = "under coverage, its counters are in what it measures"
+    )]
     fn timing_a_take_costs_under_one_hundredth_of_the_median_hold() {
         let timed = TimedLock::new(0u64);
         let plain = Mutex::new(0u64);

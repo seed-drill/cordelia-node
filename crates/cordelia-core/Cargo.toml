@@ -17,3 +17,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints.rust]
+# CI's coverage job builds with `--cfg coverage` (ci.yml), which leaves out
+# the test of what timing a take of the node's lock costs (lock.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
