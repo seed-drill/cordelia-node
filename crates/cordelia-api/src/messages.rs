@@ -24,9 +24,10 @@
 //! - **`send`** ([`send_of`]) gives [`sender::send`] what it needs, and the
 //!   lookup of the message a reply answers ([`answering`]), which it calls
 //!   at step 9.
-//! - **`log`** ([`log_of`]) gives places, lists every thread of the
-//!   folder's agent, or of every name, with what is counted of each signer
-//!   and of the device's own messages, and marks read by a person what the
+//! - **`log`** ([`log_of`]) gives places, lists the messages of the
+//!   folder's agent, or of every name, that no person has read here, and
+//!   counts those a person has, with what is counted of each signer and of
+//!   the device's own messages, and marks read by a person what the
 //!   command printed, after a yes: the one act that ends a hold (§6, §7.2).
 //!
 //! **Text that another device chose** is cleaned by one function
@@ -1213,8 +1214,6 @@ pub struct Said {
     pub read_on: Vec<String>,
     /// This device's own table says that an agent here read it.
     pub read_here: bool,
-    /// A person here has read it.
-    pub read_by_a_person: bool,
 }
 
 /// What `log` counts of one signer, across the generations the device
@@ -1236,8 +1235,12 @@ pub struct Log {
     /// The folder's agent, or `None` where every name is listed.
     pub name: Option<String>,
     /// Each thread, newest first by the shown time of its newest message,
-    /// with its messages oldest first.
+    /// with its messages oldest first: only the messages that no person
+    /// has read here.
     pub threads: Vec<(Id, Vec<Logged>)>,
+    /// How many messages it would list but that a person here has read:
+    /// they are not listed (decision 2026-10-09 §4.1).
+    pub already_read: usize,
     /// What is counted of each signer that has anything counted, in order
     /// of key.
     pub signers: Vec<Counted>,
@@ -1291,14 +1294,16 @@ fn every_name(conn: &Connection) -> Result<Vec<String>, PersonError> {
 /// Places are given first, as at every show.
 ///
 /// It lists every message of the folder's agent, or of every name where
-/// none is given: those addressed to its name or to every name, and those
-/// it sent here, as `read` reaches them; a message whose signer no longer
-/// counts among them, which `log` alone lists. A message held back by the
-/// reader's hour is listed without what it says, and so, where a folder is
-/// given, is one whose signer no longer counts. Whether an agent read a
-/// message is worked out now, from the device's own table and the latest
-/// list of each device that counts, so a device that lies in its list
-/// hides nothing from `log`.
+/// none is given, that no person has read here: those addressed to its
+/// name or to every name, and those it sent here, as `read` reaches them;
+/// a message whose signer no longer counts among them, which `log` alone
+/// lists. One that a person here has read is not listed, and is counted
+/// in `already_read`. A message held back by the reader's hour is listed
+/// without what it says, and so, where a folder is given, is one whose
+/// signer no longer counts. Whether an agent read a message is worked out
+/// now, from the device's own table and the latest list of each device
+/// that counts, so a device that lies in its list hides nothing from
+/// `log`.
 ///
 /// **Where `mark` is not empty,** each message whose ID is in it and that
 /// it lists with a place is marked read by a person here, and no other:
@@ -1360,6 +1365,7 @@ fn log_in(
     let mut listed = Vec::new();
     let shown = kept(held::shown(conn, now))?;
     let mut marked = 0;
+    let mut already_read = 0;
     for message in &shown {
         if !of_the_agent(&message.signer, &message.from, message.to.as_deref()) {
             continue;
@@ -1370,6 +1376,11 @@ fn log_in(
             marked += 1;
         }
         if asked.since.is_some_and(|since| message.shown_at < since) {
+            continue;
+        }
+        // What a person here has read is counted, and not listed again.
+        if kept(held::is_read_by_a_person(conn, &id))? {
+            already_read += 1;
             continue;
         }
         // Away from a terminal, nothing that such a signer wrote.
@@ -1424,7 +1435,6 @@ fn log_in(
                 body: message.body.clone(),
                 read_on: labels,
                 read_here,
-                read_by_a_person: kept(held::is_read_by_a_person(conn, &id))?,
             }),
             &own,
             &counting,
@@ -1535,6 +1545,7 @@ fn log_in(
     Ok(Log {
         name,
         threads,
+        already_read,
         signers,
         waiting,
         room,
@@ -1638,7 +1649,6 @@ impl Log {
                             said["body"] = json!(shown.body);
                             said["read_on"] = json!(shown.read_on);
                             said["read_here"] = json!(shown.read_here);
-                            said["read_by_a_person"] = json!(shown.read_by_a_person);
                         }
                         said
                     })
@@ -1666,6 +1676,7 @@ impl Log {
         json!({
             "name": self.name,
             "threads": threads,
+            "already_read": self.already_read,
             "signers": signers,
             "waiting": ids(&self.waiting),
             "refused_for_room": ids(&self.room.refused),
@@ -3004,7 +3015,8 @@ mod tests {
         let to_plans = sent(&s, 0, &asking("notes", Some("plans"), "plans"), t + 3);
         s.pass(0, 1);
         let now = s.now + MINUTE;
-        let unread = |log: &Log, id: &Id| !logged(log, id).said.as_ref().unwrap().read_by_a_person;
+        // What a person has not read here is listed, and nothing else.
+        let unread = |log: &Log, id: &Id| logged_ids(log).contains(id);
         let first = log_on(&s, 1, None, &[], now).unwrap();
         assert_eq!(first.marked, 0);
         assert!(ids.iter().all(|id| unread(&first, id)));
@@ -3022,10 +3034,10 @@ mod tests {
         let after = log_on(&s, 1, None, &[], now).unwrap();
         assert!(!unread(&after, &ids[0]) && !unread(&after, &ids[1]));
         assert!(unread(&after, &ids[2]) && unread(&after, &to_plans));
+        assert_eq!(after.already_read, 2);
         assert!(held::is_read_by_a_person(&s[1].conn, &ids[0]).unwrap());
         assert!(!held::is_read_by_a_person(&s[1].conn, &not_held).unwrap());
         // Only a person's mark: no agent read them.
-        assert!(!logged(&after, &ids[0]).said.as_ref().unwrap().read_here);
         assert_eq!(summary_on(&s, 1, "work", now).unwrap().lines.len(), 3);
         // The pair counts what is left.
         let pairs = held::pairs_with(&s[1].conn, "work", now).unwrap();
@@ -3037,6 +3049,64 @@ mod tests {
             held::pairs_with(&s[1].conn, "plans", now).unwrap(),
             Vec::<(held::Other, u64)>::new()
         );
+    }
+
+    /// `log` lists only the messages that no person has read here, and
+    /// counts the others, of every name, of a folder's agent and since a
+    /// time; where a person has read them all it lists none (decision
+    /// 2026-10-09 §4.1).
+    #[test]
+    fn log_lists_only_what_no_person_has_read_here_and_counts_the_rest() {
+        let mut s = devices(2);
+        // Sent before they are held, so each is shown from its `sent`.
+        let t = s.now - 10 * MINUTE;
+        let old = sent(&s, 0, &asking("notes", Some("work"), "old"), t);
+        let old_to_plans = sent(
+            &s,
+            0,
+            &asking("notes", Some("plans"), "old to plans"),
+            t + 1,
+        );
+        let new = sent(&s, 0, &asking("notes", Some("work"), "new"), t + 2);
+        s.pass(0, 1);
+        let now = s.now + MINUTE;
+        let first = log_on(&s, 1, None, &[], now).unwrap();
+        assert_eq!((logged_ids(&first).len(), first.already_read), (3, 0));
+
+        // A person here reads the two older ones.
+        assert_eq!(
+            log_on(&s, 1, None, &[old, old_to_plans], now)
+                .unwrap()
+                .marked,
+            2
+        );
+        let every = log_on(&s, 1, None, &[], now).unwrap();
+        assert_eq!((logged_ids(&every), every.already_read), (vec![new], 2));
+        assert_eq!(every.printed(), [new]);
+        let answered = every.answered();
+        assert_eq!(answered["already_read"], 2);
+        assert_eq!(answered["threads"].as_array().unwrap().len(), 1);
+        assert!(!answered.to_string().contains("old to plans"));
+        // Of a folder's agent, only what is its own is counted.
+        let work = log_on(&s, 1, Some("work"), &[], now).unwrap();
+        assert_eq!((logged_ids(&work), work.already_read), (vec![new], 1));
+        let plans = log_on(&s, 1, Some("plans"), &[], now).unwrap();
+        assert_eq!((logged_ids(&plans), plans.already_read), (vec![], 1));
+        // Since a time, only what was shown since it.
+        let asked = LogAsked {
+            folder: None,
+            since: Some(t + 1),
+            mark: &[],
+        };
+        let since = log_of(&s[1].conn, &s[1].identity, &asked, now, |_| false).unwrap();
+        assert_eq!((logged_ids(&since), since.already_read), (vec![new], 1));
+
+        // A person here has read them all: none is listed.
+        log_on(&s, 1, None, &[new], now).unwrap();
+        let none = log_on(&s, 1, None, &[], now).unwrap();
+        assert!(none.threads.is_empty() && none.printed().is_empty());
+        assert_eq!(none.already_read, 3);
+        assert_eq!(none.answered()["threads"], json!([]));
     }
 
     /// After the threads `log` says, of the device's own messages, which
@@ -3252,6 +3322,12 @@ mod tests {
             assert!(answered.get(field).is_none(), "{field}: {answered}");
         }
         assert!(!away.answered().to_string().contains(&body));
+        // Once a person here has read it, it is listed there no more, and
+        // is counted.
+        assert_eq!(log_on(&s, 1, None, &[gone], t + 1).unwrap().marked, 1);
+        let read = log_on(&s, 1, Some("work"), &[], t + 1).unwrap();
+        assert!(!logged_ids(&read).contains(&gone));
+        assert_eq!(read.already_read, 1);
         let answered = log.answered();
         let first = &answered["threads"][0]["messages"][0];
         assert_eq!(first["held_back"], true);
@@ -3826,6 +3902,7 @@ mod tests {
     /// is given, and refuses, before anything, a `since` that is no time
     /// and an ID to mark that is not whole; in a folder that is not mapped
     /// it is refused with `not_mapped` (decision 2026-10-09 §4.2, §4.3).
+    /// What it marked it lists no more, and counts.
     #[actix_web::test]
     async fn the_log_route_lists_marks_and_refuses_what_is_not_asked_rightly() {
         let (state, id) = a_node_with_a_message();
@@ -3834,12 +3911,24 @@ mod tests {
         assert_eq!(status, 200, "{said}");
         assert_eq!(said["name"], "work");
         assert_eq!(said["threads"][0]["messages"][0]["id"], hex::encode(id));
-        assert_eq!(said["threads"][0]["messages"][0]["read_by_a_person"], false);
-        assert_eq!(said["marked"], 0);
+        assert_eq!(
+            (&said["marked"], &said["already_read"]),
+            (&json!(0), &json!(0))
+        );
+        let since = web::Json(LogRequest {
+            folder: None,
+            since: Some("2999-01-01T00:00:00Z".into()),
+            mark: vec![],
+        });
+        let (status, said) = answer(log(asked(), state.clone(), since).await).await;
+        assert_eq!(status, 200);
+        assert_eq!(said["threads"], json!([]));
+        assert_eq!(said["already_read"], 0);
         let (status, said) =
             answer(log(asked(), state.clone(), log_asked(None, &[id])).await).await;
         assert_eq!((status, &said["marked"]), (200, &json!(1)));
-        assert_eq!(said["threads"][0]["messages"][0]["read_by_a_person"], true);
+        assert_eq!(said["threads"], json!([]));
+        assert_eq!(said["already_read"], 1);
         for (since, mark) in [
             (Some("yesterday".to_string()), vec![]),
             (None, vec!["0123456789abcdef".to_string()]),
@@ -3853,14 +3942,6 @@ mod tests {
             let (status, _) = answer(log(asked(), state.clone(), asked_badly).await).await;
             assert_eq!(status, 400);
         }
-        let since = web::Json(LogRequest {
-            folder: None,
-            since: Some("2999-01-01T00:00:00Z".into()),
-            mark: vec![],
-        });
-        let (status, said) = answer(log(asked(), state.clone(), since).await).await;
-        assert_eq!(status, 200);
-        assert_eq!(said["threads"], json!([]));
         let unmapped = web::Json(LogRequest {
             folder: Some("/nowhere".into()),
             since: None,
@@ -3892,7 +3973,7 @@ mod tests {
             answer(log(asked(), state.clone(), log_asked(None, &many)).await).await;
         assert_eq!((status, &said["marked"]), (200, &json!(0)), "{said}");
         assert_eq!(said["threads"][0]["messages"][0]["id"], hex::encode(id));
-        assert_eq!(said["threads"][0]["messages"][0]["read_by_a_person"], false);
+        assert_eq!(said["already_read"], 0);
         assert!(!held::is_read_by_a_person(&state.db.lock().unwrap(), &id).unwrap());
     }
 
