@@ -6227,12 +6227,12 @@ mod tests {
         let taken = serde_json::json!({
             "folder": format!("{claude}/-x-src-cn"), "cwd": format!("{home}/src/cn"),
             "name": "github.com/o/cn", "mappable": true, "needs_name": true,
-            "says": "another copy of github.com/o/cn, which syncs from /x/Work/cn: to sync this one too, give it its own name",
+            "says": "github.com/o/cn already syncs from ~/Work/cn: give this one its own name, or unmap ~/Work/cn first",
         });
         assert_eq!(
             row(taken)[1..],
             [
-                "another copy of github.com/o/cn, which syncs from /x/Work/cn: to sync this one too, give it its own name",
+                "github.com/o/cn already syncs from ~/Work/cn: give this one its own name, or unmap ~/Work/cn first",
                 "cordelia sync map ~/src/cn <name>"
             ]
         );
@@ -6684,7 +6684,7 @@ mod tests {
             // Needs a name: another folder is mapped under its own.
             { "folder": folder("-x-src-cn"), "cwd": format!("{home}/src/cn"),
               "name": "github.com/o/two", "mappable": true, "needs_name": true,
-              "says": "another copy of github.com/o/two, which syncs from /x/two: to sync this one too, give it its own name" },
+              "says": "github.com/o/two already syncs from ~/two: give this one its own name, or unmap ~/two first" },
             // The home directory's own folder, as `~` and under a name.
             { "folder": folder("-x"), "cwd": home, "name": "~", "mappable": true, "home": true },
             // A tree laid out by hand.
@@ -6718,7 +6718,7 @@ mod tests {
             ],
             vec![
                 "~/src/cn",
-                "another copy of github.com/o/two, which syncs from /x/two: to sync this one too, give it its own name",
+                "github.com/o/two already syncs from ~/two: give this one its own name, or unmap ~/two first",
                 "cordelia sync map ~/src/cn <name>",
             ],
             vec!["~", "synced as home memory", "cordelia sync map ~ --home"],

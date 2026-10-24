@@ -1519,46 +1519,61 @@ fn what_is_found_says_whether_map_would_sync_it() {
     // that the first is mapped under, so it needs a name of its own.
     let second = a.clone_at("src/cn");
     std::fs::write(a.claude_folder(&second).join("notes.md"), "own\n").unwrap();
-    // A third, with a session and no memory, and a fourth whose memory
-    // folder is empty: nothing to sync apart, so neither is listed (#207).
+    // A third, with a session and no memory; a fourth whose memory folder
+    // is empty; and a fifth whose memory holds only a dotfile and a
+    // folder, which a cycle does not carry: nothing to sync apart, and the
+    // name syncs here already, so none is listed (#207).
     let third = a.clone_at("src/cn3");
     a.session_in(&third);
     let fourth = a.clone_at("src/cn4");
     a.claude_folder(&fourth);
-    // A project of its own, under its remote's name.
+    let fifth = a.clone_at("src/cn5");
+    let fifth_memory = a.claude_folder(&fifth);
+    std::fs::write(fifth_memory.join(".DS_Store"), "\0").unwrap();
+    std::fs::create_dir(fifth_memory.join("kept")).unwrap();
+    // A project of its own, under its remote's name, with a session and no
+    // memory: listed, for mapped it gets what the other devices sync.
     let other = a.clone_of("Work/other", "git@github.com:seed-drill/other.git");
     a.session_in(&other);
     // A folder that is no git project: under a name that is given.
     let notes = a.plain_dir("notes");
-    a.claude_folder(&notes);
+    let with_a_file = |memory: PathBuf| std::fs::write(memory.join("a.md"), "a\n").unwrap();
+    with_a_file(a.claude_folder(&notes));
     // The home directory's own folder.
     a.home_memory();
     // A directory outside the home directory.
     let outside = a.home.parent().unwrap().join("elsewhere/app");
     std::fs::create_dir_all(&outside).unwrap();
-    a.claude_folder(&outside);
+    with_a_file(a.claude_folder(&outside));
+    // And one with an empty memory folder: it cannot be mapped, and has
+    // nothing to sync, so it is not listed.
+    let outside_empty = a.home.parent().unwrap().join("elsewhere/empty");
+    std::fs::create_dir_all(&outside_empty).unwrap();
+    a.claude_folder(&outside_empty);
     // A directory that is gone.
     let gone = a.home.join("was-here");
-    a.claude_folder(&gone);
+    with_a_file(a.claude_folder(&gone));
     // And one where a file is now: the path is there, and is no
     // directory.
     let a_file = a.home.join("now-a-file");
     std::fs::write(&a_file, "no directory\n").unwrap();
-    a.claude_folder(&a_file);
+    with_a_file(a.claude_folder(&a_file));
     // A folder with memory and no transcript: no directory is known.
     let unknown = a.home.join(".claude/projects/-home-nobody-knows");
     std::fs::create_dir_all(unknown.join("memory")).unwrap();
+    with_a_file(unknown.join("memory"));
     // A directory that a session recorded through a link: `map` takes a
     // directory by its real path, and would sync the folder of that.
     let real = a.plain_dir("kept/real");
     let link = a.home.join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    a.claude_folder(&link);
+    with_a_file(a.claude_folder(&link));
     // Two folders laid out by hand: one whose transcript records the
     // home directory, and one that records the mapped repository.
     let by_hand = |name: &str, records: &Path| {
         let folder = a.home.join(".claude/projects").join(name);
         std::fs::create_dir_all(folder.join("memory")).unwrap();
+        with_a_file(folder.join("memory"));
         let line = format!("{{\"cwd\":{:?}}}\n", shown(records));
         std::fs::write(folder.join("scope.jsonl"), line).unwrap();
         folder
@@ -1594,12 +1609,11 @@ fn what_is_found_says_whether_map_would_sync_it() {
     assert_eq!(
         clone.says,
         Some(format!(
-            "another copy of {PROJECT}, which syncs from {}: to sync this one too, give it its \
-             own name",
-            shown(&repo)
+            "{PROJECT} already syncs from ~/Work/cordelia-node: give this one its own name, or \
+             unmap ~/Work/cordelia-node first"
         ))
     );
-    for empty in [&third, &fourth] {
+    for empty in [&third, &fourth, &fifth, &outside_empty] {
         let of = shown(&a.folder_of(empty));
         assert!(
             !report.unmapped.iter().any(|entry| entry.folder == of),
@@ -1653,8 +1667,44 @@ fn what_is_found_says_whether_map_would_sync_it() {
         let found = report.unmapped.iter().find(|entry| entry.folder == of);
         found.and_then(|entry| entry.why_not)
     };
-    assert_eq!(of(&a.folder_of(&other)), Some("home_not_set"));
+    assert_eq!(of(&a.folder_of(&notes)), Some("home_not_set"));
     assert_eq!(of(&tree_of_repo), Some("laid_out_by_hand"));
+    // One with no memory is not listed: it cannot be mapped now.
+    let other_folder = shown(&a.folder_of(&other));
+    assert!(
+        report
+            .unmapped
+            .iter()
+            .all(|entry| entry.folder != other_folder)
+    );
+}
+
+/// A checkout that was moved, or cloned again elsewhere, after its first
+/// place was mapped: the new place has a session and no memory yet, and
+/// the folder mapped under its name is gone. It is listed, and says so
+/// (#207).
+#[test]
+fn a_checkout_whose_mapped_place_is_gone_is_listed() {
+    let mut a = Device::new().with_phrase().sync_on();
+    let first = a.clone_at("Work/cn");
+    a.claude_folder(&first);
+    map(&a, &first, PROJECT);
+    std::fs::remove_dir_all(&first).unwrap();
+    let moved = a.clone_at("src/cn");
+    a.session_in(&moved);
+
+    let report = a.cycle();
+    let of = a.folder_of(&moved).display().to_string();
+    let found = report.unmapped.iter().find(|entry| entry.folder == of);
+    let found = found.unwrap_or_else(|| panic!("{of} is not listed: {:?}", report.unmapped));
+    assert!(found.mappable && found.needs_name, "{found:?}");
+    assert_eq!(
+        found.says,
+        Some(format!(
+            "{PROJECT} is mapped from ~/Work/cn, which is gone: unmap it first, or give this one \
+             its own name"
+        ))
+    );
 }
 
 #[test]

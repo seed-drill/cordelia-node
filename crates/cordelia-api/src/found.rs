@@ -463,13 +463,15 @@ pub enum WhyAName {
     HasNone,
     /// The name it has is not one that a folder can be mapped under.
     NotUsable,
-    /// Another folder is mapped under the name it has: it is another
-    /// copy of a repository whose memory syncs from that folder.
+    /// Another folder is mapped under the name it has.
     Taken {
         /// The name, as `map` would send it.
         name: String,
         /// The folder that is mapped under it.
         folder: String,
+        /// Whether that folder is there: one that is gone may be this
+        /// one, moved.
+        there: bool,
     },
 }
 
@@ -558,16 +560,39 @@ impl WhyNot {
 }
 
 impl WhyAName {
-    /// Why a name is needed, in words.
-    pub fn says(&self) -> String {
+    /// Why a name is needed, in words, with a folder under `home` shown
+    /// from `~`.
+    pub fn says(&self, home: Option<&Path>) -> String {
         match self {
             WhyAName::HasNone => "needs a name (not a git project)".into(),
             WhyAName::NotUsable => "needs a name (the one it has cannot be mapped)".into(),
-            WhyAName::Taken { name, folder } => format!(
-                "another copy of {name}, which syncs from {folder}: to sync this one too, \
-                 give it its own name"
-            ),
+            WhyAName::Taken {
+                name,
+                folder,
+                there,
+            } => {
+                let folder = from_home(Path::new(folder), home);
+                match there {
+                    true => format!(
+                        "{name} already syncs from {folder}: give this one its own name, or \
+                         unmap {folder} first"
+                    ),
+                    false => format!(
+                        "{name} is mapped from {folder}, which is gone: unmap it first, or give \
+                         this one its own name"
+                    ),
+                }
+            }
         }
+    }
+}
+
+/// `path` as a person reads it: from `~` where it is under `home`.
+fn from_home(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -667,6 +692,7 @@ pub fn would_map(asked: &Asked, against: &Against, machine: &dyn Machine) -> Map
         return Maps::Yes(How::UnderAName(WhyAName::Taken {
             name,
             folder: mapped.folder.clone(),
+            there: machine.is_dir(Path::new(&mapped.folder)),
         }));
     }
     Maps::Yes(How::UnderItsName)
@@ -678,8 +704,10 @@ const HOME_NAME: &str = "~";
 // ── An entry, as a status carries it ─────────────────────────────────
 
 /// A folder that was found and is not mapped, as a status carries it:
-/// the adapter's report lists one for each folder it found, and the
-/// node's status one for each folder that a notice names.
+/// the adapter's report lists one for each folder it found that it lists
+/// (one whose memory holds no file is listed only where mapping it would
+/// bring memory in), and the node's status one for each folder that a
+/// notice names.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Entry {
     /// Claude Code's folder for it.
@@ -744,7 +772,7 @@ impl Entry {
                     How::Home => entry.home = true,
                     How::UnderAName(why) => {
                         entry.needs_name = true;
-                        entry.says = Some(why.says());
+                        entry.says = Some(why.says(against.home));
                     }
                 }
             }
@@ -1528,7 +1556,62 @@ mod tests {
             Maps::Yes(How::UnderAName(WhyAName::Taken {
                 name: "github.com/o/cn".into(),
                 folder: "/home/sam/Work/cn".into(),
+                there: true,
             }))
+        );
+    }
+
+    /// A name that another folder is mapped under: whether that folder is
+    /// there, and the words for each, with a folder under the home
+    /// directory shown from `~`.
+    #[test]
+    fn test_a_name_mapped_from_another_folder_says_whether_that_folder_is_there() {
+        let mapped = [mapping("/home/sam/Work/cn", "github.com/o/cn")];
+        let Maps::Yes(How::UnderAName(there)) =
+            asks_of("/home/sam/src/cn", Some("github.com/o/cn"), &mapped)
+        else {
+            panic!("not a name taken");
+        };
+        assert_eq!(
+            there.says(Some(Path::new(HOME))),
+            "github.com/o/cn already syncs from ~/Work/cn: give this one its own name, or unmap \
+             ~/Work/cn first"
+        );
+        let gone = Said {
+            gone: vec!["/home/sam/Work/cn"],
+            ..Default::default()
+        };
+        let folder = folder_of("/home/sam/src/cn");
+        let asked = asks(
+            &folder,
+            Some("/home/sam/src/cn"),
+            Some("github.com/o/cn"),
+            &mapped,
+            &gone,
+            Some(HOME),
+        );
+        let Maps::Yes(How::UnderAName(why)) = asked else {
+            panic!("{asked:?}");
+        };
+        assert_eq!(
+            why,
+            WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+                there: false,
+            }
+        );
+        assert_eq!(
+            why.says(Some(Path::new(HOME))),
+            "github.com/o/cn is mapped from ~/Work/cn, which is gone: unmap it first, or give \
+             this one its own name"
+        );
+        // Outside the home directory, or with none known, as it is.
+        assert!(why.says(None).contains("mapped from /home/sam/Work/cn,"));
+        assert_eq!(from_home(Path::new(HOME), Some(Path::new(HOME))), "~");
+        assert_eq!(
+            from_home(Path::new("/home/samantha"), Some(Path::new(HOME))),
+            "/home/samantha"
         );
     }
 
@@ -1561,6 +1644,7 @@ mod tests {
             Maps::Yes(How::UnderAName(WhyAName::Taken {
                 name: "github.com/o/cn".into(),
                 folder: "/home/sam/Work/cn".into(),
+                there: true,
             }))
         );
     }
