@@ -2955,9 +2955,11 @@ the least of eleven rounds each, taken in turn): about 15 ns a take untimed
 and 84 ns timed, so timing costs about 69 ns; a take with a mutex taken
 under it, about 29 ns untimed and 106 ns timed, so 77 ns. Both are under
 the 120 ns bar, on a machine of 4 cores. So every take is timed, and none
-is sampled. `cordelia-core` is
-optimised in every build (`Cargo.toml`), so the test measures the timing as
-a relay runs it.
+is sampled. The test is in `cordelia-core`, which is optimised in every
+build (`Cargo.toml`), so the lock it times is compiled optimised, as a
+relay's release build runs it. In a debug build of the node the lock's
+take, which is generic over what it holds, is compiled at the node's level,
+and is not.
 
 **Derivation:** `LOCK_HOLD_MEDIAN_NANOS / 100`.
 
