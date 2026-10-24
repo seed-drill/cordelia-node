@@ -21,8 +21,11 @@
 //!
 //! **What timing costs** is a read of the monotonic clock and an addition
 //! as the lock is taken where nothing holds it (two reads where it waits),
-//! and one read and a few additions as it is let go (§1.1, rule 5). It is measured against LOCK_TIMING_COST_MAX_NANOS by a
-//! test here, and is under it: every take is timed.
+//! and one read and a few additions as it is let go (§1.1, rule 5). A
+//! mutex taken under it costs an addition where nothing holds it, and the
+//! clock is read only where it waits. It is measured against
+//! LOCK_TIMING_COST_MAX_NANOS by a test here, a take alone and a take with
+//! a mutex taken under it, and is under it: every take is timed.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -301,10 +304,22 @@ impl<'a, T> TimedGuard<'a, T> {
     /// holder of `mutex` that panicked left what it guards whole, as each
     /// of the relay's counts is after any one step, so it is taken all the
     /// same.
+    ///
+    /// As [`TimedLock::lock`] does, it is tried first: one that nothing
+    /// holds is taken at once, with a wait of none and no read of the
+    /// clock, which is read only where it waits (§1.1, rule 5). This is
+    /// inside the store's hold.
     pub fn nested<'b, U>(&self, which: Nested, mutex: &'b Mutex<U>) -> MutexGuard<'b, U> {
-        let asked = Instant::now();
-        let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
-        self.times.nested[which as usize].record(asked.elapsed());
+        let (guard, waited) = match mutex.try_lock() {
+            Ok(guard) => (guard, Duration::ZERO),
+            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), Duration::ZERO),
+            Err(TryLockError::WouldBlock) => {
+                let asked = Instant::now();
+                let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+                (guard, asked.elapsed())
+            }
+        };
+        self.times.nested[which as usize].record(waited);
         guard
     }
 }
@@ -331,8 +346,12 @@ impl<T> DerefMut for TimedGuard<'_, T> {
 
 impl<T> Drop for TimedGuard<'_, T> {
     fn drop(&mut self) {
+        // The hold is read as the lock is let go, and recorded after: so
+        // that letting it go, and what else the thread does then, is not
+        // in the hold, and the record is not in the next take's wait.
+        let held = self.since.elapsed();
         drop(self.guard.take());
-        self.times.hold[self.kind as usize].record(self.since.elapsed());
+        self.times.hold[self.kind as usize].record(held);
     }
 }
 
@@ -526,29 +545,34 @@ mod tests {
         assert_eq!(lock.times().hold(Kind::Other).count, 2);
     }
 
-    /// The nanoseconds that `takes` takes of a lock cost each, the least
-    /// of several rounds: the least is the cost, and the rest is what
-    /// else the machine was doing.
-    fn cost_of_a_take(take: impl Fn()) -> f64 {
+    /// The nanoseconds that one take of each of `takes` costs: a million
+    /// of each, the least of several rounds, the rounds of each taken in
+    /// turn so that each meets the machine as the others do. The least is
+    /// the cost, and the rest is what else the machine was doing.
+    fn costs_of<const N: usize>(takes: [&dyn Fn(); N]) -> [f64; N] {
         const TAKES: u32 = 1_000_000;
         const ROUNDS: usize = 11;
-        (0..ROUNDS)
-            .map(|_| {
+        let mut least = [f64::INFINITY; N];
+        for _ in 0..ROUNDS {
+            for (take, least) in takes.iter().zip(&mut least) {
                 let begun = Instant::now();
                 for _ in 0..TAKES {
                     take();
                 }
-                begun.elapsed().as_nanos() as f64 / f64::from(TAKES)
-            })
-            .fold(f64::INFINITY, f64::min)
+                let each = begun.elapsed().as_nanos() as f64 / f64::from(TAKES);
+                *least = least.min(each);
+            }
+        }
+        least
     }
 
     /// What timing a take costs (decision 2026-10-22 §1.1, rule 5): a
     /// million takes of a timed lock, and a million of the `Mutex` it
-    /// wraps, each the least of several rounds. The difference is under
-    /// 1% of the median hold that §1.4 measured
-    /// (LOCK_TIMING_COST_MAX_NANOS), so every take is timed and none is
-    /// sampled. It prints both, for the record.
+    /// wraps, each the least of several rounds; and the same of a take
+    /// with a mutex taken under it, as a relay takes its rates or its
+    /// room. Each difference is under 1% of the median hold that §1.4
+    /// measured (LOCK_TIMING_COST_MAX_NANOS), so every take is timed and
+    /// none is sampled. It prints them, for the record.
     ///
     /// Not under coverage (CI's coverage job builds with `--cfg
     /// coverage`): there a counter of coverage is added to each branch of
@@ -559,20 +583,39 @@ mod tests {
         ignore = "under coverage, its counters are in what it measures"
     )]
     fn timing_a_take_costs_under_one_hundredth_of_the_median_hold() {
+        use std::hint::black_box;
         let timed = TimedLock::new(0u64);
         let plain = Mutex::new(0u64);
+        let rates = Mutex::new(0u64);
         let _pull = taking(Kind::Pull);
-        let untimed = cost_of_a_take(|| *std::hint::black_box(&plain).lock().unwrap() += 1);
-        let with_timing = cost_of_a_take(|| *std::hint::black_box(&timed).lock().unwrap() += 1);
-        let cost = with_timing - untimed;
-        println!(
-            "a take: {untimed:.1} ns untimed, {with_timing:.1} ns timed; timing costs {cost:.1} ns, \
-             against a bar of {LOCK_TIMING_COST_MAX_NANOS} ns"
-        );
-        assert!(
-            cost < LOCK_TIMING_COST_MAX_NANOS as f64,
-            "timing a take costs {cost:.1} ns, over {LOCK_TIMING_COST_MAX_NANOS} ns"
-        );
-        assert!(timed.times().hold(Kind::Pull).count >= 11_000_000);
+        let [untimed, timed_take, untimed_nested, timed_nested] = costs_of([
+            &|| *black_box(&plain).lock().unwrap() += 1,
+            &|| *black_box(&timed).lock().unwrap() += 1,
+            &|| {
+                let _db = black_box(&plain).lock().unwrap();
+                *black_box(&rates).lock().unwrap() += 1;
+            },
+            &|| {
+                let db = black_box(&timed).lock().unwrap();
+                *db.nested(Nested::Rates, black_box(&rates)) += 1;
+            },
+        ]);
+        let costs = [
+            ("a take", untimed, timed_take),
+            ("a take with a mutex under it", untimed_nested, timed_nested),
+        ];
+        for (what, untimed, with_timing) in costs {
+            let cost = with_timing - untimed;
+            println!(
+                "{what}: {untimed:.1} ns untimed, {with_timing:.1} ns timed; timing costs \
+                 {cost:.1} ns, against a bar of {LOCK_TIMING_COST_MAX_NANOS} ns"
+            );
+            assert!(
+                cost < LOCK_TIMING_COST_MAX_NANOS as f64,
+                "timing {what} costs {cost:.1} ns, over {LOCK_TIMING_COST_MAX_NANOS} ns"
+            );
+        }
+        assert!(timed.times().hold(Kind::Pull).count >= 22_000_000);
+        assert!(timed.times().nested(Nested::Rates).count >= 11_000_000);
     }
 }
