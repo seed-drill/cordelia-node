@@ -1000,14 +1000,22 @@ gauge is what it was when last set.
   `show_short`, `proof`, `pull`, `push`, `relays`, `sweep`, `checkpoint`,
   `pass`, `cycle`, `api` and `other`; buckets of powers of two from 1 µs to
   16 s, with `_sum`, `_count`, `_max` and `_over{ms="5"|"50"|"100"|"250"}`.
+  A take that tries the lock until its time is up (`cordelia msg summary`,
+  for at most 100 ms) has its wait counted from its first try.
+- `cordelia_lock_given_up_total{kind}`: the takes that tried until their time
+  was up and were not had; each is a summary that printed nothing.
 - `cordelia_lock_nested_wait_microseconds{mutex="rates"|"room"}`: the waits
   for a relay's rates and room while the lock is held.
 - `cordelia_requests_total{kind}`, `cordelia_answers_total{kind,answer}`
-  (`answered`, `not_now`, `refused_for_rate`, `not_served`, `stray`),
+  (`answered`, once the answer is written; `not_now`, `refused_for_rate`,
+  `not_served`, `stray`, and `large_later`, a frame over a small message for
+  which no large permit came, of which only the length was read),
   `cordelia_entries_refused_total{kind,answer}` (`refused_for_room`,
-  `refused_for_new_channels`) and `cordelia_stream_bytes_total{kind,direction}`:
-  what a relay is asked on the streams of entries.
-- `cordelia_connections_open`, `cordelia_connections_closed_total`,
+  `refused_for_new_channels`, each entry refused in an answer given) and
+  `cordelia_stream_bytes_total{kind,direction}`: what a relay is asked on the
+  streams of entries. A request is counted as it is read, with its bytes in.
+- `cordelia_connections_open`, `cordelia_connections_closed_total` (gone for
+  any reason, warm churn's among them),
   `cordelia_connections_turned_away_total{why="bound"|"address"|"subnet"|"refused_for_a_time"}`
   and `cordelia_relay_link_closures_total{relay}`.
 - `cordelia_churns_total`, `cordelia_closed_by_warm_churn_total{peer="device"|"relay"}`
@@ -1016,8 +1024,11 @@ gauge is what it was when last set.
 - `cordelia_device_requests_total{relay,kind}`,
   `cordelia_device_request_bytes_total{relay,kind}`,
   `cordelia_device_held_back_total{relay}` and
-  `cordelia_device_refused_for_rate_total{relay}`: what a device asked of
-  each relay, by its key in hex.
+  `cordelia_device_refused_for_now_total{relay}`: what a device asked of
+  each relay, by its key in hex. Refused for now is what the relay reset
+  with `ERR_RATE_LIMIT`, which a relay's `refused_for_rate` and `not_now`
+  both are: a device cannot tell them apart, and its count is checked
+  against the two together.
 
 ---
 

@@ -3493,19 +3493,7 @@ pub async fn p2p_loop(
                 // sweeps a key only when every author has deleted it.
                 if carries_older_kind(&node_role) {
                     let gc_state = state.clone();
-                    let members_known = false;
-                    tokio::task::spawn_blocking(move || {
-                        let Ok(db) = gc_state.db.lock() else { return };
-                        match cordelia_storage::items::gc_keyed_tombstones(
-                            &db,
-                            cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
-                            members_known,
-                        ) {
-                            Ok(0) => {}
-                            Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
-                            Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
-                        }
-                    });
+                    tokio::task::spawn_blocking(move || sweep_older_deletes(&gc_state.db));
                 }
                 // Of the entries of channels from their secrets: a relay
                 // sweeps what it holds, and a device its own store.
@@ -5642,6 +5630,26 @@ pub async fn handle_peer_streams(
     }
 }
 
+/// Sweep the older kind's deletes held for KEYED_TOMBSTONE_RETENTION_DAYS
+/// (decision 2026-09-30 §4.4), on a node that carries that kind. No such
+/// node holds a channel's member list, so it sweeps a key only when every
+/// author has deleted it. Its takes of the lock are a sweep's (decision
+/// 2026-10-22 §1.1, rule 4).
+fn sweep_older_deletes(db: &cordelia_core::lock::TimedLock<rusqlite::Connection>) {
+    let _sweep = cordelia_core::lock::taking(cordelia_core::load::Kind::Sweep);
+    let Ok(db) = db.lock() else { return };
+    let members_known = false;
+    match cordelia_storage::items::gc_keyed_tombstones(
+        &db,
+        cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+        members_known,
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
+        Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
+    }
+}
+
 // ── Protocol handlers (extracted from handle_peer_streams) ───────
 
 /// Refuse a stream whose frame is longer than a small message, when no
@@ -7184,6 +7192,20 @@ mod tests {
             held: Default::default(),
             history: Default::default(),
         })
+    }
+
+    /// The sweep of the older kind's old deletes takes the lock as a
+    /// sweep, and as no other kind (decision 2026-10-22 §1.1, rule 4).
+    #[test]
+    fn the_sweep_of_the_older_kinds_deletes_takes_the_lock_as_a_sweep() {
+        use cordelia_core::load::Kind;
+        let state = a_state();
+        sweep_older_deletes(&state.db);
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|kind| state.db.times().hold(*kind).count > 0)
+            .collect();
+        assert_eq!(kinds, [Kind::Sweep]);
     }
 
     /// A request for items that a peer sent on a sync of the older kind is

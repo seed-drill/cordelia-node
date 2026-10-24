@@ -918,6 +918,29 @@ mod tests {
         }
     }
 
+    /// The work of a route of history runs on another thread, and its
+    /// takes of the lock there are of the local API, and of no other kind
+    /// (decision 2026-10-22 §1.1, rule 4): the kind of the request's own
+    /// thread is not on that one.
+    #[actix_rt::test]
+    async fn the_work_of_a_route_of_history_takes_the_lock_as_the_local_api() {
+        use cordelia_core::load::Kind;
+        let Node { state, _dir, .. } = node();
+        let state = web::Data::new(state);
+        let answered = blocking(state.clone(), |state| {
+            drop(state.db.lock().unwrap());
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(answered.status().is_success());
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|kind| state.db.times().hold(*kind).count > 0)
+            .collect();
+        assert_eq!(kinds, [Kind::Api]);
+    }
+
     /// A restore writes as the adapter writes. A file that an agent writes
     /// to while the restored text is being flushed is not replaced, and
     /// nothing is recorded as replaced. A link left under the temporary

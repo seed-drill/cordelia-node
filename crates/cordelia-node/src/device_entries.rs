@@ -3254,6 +3254,26 @@ mod tests {
         assert!(bodies().is_empty());
     }
 
+    /// A device's sweep of old deletes and its hourly task each take the
+    /// lock as their own kind, and as no other (decision 2026-10-22 §1.1,
+    /// rule 4; §1.2): the sweep as a sweep, and the hourly task, which ends
+    /// with the checkpoint, as the checkpoint.
+    #[test]
+    fn a_devices_sweep_and_its_hourly_task_take_the_lock_each_as_its_kind() {
+        let state = a_node();
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let kinds = || -> Vec<TakeKind> {
+            TakeKind::ALL
+                .into_iter()
+                .filter(|kind| state.db.times().hold(*kind).count > 0)
+                .collect()
+        };
+        device.sweep_deletes();
+        assert_eq!(kinds(), [TakeKind::Sweep]);
+        device.messages_hourly();
+        assert_eq!(kinds(), [TakeKind::Sweep, TakeKind::Checkpoint]);
+    }
+
     /// What is kept in memory of a relay and a channel is kept while
     /// the channel is the device's own and the relay is one it is set up
     /// with: and, where the relays it is set up with are not all known,

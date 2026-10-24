@@ -122,9 +122,13 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.subtle]
 opt-level = 3
-# The counters of the scale test are optimised in every build, as a relay
-# runs them (decision 2026-10-22 §1.1, rule 5): their test holds what
-# timing one take of the node's lock costs under 1% of the median hold, and
-# measures it in the build that `cargo test` makes.
+# cordelia-core is optimised in every build, for the test of what timing a
+# take of the node's lock costs (decision 2026-10-22 §1.1, rule 5): the
+# test is in cordelia-core, so the lock it times is compiled there, and it
+# measures the timing optimised, as a relay's release build runs it, in
+# the build that `cargo test` makes. This does not optimise the timing in a
+# debug build of another crate: the lock's take and its guard are generic
+# over what it holds, and are compiled at the level of the crate that uses
+# them. What is not generic, the histograms and the kind of a take, is.
 [profile.dev.package.cordelia-core]
 opt-level = 3

@@ -441,23 +441,17 @@ fn summary_wait(within_ms: u64) -> Duration {
 }
 
 /// The store, where its lock is had before `deadline`: tried until then,
-/// and `None` where it was not. Time spent waiting counts as no answer.
-/// It waits without holding the worker, which serves other requests
-/// meanwhile.
+/// every millisecond, and `None` where it was not. Time spent waiting
+/// counts as no answer. It waits without holding the worker, which serves
+/// other requests meanwhile. Its wait is recorded from its first try, and
+/// a give-up is counted, for the scale test's bar 5 (decision 2026-10-22
+/// §1.2).
 async fn db_by(
     state: &AppState,
     deadline: Instant,
 ) -> Option<cordelia_core::lock::TimedGuard<'_, Connection>> {
-    loop {
-        match state.db.try_lock() {
-            Ok(db) => return Some(db),
-            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                actix_web::rt::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        }
-    }
+    let pause = || actix_web::rt::time::sleep(Duration::from_millis(1));
+    state.db.try_lock_until(deadline, pause).await
 }
 
 /// Nothing: what `summary` answers wherever it prints nothing.
@@ -3529,6 +3523,49 @@ mod tests {
             "the other request waited for the summary"
         );
         assert!(waited_until.duration_since(began) >= Duration::from_millis(100));
+    }
+
+    /// A wait for the store's lock that tries, as a summary does, is
+    /// recorded from its first try to the take, as a wait of its kind; and
+    /// a summary that does not have the lock within its 100 ms is counted
+    /// as given up, and records no wait (decision 2026-10-22 §1.2, bar 5).
+    /// Another holds the lock for 150 ms while a try of up to a second
+    /// waits for it, and for 400 ms while a summary does.
+    #[actix_web::test]
+    async fn a_wait_that_tries_for_the_store_is_recorded_and_a_summary_that_gives_up_is_counted() {
+        use cordelia_core::load::Kind;
+        use cordelia_core::lock::take_as;
+        let (state, _) = a_node_with_a_message();
+        let held_for = |ms: u64| {
+            let (holding, held) = std::sync::mpsc::channel();
+            let other = state.clone();
+            let holder = std::thread::spawn(move || {
+                let _held = other.db.lock().unwrap();
+                holding.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(ms));
+            });
+            held.recv().unwrap();
+            holder
+        };
+        let holder = held_for(150);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let taken = take_as(Kind::Api, async { db_by(&state, deadline).await.is_some() }).await;
+        holder.join().unwrap();
+        assert!(taken, "the lock was let go within the deadline");
+        let wait = state.db.times().wait(Kind::Api);
+        assert_eq!(wait.count, 1);
+        assert!(wait.max_micros >= 100_000, "{wait:?}");
+        assert_eq!(wait.over[2], 1, "a wait over 100 ms, as bar 5 counts");
+        assert_eq!(state.db.times().given_up(Kind::Api), 0);
+
+        let holder = held_for(400);
+        let summarised = summary(asked(), state.clone(), summary_asked("work", 100));
+        let answered = take_as(Kind::Api, summarised).await;
+        holder.join().unwrap();
+        assert_eq!(answer(answered).await.0, 204);
+        assert_eq!(state.db.times().given_up(Kind::Api), 1);
+        let wait = state.db.times().wait(Kind::Api);
+        assert_eq!(wait.count, 1, "a give-up is no wait");
     }
 
     /// While `announced` waits for the store's lock, the worker it runs on

@@ -21,14 +21,18 @@
 //!
 //! **What timing costs** is a read of the monotonic clock and an addition
 //! as the lock is taken where nothing holds it (two reads where it waits),
-//! and one read and a few additions as it is let go (§1.1, rule 5). It is measured against LOCK_TIMING_COST_MAX_NANOS by a
-//! test here, and is under it: every take is timed.
+//! and one read and a few additions as it is let go (§1.1, rule 5). A
+//! mutex taken under it costs an addition where nothing holds it, and the
+//! clock is read only where it waits. It is measured against
+//! LOCK_TIMING_COST_MAX_NANOS by a test here, a take alone and a take with
+//! a mutex taken under it, and is under it: every take is timed.
 
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -120,12 +124,14 @@ impl Nested {
     }
 }
 
-/// The waits and holds of a timed lock, by kind of take, and the waits
-/// for the mutexes taken under it.
+/// The waits and holds of a timed lock, by kind of take; the takes that
+/// tried until their time was up and were not had; and the waits for the
+/// mutexes taken under it.
 #[derive(Debug, Default)]
 pub struct LockTimes {
     wait: [Histogram; Kind::ALL.len()],
     hold: [Histogram; Kind::ALL.len()],
+    given_up: [AtomicU64; Kind::ALL.len()],
     nested: [Histogram; Nested::ALL.len()],
 }
 
@@ -138,6 +144,12 @@ impl LockTimes {
     /// The holds of the takes of `kind`.
     pub fn hold(&self, kind: Kind) -> HistogramRead {
         self.hold[kind as usize].read()
+    }
+
+    /// The takes of `kind` that tried until their time was up, and were
+    /// not had ([`TimedLock::try_lock_until`]).
+    pub fn given_up(&self, kind: Kind) -> u64 {
+        self.given_up[kind as usize].load(Ordering::Relaxed)
     }
 
     /// The waits for `nested` while the lock was held.
@@ -269,6 +281,47 @@ impl<T> TimedLock<T> {
         Ok(self.guard(guard, kind, since))
     }
 
+    /// Take it by trying until `deadline`, awaiting what `pause` returns
+    /// between tries: a take that waits without holding its thread, as
+    /// `cordelia msg summary` does (decision 2026-10-09 §4.1, C20). A
+    /// holder that panicked left what it holds whole, and it is taken all
+    /// the same.
+    ///
+    /// Its wait is recorded from its first try to the take, as any take's
+    /// is (decision 2026-10-22 §1.2, bar 5): a try that finds the lock held
+    /// is part of the wait, and not a take. One not had by `deadline` takes
+    /// nothing, records no wait, and is counted as given up
+    /// ([`LockTimes::given_up`]).
+    pub async fn try_lock_until<P, F>(
+        &self,
+        deadline: Instant,
+        mut pause: P,
+    ) -> Option<TimedGuard<'_, T>>
+    where
+        P: FnMut() -> F,
+        F: Future<Output = ()>,
+    {
+        let kind = kind_now();
+        let first_try = Instant::now();
+        loop {
+            let guard = match self.inner.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    pause().await;
+                    continue;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    self.times.given_up[kind as usize].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            };
+            let since = Instant::now();
+            self.times.wait[kind as usize].record(since - first_try);
+            return Some(self.guard(guard, kind, since));
+        }
+    }
+
     /// What it holds, where nothing can hold the lock: it is borrowed
     /// mutably.
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
@@ -301,10 +354,22 @@ impl<'a, T> TimedGuard<'a, T> {
     /// holder of `mutex` that panicked left what it guards whole, as each
     /// of the relay's counts is after any one step, so it is taken all the
     /// same.
+    ///
+    /// As [`TimedLock::lock`] does, it is tried first: one that nothing
+    /// holds is taken at once, with a wait of none and no read of the
+    /// clock, which is read only where it waits (§1.1, rule 5). This is
+    /// inside the store's hold.
     pub fn nested<'b, U>(&self, which: Nested, mutex: &'b Mutex<U>) -> MutexGuard<'b, U> {
-        let asked = Instant::now();
-        let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
-        self.times.nested[which as usize].record(asked.elapsed());
+        let (guard, waited) = match mutex.try_lock() {
+            Ok(guard) => (guard, Duration::ZERO),
+            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), Duration::ZERO),
+            Err(TryLockError::WouldBlock) => {
+                let asked = Instant::now();
+                let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+                (guard, asked.elapsed())
+            }
+        };
+        self.times.nested[which as usize].record(waited);
         guard
     }
 }
@@ -331,8 +396,12 @@ impl<T> DerefMut for TimedGuard<'_, T> {
 
 impl<T> Drop for TimedGuard<'_, T> {
     fn drop(&mut self) {
+        // The hold is read as the lock is let go, and recorded after: so
+        // that letting it go, and what else the thread does then, is not
+        // in the hold, and the record is not in the next take's wait.
+        let held = self.since.elapsed();
         drop(self.guard.take());
-        self.times.hold[self.kind as usize].record(self.since.elapsed());
+        self.times.hold[self.kind as usize].record(held);
     }
 }
 
@@ -507,6 +576,78 @@ mod tests {
         );
     }
 
+    /// `future`'s output, where it is ready at its first poll: every
+    /// pause these tests give is.
+    fn at_once<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("a future of these tests waited"),
+        }
+    }
+
+    /// The lock, held by another thread for `ms` from when this returns.
+    fn held_for(lock: &Arc<TimedLock<()>>, ms: u64) -> std::thread::JoinHandle<()> {
+        let (holding, held) = std::sync::mpsc::channel();
+        let lock = lock.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = lock.lock().unwrap();
+            holding.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(ms));
+        });
+        held.recv().unwrap();
+        holder
+    }
+
+    /// A take that tries until a deadline records its wait from its first
+    /// try to the take, as a wait of its kind; one not had by its deadline
+    /// is counted as given up, and records no wait (decision 2026-10-22
+    /// §1.2, bar 5). Another thread holds the lock for 150 ms while a take
+    /// tries for up to a second, a pause of 1 ms between tries, as
+    /// `cordelia msg summary` does; and for 400 ms while one tries for
+    /// 100 ms.
+    #[test]
+    fn a_take_that_tries_until_a_deadline_records_its_wait_from_its_first_try() {
+        let lock = Arc::new(TimedLock::new(()));
+        let pause = || {
+            std::thread::sleep(Duration::from_millis(1));
+            std::future::ready(())
+        };
+        let _api = taking(Kind::Api);
+        let holder = held_for(&lock, 150);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let taken = at_once(lock.try_lock_until(deadline, pause));
+        assert!(taken.is_some(), "the lock was let go within the deadline");
+        drop(taken);
+        holder.join().unwrap();
+        let wait = lock.times().wait(Kind::Api);
+        assert_eq!(wait.count, 1);
+        assert!(wait.max_micros >= 100_000, "{wait:?}");
+        assert_eq!(
+            wait.over,
+            [1, 1, 1, 0],
+            "a wait over 100 ms, as bar 5 counts"
+        );
+        assert_eq!(lock.times().given_up(Kind::Api), 0);
+
+        let holder = held_for(&lock, 400);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(at_once(lock.try_lock_until(deadline, pause)).is_none());
+        holder.join().unwrap();
+        assert_eq!(lock.times().given_up(Kind::Api), 1);
+        assert_eq!(
+            lock.times().wait(Kind::Api).count,
+            1,
+            "a give-up is no wait"
+        );
+        assert_eq!(lock.times().hold(Kind::Api).count, 1);
+        for kind in Kind::ALL {
+            let want = u64::from(kind == Kind::Api);
+            assert_eq!(lock.times().given_up(kind), want, "{kind:?}");
+        }
+    }
+
     /// A lock whose holder panicked is poisoned as a `Mutex` is, and its
     /// guard is in the error; the panicked hold is recorded.
     #[test]
@@ -526,45 +667,77 @@ mod tests {
         assert_eq!(lock.times().hold(Kind::Other).count, 2);
     }
 
-    /// The nanoseconds that `takes` takes of a lock cost each, the least
-    /// of several rounds: the least is the cost, and the rest is what
-    /// else the machine was doing.
-    fn cost_of_a_take(take: impl Fn()) -> f64 {
+    /// The nanoseconds that one take of each of `takes` costs: a million
+    /// of each, the least of several rounds, the rounds of each taken in
+    /// turn so that each meets the machine as the others do. The least is
+    /// the cost, and the rest is what else the machine was doing.
+    fn costs_of<const N: usize>(takes: [&dyn Fn(); N]) -> [f64; N] {
         const TAKES: u32 = 1_000_000;
         const ROUNDS: usize = 11;
-        (0..ROUNDS)
-            .map(|_| {
+        let mut least = [f64::INFINITY; N];
+        for _ in 0..ROUNDS {
+            for (take, least) in takes.iter().zip(&mut least) {
                 let begun = Instant::now();
                 for _ in 0..TAKES {
                     take();
                 }
-                begun.elapsed().as_nanos() as f64 / f64::from(TAKES)
-            })
-            .fold(f64::INFINITY, f64::min)
+                let each = begun.elapsed().as_nanos() as f64 / f64::from(TAKES);
+                *least = least.min(each);
+            }
+        }
+        least
     }
 
     /// What timing a take costs (decision 2026-10-22 §1.1, rule 5): a
     /// million takes of a timed lock, and a million of the `Mutex` it
-    /// wraps, each the least of several rounds. The difference is under
-    /// 1% of the median hold that §1.4 measured
-    /// (LOCK_TIMING_COST_MAX_NANOS), so every take is timed and none is
-    /// sampled. It prints both, for the record.
+    /// wraps, each the least of several rounds; and the same of a take
+    /// with a mutex taken under it, as a relay takes its rates or its
+    /// room. Each difference is under 1% of the median hold that §1.4
+    /// measured (LOCK_TIMING_COST_MAX_NANOS), so every take is timed and
+    /// none is sampled. It prints them, for the record.
+    ///
+    /// Not under coverage (CI's coverage job builds with `--cfg
+    /// coverage`): there a counter of coverage is added to each branch of
+    /// what it times, and the cost measured is theirs.
     #[test]
+    #[cfg_attr(
+        coverage,
+        ignore = "under coverage, its counters are in what it measures"
+    )]
     fn timing_a_take_costs_under_one_hundredth_of_the_median_hold() {
+        use std::hint::black_box;
         let timed = TimedLock::new(0u64);
         let plain = Mutex::new(0u64);
+        let rates = Mutex::new(0u64);
         let _pull = taking(Kind::Pull);
-        let untimed = cost_of_a_take(|| *std::hint::black_box(&plain).lock().unwrap() += 1);
-        let with_timing = cost_of_a_take(|| *std::hint::black_box(&timed).lock().unwrap() += 1);
-        let cost = with_timing - untimed;
-        println!(
-            "a take: {untimed:.1} ns untimed, {with_timing:.1} ns timed; timing costs {cost:.1} ns, \
-             against a bar of {LOCK_TIMING_COST_MAX_NANOS} ns"
-        );
-        assert!(
-            cost < LOCK_TIMING_COST_MAX_NANOS as f64,
-            "timing a take costs {cost:.1} ns, over {LOCK_TIMING_COST_MAX_NANOS} ns"
-        );
-        assert!(timed.times().hold(Kind::Pull).count >= 11_000_000);
+        let [untimed, timed_take, untimed_nested, timed_nested] = costs_of([
+            &|| *black_box(&plain).lock().unwrap() += 1,
+            &|| *black_box(&timed).lock().unwrap() += 1,
+            &|| {
+                let _db = black_box(&plain).lock().unwrap();
+                *black_box(&rates).lock().unwrap() += 1;
+            },
+            &|| {
+                let db = black_box(&timed).lock().unwrap();
+                *db.nested(Nested::Rates, black_box(&rates)) += 1;
+            },
+        ]);
+        let costs = [
+            ("a take", untimed, timed_take),
+            ("a take with a mutex under it", untimed_nested, timed_nested),
+        ];
+        for (what, untimed, with_timing) in costs {
+            let cost = with_timing - untimed;
+            println!(
+                "{what}: {untimed:.1} ns untimed, {with_timing:.1} ns timed; timing costs \
+                 {cost:.1} ns, against a bar of {LOCK_TIMING_COST_MAX_NANOS} ns"
+            );
+            assert!(
+                cost < LOCK_TIMING_COST_MAX_NANOS as f64,
+                "timing {what} costs {cost:.1} ns, over {LOCK_TIMING_COST_MAX_NANOS} ns"
+            );
+        }
+        assert!(timed.times().hold(Kind::Pull).count >= 22_000_000);
+        assert!(timed.times().nested(Nested::Rates).count >= 11_000_000);
     }
 }

@@ -152,6 +152,7 @@ Do not add new protocol constants outside `protocol.rs`. All other modules deriv
 | `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §6 |
 | `NODE_STOP_TIMEOUT_SECS` | 30s | parameter-rationale.md §6 |
 | `MAX_MESSAGE_BYTES` | 1MB | parameter-rationale.md §5.2 |
+| `FRAME_LENGTH_BYTES` | 4 (derived: a frame's length, a big-endian u32, before its message) | network-protocol.md §3.1 |
 | `MAX_ITEM_BYTES` | 64KB | parameter-rationale.md §4 |
 | `ENTRY_OVERHEAD_BYTES` | 1KB (counted for each entry, in every limit on bytes) | parameter-rationale.md §4 |
 | `QUIC_KEEPALIVE_INTERVAL_SECS` | 15s | network-protocol.md §2.1 |

@@ -109,7 +109,8 @@ impl Histogram {
 /// stream between relays and a relay's own pull and passing on), and the
 /// sweeps. On a device: its passes, its sync cycle, its local API, its
 /// sweep and its hourly task, which ends with the checkpoint. Any other is
-/// `Other`.
+/// `Other`, which is declared last: a kind is added before it, and in
+/// [`Kind::ALL`] at its place, or the build fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     ShowWhole,
@@ -162,6 +163,19 @@ impl Kind {
     }
 }
 
+// Kind::ALL holds every kind, each at its own place (`kind as usize`, by
+// which the lock's histograms are indexed), and ends with Other, the kind
+// declared last: so a kind declared and left out of it, or put at another
+// place, fails the build.
+const _: () = {
+    let mut i = 0;
+    while i < Kind::ALL.len() {
+        assert!(Kind::ALL[i] as usize == i);
+        i += 1;
+    }
+    assert!(Kind::Other as usize == Kind::ALL.len() - 1);
+};
+
 /// A kind of request on the streams of entries (decision 2026-10-22
 /// §1.2): a show, whole or in short; a proof; a pull; a push; and the
 /// stream between relays (0x14).
@@ -208,7 +222,7 @@ impl Stream {
 /// §1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answered {
-    /// An answer was written.
+    /// An answer was written: counted once it is.
     Answered,
     /// It asked for more than the asker may be handed for now: refused,
     /// and no breach.
@@ -216,20 +230,28 @@ pub enum Answered {
     /// It was over the connection's or the address's count: refused, a
     /// breach.
     RefusedForRate,
-    /// It could not be served: nothing was said.
+    /// It could not be served, or its answer could not be written:
+    /// nothing was said.
     NotServed,
     /// It was no request for the stream it came on.
     Stray,
+    /// It was longer than a small message, from a peer that is not a
+    /// listed relay, and no large permit came for it within
+    /// STREAM_TIMEOUT_SECS: refused with ERR_LARGE_MESSAGE_LATER, to be
+    /// sent again, and no breach. Its frame was not read: the bytes in
+    /// counted for it are its length's.
+    LargeLater,
 }
 
 impl Answered {
     /// Every answer, in the order they are served.
-    pub const ALL: [Answered; 5] = [
+    pub const ALL: [Answered; 6] = [
         Answered::Answered,
         Answered::NotNow,
         Answered::RefusedForRate,
         Answered::NotServed,
         Answered::Stray,
+        Answered::LargeLater,
     ];
 
     /// Its name, as the route serves it.
@@ -240,6 +262,7 @@ impl Answered {
             Answered::RefusedForRate => "refused_for_rate",
             Answered::NotServed => "not_served",
             Answered::Stray => "stray",
+            Answered::LargeLater => "large_later",
         }
     }
 }
@@ -398,6 +421,21 @@ impl<const C: usize> ByRelay<C> {
         &self.rest
     }
 
+    /// What the relay `key` has, its slots summed: two that took a slot
+    /// for it at the same moment have one each. `None` where it has none.
+    fn sum_of(&self, key: &[u8; 32]) -> Option<[u64; C]> {
+        let mut sum = None;
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == READY && slot.is_of(key) {
+                let summed = sum.get_or_insert([0; C]);
+                for (n, count) in summed.iter_mut().zip(&slot.counts) {
+                    *n += count.load(Ordering::Relaxed);
+                }
+            }
+        }
+        sum
+    }
+
     /// Count the relay `key`, so that it has a slot from now on.
     pub fn counts(&self, key: &[u8; 32]) {
         self.of(key);
@@ -441,9 +479,9 @@ impl<const C: usize> ByRelay<C> {
 
 /// What a relay is asked on the streams of entries, by stream kind
 /// (decision 2026-10-22 §1.2): the requests, counted when each is read;
-/// what became of each; the entries it refused in the answers it gave,
-/// for room and for the allowance of new channels; and the bytes in and
-/// out, as each frame is read and written.
+/// what became of each, an answer once it is written; each entry it
+/// refused in the answers it gave, for room and for the allowance of new
+/// channels; and the bytes in and out, as each frame is read and written.
 #[derive(Debug, Default)]
 pub struct StreamCounts {
     requests: [AtomicU64; Stream::ALL.len()],
@@ -507,9 +545,11 @@ impl StreamCounts {
 const CLOSURES: usize = 0;
 
 /// A node's connections (decision 2026-10-22 §1.2): how many are open, as
-/// a gauge set each time one is made or goes; how many have gone; those it
-/// turned away, by why; and the closures of the link to each relay that
-/// it is set up with or lists by key.
+/// a gauge set each time one is made or goes; how many have gone, for any
+/// reason, those warm churn closed among them (the governor counts those
+/// apart, so the rest are the difference); those it turned away, by why;
+/// and the closures of the link to each relay that it is set up with or
+/// lists by key.
 #[derive(Debug, Default)]
 pub struct ConnectionCounts {
     open: AtomicU64,
@@ -553,12 +593,10 @@ impl ConnectionCounts {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// The closures of the link to the relay `key` so far: none where it
-    /// is not counted.
+    /// The closures of the link to the relay `key` so far, its slots
+    /// summed: none where it is not counted.
     pub fn closures_of(&self, key: &[u8; 32]) -> u64 {
-        self.relays
-            .find(key)
-            .map_or(0, |counts| counts[CLOSURES].load(Ordering::Relaxed))
+        self.relays.sum_of(key).map_or(0, |counts| counts[CLOSURES])
     }
 
     /// The inbound connections turned away for `why` so far.
@@ -646,17 +684,24 @@ impl GovernorCounts {
 
 /// Where each of a device's counts for a relay is: its requests and
 /// their bytes by stream kind, then those it held back and those the
-/// relay refused for rate.
+/// relay refused for now.
 const ASKED: usize = 0;
 const ASKED_BYTES: usize = Stream::ALL.len();
 const HELD_BACK: usize = 2 * Stream::ALL.len();
-const REFUSED_FOR_RATE: usize = HELD_BACK + 1;
-const DEVICE_COUNTS: usize = REFUSED_FOR_RATE + 1;
+const REFUSED_FOR_NOW: usize = HELD_BACK + 1;
+const DEVICE_COUNTS: usize = REFUSED_FOR_NOW + 1;
 
 /// What a device asked of each relay (decision 2026-10-22 §1.2): the
 /// requests by stream kind and their bytes, counted as each is sent; the
 /// requests it held back by its own pace (OWN_ENTRY_REQUESTS_PER_MINUTE);
-/// and those the relay refused for rate.
+/// and those the relay refused for now.
+///
+/// **Refused for now** is what the relay reset with ERR_RATE_LIMIT: a
+/// request over the connection's or the address's count (the relay's
+/// `refused_for_rate`, a breach) and one for more than the device may be
+/// handed for now (its `not_now`, no breach) are reset with the same code,
+/// and a device cannot tell them apart. So it is cross-checked against the
+/// relay's `refused_for_rate` and `not_now` together.
 #[derive(Debug, Default)]
 pub struct DeviceCounts {
     relays: ByRelay<DEVICE_COUNTS>,
@@ -668,7 +713,8 @@ pub struct DeviceRead {
     pub asked: [u64; Stream::ALL.len()],
     pub asked_bytes: [u64; Stream::ALL.len()],
     pub held_back: u64,
-    pub refused_for_rate: u64,
+    /// Reset by the relay with ERR_RATE_LIMIT: for rate, or not now.
+    pub refused_for_now: u64,
 }
 
 impl DeviceRead {
@@ -677,7 +723,7 @@ impl DeviceRead {
             asked: std::array::from_fn(|i| counts[ASKED + i]),
             asked_bytes: std::array::from_fn(|i| counts[ASKED_BYTES + i]),
             held_back: counts[HELD_BACK],
-            refused_for_rate: counts[REFUSED_FOR_RATE],
+            refused_for_now: counts[REFUSED_FOR_NOW],
         }
     }
 }
@@ -697,18 +743,18 @@ impl DeviceCounts {
         self.relays.add(relay, HELD_BACK, 1);
     }
 
-    /// The relay `relay` refused a request for rate.
-    pub fn refused_for_rate(&self, relay: &[u8; 32]) {
-        self.relays.add(relay, REFUSED_FOR_RATE, 1);
+    /// The relay `relay` refused a request for now: it reset its stream
+    /// with ERR_RATE_LIMIT, for rate or not now.
+    pub fn refused_for_now(&self, relay: &[u8; 32]) {
+        self.relays.add(relay, REFUSED_FOR_NOW, 1);
     }
 
-    /// What is counted of the relay `key`: nothing where it has no slot.
+    /// What is counted of the relay `key`, its slots summed: nothing
+    /// where it has no slot.
     pub fn of(&self, key: &[u8; 32]) -> DeviceRead {
         self.relays
-            .find(key)
-            .map_or_else(DeviceRead::default, |counts| {
-                DeviceRead::of(std::array::from_fn(|i| counts[i].load(Ordering::Relaxed)))
-            })
+            .sum_of(key)
+            .map_or_else(DeviceRead::default, DeviceRead::of)
     }
 
     /// What is counted of each relay, by its key; and of the rest, where
@@ -804,6 +850,17 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
             histogram(&mut out, name, &label, &of(lock, kind));
         }
     }
+    let name = "cordelia_lock_given_up_total";
+    family(
+        &mut out,
+        name,
+        "counter",
+        "Takes of the node's lock that tried until their time was up and were not had, by kind",
+    );
+    for kind in Kind::ALL {
+        let n = lock.given_up(kind);
+        let _ = writeln!(out, "{name}{{kind=\"{}\"}} {n}", kind.name());
+    }
     let name = "cordelia_lock_nested_wait_microseconds";
     family(
         &mut out,
@@ -878,7 +935,7 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
         &mut out,
         "cordelia_connections_closed_total",
         "counter",
-        "Connections gone, for any reason",
+        "Connections gone, for any reason, warm churn's among them",
     );
     let closed = connections.closed.load(Ordering::Relaxed);
     let _ = writeln!(out, "cordelia_connections_closed_total {closed}");
@@ -970,9 +1027,9 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
             (|read: &DeviceRead| read.held_back) as fn(&DeviceRead) -> u64,
         ),
         (
-            "cordelia_device_refused_for_rate_total",
-            "Requests each relay refused a device for rate",
-            |read: &DeviceRead| read.refused_for_rate,
+            "cordelia_device_refused_for_now_total",
+            "Requests each relay refused a device for now (ERR_RATE_LIMIT): its refused_for_rate and not_now",
+            |read: &DeviceRead| read.refused_for_now,
         ),
     ] {
         family(&mut out, name, "counter", help);
@@ -1249,10 +1306,10 @@ mod tests {
             [at("cordelia_device_held_back_total", &other, None)]
         );
         let before = said(&load);
-        load.device.refused_for_rate(&other);
+        load.device.refused_for_now(&other);
         assert_eq!(
             moved(&before, &said(&load)),
-            [at("cordelia_device_refused_for_rate_total", &other, None)]
+            [at("cordelia_device_refused_for_now_total", &other, None)]
         );
         // A relay asked for the first time is said from then on, and
         // nothing of the other moves.
@@ -1298,6 +1355,41 @@ mod tests {
         by.counts(&[9; 32]);
         by.add_where_counted(&[9; 32], 0, 1);
         assert_eq!(by.read(), (vec![([9; 32], [1])], None));
+    }
+
+    /// The relay `key`, given two slots, as two threads that count it at
+    /// the same moment may give it.
+    fn taken_twice<const C: usize>(by: &ByRelay<C>, key: &[u8; 32]) {
+        for slot in &by.slots[..2] {
+            slot.state.store(WRITING, Ordering::Release);
+            for (part, of) in slot.key.iter().zip(key.as_chunks::<8>().0) {
+                part.store(u64::from_le_bytes(*of), Ordering::Relaxed);
+            }
+            slot.state.store(READY, Ordering::Release);
+        }
+    }
+
+    /// A relay that has two slots is read with its slots summed, wherever
+    /// it is read (decision 2026-10-22 §1.2): what a device counts of it,
+    /// and the closures of its link. What is counted goes in the first.
+    #[test]
+    fn a_relay_with_two_slots_is_read_with_them_summed() {
+        let key = [5; 32];
+        let device = DeviceCounts::default();
+        taken_twice(&device.relays, &key);
+        device.held_back(&key);
+        device.relays.slots[1].counts[REFUSED_FOR_NOW].fetch_add(2, Ordering::Relaxed);
+        device.relays.slots[1].counts[HELD_BACK].fetch_add(1, Ordering::Relaxed);
+        let read = device.of(&key);
+        assert_eq!((read.held_back, read.refused_for_now), (2, 2));
+        assert_eq!(device.read().0, [(key, read)]);
+
+        let connections = ConnectionCounts::default();
+        taken_twice(&connections.relays, &key);
+        connections.closed(&key);
+        connections.relays.slots[1].counts[CLOSURES].fetch_add(2, Ordering::Relaxed);
+        assert_eq!(connections.closures_of(&key), 3);
+        assert_eq!(connections.closures_of(&[6; 32]), 0);
     }
 
     /// Relays counted from many threads at once are each counted, and
