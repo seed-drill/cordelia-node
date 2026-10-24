@@ -2985,7 +2985,7 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
         "{printed}"
     );
     assert!(
-        printed.contains("\nYou have read 11 older messages here, so they are not shown.\n"),
+        printed.contains("\nYou have read 11 other messages here, so they are not shown.\n"),
         "{printed}"
     );
     assert_eq!(printed.matches("\nThread ").count(), 1, "{printed}");
@@ -3050,7 +3050,7 @@ fn a_message_that_arrives_during_logs_question_is_not_marked() {
         );
     }
     assert!(
-        printed.contains("\nYou have read 9 older messages here, so they are not shown.\n"),
+        printed.contains("\nYou have read 9 other messages here, so they are not shown.\n"),
         "{printed}"
     );
     let shown = out(&read(&two.desktop, "work", &tenth));
@@ -3212,7 +3212,7 @@ fn read_marks_by_the_agent_and_log_by_a_person_at_a_terminal_with_yes() {
     assert!(!after.contains(&id), "{after}");
     assert!(
         after.contains(
-            "\nNo new message of the agent work is held on this device. You have read the older \
+            "\nNo new message of the agent work is held on this device. You have read the other \
              one here.\n"
         ),
         "{after}"
@@ -3265,7 +3265,7 @@ fn log_shows_and_marks_only_what_no_person_has_read_here() {
         said.replace("\r\n", "\n"),
         format!(
             "{FOR_A_PERSON}\nNo new message of any agent is held on this device. You have read \
-             the 2 older ones here.\n"
+             the 2 others here.\n"
         )
     );
 
@@ -3281,7 +3281,7 @@ fn log_shows_and_marks_only_what_no_person_has_read_here() {
     );
     assert_eq!(frames(&shown), 1, "{shown}");
     assert!(
-        shown.contains("\nYou have read 2 older messages here, so they are not shown.\n"),
+        shown.contains("\nYou have read 2 other messages here, so they are not shown.\n"),
         "{shown}"
     );
     assert!(
@@ -3329,7 +3329,7 @@ fn log_shows_and_marks_only_what_no_person_has_read_here() {
     assert!(shown.contains("\nbody four\n"), "{shown}");
     assert_eq!(frames(&shown), 1, "{shown}");
     assert!(
-        shown.contains("\nYou have read 4 older messages here, so they are not shown.\n"),
+        shown.contains("\nYou have read 4 other messages here, so they are not shown.\n"),
         "{shown}"
     );
 }

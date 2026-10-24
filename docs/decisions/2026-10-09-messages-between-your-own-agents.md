@@ -334,9 +334,9 @@ What it prints, exactly, each line where it holds:
 This is for a person at a terminal. An agent must not run it, and must not answer its question.
 Messages of <every agent, or the agent <name>> on this device:
 No message of <any agent, or the agent <name>> is held on this device.          (where it lists none, and a person here has read none)
-No new message of <any agent, or the agent <name>> is held on this device. You have read the <N> older ones here.
+No new message of <any agent, or the agent <name>> is held on this device. You have read the <N> others here.
                                                                                  (where it lists none, and a person here has read N;
-                                                                                  for one: You have read the older one here.)
+                                                                                  for one: You have read the other one here.)
 
 Thread <thread, 8 hex>:
 
@@ -354,7 +354,7 @@ Message <id, 32 hex> from <from> on "<label>".                                  
 From a device that is no longer one of yours.
 A person can see it by running cordelia msg log at a terminal.
 
-You have read <N> older messages here, so they are not shown.                    (where it lists any; for one: You have read 1 older message here, so it is not shown.)
+You have read <N> other messages here, so they are not shown.                    (where it lists any; for one: You have read 1 other message here, so it is not shown.)
 <N> messages from "<label>" were overwritten before they were shown on this device.
 <N> entries from "<label>" were not messages, and were not shown.
 <N> messages from "<label>" are held back by this device's hour, and are shown when it has room.

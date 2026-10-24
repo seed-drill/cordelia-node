@@ -126,7 +126,7 @@ pub const NOT_MARKED: &str = "Not marked as read by a person: this was not run a
 
 /// The question `log` asks at a terminal, of the `printed` messages it
 /// printed with their bodies, where it was given `--since` or not
-/// (decision 2026-10-09 §4.1, §7.2): older messages are not shown then,
+/// (decision 2026-10-09 §4.1, §7.2): messages a person has read are not shown then,
 /// and may hold a pair.
 pub fn log_question(printed: usize, since: bool) -> String {
     let (these, between, them) = match printed {
@@ -1348,8 +1348,8 @@ fn device_named(device: &Value) -> String {
 /// §4.1).
 fn already_read_says(already: u64) -> String {
     match already {
-        1 => "You have read 1 older message here, so it is not shown.\n".into(),
-        _ => format!("You have read {already} older messages here, so they are not shown.\n"),
+        1 => "You have read 1 other message here, so it is not shown.\n".into(),
+        _ => format!("You have read {already} other messages here, so they are not shown.\n"),
     }
 }
 
@@ -1373,11 +1373,11 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
     match (threads.is_empty(), already) {
         (true, 0) => out.push_str(&format!("No message of {any} is held on this device.\n")),
         (true, 1) => out.push_str(&format!(
-            "No new message of {any} is held on this device. You have read the older one here.\n"
+            "No new message of {any} is held on this device. You have read the other one here.\n"
         )),
         (true, _) => out.push_str(&format!(
-            "No new message of {any} is held on this device. You have read the {already} older \
-             ones here.\n"
+            "No new message of {any} is held on this device. You have read the {already} \
+             others here.\n"
         )),
         (false, _) => out.push_str(&format!("Messages of {whose} on this device:\n")),
     }
@@ -2049,7 +2049,7 @@ mod tests {
                 "From before the last change of your devices.",
                 "to all",
                 "",
-                "You have read 2 older messages here, so they are not shown.",
+                "You have read 2 other messages here, so they are not shown.",
                 "3 messages from \"laptop\" were overwritten before they were shown on this \
                  device.",
                 "2 entries from \"laptop\" were not messages, and were not shown.",
@@ -2113,12 +2113,12 @@ mod tests {
         nothing["already_read"] = json!(3);
         assert!(log_says(&nothing, marker).0.starts_with(
             "No new message of the agent work is held on this device. You have read the 3 \
-             older ones here.\n"
+             others here.\n"
         ));
         nothing["name"] = Value::Null;
         nothing["already_read"] = json!(1);
         assert!(log_says(&nothing, marker).0.starts_with(
-            "No new message of any agent is held on this device. You have read the older one \
+            "No new message of any agent is held on this device. You have read the other one \
              here.\n"
         ));
         // What a yes says.
@@ -2221,7 +2221,7 @@ mod tests {
              From before the last change of your devices.\n\
              {own}\
              \n\
-             You have read 2 older messages here, so they are not shown.\n\
+             You have read 2 other messages here, so they are not shown.\n\
              3 messages from \"laptop\" were overwritten before they were shown on this device.\n\
              2 entries from \"laptop\" were not messages, and were not shown.\n\
              1 messages from \"laptop\" are held back by this device's hour, and are shown when \
@@ -2334,7 +2334,7 @@ mod tests {
             "{said}"
         );
         assert!(
-            said.ends_with("\n\nYou have read 1 older message here, so it is not shown.\n"),
+            said.ends_with("\n\nYou have read 1 other message here, so it is not shown.\n"),
             "{said}"
         );
         let mut two = one.clone();
@@ -2342,7 +2342,7 @@ mod tests {
         assert!(
             log_says(&two, marker)
                 .0
-                .ends_with("\n\nYou have read 2 older messages here, so they are not shown.\n")
+                .ends_with("\n\nYou have read 2 other messages here, so they are not shown.\n")
         );
         // None read before: no count.
         two["already_read"] = json!(0);
@@ -2355,7 +2355,7 @@ mod tests {
         assert!(printed.is_empty());
         assert_eq!(
             said,
-            "No new message of any agent is held on this device. You have read the 4 older ones \
+            "No new message of any agent is held on this device. You have read the 4 others \
              here.\n"
         );
     }

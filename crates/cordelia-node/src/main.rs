@@ -474,7 +474,7 @@ enum MsgCommand {
     /// For a person at a terminal
     ///
     /// It shows only the messages you have not read here yet, and says how
-    /// many older ones you have read. At a terminal it shows those of every
+    /// many others you have read. At a terminal it shows those of every
     /// agent of yours on this device, with on which devices an agent read
     /// each, and asks whether to mark them read by a person here: that ends
     /// any hold between the agents they are between. Where there is
