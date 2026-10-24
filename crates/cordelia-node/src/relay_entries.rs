@@ -3361,7 +3361,11 @@ mod tests {
             !asked.is_empty() && asked.iter().all(|limit| *limit == ENTRY_PAGE_MAX_ENTRIES),
             "a relay that carries the listed settings did not ask for full pages: {asked:?}"
         );
-        let of_one = from_a.pulls().iter().filter(|(c, ..)| *c == channel(1)).count();
+        let of_one = from_a
+            .pulls()
+            .iter()
+            .filter(|(c, ..)| *c == channel(1))
+            .count();
         assert_eq!(of_one, 1, "the channel was not had in one full page");
         assert_eq!(
             b.held(1).unwrap().bytes,
@@ -4402,8 +4406,7 @@ mod tests {
         let waiting = at.entries.to_pass_on(&at.db, &both);
         let sizes: Vec<usize> = waiting_for(&waiting, 9).iter().map(Vec::len).collect();
         assert_eq!(
-            sizes,
-            [1; 20],
+            sizes, [1; 20],
             "entries of the largest size were passed on more than a small page to a message"
         );
         for message in &waiting[0].1 {

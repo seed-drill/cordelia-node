@@ -2437,22 +2437,8 @@ pub fn post_connect(
         let permits = large_permits.clone();
         tokio::spawn(async move {
             handle_peer_streams(
-                conn,
-                peer_id,
-                made_from,
-                db_state,
-                peers_ref,
-                role,
-                rtx,
-                dtx,
-                rates,
-                states,
-                relays,
-                gtx,
-                sm,
-                st,
-                entries,
-                permits,
+                conn, peer_id, made_from, db_state, peers_ref, role, rtx, dtx, rates, states,
+                relays, gtx, sm, st, entries, permits,
             )
             .await;
         });
@@ -13234,7 +13220,9 @@ mod tests {
         let at_a = crate::relay_entries::listed_links(&entries_with(&at_a), &a);
         let at_b = crate::relay_entries::listed_links(&entries_with(&at_b), &b);
         assert_eq!(
-            at_a.iter().map(|(relay, _)| relay.clone()).collect::<Vec<_>>(),
+            at_a.iter()
+                .map(|(relay, _)| relay.clone())
+                .collect::<Vec<_>>(),
             [NodeId(b_key.public_key())]
         );
         assert!(
@@ -13242,7 +13230,9 @@ mod tests {
             "A, on every peer's windows, would ask B for full pages"
         );
         assert_eq!(
-            at_b.iter().map(|(relay, _)| relay.clone()).collect::<Vec<_>>(),
+            at_b.iter()
+                .map(|(relay, _)| relay.clone())
+                .collect::<Vec<_>>(),
             [NodeId(a_key.public_key())]
         );
         assert!(

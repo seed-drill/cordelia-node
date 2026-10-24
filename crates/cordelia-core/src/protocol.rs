@@ -1612,7 +1612,8 @@ pub const SMALL_WINDOWS_PULL_ENTRIES: u32 = (SMALL_PAGE_BYTES / MAX_ENTRY_WIRE_B
 // Checked at compile time: a page asked for on every peer's windows holds
 // at least one entry, and its worst case fits a small page.
 const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES >= 1);
-const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
+const _: () =
+    assert!(SMALL_WINDOWS_PULL_ENTRIES as usize * MAX_ENTRY_WIRE_BYTES <= SMALL_PAGE_BYTES);
 const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES <= ENTRY_PAGE_MAX_ENTRIES);
 
 /// How many large messages a node reads at once, across all its

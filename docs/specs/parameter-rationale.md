@@ -2828,7 +2828,9 @@ until it is handed.
 page, `RELAY_ENTRY_PULL_PAGES` (10) a pass of a channel, where at full
 pages it would pull up to 100 a page: a channel of small entries catches
 up there up to 100 times more slowly, one of entries of the largest size
-(13 to a full page) 13 times. What is passed on to it as it is taken
+(13 to a full page) 13 times. A page of one entry of the largest size takes
+about 0.73 s at a round trip of 200 ms on every peer's windows, and fails
+the stream timeout only past about 2.7 s. What is passed on to it as it is taken
 (`to_pass_on`, a small page a message) is not slowed. **If you raise it
 to two:** the worst case of a page is two entries of the largest size,
 131,546 bytes, over a small page by 474 bytes, and still a small message.
