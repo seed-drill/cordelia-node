@@ -102,45 +102,48 @@ can hold 32 KiB of reassembly beyond its data. **If you lower it below
 four:** a device's pass, show, hand-over ask and a command's read could
 not all be open to a relay at once, and one would wait.
 
-### stream_receive_window = 36 KiB, receive_window = 288 KiB
+### stream_receive_window = 31.5 KiB, receive_window = 288 KiB
 
 **Rationale:** How much a peer may send before this node has read it: two
-small messages on a whole connection (`QUIC_RECEIVE_WINDOW`), and an
-eighth of that on a stream (`QUIC_STREAM_RECEIVE_WINDOW`, 36,864 bytes),
-rule 8. The first is what bounds the memory one connection can make a
-node hold unread. Quinn's default has no limit for the connection. A
-relay listed by key may send one message on a stream and two on the
-connection, as before change F (§13, rule 12).
+small messages on a whole connection (`QUIC_RECEIVE_WINDOW`), and on a
+stream what leaves every stream a peer may open within seven eighths of
+that (`QUIC_STREAM_RECEIVE_WINDOW`, 32,256 bytes), rule 8. The first is
+what bounds the memory one connection can make a node hold unread.
+Quinn's default has no limit for the connection. A relay listed by key
+may send one message on a stream and two on the connection, as before
+change F (§13, rule 12).
 
 **Derivation:** The largest thing a device of this version sends is one
 small message (`SMALL_MESSAGE_BYTES`, §13); two on the connection let a
 second request arrive while the first is read. With 200 connections a
 relay holds at most 56 MiB unread (it was 400 MiB at a message and two).
-A stream's window is the connection's divided by the streams a peer may
-open (`QUIC_MAX_BIDI_STREAMS`), checked at compile time, so that every
-such stream, each with its window full, fits the connection's window
-together.
+A stream's window is seven eighths of the connection's divided by the
+streams a peer may open (`QUIC_MAX_BIDI_STREAMS`), checked at compile
+time: (294,912 − 36,864) / 8 = 32,256.
 
-**Why a stream's window is not a small message.** A node reads the
-streams a peer opens one at a time (`handle_peer_streams`). At a stream
-window of a small message, two streams queued behind the one being read
-held all the connection's credit, and the stream being read, and the
-relay's own fetch on the same connection, waited out STREAM_TIMEOUT
-(§6): measured over QUIC with a relay configured by address alone pushing
-on several streams while the relay fetched from it, 3 pushes of 300 KB
-beside a fetch answer of 400 KB ended 5 times in 10, 5 of 300 KB and 3 of
-900 KB never, and 7 of 140 KB, which need no permit, 3 times in 10. With
-the streams within the connection's window, none of them can take all of
-it: every case ended in 10 of 10 runs, the slowest fetch in 91 ms
+**Why a stream's window is not a small message, nor an eighth of the
+connection's.** A node reads the streams a peer opens one at a time
+(`handle_peer_streams`). At a stream window of a small message, two
+streams queued behind the one being read held all the connection's
+credit, and the stream being read, and the relay's own fetch on the same
+connection, waited out STREAM_TIMEOUT (§6): measured over QUIC with a
+relay configured by address alone pushing on several streams while the
+relay fetched from it, 3 pushes of 300 KB beside a fetch answer of 400 KB
+ended 5 times in 10, 5 of 300 KB and 3 of 900 KB never, and 7 of 140 KB,
+which need no permit, 3 times in 10. Quinn announces credit once an
+eighth of the connection's window (`MAX_DATA`) or of a stream's
+(`MAX_STREAM_DATA`) has been read back (quinn-proto 0.11's
+`add_read_credits`, `max_stream_data`). A stream the node opened itself,
+the relay's fetch, is not among the peer's eight, and at an eighth of the
+window a stream, a peer that the relay dialled, which may open all eight
+(the end that dials holds one for good, the handshake's), filled the
+whole window: the fetch, which holds the large permit for the peer's
+subnet, read back less than the eighth, and the pushes waited for its
+permit (8 pushes of 900 KB beside a fetch answer of 900 KB, never in 10
+runs). With the peer's streams within seven eighths, the eighth left is
+always there to read back: every case ended in 10 of 10 runs in both
+directions, each run in a process of its own
 (`a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other`).
-Quinn announces credit once an eighth of a stream's window
-(`MAX_STREAM_DATA`) or of the connection's (`MAX_DATA`) has come back
-(quinn-proto 0.11's `max_stream_data`, `add_read_credits`): with seven
-streams queued at 36 KiB each, 36 KiB of the connection's comes back to
-the stream being read, which is the eighth, so it is announced. A stream
-the node opened itself (a fetch) is not among the peer's eight, but the
-end that dials holds one of its eight for good (§1, the handshake's
-stream), so a peer has at most seven to fill.
 
 **What it costs an honest peer, at a round trip of 200 ms.** Measured for
 the decision record (its section 2.3): one connection through a path that
@@ -2798,7 +2801,7 @@ keeps the windows and streams that every connection had before change F
 (rule 12): one message on a stream and two on the connection each way,
 and 64 streams. A relay's passes on and its pulls from the relays it works
 with go a full page at a time (`ENTRY_PAGE_MAX_BYTES`, 896 KiB), and at
-the windows of every other peer (36 KiB on a stream, rule 8) a
+the windows of every other peer (31.5 KiB on a stream, rule 8) a
 full page takes about 5.2 s at a round trip of 200 ms where it takes
 0.24 s (1.43 s at a small message a stream): a pull of ten full pages
 would take about 52 s, five times the 10 s between pulls, and catching up

@@ -114,10 +114,10 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
 /// - A peer may have QUIC_MAX_BIDI_STREAMS (8) streams open at once, and
 ///   no unidirectional ones.
 /// - It may send two small messages' worth on the whole connection before
-///   this node has read it, and an eighth of that on a stream, so that
-///   every stream it may have open fits the connection's window together:
-///   the streams queued behind the one the node reads cannot take the
-///   credit that one needs. So one connection can make a node buffer
+///   this node has read it, and on a stream as much as leaves every stream
+///   it may have open within seven eighths of that together: the streams
+///   queued behind the one the node reads cannot take the credit that one,
+///   or a stream this node opened, needs. So one connection can make a node buffer
 ///   288 KiB unread, whatever the peer does. A message larger than a
 ///   stream's window arrives a window at a time, as the node reads it.
 /// - This node may have written two small messages' worth on the
@@ -790,7 +790,7 @@ mod tests {
     /// messages' worth that it has not read, however many streams the peer
     /// uses (decision 2026-10-22, memory across connections, rule 8): a
     /// stream's window on each stream it may open, which together are
-    /// QUIC_RECEIVE_WINDOW.
+    /// seven eighths of QUIC_RECEIVE_WINDOW.
     #[tokio::test]
     async fn a_connection_buffers_at_most_two_unread_messages() {
         // On every stream it may open, as much as each takes: no more than
@@ -802,8 +802,9 @@ mod tests {
         for _ in 0..protocol::QUIC_MAX_BIDI_STREAMS {
             let (mut send, recv) = client.open_bi().await.unwrap();
             let mut on_this = 0usize;
+            // A write waits for credit; one that waits this long has none.
             while let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_millis(300), send.write(&chunk)).await
+                tokio::time::timeout(Duration::from_millis(1500), send.write(&chunk)).await
             {
                 on_this += n;
             }
@@ -813,9 +814,10 @@ mod tests {
         }
         assert_eq!(
             in_all,
-            protocol::QUIC_RECEIVE_WINDOW as usize,
+            (protocol::QUIC_STREAM_RECEIVE_WINDOW * protocol::QUIC_MAX_BIDI_STREAMS) as usize,
             "the connection took {in_all} bytes unread"
         );
+        assert!(in_all <= protocol::QUIC_RECEIVE_WINDOW as usize);
         assert_eq!(
             most,
             protocol::QUIC_STREAM_RECEIVE_WINDOW as usize,
@@ -911,13 +913,13 @@ mod tests {
     /// Decision 2026-10-22, memory across connections, rules 8, 9 and 11.
     /// The configs of every connection but one with a relay listed by key
     /// carry two small messages on the connection each way, an eighth of
-    /// that on a stream, and 8 streams, as the client that dials and as
-    /// the server that is dialled.
+    /// seven eighths of that on a stream, and 8 streams, as the client that
+    /// dials and as the server that is dialled.
     #[test]
     fn the_windows_and_streams_are_set_from_a_small_message() {
         let id = NodeIdentity::generate().unwrap();
         let small = u64::from(protocol::SMALL_MESSAGE_BYTES);
-        let set = (2 * small / 8, 2 * small, 2 * small, 8);
+        let set = ((2 * small - 2 * small / 8) / 8, 2 * small, 2 * small, 8);
         assert_eq!(limits_of(&transport_config()), set);
         assert_eq!(limits_of(&client_config(&id).unwrap()), set);
         assert_eq!(limits_of(&server_config(&id).unwrap().transport), set);
