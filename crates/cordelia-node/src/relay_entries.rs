@@ -118,10 +118,10 @@ use cordelia_core::load::{Answered, Kind, Refusal, Stream, StreamCounts};
 use cordelia_core::lock::{LockWhole, Nested, TimedLock, take_as, taking};
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
-    MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX,
-    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, SMALL_WINDOWS_PULL_ENTRIES,
-    entry_cost,
+    FRAME_LENGTH_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
+    MAX_SLOTS_SHOWN_ON_A_CONNECTION, MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS,
+    RELAY_CHANNELS_PAGE_MAX, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES,
+    SMALL_WINDOWS_PULL_ENTRIES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::proof;
@@ -370,10 +370,6 @@ impl Answer {
         }
     }
 }
-
-/// The bytes of a frame's length, before its message: a frame is counted
-/// with them, as it is read and written.
-const FRAME_LENGTH_BYTES: usize = 4;
 
 /// The entries refused in an answer, for room or for the allowance of new
 /// channels (decision 2026-10-22 §1.2): an entry shown, or each entry

@@ -394,6 +394,13 @@ pub const COLD_MAX: u32 = 50;
 /// operations, small enough to bound memory per connection.
 pub const MAX_MESSAGE_BYTES: u32 = 1_048_576;
 
+/// The bytes of a frame's length, before its message: a big-endian u32
+/// (network-protocol.md §3.1). The codec reads a length into this many
+/// bytes, and the counters of the scale test count a frame with them, as
+/// a relay reads it and a device writes it (decision 2026-10-22 §1.2).
+/// Derived: the size of a u32.
+pub const FRAME_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+
 /// The size every entry must fit in as it travels: 64 KB of ciphertext
 /// (parameter-rationale.md §4). One small size for everything, checked by
 /// the sender, by each relay and by the device that receives it. Small
@@ -2773,6 +2780,11 @@ mod tests {
     #[test]
     fn test_max_message_bytes_parameter_rationale_5_2() {
         assert_eq!(MAX_MESSAGE_BYTES, 1_048_576); // 1 MB
+    }
+
+    #[test]
+    fn test_frame_length_bytes_network_protocol_3_1() {
+        assert_eq!(FRAME_LENGTH_BYTES, 4);
     }
 
     #[test]

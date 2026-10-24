@@ -111,7 +111,7 @@ use cordelia_core::NodeId;
 use cordelia_core::load::DeviceCounts;
 use cordelia_core::lock::{LockWhole, TimedLock};
 use cordelia_core::protocol::{
-    BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT,
+    BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, FRAME_LENGTH_BYTES,
     OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
     WAKE_WAIT_SECS,
 };
@@ -1281,10 +1281,6 @@ async fn exchange(
     let _ = send.finish();
     answer
 }
-
-/// The bytes of a frame's length, before its message: a request is counted
-/// with them, as a relay counts what it reads.
-const FRAME_LENGTH_BYTES: usize = 4;
 
 /// Whether a request failed because the relay reset its stream with
 /// ERR_RATE_LIMIT: the answer, or the request, was cut off with that
