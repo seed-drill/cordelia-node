@@ -659,10 +659,10 @@ fn a_configuration_the_harness_writes_dials_only_its_relays() {
     }
     // Outside loopback: refused before anything starts.
     let mut away = device.clone();
-    away.listen = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    away.listen = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
     assert!(away.check().unwrap_err().contains("127.0.0.0/8"));
     let mut away = device.clone();
-    away.relays[0].0 = "192.168.1.1:9474".parse().unwrap();
+    away.relays[0].0 = "192.0.2.1:9474".parse().unwrap();
     assert!(away.check().unwrap_err().contains("127.0.0.0/8"));
     let mut wide = relay(0);
     wide.listen = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -674,7 +674,9 @@ fn a_configuration_the_harness_writes_dials_only_its_relays() {
     assert!(check_written(&file).unwrap_err().contains("127.0.0.0/8"));
     std::fs::write(
         &file,
-        device.render().replace("127.0.0.1:21001", "10.1.2.3:21001"),
+        device
+            .render()
+            .replace("127.0.0.1:21001", "203.0.113.9:21001"),
     )
     .unwrap();
     assert!(check_written(&file).unwrap_err().contains("127.0.0.0/8"));

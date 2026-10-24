@@ -655,7 +655,7 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         .collect();
     said.push((
         format!(
-            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should              within {NODE_STOP_TIMEOUT_SECS} s{}",
+            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {NODE_STOP_TIMEOUT_SECS} s{}",
             stops.len(),
             badly.len(),
             match badly.is_empty() {
