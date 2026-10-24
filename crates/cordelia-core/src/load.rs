@@ -804,6 +804,17 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
             histogram(&mut out, name, &label, &of(lock, kind));
         }
     }
+    let name = "cordelia_lock_given_up_total";
+    family(
+        &mut out,
+        name,
+        "counter",
+        "Takes of the node's lock that tried until their time was up and were not had, by kind",
+    );
+    for kind in Kind::ALL {
+        let n = lock.given_up(kind);
+        let _ = writeln!(out, "{name}{{kind=\"{}\"}} {n}", kind.name());
+    }
     let name = "cordelia_lock_nested_wait_microseconds";
     family(
         &mut out,

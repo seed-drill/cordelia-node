@@ -1000,6 +1000,10 @@ gauge is what it was when last set.
   `show_short`, `proof`, `pull`, `push`, `relays`, `sweep`, `checkpoint`,
   `pass`, `cycle`, `api` and `other`; buckets of powers of two from 1 µs to
   16 s, with `_sum`, `_count`, `_max` and `_over{ms="5"|"50"|"100"|"250"}`.
+  A take that tries the lock until its time is up (`cordelia msg summary`,
+  for at most 100 ms) has its wait counted from its first try.
+- `cordelia_lock_given_up_total{kind}`: the takes that tried until their time
+  was up and were not had; each is a summary that printed nothing.
 - `cordelia_lock_nested_wait_microseconds{mutex="rates"|"room"}`: the waits
   for a relay's rates and room while the lock is held.
 - `cordelia_requests_total{kind}`, `cordelia_answers_total{kind,answer}`

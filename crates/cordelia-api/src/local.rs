@@ -761,6 +761,7 @@ mod tests {
         for line in [
             "cordelia_lock_hold_microseconds_count{kind=\"api\"} 1\n",
             "cordelia_lock_wait_microseconds_count{kind=\"api\"} 1\n",
+            "cordelia_lock_given_up_total{kind=\"api\"} 0\n",
             "cordelia_lock_hold_microseconds_count{kind=\"pull\"} 0\n",
             "cordelia_requests_total{kind=\"pull\"} 1\n",
             "cordelia_stream_bytes_total{kind=\"pull\",direction=\"in\"} 60\n",

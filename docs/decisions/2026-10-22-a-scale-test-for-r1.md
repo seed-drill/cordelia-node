@@ -107,7 +107,7 @@ What a relay has written and a peer has not acknowledged is not measured: quinn 
 | Memory, CPU, threads, descriptors | as at a relay | `/proc`, once a minute |
 | Requests | requests a minute to each relay, by kind; and those it held back by its own pace (`OWN_ENTRY_REQUESTS_PER_MINUTE`) | Counters of the counters' piece |
 | Requests refused for rate | requests, in all, for each relay | The same counters; cross-checked against the relay's |
-| The lock's wait | µs, a histogram for each kind of take, and the count of waits over 100 ms | The same wrapper |
+| The lock's wait | µs, a histogram for each kind of take, and the count of waits over 100 ms; a `msg summary` that tried the lock for its 100 ms and did not have it is no take, and is counted apart as a wait given up | The same wrapper |
 | What waits to be sent | entries | `outbox_waiting` of `/api/v1/status`, once a minute |
 | Conflict copies | files | Counted by the harness at the end |
 
