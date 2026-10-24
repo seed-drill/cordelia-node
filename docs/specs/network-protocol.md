@@ -125,7 +125,7 @@ in `transport.rs`):
 | Setting | Value | Reason |
 |---|---|---|
 | Receive window of a connection (`QUIC_RECEIVE_WINDOW`) | 294,912 bytes, two small messages (288 KiB) | The largest message a device of this version sends is one small message (`SMALL_MESSAGE_BYTES`, 144 KiB, §9.3). A second can arrive while the first is read |
-| Receive window of a stream (`QUIC_STREAM_RECEIVE_WINDOW`) | 36,864 bytes, an eighth of the connection's | The connection's window divided by the streams a peer may open (checked at compile time). A node reads the streams a peer opens one at a time. Because every stream a peer may have open fits the connection's window, the streams queued behind the one being read cannot hold all of its credit. A message larger than this arrives a window at a time as the node reads it; a small message takes four round trips |
+| Receive window of a stream (`QUIC_STREAM_RECEIVE_WINDOW`) | 32,256 bytes (31.5 KiB): seven eighths of the connection's window, divided by the streams a peer may open | Checked at compile time. A node reads the streams a peer opens one at a time. Every stream a peer may have open fits within seven eighths of the connection's window, so the streams queued behind the one being read cannot hold all of its credit. A stream the node opened itself, such as a relay's own fetch, always has the eighth that is left. Quinn announces more credit for the connection only once an eighth of its window has been read back (`MAX_DATA`), and that eighth is exactly what is left. At an eighth of the window a stream (36,864 bytes), a peer the node had dialled could open all eight of its streams and fill the whole window, so the node's own fetch waited out `STREAM_TIMEOUT_SECS`. A message larger than a stream's window arrives a window at a time as the node reads it; a small message takes five round trips |
 | Send window (`QUIC_SEND_WINDOW`) | 294,912 bytes, two small messages | A write beyond it waits for acknowledgements, and the codec gives it up after `STREAM_TIMEOUT_SECS` |
 | Bidirectional streams a peer may have open (`QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS`) | 8 | The inbound loop serves one stream at a time, so a stream beyond the first only waits. Each open stream may hold up to 32 KiB of quinn's reassembly beyond its data |
 | Unidirectional streams, datagrams | none | No node uses them; quinn's default would keep 1.25 MB of datagrams unread |
@@ -151,7 +151,36 @@ connection's settings when the connection is made, so:
 
 The windows announced are the receiver's own. So a device that dials its
 relay by key may be sent full windows, while what it sends the relay is
-held to the relay's windows for an unlisted peer.
+held to the relay's windows for an unlisted peer. A relay listed by key
+is sent full pages, and the older kind's full fetch answers, only on a
+connection that carries these settings at the sending end
+(`carries_listed_settings`), not by its key alone. A listed relay whose
+connection comes from another address than the one configured gets
+small pages.
+
+**What each exchange takes at a round trip of 200, 300 and 400 ms,** at
+these windows. These are the decision record's §2.3 figures, measured
+over in-process endpoints through a line that delays each datagram
+(`what_each_exchange_takes_at_a_round_trip_of_200_ms` in `transport.rs`,
+run by hand). The last column is the round trip past which the exchange
+takes longer than `STREAM_TIMEOUT_SECS` (10 s); for a pass, it is the
+round trip at which one of its pages does:
+
+| What crosses | 200 ms | 300 ms | 400 ms | Fails past |
+|---|---|---|---|---|
+| A device's push of 128 KiB to its relay | 1.15 s | 1.70 s | 2.25 s | about 1.7 s |
+| A device's pass of 10 pages of 128 KiB, dialling its relay by key | 3.64 s | 5.37 s | 7.20 s | about 5.5 s |
+| The same pass, to a relay configured by address alone | 11.2 s | 16.7 s | 22.2 s | about 1.8 s |
+| A device of the version before pushes 896 KiB | 6.03 s | 8.99 s | 12.0 s | about 0.33 s |
+| An older kind's fetch answer of 1 MiB, between relays not listed by key | 6.85 s | 10.2 s | 13.6 s | about 0.29 s |
+| A full page of 896 KiB between relays listed by key | 0.41 s | 0.61 s | 0.80 s | about 4.9 s |
+
+A message larger than a stream's window takes about one round trip for
+each 31.5 KiB. A device of this version sends nothing larger than a
+small message, so its exchanges work at round trips up to more than a
+second. Only a node of the version before, and the older kind between
+relays not listed by key, send messages large enough to fail the stream
+timeout above about 0.3 s (§9.5).
 
 **The kernel's receive batching of UDP (`UDP_GRO`) is off** on every
 node's endpoint socket. It is turned off after quinn wraps the socket,
@@ -2239,7 +2268,7 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 | an entry of a channel from its secret | A content that is a power of two from 256 bytes to 64 KB, and 237 bytes beside it | Whoever writes it, each relay, the device that receives it (§4.9, data-formats.md §9.2) |
 | a text and its name in such an entry | 60 KB together (`MAX_ENTRY_NAME_AND_VALUE_BYTES`) | The device that writes it; one that is over is no version to a device that reads it |
-| a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) between relays listed by key | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push. A page that stops at its bytes says there is more, and its reader reads on |
+| a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) to a relay listed by key, on a connection that carries the listed settings (§2.1) | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push. A page that stops at its bytes says there is more, and its reader reads on |
 | a small message (`SMALL_MESSAGE_BYTES`) | 144 KiB (147,456): a small page and 16 KiB | Every message a device of alpha.16 sends or is sent fits one. A node reads a longer frame from a peer that is not a relay listed by key only under a large permit (below) |
 
 Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
@@ -2290,7 +2319,11 @@ The QUIC application error codes a node closes a connection or resets a stream w
 **What a node of alpha.15 or alpha.14 meets from one of alpha.16.** Nothing changes on the wire for a message that fits a small message.
 
 - **A stop with `0x05`.** It comes on a push of over 144 KiB (a device of those versions pushes up to 896 KiB) while every permit it could take is held. A relay of those versions can also meet it on an older kind's fetch answer or channel list over that size, sent to a relay of alpha.16 that does not list it by key. A sender blocked in its write of the payload sees the stop (`WriteError::Stopped(0x05)`), not the reset. Those versions match only `ERR_RATE_LIMIT` (`refused_for_now`), so they take `0x05` as a request not answered and send the same batch again at their next send. Nothing else in their handling changes.
-- **Smaller windows and 8 streams,** announced by QUIC itself. A large message arrives a window at a time. A relay of those versions retries the older kind's pushes one stream for each item, and against a relay of alpha.16 that does not list it by key, most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1).
+- **Smaller windows and 8 streams,** announced by QUIC itself. A large message arrives a window at a time, about one round trip for each 31.5 KiB.
+- **At round trips above about 0.3 s, its large messages fail the stream timeout** (§2.1's table).
+  - Its pushes of up to 896 KiB to a relay of alpha.16 take about 6.0 s at 200 ms, 9.0 s at 300 ms and 12.0 s at 400 ms. They fail on every try past about 0.33 s, so its outbox does not drain at that relay over such a link.
+  - An older kind's fetch answer of 1 MiB between relays not listed by key takes 6.85 s at 200 ms, 10.2 s at 300 ms and 13.6 s at 400 ms. It fails past about 0.29 s, and the fetcher then asks for fewer items (`SYNC_PAGE_STEPS`).
+  - A node of alpha.16 does not meet this. Its pushes and pages are small messages: a push of 128 KiB fails only past about 1.7 s. Between relays listed by key, which keep the windows from before, a full page fails only past about 4.9 s. A relay of those versions retries the older kind's pushes one stream for each item, and against a relay of alpha.16 that does not list it by key, most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1).
 - **Small pages.** A page from a relay of alpha.16 holds at most 128 KiB of entries and says there is more. Those versions read on from such a page as from any other, except `cordelia accept`, which reads one page of the pair channel. Where an entry of the largest size comes before the typed key's hand-over, an older device does not find the hand-over. The device being added runs alpha.16, and it reads on.
 
 ---
