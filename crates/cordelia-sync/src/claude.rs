@@ -1130,7 +1130,7 @@ fn exchange_names(
 
 fn lock(
     state: &AppState,
-) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, CordeliaError> {
+) -> Result<cordelia_core::lock::TimedGuard<'_, rusqlite::Connection>, CordeliaError> {
     state
         .db
         .lock()
@@ -2666,7 +2666,10 @@ mod tests {
     /// folder's first cycle waits for none.
     fn state(dir: &Path) -> AppState {
         let state = AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: dir.join("node"),

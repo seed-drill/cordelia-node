@@ -238,7 +238,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin + GiveUp>(
 /// MAX_MESSAGE_BYTES here, as it is for a whole-frame read, so a caller
 /// never allocates by a length straight off the wire (CLAUDE.md).
 pub async fn read_frame_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u32, CodecError> {
-    let mut len_buf = [0u8; 4];
+    let mut len_buf = [0u8; protocol::FRAME_LENGTH_BYTES];
     read_exact_guarded(reader, &mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_MESSAGE_BYTES {

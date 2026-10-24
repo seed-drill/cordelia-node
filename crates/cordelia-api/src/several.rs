@@ -436,7 +436,8 @@ impl Several {
 /// network: what a handler is given.
 pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
     crate::state::AppState {
-        db: std::sync::Mutex::new(machine.conn),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(machine.conn),
         identity: machine.identity,
         bearer_token: "t".into(),
         home_dir: std::env::temp_dir().join("cordelia-several-test-no-such-directory"),
@@ -459,7 +460,7 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
 
 // ── A node with a network, and a stand-in for its loop ───────────────
 
-fn db(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
+fn db(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
 }
 

@@ -982,6 +982,54 @@ cordelia_items_synced_total 45
 - `cordelia_replication_lag_seconds` is computed as `now() - last_successful_sync_at` per channel. High values indicate replication problems.
 - SPOs already run Prometheus/Grafana for Cardano nodes. Same stack, zero learning curve.
 
+### 3.15a GET /api/v1/metrics/load
+
+> **v1 status.** The counters of the scale test
+> ([decision 2026-10-22](../decisions/2026-10-22-a-scale-test-for-r1.md)
+> §1.1, rule 3; §7.3; `crates/cordelia-core/src/load.rs`). Served by every
+> role.
+
+The same text form as §3.15. Bearer token authentication required; it is
+answered while a node is held up, as every GET is. **It takes no lock:** the
+token is checked and atomics are read, so a read neither waits for the
+node's work nor holds it up. Each counter counts from the node's start; a
+gauge is what it was when last set.
+
+- `cordelia_lock_wait_microseconds` and `cordelia_lock_hold_microseconds`:
+  histograms of the node's lock on its database, `kind` one of `show_whole`,
+  `show_short`, `proof`, `pull`, `push`, `relays`, `sweep`, `checkpoint`,
+  `pass`, `cycle`, `api` and `other`; buckets of powers of two from 1 µs to
+  16 s, with `_sum`, `_count`, `_max` and `_over{ms="5"|"50"|"100"|"250"}`.
+  A take that tries the lock until its time is up (`cordelia msg summary`,
+  for at most 100 ms) has its wait counted from its first try.
+- `cordelia_lock_given_up_total{kind}`: the takes that tried until their time
+  was up and were not had; each is a summary that printed nothing.
+- `cordelia_lock_nested_wait_microseconds{mutex="rates"|"room"}`: the waits
+  for a relay's rates and room while the lock is held.
+- `cordelia_requests_total{kind}`, `cordelia_answers_total{kind,answer}`
+  (`answered`, once the answer is written; `not_now`, `refused_for_rate`,
+  `not_served`, `stray`, and `large_later`, a frame over a small message for
+  which no large permit came, of which only the length was read),
+  `cordelia_entries_refused_total{kind,answer}` (`refused_for_room`,
+  `refused_for_new_channels`, each entry refused in an answer given) and
+  `cordelia_stream_bytes_total{kind,direction}`: what a relay is asked on the
+  streams of entries. A request is counted as it is read, with its bytes in.
+- `cordelia_connections_open`, `cordelia_connections_closed_total` (gone for
+  any reason, warm churn's among them),
+  `cordelia_connections_turned_away_total{why="bound"|"address"|"subnet"|"refused_for_a_time"}`
+  and `cordelia_relay_link_closures_total{relay}`.
+- `cordelia_churns_total`, `cordelia_closed_by_warm_churn_total{peer="device"|"relay"}`
+  and `cordelia_governor_peers{state="hot"|"warm"|"cold"}`, the governor's
+  own count at its tick.
+- `cordelia_device_requests_total{relay,kind}`,
+  `cordelia_device_request_bytes_total{relay,kind}`,
+  `cordelia_device_held_back_total{relay}` and
+  `cordelia_device_refused_for_now_total{relay}`: what a device asked of
+  each relay, by its key in hex. Refused for now is what the relay reset
+  with `ERR_RATE_LIMIT`, which a relay's `refused_for_rate` and `not_now`
+  both are: a device cannot tell them apart, and its count is checked
+  against the two together.
+
 ---
 
 ### 3.16 The Local API of a Device, for the Names It Holds
@@ -1479,7 +1527,7 @@ This is a clean break. Zero backward compatibility with the pre-pivot API. No mi
 > | `/api/v1/channels/*` | `publish`, `entries`, `delete-key`, `identity` for the names it holds (§3.16) | The Channels API of the older kind (§3.1 to §3.14) |
 > | `/api/v1/devices/*`, `/api/v1/phrase/make`, `/api/v1/change/*` | A person's devices (§3.17) | Served |
 > | `/api/v1/sync/*`, `/api/v1/history/*` | Sync and local history (§3.18) | Served |
-> | `/api/v1/status`, `/api/v1/metrics`, `/api/v1/health`, `/api/v1/peers` | Yes | Yes |
+> | `/api/v1/status`, `/api/v1/metrics`, `/api/v1/metrics/load`, `/api/v1/health`, `/api/v1/peers` | Yes | Yes |
 >
 > `/api/v1/diagnostics` is not served.
 

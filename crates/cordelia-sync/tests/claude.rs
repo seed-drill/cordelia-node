@@ -25,7 +25,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use cordelia_api::state::AppState;
@@ -65,7 +64,10 @@ impl Device {
         let node_dir = base.join("node");
         std::fs::create_dir_all(&home).unwrap();
         let state = AppState {
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: node_dir,

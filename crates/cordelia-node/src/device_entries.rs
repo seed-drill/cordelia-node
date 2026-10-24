@@ -114,7 +114,7 @@ pub mod reach;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted, drop_old_hand_overs, write_over_dropped};
@@ -130,6 +130,8 @@ use cordelia_api::state::{
 };
 use cordelia_api::take::Taken;
 use cordelia_api::{marks, sender};
+use cordelia_core::load::Kind as TakeKind;
+use cordelia_core::lock::{LockWhole, take_as, taking};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
     ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION,
@@ -175,8 +177,8 @@ const LEFT_ROOM_WAIT: Duration = Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS)
 
 /// Lock a mutex, also one whose holder panicked: what it guards is whole
 /// after any one step.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<L: LockWhole + ?Sized>(mutex: &L) -> L::Guard<'_> {
+    mutex.lock_whole()
 }
 
 /// A relay that the device is set up with: what its configuration calls
@@ -493,9 +495,10 @@ impl DeviceEntries {
         most_proved: usize,
         reach: Arc<Reach>,
     ) -> Arc<Self> {
+        let counts = state.load.device.clone();
         Arc::new(Self {
             state,
-            leave: Leave::new(clock.clone()),
+            leave: Leave::new(clock.clone()).counting(counts),
             clock,
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
@@ -547,6 +550,13 @@ impl DeviceEntries {
     /// §10.1): nothing is shown, asked, sent or taken, of either kind of
     /// pass, until it is held up no longer.
     pub async fn pass(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
+        // Each take of the lock in a pass is of a pass (decision
+        // 2026-10-22 §1.1, rule 4).
+        take_as(TakeKind::Pass, self.passing(relays, kind)).await
+    }
+
+    /// [`Self::pass`], whose takes of the lock are said as its own.
+    async fn passing(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
         if self.state.held.why().is_some() {
             return;
         }
@@ -563,7 +573,11 @@ impl DeviceEntries {
             let typed = typed.unwrap_or_default();
             for link in links.iter().filter(|_| !typed.is_empty()) {
                 let (engine, link, typed) = (Arc::clone(self), (*link).clone(), typed.clone());
-                asking.spawn(async move { engine.asks_for_hand_overs(&link, &typed).await });
+                // A task of its own takes the lock as the pass does
+                // (decision 2026-10-22 §1.1, rule 4), and so below.
+                asking.spawn(take_as(TakeKind::Pass, async move {
+                    engine.asks_for_hand_overs(&link, &typed).await
+                }));
             }
         }
         let read_all = self.pass_at(relays, &links, kind).await;
@@ -616,6 +630,13 @@ impl DeviceEntries {
     /// **A node that is held up reads nothing** (decision 2026-10-04
     /// §10.1): every relay is answered for as not read.
     pub async fn door(self: &Arc<Self>, relays: &[Relay], ask: DoorAsk) {
+        // What it asks of the relays is a pass's kind of take of the lock
+        // (decision 2026-10-22 §1.1, rule 4).
+        take_as(TakeKind::Pass, self.through_the_door(relays, ask)).await
+    }
+
+    /// [`Self::door`], whose takes of the lock are said as its own.
+    async fn through_the_door(self: &Arc<Self>, relays: &[Relay], ask: DoorAsk) {
         let open = |relay: &Relay| relay.link.clone().filter(|link| link.is_open());
         match ask {
             DoorAsk::Sessions { answer } => {
@@ -699,7 +720,7 @@ impl DeviceEntries {
                     };
                     let engine = Arc::clone(self);
                     let place = from.get(&name).copied().unwrap_or(LeftPlace::START);
-                    reads.spawn(async move {
+                    reads.spawn(take_as(TakeKind::Pass, async move {
                         let read = engine
                             .read_left(&link, &channel, &proof, place, until)
                             .await;
@@ -708,7 +729,7 @@ impl DeviceEntries {
                             read,
                             key,
                         }
-                    });
+                    }));
                 }
                 while let Some(done) = reads.join_next().await {
                     if let Ok(done) = done {
@@ -1038,7 +1059,9 @@ impl DeviceEntries {
             for link in links {
                 if whole || !self.leave.has_heard(link.name()) {
                     let (engine, link) = (Arc::clone(self), (*link).clone());
-                    shows.spawn(async move { (link.id(), engine.show_at(&link, false).await) });
+                    shows.spawn(take_as(TakeKind::Pass, async move {
+                        (link.id(), engine.show_at(&link, false).await)
+                    }));
                 }
             }
             while let Some(done) = shows.join_next().await {
@@ -1057,7 +1080,9 @@ impl DeviceEntries {
         for link in links {
             let shown = shown.get(&link.id()).copied();
             let (engine, link) = (Arc::clone(self), (*link).clone());
-            turns.spawn(async move { engine.turn(&link, kind, shown).await });
+            turns.spawn(take_as(TakeKind::Pass, async move {
+                engine.turn(&link, kind, shown).await
+            }));
         }
         let mut read_all = true;
         while let Some(turn) = turns.join_next().await {
@@ -1321,6 +1346,7 @@ impl DeviceEntries {
     /// 2026-10-04 §16): one that failed is tried again when the device is
     /// next asked, and not a day later.
     pub fn sweep_deletes(&self) {
+        let _sweep = taking(TakeKind::Sweep);
         let held_up = self.state.held.why().is_some();
         if held_up {
             return;
@@ -1374,6 +1400,9 @@ impl DeviceEntries {
     /// this version is done its store holds no message, and over a
     /// database from a later version it writes nothing.
     pub fn messages_hourly(&self) {
+        // Its takes of the lock end with the checkpoint, and are of its
+        // kind (decision 2026-10-22 §1.2).
+        let _checkpoint = taking(TakeKind::Checkpoint);
         if self.state.held.why().is_some() {
             return;
         }
@@ -3111,7 +3140,10 @@ mod tests {
     /// follows no phrase.
     fn a_node() -> Arc<cordelia_api::state::AppState> {
         Arc::new(cordelia_api::state::AppState {
-            db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: std::env::temp_dir().join("cordelia-hourly-test-no-such-directory"),
@@ -3220,6 +3252,26 @@ mod tests {
         assert_eq!(device.unix(), set + 1);
         device.messages_hourly();
         assert!(bodies().is_empty());
+    }
+
+    /// A device's sweep of old deletes and its hourly task each take the
+    /// lock as their own kind, and as no other (decision 2026-10-22 §1.1,
+    /// rule 4; §1.2): the sweep as a sweep, and the hourly task, which ends
+    /// with the checkpoint, as the checkpoint.
+    #[test]
+    fn a_devices_sweep_and_its_hourly_task_take_the_lock_each_as_its_kind() {
+        let state = a_node();
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let kinds = || -> Vec<TakeKind> {
+            TakeKind::ALL
+                .into_iter()
+                .filter(|kind| state.db.times().hold(*kind).count > 0)
+                .collect()
+        };
+        device.sweep_deletes();
+        assert_eq!(kinds(), [TakeKind::Sweep]);
+        device.messages_hourly();
+        assert_eq!(kinds(), [TakeKind::Sweep, TakeKind::Checkpoint]);
     }
 
     /// What is kept in memory of a relay and a channel is kept while

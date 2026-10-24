@@ -733,9 +733,14 @@ async fn blocking<T: Serialize + Send + 'static>(
     state: web::Data<AppState>,
     work: impl FnOnce(&AppState) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<HttpResponse, ApiError> {
-    let answer = web::block(move || work(&state))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))??;
+    // On another thread, its takes of the lock are still of the local
+    // API (decision 2026-10-22 §1.1, rule 4).
+    let answer = web::block(move || {
+        let _api = cordelia_core::lock::taking(cordelia_core::load::Kind::Api);
+        work(&state)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(HttpResponse::Ok().json(answer))
 }
 
@@ -796,7 +801,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("node");
         let state = AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: home.clone(),
@@ -908,6 +916,29 @@ mod tests {
             names.sort();
             names
         }
+    }
+
+    /// The work of a route of history runs on another thread, and its
+    /// takes of the lock there are of the local API, and of no other kind
+    /// (decision 2026-10-22 §1.1, rule 4): the kind of the request's own
+    /// thread is not on that one.
+    #[actix_rt::test]
+    async fn the_work_of_a_route_of_history_takes_the_lock_as_the_local_api() {
+        use cordelia_core::load::Kind;
+        let Node { state, _dir, .. } = node();
+        let state = web::Data::new(state);
+        let answered = blocking(state.clone(), |state| {
+            drop(state.db.lock().unwrap());
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(answered.status().is_success());
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|kind| state.db.times().hold(*kind).count > 0)
+            .collect();
+        assert_eq!(kinds, [Kind::Api]);
     }
 
     /// A restore writes as the adapter writes. A file that an agent writes

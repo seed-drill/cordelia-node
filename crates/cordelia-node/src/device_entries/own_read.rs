@@ -127,6 +127,17 @@ impl DeviceEntries {
     /// A round lasts until `until`, and no longer than CARRY_READ_MAX_SECS
     /// from now, whatever was asked.
     pub async fn own(self: &Arc<Self>, relays: &[Relay], ask: OwnAsk) {
+        // What it asks of the relays is a pass's kind of take of the lock
+        // (decision 2026-10-22 §1.1, rule 4).
+        cordelia_core::lock::take_as(
+            cordelia_core::load::Kind::Pass,
+            self.reading_own(relays, ask),
+        )
+        .await
+    }
+
+    /// [`Self::own`], whose takes of the lock are said as its own.
+    async fn reading_own(self: &Arc<Self>, relays: &[Relay], ask: OwnAsk) {
         match ask {
             OwnAsk::Begin {
                 channel,
@@ -229,11 +240,14 @@ impl DeviceEntries {
             match (&own, link) {
                 (Some(channel), Some(link)) => {
                     let (engine, channel, read) = (Arc::clone(self), channel.clone(), *read);
-                    reading.spawn(async move {
-                        engine
-                            .read_own_at(&link, &read, &under, &channel, one, until)
-                            .await
-                    });
+                    reading.spawn(cordelia_core::lock::take_as(
+                        cordelia_core::load::Kind::Pass,
+                        async move {
+                            engine
+                                .read_own_at(&link, &read, &under, &channel, one, until)
+                                .await
+                        },
+                    ));
                 }
                 _ => {
                     one.not_reached();
