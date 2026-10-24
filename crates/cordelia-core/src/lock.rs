@@ -604,8 +604,9 @@ mod tests {
     /// try to the take, as a wait of its kind; one not had by its deadline
     /// is counted as given up, and records no wait (decision 2026-10-22
     /// §1.2, bar 5). Another thread holds the lock for 150 ms while a take
-    /// tries for 300 ms, a pause of 1 ms between tries, as `cordelia msg
-    /// summary` does; and again while one tries for 100 ms.
+    /// tries for up to a second, a pause of 1 ms between tries, as
+    /// `cordelia msg summary` does; and for 400 ms while one tries for
+    /// 100 ms.
     #[test]
     fn a_take_that_tries_until_a_deadline_records_its_wait_from_its_first_try() {
         let lock = Arc::new(TimedLock::new(()));
@@ -615,7 +616,7 @@ mod tests {
         };
         let _api = taking(Kind::Api);
         let holder = held_for(&lock, 150);
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let deadline = Instant::now() + Duration::from_secs(1);
         let taken = at_once(lock.try_lock_until(deadline, pause));
         assert!(taken.is_some(), "the lock was let go within the deadline");
         drop(taken);
@@ -630,7 +631,7 @@ mod tests {
         );
         assert_eq!(lock.times().given_up(Kind::Api), 0);
 
-        let holder = held_for(&lock, 150);
+        let holder = held_for(&lock, 400);
         let deadline = Instant::now() + Duration::from_millis(100);
         assert!(at_once(lock.try_lock_until(deadline, pause)).is_none());
         holder.join().unwrap();

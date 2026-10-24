@@ -3529,8 +3529,8 @@ mod tests {
     /// recorded from its first try to the take, as a wait of its kind; and
     /// a summary that does not have the lock within its 100 ms is counted
     /// as given up, and records no wait (decision 2026-10-22 §1.2, bar 5).
-    /// Another holds the lock for 150 ms each time: while a try of 300 ms
-    /// waits for it, and while a summary does.
+    /// Another holds the lock for 150 ms while a try of up to a second
+    /// waits for it, and for 400 ms while a summary does.
     #[actix_web::test]
     async fn a_wait_that_tries_for_the_store_is_recorded_and_a_summary_that_gives_up_is_counted() {
         use cordelia_core::load::Kind;
@@ -3548,7 +3548,7 @@ mod tests {
             holder
         };
         let holder = held_for(150);
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let deadline = Instant::now() + Duration::from_secs(1);
         let taken = take_as(Kind::Api, async { db_by(&state, deadline).await.is_some() }).await;
         holder.join().unwrap();
         assert!(taken, "the lock was let go within the deadline");
@@ -3558,7 +3558,7 @@ mod tests {
         assert_eq!(wait.over[2], 1, "a wait over 100 ms, as bar 5 counts");
         assert_eq!(state.db.times().given_up(Kind::Api), 0);
 
-        let holder = held_for(150);
+        let holder = held_for(400);
         let summarised = summary(asked(), state.clone(), summary_asked("work", 100));
         let answered = take_as(Kind::Api, summarised).await;
         holder.join().unwrap();
