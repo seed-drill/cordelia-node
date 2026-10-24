@@ -6227,12 +6227,12 @@ mod tests {
         let taken = serde_json::json!({
             "folder": format!("{claude}/-x-src-cn"), "cwd": format!("{home}/src/cn"),
             "name": "github.com/o/cn", "mappable": true, "needs_name": true,
-            "says": "needs another name (its own is mapped from /x/Work/cn)",
+            "says": "another copy of github.com/o/cn, which syncs from /x/Work/cn: to sync this one too, give it its own name",
         });
         assert_eq!(
             row(taken)[1..],
             [
-                "needs another name (its own is mapped from /x/Work/cn)",
+                "another copy of github.com/o/cn, which syncs from /x/Work/cn: to sync this one too, give it its own name",
                 "cordelia sync map ~/src/cn <name>"
             ]
         );
@@ -6684,7 +6684,7 @@ mod tests {
             // Needs a name: another folder is mapped under its own.
             { "folder": folder("-x-src-cn"), "cwd": format!("{home}/src/cn"),
               "name": "github.com/o/two", "mappable": true, "needs_name": true,
-              "says": "needs another name (its own is mapped from /x/two)" },
+              "says": "another copy of github.com/o/two, which syncs from /x/two: to sync this one too, give it its own name" },
             // The home directory's own folder, as `~` and under a name.
             { "folder": folder("-x"), "cwd": home, "name": "~", "mappable": true, "home": true },
             // A tree laid out by hand.
@@ -6718,7 +6718,7 @@ mod tests {
             ],
             vec![
                 "~/src/cn",
-                "needs another name (its own is mapped from /x/two)",
+                "another copy of github.com/o/two, which syncs from /x/two: to sync this one too, give it its own name",
                 "cordelia sync map ~/src/cn <name>",
             ],
             vec!["~", "synced as home memory", "cordelia sync map ~ --home"],

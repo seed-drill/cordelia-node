@@ -1515,10 +1515,16 @@ fn what_is_found_says_whether_map_would_sync_it() {
     let repo = a.clone_at("Work/cordelia-node");
     a.claude_folder(&repo);
     map(&a, &repo, PROJECT);
-    // A second clone of it: found under the name that the first is
-    // mapped under, so it needs a name of its own.
+    // A second clone of it, with memory of its own: found under the name
+    // that the first is mapped under, so it needs a name of its own.
     let second = a.clone_at("src/cn");
-    a.session_in(&second);
+    std::fs::write(a.claude_folder(&second).join("notes.md"), "own\n").unwrap();
+    // A third, with a session and no memory, and a fourth whose memory
+    // folder is empty: nothing to sync apart, so neither is listed (#207).
+    let third = a.clone_at("src/cn3");
+    a.session_in(&third);
+    let fourth = a.clone_at("src/cn4");
+    a.claude_folder(&fourth);
     // A project of its own, under its remote's name.
     let other = a.clone_of("Work/other", "git@github.com:seed-drill/other.git");
     a.session_in(&other);
@@ -1588,10 +1594,19 @@ fn what_is_found_says_whether_map_would_sync_it() {
     assert_eq!(
         clone.says,
         Some(format!(
-            "needs another name (its own is mapped from {})",
+            "another copy of {PROJECT}, which syncs from {}: to sync this one too, give it its \
+             own name",
             shown(&repo)
         ))
     );
+    for empty in [&third, &fourth] {
+        let of = shown(&a.folder_of(empty));
+        assert!(
+            !report.unmapped.iter().any(|entry| entry.folder == of),
+            "{of} is listed: {:?}",
+            report.unmapped
+        );
+    }
 
     let home = entry(&a.folder_of(&a.home));
     assert!(home.mappable && home.home && !home.needs_name, "{home:?}");

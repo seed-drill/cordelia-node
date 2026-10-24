@@ -349,6 +349,11 @@ fn name_of(project: &Project) -> String {
     }
 }
 
+/// Whether the memory folder `memory` is there and holds anything.
+fn holds_a_file(memory: &Path) -> bool {
+    std::fs::read_dir(memory).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// One folder to sync this cycle: a mapped one.
 struct Target {
     /// Claude Code's folder.
@@ -718,9 +723,6 @@ impl ClaudeAdapter {
             mappings: &declared,
         };
         for candidate in candidates {
-            if candidate.project.is_none() {
-                report.unsynced.push(candidate.dir.display().to_string());
-            }
             let name = candidate.project.as_ref().map(name_of);
             let asked = found::Asked {
                 folder: &candidate.dir,
@@ -728,6 +730,22 @@ impl ClaudeAdapter {
                 name: name.as_deref(),
             };
             let looked = Looked { git: candidate.git };
+            // Another copy of a repository whose memory syncs from another
+            // folder, with no memory of its own: mapped under a name of its
+            // own, it would sync an empty folder, and under the repository's
+            // it would get nothing that does not reach this device already.
+            // Not worth a line (#207).
+            if !holds_a_file(&candidate.dir.join("memory"))
+                && matches!(
+                    found::would_map(&asked, &against, &looked),
+                    found::Maps::Yes(found::How::UnderAName(found::WhyAName::Taken { .. }))
+                )
+            {
+                continue;
+            }
+            if candidate.project.is_none() {
+                report.unsynced.push(candidate.dir.display().to_string());
+            }
             report
                 .unmapped
                 .push(found::Entry::of(&asked, &against, &looked));

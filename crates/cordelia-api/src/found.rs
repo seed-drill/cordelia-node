@@ -463,8 +463,14 @@ pub enum WhyAName {
     HasNone,
     /// The name it has is not one that a folder can be mapped under.
     NotUsable,
-    /// Another folder is mapped under the name it has: that folder.
-    Taken(String),
+    /// Another folder is mapped under the name it has: it is another
+    /// copy of a repository whose memory syncs from that folder.
+    Taken {
+        /// The name, as `map` would send it.
+        name: String,
+        /// The folder that is mapped under it.
+        folder: String,
+    },
 }
 
 /// Why `cordelia sync map` would not sync a folder that was found.
@@ -557,9 +563,10 @@ impl WhyAName {
         match self {
             WhyAName::HasNone => "needs a name (not a git project)".into(),
             WhyAName::NotUsable => "needs a name (the one it has cannot be mapped)".into(),
-            WhyAName::Taken(folder) => {
-                format!("needs another name (its own is mapped from {folder})")
-            }
+            WhyAName::Taken { name, folder } => format!(
+                "another copy of {name}, which syncs from {folder}: to sync this one too, \
+                 give it its own name"
+            ),
         }
     }
 }
@@ -657,7 +664,10 @@ pub fn would_map(asked: &Asked, against: &Against, machine: &dyn Machine) -> Map
         return Maps::Yes(How::UnderAName(WhyAName::NotUsable));
     }
     if let Some(mapped) = against.mappings.iter().find(|mapping| mapping.name == name) {
-        return Maps::Yes(How::UnderAName(WhyAName::Taken(mapped.folder.clone())));
+        return Maps::Yes(How::UnderAName(WhyAName::Taken {
+            name,
+            folder: mapped.folder.clone(),
+        }));
     }
     Maps::Yes(How::UnderItsName)
 }
@@ -1515,7 +1525,10 @@ mod tests {
         // under: it needs a name of its own.
         assert_eq!(
             asks_of("/home/sam/src/cn", Some("github.com/o/cn"), &mapped),
-            Maps::Yes(How::UnderAName(WhyAName::Taken("/home/sam/Work/cn".into())))
+            Maps::Yes(How::UnderAName(WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+            }))
         );
     }
 
@@ -1545,7 +1558,10 @@ mod tests {
         let mapped = [mapping("/home/sam/Work/cn", "github.com/o/cn")];
         assert_eq!(
             asks_of("/home/sam/src/cn", Some("github.com/o/cn.git"), &mapped),
-            Maps::Yes(How::UnderAName(WhyAName::Taken("/home/sam/Work/cn".into())))
+            Maps::Yes(How::UnderAName(WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+            }))
         );
     }
 
