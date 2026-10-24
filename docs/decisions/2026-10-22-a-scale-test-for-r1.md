@@ -106,7 +106,7 @@ What a relay has written and a peer has not acknowledged is not measured: quinn 
 | Catching up | seconds, from the moment a device is running again after being off to the moment it holds every edit its person made while it was off | The harness, from the same records |
 | Memory, CPU, threads, descriptors | as at a relay | `/proc`, once a minute |
 | Requests | requests a minute to each relay, by kind; and those it held back by its own pace (`OWN_ENTRY_REQUESTS_PER_MINUTE`) | Counters of the counters' piece |
-| Requests refused for rate | requests, in all, for each relay | The same counters; cross-checked against the relay's |
+| Requests refused for rate | requests, in all, for each relay | The same counters, as refused for now: a relay resets a request refused for rate and one not now with the same code (`ERR_RATE_LIMIT`), so a device counts them together, and the count is cross-checked against the relay's refused for rate and not now together |
 | The lock's wait | µs, a histogram for each kind of take, and the count of waits over 100 ms; a `msg summary` that tried the lock for its 100 ms and did not have it is no take, and is counted apart as a wait given up | The same wrapper |
 | What waits to be sent | entries | `outbox_waiting` of `/api/v1/status`, once a minute |
 | Conflict copies | files | Counted by the harness at the end |

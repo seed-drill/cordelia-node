@@ -10666,7 +10666,7 @@ async fn what_a_device_counts_it_asked_is_what_its_relay_counts_it_read() {
         assert!(value_of(&text, &held) > 0, "{held}");
     }
     assert_eq!(asked.asked[Stream::Relays as usize], 0);
-    assert_eq!((asked.held_back, asked.refused_for_rate), (0, 0));
+    assert_eq!((asked.held_back, asked.refused_for_now), (0, 0));
     assert_eq!(value_of(&text, "cordelia_connections_open"), 1);
     assert_eq!(
         value_of(

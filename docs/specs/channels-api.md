@@ -1020,8 +1020,11 @@ gauge is what it was when last set.
 - `cordelia_device_requests_total{relay,kind}`,
   `cordelia_device_request_bytes_total{relay,kind}`,
   `cordelia_device_held_back_total{relay}` and
-  `cordelia_device_refused_for_rate_total{relay}`: what a device asked of
-  each relay, by its key in hex.
+  `cordelia_device_refused_for_now_total{relay}`: what a device asked of
+  each relay, by its key in hex. Refused for now is what the relay reset
+  with `ERR_RATE_LIMIT`, which a relay's `refused_for_rate` and `not_now`
+  both are: a device cannot tell them apart, and its count is checked
+  against the two together.
 
 ---
 

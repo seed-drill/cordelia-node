@@ -521,7 +521,7 @@ pub struct Leave {
     clock: Clock,
     inner: Mutex<Inner>,
     /// What the device asked of each relay, held back and was refused for
-    /// rate: counted, and read by nothing here (decision 2026-10-22 §1.2,
+    /// now: counted, and read by nothing here (decision 2026-10-22 §1.2,
     /// §7.3).
     counts: Arc<DeviceCounts>,
 }
@@ -1191,7 +1191,7 @@ impl Leave {
     /// The relay whose node key is `relay` refused a request for now
     /// ([`Self::refused_at`]).
     fn refused_by(&self, relay: [u8; 32]) {
-        self.counts.refused_for_rate(&relay);
+        self.counts.refused_for_now(&relay);
         let now = self.clock.now();
         let mut inner = lock(&self.inner);
         // Those older than the window are forgotten first, so that a relay
@@ -1581,17 +1581,18 @@ mod tests {
         );
     }
 
-    /// A request that a relay refused for rate is counted for that relay
-    /// (decision 2026-10-22 §1.2), and for no other.
+    /// A request that a relay refused for now, for rate or not now, is
+    /// counted for that relay (decision 2026-10-22 §1.2), and for no
+    /// other.
     #[test]
-    fn a_request_refused_for_rate_is_counted_for_its_relay() {
+    fn a_request_refused_for_now_is_counted_for_its_relay() {
         let counts = Arc::new(DeviceCounts::default());
         let leave = Leave::new(Clock::system()).counting(counts.clone());
         leave.refused_by([1; 32]);
         leave.refused_by([1; 32]);
         leave.refused_by([2; 32]);
-        assert_eq!(counts.of(&[1; 32]).refused_for_rate, 2);
-        assert_eq!(counts.of(&[2; 32]).refused_for_rate, 1);
+        assert_eq!(counts.of(&[1; 32]).refused_for_now, 2);
+        assert_eq!(counts.of(&[2; 32]).refused_for_now, 1);
         assert_eq!(counts.of(&[1; 32]).held_back, 0);
     }
 }

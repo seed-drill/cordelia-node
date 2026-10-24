@@ -646,17 +646,24 @@ impl GovernorCounts {
 
 /// Where each of a device's counts for a relay is: its requests and
 /// their bytes by stream kind, then those it held back and those the
-/// relay refused for rate.
+/// relay refused for now.
 const ASKED: usize = 0;
 const ASKED_BYTES: usize = Stream::ALL.len();
 const HELD_BACK: usize = 2 * Stream::ALL.len();
-const REFUSED_FOR_RATE: usize = HELD_BACK + 1;
-const DEVICE_COUNTS: usize = REFUSED_FOR_RATE + 1;
+const REFUSED_FOR_NOW: usize = HELD_BACK + 1;
+const DEVICE_COUNTS: usize = REFUSED_FOR_NOW + 1;
 
 /// What a device asked of each relay (decision 2026-10-22 §1.2): the
 /// requests by stream kind and their bytes, counted as each is sent; the
 /// requests it held back by its own pace (OWN_ENTRY_REQUESTS_PER_MINUTE);
-/// and those the relay refused for rate.
+/// and those the relay refused for now.
+///
+/// **Refused for now** is what the relay reset with ERR_RATE_LIMIT: a
+/// request over the connection's or the address's count (the relay's
+/// `refused_for_rate`, a breach) and one for more than the device may be
+/// handed for now (its `not_now`, no breach) are reset with the same code,
+/// and a device cannot tell them apart. So it is cross-checked against the
+/// relay's `refused_for_rate` and `not_now` together.
 #[derive(Debug, Default)]
 pub struct DeviceCounts {
     relays: ByRelay<DEVICE_COUNTS>,
@@ -668,7 +675,8 @@ pub struct DeviceRead {
     pub asked: [u64; Stream::ALL.len()],
     pub asked_bytes: [u64; Stream::ALL.len()],
     pub held_back: u64,
-    pub refused_for_rate: u64,
+    /// Reset by the relay with ERR_RATE_LIMIT: for rate, or not now.
+    pub refused_for_now: u64,
 }
 
 impl DeviceRead {
@@ -677,7 +685,7 @@ impl DeviceRead {
             asked: std::array::from_fn(|i| counts[ASKED + i]),
             asked_bytes: std::array::from_fn(|i| counts[ASKED_BYTES + i]),
             held_back: counts[HELD_BACK],
-            refused_for_rate: counts[REFUSED_FOR_RATE],
+            refused_for_now: counts[REFUSED_FOR_NOW],
         }
     }
 }
@@ -697,9 +705,10 @@ impl DeviceCounts {
         self.relays.add(relay, HELD_BACK, 1);
     }
 
-    /// The relay `relay` refused a request for rate.
-    pub fn refused_for_rate(&self, relay: &[u8; 32]) {
-        self.relays.add(relay, REFUSED_FOR_RATE, 1);
+    /// The relay `relay` refused a request for now: it reset its stream
+    /// with ERR_RATE_LIMIT, for rate or not now.
+    pub fn refused_for_now(&self, relay: &[u8; 32]) {
+        self.relays.add(relay, REFUSED_FOR_NOW, 1);
     }
 
     /// What is counted of the relay `key`: nothing where it has no slot.
@@ -981,9 +990,9 @@ pub fn render(load: &Load, lock: &LockTimes, uptime_secs: f64) -> String {
             (|read: &DeviceRead| read.held_back) as fn(&DeviceRead) -> u64,
         ),
         (
-            "cordelia_device_refused_for_rate_total",
-            "Requests each relay refused a device for rate",
-            |read: &DeviceRead| read.refused_for_rate,
+            "cordelia_device_refused_for_now_total",
+            "Requests each relay refused a device for now (ERR_RATE_LIMIT): its refused_for_rate and not_now",
+            |read: &DeviceRead| read.refused_for_now,
         ),
     ] {
         family(&mut out, name, "counter", help);
@@ -1260,10 +1269,10 @@ mod tests {
             [at("cordelia_device_held_back_total", &other, None)]
         );
         let before = said(&load);
-        load.device.refused_for_rate(&other);
+        load.device.refused_for_now(&other);
         assert_eq!(
             moved(&before, &said(&load)),
-            [at("cordelia_device_refused_for_rate_total", &other, None)]
+            [at("cordelia_device_refused_for_now_total", &other, None)]
         );
         // A relay asked for the first time is said from then on, and
         // nothing of the other moves.

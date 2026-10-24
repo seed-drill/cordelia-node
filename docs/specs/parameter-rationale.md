@@ -2925,7 +2925,7 @@ which bar 4 (c) holds every write under. 250 ms falls inside the bucket of
 ### LOAD_RELAYS_COUNTED = 16
 
 **Rationale:** the relays a node counts apart, each by its key: a device's
-requests to each relay, those it held back and those refused for rate, and
+requests to each relay, those it held back and those refused for now, and
 the closures of the link to each relay a node is set up with. A slot is
 taken the first time a relay is counted, with no lock, and kept while the
 node runs; past the last, relays are counted together, as "rest". A device
