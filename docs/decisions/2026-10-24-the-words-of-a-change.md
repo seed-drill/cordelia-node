@@ -1,7 +1,7 @@
 # Decision: the words of a change
 
 **Date**: 2026-10-24
-**Status**: Proposed. Not built. Revised once after its review (section 8).
+**Status**: Proposed. Not built. Revised once after its review (section 8). **Rules 1 to 7 are built first; rules 8 and 9, and the parts of rule 10 that state them, are held** until the record of a removal that fails safe (`2026-10-24-removal-fails-safe.md`) is settled. The person ruled on 24 October that a removal must fail safe by construction, and that a warning before the phrase is a nicety, not the fix. Under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes; and its narrow check found two high findings in rules 8 and 9 (section 8). They are written again against that record before they are built.
 **Cited as**: "decision 2026-10-24, rule 3". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
