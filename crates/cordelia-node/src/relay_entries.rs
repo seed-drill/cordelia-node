@@ -1310,8 +1310,15 @@ impl RelayEntries {
 
     /// The entries that wait to be passed on, as the messages for each of
     /// `relays`: every entry but those that came from that relay, each
-    /// with the two times of its channel as this relay holds it, a page's
-    /// worth to a message. Nothing waits afterwards.
+    /// with the two times of its channel as this relay holds it, a small
+    /// page's worth to a message. Nothing waits afterwards.
+    ///
+    /// A small page, not a full one (decision 2026-10-22 (memory), rule
+    /// 12): a push crosses the other relay's receive windows, which this
+    /// end cannot see. A listed relay whose connection came from another
+    /// address than the one it is configured at has every peer's windows
+    /// at its end, at which a message of 896 KiB fails the stream timeout
+    /// past a round trip of about 0.33 s.
     fn to_pass_on(
         &self,
         db: &Mutex<Connection>,
@@ -1350,7 +1357,7 @@ impl RelayEntries {
                     };
                     let full = messages.last().is_none_or(|message| {
                         message.entries.len() >= ENTRY_PAGE_MAX_ENTRIES as usize
-                            || bytes + entry.bytes.len() > ENTRY_PAGE_MAX_BYTES
+                            || bytes + entry.bytes.len() > SMALL_PAGE_BYTES
                     });
                     if full {
                         messages.push(RelayPush {
@@ -4346,8 +4353,8 @@ mod tests {
         relay::make_room(&lock(&at.db), 0).unwrap();
         assert!(at.entries.to_pass_on(&at.db, &both).is_empty());
 
-        // A page's worth to a message: 150 small entries are two, and 20
-        // of the largest are two, 13 and 7.
+        // A small page's worth to a message: 150 small entries are two,
+        // and 20 of the largest are twenty, one each.
         for from in [0u8, 100] {
             let entries = (from..(from + 100).min(150))
                 .map(|d| made(10, d, 5, "notes.md", "a small text").to_wire())
@@ -4361,12 +4368,16 @@ mod tests {
         pushed(at.push(8, (14..=20).map(|d| largest(11, d).to_wire()).collect()));
         let waiting = at.entries.to_pass_on(&at.db, &both);
         let sizes: Vec<usize> = waiting_for(&waiting, 9).iter().map(Vec::len).collect();
-        assert_eq!(sizes, [13, 7]);
+        assert_eq!(
+            sizes,
+            [1; 20],
+            "entries of the largest size were passed on more than a small page to a message"
+        );
         for message in &waiting[0].1 {
             let bytes: usize = message.entries.iter().map(|e| e.entry.len()).sum();
-            assert!(bytes <= ENTRY_PAGE_MAX_BYTES);
+            assert!(bytes <= SMALL_PAGE_BYTES);
             let travels = codec::encode_message(&WireMessage::RelayPush(message.clone()));
-            assert!(travels.unwrap().len() <= codec::MAX_MESSAGE_BYTES as usize);
+            assert!(travels.unwrap().len() <= SMALL_MESSAGE_BYTES as usize);
         }
 
         // A relay whose operator lists no relay by key keeps nothing to
