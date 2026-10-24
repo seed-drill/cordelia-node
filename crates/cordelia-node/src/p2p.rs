@@ -2435,10 +2435,28 @@ pub fn post_connect(
         let st = seen_table.clone();
         let entries = relay_entries.clone();
         let permits = large_permits.clone();
+        // Whether a listed relay's connection carries the listed settings
+        // at this end, by which it is given full pages (rule 12).
+        let listed_settings = conn_mgr.carries_listed_settings(node_id);
         tokio::spawn(async move {
             handle_peer_streams(
-                conn, peer_id, made_from, db_state, peers_ref, role, rtx, dtx, rates, states,
-                relays, gtx, sm, st, entries, permits,
+                conn,
+                peer_id,
+                made_from,
+                db_state,
+                peers_ref,
+                role,
+                rtx,
+                dtx,
+                rates,
+                states,
+                relays,
+                gtx,
+                sm,
+                st,
+                entries,
+                permits,
+                listed_settings,
             )
             .await;
         });
@@ -5354,6 +5372,7 @@ pub async fn handle_peer_streams(
     seen_table: std::sync::Arc<std::sync::RwLock<cordelia_network::seen_table::SeenTable>>,
     relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>>,
     large_permits: std::sync::Arc<LargePermits>,
+    listed_settings: bool,
 ) {
     let mut stream_count: u64 = 0;
     // The channels of entries whose keys were proved on this connection
@@ -5599,6 +5618,7 @@ pub async fn handle_peer_streams(
                     db: &state.db,
                     rates: &peer_rates,
                     permits: Some(&large_permits),
+                    listed_settings,
                 };
                 let over = entries
                     .serve(
@@ -8962,6 +8982,7 @@ mod tests {
             seen,
             relay_entries,
             permits,
+            listed,
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -12936,6 +12957,34 @@ mod tests {
         peer.abort();
     }
 
+    /// Decision 2026-10-22 (memory), rule 12. The keys listed at an
+    /// address are those of the relays configured by key at that address
+    /// and port; an IPv4 address that a dual-stack socket shows mapped into
+    /// IPv6 is the same address. Another port, and a relay configured by
+    /// address alone, list nothing.
+    #[test]
+    fn a_listed_relays_address_is_found_when_shown_mapped_into_ipv6() {
+        use cordelia_network::bootstrap::RelayAddr;
+        let at = |addr: &str, key: Option<[u8; 32]>| RelayAddr {
+            host: "relay.test:9474".into(),
+            addr: addr.parse().unwrap(),
+            key,
+        };
+        let relays = [
+            at("192.0.2.7:9474", Some([7; 32])),
+            at("192.0.2.8:9474", None),
+        ];
+        let from = |addr: &str| keys_listed_at(&relays, addr.parse().unwrap());
+        assert_eq!(from("192.0.2.7:9474"), vec![[7; 32]]);
+        assert_eq!(
+            from("[::ffff:192.0.2.7]:9474"),
+            vec![[7; 32]],
+            "a listed relay's address shown mapped into IPv6 was not found"
+        );
+        assert!(from("192.0.2.7:9475").is_empty());
+        assert!(from("[::ffff:192.0.2.8]:9474").is_empty());
+    }
+
     /// What the end at `writer` may send the other end of its connection,
     /// which reads nothing: the bytes one stream takes, and how many
     /// streams it may have open at once, `held` of them before this.
@@ -12947,7 +12996,9 @@ mod tests {
     /// accepting end writes is stopped by the dialler after its handle has
     /// gone, and so never is).
     async fn what_it_may_send(writer: &quinn::Connection, held: usize) -> (usize, usize) {
-        let brief = std::time::Duration::from_millis(500);
+        // A write or an opening waits for credit; one that waits this long
+        // has none.
+        let brief = std::time::Duration::from_millis(1500);
         let (mut send, recv) = writer.open_bi().await.unwrap();
         let chunk = vec![0u8; 16 * 1024];
         let mut taken = 0usize;
@@ -13041,6 +13092,10 @@ mod tests {
             (listed_window, listed_streams),
             "a connection dialled to a relay configured by key has another's windows"
         );
+        assert!(
+            dialled.listed_settings,
+            "a dial to a relay configured by key does not say it has the listed settings"
+        );
         drop(dialled);
 
         // Accepted from the relay's address, with its key.
@@ -13054,7 +13109,11 @@ mod tests {
         let from_relay = connection::outbound_connect(&relay_ctx, node_addr)
             .await
             .unwrap();
-        let _accepted = at_node.await.unwrap().unwrap();
+        let accepted = at_node.await.unwrap().unwrap();
+        assert!(
+            accepted.listed_settings,
+            "a connection accepted from a listed relay does not say it has the listed settings"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             what_it_may_send(&from_relay.conn, 1).await,
@@ -13077,6 +13136,10 @@ mod tests {
             from_other.is_ok() && accepted.is_ok(),
             "a peer from another address than a listed relay's was not accepted: {:?}",
             accepted.err()
+        );
+        assert!(
+            !accepted.as_ref().unwrap().listed_settings,
+            "a peer from another address is said to have the listed settings"
         );
         let from_other = from_other.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -13134,11 +13197,16 @@ mod tests {
     /// A relay fetches from a peer it is connected to, which answers the
     /// fetch of a page's entries with `fetched_bytes` of items, while the
     /// peer pushes `pushes` frames of `push_bytes` each, each on a stream of
-    /// its own, all begun before the fetch's answer is written.
+    /// its own, all begun as the fetch's answer is written. The relay
+    /// dialled the peer where `node_dials`, and the peer dialled it
+    /// otherwise: the end that dials holds one of its streams for the
+    /// handshake for as long as the connection lasts, so a peer that was
+    /// dialled may open one stream more.
     async fn a_fetch_beside_large_pushes(
         pushes: usize,
         push_bytes: usize,
         fetched_bytes: usize,
+        node_dials: bool,
     ) -> Contended {
         use cordelia_network::codec::{self, encode_message, write_raw_frame};
         use cordelia_network::messages::{
@@ -13183,26 +13251,44 @@ mod tests {
         let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
         let peer_rates = Arc::new(std::sync::Mutex::new(Rates::new(u64::MAX)));
 
-        let node_conn = tokio::spawn(async move {
-            let incoming = accepts.accept().await.unwrap();
-            connection::inbound_accept(&as_node, incoming)
-                .await
-                .unwrap()
-                .conn
-        });
-        let mut peer_mgr = connection::ConnectionManager::new(
+        let peer_end = transport::create_endpoint(&peer, here).unwrap();
+        let peer_addr = peer_end.local_addr().unwrap();
+        let peer_mgr = connection::ConnectionManager::new(
             peer.clone(),
-            transport::create_endpoint(&peer, here).unwrap(),
+            peer_end,
             vec![],
             vec!["relay".into()],
-            9474,
+            peer_addr.port(),
         );
-        peer_mgr.connect_to(node_addr).await.unwrap();
-        let at_peer = peer_mgr
-            .get_connection(&NodeId(node.public_key()))
-            .unwrap()
-            .clone();
-        let node_conn = node_conn.await.unwrap();
+        let (node_conn, at_peer) = if node_dials {
+            let (peer_accepts, as_peer) = (peer_mgr.endpoint(), peer_mgr.connect_context());
+            let at_peer = tokio::spawn(async move {
+                let incoming = peer_accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_peer, incoming)
+                    .await
+                    .unwrap()
+                    .conn
+            });
+            let dialled = connection::outbound_connect(&as_node, peer_addr)
+                .await
+                .unwrap()
+                .conn;
+            drop(accepts);
+            (dialled, at_peer.await.unwrap())
+        } else {
+            let node_conn = tokio::spawn(async move {
+                let incoming = accepts.accept().await.unwrap();
+                connection::inbound_accept(&as_node, incoming)
+                    .await
+                    .unwrap()
+                    .conn
+            });
+            let dialled = connection::outbound_connect(&peer_mgr.connect_context(), node_addr)
+                .await
+                .unwrap()
+                .conn;
+            (node_conn.await.unwrap(), dialled)
+        };
 
         let loop_task = tokio::spawn(handle_peer_streams(
             node_conn.clone(),
@@ -13223,6 +13309,7 @@ mod tests {
             )),
             relay_entries,
             permits.clone(),
+            false,
         ));
 
         let item = |n: usize, bytes: usize| Item {
@@ -13306,7 +13393,6 @@ mod tests {
                                     }
                                 });
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             WireMessage::FetchResponse(FetchResponse {
                                 items: (0..4).map(|n| item(n, fetched_bytes / 4)).collect(),
                             })
@@ -13348,6 +13434,13 @@ mod tests {
         let answered = answered.lock().unwrap().clone();
         loop_task.abort();
         serving.abort();
+        // Close both ends, so that nothing of this run (a push still
+        // waiting in its write) is left beside the next.
+        at_peer.close(0u32.into(), b"done");
+        node_mgr.endpoint().close(0u32.into(), b"done");
+        peer_mgr.endpoint().close(0u32.into(), b"done");
+        node_mgr.endpoint().wait_idle().await;
+        peer_mgr.endpoint().wait_idle().await;
         Contended {
             fetched,
             fetch_took,
@@ -13363,8 +13456,12 @@ mod tests {
     /// time; at a stream window of a small message, two pushes queued
     /// behind the one being read held the whole connection's window, and
     /// the push being read, the fetch and the other pushes waited out
-    /// STREAM_TIMEOUT. Each stream's window an eighth of the connection's,
-    /// the streams queued cannot hold all of it.
+    /// STREAM_TIMEOUT. With every stream the peer may open within seven
+    /// eighths of the connection's window, the streams queued cannot hold
+    /// all of it, and the fetch, on a stream the relay opened, has an
+    /// eighth to read back, which is when quinn announces more. Both ways
+    /// round: the relay dialled by the peer, and the relay dialling it,
+    /// where the peer may open all 8 of its streams.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other() {
         for (pushes, push_bytes, fetched_bytes) in [
@@ -13372,19 +13469,25 @@ mod tests {
             (5, 300_000, 100_000),
             (3, 900_000, 100_000),
             (7, 140_000, 100_000),
+            (8, 300_000, 400_000),
+            (8, 900_000, 900_000),
         ] {
-            let ended = a_fetch_beside_large_pushes(pushes, push_bytes, fetched_bytes).await;
-            assert!(
-                ended.fetched == Fetched::All
-                    && ended.fetch_took < std::time::Duration::from_secs(2)
-                    && ended.pushes_answered == pushes,
-                "{pushes} pushes of {push_bytes} bytes beside a fetch of {fetched_bytes}: \
+            for node_dials in [false, true] {
+                let ended =
+                    a_fetch_beside_large_pushes(pushes, push_bytes, fetched_bytes, node_dials)
+                        .await;
+                assert!(
+                    ended.fetched == Fetched::All
+                        && ended.fetch_took < std::time::Duration::from_secs(2)
+                        && ended.pushes_answered == pushes,
+                    "{pushes} pushes of {push_bytes} bytes beside a fetch of {fetched_bytes}, the relay dialling: {node_dials}: \
                  the fetch ended {:?} after {:?}, and {} pushes were answered, the last after {:?}",
-                ended.fetched,
-                ended.fetch_took,
-                ended.pushes_answered,
-                ended.pushes_took
-            );
+                    ended.fetched,
+                    ended.fetch_took,
+                    ended.pushes_answered,
+                    ended.pushes_took
+                );
+            }
         }
     }
 }

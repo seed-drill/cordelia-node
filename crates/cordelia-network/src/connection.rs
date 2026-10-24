@@ -88,6 +88,11 @@ pub struct PeerConnection {
     /// counted under this one, read once, so that a peer does not come by
     /// another address's allowance by moving.
     pub addr: SocketAddr,
+    /// Whether this end made the connection with the transport settings
+    /// of a relay listed by key (decision 2026-10-22, memory across
+    /// connections, rule 12): dialled as one, or accepted from a listed
+    /// relay's address with its key.
+    pub listed_settings: bool,
 }
 
 /// Data needed by spawned connect/accept tasks. All fields Clone.
@@ -111,6 +116,8 @@ pub struct ConnectOutcome {
     pub handshake: HandshakeResult,
     pub addr: SocketAddr,
     pub direction: Direction,
+    /// Whether this end made it with the settings of a relay listed by key.
+    pub listed_settings: bool,
 }
 
 /// Direction of a connection attempt.
@@ -255,6 +262,7 @@ impl ConnectionManager {
             keepalive: KeepAliveState::new(),
             direction: outcome.direction,
             addr: outcome.addr,
+            listed_settings: outcome.listed_settings,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
@@ -311,6 +319,7 @@ impl ConnectionManager {
             keepalive: KeepAliveState::new(),
             direction: Direction::Outbound,
             addr,
+            listed_settings: false,
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
@@ -332,6 +341,15 @@ impl ConnectionManager {
             self.connections.remove(id);
         }
         closed
+    }
+
+    /// Whether this end made the connection of `node_id` with the
+    /// transport settings of a relay listed by key (rule 12): what a full
+    /// page to it may cross in time by.
+    pub fn carries_listed_settings(&self, node_id: &NodeId) -> bool {
+        self.connections
+            .get(node_id)
+            .is_some_and(|peer| peer.listed_settings)
     }
 
     /// The address that the connection of `node_id` was made from, or
@@ -441,7 +459,7 @@ pub async fn outbound_connect(
         .endpoint
         .connect(addr, "cordelia")
         .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr).await
+    outbound_on(ctx, connecting, addr, false).await
 }
 
 /// Outbound connect to a relay configured by key, as [`outbound_connect`],
@@ -461,13 +479,14 @@ pub async fn outbound_connect_to_listed(
         None => ctx.endpoint.connect(addr, "cordelia"),
     }
     .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr).await
+    outbound_on(ctx, connecting, addr, ctx.listed.is_some()).await
 }
 
 async fn outbound_on(
     ctx: &ConnectContext,
     connecting: quinn::Connecting,
     addr: SocketAddr,
+    listed_settings: bool,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let conn = tokio::time::timeout(
         Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
@@ -513,6 +532,7 @@ async fn outbound_on(
         handshake: handshake_result,
         addr,
         direction: Direction::Outbound,
+        listed_settings,
     })
 }
 
@@ -625,6 +645,7 @@ async fn inbound_on(
         handshake: handshake_result,
         addr: remote,
         direction: Direction::Inbound,
+        listed_settings: keys.is_some() && ctx.listed.is_some(),
     })
 }
 

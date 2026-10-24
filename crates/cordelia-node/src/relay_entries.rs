@@ -293,6 +293,13 @@ pub struct Who<'a> {
     pub address: IpAddr,
     /// Whether it is a relay that the operator lists by key.
     pub listed: bool,
+    /// Whether it is given full pages: a relay listed by key whose
+    /// connection carries, at this end, the transport settings of rule 12
+    /// (decision 2026-10-22 (memory), rules 3 and 12). A listed relay
+    /// whose connection came from another address than the one configured
+    /// (behind a NAT) has every peer's windows, at which a full page takes
+    /// many round trips, so it is given small pages as any peer is.
+    pub full_pages: bool,
 }
 
 impl Who<'_> {
@@ -660,7 +667,7 @@ impl RelayEntries {
                 self.pushing(db, rates, who, push, now)
             }
             (Protocol::RelayEntries, request) if who.listed => {
-                self.asked_by_a_relay(db, who.peer, request, now)
+                self.asked_by_a_relay(db, who, request, now)
             }
             _ => Answer::Stray,
         }
@@ -916,8 +923,9 @@ impl RelayEntries {
         // one (decision 2026-10-22 (memory), rule 3): it holds at most
         // SMALL_PAGE_BYTES of entries, so that it fits a small message, and
         // says there is more as a full page does. A listed relay is given
-        // full pages (rule 7).
-        let most_bytes = match who.listed {
+        // full pages (rule 7) where its connection carries the listed
+        // settings (rule 12).
+        let most_bytes = match who.full_pages {
             true => ENTRY_PAGE_MAX_BYTES,
             false => SMALL_PAGE_BYTES,
         };
@@ -1084,10 +1092,11 @@ impl RelayEntries {
     fn asked_by_a_relay(
         &self,
         db: &Mutex<Connection>,
-        from: &NodeId,
+        who: &Who,
         request: &WireMessage,
         now: i64,
     ) -> Answer {
+        let from = who.peer;
         match request {
             WireMessage::RelayChannelsAsk(RelayChannelsAsk { after, limit }) => {
                 let Ok(db) = db.lock() else {
@@ -1105,7 +1114,9 @@ impl RelayEntries {
             }
             // Without the proof: the page is the one for a channel that
             // was proved, and a full one, as for any listed relay
-            // (decision 2026-10-22 (memory), rule 7).
+            // (decision 2026-10-22 (memory), rule 7), where its connection
+            // carries the listed settings (rule 12); a small one where it
+            // does not.
             WireMessage::RelayPull(pull) => {
                 let Ok(db) = db.lock() else {
                     return Answer::Nothing;
@@ -1117,7 +1128,11 @@ impl RelayEntries {
                     &pull.mark,
                     pull.after,
                     pull.limit,
-                    ENTRY_PAGE_MAX_BYTES,
+                    if who.full_pages {
+                        ENTRY_PAGE_MAX_BYTES
+                    } else {
+                        SMALL_PAGE_BYTES
+                    },
                 );
                 match page {
                     Ok(page) => Answer::of(WireMessage::EntryPulled((&page).into())),
@@ -1408,6 +1423,10 @@ pub struct Serving<'a> {
     /// 2026-10-22 (memory), rule 2). `None` in a test that does not
     /// exercise them.
     pub permits: Option<&'a crate::p2p::LargePermits>,
+    /// Whether this end made the connection with the transport settings
+    /// of a relay listed by key (rule 12), by which a listed relay is
+    /// given full pages.
+    pub listed_settings: bool,
 }
 
 /// An end of a stream that can be refused with a code: a QUIC stream's is
@@ -1467,6 +1486,7 @@ impl RelayEntries {
             // By the key in the peer's certificate: the connection is
             // known by that key.
             listed: self.lists(serving.peer),
+            full_pages: self.lists(serving.peer) && serving.listed_settings,
         };
         // The frame as its bytes: what is no request is counted by them. A
         // frame longer than a small message from a peer that is not a
@@ -1922,6 +1942,7 @@ mod tests {
             db: &relay.db,
             rates: &relay.rates,
             permits: Some(&permits),
+            listed_settings: false,
         };
         let mut proved = Proved::default();
         let mut whole = ShownWhole::default();
@@ -1989,6 +2010,7 @@ mod tests {
             db: &relay.db,
             rates: &relay.rates,
             permits: Some(&permits),
+            listed_settings: false,
         };
         // The answer goes into a one-byte pipe the peer never reads, so the
         // write blocks and the stream stays in it, holding its permit.
@@ -2051,6 +2073,7 @@ mod tests {
                 peer,
                 address: address(n),
                 listed: self.entries.lists(peer),
+                full_pages: self.entries.lists(peer),
             }
         }
 
@@ -3233,6 +3256,76 @@ mod tests {
         }
     }
 
+    /// A relay listed by key is given full pages only where its connection
+    /// carries, at this end, the transport settings of rule 12 (decision
+    /// 2026-10-22 (memory), rules 3 and 12). One whose connection came
+    /// from another address than the one configured, behind a NAT, has
+    /// every peer's windows, at which a full page would take many round
+    /// trips: of a channel of 13 entries of the largest size, a pull
+    /// between relays served on such a connection hands one entry, within
+    /// a small page, where the same pull on a connection of the listed
+    /// settings hands all 13.
+    #[tokio::test]
+    async fn a_relay_listed_by_key_on_a_connection_without_its_settings_is_given_small_pages() {
+        let at = relay_of(u64::MAX, &[8]);
+        for d in 1..=13 {
+            at.hold(&largest(1, d), NOW);
+        }
+        let mark = at.held(1).unwrap().mark;
+        let listed = peer(8);
+        let page_on = |listed_settings: bool| {
+            let (at, listed) = (&at, &listed);
+            async move {
+                let serving = Serving {
+                    conn: None,
+                    peer: listed,
+                    address: address(8),
+                    db: &at.db,
+                    rates: &at.rates,
+                    permits: None,
+                    listed_settings,
+                };
+                let (mut relay_w, mut peer_r) = tokio::io::duplex(64 * 1024);
+                let (mut peer_w, mut relay_r) = tokio::io::duplex(64 * 1024);
+                let request = WireMessage::RelayPull(RelayPull {
+                    channel: channel(1),
+                    mark,
+                    after: 0,
+                    limit: 100,
+                });
+                codec::write_raw_frame(&mut peer_w, &codec::encode_message(&request).unwrap())
+                    .await
+                    .unwrap();
+                let (mut proved, mut whole) = (Proved::default(), ShownWhole::default());
+                let serve = at.entries.serve(
+                    Protocol::RelayEntries,
+                    &mut relay_w,
+                    &mut relay_r,
+                    &serving,
+                    &mut proved,
+                    &mut whole,
+                );
+                let read = codec::read_frame(&mut peer_r, Protocol::RelayEntries);
+                let (_, answer) = tokio::join!(serve, read);
+                match answer.unwrap() {
+                    WireMessage::EntryPulled(page) => page,
+                    other => panic!("not a page: {other:?}"),
+                }
+            }
+        };
+        let full = page_on(true).await;
+        assert_eq!(full.entries.len(), 13, "a listed relay's page was cut");
+        let small = page_on(false).await;
+        let bytes: usize = small.entries.iter().map(|entry| entry.len()).sum();
+        assert_eq!(
+            small.entries.len(),
+            1,
+            "a listed relay without the listed settings was given a full page"
+        );
+        assert!(bytes <= SMALL_PAGE_BYTES);
+        assert_eq!(small.next, 1, "the small page does not say there is more");
+    }
+
     /// A pull of a channel that was not proved on the connection is
     /// answered from the connection's memory, and the store is not asked:
     /// the answer comes while the database is held by another. It is the
@@ -3522,6 +3615,7 @@ mod tests {
             peer: Box::leak(Box::new(peer(n))),
             address: home,
             listed: false,
+            full_pages: false,
         };
         assert_eq!(MAX_CONNECTIONS_PER_IP, 5);
         for n in 10..15 {
@@ -3609,6 +3703,7 @@ mod tests {
             peer: Box::leak(Box::new(peer(n))),
             address: home,
             listed: false,
+            full_pages: false,
         };
         assert_eq!(MAX_CONNECTIONS_PER_IP, 5);
         for n in 10..15 {
@@ -3947,6 +4042,7 @@ mod tests {
             peer: &other_key,
             address: address(1),
             listed: false,
+            full_pages: false,
         };
         let push = EntryPush {
             entries: vec![first(256).into()],
@@ -3976,6 +4072,7 @@ mod tests {
             peer: &listed,
             address: address(1),
             listed: at.entries.lists(&listed),
+            full_pages: at.entries.lists(&listed),
         };
         let push = |entries: Vec<Vec<u8>>| {
             let push = EntryPush {
@@ -5253,6 +5350,7 @@ mod tests {
             db: &relay.db,
             rates: &relay.rates,
             permits: None,
+            listed_settings: false,
         };
         let mut whole = ShownWhole::default();
         // Small pipes, so that what a pipe keeps for itself is small: the
