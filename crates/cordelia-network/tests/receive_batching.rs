@@ -353,18 +353,31 @@ const THRESHOLD_BYTES: isize = 1200 * 1024;
 /// reads and a byte at a time on its other streams, cannot make a node
 /// hold the batches its bytes came in: the node's thread holds less than
 /// THRESHOLD_BYTES over its level, at two pacings. The same peer against
-/// an endpoint that quinn makes by itself, with GRO on, takes it over;
-/// where it does not, this host hands a socket no batches, and there is
-/// nothing to tell.
+/// an endpoint that quinn makes by itself, with GRO on, takes it over
+/// first: that control shows that this host hands a socket batches and
+/// that the peer loads them.
+///
+/// Where the control stays under the threshold, the test checks nothing,
+/// and says so loudly on its output; it is not failed, since that is a
+/// property of the host (a kernel without GRO, a loopback that does not
+/// coalesce, or a runner too loaded for the peer to fill its batches) and
+/// not of the node, and a node on such a host takes no batches either.
 #[test]
 fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
     let lasting = Duration::from_secs(3);
     let with_gro = held_by_the_node(Node::AsQuinnMakesIt, Duration::from_millis(4), lasting);
     if with_gro < THRESHOLD_BYTES {
-        eprintln!(
-            "with GRO on the node held {} KiB: this host hands a socket no batches",
-            with_gro / 1024
+        let said = format!(
+            "\n*** TEST 8 CHECKED NOTHING: with GRO on, the control held {} KiB, \
+             under the threshold of {} KiB, so this host hands a socket no batches \
+             (or is too loaded to fill them), and rule 10 was not tested here ***\n",
+            with_gro / 1024,
+            THRESHOLD_BYTES / 1024
         );
+        // On both streams, so that it is seen whether or not the output
+        // is captured.
+        println!("{said}");
+        eprintln!("{said}");
         return;
     }
     for pace in [2u64, 8] {
