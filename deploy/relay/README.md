@@ -87,9 +87,52 @@ It runs hardened:
 - as an unprivileged user (uid 10001), on a read-only filesystem, with a
   small writable `/tmp`;
 - with every Linux capability dropped and `no-new-privileges`;
-- with memory (512 MB) and process (512) limits;
+- with memory (`mem_limit: 512m`, below) and process (512) limits;
 - with a healthcheck, `cordelia peers`, which fails when the node stops
   answering: `docker ps` shows `(healthy)`.
+
+### What a container of 512 MiB holds, and how to give it 1 GiB
+
+A relay takes at most 200 connections, one for each device and one for
+the other relay, and turns the rest away before the handshake. The
+question for its memory is what those connections can make it hold when
+every one of them behaves as badly as it can. From 0.2.0-alpha.16, a
+connection can make a relay hold about 2.0 MiB at most. Beside that, the
+relay holds a fixed part of its own: about 111 MiB, and 6 MiB more for
+each core it may use. This is worked out from the code, not measured as a
+whole (decision 2026-10-22, memory across connections, §3).
+
+- **512 MiB, as `compose.yml` sets it:** holds 197 connections at worst
+  on a host of one core, and 188 on four. That is just under the bound of
+  200. With ordinary devices a relay uses far less: the scale test's
+  bar for 199 devices is under about 140 MiB. On a host of 1 GB, as section 1
+  names, this is the size to keep, because the host needs the rest.
+- **1 GiB:** holds the whole bound of 200 at worst, at about 516 MiB on
+  one core and 606 MiB on sixteen. It needs a host with memory to spare
+  beside the container's 1 GiB, for example 2 GB.
+
+Releases before 0.2.0-alpha.16 hold far fewer at worst: about 6 such
+connections can take a container of 512 MiB to its limit.
+
+To give the container 1 GiB, leave `compose.yml` as it is and add an
+override file beside it on the host, `deploy/relay/compose.memory.yml`:
+
+```yaml
+services:
+  relay:
+    mem_limit: 1g
+```
+
+Git ignores it, as it does `.env`, so an upgrade leaves it alone. Then name
+both files whenever you run Compose, the override last:
+
+```bash
+docker compose -f deploy/relay/compose.yml -f deploy/relay/compose.memory.yml up -d
+```
+
+`docker inspect -f '{{.HostConfig.Memory}}' cordelia-relay1` then prints
+1073741824. On a host of many cores, `cpus: 1` in the same file holds the
+relay to one core, and so to 6 MiB for its cores.
 
 ## 4. Check it
 
@@ -218,6 +261,9 @@ Change the pin in `deploy/relay/.env` (a new `CORDELIA_VERSION` and its
 ```bash
 docker compose -f deploy/relay/compose.yml up -d --build
 ```
+
+If you gave the container 1 GiB (section 3), name the override file here
+too, after `compose.yml`, or the container comes back at 512 MiB.
 
 Read the release's upgrade notes first.
 
@@ -365,3 +411,5 @@ IPv4 and a bind to `fly-global-services` (set through `CORDELIA_LISTEN_ADDR`),
 with the same port inside and out. Pin the release in its `[build.args]`,
 then deploy from the repository root with
 `fly deploy . --config deploy/relay/fly.relay1.toml --remote-only`.
+Its machine of 256 MB holds about 53 connections at worst (section 3's
+reckoning, with 32 MB kept for the system), well under the bound of 200.
