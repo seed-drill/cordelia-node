@@ -349,24 +349,6 @@ fn name_of(project: &Project) -> String {
     }
 }
 
-/// Whether the memory folder `memory` holds a file that a cycle would
-/// look at: a plain file whose name does not start with a dot. One that
-/// cannot be read is taken to hold one, so that it is listed and its error
-/// is seen; one that is not there, or is no folder, holds none.
-fn holds_a_file(memory: &Path) -> bool {
-    let entries = match std::fs::read_dir(memory) {
-        Ok(entries) => entries,
-        Err(e) => {
-            use std::io::ErrorKind::{NotADirectory, NotFound};
-            return !matches!(e.kind(), NotFound | NotADirectory);
-        }
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        !entry.file_name().to_string_lossy().starts_with('.')
-            && entry.file_type().is_ok_and(|kind| kind.is_file())
-    })
-}
-
 /// One folder to sync this cycle: a mapped one.
 struct Target {
     /// Claude Code's folder.
@@ -748,7 +730,7 @@ impl ClaudeAdapter {
             // the name it has, which the other devices may sync, or where
             // the folder mapped under that name is gone, which may be this
             // one moved. Any other is not worth a line (#207).
-            if !holds_a_file(&candidate.dir.join("memory"))
+            if !found::holds_a_file(&candidate.dir.join("memory"))
                 && !matches!(
                     found::would_map(&asked, &against, &looked),
                     found::Maps::Yes(
@@ -3079,36 +3061,6 @@ mod tests {
             signer: Some(OTHER),
             chain: Some(Vec::new()),
         }
-    }
-
-    /// What a memory folder holds, as the found list counts it (#207): a
-    /// plain file whose name does not start with a dot. One that is not
-    /// there, or is no folder, holds none; one that cannot be read is
-    /// taken to hold one, so that it is listed.
-    #[test]
-    fn a_memory_folder_holds_a_file_only_where_a_cycle_would_look_at_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let memory = tmp.path().join("memory");
-        assert!(!holds_a_file(&memory), "not there");
-        std::fs::write(tmp.path().join("a-file"), "x").unwrap();
-        assert!(!holds_a_file(&tmp.path().join("a-file")), "no folder");
-        std::fs::create_dir(&memory).unwrap();
-        assert!(!holds_a_file(&memory), "empty");
-        std::fs::write(memory.join(".DS_Store"), "x").unwrap();
-        std::fs::create_dir(memory.join("kept")).unwrap();
-        assert!(!holds_a_file(&memory), "a dotfile and a folder");
-        std::fs::write(memory.join("a.md"), "x").unwrap();
-        assert!(holds_a_file(&memory));
-
-        use std::os::unix::fs::PermissionsExt;
-        let locked = tmp.path().join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // One who may read anything (root) reads it, and it is empty.
-        if std::fs::read_dir(&locked).is_err() {
-            assert!(holds_a_file(&locked), "cannot be read");
-        }
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// An agent writing a file after the scan must not be overwritten by an

@@ -1851,11 +1851,11 @@ fn folders_that_stopped_sync_again_once_they_are_mapped(
         std::fs::write(tree.join("memory/kept.md"), "kept by hand\n").unwrap();
         let line = format!("{{\"cwd\":{:?}}}\n", shown(&other));
         std::fs::write(tree.join("scope.jsonl"), line).unwrap();
-        // And a folder that is no repository, which is found; a
-        // repository then appears above it.
+        // And a folder that is no repository, with memory, which is
+        // found; a repository then appears above it.
         let notes = home.join("deep/notes");
         std::fs::create_dir_all(&notes).unwrap();
-        claude_folder(&home, &notes);
+        std::fs::write(claude_folder(&home, &notes).join("n.md"), "a note\n").unwrap();
         let said = wait_for("the laptop lists both", &all, 60, || {
             let said = laptop.cli(&["sync", "status"]);
             let both = said.contains("this layout cannot be mapped")

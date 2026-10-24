@@ -1539,6 +1539,10 @@ fn what_is_found_says_whether_map_would_sync_it() {
     let notes = a.plain_dir("notes");
     let with_a_file = |memory: PathBuf| std::fs::write(memory.join("a.md"), "a\n").unwrap();
     with_a_file(a.claude_folder(&notes));
+    // And one with an empty memory folder: it needs a name and has
+    // nothing to sync, so it is not listed.
+    let notes_empty = a.plain_dir("notes-empty");
+    a.claude_folder(&notes_empty);
     // The home directory's own folder.
     a.home_memory();
     // A directory outside the home directory.
@@ -1613,7 +1617,7 @@ fn what_is_found_says_whether_map_would_sync_it() {
              unmap ~/Work/cordelia-node first"
         ))
     );
-    for empty in [&third, &fourth, &fifth, &outside_empty] {
+    for empty in [&third, &fourth, &fifth, &outside_empty, &notes_empty] {
         let of = shown(&a.folder_of(empty));
         assert!(
             !report.unmapped.iter().any(|entry| entry.folder == of),

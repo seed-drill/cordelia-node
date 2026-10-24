@@ -296,10 +296,29 @@ pub fn recorded_directory(folder: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether the memory folder `memory` holds a file that a cycle would
+/// look at: a plain file whose name does not start with a dot (#207). One
+/// that cannot be read is taken to hold one, so that it is listed; one
+/// that is not there, or is no folder, holds none.
+pub fn holds_a_file(memory: &Path) -> bool {
+    let entries = match std::fs::read_dir(memory) {
+        Ok(entries) => entries,
+        Err(e) => {
+            use std::io::ErrorKind::{NotADirectory, NotFound};
+            return !matches!(e.kind(), NotFound | NotADirectory);
+        }
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        !entry.file_name().to_string_lossy().starts_with('.')
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    })
+}
+
 /// What is found on disk for the directory `given`, under the Claude Code
 /// directory `claude_dir`, as the node looks itself (decision 2026-10-04
-/// §10.1): each folder directly under `projects` that holds memory and
-/// belongs to that directory ([`recorded_directory`]), as its folder and
+/// §10.1): each folder directly under `projects` whose memory holds a
+/// file ([`holds_a_file`]) and that belongs to that directory
+/// ([`recorded_directory`]), as its folder and
 /// its directory as recorded, in order of folder. Directories are
 /// compared by their real paths.
 ///
@@ -320,7 +339,7 @@ pub fn found_for(claude_dir: &Path, given: &Path, machine: &dyn Machine) -> Vec<
     let mut found: Vec<(String, String)> = listed
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|folder| folder.join("memory").is_dir())
+        .filter(|folder| holds_a_file(&folder.join("memory")))
         .filter_map(|folder| Some((shown(&folder), recorded_directory(&folder)?)))
         .filter(|(_, directory)| real(directory) == given)
         .map(|(folder, directory)| (folder, shown(&directory)))
@@ -1561,6 +1580,36 @@ mod tests {
         );
     }
 
+    /// What a memory folder holds, as the found list counts it (#207): a
+    /// plain file whose name does not start with a dot. One that is not
+    /// there, or is no folder, holds none; one that cannot be read is
+    /// taken to hold one, so that it is listed.
+    #[test]
+    fn test_a_memory_folder_holds_a_file_only_where_a_cycle_would_look_at_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        assert!(!holds_a_file(&memory), "not there");
+        std::fs::write(tmp.path().join("a-file"), "x").unwrap();
+        assert!(!holds_a_file(&tmp.path().join("a-file")), "no folder");
+        std::fs::create_dir(&memory).unwrap();
+        assert!(!holds_a_file(&memory), "empty");
+        std::fs::write(memory.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir(memory.join("kept")).unwrap();
+        assert!(!holds_a_file(&memory), "a dotfile and a folder");
+        std::fs::write(memory.join("a.md"), "x").unwrap();
+        assert!(holds_a_file(&memory));
+
+        use std::os::unix::fs::PermissionsExt;
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // One who may read anything (root) reads it, and it is empty.
+        if std::fs::read_dir(&locked).is_err() {
+            assert!(holds_a_file(&locked), "cannot be read");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// A name that another folder is mapped under: whether that folder is
     /// there, and the words for each, with a folder under the home
     /// directory shown from `~`.
@@ -2046,6 +2095,7 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             if memory {
                 std::fs::create_dir_all(folder.join("memory")).unwrap();
+                std::fs::write(folder.join("memory/a.md"), "a\n").unwrap();
             }
             let lines: Vec<String> = records
                 .iter()
@@ -2060,10 +2110,13 @@ mod tests {
         let own = folder(&own_name, &[&other, &work], true);
         let tree = folder("workspace", &[&work, &other], true);
         // In no list: a tree that records another directory first, one
-        // that holds no memory, one with no transcript, and a folder
-        // that Claude Code named after another directory.
+        // that holds no memory, one whose memory folder is empty, one with
+        // no transcript, and a folder that Claude Code named after another
+        // directory.
         folder("second", &[&other, &work], true);
         folder("emptied", &[&work], false);
+        let empty = folder("empty", &[&work], false);
+        std::fs::create_dir(empty.join("memory")).unwrap();
         folder("bare", &[], true);
         folder(&claude_folder_name(&root.join("gone")), &[&work], true);
 

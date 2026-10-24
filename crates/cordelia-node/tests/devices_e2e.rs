@@ -2179,10 +2179,11 @@ fn claude_memory_syncs_between_two_machines() {
     std::fs::write(a_notes_mem.join("idea.md"), "A thought.\n").unwrap();
 
     // Nothing syncs until a folder is mapped. What was found is listed
-    // with the command that maps it.
+    // with the command that maps it: the notes folder once a cycle has
+    // seen the note written there.
     let found = wait_for("a lists what it found", &all, 60, || {
         let out = a.cli(&["sync", "status"]);
-        out.contains("Found on this machine").then_some(out)
+        out.contains("cordelia sync map ~/notes <name>").then_some(out)
     });
     for expected in [
         "Nothing syncs yet.",
