@@ -292,7 +292,8 @@ fn the_items_in_force_are_a_function_of_the_lists() {
                 generation: 1,
                 taken_at: 10,
             });
-            for act in &acts {
+            // One history took every other act long before.
+            for act in acts.iter().step_by(2) {
                 earlier.record(
                     act.signature(),
                     Taken {
@@ -364,41 +365,63 @@ fn a_copy_brings_back_nothing_its_maker_undid() {
     let on_a = sub(1, true, &p, 6);
     let alice = label(9, Some("alice")).by(&p, 1, 0);
     let unlabelled = label(9, None).by(&p, 5, 0);
-    let p_list = vec![off_c.clone(), on_a.clone(), unlabelled.clone()];
+    let labelled_a = label(1, Some("a")).by(&p, 6, 0);
+    let p_list = vec![
+        off_c.clone(),
+        on_a.clone(),
+        unlabelled.clone(),
+        labelled_a.clone(),
+    ];
+    // T writes copies of P's subscribe of `c` and label of `alice`, and
+    // `t1` at 100 and `t2` at 101; then the copies, and undoes of `t1` at
+    // 102 and of `t2` at 103.
     let t_first = vec![
         on_c.clone(),
         sub(10, true, &t, 100),
         sub(11, true, &t, 101),
         alice.clone(),
+        label(10, Some("t")).by(&t, 100, 0),
+        label(11, Some("t")).by(&t, 101, 0),
     ];
     let t_then = vec![
         on_c.clone(),
         sub(10, false, &t, 102),
         sub(11, false, &t, 103),
         alice.clone(),
+        label(10, None).by(&t, 102, 0),
+        label(11, None).by(&t, 103, 0),
     ];
-    for t_list in [t_first, t_then] {
-        for (counting, removed) in [(vec![&p, &t], vec![]), (vec![&p], vec![&t])] {
-            let makers = makers(&counting, &removed);
-            let of = lists(&[(&p, p_list.clone()), (&t, t_list.clone())]);
-            let computed = work(&of, &makers, bounds);
-            assert!(!in_force_of(&computed, &on_c), "{}", removed.len());
-            assert_eq!(newest_of(&computed, &on_c), Some(off_c.written()));
-            assert!(!in_force_of(&computed, &alice));
-            assert_eq!(newest_of(&computed, &alice), Some(unlabelled.written()));
-            assert!(in_force_of(&computed, &on_a));
-            // And the round after, each writing what it worked out.
-            let mut settling = of.clone();
-            settle(
-                &mut settling,
-                &[p.public_key(), t.public_key()],
-                &makers,
-                bounds,
-            );
-            let settled = work(&settling, &makers, bounds);
-            assert!(!in_force_of(&settled, &on_c));
-            assert!(!in_force_of(&settled, &alice));
-        }
+    let not_back = |computed: &Computed, when: &str| {
+        assert!(!in_force_of(computed, &on_c), "{when}");
+        assert!(!in_force_of(computed, &alice), "{when}");
+        assert!(in_force_of(computed, &on_a), "{when}");
+    };
+    let counting = makers(&[&p, &t], &[]);
+    let removed = makers(&[&p], &[&t]);
+
+    // The first computation: P's undoes are of nothing below them, since
+    // the copies are not taken, and fall past the bound.
+    let mut of = lists(&[(&p, p_list.clone()), (&t, t_first)]);
+    let first = work(&of, &counting, bounds);
+    not_back(&first, "first");
+    assert_eq!(newest_of(&first, &on_c), Some(off_c.written()));
+    assert_eq!(newest_of(&first, &alice), Some(unlabelled.written()));
+    // P writes its list again: it no longer carries its undoes.
+    of[0].1 = list_of(first.written.clone());
+    // T writes the copies and its own undoes.
+    of[1].1 = list_of(t_then);
+    for (makers, when) in [(&counting, "then"), (&removed, "after T's removal")] {
+        let computed = work(&of, makers, bounds);
+        not_back(&computed, when);
+        // And in every round after, each writing what it worked out.
+        let mut settling = of.clone();
+        settle(
+            &mut settling,
+            &[p.public_key(), t.public_key()],
+            makers,
+            bounds,
+        );
+        not_back(&work(&settling, makers, bounds), when);
     }
 }
 
