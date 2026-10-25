@@ -1103,6 +1103,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         "You may close this machine once every relay holds the change, and what this device \
          carried is at a relay that it reaches.",
     );
+    at.says("Until the wait ends, each line below starts with the time it was said, in UTC.");
     let said = at.done();
     println!("{said}");
     assert!(
@@ -1569,26 +1570,31 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     // The desktop was added since the last change. Before a change lists
     // it, the command shows it as an addition, from the record of its
     // own addition, and its listing is confirmed by a typed answer
-    // (decision 2026-10-04 §16).
+    // (decision 2026-10-04 §16; decision 2026-10-24, rule 1).
     let mut not_confirmed = desktop.at_terminal(&["renew"]);
     not_confirmed
-        .says("Type `stays` to list this device")
+        .says("Type `list` to list this machine and go on.")
         .types("yes");
     let said = not_confirmed.refused();
     assert!(
-        said.contains("That was not `stays`. Nothing was done."),
+        said.contains("You did not type `list`. Nothing was changed."),
         "{said}"
     );
     assert!(!said.contains("Make this change?"), "{said}");
     let mut on_desktop = desktop.at_terminal(&["renew"]);
     on_desktop
-        .says("This device is not in the last change: it was added since, as ")
-        .says("desktop")
-        .says("from ")
+        .says("A change is the list of your devices that your recovery phrase signs.")
+        .says("Your last change (change 1, made on ")
         .says("laptop")
-        .says("this change lists it under that label")
-        .says("Type `stays` to list this device")
-        .types("stays");
+        .says("was signed before this machine was added")
+        .says("laptop")
+        .says("added this machine at ")
+        .says("desktop")
+        .says("This command makes change 2.")
+        .says("will list this machine as ")
+        .says("desktop")
+        .says("Type `list` to list this machine and go on.")
+        .types("list");
     on_desktop
         .says("Make this change?")
         .says("Type yes to go on")
@@ -3839,7 +3845,8 @@ fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
 
     // The input ends at the first question: nothing is made.
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
-    at.says("Type `stays` to list this device").types("stays");
+    at.says("Type `list` to list this machine and go on.")
+        .types("list");
     at.says("No answer is suggested for any of them: each is typed.");
     at.says("Type `stays` or `removed`").ends_the_input();
     let said = at.refused_within(std::time::Duration::from_secs(60));
@@ -3852,9 +3859,9 @@ fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
 
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
     at.says("To be removed:");
-    at.says("This device is not in the last change: it was added since")
-        .says("Type `stays` to list this device")
-        .types("stays");
+    at.says("was signed before this machine was added, so it does not list this machine.")
+        .says("Type `list` to list this machine and go on.")
+        .types("list");
     at.says("No answer is suggested for any of them: each is typed.");
     // The tablet first: the device that is being removed added it.
     at.says("tablet")
@@ -3945,7 +3952,8 @@ fn a_devices_word_that_it_left_outlives_the_next_change() {
     // is asked about, and that it has said it left is said.
     laptop.stop();
     let mut at = desktop.at_terminal(&["renew"]);
-    at.says("Type `stays` to list this device").types("stays");
+    at.says("Type `list` to list this machine and go on.")
+        .types("list");
     at.says("tablet")
         .says("added since the last change, from")
         .says("It has said that it left, and started again under another phrase");
@@ -5431,12 +5439,18 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
         made.elapsed()
     );
     assert_eq!(status, Some(3), "{said}");
+    // Each says that it cannot be reached from here, and since what
+    // (decision 2026-10-24, rules 6 and 7): it has never answered, so
+    // since this device applied the change.
     for line in [
         format!(
-            "keep this machine on: {NO_SUCH_NAME} is not known to hold the change yet, and has \
-             not answered since"
+            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and is not known \
+             to hold the change yet: it has not answered since this device applied the change at "
         ),
-        format!("  {NO_SUCH_NAME} is not known to hold the change, and has not answered since"),
+        format!(
+            "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
+             it has not answered since this device applied the change at "
+        ),
         format!(
             "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
         ),
@@ -5450,9 +5464,10 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     }
     says_not_that_it_may_be_closed(&said);
     // The status line says so, with sync off and nothing mapped (rule
-    // 11): the command ends at five minutes, and the line once they are
+    // 11), and that the relay is out of reach (decision 2026-10-24, rule
+    // 7): the command ends at five minutes, and the line once they are
     // over, at the node's next pass. `cordelia devices` says D4.
-    let says = "memory: a relay not known to hold the latest change";
+    let says = "memory: a relay out of reach, not known to hold the latest change";
     wait_for("the status line is amber", &[&relay, &laptop], 30, || {
         amber_with(&laptop, says)
     });
@@ -5461,7 +5476,8 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     let devices = laptop.cli(&["devices"]);
     assert!(
         devices.contains(&format!(
-            "  {NO_SUCH_NAME}: is not known to hold the latest change, and has not answered since"
+            "  {NO_SUCH_NAME}: cannot be reached from here, and is not known to hold the latest \
+             change: it has not answered since this device applied the change at "
         )),
         "{devices}"
     );
@@ -5514,11 +5530,16 @@ fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_th
     });
     let seen = look(&laptop);
     assert_eq!(seen["relays"][1]["reach"]["holds"], "lacks", "{seen}");
-    let says = "memory: a relay not known to hold the latest change";
-    assert!(
-        amber_with(&laptop, says).is_none(),
-        "amber before five minutes"
-    );
+    // It never answers, and so is out of reach by then too: the line says
+    // so (decision 2026-10-24, rule 7).
+    let says = "memory: a relay out of reach, not known to hold the latest change";
+    // Not before five minutes, in either form of the line.
+    for early in [says, "memory: a relay not known to hold the latest change"] {
+        assert!(
+            amber_with(&laptop, early).is_none(),
+            "amber before five minutes: {early}"
+        );
+    }
     wait_for("the status line is amber", &all, 360, || {
         amber_with(&laptop, says)
     });
@@ -5558,7 +5579,10 @@ fn a_change_ends_not_done_where_the_relay_it_reaches_refuses_it() {
     for line in [
         format!("  {reached} is reached, and has not taken the change: it had no room for it at"),
         "(it is full).".to_string(),
-        format!("  {NO_SUCH_NAME} is not known to hold the change, and has not answered since"),
+        format!(
+            "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
+             it has not answered since"
+        ),
         format!(
             "{reached} refuses the change. A device that reaches it hears of it only once it takes it, or from another relay."
         ),
@@ -5598,7 +5622,10 @@ fn a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_ad
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert_eq!(status, Some(3), "{said}");
     for line in [
-        format!("  {wrong} is not known to hold the change, and has not answered since"),
+        format!(
+            "  {wrong} cannot be reached from here, and is not known to hold the change: it has \
+             not answered since"
+        ),
         format!("It cannot dial {wrong} while another relay answers at its address."),
         format!("The change is not known to be at {wrong}."),
     ] {
@@ -5682,7 +5709,8 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
     assert_eq!(status, Some(0), "{said}");
     for line in [
         format!(
-            "  {name_b} holds the change and all that this device carried, and has not been reached from here since"
+            "  {name_b} holds the change and all that this device carried, and cannot be reached \
+             from here: it has not been reached since"
         ),
         "Every relay holds the change. You may close this machine.".to_string(),
         format!("All that this device carried is at {name_a} and {name_b}."),
@@ -5697,13 +5725,100 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
     let mut laptop = laptop;
     laptop.stop();
     laptop.start();
-    let d5 = format!("  {name_b}: holds the latest change (as it said at ");
+    let d5 = format!(
+        "  {name_b}: cannot be reached from here, and holds the latest change (as it said at "
+    );
     wait_for("D5 is said of B", &[&a, &laptop], 420, || {
         let devices = laptop.cli(&["devices"]);
         let line = devices.lines().find(|line| line.starts_with(&d5))?;
-        line.contains("), and has not answered since ")
+        line.contains("): it has not answered since this device started at ")
             .then_some(())
     });
+}
+
+/// **A device added since the last change is asked to list itself**
+/// (decision 2026-10-24, rule 1). The laptop makes change 2, and adds the
+/// desktop after it. The desktop's `cordelia renew` says what a change is,
+/// its last change and who made it, who added it, and the change that the
+/// command makes; it asks for `list`. Another word stops it with nothing
+/// changed, and `stays` is such a word; `list` goes on, to the change
+/// that the phrase will sign, numbered as the question said.
+#[test]
+fn a_device_added_since_the_last_change_is_asked_to_list_itself() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let desktop = device_started("desktop", &relay);
+    let all = [&relay, &laptop, &desktop];
+    let words = makes_a_phrase(&laptop, "laptop");
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    adds(&laptop, &desktop, "desktop");
+    has_applied(&desktop, 2, &all);
+
+    let mut at = desktop.at_terminal(&["renew"]);
+    at.says("A change is the list of your devices that your recovery phrase signs.")
+        .says("Your last change (change 2, made on ")
+        .says("laptop")
+        .says("was signed before this machine was added, so it does not list this machine.")
+        .says("laptop")
+        .says("added this machine at ")
+        .says("This command makes change 3. The machine that makes a change is always in it, ")
+        .says(
+            "Type `list` to list this machine and go on. Anything else stops here, and nothing \
+               is changed:",
+        )
+        .types("stays");
+    let said = at.refused();
+    assert!(
+        said.contains("You did not type `list`. Nothing was changed."),
+        "{said}"
+    );
+    assert!(!said.contains("Make this change?"), "{said}");
+    assert_eq!(look(&desktop)["change"], 2);
+    assert!(
+        desktop
+            .cli(&["devices"])
+            .contains("The last change it has applied: change 2."),
+    );
+
+    let mut at = desktop.at_terminal(&["renew"]);
+    at.says("This command makes change 3.")
+        .says("Type `list` to list this machine and go on.")
+        .types("list");
+    at.says("The change that the recovery phrase will sign (change 3):");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("no");
+    at.done();
+    assert_eq!(look(&desktop)["change"], 2);
+}
+
+/// **The wait names a relay as it is configured** (decision 2026-10-24,
+/// rule 2). The laptop is set up with a relay given no key, by a name
+/// that resolves to its address (`localhost:<port>`). The relay has no
+/// room, so what this device has to send waits there for as long as the
+/// test looks. The wait's line of what waits there names the relay by
+/// that name, and never by the address it was reached at.
+#[test]
+fn the_wait_names_a_relay_as_configured() {
+    let mut relay = node("relay", "relay", None);
+    relay.max_storage_bytes(1);
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    let name = format!("localhost:{}", relay.p2p);
+    let (laptop, words) = phrase_made_at(&relay, &[(name.clone(), None)]);
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 2).");
+    at.says(&format!(
+        " of this device's channels still to send to {name}"
+    ));
+    let said = at.said.clone();
+    drop(at);
+    let port = format!(":{}", relay.p2p);
+    for address in [format!("127.0.0.1{port}"), format!("[::1]{port}")] {
+        assert!(!said.contains(&address), "{address}: {said}");
+    }
 }
 
 /// The wait that cannot be started ends with status 3 (decision
