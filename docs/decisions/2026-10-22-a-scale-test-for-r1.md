@@ -365,7 +365,7 @@ It is a test file of the real-process harness, `crates/cordelia-node/tests/scale
 ```bash
 cargo build --release -p cordelia-node
 CORDELIA_SCALE_STAGE=100 CORDELIA_SCALE_SEED=1 CORDELIA_SCALE_OUT=/path/to/out \
-  cargo test --release -p cordelia-node --test scale -- --ignored --nocapture
+  cargo test --release -p cordelia-node --test scale a_stage_of_the_scale_test -- --ignored --nocapture
 ```
 
 ### 4.2 The steps of a run
@@ -397,7 +397,7 @@ So in the window each relay counts two churns at least: the first relay two, by 
 
 In `CORDELIA_SCALE_OUT`:
 
-- **`SUMMARY.md`, the one file for a person to read.** First line: PASS, FAIL or INVALID, the stage, the seed, the commit, and which of changes C, D, B and A are in the build. Then each bar of section 3, one line each: the figure, the bar, pass or fail. Then the checks of section 6 (whether the run is valid). Then, per relay and per profile of device: the median and the worst of each measure, and the parts treated apart. Then the setup's figures and every setting given beyond the defaults. It names no machine and no host: it says "16 vCPU, 32 GB" from `/proc`, and no more.
+- **`SUMMARY.md`, the one file for a person to read.** First line: PASS, FAIL or INVALID, or NOT RESOLVED where no bar fails and a bar's figure cannot be told from its bar (bar 4's p99, read as the bound of a bucket of powers of two, in the bucket that holds the bar), the stage, the seed, the commit, and which of changes C, D, B and A are in the build. Then each bar of section 3, one line each: the figure, the bar, pass or fail. Then the checks of section 6 (whether the run is valid). Then, per relay and per profile of device: the median and the worst of each measure, and the parts treated apart. Then the setup's figures and every setting given beyond the defaults. It names no machine and no host: it says "16 vCPU, 32 GB" from `/proc`, and no more.
 - `samples.jsonl`: every sample, one line each.
 - `edits.csv`: every edit, and its arrival on each other device.
 - `pids`: the pids the run started.
@@ -421,7 +421,7 @@ In `CORDELIA_SCALE_OUT`:
 
 ## 6. The tests of the harness, and how a run is checked
 
-The tests of the harness are tests of `scale.rs`. Tests 1, 2, 3, 6 and 7 start no process and are not ignored; tests 4 and 5 take some minutes and are ignored for their length, and CI runs them with the other ignored tests of cordelia-node (TESTING.md).
+The tests of the harness are tests of `scale.rs`. Tests 1, 2, 3, 6 and 7 start no process and are not ignored. Tests 4 and 5 take some minutes and are ignored for their length; as the run of a stage does without `CORDELIA_SCALE_STAGE`, they return at once unless `CORDELIA_SCALE_SMALL` is set, so that the CI job that runs the ignored tests passes over them. They run, in a release build, in a CI job of their own that runs only when asked for (`scale.yml`), and on the build machine; a run on a machine busy with other work is INVALID by rule 5 below, and test 5, which must say FAIL, fails then (TESTING.md).
 
 1. **The population.** For each stage, the population has exactly the stage's devices, the mix of §2.2, the office, the split people, a /24 for each person at setup and the office's one address in the window, and no address outside 127.0.0.0/8; the same seed gives the same population; another seed gives another.
 2. **The schedule.** Over a simulated ten hours, each profile's edits an hour are within 5% of section 2.1; its bursts come once each 30 minutes; every edit of a session is on its active device; no file is written twice on one device within 15 s; the active device is never off in its session; and each profile's share of time off is within 5% of what item 4 of section 2.1 gives. And the steps of section 4.2 follow churns given to them: with the churns of a slow setup they still place two churns of each relay in the window, and with no churn after five hours they cut the window and say INVALID.
