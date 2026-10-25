@@ -125,7 +125,7 @@ cordelia msg allow <a> --all (<n> | any) [--for <time>]
 > `<Pair>`, `<k>` messages wait for you to read them. `<now>`
 > `<question>` If you are an agent, stop here and tell your user. Type yes to allow it:
 
-For `<k>` of 1, "1 message waits"; for 0, "no message waits".
+For `<k>` of 1, "1 message waits for you to read it."; for 0, "no message waits for you to read.": "Between `<a>` and `<b>`, no message waits for you to read. `<now>`".
 
 `<now>` is one of:
 
@@ -136,7 +136,7 @@ For `<k>` of 1, "1 message waits"; for 0, "no message waits".
 `<question>` is one of:
 
 - "Allow `<n>` to wait unread, until `<when>`? At `<n>`, sending stops until you read them with cordelia msg log. After `<when>` it stops at 10 again."
-- where `<n>` is at or below `<k>`: "Allow `<n>` to wait unread, until `<when>`? `<k>` wait now, so sending stops at once, until you read them with cordelia msg log. After `<when>` it stops at 10 again."
+- where `<n>` is at or below `<k>`: "Allow `<n>` to wait unread, until `<when>`? `<k>` wait now, so sending stops at once, until you read them with cordelia msg log. After `<when>` it stops at 10 again." For `<k>` of 1: "... 1 waits now, so sending stops at once, ..."
 - for `any`: "Allow any number to wait unread, until `<when>`? Until then only the hourly limits stop sending. After `<when>` it stops at 10 again."
 - for 10: "Go back to the usual hold of 10 now?"
 
@@ -164,9 +164,9 @@ After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other 
 
 - For a pair of two names, `a` is not above `b` in byte order, so a pair has one spelling; they may be equal.
 - **As many bounds as fit:** at the longest names 4 (1,706 bytes; five would need 2,132), at names of 30 bytes 22.
-- A reader takes as no list one with a name that is not a name, a kind other than 1 or 2, `a` above `b` for kind 1, a bound over 64, a `for` outside 60 to 604,800, two bounds of one pair, bytes that run past the value, or a fill that is not zeros. **Where a newer list of form 4 is no list, that key's bounds go:** a bound that cannot be read holds nothing, and the pair is at what the others list. **A form this version does not know leaves that key's bounds as they were,** as a list of what agents read that does not read leaves the marks before it (`reader.rs:167`): so a later version that changes what a list of bounds holds writes it under a new form byte, and this version keeps that key's last bounds of form 4 rather than drop a 10 that holds an older `any` back.
+- A reader takes as no list one with a name that is not a name, a kind other than 1 or 2, `a` above `b` for kind 1, a bound over 64, a `for` outside 60 to 604,800, two bounds of one pair, bytes that run past the value, or a fill that is not zeros. **Where a newer list of form 4 is no list, that key's bounds go:** a bound that cannot be read holds nothing, and the pair is at what the others list. The device's own key is the one exception: its own bounds are its person's acts at its terminal, and a list of its own that does not read, handed back by a relay, is a holder of its key's, so they stay. **A form this version does not know leaves that key's bounds as they were,** as a list of what agents read that does not read leaves the marks before it (`reader.rs:167`): so a later version that changes what a list of bounds holds writes it under a new form byte, and this version keeps that key's last bounds of form 4 rather than drop a 10 that holds an older `any` back.
 - **The device's own list, handed back by a relay from its later life** (a store restored from a backup), is merged into the device's own rows of `message_bounds`, in the door's write: for each pair, the bound with the later `set` is kept; an own bound that the later list lacks is kept only where it was set since this start (the later life dropped the rest). Its next list goes above it.
-- **A relay's answer of another to the device's own list** means that its store went back: the device first drops its own bounds set before this start, which may be ones its later life ended, and then writes above. So a restored store brings no ended `any` back, and keeps what you set since it started; what its later life set and no relay it reaches still holds is lost, and the pair is at what the others list.
+- **A relay's answer of another to the device's own list** means that its store went back, or that the relay lies. The device acts on it only where it may write its list, the answer names the revision of the list it holds, and it has written that list again so fewer than three times in a row, as it writes a list again: it first drops those of its own bounds set before this start that allow more than the usual hold (`any`, or a number above 10), which may be ones its later life ended, keeps a 10 or a lower number, the safe side whichever it is, and then writes above. So a restored store brings no ended `any` back, a relay that lies ends no 10 and no lower bound, and the device keeps what you set since it started; what its later life set and no relay it reaches still holds is lost, and the pair is at what the others list.
 - It is sealed, signed, sized and written by the rules of rule 1's list, wherever what it lists changes (rule 3.5). Its name, `hold/` and a key, is 75 bytes.
 
 **Beside the version before.** `cordelia msg allow` is not there, and a device of the version before holds every pair at 10. It counts each list of bounds as an entry that was not a message, as in rule 1. So where your agents run on two devices of two versions, the older one stops its side at 10, whatever you allow. The help of `cordelia msg allow` says so: "A device of yours on an older version holds every pair at 10, and does not hear of this." When it takes this version it reads the list it holds (rule 1).
@@ -409,3 +409,13 @@ The first form (commit 2160a7f3, pull request #212) had one independent review: 
 | 5 | low | A later version that changed form 4 would have this version drop its 10s | A change takes a new form byte, and a form this version does not know leaves that key's bounds as they were; a form 4 that fails its checks still drops them (rule 2) |
 | 6 | low | How `<where>` joins three or more | This device first, the rest in order of label, joined with ", " and " and " (section 1) |
 | 7 | low | §5 missed §12's figure of a reader's rows | Added, with the figure of section 7 (162,518 for each signer) |
+
+**The review of the build** (pull request #215) found one medium and four low findings (rows 2 to 5 are its lows 1 to 4).
+
+| # | Level | Finding | Settled |
+|---|---|---|---|
+| 1 | medium | A relay that answers another could end a 10: the device dropped every own bound of before its start, whatever revision the answer named, however often, and even where it then wrote nothing; another device's older `any` then held everywhere | It acts only on an answer to the list it holds, within its three, where it may write; and of its own bounds of before the start it drops only those that allow more than the usual hold (rule 2). Test `a_relay_that_answers_another_cannot_end_a_ten` |
+| 2 | low | A bad list of the device's own key left its own bounds, though the record said that key's bounds go | Kept, and said: the device's own bounds are its person's acts (rule 2) |
+| 3 | low | Four rules had no test that caught them undone: a person's read of another device going with its message's row; the device's own key in the answer of another; the tie by key; the list of bounds counting its writes again apart | A test for each |
+| 4 | low | The look for 0 and 1, the question's "1 wait now", and a `--for` given with 10, which the command refused for its time | The words are said in full (rule 2), "1 waits now" in both, and a `--for` given with 10 is not read |
+| 5 | low | The status could count before the lists held from before step 20 were read | Left: the status writes nothing of its own (its test, `test_a_devices_status_identity_and_metrics_count_nothing_of_the_older_kind`), and the node reads the lists at its start, before its server answers, and at each pass, before it writes a list |
