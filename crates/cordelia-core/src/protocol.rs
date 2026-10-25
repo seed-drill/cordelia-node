@@ -3226,8 +3226,12 @@ mod tests {
     #[test]
     fn test_change_entry_decision_2026_10_04_4_6() {
         assert_eq!(CHANGE_ENTRY_BYTES, 32_768);
+        // The two sealed parts, and the lineage of decision 2026-10-24
+        // rule 13.
         assert_eq!(
-            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES,
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
             CHANGE_ENTRY_BYTES
         );
         assert_eq!(SEALED_SECRET_BYTES, 92);
@@ -3422,7 +3426,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 28);
+        assert_eq!(LABELS.len(), 29);
     }
 
     /// What the commands a person types go by: the place of a device's
