@@ -38,6 +38,17 @@
 //! each other device ([`keep_list`]). Neither is matched
 //! to a message when it is taken: whether a message is read is worked out
 //! when it is shown ([`read_by`], decision 2026-10-09 §7.2).
+//!
+//! ## A person's hold (decision 2026-10-25, step 20)
+//!
+//! **A person's read** here is a row of `message_read_by_a_person`, and
+//! what other devices said a person read is kept in `message_person_marks`
+//! as a union ([`keep_person_list`]): read by a person is worked out when
+//! it is asked, from a row of the first, or a row of the second under a
+//! key that counts now, which the caller says ([`person_reads`],
+//! [`pairs_with`]). **The bounds** a person set, this device's own and
+//! those of each key's latest list, are rows of `message_bounds`
+//! ([`bounds`]); which bound holds a pair is worked out by the caller.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -1029,26 +1040,49 @@ pub fn newest_own_sent(
 /// The other side of a pair of agents: a name, or every name.
 pub type Other = Option<String>;
 
+/// The SQL of the keys of `counting` as a list of blobs, for `IN (...)`:
+/// each a key of 32 bytes, written in hex, so no text of another's is in
+/// it. `NULL` where there are none, which `IN` matches with nothing.
+fn keys_sql(counting: &[[u8; 32]]) -> String {
+    match counting.is_empty() {
+        true => "NULL".into(),
+        false => counting
+            .iter()
+            .map(|key| {
+                let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                format!("X'{hex}'")
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 /// For each pair with the agent of `name` on one side, how many of its
 /// messages count towards the hold at `now` (decision 2026-10-09 §6, C8,
 /// F2): those the device holds, that have a place, that have not expired,
-/// that are live, and that no person has read on this device. A message
-/// to one name is of the pair of its sender and its recipient, in either
-/// direction; a message to every name is of the pair of its sender and
-/// all (`None`). In order of the other name, and all last.
+/// that are live, and that no person has read on any device that counts
+/// (decision 2026-10-25, rule 1.3): no row of a person's read here, and
+/// none of another key's list among `counting`, the keys that count now.
+/// A message to one name is of the pair of its sender and its recipient,
+/// in either direction; a message to every name is of the pair of its
+/// sender and all (`None`). In order of the other name, and all last.
 pub fn pairs_with(
     conn: &Connection,
     name: &str,
     now: i64,
+    counting: &[[u8; 32]],
 ) -> Result<Vec<(Other, u64)>, StorageError> {
     let rows: Vec<(String, Option<String>)> = conn
         .prepare(&format!(
             "SELECT i.from_name, i.to_name FROM message_index i
              WHERE i.placed_at IS NOT NULL AND ?1 < {expires} AND {live}
                AND NOT EXISTS (SELECT 1 FROM message_read_by_a_person p WHERE p.id = i.id)
+               AND NOT EXISTS (SELECT 1 FROM message_person_marks m
+                               WHERE m.id = i.id AND m.key IN ({keys}))
                AND (i.from_name = ?2 OR i.to_name = ?2)",
             expires = expires_sql(),
             live = live_sql(),
+            keys = keys_sql(counting),
         ))?
         .query_map(params![now, name], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
@@ -1645,8 +1679,10 @@ pub fn is_announced(conn: &Connection, id: &Id, name: &str) -> Result<bool, Stor
 
 /// A person read message `id` on this device (decision 2026-10-09 §7.2,
 /// §6): `log` at a terminal, with yes, marks what it printed. The mark is
-/// the device's own and is never synced, and it goes with its message's
-/// row. In the caller's write. Returns whether it was not marked before.
+/// the device's own, said to the other devices in its list of a person's
+/// reads (decision 2026-10-25, rule 1), and it goes with its message's
+/// row. Its order is the table's rowid: the newest is the highest. In the
+/// caller's write. Returns whether it was not marked before.
 pub fn mark_read_by_a_person(conn: &Connection, id: &Id) -> Result<bool, StorageError> {
     Ok(conn.execute(
         "INSERT OR IGNORE INTO message_read_by_a_person (id) VALUES (?1)",
@@ -1663,6 +1699,267 @@ pub fn is_read_by_a_person(conn: &Connection, id: &Id) -> Result<bool, StorageEr
         |row| row.get(0),
     )?;
     Ok(held > 0)
+}
+
+// ── What a person read, said to the other devices ───────────────────
+
+/// The IDs that the device's list of a person's reads holds (decision
+/// 2026-10-25, rule 1): the newest 120 rows of its table of a person's
+/// reads here, newest first.
+pub fn person_ids_to_list(conn: &Connection) -> Result<Vec<Id>, StorageError> {
+    let ids: Vec<Vec<u8>> = conn
+        .prepare(&format!(
+            "SELECT id FROM message_read_by_a_person ORDER BY rowid DESC
+             LIMIT {AGENT_MESSAGE_READ_MARKS_MAX}"
+        ))?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids.iter().map(|id| id_of(id)).collect())
+}
+
+/// The store kept a newer list of a person's reads of the device `key`
+/// (decision 2026-10-25, rule 1), in the caller's write: each of its `ids`
+/// is added to what is kept of that key, taken at `now`, **and nothing is
+/// taken away**. Of the rows whose message the device does not hold, the
+/// newest 120 of each key are kept ([`keep_person_marks`]).
+pub fn keep_person_list(
+    conn: &Connection,
+    key: &[u8; 32],
+    ids: &[Id],
+    now: i64,
+) -> Result<(), StorageError> {
+    // The oldest first, so that the newest of a list is the last taken.
+    for id in ids.iter().rev() {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_person_marks (key, id, taken_at) VALUES (?1, ?2, ?3)",
+            params![&key[..], &id[..], now],
+        )?;
+    }
+    keep_person_marks(conn, now)
+}
+
+/// Keep what the device keeps of other devices' lists of a person's reads
+/// within its bounds at `now` (decision 2026-10-25, rule 1.2), in the
+/// caller's write: of the rows whose message the device does not hold, at
+/// most 120 for each key, the latest taken first, and each for 30 days
+/// from when it was taken. A row whose message it holds goes with that
+/// message's row ([`drop_row`]).
+pub fn keep_person_marks(conn: &Connection, now: i64) -> Result<(), StorageError> {
+    conn.execute(
+        "DELETE FROM message_person_marks
+         WHERE taken_at <= ?1
+           AND NOT EXISTS (SELECT 1 FROM message_index i WHERE i.id = message_person_marks.id)",
+        [now - i64::from(AGENT_MESSAGE_KEPT_DAYS) * DAY_SECS],
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM message_person_marks WHERE rowid IN (
+                 SELECT rowid FROM (
+                     SELECT m.rowid AS rowid, ROW_NUMBER() OVER (
+                         PARTITION BY m.key ORDER BY m.taken_at DESC, m.rowid DESC) AS place
+                     FROM message_person_marks m
+                     WHERE NOT EXISTS (SELECT 1 FROM message_index i WHERE i.id = m.id))
+                 WHERE place > {AGENT_MESSAGE_READ_MARKS_MAX})"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+/// Drop what is kept of the lists of a person's reads of each key that is
+/// not among `counting` (decision 2026-10-25, rule 1.2): in the
+/// transaction that applies a statement, so that a key added again later
+/// counts only what it lists from then. Returns how many rows went.
+pub fn drop_person_marks_but(
+    conn: &Connection,
+    counting: &[[u8; 32]],
+) -> Result<usize, StorageError> {
+    Ok(conn.execute(
+        &format!(
+            "DELETE FROM message_person_marks WHERE key NOT IN ({})",
+            keys_sql(counting)
+        ),
+        [],
+    )?)
+}
+
+/// Every row that says a message read by a person (decision 2026-10-25,
+/// rule 1.3), as [`person_reads`] reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonReadsHeld {
+    /// The IDs a person read here.
+    pub here: Vec<Id>,
+    /// The IDs each other key's lists said, with the key.
+    pub lists: Vec<([u8; 32], Id)>,
+}
+
+/// Every row that says a message read by a person, read with two
+/// statements for every message at once. Which keys count is the caller's
+/// to say.
+pub fn person_reads(conn: &Connection) -> Result<PersonReadsHeld, StorageError> {
+    let here: Vec<Vec<u8>> = conn
+        .prepare("SELECT id FROM message_read_by_a_person")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let lists: Vec<(Vec<u8>, Vec<u8>)> = conn
+        .prepare("SELECT key, id FROM message_person_marks")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(PersonReadsHeld {
+        here: here.iter().map(|id| id_of(id)).collect(),
+        lists: lists
+            .into_iter()
+            .filter_map(|(key, id)| Some((key.try_into().ok()?, id_of(&id))))
+            .collect(),
+    })
+}
+
+/// Whether the device holds message `id` in its index.
+pub fn holds_message(conn: &Connection, id: &Id) -> Result<bool, StorageError> {
+    let held: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_index WHERE id = ?1",
+        [&id[..]],
+        |row| row.get(0),
+    )?;
+    Ok(held > 0)
+}
+
+// ── The bounds a person set ──────────────────────────────────────────
+
+/// A pair of agents, as a bound is set for it (decision 2026-10-25, rule
+/// 2): two names, `a` not above `b` in byte order, or a name and every
+/// agent (`b` is `None`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pair {
+    pub a: String,
+    pub b: Option<String>,
+}
+
+impl Pair {
+    /// The pair of `x` and `y`, in its one spelling.
+    pub fn of(x: &str, y: Option<&str>) -> Self {
+        match y {
+            Some(y) if y.as_bytes() < x.as_bytes() => Self {
+                a: y.into(),
+                b: Some(x.into()),
+            },
+            y => Self {
+                a: x.into(),
+                b: y.map(String::from),
+            },
+        }
+    }
+}
+
+/// One row of `message_bounds` (decision 2026-10-25, rules 2 and 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundRow {
+    /// The key whose list holds it, this device's own among them.
+    pub key: [u8; 32],
+    pub pair: Pair,
+    /// 1 to 64, or `None` for any.
+    pub bound: Option<u8>,
+    pub set: u64,
+    pub at: u64,
+    pub for_secs: u32,
+    /// When this device first held it, by its clock.
+    pub first_held: i64,
+    /// The start of the node in which this device set it: its own rows
+    /// alone.
+    pub start: Option<i64>,
+}
+
+fn bound_from(row: &rusqlite::Row) -> rusqlite::Result<BoundRow> {
+    let key: Vec<u8> = row.get(0)?;
+    let b_kind: i64 = row.get(2)?;
+    let b: String = row.get(3)?;
+    let set: Vec<u8> = row.get(5)?;
+    let at: Vec<u8> = row.get(6)?;
+    let eight = |bytes: Vec<u8>| -> u64 {
+        let mut out = [0u8; 8];
+        let len = bytes.len().min(8);
+        out[..len].copy_from_slice(&bytes[..len]);
+        u64::from_be_bytes(out)
+    };
+    Ok(BoundRow {
+        key: key.try_into().unwrap_or([0; 32]),
+        pair: Pair {
+            a: row.get(1)?,
+            b: (b_kind == 1).then_some(b),
+        },
+        bound: row.get::<_, Option<i64>>(4)?.map(|n| n as u8),
+        set: eight(set),
+        at: eight(at),
+        for_secs: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+        first_held: row.get(8)?,
+        start: row.get(9)?,
+    })
+}
+
+/// Every bound the device holds, of every key, in order of key and pair.
+pub fn bounds(conn: &Connection) -> Result<Vec<BoundRow>, StorageError> {
+    let rows = conn
+        .prepare(
+            "SELECT key, a, b_kind, b, bound, set_order, at_clock, for_secs, first_held, start
+             FROM message_bounds ORDER BY key, a, b_kind, b",
+        )?
+        .query_map([], bound_from)?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Write `row` in place of what the device held of its key and pair, in
+/// the caller's write.
+pub fn put_bound(conn: &Connection, row: &BoundRow) -> Result<(), StorageError> {
+    let (b_kind, b) = match &row.pair.b {
+        Some(b) => (1, b.as_str()),
+        None => (2, ""),
+    };
+    conn.execute(
+        "INSERT INTO message_bounds (key, a, b_kind, b, bound, set_order, at_clock, for_secs,
+                                     first_held, start)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(key, a, b_kind, b) DO UPDATE SET
+             bound = excluded.bound, set_order = excluded.set_order,
+             at_clock = excluded.at_clock, for_secs = excluded.for_secs,
+             first_held = excluded.first_held, start = excluded.start",
+        params![
+            &row.key[..],
+            row.pair.a,
+            b_kind,
+            b,
+            row.bound.map(i64::from),
+            &row.set.to_be_bytes()[..],
+            &row.at.to_be_bytes()[..],
+            i64::from(row.for_secs),
+            row.first_held,
+            row.start,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop the bound of `key` for `pair`, where the device holds one.
+pub fn drop_bound(conn: &Connection, key: &[u8; 32], pair: &Pair) -> Result<bool, StorageError> {
+    let (b_kind, b) = match &pair.b {
+        Some(b) => (1, b.as_str()),
+        None => (2, ""),
+    };
+    Ok(conn.execute(
+        "DELETE FROM message_bounds WHERE key = ?1 AND a = ?2 AND b_kind = ?3 AND b = ?4",
+        params![&key[..], pair.a, b_kind, b],
+    )? == 1)
+}
+
+/// Drop every bound of `key`. Returns how many went.
+pub fn drop_bounds_of(conn: &Connection, key: &[u8; 32]) -> Result<usize, StorageError> {
+    Ok(conn.execute("DELETE FROM message_bounds WHERE key = ?1", [&key[..]])?)
+}
+
+/// Drop every bound of every key (decision 2026-10-25, rule 3.7): in the
+/// transaction that applies a statement. Returns how many went.
+pub fn drop_all_bounds(conn: &Connection) -> Result<usize, StorageError> {
+    Ok(conn.execute("DELETE FROM message_bounds", [])?)
 }
 
 /// How many entries of the channel `channel` the store holds of each
@@ -1764,6 +2061,12 @@ fn overwritten_and_deleted(conn: &Connection, id: &[u8], now: i64) -> Result<boo
         params![id, now],
     )?;
     keep_120_bare(conn)?;
+    // What another device said a person read goes with the message's row
+    // (decision 2026-10-25, rule 1.2).
+    conn.execute(
+        "DELETE FROM message_person_marks WHERE id = ?1",
+        params![id],
+    )?;
     let dropped = conn.execute("DELETE FROM message_index WHERE id = ?1", params![id])?;
     Ok(dropped == 1)
 }

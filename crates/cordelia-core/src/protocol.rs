@@ -2214,13 +2214,28 @@ pub const AGENT_MESSAGE_PREFIX: &str = "msg/";
 /// (decision 2026-10-09 §2.2, §2.4): the device's key follows it.
 pub const AGENT_MESSAGE_READ_PREFIX: &str = "read/";
 
+/// The first part of the name of a device's list of what a person read on
+/// it (decision 2026-10-25, rule 1): the device's key follows it. With a
+/// key it is 77 bytes, the longest name that the channel's value is sized
+/// by (`AGENT_MESSAGE_VALUE_BYTES`), so the size does not change.
+pub const AGENT_MESSAGE_PERSON_PREFIX: &str = "person/";
+
+/// The first part of the name of a device's list of the bounds a person
+/// set on it (decision 2026-10-25, rule 2): the device's key follows it,
+/// 75 bytes in all.
+pub const AGENT_MESSAGE_PAIR_BOUNDS_PREFIX: &str = "hold/";
+
 /// How many slots a device has for its messages (decision 2026-10-09
 /// §2.3), how many numbers of one signer are live at a reader (§2.5), and
 /// how many places a reader gives one signer in an hour (§6). With its
-/// list, a device has 65 slots of the messages channel, and 64 devices'
-/// are within what a relay holds of one channel. It is above the device's
-/// hourly limit, so an honest device's hour of messages is never
-/// overwritten within the hour.
+/// three lists (of what its agents read, of what a person read on it, and
+/// of the bounds a person set on it, decision 2026-10-25), a device has 67
+/// slots of the messages channel, and 64 devices' are within what a relay
+/// holds of one channel. It is above the device's hourly limit, so an
+/// honest device's hour of messages is never overwritten within the hour.
+/// It is also the highest bound a person can set for a pair (decision
+/// 2026-10-25, rule 2): one lap of a device's ring, above which a bound
+/// stops no loop between two agents of one device.
 pub const AGENT_MESSAGE_RING: usize = 64;
 
 /// The content of every entry of the messages channel, whatever it holds
@@ -2279,7 +2294,10 @@ pub const AGENT_MESSAGE_ID_SHOWN_CHARS: usize = 8;
 pub const AGENT_MESSAGE_READ_MARK_BYTES: usize = 16;
 
 /// The most marks in a device's list of what its agents read (decision
-/// 2026-10-09 §2.2, §2.4).
+/// 2026-10-09 §2.2, §2.4). Also the most IDs in its list of what a person
+/// read on it, and the most rows of messages it does not hold that a
+/// device keeps of each key's lists of a person's reads (decision
+/// 2026-10-25, rule 1).
 /// Derived: as many as fit in a value after the form's byte and the
 /// count's two.
 pub const AGENT_MESSAGE_READ_MARKS_MAX: usize =
@@ -2288,19 +2306,47 @@ pub const AGENT_MESSAGE_READ_MARKS_MAX: usize =
 /// How long a message is shown on a device, from its shown time, and when
 /// its sender clears it at the relays (decision 2026-10-09 §7.1): 30 days.
 /// Messages are coordination, not a record. Also how long a kept value
-/// waits for every relay to take it (§2.3).
+/// waits for every relay to take it (§2.3), and how long a device keeps a
+/// person's read of a message it does not hold (decision 2026-10-25, rule
+/// 1).
 pub const AGENT_MESSAGE_KEPT_DAYS: u32 = 30;
 
 /// How far ahead of a sender's clock a `sent` of its own may be and still
 /// hold its sending back (decision 2026-10-09 §7.1): ten minutes. A row
 /// further ahead is passed over, so a clock that was ahead for a moment
-/// does not lock a device out. A reader uses no such bound.
+/// does not lock a device out. A reader uses no such bound. Also the
+/// clock's margin in `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS` (decision
+/// 2026-10-25, rule 3.5).
 pub const AGENT_MESSAGE_AHEAD_MAX_SECS: u64 = 600;
 
 /// The most numbers that one message is sent under (decision 2026-10-09
 /// §2.3): a restore a lap behind needs one more, and behind two relays
-/// two; four leaves room, and bounds a relay that answers falsely.
+/// two; four leaves room, and bounds a relay that answers falsely. Also
+/// the most revisions of each of a device's lists in a row for a relay's
+/// answer of another (decision 2026-10-25, rules 1 and 2).
 pub const AGENT_MESSAGE_SENDS_MAX: usize = 4;
+
+/// How long a bound a person sets for a pair holds where `--for` gives
+/// none (decision 2026-10-25, rule 2): 8 hours, a working day, so that
+/// what is allowed for a task is gone by the next morning.
+pub const AGENT_MESSAGE_PAIR_BOUND_SECS: u32 = 28_800;
+
+/// The longest a bound a person sets for a pair holds, and the `for` of a
+/// 10 (decision 2026-10-25, rules 2 and 3.3): 7 days, a week away, after
+/// which a bound that was forgotten ends by itself.
+pub const AGENT_MESSAGE_PAIR_BOUND_MAX_SECS: u32 = 604_800;
+
+/// The shortest `--for` a person can give (decision 2026-10-25, rule 2):
+/// one minute, as `--for` is given in whole minutes at the least.
+pub const AGENT_MESSAGE_PAIR_BOUND_MIN_SECS: u32 = 60;
+
+/// How long after its `at`, by its own clock, a device lists the latest
+/// bound it set for a pair (decision 2026-10-25, rule 3.5): so that every
+/// bound it overrode has ended first, with a clock's ten minutes.
+/// Derived: AGENT_MESSAGE_PAIR_BOUND_MAX_SECS and
+/// AGENT_MESSAGE_AHEAD_MAX_SECS.
+pub const AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS: u64 =
+    AGENT_MESSAGE_PAIR_BOUND_MAX_SECS as u64 + AGENT_MESSAGE_AHEAD_MAX_SECS;
 
 /// The most messages an honest command sends from one folder in an hour
 /// (decision 2026-10-09 §6). A message to every name counts as one.
@@ -2313,8 +2359,10 @@ pub const AGENT_MESSAGES_PER_FOLDER_PER_HOUR: usize = 20;
 pub const AGENT_MESSAGES_PER_DEVICE_PER_HOUR: usize = 60;
 
 /// How many messages between two agents that are shown on a device and
-/// that no person there has read stop that device sending between them
-/// (decision 2026-10-09 §6).
+/// that no person has read stop that device sending between them
+/// (decision 2026-10-09 §6): the usual hold, the bound of every pair
+/// until a person sets another, and again when it ends (decision
+/// 2026-10-25, rule 3).
 pub const AGENT_MESSAGE_PAIR_UNREAD_MAX: usize = 10;
 
 /// How many lines of new messages `cordelia msg summary` prints, and how
@@ -2401,12 +2449,40 @@ const _: () = assert!(
         .next_power_of_two()
         == AGENT_MESSAGE_CONTENT_BYTES
 );
-// Every counted device's ring and list are within one channel at a relay.
+// Every counted device's ring and its three lists are within one channel
+// at a relay (decision 2026-10-25, section 4).
 const _: () = assert!(
-    (MAX_COUNTED_DEVICES * (AGENT_MESSAGE_RING + 1)) as u64
+    (MAX_COUNTED_DEVICES * (AGENT_MESSAGE_RING + 3)) as u64
         * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
         <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY
 );
+// The names of a person's reads and of the bounds, with a key, are at most
+// the longest name the value is sized by (decision 2026-10-25, section 4).
+const _: () =
+    assert!(AGENT_MESSAGE_PERSON_PREFIX.len() + 70 <= AGENT_MESSAGE_PREFIX.len() + 70 + 1 + 2);
+const _: () =
+    assert!(AGENT_MESSAGE_PAIR_BOUNDS_PREFIX.len() + 70 <= AGENT_MESSAGE_PREFIX.len() + 70 + 1 + 2);
+// A full list of a person's reads (form 3): its form, its count and 120
+// IDs.
+const _: () = assert!(
+    1 + 2 + AGENT_MESSAGE_READ_MARKS_MAX * AGENT_MESSAGE_ID_BYTES <= AGENT_MESSAGE_VALUE_BYTES
+);
+// Four bounds of form 4 at the longest names fit, and five do not: the
+// form and the count, then for each `a`, the kind, `b`, the bound, `set`,
+// `at` and `for` (decision 2026-10-25, rule 2).
+const _: () = assert!(
+    1 + 1 + 4 * ((2 + AGENT_MESSAGE_NAME_MAX_BYTES) * 2 + 1 + 1 + 8 + 8 + 4)
+        <= AGENT_MESSAGE_VALUE_BYTES
+);
+const _: () = assert!(
+    1 + 1 + 5 * ((2 + AGENT_MESSAGE_NAME_MAX_BYTES) * 2 + 1 + 1 + 8 + 8 + 4)
+        > AGENT_MESSAGE_VALUE_BYTES
+);
+// The highest bound fits in its byte; a `for` in its four.
+const _: () = assert!(AGENT_MESSAGE_RING <= u8::MAX as usize);
+const _: () = assert!(AGENT_MESSAGE_PAIR_UNREAD_MAX <= AGENT_MESSAGE_RING);
+const _: () = assert!(AGENT_MESSAGE_PAIR_BOUND_MIN_SECS < AGENT_MESSAGE_PAIR_BOUND_SECS);
+const _: () = assert!(AGENT_MESSAGE_PAIR_BOUND_SECS <= AGENT_MESSAGE_PAIR_BOUND_MAX_SECS);
 // An honest device's hour of messages is within one lap of its ring.
 const _: () = assert!(AGENT_MESSAGES_PER_DEVICE_PER_HOUR < AGENT_MESSAGE_RING);
 // The clearing of the highest number is in the bottom half of band 0.
@@ -3419,6 +3495,8 @@ mod tests {
             PERSONAL_LEFT_PREFIX,
             AGENT_MESSAGE_PREFIX,
             AGENT_MESSAGE_READ_PREFIX,
+            AGENT_MESSAGE_PERSON_PREFIX,
+            AGENT_MESSAGE_PAIR_BOUNDS_PREFIX,
         ] {
             assert!(!PERSONAL_REACHED_PREFIX.starts_with(other), "{other}");
             assert!(!other.starts_with(PERSONAL_REACHED_PREFIX), "{other}");
@@ -3739,8 +3817,63 @@ mod tests {
         }
         assert_eq!(AGENT_MESSAGE_PREFIX, "msg/");
         assert_eq!(AGENT_MESSAGE_READ_PREFIX, "read/");
-        assert!(!AGENT_MESSAGE_PREFIX.starts_with(AGENT_MESSAGE_READ_PREFIX));
-        assert!(!AGENT_MESSAGE_READ_PREFIX.starts_with(AGENT_MESSAGE_PREFIX));
+        // And the lists of a person's reads and of the bounds (decision
+        // 2026-10-25, section 4): no prefix of the channel begins another.
+        assert_eq!(AGENT_MESSAGE_PERSON_PREFIX, "person/");
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUNDS_PREFIX, "hold/");
+        let prefixes = [
+            AGENT_MESSAGE_PREFIX,
+            AGENT_MESSAGE_READ_PREFIX,
+            AGENT_MESSAGE_PERSON_PREFIX,
+            AGENT_MESSAGE_PAIR_BOUNDS_PREFIX,
+        ];
+        for one in prefixes {
+            for other in prefixes {
+                if one != other {
+                    assert!(!one.starts_with(other), "{one} {other}");
+                }
+            }
+        }
+        // With a key: 77 and 75 bytes, at most the longest name.
+        assert_eq!(AGENT_MESSAGE_PERSON_PREFIX.len() + 70, 77);
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUNDS_PREFIX.len() + 70, 75);
+    }
+
+    /// The bounds a person sets for a pair (decision 2026-10-25, section
+    /// 4): 8 hours where `--for` gives none, a minute to 7 days, and listed
+    /// 7 days and 10 minutes after their `at`. Four bounds at the longest
+    /// names are 1,706 bytes, and five would be 2,132; at names of 30
+    /// bytes, 22 fit. A full list of a person's reads is 1,923 bytes. With
+    /// the three lists a device has 67 slots: 205,824 bytes, and 64
+    /// devices' 13,172,736.
+    #[test]
+    fn test_the_bounds_and_the_lists_of_a_person_decision_2026_10_25_4() {
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUND_SECS, 28_800);
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, 604_800);
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUND_MIN_SECS, 60);
+        assert_eq!(AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS, 605_400);
+        assert_eq!(
+            AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS,
+            AGENT_MESSAGE_PAIR_BOUND_MAX_SECS as u64 + AGENT_MESSAGE_AHEAD_MAX_SECS
+        );
+        let bound = |a: usize, b: usize| 2 + a + 1 + (2 + b) + 1 + 8 + 8 + 4;
+        assert_eq!(2 + 4 * bound(200, 200), 1_706);
+        assert_eq!(2 + 5 * bound(200, 200), 2_132);
+        assert!(2 + 4 * bound(200, 200) <= AGENT_MESSAGE_VALUE_BYTES);
+        assert!(2 + 5 * bound(200, 200) > AGENT_MESSAGE_VALUE_BYTES);
+        assert_eq!((AGENT_MESSAGE_VALUE_BYTES - 2) / bound(30, 30), 22);
+        assert_eq!(
+            1 + 2 + AGENT_MESSAGE_READ_MARKS_MAX * AGENT_MESSAGE_ID_BYTES,
+            1_923
+        );
+        let room = (AGENT_MESSAGE_RING as u64 + 3) * entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        assert_eq!(room, 205_824);
+        assert_eq!(room * MAX_COUNTED_DEVICES as u64, 13_172_736);
+        assert!(room * MAX_COUNTED_DEVICES as u64 <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        // The highest bound is one lap of a device's ring, and the usual
+        // hold is below it.
+        assert_eq!(AGENT_MESSAGE_RING, 64);
+        const { assert!(AGENT_MESSAGE_PAIR_UNREAD_MAX < AGENT_MESSAGE_RING) };
     }
 
     /// Every entry of the messages channel is 2,048 bytes, and its value
@@ -3792,12 +3925,13 @@ mod tests {
                 AGENT_MESSAGE_CONTENT_BYTES
             );
         }
-        // 65 slots of 3,072 bytes for each device, and 64 devices'.
+        // 67 slots of 3,072 bytes for each device, with its three lists
+        // (decision 2026-10-25), and 64 devices'.
         assert_eq!(AGENT_MESSAGE_RING, 64);
         assert_eq!(entry_cost(AGENT_MESSAGE_CONTENT_BYTES), 3_072);
-        let room = (AGENT_MESSAGE_RING as u64 + 1) * entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
-        assert_eq!(room, 199_680);
-        assert_eq!(room * MAX_COUNTED_DEVICES as u64, 12_779_520);
+        let room = (AGENT_MESSAGE_RING as u64 + 3) * entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
+        assert_eq!(room, 205_824);
+        assert_eq!(room * MAX_COUNTED_DEVICES as u64, 13_172_736);
         assert!(room * MAX_COUNTED_DEVICES as u64 <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
         // The highest number, whose clearing is the last revision in the
         // bottom half of band 0.
