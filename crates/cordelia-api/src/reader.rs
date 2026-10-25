@@ -164,6 +164,11 @@ pub fn taken(
             crate::marks::list_taken(conn, own, &signer, &list.marks, now)?;
             Ok(Read::List)
         }
+        // Not yet read here: the lists of decision 2026-10-25 are no
+        // messages until rules 1 and 2 are built.
+        Ok(InTheRing::PersonList(_)) | Ok(InTheRing::Bounds(_)) => {
+            no_message(NotAMessage::NotInRing)
+        }
         Err(why) => no_message(why),
     }
 }
