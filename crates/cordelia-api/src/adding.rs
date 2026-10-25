@@ -707,6 +707,9 @@ pub fn accept(
     now: i64,
 ) -> Result<Accepted, PersonError> {
     drop_old_hand_overs(conn, now)?;
+    // The statement handed under the phrase this device follows: what it
+    // removes is kept whatever comes of it (below).
+    let handed = std::cell::RefCell::new(None);
     let accepted = in_one(conn, || {
         let hand_over = match hand_over_in(identity, typed, typed_at, entry, now)? {
             Ok(hand_over) => hand_over,
@@ -730,7 +733,10 @@ pub fn accept(
         match held.state {
             State::Removed => Ok(Accepted::Refused(NotAccepted::Removed)),
             State::Fork => Ok(Accepted::Refused(NotAccepted::InAFork)),
-            _ if under_the_same => brought.taken_by(conn, identity, &held, now),
+            _ if under_the_same => {
+                *handed.borrow_mut() = Some(hand_over.statement.clone());
+                brought.taken_by(conn, identity, &held, now)
+            }
             State::Applied if is_alone(conn, &held, &identity.public_key())? => {
                 if sync_on {
                     return Ok(Accepted::Refused(NotAccepted::SyncIsOn));
@@ -749,6 +755,15 @@ pub fn accept(
             _ => Ok(Accepted::Refused(NotAccepted::AnotherPhrase)),
         }
     });
+    // The keys that a statement the phrase signed lists as removed are
+    // kept though it is refused, and in a transaction of their own: one
+    // refused as not clear is undone whole (decision 2026-10-24 (removal),
+    // rule 2).
+    if let Some(statement) = handed.into_inner() {
+        in_one(conn, || {
+            crate::person::know_removed_if_signed(conn, identity, &statement, now)
+        })?;
+    }
     match accepted {
         // The statement was applied and then undone: rule 3 did not hold.
         Err(PersonError::RecordNotCounted(why)) => {
@@ -3764,6 +3779,51 @@ mod tests {
         assert_eq!(s[2].latest(), its_own);
         assert_eq!(s[2].apart(), Some(change));
         assert_eq!(s[2].number(), 2);
+    }
+
+    /// `cordelia accept` refuses a hand-over whose change is not clear on
+    /// this device (decision 2026-10-24 (removal), rules 4 and 8): its
+    /// statement lists a key that the device knows to be removed. Nothing
+    /// changes but what it knows of removals: the keys the change removes,
+    /// signed by the phrase, are kept though its transaction is undone
+    /// (rule 2). A hand-over whose change lists this device's own key, as
+    /// one it knows to be removed, is refused as for a removed device.
+    #[test]
+    fn test_accept_refuses_a_hand_over_whose_change_is_not_clear() {
+        let mut s = Several::of_one_person(4);
+        s.hold(&[0, 1, 2, 3], "notes");
+        s.write(1, "notes", "a.md", "one");
+        // Device 1 knows device 2 to be removed, on a branch it has seen
+        // (set so by hand: no branch is kept in this slice).
+        held_rows::keep_removed(&s[1].conn, &[s.key(2)], s.now).unwrap();
+        let before = s[1].everything();
+        let removed_before = held_rows::removed_keys(&s[1].conn).unwrap();
+        assert_eq!(removed_before, vec![s.key(2)]);
+
+        // Device 0 removes device 3, and lists device 2, and hands device 1
+        // the change.
+        s.change(0, &[0, 1, 2], &[3]);
+        let told = s.hand(0, 1);
+        assert_eq!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Refused(NotAccepted::NotClear)
+        );
+        assert_eq!(s[1].everything(), before);
+        assert_eq!(s[1].number(), 1);
+        let mut known = vec![s.key(2), s.key(3)];
+        known.sort_unstable();
+        assert_eq!(held_rows::removed_keys(&s[1].conn).unwrap(), known);
+
+        // Device 2 knows its own key to be removed: the same hand-over is
+        // refused as for a removed device, whose way on is a new key.
+        let told = s.hand(0, 2);
+        held_rows::keep_removed(&s[2].conn, &[s.key(2)], s.now).unwrap();
+        let before = s[2].everything();
+        assert_eq!(
+            s.accept(2, 0, &told.hand_over),
+            Accepted::Refused(NotAccepted::Removed)
+        );
+        assert_eq!(s[2].everything(), before);
     }
 
     /// The fourth row: a device that is in no list takes only a hand-over

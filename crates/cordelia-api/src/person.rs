@@ -515,6 +515,38 @@ pub(crate) fn know_removed(
     Ok(())
 }
 
+/// Keep the keys that `shown` lists as removed, where the phrase that this
+/// device follows signed it (decision 2026-10-24 (removal), rule 2):
+/// whatever it is to the device, and though it is then refused. A change
+/// shown that undoes a removal, or a hand-over refused at `cordelia
+/// accept`, still says what the person removed. The device's own key is
+/// left out only where the change is after the one applied and stops it
+/// as removed, as [`shown`] leaves it out: it then seals nothing, and its
+/// way on is a new key. Anywhere else its own key is kept, and the device
+/// is closed. Nothing is kept where the phrase did not sign it.
+pub(crate) fn know_removed_if_signed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    shown: &SignedStatement,
+    now: i64,
+) -> Result<(), PersonError> {
+    let Some(held) = held(conn)? else {
+        return Ok(());
+    };
+    let follows = &held.following.phrase_key;
+    if shown.statement.phrase_key != *follows || shown.verify().is_err() {
+        return Ok(());
+    }
+    let own = identity.public_key();
+    let mut removes = shown.statement.clone();
+    if held.state != State::Fork
+        && judge(shown, &held.statement.statement, &own, follows) == Ok(Judgement::Removed)
+    {
+        removes.removed.retain(|key| *key != own);
+    }
+    know_removed(conn, &removes, now)
+}
+
 /// Whether the secret of `statement`'s change is clear on this device
 /// (decision 2026-10-24 (removal), rule 3): no key that the device knows
 /// to be removed holds it, as far as the device knows. It is held by each
@@ -1159,7 +1191,14 @@ pub fn shown(
 
         let judgement = match judged(conn, &held, &opened.statement, identity)? {
             Ok(judgement) => judgement,
-            Err(e) => return Ok(Shown::Refused(Refused::NotAChangeEntry(e.into()))),
+            Err(e) => {
+                // Refused, and still what the person removed where the
+                // phrase signed it (decision 2026-10-24 (removal), rule 2):
+                // a change that drops a removal and makes another says
+                // that the other key is removed.
+                know_removed_if_signed(conn, identity, &opened.statement, now)?;
+                return Ok(Shown::Refused(Refused::NotAChangeEntry(e.into())));
+            }
         };
         // It is a change of the phrase's, checked: whatever it is to this
         // device, the keys it removes are removed from now on, on any
@@ -7268,6 +7307,51 @@ mod tests {
         )
         .unwrap();
         assert!(!clear(&third));
+    }
+
+    /// A change of the phrase's that is refused after its signature is
+    /// checked still says what the person removed (rule 2): shown a change
+    /// 4 that drops statement 3's removal of device 2 and removes device 5,
+    /// the device refuses it and keeps device 5 as removed. One whose
+    /// signature does not hold says nothing.
+    #[test]
+    fn test_the_removed_keys_of_a_change_refused_after_its_signature_are_kept() {
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        let conn = under_three();
+        let before = everything(&conn);
+        let mut drops = three
+            .next(key(0), &secret(15), listed(&[0, 1]), &[key(5)])
+            .unwrap();
+        drops.removed = vec![key(5)];
+        drops.validate().unwrap();
+        let entry = change(&phrase, &drops, secret(15));
+        assert_eq!(
+            shown(&conn, &device(0), &entry, NOW).unwrap(),
+            Shown::Refused(Refused::NotAChangeEntry(ChangeEntryError::Statement(
+                StatementError::UndoesARemoval
+            )))
+        );
+        assert_eq!(everything(&conn), before);
+        assert_eq!(state(&conn), State::Applied);
+        let mut known = vec![key(2), key(5)];
+        known.sort_unstable();
+        assert_eq!(removed(&conn), known);
+        assert!(clear(&conn));
+
+        // Its signature broken: nothing is kept.
+        let mut forged = sign(&drops, &phrase);
+        forged.statement.removed = vec![key(6)];
+        know_removed_if_signed(&conn, &device(0), &forged, NOW).unwrap();
+        assert_eq!(removed(&conn), known);
+        // Signed, it is kept, though nothing applies it.
+        let mut signed = drops.clone();
+        signed.removed = vec![key(6)];
+        signed.validate().unwrap();
+        know_removed_if_signed(&conn, &device(0), &sign(&signed, &phrase), NOW).unwrap();
+        known.push(key(6));
+        known.sort_unstable();
+        assert_eq!(removed(&conn), known);
     }
 
     /// A device whose own key is among those it knows to be removed is
