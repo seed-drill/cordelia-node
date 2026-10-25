@@ -143,6 +143,28 @@ pub const MESSAGES_LIST_AGAIN: &str = "messages.list_again";
 /// two, and raises it to the highest of those marks.
 pub const MESSAGES_LISTED_SEQ: &str = "messages.listed_seq";
 
+/// How many times in a row the device's list of what a person read on it
+/// was written again for a relay's answer of another (`cordelia_api::marks`,
+/// decision 2026-10-25, rule 1): counted apart from the agents' list.
+pub const MESSAGES_PERSON_AGAIN: &str = "messages.person_again";
+
+/// How many times in a row the device's list of the bounds a person set on
+/// it was written again for a relay's answer of another
+/// (`cordelia_api::bounds`, decision 2026-10-25, rule 2): counted apart.
+pub const MESSAGES_BOUNDS_AGAIN: &str = "messages.bounds_again";
+
+/// The start of the node, a count from 1 that each start raises
+/// (`cordelia_api::bounds::started`, decision 2026-10-25, rule 2): a bound
+/// of the device's own is kept with the start it was set in, so that what
+/// was set since this start is known when a relay hands back a list from
+/// the device's later life.
+pub const MESSAGES_START: &str = "messages.start";
+
+/// That the lists of a person's reads and of bounds that the store held
+/// before step 20 were read once, with the time (`cordelia_api::reader::
+/// read_held_lists`, decision 2026-10-25, rule 1).
+pub const MESSAGES_LISTS_READ: &str = "messages.lists_read";
+
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])
