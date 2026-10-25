@@ -1829,6 +1829,20 @@ enum Answer {
     Neither,
 }
 
+/// What a command that makes a change asks a person, and what they type
+/// ([`Terminal::answer`]): its questions are asked through this, so that a
+/// test can answer them.
+trait Answers {
+    /// Ask, and read a line typed back: `None` where the input ended.
+    fn answer(&self, asks: &str) -> anyhow::Result<Option<String>>;
+}
+
+impl Answers for Terminal {
+    fn answer(&self, asks: &str) -> anyhow::Result<Option<String>> {
+        Terminal::answer(self, asks)
+    }
+}
+
 /// Ask whether a device stays or is removed. **No answer is suggested:
 /// each is typed** (decision 2026-10-04 §6), and pressing Enter answers
 /// nothing. `neither` says that the third answer is on offer: the device
@@ -1836,7 +1850,7 @@ enum Answer {
 ///
 /// Where the input ends at the question, the command is refused: nothing
 /// is made of an answer that nobody typed.
-fn asks_of(at: &Terminal, says: &str, neither: bool) -> anyhow::Result<Answer> {
+fn asks_of(at: &impl Answers, says: &str, neither: bool) -> anyhow::Result<Answer> {
     let third = match neither {
         true => ", or `neither` (it is in no list, and is added again by hand)",
         false => "",
@@ -2066,7 +2080,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
 
 /// Show what the node handed, ask of each device what a person has to
 /// say of it, and prepare the statement, with no phrase.
-fn asked(at: &Terminal, handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
+fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
     let own = handed.this_device;
     let applied = &handed.applied.statement;
     let mut stay: Vec<Device> = Vec::new();
@@ -2218,7 +2232,7 @@ const REFUSES_THE_KEY: &str = "refuse";
 /// 2026-10-04 §2.2): a point under which anyone can sign, and to which
 /// nothing can be sealed, is added by nothing, so there is nothing of it
 /// to refuse, and no statement lists it.
-fn refuses_a_key_it_does_not_know(at: &Terminal, goes: &[u8; 32]) -> anyhow::Result<()> {
+fn refuses_a_key_it_does_not_know(at: &impl Answers, goes: &[u8; 32]) -> anyhow::Result<()> {
     if !cordelia_crypto::identity::is_usable_public_key(goes) {
         anyhow::bail!(
             "that key is no device's key, and no device of yours: nothing is added under it, \
@@ -2255,7 +2269,7 @@ const LISTS_THIS_MACHINE: &str = "list";
 /// Refused where no record of its addition was handed: a device that is
 /// in no list and was added by nobody makes no change. Any answer but the
 /// one word stops the command, with nothing changed.
-fn own_listing(at: &Terminal, handed: &Handed, settles: bool) -> anyhow::Result<Device> {
+fn own_listing(at: &impl Answers, handed: &Handed, settles: bool) -> anyhow::Result<Device> {
     let (says, device) = own_addition(handed, settles)?;
     let typed = at.answer(&format!(
         "{says}\n  Type `{LISTS_THIS_MACHINE}` to list this machine and go on. Anything else \
@@ -2305,8 +2319,7 @@ fn own_addition(handed: &Handed, settles: bool) -> anyhow::Result<(String, Devic
     let (signed_before, makes) = match (&handed.apart, settles) {
         (Some((apart, _, _)), true) => (
             format!(
-                "Neither change {} nor change {} lists this machine: both were signed before it \
-                 was added.",
+                "Neither change {} nor change {} lists this machine: both were made without it.",
                 applied.number, apart.statement.number
             ),
             format!("This command makes change {new}, which settles the two."),
@@ -2684,9 +2697,31 @@ const UNNAMED_RELAY: &str = "a relay that this device is connected to and that n
 
 /// The relay that a row of what waits is of, as a line names it (decision
 /// 2026-10-24, rule 2): by the name that the configuration gives it, and
-/// never by the address it was reached at.
-fn relay_of_row(waits: &Value) -> &str {
-    waits["name"].as_str().unwrap_or(UNNAMED_RELAY)
+/// never by the address it was reached at. A connection that two relays
+/// given no key share is named by both.
+fn relay_of_row(waits: &Value) -> String {
+    if let Some(name) = waits["name"].as_str() {
+        return name.to_string();
+    }
+    let names: Vec<String> = list(waits, "names")
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    match names.is_empty() {
+        true => UNNAMED_RELAY.to_string(),
+        false => joined(&names),
+    }
+}
+
+/// The relays that what this device leaves behind is still to be sent to,
+/// as `cordelia init --new-key` names them, from what the node answered
+/// (`/api/v1/devices/leave/sent`): each row at which something waits, by
+/// [`relay_of_row`].
+fn still_to_send_to(sent: &Value) -> Vec<String> {
+    list(sent, "waiting")
+        .filter(|relay| relay["waits"].as_u64().unwrap_or(0) > 0)
+        .map(relay_of_row)
+        .collect()
 }
 
 /// After a change: stay, and show as they come whether each relay holds
@@ -2777,7 +2812,8 @@ fn waits_after(
             return Ok(Waited::NoLongerStands);
         }
         let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
-        for line in told.of_look(after_a_change(&seen, number, &own, at), at) {
+        let lines = after_a_change(&seen, number, &own, at);
+        for line in told.of_look(lines, at, end.is_some()) {
             say(line);
         }
         if let Some(end) = end {
@@ -2849,10 +2885,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         let not_sent = loop {
             std::thread::sleep(ASK_EVERY);
             let sent = api_post(config_path, "/api/v1/devices/leave/sent", json!({}))?;
-            let waiting: Vec<String> = list(&sent, "waiting")
-                .filter(|relay| relay["waits"].as_u64().unwrap_or(0) > 0)
-                .map(|relay| relay_of_row(relay).to_string())
-                .collect();
+            let waiting = still_to_send_to(&sent);
             let reached = list(&sent, "waiting").count();
             if reached > 0 && waiting.is_empty() {
                 break Vec::new();
@@ -3514,13 +3547,85 @@ mod tests {
             says,
             format!(
                 "\nA change is the list of your devices that your recovery phrase signs.\n\
-                 Neither change 2 nor change 3 lists this machine: both were signed before it was \
-                 added. {laptop} added this machine at {}, as {desktop}.\nThis command makes \
-                 change 4, which settles the two. The machine that makes a change is always in \
-                 it, so change 4 will list this machine as {desktop}.",
+                 Neither change 2 nor change 3 lists this machine: both were made without it. \
+                 {laptop} added this machine at {}, as {desktop}.\nThis command makes change 4, \
+                 which settles the two. The machine that makes a change is always in it, so \
+                 change 4 will list this machine as {desktop}.",
                 time_of(7)
             )
         );
+    }
+
+    /// What a person types, a line for each question in turn, and each
+    /// question that was asked.
+    struct Typed {
+        answers: std::cell::RefCell<Vec<&'static str>>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Typed {
+        fn of(answers: &[&'static str]) -> Self {
+            Self {
+                answers: std::cell::RefCell::new(answers.to_vec()),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Answers for Typed {
+        fn answer(&self, asks: &str) -> anyhow::Result<Option<String>> {
+            self.asked.borrow_mut().push(asks.to_string());
+            let mut answers = self.answers.borrow_mut();
+            Ok((!answers.is_empty()).then(|| answers.remove(0).to_string()))
+        }
+    }
+
+    /// **A settlement on a machine that neither change lists asks it to
+    /// list itself in the settlement** (decision 2026-10-24, rule 1): the
+    /// question names the two changes and the change above both, and that
+    /// is the change that is prepared. The machine was added under change
+    /// 2; change 3 was made apart from it.
+    #[test]
+    fn a_settlement_on_a_machine_that_neither_change_lists_names_the_settlement() {
+        let f = Fixture::new();
+        let five = NodeIdentity::from_seed([5; 32]).unwrap().public_key();
+        let mut handed = f.handed(&f.statement, &[f.adds(five, "desktop")]);
+        handed["this_device"] = encode_public_key(&five).unwrap().into();
+        let (apart, apart_entry) = f.apart(2);
+        handed["apart_statement"] = hex::encode(apart.to_bytes().unwrap()).into();
+        handed["apart_entry"] = hex::encode(apart_entry.to_wire()).into();
+        let read = Handed::of(&handed, &five).unwrap();
+        // The laptop, of both changes, and the phone stay; then this
+        // machine is listed.
+        let typed = Typed::of(&["stays", "stays", "list"]);
+        let prepared = asked(&typed, &read, &Which::Settle).unwrap();
+        let asked = typed.asked.borrow();
+        let listing = asked.last().unwrap();
+        assert!(
+            listing.contains(
+                "Neither change 2 nor change 3 lists this machine: both were made without it."
+            ),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("This command makes change 4, which settles the two."),
+            "{listing}"
+        );
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert_eq!(signs.number, 4);
+        assert!(signs.lists(&five));
+        // Any other word stops it, with nothing prepared.
+        let typed = Typed::of(&["stays", "stays", "stays"]);
+        let refused = asked_err(&typed, &read);
+        assert_eq!(refused, "You did not type `list`. Nothing was changed.");
+    }
+
+    /// What [`asked`] refuses of a settlement, as it says it.
+    fn asked_err(typed: &Typed, read: &Handed) -> String {
+        match asked(typed, read, &Which::Settle) {
+            Ok(_) => panic!("a settlement was prepared"),
+            Err(e) => e.to_string(),
+        }
     }
 
     /// **The change that the question names is the one that is signed**
@@ -4163,7 +4268,9 @@ mod tests {
         assert_eq!(waited.unwrap(), Waited::Ended(wait::End::Done), "{said:?}");
         assert_eq!(said[0], wait::first_line());
         assert!(
-            said[0].ends_with("Each line below starts with the time it was said, in UTC."),
+            said[0].ends_with(
+                "Until the wait ends, each line below starts with the time it was said, in UTC."
+            ),
             "{said:?}"
         );
         let ended = said
@@ -4232,6 +4339,60 @@ mod tests {
         );
     }
 
+    /// **No line says that the wait is still waiting at a look that ends
+    /// it** (decision 2026-10-24, rule 3): a minute after the last line, a
+    /// look with no new line that ends the wait says only the line that it
+    /// has ended, and then what the end says.
+    #[test]
+    fn no_still_waiting_line_comes_beside_the_end() {
+        use wait::OwnWord;
+        use wait::tests::Scenario::{Ok as Reached, OutHolding};
+        // End 2 once the node says that no word is to come; the same lines
+        // before, while it says one is.
+        let ends = after(&[Reached, OutHolding], OwnWord::Carried);
+        let mut goes_on = ends.clone();
+        goes_on["word_to_come"] = json!(true);
+        let looks = vec![(AT_10_53 + 1, goes_on), (AT_10_53 + 61, ends)];
+        let (waited, said) = Looks::from(AT_10_53, looks).said();
+        assert_eq!(
+            waited.unwrap(),
+            Waited::Ended(wait::End::Warned),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|line| line.contains("still waiting")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line == "  10:54:01  The wait has ended."),
+            "{said:?}"
+        );
+    }
+
+    /// **`cordelia init --new-key` names each relay that it could not send
+    /// to as it is configured** (decision 2026-10-24, rule 2): by the name
+    /// of its row, both names of a connection that two relays given no
+    /// key share, and never the address it was reached at.
+    #[test]
+    fn init_new_key_names_each_relay_it_could_not_send_to_as_configured() {
+        let sent = json!({ "waiting": [
+            { "relay": "127.0.0.1:9474", "name": "localhost:9474", "waits": 2 },
+            { "relay": "127.0.0.1:9475", "name": null,
+              "names": ["localhost:9475", "loopback.example:9475"], "waits": 1 },
+            { "relay": "192.0.2.9:9474", "name": null, "names": [], "waits": 1 },
+            { "relay": "192.0.2.8:9474", "name": "sent.example:9474", "waits": 0 },
+        ]});
+        assert_eq!(
+            still_to_send_to(&sent),
+            [
+                "localhost:9474",
+                "localhost:9475 and loopback.example:9475",
+                UNNAMED_RELAY,
+            ]
+        );
+    }
+
     /// **Each end begins with the line that the wait has ended** (decision
     /// 2026-10-24, rule 3), with its time; the lines of the end come under
     /// it as they were, with none: end 1, end 2 and end 3, and where the
@@ -4280,11 +4441,12 @@ mod tests {
 
     /// **The count of a relay that the wait waits out** (decision
     /// 2026-10-24, rule 4): a relay not reached, its reference 30 seconds
-    /// ago, gives no count; at 3 minutes and 10 seconds, 3 of the 5; at 6
-    /// minutes and in no class, 6 minutes, and that the command stops
-    /// waiting once this machine has tried it again and failed; out of
-    /// reach, no count. A relay that refuses the change counts from when
-    /// it came to refuse it, from minute 1 to minute 4.
+    /// ago, gives no count; at 3 minutes and 10 seconds, 3 of the 5; at 4,
+    /// 4 of the 5; at 5 and 6 minutes and in no class, that it has not been
+    /// reached in the minutes that the command has waited for it, and that
+    /// the command stops waiting once this machine has tried it again and
+    /// failed; out of reach, no count. A relay that refuses the change
+    /// counts from when it came to refuse it, from minute 1 to minute 4.
     #[test]
     fn the_count_of_a_relay_waited_out() {
         use wait::OwnWord;
@@ -4301,24 +4463,32 @@ mod tests {
         let reach = |seen: &mut Value, field: &str, value: Value| {
             seen["relays"][1]["reach"][field] = value;
         };
-        reach(&mut seen, "reference", json!(at - 30));
-        assert_eq!(counts(&seen), Vec::<String>::new());
-        reach(&mut seen, "reference", json!(at - 190));
-        assert_eq!(
-            counts(&seen),
-            [
-                "relay-1.example:9474 has not been reached for 3 of the 5 minutes that this command \
-              waits for it"
-            ]
-        );
-        reach(&mut seen, "reference", json!(at - 360));
-        assert_eq!(
-            counts(&seen),
-            [
-                "relay-1.example:9474 has not been reached for 6 minutes. This command stops \
-              waiting for it once this machine has tried it again and failed."
-            ]
-        );
+        let of_the_five = |m: u64| {
+            format!(
+                "relay-1.example:9474 has not been reached for {m} of the 5 minutes that this \
+                 command waits for it"
+            )
+        };
+        // From minute 5, the minutes of the wait, in which it was not
+        // reached: not for how long it has not been, since it may have been
+        // lost before the change.
+        let waited = |m: u64| {
+            format!(
+                "relay-1.example:9474 has not been reached in the {m} minutes that this command \
+                 has waited for it. This command stops waiting for it once this machine has tried \
+                 it again and failed."
+            )
+        };
+        for (ago, said) in [
+            (30, None),
+            (190, Some(of_the_five(3))),
+            (245, Some(of_the_five(4))),
+            (305, Some(waited(5))),
+            (360, Some(waited(6))),
+        ] {
+            reach(&mut seen, "reference", json!(at - ago));
+            assert_eq!(counts(&seen), Vec::from_iter(said), "{ago}");
+        }
         reach(&mut seen, "out_of_reach_since", json!(at - 10));
         reach(&mut seen, "class", json!("out_lacking"));
         assert!(counts(&seen).is_empty(), "{:?}", counts(&seen));

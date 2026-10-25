@@ -2312,8 +2312,8 @@ fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
     at.says(
         "This command stays until every relay holds the change. It ends sooner, with status 3, \
          once each relay that is not known to hold it cannot be reached, or refuses it, for five \
-         minutes. Stopping it stops nothing: the node goes on, and the recovery stays made. Each \
-         line below starts with the time it was said, in UTC.",
+         minutes. Stopping it stops nothing: the node goes on, and the recovery stays made. Until \
+         the wait ends, each line below starts with the time it was said, in UTC.",
     );
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     println!("{said}");

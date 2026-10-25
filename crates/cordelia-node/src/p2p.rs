@@ -3174,6 +3174,9 @@ pub async fn p2p_loop(
                                 if let Ok(mut ask_next) = ask_next.lock() {
                                     ask_next.remove(&node_id);
                                 }
+                                // Which relay the connection is, before the
+                                // peers list it (decision 2026-10-24, rule 2).
+                                publish_relays_now(&state, &relays_set_up, &relay_addrs, &relay_tries, &conn_mgr);
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
@@ -3907,6 +3910,9 @@ pub async fn p2p_loop(
                         )
                     })
                     .collect();
+                // Which relay each connection is, before the peers list it
+                // or drop it (decision 2026-10-24, rule 2).
+                publish_relays_now(&state, &relays_set_up, &relay_addrs, &relay_tries, &conn_mgr);
                 publish_peers(&state, &connected, &conn_mgr);
                 sightings.note(&state, &connected);
 
@@ -5270,6 +5276,24 @@ fn relays_now(
         }
     }
     list
+}
+
+/// [`publish_relays`], with the relays as their names resolve now: at a
+/// connection, and at the governor's tick, so that the connection that
+/// each relay has as its own is known before the peers that list it are
+/// (decision 2026-10-24, rule 2).
+fn publish_relays_now(
+    state: &cordelia_api::state::AppState,
+    set_up: &[cordelia_network::bootstrap::Relay],
+    relay_addrs: &RelayAddrs,
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) {
+    let resolved = relay_addrs
+        .read()
+        .map(|resolved| resolved.clone())
+        .unwrap_or_default();
+    publish_relays(state, set_up, &resolved, tries, conn_mgr);
 }
 
 /// Publish where each relay that the node is set up with stands

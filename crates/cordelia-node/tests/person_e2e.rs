@@ -1103,7 +1103,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         "You may close this machine once every relay holds the change, and what this device \
          carried is at a relay that it reaches.",
     );
-    at.says("Each line below starts with the time it was said, in UTC.");
+    at.says("Until the wait ends, each line below starts with the time it was said, in UTC.");
     let said = at.done();
     println!("{said}");
     assert!(
@@ -5533,10 +5533,13 @@ fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_th
     // It never answers, and so is out of reach by then too: the line says
     // so (decision 2026-10-24, rule 7).
     let says = "memory: a relay out of reach, not known to hold the latest change";
-    assert!(
-        amber_with(&laptop, says).is_none(),
-        "amber before five minutes"
-    );
+    // Not before five minutes, in either form of the line.
+    for early in [says, "memory: a relay not known to hold the latest change"] {
+        assert!(
+            amber_with(&laptop, early).is_none(),
+            "amber before five minutes: {early}"
+        );
+    }
     wait_for("the status line is amber", &all, 360, || {
         amber_with(&laptop, says)
     });
