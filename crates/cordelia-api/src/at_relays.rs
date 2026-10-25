@@ -201,7 +201,7 @@ pub fn answered(
     }
     Ok(match take(conn, identity, answer, now)? {
         Taken::Shown(shown) => Answered::Shown(shown),
-        Taken::Own { .. } | Taken::Refused(_) => Answered::NotTaken,
+        Taken::Own { .. } | Taken::Shared { .. } | Taken::Refused(_) => Answered::NotTaken,
     })
 }
 

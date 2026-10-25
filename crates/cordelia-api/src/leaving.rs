@@ -285,6 +285,11 @@ pub fn forget(
         // What it held of the person's lists of shared channels is the
         // person's (decision 2026-10-10 §3.4).
         cordelia_storage::shared_lists::forget_all(conn)?;
+        // And the shared channels it held, their seeds with them (§2.2).
+        for row in cordelia_storage::shared::channels(conn)? {
+            entries::remove_channel(conn, &row.channel)?;
+        }
+        cordelia_storage::shared::forget_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }
@@ -762,6 +767,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A shared channel it holds, with an entry of it (§2.2, §2.3).
+        cordelia_storage::meta::set(&on.conn, cordelia_storage::meta::SYNC_CLAUDE_DIR, "/c")
+            .unwrap();
+        let file = crate::lists::Do::File(crate::lists::tests::filing(1, "review"));
+        let done = crate::lists::act(&on.conn, &on.identity, file, now);
+        assert!(matches!(done, Ok(crate::lists::Done::Made(_))), "{done:?}");
+        let shared = crate::shared::tests::Shared::of(1);
+        let alice = crate::shared::tests::member(1);
+        let written = crate::shared::tests::message(&alice, &shared, 1, "hello", now);
+        crate::take::take(&on.conn, &on.identity, &written, now).unwrap();
+        assert_eq!(on.stored_in(&shared.secret).len(), 1);
+        assert!(
+            !cordelia_storage::shared::channels(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         let kept = kept_rows::kept(&on.conn, &[0x77; 32], &messages_id).unwrap();
@@ -776,6 +797,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            cordelia_storage::shared::channels(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(on.stored_in(&shared.secret).is_empty());
         assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
         assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());

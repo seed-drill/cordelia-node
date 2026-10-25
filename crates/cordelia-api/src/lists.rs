@@ -1069,6 +1069,9 @@ pub fn act(
             .map_or(lists.list.fetched, |at| u64::try_from(at).unwrap_or(0));
         write_list(conn, identity, &standing, &mut lists, fetched, now)?;
         lists.save(conn)?;
+        // The table of shared channels follows the list (decision
+        // 2026-10-10 §3.4, §6.3).
+        crate::shared::keep(conn, now)?;
         Ok(Done::Made(made))
     })
 }
@@ -1130,6 +1133,7 @@ pub fn fetched_whole(
             write_list(conn, identity, &standing, &mut lists, fetched, now)?;
         }
         lists.save(conn)?;
+        crate::shared::keep(conn, now)?;
         Ok(wrote)
     })
 }

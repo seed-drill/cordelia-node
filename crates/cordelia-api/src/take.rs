@@ -105,6 +105,15 @@ pub enum Taken {
     /// It is of the phrase's channel: it was shown to the device, which
     /// did what a change entry has it do.
     Shown(Shown),
+    /// It is of a shared channel this device holds, and passed the door's
+    /// checks (decision 2026-10-10 §2.3): the store was given it, with no
+    /// check that its signer counts.
+    Shared {
+        /// What the store did with it, by its own rule.
+        stored: Outcome,
+        /// What the reader made of it, where the store kept it.
+        read: Option<crate::shared::Read>,
+    },
     /// It was refused, and nothing was stored.
     Refused(NotTaken),
 }
@@ -129,6 +138,22 @@ pub enum NotTaken {
     OldChannel,
     /// It is of no channel that this device takes from.
     AnotherChannel,
+    /// It is of a shared channel, and sync is off on this device: a shared
+    /// channel is turned off as messages are (decision 2026-10-10 §2.3,
+    /// rule 2; §6.1).
+    SyncOff,
+    /// It is of a shared channel, and no honest member writes it: a
+    /// delete, an entry in none of the 65 slots named for its author, or
+    /// one whose content is not its slot's size (§2.3, rule 3).
+    NotAShared,
+    /// It is of a shared channel, and its revision is not in the bottom
+    /// half of band 0 (§2.3, rule 3).
+    NotInBandZero,
+    /// It is of a shared channel, and the device has no room for it: a new
+    /// slot of a key the person does not know, past the room of all such
+    /// keys; or an entry of a key the table let go, at or below what its
+    /// row kept (§2.3, rule 4; §6.3).
+    SharedFull,
 }
 
 /// What an entry in the personal channel, under a record's name, was as a
@@ -173,7 +198,29 @@ pub fn take(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Taken, PersonError> {
-    match in_one(conn, || taken_as_its_own(conn, identity, entry, now))? {
+    let taken = in_one(conn, || {
+        let taken = match taken_as_its_own(conn, identity, entry, now)? {
+            Some(taken) => Some(taken),
+            // Of no channel of the person's own: perhaps of a shared
+            // channel, in the same transaction (decision 2026-10-10 §2.3).
+            None => crate::shared::taken_as_shared(conn, entry, now)?,
+        };
+        // Who the person knows may have changed: a statement applied, or a
+        // key that came to count. The shared channels follow it (§6.3).
+        let knows_anew = matches!(
+            &taken,
+            Some(Taken::Shown(Shown::Applied(_)))
+                | Some(Taken::Own {
+                    came_to_count: 1..,
+                    ..
+                })
+        );
+        if knows_anew {
+            crate::shared::keep(conn, now)?;
+        }
+        Ok(taken)
+    })?;
+    match taken {
         Some(taken) => Ok(taken),
         // Of no channel that this device takes from: it is refused, and
         // only then is the refusal given its name.
@@ -1235,6 +1282,249 @@ mod tests {
             );
         }
         assert!(new.stored().is_empty() && !new.follows_a_phrase());
+    }
+
+    /// The door takes a shared channel's entries only of a channel held in
+    /// the table of shared channels, on a device that stands applied with
+    /// sync on (decision 2026-10-10 §2.3, rules 1 and 2): of a channel not
+    /// held, one dropped and one moved from, an entry is refused as of
+    /// another channel; with sync off, as `SyncOff`; on a device that has
+    /// stopped, as it is stopped. Nothing is stored. The control: applied,
+    /// with sync on, it is stored, from a signer that does not count.
+    #[test]
+    fn the_door_takes_a_shared_channels_entries_only_where_the_device_stands_applied_with_sync_on()
+    {
+        use crate::lists::Do;
+        use crate::shared::tests::{Shared, acts, bob, everything, holds, member, message};
+        use cordelia_storage::meta;
+
+        let s = bob(1);
+        let now = s.now + 10;
+        let alice = member(1);
+        let channel = Shared::of(1);
+        let entry = message(&alice, &channel, 1, "hello", now);
+        let before = everything(&s, 0);
+        assert_eq!(
+            given(&s, 0, &entry),
+            Taken::Refused(NotTaken::AnotherChannel)
+        );
+        assert_eq!(everything(&s, 0), before);
+
+        holds(&s, 0, 1, "review", now);
+        let before = everything(&s, 0);
+        meta::remove(&s[0].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(given(&s, 0, &entry), Taken::Refused(NotTaken::SyncOff));
+        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/bob/.claude").unwrap();
+        for state in [
+            State::Fork,
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+        ] {
+            held_rows::set_state(&s[0].conn, state).unwrap();
+            assert_eq!(
+                given(&s, 0, &entry),
+                Taken::Refused(NotTaken::Stopped(state))
+            );
+        }
+        held_rows::set_state(&s[0].conn, State::Applied).unwrap();
+        assert_eq!(everything(&s, 0), before);
+
+        assert!(!s[0].counts(&alice.public_key()));
+        assert_eq!(
+            given(&s, 0, &entry),
+            Taken::Shared {
+                stored: Outcome::Stored,
+                read: Some(crate::shared::Read::Message(
+                    cordelia_storage::shared::Indexed::New
+                )),
+            }
+        );
+        assert_eq!(
+            given(&s, 0, &entry),
+            Taken::Shared {
+                stored: Outcome::AlreadyHeld,
+                read: None,
+            }
+        );
+
+        // Dropped, and moved from: refused as of another channel.
+        let moved = holds(&s, 0, 2, "design", now);
+        acts(&s, 0, Do::Drop(channel.id), now + 1);
+        let mut to = crate::lists::tests::filing(3, "design");
+        to.came = cordelia_crypto::acts::Came::Moved(moved.id);
+        acts(&s, 0, Do::Move { from: moved.id, to }, now + 2);
+        let before = everything(&s, 0);
+        for channel in [&channel, &moved] {
+            let entry = message(&alice, channel, 2, "again", now);
+            assert_eq!(
+                given(&s, 0, &entry),
+                Taken::Refused(NotTaken::AnotherChannel)
+            );
+        }
+        assert_eq!(everything(&s, 0), before);
+    }
+
+    /// An entry outside its signer's slots or size is not stored (decision
+    /// 2026-10-10 §1, property 22; §2.3, rule 3, T23): a delete, an entry in
+    /// a slot of no name of its author's, one of another size than its
+    /// slot's, and one at or above the half of band 0, each refused before
+    /// anything is stored, and none leaves a row. A key that writes in all
+    /// 65 of its slots, and then in a 66th, leaves 214,016 bytes as a relay
+    /// counts them, and a slot written again changes nothing.
+    #[test]
+    fn an_entry_outside_its_signers_slots_or_size_is_not_stored() {
+        use crate::shared::tests::{
+            ANEW_COST, MESSAGE_COST, bob, everything, held_by, holds, key_row, member, message,
+        };
+        use cordelia_core::protocol::{AGENT_MESSAGE_VALUE_BYTES, SHARED_ANEW_VALUE_BYTES};
+        use cordelia_crypto::message::message_name;
+        use cordelia_crypto::shared::anew_name;
+
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let alice = member(1);
+        let key = alice.public_key();
+        let by_alice = |name: &str, rev: u64, value: Value| {
+            entry_by(&alice, &channel.secret, rev, name, value, &[])
+        };
+        let msg_0 = message_name(&key, 0).unwrap();
+        let her_anew = anew_name(&key).unwrap();
+        let (message_value, anew_value) = (
+            Value::Other(vec![0; AGENT_MESSAGE_VALUE_BYTES]),
+            Value::Other(vec![5; SHARED_ANEW_VALUE_BYTES]),
+        );
+        let before = everything(&s, 0);
+        let refused = [
+            (by_alice(&msg_0, 129, Value::Delete), NotTaken::NotAShared),
+            (by_alice(&her_anew, 3, Value::Delete), NotTaken::NotAShared),
+            (
+                by_alice("notes.md", 2, message_value.clone()),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(&format!("{msg_0}4"), 2, message_value.clone()),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(
+                    &message_name(&key, 64).unwrap().replace("/0", "/64"),
+                    2,
+                    message_value.clone(),
+                ),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(
+                    &message_name(&member(2).public_key(), 1).unwrap(),
+                    2,
+                    message_value.clone(),
+                ),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(&msg_0, 128, Value::Other(vec![0; 3_000])),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(&her_anew, 1, message_value.clone()),
+                NotTaken::NotAShared,
+            ),
+            (
+                by_alice(&msg_0, REV_BAND_HALF, message_value.clone()),
+                NotTaken::NotInBandZero,
+            ),
+            (
+                by_alice(&her_anew, REV_BAND_HALF, anew_value.clone()),
+                NotTaken::NotInBandZero,
+            ),
+            (
+                by_alice(&her_anew, REV_BAND_SIZE + 1, anew_value.clone()),
+                NotTaken::NotInBandZero,
+            ),
+        ];
+        for (entry, why) in &refused {
+            assert_eq!(given(&s, 0, entry), Taken::Refused(*why));
+        }
+        // A delete of a message's full size, in her slot, signed so: no
+        // honest node writes one, and it is refused as a delete.
+        let full_delete = {
+            use cordelia_core::protocol::{LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL};
+            let slot = cordelia_crypto::slots::slot_id(
+                &derive::slot_key(&channel.secret).unwrap(),
+                &message_name(&key, 1).unwrap(),
+            );
+            let channel_key = derive::signing_key(&channel.secret).unwrap();
+            let mut entry = cordelia_crypto::entry::Entry {
+                channel: channel_key.public_key(),
+                slot,
+                author: key,
+                rev: 3,
+                delete: true,
+                content: vec![0; cordelia_core::protocol::AGENT_MESSAGE_CONTENT_BYTES],
+                author_signature: [0; 64],
+                channel_signature: [0; 64],
+            };
+            let form = entry.signed_bytes();
+            entry.author_signature = alice.sign(&[LABEL_ENTRY_AUTHOR, &form[..]].concat());
+            entry.channel_signature = channel_key.sign(&[LABEL_ENTRY_CHANNEL, &form[..]].concat());
+            entry.check().unwrap()
+        };
+        assert_eq!(
+            given(&s, 0, &full_delete),
+            Taken::Refused(NotTaken::NotAShared)
+        );
+        assert_eq!(everything(&s, 0), before);
+        assert!(key_row(&s, 0, &channel, &key).is_none());
+        // The highest revision below the half of band 0 is taken.
+        let highest = by_alice(&her_anew, REV_BAND_HALF - 1, anew_value);
+        assert!(matches!(
+            given(&s, 0, &highest),
+            Taken::Shared {
+                stored: Outcome::Stored,
+                ..
+            }
+        ));
+
+        // All 65 slots, and then a 66th that is none of them.
+        for number in 1..=64 {
+            let entry = message(&alice, &channel, number, "one of 64", now);
+            assert!(matches!(
+                given(&s, 0, &entry),
+                Taken::Shared {
+                    stored: Outcome::Stored,
+                    ..
+                }
+            ));
+        }
+        let held = || held_by(&s, 0, &channel, &key);
+        assert_eq!(held().len(), 65);
+        let counted = |held: &[CheckedEntry]| -> u64 {
+            held.iter()
+                .map(|entry| cordelia_core::protocol::entry_cost(entry.content.len()))
+                .sum()
+        };
+        assert_eq!(counted(&held()), 64 * MESSAGE_COST + ANEW_COST);
+        assert_eq!(counted(&held()), 214_016);
+        for (entry, why) in &refused {
+            assert_eq!(given(&s, 0, entry), Taken::Refused(*why));
+        }
+        // A slot written again: the next number, in the slot of number 1.
+        let over = message(&alice, &channel, 65, "over number 1", now);
+        assert!(matches!(
+            given(&s, 0, &over),
+            Taken::Shared {
+                stored: Outcome::Stored,
+                ..
+            }
+        ));
+        assert_eq!(held().len(), 65);
+        assert_eq!(counted(&held()), 214_016);
+        assert_eq!(
+            key_row(&s, 0, &channel, &key).unwrap().bytes_stored,
+            214_016
+        );
     }
 
     /// An entry in a band above the applied statement's counts for
