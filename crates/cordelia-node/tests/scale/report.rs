@@ -2011,15 +2011,41 @@ fn model_of(read: &Read, r: usize, spans: &[(f64, f64)]) -> (f64, f64) {
     let step = 5.0;
     let (mut pulls, mut shows) = (0.0, 0.0);
     let kept = |t: f64| spans.iter().any(|(a, b)| t >= *a && t < *b);
+    // Whom the relay held a connection from, as each of its samples read
+    // it: a device that is on and not connected to it (warm churn closed
+    // its connection, and it dials again later) asks it nothing.
+    let series = relay_series(read, r);
+    let peers: Vec<(f64, HashSet<&str>)> = series
+        .iter()
+        .filter_map(|s| {
+            let keys = s
+                .peers
+                .as_ref()?
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
+            Some((s.t, keys))
+        })
+        .collect();
+    let gap = 2.0 * read.run.plan.timing.sample_every;
+    let connected = |key: &str, t: f64| {
+        peers
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= t)
+            .filter(|(at, _)| t - at <= gap)
+            .is_none_or(|(_, keys)| keys.contains(key))
+    };
     for (k, d) in plan.population.each_device() {
         let p = &plan.population.people[k];
         if !p.relays_of(d, plan.relays).contains(&r) || p.office {
             continue;
         }
         let node = read.run.fleet.device(k, d);
+        let key = read.run.fleet.made[node].key.as_str();
         let mut t = read.start;
         while t < read.end {
-            if kept(t) && read.lives.at(node, t) == Is::Running {
+            if kept(t) && read.lives.at(node, t) == Is::Running && connected(key, t) {
                 pulls += p.profile.pulled() as f64 * 6.0 * step / 60.0;
                 shows += 6.0 * step / 60.0;
             }
@@ -2100,7 +2126,8 @@ fn bar_12(read: &Read, edits: &Edits) -> (Line, Vec<(f64, f64)>) {
         line(
             "The model holds",
             said.join("; "),
-            "pulls within a fifth of §2.3 for the minutes each device was on; edits within a \
+            "pulls within a fifth of §2.3 for the minutes each device was on and connected to the \
+             relay (in the relay's peers at its last sample); edits within a \
              tenth of §2.1; shows no fewer than one for each pass, and pushes no fewer than one \
              for each cycle of a writer's adapter that published an edit (both within 5% for \
              the edges of the window)",

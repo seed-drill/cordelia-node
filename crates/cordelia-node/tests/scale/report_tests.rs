@@ -603,3 +603,43 @@ fn a_device_removed_while_off_still_owed_what_it_ran_through() {
         1980.0
     );
 }
+
+// ── Bar 12: the model counts a device where its relay holds it ──
+
+/// Person 0's first device (node 2) is on all through, but relay 1 lists no
+/// connection of it from 300 s to 480 s: warm churn closed it, and it
+/// dialled again later. The model asks nothing of it there: its six
+/// channels' pulls, six a minute, for three minutes.
+#[test]
+fn the_model_counts_a_device_only_where_its_relay_holds_its_connection() {
+    let model = |away: bool| {
+        let (_dir, run) = made_up();
+        all_running(&run, 0.0);
+        window(&run, 0.0, 600.0);
+        let keys: Vec<(String, String)> = (2..run.fleet.made.len())
+            .map(|i| (run.fleet.made[i].key.clone(), "127.20.0.1:1".to_string()))
+            .collect();
+        // Every 20 s, as the small run samples.
+        for t in (0..=30).map(|n| n as f64 * 20.0) {
+            let listed: Vec<(String, String)> = keys
+                .iter()
+                .filter(|(key, _)| {
+                    !(away && (300.0..480.0).contains(&t) && *key == run.fleet.made[2].key)
+                })
+                .cloned()
+                .collect();
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t,
+                node: 0,
+                metrics: Some(HashMap::new()),
+                peers: Some(listed),
+                ..Sample::default()
+            });
+        }
+        let read = read_of(&run);
+        model_of(&read, 0, &[(0.0, 600.0)])
+    };
+    let (all, _) = model(false);
+    let (less, _) = model(true);
+    assert_eq!(all - less, 6.0 * 6.0 * 3.0);
+}
