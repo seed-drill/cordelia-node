@@ -45,7 +45,10 @@ cordelia-node/
                          #   current version), addition, hand_over, proof, fingerprint;
                          #   message (the value of a message, its ID and the ring);
                          #   reached (the value of the carried word, decision 2026-10-19);
-                         #   slots (a name's slot, for both kinds).
+                         #   slots (a name's slot, for both kinds). A shared channel
+                         #   (decision 2026-10-10, not yet used): share (the card and
+                         #   the share), shared (forms 3 and 5, and the anew seal),
+                         #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
     cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
@@ -217,7 +220,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (28 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (34 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, the three of messages and the six of a shared channel below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -298,6 +301,27 @@ The constants of what a relay holds across its connections (decision
 | `QUIC_LISTED_STREAM_RECEIVE_WINDOW`, `QUIC_LISTED_RECEIVE_WINDOW`, `QUIC_LISTED_SEND_WINDOW`, `QUIC_LISTED_MAX_BIDI_STREAMS` | 1MB, 2MB, 2MB, 64 (derived: today's values, for a connection with a relay listed by key, dialled with `connect_with` and accepted with `accept_with`) | parameter-rationale.md §13 |
 | `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
 | `SMALL_WINDOWS_PULL_ENTRIES` | 1 (derived: the entries of the largest size on the wire that a small page holds; what a relay asks a listed relay for in a page where its own end of their connection has every peer's windows, as behind a NAT) | parameter-rationale.md §13 |
+The constants of a shared channel, for messages between people (decision
+2026-10-10, proposed and not yet used by the node), each with its reason in
+parameter-rationale.md §12.13:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `LABEL_SHARED`, `LABEL_SHARED_RELAYS`, `LABEL_SHARE_PAIR` | `cordelia v2 shared`, `cordelia v2 relays`, `cordelia v2 share pair` | parameter-rationale.md §12.13 |
+| `LABEL_ANEW_SEAL`, `LABEL_SHARED_SENT`, `LABEL_SHARED_ACT` | `cordelia v2 anew seal`, `cordelia v2 message sent`, `cordelia v2 act` | parameter-rationale.md §12.13 |
+| `SHARED_SEED_BYTES`, `SHARED_MAX_RELAYS` | 32, 2 (a card is the seed and one or two relays by key: 97 bytes at most) | parameter-rationale.md §12.13 |
+| `SHARED_MAX_CHANNELS`, `SHARED_MAX_DROPPED`, `SHARED_MAX_SUBSCRIPTIONS`, `SHARED_MAX_LABELS` | 16, 64, 32, 64 | parameter-rationale.md §12.13 |
+| `SHARED_LABEL_MAX_BYTES` | 64 (derived: `MAX_DEVICE_LABEL_BYTES`) | parameter-rationale.md §12.13 |
+| `SHARED_LIST_MAX_VALUE_BYTES` | 41,341 (derived: a device's list at every bound, which seals at 65,536) | parameter-rationale.md §12.13 |
+| `SHARED_WORDS_WRITTEN_AGAIN_DAYS` | 30 (derived: a third of `KEYED_TOMBSTONE_RETENTION_DAYS`) | parameter-rationale.md §12.13 |
+| `SHARED_ACT_TIME_MAX` | 2^40 (the latest time and the highest count an act may say) | parameter-rationale.md §12.13 |
+| `SHARED_MAX_KEYS`, `SHARED_KEYS_KEPT` | 64, 1,024 | parameter-rationale.md §12.13 |
+| `SHARED_BYTES_PER_MINUTE`, `SHARED_PUSH_BYTES_PER_MINUTE` | 512KB, 384KB (derived: a quarter of what a relay hands, and of what a device pushes) | parameter-rationale.md §12.13 |
+| `SHARED_READ_AGAIN_SECS`, `SHARED_REQUESTS_PER_MINUTE` | 86400s, 600 (with the device's own 2,250 and its 72 shows, 2,922 of 3,000) | parameter-rationale.md §12.13 |
+| `SHARED_KEY_WORDS_SHOWN` | 6 (66 bits, as `CARRY_FROM_WORDS`) | parameter-rationale.md §12.13 |
+| `SHARED_ANEW_CONTENT_BYTES`, `SHARED_ANEW_VALUE_BYTES` | 16,384, 16,274 (derived) | parameter-rationale.md §12.13 |
+| `SHARE_VALUE_BYTES` | 407 (derived: a share seals at 512) | parameter-rationale.md §12.13 |
+| `SHARE_PREFIX`, `SHARED_ANEW_PREFIX`, `SHARED_READ_PREFIX`, `PERSONAL_SHARED_PREFIX` | `share/`, `anew/`, `sread/`, `shared/` | parameter-rationale.md §12.13 |
 
 ## Running Tests
 
