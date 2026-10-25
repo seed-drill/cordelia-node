@@ -955,8 +955,7 @@ fn publishes_nothing(stands: Stands, moved_on: bool) -> Option<String> {
         }
         Stands::Closed => {
             "a device that was removed holds the secret of the change this device follows: \
-             memory stays on this machine until a change is made with the phrase here \
-             (`cordelia renew`)."
+             memory stays on this machine. `cordelia devices` says the way on."
         }
     };
     Some(why.to_string())

@@ -163,9 +163,17 @@ pub enum PersonError {
     #[error(
         "a device that was removed holds the secret of this change, as far as this device \
          knows: nothing is sealed under it. A change made with the recovery phrase on this \
-         device (`cordelia renew`) lists no removed device, and goes on."
+         device (`cordelia renew`) lists no removed device, and goes on; where this device is \
+         itself one that was removed, `cordelia devices` says so, and its way on is a new key."
     )]
     NotClear,
+
+    #[error(
+        "this device was removed: a change of the recovery phrase that it has seen removes \
+         it, and nothing is sealed under a change that lists it. `cordelia init --new-key` \
+         gives it a new key; it is then added as a new device."
+    )]
+    RemovedAsKnown,
 
     #[error(
         "the word that was given with the recovery phrase does not hold here: the phrase that \
@@ -1742,6 +1750,12 @@ fn come_to(
     }
     know_removed(conn, statement, now)?;
     if !is_clear(conn, statement, false)? {
+        // Where this device's own key is among the removed, no change that
+        // lists it is clear, and its way on is a new key: it says so, and
+        // not that a change made here goes on.
+        if held_rows::removed_keys(conn)?.contains(&identity.public_key()) {
+            return Err(PersonError::RemovedAsKnown);
+        }
         return Err(PersonError::NotClear);
     }
     let to = Generation {
@@ -7256,6 +7270,70 @@ mod tests {
         assert!(!clear(&third));
     }
 
+    /// A device whose own key is among those it knows to be removed is
+    /// told that it was removed, and that its way on is a new key, and not
+    /// to make a change here (rules 2 and 4): a change made here that lists
+    /// it is refused so, and `cordelia devices` says so, applied or in a
+    /// fork whose other branch removed it.
+    #[test]
+    fn test_a_device_that_knows_its_own_key_removed_is_told_it_was_removed() {
+        let phrase = phrase();
+        let [_, _, three, four] = statements(&phrase);
+        let conn = under_three();
+        held_rows::keep_removed(&conn, &[key(0)], NOW).unwrap();
+        let entry = change(&phrase, &four, secret(4));
+        assert!(matches!(
+            apply(
+                &conn,
+                &device(0),
+                &sign(&four, &phrase),
+                &secret(4),
+                &entry,
+                NOW
+            ),
+            Err(PersonError::RemovedAsKnown)
+        ));
+        let at_relays = crate::state::AtRelays::default();
+        let look = crate::look::look(&conn, &device(0), &at_relays, NOW).unwrap();
+        assert_eq!(
+            look.short.as_deref(),
+            Some(crate::look::REMOVED_AS_KNOWN_SHORT)
+        );
+        assert_eq!(
+            look.cannot_go_on.as_deref(),
+            Some(crate::look::REMOVED_AS_KNOWN_WHY)
+        );
+        assert!(!crate::look::REMOVED_AS_KNOWN_WHY.contains("renew"));
+        assert!(crate::look::REMOVED_AS_KNOWN_WHY.contains("cordelia init --new-key"));
+        let _ = three;
+
+        // In a fork whose other branch removes it.
+        let [same_number, _] = made_apart(&phrase);
+        let conn = db::open_in_memory().unwrap();
+        follow(&conn, 0, &phrase, &same_number, secret(13));
+        let removes_zero = statements(&phrase)[1]
+            .next(key(1), &secret(16), listed(&[1, 2]), &[key(0)])
+            .unwrap();
+        assert_eq!(
+            shown(
+                &conn,
+                &device(0),
+                &change(&phrase, &removes_zero, secret(16)),
+                NOW
+            )
+            .unwrap(),
+            Shown::Fork
+        );
+        assert!(removed(&conn).contains(&key(0)));
+        let look = crate::look::look(&conn, &device(0), &at_relays, NOW).unwrap();
+        assert_eq!(look.state, "fork");
+        assert_eq!(
+            look.cannot_go_on.as_deref(),
+            Some(crate::look::REMOVED_AS_KNOWN_WHY)
+        );
+        assert!(look.apart.is_some());
+    }
+
     /// A record under the change followed that adds a removed key makes
     /// that change not clear, as a new removed key does, though the key
     /// does not count by it (rule 3). The key is kept apart from the
@@ -7403,7 +7481,7 @@ mod tests {
         let made = first_entry(&phrase, &key(0), "device 0").unwrap();
         assert!(matches!(
             follow_first(&conn, &device(0), &made.entry, &made.statement_key, NOW),
-            Err(PersonError::NotClear)
+            Err(PersonError::RemovedAsKnown)
         ));
         assert!(held(&conn).unwrap().is_none());
 
@@ -7423,7 +7501,7 @@ mod tests {
                 &[],
                 NOW
             ),
-            Err(PersonError::NotClear)
+            Err(PersonError::RemovedAsKnown)
         ));
         assert!(held(&conn).unwrap().is_none());
 

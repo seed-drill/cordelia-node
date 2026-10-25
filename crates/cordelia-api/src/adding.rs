@@ -757,6 +757,9 @@ pub fn accept(
         // Its change is not clear, and nothing was applied (decision
         // 2026-10-24 (removal), rules 4 and 8).
         Err(PersonError::NotClear) => Ok(Accepted::Refused(NotAccepted::NotClear)),
+        // This device's own key is among those it knows to be removed: its
+        // way on is a new key.
+        Err(PersonError::RemovedAsKnown) => Ok(Accepted::Refused(NotAccepted::Removed)),
         accepted => accepted,
     }
 }

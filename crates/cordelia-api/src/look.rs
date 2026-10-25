@@ -728,8 +728,21 @@ fn of_its_person(
 
     look.notices = notices(conn, identity, statement, &kept, &reader)?;
 
-    // Why it cannot go on.
+    // Why it cannot go on. A device whose own key is among those it knows
+    // to be removed, applied or in a fork, was removed: no change that
+    // lists it is clear, and its way on is a new key (decision 2026-10-24
+    // (removal), rules 2 and 4), not a change made here.
+    let removed_as_known = counting.is_removed(&own);
     let why = match held.state {
+        State::Applied | State::Fork if removed_as_known => {
+            if held.state == State::Fork {
+                look.apart = apart(conn, held)?;
+            }
+            look.short = Some(REMOVED_AS_KNOWN_SHORT.into());
+            look.says.push(REMOVED_AS_KNOWN_WHY.into());
+            look.cannot_go_on = Some(REMOVED_AS_KNOWN_WHY.into());
+            return Ok(());
+        }
         State::Applied if closed => {
             look.short = Some(CLOSED_SHORT.into());
             look.says.push(CLOSED_WHY.into());
@@ -787,6 +800,19 @@ pub const CLOSED_WHY: &str = "a device that was removed holds the secret of the 
      device follows, as far as it knows: this device seals nothing, sends nothing and takes \
      nothing in a channel of its own, and keeps new content in its folders. Make a change \
      with the recovery phrase here (`cordelia renew`)";
+
+/// Why a device whose own key is among those it knows to be removed
+/// cannot go on, in a few words (decision 2026-10-24 (removal), rule 2).
+pub const REMOVED_AS_KNOWN_SHORT: &str = "this device was removed";
+
+/// Why a device whose own key is among those it knows to be removed
+/// cannot go on, and the way on: a change of the phrase that it has seen
+/// removes it, on this branch or on one made apart, and no change that
+/// lists it is clear. Its way on is a new key.
+pub const REMOVED_AS_KNOWN_WHY: &str = "this device was removed: a change of the recovery \
+     phrase that it has seen removes it, and it seals nothing, sends nothing and takes nothing \
+     in a channel of its own. `cordelia init --new-key` gives it a new key; it is then added \
+     as a new device";
 
 /// Why a device in `state` cannot go on, in a few words: what `cordelia
 /// devices` says first, and what a command that the state refuses says.
