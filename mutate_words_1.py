@@ -6,10 +6,13 @@ line, from the connection that the dial loop made to it; each line of
 the wait with its time, the line that the wait is still waiting, and
 the line that each end begins with; the count while a relay is waited
 out; the plain status that says its label once; "since" that says since
-what; and a relay out of reach that says that it cannot be reached. A
-part for each rule of the slice: put each fault in, and confirm the test
-named for it fails on an assertion. Run from the root of a checkout that
-nothing else edits."""
+what; and a relay out of reach that says that it cannot be reached; and,
+from the review of what was built, the count from minute 5, a recovery's
+count, its lines before R0, no line that the wait is still waiting beside
+its end, a connection that two relays given no key share, a settlement's
+question, and init's relay by its name. A part for each rule of the
+slice: put each fault in, and confirm the test named for it fails on an
+assertion. Run from the root of a checkout that nothing else edits."""
 import re, subprocess, sys
 
 # One name for each file a part edits.
@@ -40,6 +43,9 @@ def reach(test): return (NODE_LIB, "device_entries::reach::tests::" + test)
 def commands(test): return (API, "commands::tests::" + test)
 def look(test): return (API, "look::tests::" + test)
 def e2e(test): return (PERSON_E2E, test)
+# An ignored real-process test: run with the others.
+PERSON_E2E_IGNORED = ("cordelia-node", ["--test", "person_e2e"], ["--include-ignored"])
+def e2e_ignored(test): return (PERSON_E2E_IGNORED, test)
 
 # Each part: (a short id and what the fault is, the file, the exact text
 # to take out, the exact text to put in its place, the tests that must
@@ -73,19 +79,42 @@ MUTATIONS = [
      '''const LISTS_THIS_MACHINE: &str = "list";''',
      '''const LISTS_THIS_MACHINE: &str = "stays";''',
      [e2e("a_device_added_since_the_last_change_is_asked_to_list_itself")]),
+    ("Q4 a settlement says that both changes were signed before this machine was added", PERSON,
+     '''                "Neither change {} nor change {} lists this machine: both were made without it.",''',
+     '''                "Neither change {} nor change {} lists this machine: both were signed before it \\
+                 was added.",''',
+     [person("a_device_added_since_is_told_the_change_that_will_list_it")]),
+    ("Q5 a settlement asks this device to list itself as a renewal would", PERSON,
+     '''            stay.insert(0, own_listing(at, handed, true)?);''',
+     '''            stay.insert(0, own_listing(at, handed, false)?);''',
+     [person("a_settlement_on_a_machine_that_neither_change_lists_names_the_settlement")]),
     # ── Rule 2: a relay named as it is configured ──
     ("N1 the dial loop says of no relay which connection is its own", P2P,
      '''            relay.connection = peer.map(|peer| peer.0);''',
      '''            relay.connection = peer.and(None);''',
      [p2p("each_connection_says_the_configured_relay_it_was_made_to")]),
     ("N2 a row names a relay given no key by nothing", COMMANDS,
-     '''                None => relay.connection?,''',
-     '''                None => None?,''',
+     '''                None => (relay.connection?, false),''',
+     '''                None => (None?, false),''',
      [commands("a_relay_given_no_key_is_named_in_its_row_as_configured")]),
     ("N3 the wait names a row by the address it was reached at", PERSON,
-     '''    waits["name"].as_str().unwrap_or(UNNAMED_RELAY)''',
-     '''    waits["relay"].as_str().unwrap_or(UNNAMED_RELAY)''',
+     '''    if let Some(name) = waits["name"].as_str() {''',
+     '''    if let Some(name) = waits["relay"].as_str() {''',
      [e2e("the_wait_names_a_relay_as_configured")]),
+    ("N4 init --new-key names a relay by the address it was reached at", PERSON,
+     '''        .map(relay_of_row)''',
+     '''        .map(|relay| text(relay, "relay").to_string())''',
+     [person("init_new_key_names_each_relay_it_could_not_send_to_as_configured")]),
+    ("N5 a connection that two relays given no key share is named by the first", COMMANDS,
+     '''        None => given(false).map(|(_, _, name)| name.as_str()).collect(),''',
+     '''        None => given(false).take(1).map(|(_, _, name)| name.as_str()).collect(),''',
+     [commands("a_connection_that_two_relays_given_no_key_share_names_both")]),
+    ("N6 a row that names two relays is said as one that names none", PERSON,
+     '''    match names.is_empty() {
+        true => UNNAMED_RELAY.to_string(),''',
+     '''    match names.is_empty() || names.len() > 1 {
+        true => UNNAMED_RELAY.to_string(),''',
+     [person("init_new_key_names_each_relay_it_could_not_send_to_as_configured")]),
     # ── Rule 3: each line of the wait carries its time ──
     ("W1 a line of the wait is said with no time", WAIT,
      '''    format!("  {}  {line}", clock(at))''',
@@ -93,8 +122,8 @@ MUTATIONS = [
     format!("  {line}")''',
      [person("each_line_of_the_wait_starts_with_its_time_and_is_said_once")]),
     ("W2 the wait never says that it is still waiting", WAIT,
-     '''        if at.saturating_sub(self.last_said) < STILL_WAITING_SECS {''',
-     '''        if at.saturating_sub(self.last_said) < STILL_WAITING_SECS || STILL_WAITING_SECS > 0 {''',
+     '''        if ends || at.saturating_sub(self.last_said) < STILL_WAITING_SECS {''',
+     '''        if ends || at.saturating_sub(self.last_said) < STILL_WAITING_SECS || STILL_WAITING_SECS > 0 {''',
      [person("still_waiting_is_said_after_a_minute_with_no_new_line")]),
     ("W3 an end of the wait after a change says no line of its own first", PERSON,
      '''        if let Some(end) = end {
@@ -104,18 +133,64 @@ MUTATIONS = [
             for line in wait::end_lines(end, &relays, word, at) {''',
      [person("each_end_begins_with_the_wait_has_ended")]),
     ("W4 an end of a recovery's wait says no line of its own first", RECOVER,
-     '''        let ended = |begun: bool| begun.then(|| wait::Told::ended(at));''',
-     '''        let ended = |begun: bool| begun.then(|| wait::Told::ended(at)).and(None);''',
+     '''        let ended = |told: &Option<wait::Told>| told.as_ref().map(|_| wait::Told::ended(at));''',
+     '''        let ended = |told: &Option<wait::Told>| told.as_ref().and(None::<String>);''',
      [recover("each_end_of_a_recoverys_wait_begins_with_the_wait_has_ended")]),
     ("W5 S1 does not say that its lines have their times", WAIT,
      '''         goes on. {TIMES_SAID}"''',
      '''         goes on."''',
+     [wait("each_line_word_for_word")]),
+    ("W6 the wait says that it is still waiting at a look that ends it", WAIT,
+     '''        if ends || at.saturating_sub(self.last_said) < STILL_WAITING_SECS {''',
+     '''        if at.saturating_sub(self.last_said) < STILL_WAITING_SECS {
+            let _ = ends;''',
+     [person("no_still_waiting_line_comes_beside_the_end")]),
+    ("W7 the wait after a change does not say that a look ends it", PERSON,
+     '''        for line in told.of_look(lines, at, end.is_some()) {''',
+     '''        for line in told.of_look(lines, at, false) {''',
+     [person("no_still_waiting_line_comes_beside_the_end")]),
+    ("W8 a recovery's wait does not say that a look ends it", RECOVER,
+     '''                .of_look(now, at, end.is_some())''',
+     '''                .of_look(now, at, false)''',
+     [recover("no_still_waiting_line_comes_beside_the_end_of_a_recoverys_wait")]),
+    ("W9 a recovery with no wait says its lines with a time", RECOVER,
+     '''            None => now.into_iter().for_each(|line| say(format!("  {line}"))),''',
+     '''            None => wait::Told::from(at)
+                .of_look(now, at, false)
+                .into_iter()
+                .for_each(&mut say),''',
+     [recover("each_end_of_a_recoverys_wait_begins_with_the_wait_has_ended")]),
+    ("W10 S1 and R0 say that every line below has its time", WAIT,
+     '''const TIMES_SAID: &str = "Until the wait ends, each line below starts with the time it was said, \\
+                          in UTC.";''',
+     '''const TIMES_SAID: &str = "Each line below starts with the time it was said, in UTC.";''',
      [wait("each_line_word_for_word")]),
     # ── Rule 4: the count while a relay is waited out ──
     ("C1 no count is said of a relay waited out", WAIT,
      '''    let reach = relay.reach.as_ref().filter(|reach| reach.class.is_none())?;''',
      '''    let reach = relay.reach.as_ref().filter(|reach| reach.class.is_none() && now < 0)?;''',
      [person("the_count_of_a_relay_waited_out")]),
+    ("C2 from minute 5 the count says for how long, from the reference", WAIT,
+     '''                "{name} has not been reached in the {m} minutes that this command has waited \\
+                 for it. This command stops waiting for it once this machine has tried it again \\
+                 and failed."''',
+     '''                "{name} has not been reached for {m} minutes. This command stops waiting for \\
+                 it once this machine has tried it again and failed."''',
+     [person("the_count_of_a_relay_waited_out")]),
+    ("C3 minute 5 is counted as one of the 5", WAIT,
+     '''            m if m < WAITED_MINUTES => Some(format!(''',
+     '''            m if m <= WAITED_MINUTES => Some(format!(''',
+     [person("the_count_of_a_relay_waited_out")]),
+    ("C4 a recovery's wait says no count", RECOVER,
+     '''                now.extend(wait::count_line(relay, at));''',
+     '''                let _ = wait::count_line(relay, at);''',
+     [recover("a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change")]),
+    ("C5 a recovery's wait counts a relay that holds the change", RECOVER,
+     '''            if !relay.holds() {
+                now.extend(wait::count_line(relay, at));''',
+     '''            if !relay.holds() || relay.holds() {
+                now.extend(wait::count_line(relay, at));''',
+     [recover("a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change")]),
     # ── Rule 5: the plain status says its label once ──
     ("M1 the plain status says memory twice", MAIN,
      '''    format!("  Memory:    {}", indicator::without_memory(summary))''',
@@ -168,6 +243,10 @@ MUTATIONS = [
      '''                    out_of_reach: relay["reach"]["class"] == "out_lacking",''',
      '''                    out_of_reach: relay["reach"]["class"] == "out_holding",''',
      [main("test_what_a_status_goes_by_of_a_persons_devices")]),
+    ("A1 the status line says a relay not known to hold the change before five minutes", INDICATOR,
+     '''            .filter(|relay| long(&relay.lacking_secs))''',
+     '''            .filter(|relay| long(&relay.lacking_secs) || relay.lacking_secs < 300)''',
+     [e2e_ignored("a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_the_upgrade")]),
 ]
 # Rules of the slice that no test can tell, each with why. Leave it
 # empty unless the record itself says the rule cannot be tested.
@@ -181,8 +260,9 @@ BASELINE_TRIES = 3
 
 def run(where, test):
     import os, signal
-    crate, args = where
-    p = subprocess.Popen(["cargo", "test", "-p", crate, *args, test, "--", "--exact"],
+    crate, args = where[0], where[1]
+    after = where[2] if len(where) > 2 else []
+    p = subprocess.Popen(["cargo", "test", "-p", crate, *args, test, "--", "--exact", *after],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          start_new_session=True)
     try:
