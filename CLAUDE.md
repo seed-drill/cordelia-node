@@ -266,14 +266,15 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
 | `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |
 
-The constants of messages between your own agents (decision 2026-10-09),
-each with its reason in parameter-rationale.md §12.12:
+The constants of messages between your own agents (decision 2026-10-09, and
+a person's hold on them, decision 2026-10-25), each with its reason in
+parameter-rationale.md §12.12:
 
 | Parameter | Value | Spec Section |
 |-----------|-------|-------------|
 | `LABEL_AGENT_MESSAGES`, `LABEL_AGENT_MESSAGE_ID`, `LABEL_AGENT_MESSAGE_READ` | `cordelia v2 messages`, `cordelia v2 message id`, `cordelia v2 message read` | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_PREFIX`, `AGENT_MESSAGE_READ_PREFIX` | `msg/`, `read/` | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_RING` | 64 (a device's slots for messages; a signer's live numbers; places in an hour) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_RING` | 64 (a device's slots for messages; a signer's live numbers; places in an hour; the highest bound a person sets) | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_CONTENT_BYTES`, `AGENT_MESSAGE_VALUE_BYTES` | 2,048, 1,936 (derived) | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_BODY_MAX_BYTES`, `AGENT_MESSAGE_NAME_MAX_BYTES` | 1,024, 200 | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_LINK_OWNER_MAX_BYTES`, `AGENT_MESSAGE_LINK_REPO_MAX_BYTES`, `AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS`, `AGENT_MESSAGE_LINK_MAX_BYTES` | 39, 100, 10, 151 (derived) | parameter-rationale.md §12.12 |
@@ -285,6 +286,9 @@ each with its reason in parameter-rationale.md §12.12:
 | `AGENT_MESSAGE_SUMMARY_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES` | 100ms, 20ms, 64KB | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_MARKER_BYTES`, `AGENT_MESSAGE_CLEAR_INTERVAL_SECS` | 6, 3600s (derived) | parameter-rationale.md §12.12 |
 | `AGENT_MESSAGE_NUMBER_MAX` | 2^42 - 1 (derived: a clearing's revision stays below `REV_BAND_HALF`) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_PERSON_PREFIX`, `AGENT_MESSAGE_PAIR_BOUNDS_PREFIX` | `person/`, `hold/` (a device's lists of what a person read on it and of the bounds a person set on it, decision 2026-10-25, rules 1 and 2) | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_PAIR_BOUND_SECS`, `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS`, `AGENT_MESSAGE_PAIR_BOUND_MIN_SECS` | 28,800s (`--for` where none is given), 604,800s (the longest, and the `for` of a 10), 60s | parameter-rationale.md §12.12 |
+| `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS` | 605,400s (derived: how long after its `at` a device lists the latest bound it set for a pair, rule 3.5) | parameter-rationale.md §12.12 |
 
 The constants of what a relay holds across its connections (decision
 2026-10-22, change F), each with its reason in parameter-rationale.md §13:
