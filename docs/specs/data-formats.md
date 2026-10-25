@@ -77,8 +77,14 @@
 > §10.3):
 >
 > - **v21:** what a device knows of removals: `person_removed_keys`,
->   `person_holders` and `person_holders_past`. It fills none of them, and
->   changes no older row.
+>   `person_holders` and `person_holders_past`; and `person_clear_mark`,
+>   with the triggers `person_clear_on_*` that make its mark anew at every
+>   write of what says whether the change followed is clear. It fills none
+>   of the first three, writes the mark's one row, and changes no older
+>   row. **A limit of the step:** a record of an addition that the bound of
+>   256 records not counted dropped before it is no holder, since its key
+>   was kept nowhere apart and the step has nothing to fill the holders
+>   from. Only what a device sees from the step on is kept apart.
 >
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
@@ -1071,6 +1077,16 @@ CREATE TABLE person_holders_past (                  -- v21
     hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
     PRIMARY KEY (number, hash)
 );
+
+CREATE TABLE person_clear_mark (                    -- v21
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
+);
+-- One row, written by the step with randomblob(16). A trigger after each
+-- insert, update and delete of person, person_additions,
+-- person_removed_keys, person_holders and person_holders_past, and of the
+-- row of node_meta whose key is person.removed_past_bound, sets the mark
+-- to randomblob(16): eighteen in all, person_clear_on_<table>_<write>.
 ```
 
 | Table | What it holds | Decision |
@@ -1085,6 +1101,7 @@ CREATE TABLE person_holders_past (                  -- v21
 | `person_removed_keys` | Every key that a change the device has seen and checked lists as removed, on any branch, with when it was first kept. They only grow, and go only where the device leaves its phrase. At most 2,048 (`MAX_KNOWN_REMOVED`); past them the device is closed (`person.removed_past_bound`) | decision 2026-10-24 (removal), rule 2 |
 | `person_holders` | For the change it follows, by its statement's number and hash, each key that a record of an addition under it adds, counted or not, kept apart from `person_additions` and its bound. At most 2,048 a change (`MAX_KNOWN_HOLDERS`) | decision 2026-10-24 (removal), rule 3 |
 | `person_holders_past` | Each change that a record would have given more holders than are kept. Such a change is not clear | decision 2026-10-24 (removal), rule 3 |
+| `person_clear_mark` | One mark of 16 random bytes, made anew by a trigger at every write of the tables above that say whether the change followed is clear: the row of `person`, `person_additions`, the three before this one, and `person.removed_past_bound`. The node works out whether the change it follows is clear once for each mark, and reads the mark alone after that: a write undone puts back its mark with it, and a mark is never made twice | decision 2026-10-24 (removal), rules 3 and 5 |
 
 **The person secret is in the database,** which its owner alone can read
 (mode 0600), and not in a file beside it: it changes in one transaction with

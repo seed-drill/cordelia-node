@@ -711,6 +711,19 @@ pub fn forget_holders_but(
     Ok(gone)
 }
 
+/// The mark that every write of what says whether the change followed is
+/// clear makes anew (schema step 21, `person_clear_mark`): the row of the
+/// person, its records, the removed keys, the holders, the changes past
+/// the bound of holders, and the mark past the bound of removed keys. What
+/// is worked out from them under one mark holds for as long as the
+/// database holds that mark. `None` where the row is not there, and then
+/// nothing is to be taken as worked out.
+pub fn clear_mark(conn: &Connection) -> Result<Option<[u8; 16]>, CordeliaError> {
+    conn.prepare_cached("SELECT mark FROM person_clear_mark WHERE one = 1")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).optional())
+        .map_err(storage)
+}
+
 /// Forget what the device knows of removals: the keys it keeps as
 /// removed, with the mark past their bound, and every holder. Only a
 /// device that leaves its phrase does this: under another phrase they are
@@ -1182,6 +1195,70 @@ mod tests {
         assert_eq!(holders(&conn, 4, &four).unwrap(), vec![[5; 32]]);
         forget_removals(&conn).unwrap();
         assert!(holders(&conn, 4, &four).unwrap().is_empty());
+    }
+
+    /// Every write of what says whether the change followed is clear makes
+    /// the mark anew, whatever writes it (schema step 21): an insert, an
+    /// update and a delete of the person's row, its records, the removed
+    /// keys, the holders and the changes past their bound, and of the mark
+    /// past the bound of removed keys. A write undone puts back the mark
+    /// with what it undid. A write of anything else leaves it.
+    #[test]
+    fn test_every_write_that_can_change_whether_a_change_is_clear_makes_a_new_mark() {
+        let conn = db::open_in_memory().unwrap();
+        let mark = || clear_mark(&conn).unwrap().unwrap();
+        let writes = [
+            "INSERT INTO person (one, state, phrase_key, statement_key, phrase_channel, statement)
+                 VALUES (1, 'applied', zeroblob(32), zeroblob(32), zeroblob(32), X'01')",
+            "UPDATE person SET statement = X'02'",
+            "INSERT INTO person_additions (record, key, adder, counted, seen_at)
+                 VALUES (X'01', zeroblob(32), zeroblob(32), 0, 9)",
+            "UPDATE person_additions SET counted = 1",
+            "DELETE FROM person_additions",
+            "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(32), 9)",
+            "UPDATE person_removed_keys SET seen_at = 10",
+            "DELETE FROM person_removed_keys",
+            "INSERT INTO person_holders (number, hash, key) VALUES (3, zeroblob(16), zeroblob(32))",
+            "UPDATE person_holders SET number = 4",
+            "DELETE FROM person_holders",
+            "INSERT INTO person_holders_past (number, hash) VALUES (3, zeroblob(16))",
+            "UPDATE person_holders_past SET number = 4",
+            "DELETE FROM person_holders_past",
+            "DELETE FROM person",
+        ];
+        for write in writes {
+            let before = mark();
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            conn.execute_batch(write).unwrap();
+            let after = mark();
+            assert_ne!(after, before, "{write}");
+            conn.execute_batch("ROLLBACK TO one").unwrap();
+            assert_eq!(mark(), before, "undone: {write}");
+            conn.execute_batch(write).unwrap();
+            conn.execute_batch("RELEASE one").unwrap();
+            assert_ne!(mark(), before, "{write}");
+        }
+        // The mark past the bound, by the key that `meta` names.
+        let key = crate::meta::PERSON_REMOVED_PAST_BOUND;
+        let before = mark();
+        crate::meta::set(&conn, key, "1").unwrap();
+        assert_ne!(mark(), before);
+        let before = mark();
+        crate::meta::set(&conn, key, "2").unwrap();
+        assert_ne!(mark(), before);
+        let before = mark();
+        crate::meta::remove(&conn, key).unwrap();
+        assert_ne!(mark(), before);
+        // Anything else leaves it.
+        let before = mark();
+        crate::meta::set(&conn, "person.something_else", "1").unwrap();
+        crate::meta::remove(&conn, "person.something_else").unwrap();
+        conn.execute(
+            "INSERT INTO person_names (name, channel, held_at) VALUES ('notes', zeroblob(32), 9)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(mark(), before);
     }
 
     // ── What it follows, and where it stands ─────────────────────────

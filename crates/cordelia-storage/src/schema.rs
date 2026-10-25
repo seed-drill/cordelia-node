@@ -966,10 +966,23 @@ CREATE TABLE message_bounds (
 /// - `person_holders_past`: each change that a record would have given a
 ///   2,049th holder. Such a change is not clear.
 ///
-/// A relay keeps nothing in any of them. The step fills none: what a
-/// device knew before it is read from what it holds (the statement it has
-/// applied, and its records) wherever a change is asked whether it is
-/// clear, and the rest it comes to know from then.
+/// - `person_clear_mark`: one row, a mark of 16 random bytes that every
+///   write of what says whether the change followed is clear makes anew
+///   (the triggers `person_clear_on_*`): the row of the person, its
+///   records, the three tables above, and the mark past the bound of
+///   removed keys in `node_meta`. A device works out whether the change it
+///   follows is clear once for each mark, and not on every read: a mark is
+///   never made twice, and a write undone puts back the mark with what it
+///   undid, so what was worked out under a mark is what the database holds
+///   under it. It fails closed: no write of any of them, by any code,
+///   leaves the mark as it was.
+///
+/// A relay keeps nothing in any of them but the mark. The step fills none
+/// but the mark: what a device knew before it is read from what it holds
+/// (the statement it has applied, and its records) wherever a change is
+/// asked whether it is clear, and the rest it comes to know from then. So
+/// a record that the bound of 256 dropped before this step is no holder:
+/// its key was not kept apart, and is not known now.
 const MIGRATION_V21: &str = r#"
 CREATE TABLE person_removed_keys (
     key      BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
@@ -988,6 +1001,57 @@ CREATE TABLE person_holders_past (
     hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
     PRIMARY KEY (number, hash)
 );
+
+CREATE TABLE person_clear_mark (
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
+);
+INSERT INTO person_clear_mark (one, mark) VALUES (1, randomblob(16));
+
+CREATE TRIGGER person_clear_on_person_insert AFTER INSERT ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_person_update AFTER UPDATE ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_person_delete AFTER DELETE ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_additions_insert AFTER INSERT ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_additions_update AFTER UPDATE ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_additions_delete AFTER DELETE ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_removed_insert AFTER INSERT ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_removed_update AFTER UPDATE ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_removed_delete AFTER DELETE ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_holders_insert AFTER INSERT ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_holders_update AFTER UPDATE ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_holders_delete AFTER DELETE ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_past_insert AFTER INSERT ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_past_update AFTER UPDATE ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_past_delete AFTER DELETE ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_meta_insert AFTER INSERT ON node_meta
+WHEN NEW.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_meta_update AFTER UPDATE ON node_meta
+WHEN NEW.key = 'person.removed_past_bound' OR OLD.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_meta_delete AFTER DELETE ON node_meta
+WHEN OLD.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -2030,6 +2094,7 @@ mod tests {
                AND name NOT LIKE '%person_left%'
                AND name NOT LIKE '%person_removed_keys%'
                AND name NOT LIKE '%person_holders%'
+               AND name NOT LIKE '%person_clear%'
                AND name NOT LIKE '%message%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
@@ -2241,6 +2306,8 @@ mod tests {
                    AND name NOT LIKE '%person_left%'
                    AND name NOT LIKE '%person_removed_keys%'
                    AND name NOT LIKE '%person_holders%'
+                   AND name NOT LIKE '%person_clear%'
+               AND name NOT LIKE '%person_clear%'
                    AND name NOT LIKE '%message%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
@@ -4536,8 +4603,37 @@ mod tests {
         assert_eq!(held_after_the_steps("personal.db", true), 1);
     }
 
-    /// What the step to version 21 adds: three tables.
-    const NEW_IN_V21: [&str; 3] = [
+    /// The tables the step to version 21 adds.
+    const V21_TABLES: [&str; 4] = [
+        "person_clear_mark",
+        "person_holders",
+        "person_holders_past",
+        "person_removed_keys",
+    ];
+
+    /// What the step to version 21 adds, by name: four tables, and a
+    /// trigger for each write of each table that says whether the change
+    /// followed is clear, that makes the mark anew.
+    const NEW_IN_V21: [&str; 22] = [
+        "person_clear_mark",
+        "person_clear_on_additions_delete",
+        "person_clear_on_additions_insert",
+        "person_clear_on_additions_update",
+        "person_clear_on_holders_delete",
+        "person_clear_on_holders_insert",
+        "person_clear_on_holders_update",
+        "person_clear_on_meta_delete",
+        "person_clear_on_meta_insert",
+        "person_clear_on_meta_update",
+        "person_clear_on_past_delete",
+        "person_clear_on_past_insert",
+        "person_clear_on_past_update",
+        "person_clear_on_person_delete",
+        "person_clear_on_person_insert",
+        "person_clear_on_person_update",
+        "person_clear_on_removed_delete",
+        "person_clear_on_removed_insert",
+        "person_clear_on_removed_update",
         "person_holders",
         "person_holders_past",
         "person_removed_keys",
@@ -4654,7 +4750,7 @@ mod tests {
         )
         .unwrap();
         let counted = |conn: &Connection| -> Vec<i64> {
-            NEW_IN_V21
+            V21_TABLES
                 .iter()
                 .map(|table| {
                     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -4664,12 +4760,12 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(counted(&conn), [1, 1, 1]);
+        assert_eq!(counted(&conn), [1, 1, 1, 1]);
         init_db(&conn).unwrap();
         migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
         assert_eq!(
             (version(&conn), counted(&conn)),
-            (SCHEMA_VERSION, vec![1, 1, 1])
+            (SCHEMA_VERSION, vec![1, 1, 1, 1])
         );
         assert_eq!(everything_but_v21(&conn), before);
 
