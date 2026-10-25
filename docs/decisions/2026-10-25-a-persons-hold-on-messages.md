@@ -1,7 +1,7 @@
 # Decision: a person's hold on messages
 
 **Date**: 2026-10-25
-**Status**: Proposed. Not built. Revised twice after its reviews (section 8).
+**Status**: Built. Revised twice after its reviews (section 8).
 **Cited as**: "decision 2026-10-25, rule 2", and "rule 3.6" for an item of a rule. The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:

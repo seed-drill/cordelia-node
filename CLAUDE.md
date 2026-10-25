@@ -47,7 +47,7 @@ cordelia-node/
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 20). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -84,7 +84,9 @@ cordelia-node/
                          #   to send a message: the next number, its checks, sending again
                          #   and clearing); marks (what an agent read: the device's table
                          #   and its list, the other devices' lists, and whether a message
-                         #   is unread);
+                         #   is unread; and what a person read, said to the other devices,
+                         #   decision 2026-10-25); bounds (a bound a person set for each
+                         #   pair, which one holds, and the list of bounds);
                          #   messages (the routes of `msg summary`, `msg read`, `msg
                          #   send` and `msg log`: the folder's agent, the message an ID
                          #   names, the seven categories taken out of text another device
