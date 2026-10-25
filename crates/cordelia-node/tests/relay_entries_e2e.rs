@@ -826,7 +826,7 @@ async fn a_peer_that_shows_an_earlier_entry_again_and_again_is_handed_only_its_b
 /// than it could show it whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole() {
-    let relay = relay_started(None);
+    let mut relay = relay_started(None);
     let holder = client_of(&relay).await.expect("the holder connects");
     let first = holder.made(1, 5, "change", "the first");
     assert_eq!(
@@ -845,8 +845,8 @@ async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole
     }
 
     // The connection that showed it whole: held, in short. That is use
-    // of the channel, written where the last use is more than an hour
-    // old.
+    // of the channel, kept in memory and written within a minute where
+    // the last use is more than an hour old (issue #214).
     assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Held);
     let before = held(&relay, 1).unwrap().used_at;
     used_earlier(&relay, 1, 2 * 60 * 60);
@@ -857,7 +857,9 @@ async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole
     );
     assert_eq!(held(&relay, 1).unwrap().used_at, before - 2 * 60 * 60);
     assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Held);
-    assert!(held(&relay, 1).unwrap().used_at >= before);
+    wait_for("the use is written", &[&relay], 90, || {
+        (held(&relay, 1)?.used_at >= before).then_some(())
+    });
     // Another entry of that slot, from that connection: whole, though
     // the relay holds one at a later revision than it.
     assert_eq!(
@@ -966,6 +968,18 @@ async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole
         (PUSH_BYTES_PER_PEER_PER_MINUTE - SMALL - 2 * 1024) / LARGEST,
         "whole shows answered in a minute"
     );
+
+    // A use that the relay keeps is written as it stops cleanly, and not
+    // left for the next minute (issue #214).
+    used_earlier(&relay, 30, 2 * 60 * 60);
+    let before = held(&relay, 30).unwrap().used_at;
+    let last = client_of(&relay).await.expect("a last client connects");
+    assert_eq!(
+        last.show(largest.to_wire()).await.unwrap(),
+        ShowAnswer::Held
+    );
+    relay.stop();
+    assert!(held(&relay, 30).unwrap().used_at > before + 60 * 60);
 }
 
 /// A relay near its cap for channels from their secrets: it takes no
@@ -1667,12 +1681,17 @@ async fn two_relays_that_work_together_pass_entries_on_with_how_long_each_was_he
     // the first relay last saw it used. The first relay sees no proof of
     // it: it is told, and keeps the later time, so that it does not drop
     // as unused a channel that is in use at the other.
-    let used_there = held(&r2, 1).unwrap().used_at;
-    assert!(used_there >= started, "the proof was not written down");
+    // The proof is a read: the second relay writes its use within a
+    // minute (issue #214), and the first, told of it, within a minute of
+    // its next pull.
+    let used_there = wait_for("the proof is written down", &[&r1, &r2], 90, || {
+        let used_at = held(&r2, 1)?.used_at;
+        (used_at >= started).then_some(used_at)
+    });
     wait_for(
         "relay1 is told the channel is in use",
         &[&r1, &r2],
-        90,
+        150,
         || (held(&r1, 1)?.used_at == used_there).then_some(()),
     );
     // Since when each holds it is as it was.
