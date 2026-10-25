@@ -11,8 +11,9 @@
 //!   signer's H only where its slot is the slot of `msg/<its signer>/<n>`
 //!   with n its number modulo 64, and its number is one a message can
 //!   have (§2.5). The slot's ID is worked out from that name, as the
-//!   store's slots are, and compared. The list in `read/<its signer>`
-//!   raises nothing, and an entry in any other slot is no message.
+//!   store's slots are, and compared. The lists in `read/<its signer>`,
+//!   `person/<its signer>` and `hold/<its signer>` (decision 2026-10-25)
+//!   raise nothing, and an entry in any other slot is no message.
 //! - **Only a live number is opened.** An entry at a number that is not
 //!   live is never opened into the index, and is counted as overwritten
 //!   where it is a message (its revision is even): a clearing there says
@@ -20,8 +21,10 @@
 //! - **Then the value** (`message::take`): a message is written into the
 //!   index with its opened fields, a clearing drops the index row of the
 //!   message held at its number and counts that number as gone, a list is
-//!   kept as its device's latest ([`crate::marks`]), and anything else is
-//!   counted as no message.
+//!   kept as its device's latest ([`crate::marks`]), a list of a person's
+//!   reads is added to what is kept of its device ([`crate::marks`]), a
+//!   list of bounds is kept as its device's latest ([`crate::bounds`]),
+//!   and anything else is counted as no message.
 //!
 //! The reader refuses nothing that the store took: the entry stays in the
 //! store whatever it is, and nothing here changes what the door answers.
@@ -58,6 +61,12 @@ pub enum Read {
     Clearing { dropped: bool },
     /// The signer's list of what its agents read.
     List,
+    /// The signer's list of what a person read on it (decision
+    /// 2026-10-25, rule 1).
+    PersonList,
+    /// The signer's list of the bounds a person set on it (decision
+    /// 2026-10-25, rule 2).
+    Bounds,
     /// An entry at a number that is not live: never opened, and counted
     /// as overwritten where it is a message.
     Overwritten,
@@ -102,7 +111,11 @@ pub fn taken(
 
     crate::sender::taken_over(conn, own, &slot_key, generation, entry)?;
 
-    let is_list = entry.slot == slot_id(&slot_key, &message::read_name(&signer)?);
+    let is_person_list = entry.slot == slot_id(&slot_key, &message::person_name(&signer)?);
+    let is_bounds = entry.slot == slot_id(&slot_key, &message::hold_name(&signer)?);
+    let is_list = is_person_list
+        || is_bounds
+        || entry.slot == slot_id(&slot_key, &message::read_name(&signer)?);
     let number = message::number_of(entry.rev);
     let in_its_slot = !is_list
         && message::message_rev(number).is_some()
@@ -127,6 +140,11 @@ pub fn taken(
         kept(held::not_a_message(conn, &signer, generation))?;
         return Ok(Read::DidNotOpen);
     };
+    // A list of bounds of form 4 that is no list drops that key's bounds,
+    // where a form this version does not know leaves them (decision
+    // 2026-10-25, rule 2).
+    let bounds_of_form_4 =
+        is_bounds && message::form_of(&inside.value) == Some(message::FORM_BOUNDS);
     let read = message::take(
         &inside.name,
         &signer,
@@ -164,13 +182,87 @@ pub fn taken(
             crate::marks::list_taken(conn, own, &signer, &list.marks, now)?;
             Ok(Read::List)
         }
-        // Not yet read here: the lists of decision 2026-10-25 are no
-        // messages until rules 1 and 2 are built.
-        Ok(InTheRing::PersonList(_)) | Ok(InTheRing::Bounds(_)) => {
-            no_message(NotAMessage::NotInRing)
+        // A list of a person's reads adds to what is kept of its device,
+        // and takes nothing away (decision 2026-10-25, rule 1).
+        Ok(InTheRing::PersonList(list)) => {
+            crate::marks::person_list_taken(conn, own, &signer, &list.ids, now)?;
+            Ok(Read::PersonList)
         }
-        Err(why) => no_message(why),
+        // A list of bounds is its device's latest (decision 2026-10-25,
+        // rule 2), or the device's own from its later life.
+        Ok(InTheRing::Bounds(list)) => {
+            crate::bounds::list_taken(conn, own, &signer, &list, now)?;
+            Ok(Read::Bounds)
+        }
+        Err(why) => {
+            if bounds_of_form_4 {
+                crate::bounds::no_list(conn, own, &signer)?;
+            }
+            no_message(why)
+        }
     }
+}
+
+/// Read once, after the schema's step 20, the lists of a person's reads
+/// and of bounds that the store held from before it (decision 2026-10-25,
+/// rule 1): the door reads an entry of the messages channel only where the
+/// store keeps it as new, so what a device of the version before stored
+/// would never be read. Where the device stands applied, the entry its
+/// store holds in `person/<key>` and in `hold/<key>` of each key that
+/// counts is read through the reader, as though the store had just kept
+/// it, with the time the store kept it as its first holding; each signer's
+/// count of entries that were not messages is set to 0 (it was of these
+/// lists, though it clears a real count too); and the key of `node_meta`
+/// that says it was done is written: all three in one transaction, at
+/// `now`. Where the device does not stand applied, nothing is done, and
+/// it is done at a later call once it does: so it is never marked done
+/// unread. Returns whether it was done now.
+///
+/// The node makes it at its first start after step 20, before its first
+/// pass, and at each pass and before each route of messages answers,
+/// where it is not yet done.
+pub fn read_held_lists(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<bool, PersonError> {
+    use cordelia_storage::entries;
+    use cordelia_storage::meta;
+    // Once it is done, a read of one key says so, outside any write: a
+    // route that asks first pays no more.
+    if meta::get(conn, meta::MESSAGES_LISTS_READ)?.is_some() {
+        return Ok(false);
+    }
+    in_one(conn, || {
+        if meta::get(conn, meta::MESSAGES_LISTS_READ)?.is_some()
+            || crate::at_relays::stands(conn)? != crate::at_relays::Stands::Applied
+        {
+            return Ok(false);
+        }
+        let Some(person) = crate::person::held(conn)? else {
+            return Ok(false);
+        };
+        let statement = &person.statement.statement;
+        let secret = crate::person::applied_secret(conn, statement)?;
+        let messages = derive::messages_secret(&secret)?;
+        let channel = derive::channel_id(&messages)?;
+        let slot_key = derive::slot_key(&messages)?;
+        let own = identity.public_key();
+        for key in crate::person::who_counts(conn)?.keys() {
+            for name in [message::person_name(&key)?, message::hold_name(&key)?] {
+                let slot = slot_id(&slot_key, &name);
+                let Some(stored) = entries::author_entry(conn, &channel, &slot, &key)? else {
+                    continue;
+                };
+                let entry = stored.entry.check()?;
+                taken(conn, &own, &secret, statement, &entry, stored.stored_at)?;
+            }
+        }
+        conn.execute("UPDATE message_signers SET not_messages = 0", [])
+            .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
+        meta::set(conn, meta::MESSAGES_LISTS_READ, &now.to_string())?;
+        Ok(true)
+    })
 }
 
 /// The label that this device knows `key` by (decision 2026-10-09 §3):
@@ -442,6 +534,7 @@ mod tests {
             folder: None,
             since: None,
             mark: &[],
+            fetched: true,
         };
         crate::messages::log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false)
             .unwrap_or_else(|e| panic!("{e:?}"))
