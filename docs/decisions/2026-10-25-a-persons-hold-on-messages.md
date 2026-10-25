@@ -1,13 +1,13 @@
 # Decision: a person's hold on messages
 
 **Date**: 2026-10-25
-**Status**: Proposed. Not built.
+**Status**: Proposed. Not built. Revised once after its review (section 8).
 **Cited as**: "decision 2026-10-25, rule 2", and "rule 3.6" for an item of a rule. The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
 
 - **The record of 2026-10-09** is [`2026-10-09-messages-between-your-own-agents.md`](2026-10-09-messages-between-your-own-agents.md). Its sections are cited "§6 there".
-- **A pair** is two names, or a name and every agent, as §6 there counts them: a message to a name is of the pair of its sender and its recipient, in either direction; a message to every name is of the pair of its sender and every agent. A name may be on both sides: an agent and the same agent on another device.
+- **A pair** is two names, or a name and every agent, as §6 there counts them: a message to a name is of the pair of its sender and its recipient, in either direction; a message to every name is of the pair of its sender and every agent. A name may be on both sides: an agent and the same agent on another device (`pairs_with`, `cordelia-storage/src/messages.rs:1061`).
 - **The hold** is §6 there: a device sends nothing between a pair once enough of the pair's messages that it shows are unread by a person. **A bound** is that number for one pair. **The usual hold** is 10 (`AGENT_MESSAGE_PAIR_UNREAD_MAX`).
 - **A person's read** is what the yes of `cordelia msg log` at a terminal marks (§4.1 there).
 - **Main** is commit 31f4ac54. Every file and line below is of main. **The version before** is the release that this follows, which knows none of it.
@@ -24,34 +24,36 @@ The person ruled on 24 October:
 - **(c)** A person's read counts on every device of theirs. Today it is each device's own. A person who runs `log` on the laptop ends the hold that the laptop counts, and not the one the desktop counts; one run should end both.
 - **(d)** The only test for a person is a terminal, and a pseudo-terminal passes it. That is stated as a known limit, and not fought.
 
+And on 25 October, of which bound holds: **your last act decides, on every device, whatever the clocks say and whichever relay is behind.**
+
 Rule 1 is (c). Rules 2 to 4 are (b). Rule 5 is (d).
 
 **What the code does today.**
 
 - A person's read is a row of `message_read_by_a_person` (`cordelia-storage/src/schema.rs:863-865`), keyed by the message's ID, which goes with its message's row. Only `log_of` writes it (`cordelia-api/src/messages.rs:1368-1371`), for the IDs that the command sends after a yes. Nothing says it to another device (§7.2 there: "It is never synced").
-- The hold is `held_pair` (`cordelia-api/src/sender.rs:486-504`). `pairs_with` counts each pair's messages that have a place, have not expired, are live, and have no row in that table (`cordelia-storage/src/messages.rs:1040-1070`). A count of 10 or more holds. The refusal says "Ten" in its words (`cordelia-node/src/msg_cmd.rs:668-674`).
+- The hold is `held_pair` (`cordelia-api/src/sender.rs:486-504`). `pairs_with` counts each pair's messages that have a place, have not expired, are live, and have no row in that table (`messages.rs:1040-1070` in storage). A count of 10 or more holds. The refusal says "Ten" in its words (`cordelia-node/src/msg_cmd.rs:668-674`).
 - **What an agent read already travels.** Each device writes its list in the slot `read/<its key>` of the messages channel (form 2, `cordelia-api/src/marks.rs:169-216`), and a reader keeps the latest list of each key that counts, in place of the one before (`marks.rs:260-271`). Rules 1 and 2 use that way, with the differences they give.
 - `log` asks only where its input and its output are both terminals (`msg_cmd.rs:1258`). The node's route takes `mark` from any caller that holds the token (`messages.rs:1708-1747`): it cannot tell a person from a program (§4.2 there).
 - Plain `cordelia status` says nothing of messages (`cordelia-node/src/main.rs:1536-1570`), and `docs/specs/channels-api.md` says so as a rule.
-- A reader of the version before takes an entry in a slot of the messages channel that it does not know as no message, and counts it (`cordelia-api/src/reader.rs:115`, `NotInRing`).
+- A reader of the version before takes an entry in a slot of the messages channel that it does not know as no message, and counts it (`cordelia-api/src/reader.rs:115`, `NotInRing`). The door reads an entry of the messages channel only where the store keeps it as new (`cordelia-api/src/take.rs:226-232`).
 
 ## 1. The rules
 
 Each rule gives what you see, word for word; what is stored, and where; what travels, and how it is sealed; what a device of the version before does beside it; and its tests.
 
-**Placeholders.** `<a>` and `<b>` are names as these commands print one (`name_shown`, `msg_cmd.rs:200`: cleaned, and cut to 48). `<pair>` is "between `<a>` and `<b>`", or "from `<a>` to every agent", and `<Pair>` the same with a capital. `<when>` is a moment as the record of reach writes one: "18:05 UTC", or "18:05 UTC on 2026-10-26" where it is not today. `<device>` is "this device", or a label in quotes as `label_shown` prints it.
+**Placeholders.** `<a>` and `<b>` are names as these commands print one (`name_shown`, `msg_cmd.rs:200`: cleaned, and cut to 48). `<pair>` is "between `<a>` and `<b>`", or "from `<a>` to every agent", and `<Pair>` the same with a capital. `<when>` is a moment as the record of reach writes one: "18:05 UTC", or "18:05 UTC on 2026-10-26" where it is not today. `<device>` is "this device", or a label in quotes as `label_shown` prints it. `<where>` says on which devices you read what is not shown: "on this device", or "on "laptop"", or, where it is more than one, each with its count, "3 on this device and 7 on "laptop"". A message read here and elsewhere counts as here; one read on two other devices counts under the first label, in order of label.
 
 ### Rule 1. A person's read counts on every device
 
-**What you see.** `log` no longer lists, or asks about, a message that a person read on any device of yours that counts. Its lines that change (§4.1 there):
+**What you see.** `log` no longer lists, or asks about, a message that a person read on any device of yours that counts, and it says where you read what it does not show. Its lines that change (§4.1 there):
 
-> No new message of `<any agent | the agent <name>>` is held on this device. You have read the `<N>` others, on this device or another.
+> No new message of `<any agent | the agent <name>>` is held on this device. You have read the `<N>` others, `<where>`.
 
-For one: "You have read the other one, on this device or another."
+For one: "You have read the other one, `<where>`."
 
-> You have read `<N>` other messages, on this device or another, so they are not shown.
+> You have read `<N>` other messages, `<where>`, so they are not shown.
 
-For one: "You have read 1 other message, on this device or another, so it is not shown."
+For one: "You have read 1 other message, `<where>`, so it is not shown." So "You have read 10 other messages, 3 on this device and 7 on "laptop", so they are not shown." tells you whose word hides them (rule 5).
 
 In each message it lists, "Not read by a person here." becomes "Not read by a person."
 
@@ -65,39 +67,42 @@ After a yes:
 
 > Marked `<N>` messages as read by you. Your other devices count them read once they hear of it.
 
-For one: "Marked 1 message as read by you. Your other devices count it read once they hear of it." Where the node marked fewer: "Marked `<M>` of the `<N>` messages printed as read by you: the others are no longer shown here. Your other devices count them read once they hear of it."
+For one: "Marked 1 message as read by you. Your other devices count it read once they hear of it." Where the node marked fewer: "Marked `<M>` of the `<N>` messages printed as read by you: the others are no longer shown here. Your other devices count them read once they hear of it." **Where sync is off,** the second sentence is "Sync is off on this device, so your other devices hear of it once you turn sync on."
 
 Away from a terminal, `log` still ends "Not marked as read by a person: this was not run at a terminal.": an agent reads that line, so it does not say "you". `read`'s header says "`<U>` of them not yet read by a person." (no "here"). The status's `unread_by_a_person` counts the same way.
 
 **What is stored, and where** (the device's store; the schema's step 20):
 
 1. **A person's read here** stays a row of `message_read_by_a_person`, as today. Its order is the table's rowid: the newest is the highest.
-2. **What other devices said:** a new table, `message_person_marks`, of the IDs that each other key's lists of a person's reads held, each with when it was taken here. **It is a union:** a later list that leaves an ID out takes nothing away. A row whose message this device holds goes with that message's row (`drop_row`). Of the rows whose message it does not hold, it keeps at most 120 for each key (`AGENT_MESSAGE_READ_MARKS_MAX`), the latest taken first, each for 30 days from when it was taken (`AGENT_MESSAGE_KEPT_DAYS`).
-3. **Read by a person is worked out when it is asked,** as read by an agent is (§7.2 there): a row of 1, or a row of 2 under a key that counts now. `pairs_with`, `is_read_by_a_person`, `log` and the status's count all ask it so.
+2. **What other devices said:** a new table, `message_person_marks`, of the IDs that each other key's lists of a person's reads held, each with when it was taken here. **It is a union:** a later list that leaves an ID out takes nothing away. A row whose message this device holds goes with that message's row (`drop_row`). Of the rows whose message it does not hold, it keeps at most 120 for each key (`AGENT_MESSAGE_READ_MARKS_MAX`), the latest taken first, each for 30 days from when it was taken (`AGENT_MESSAGE_KEPT_DAYS`). **The rows of a key that a statement does not count go in the transaction that applies it,** so a key added again later counts only what it lists from then.
+3. **Read by a person is worked out when it is asked,** as read by an agent is (§7.2 there): a row of 1, or a row of 2 under a key that counts now. `pairs_with`, which is SQL, is passed the keys that count; `is_read_by_a_person`, `log` and the status's count ask the same.
 
 **Why a union, where an agent's list is kept by replacing it.** An agent's mark that falls out of the newest list is unread again, and at worst an agent is shown a message twice. A person's read that fell out would bring back a hold that you had ended, with no new message. A union cannot do that. Its bound is on what it keeps of messages that this device does not hold.
 
 **What travels, and how it is sealed.** Each device writes one entry more in the messages channel, in the slot `person/<its key>` (`AGENT_MESSAGE_PERSON_PREFIX`), of form 3: the byte `3`; a count, two bytes, from 0 to 120; that many message IDs of 16 bytes each, the newest first; and zeros to 1,936 bytes. It holds the newest 120 rows of the table of 1. It is the agents' list (form 2) with IDs in place of marks: a person's read has no name to bind into a hash, and the entry is sealed.
 
 - It is sealed by `Entry::seal` under the messages channel's secret, signed by the device, at 2,048 bytes, as every entry of the channel is (§2.2 there). Its name, `person/` and a key, is 77 bytes, the longest name of the channel, so the value's size does not change.
-- It is written and sent by the rules of the agents' list (§2.4 there): only after the first fetch since the node started, and only where the device stands applied with sync on; wherever the table holds an ID that the list it holds lacks, so `log`'s write that marks writes it too; one revision above the list it holds; again above a relay's answer of another, at most three times in a row (`AGENT_MESSAGE_SENDS_MAX`); and after a relay's answer that it holds a later one, not until the next pull hands that back. A device's first list in a new generation holds the newest 120 rows of its table (§9.1 there).
-- **Taken by a reader,** in the door's write (`reader.rs`), as the agents' list is: in its signer's slot, raising no H. Another key's list adds each of its IDs to the table of 2. The device's own list, handed back by a relay from its later life (a store restored from a backup), adds each ID whose message it holds to the table of 1, and keeps the rest under its own key in the table of 2. **A list from a key that no longer counts says nothing,** and the hourly task drops its rows.
+- It is written and sent by the rules of the agents' list (§2.4 there): only after the first fetch since the node started, and only where the device stands applied with sync on; wherever the table holds an ID that the list it holds lacks, so `log`'s write that marks writes it too; one revision above the list it holds; again above a relay's answer of another, at most three times in a row (`AGENT_MESSAGE_SENDS_MAX`), counted apart from the agents' list (`meta::MESSAGES_LIST_AGAIN` is that list's alone, and `marks::answered` matches each of the three slots); and after a relay's answer that it holds a later one, not until the next pull hands that back. A device's first list in a new generation holds the newest 120 rows of its table (§9.1 there).
+- **Taken by a reader,** in the door's write (`reader.rs`), as the agents' list is: in its signer's slot, raising no H. Another key's list adds each of its IDs to the table of 2. The device's own list, handed back by a relay from its later life (a store restored from a backup), adds each ID whose message it holds to the table of 1, and keeps the rest under its own key in the table of 2. A list that is not one (a count over 120, a fill that is not zeros) is counted as no message, and takes nothing away. **A list from a key that no longer counts says nothing.**
 
-**Beside the version before.** A device of the version before writes no such list: a person's read there counts there alone, as today, and a device of this version beside it holds by that. It stores this version's lists, as a relay does, and reads each as an entry in a slot it does not know (`NotInRing`): its `log` counts each new list as one more entry that was not a message, and says "`<N>` entries from "`<label>`" were not messages, and were not shown." Nothing else changes there. **Step 20 sets each signer's count of entries that were not messages to 0,** since the version before counted this version's lists among them. The notes of the release say both.
+**Beside the version before.** A device of the version before writes no such list: a person's read there counts there alone, as today, and a device of this version beside it holds by that. It stores this version's lists, as a relay does, and reads each as an entry in a slot it does not know (`NotInRing`): its `log` counts each new list as one more entry that was not a message, and says "`<N>` entries from "`<label>`" were not messages, and were not shown." Nothing else changes there. So "here and on your other devices" is true of your devices of this version: the notes of the release, and the help of `log`, say that a device of yours on an older version does not hear of it.
+
+**When it takes this version,** the door does not read what the store already holds (`take.rs:226-232`), so the lists it stored while it was older would never be read. **Once, at the first start after step 20, before the first pass,** the node reads through the reader the entry its store holds in `person/<key>` and in `hold/<key>` for each key that counts, as though the store had just kept it, with the time the store kept it as its first holding; then it sets each signer's count of entries that were not messages to 0, and a key of `node_meta` says that it was done. The count was of this version's lists; setting it to 0 also clears the count of a device that really wrote what was no message, and the notes of the release say so.
 
 **Tests.**
 
 - Units, in-process over `Several` (`marks.rs`, `messages.rs`):
   - `a_persons_read_on_one_device_counts_on_another`: the laptop's `log` marks three; the desktop takes the list; its pair count, its status's `unread_by_a_person` and its `log`'s `already_read` count all three as read by a person.
+  - `log_says_where_you_read_what_it_does_not_show`: 3 read here and 7 by the laptop's list give "3 on this device and 7 on "laptop""; one read both here and there counts as here.
   - `a_persons_read_that_arrives_before_its_message_loses_nothing`: the desktop takes the list, then the message; the message is read by a person at once, and is never in a pair's count.
   - `a_persons_read_that_falls_out_of_the_newest_list_stays_read`: the laptop marks 130; the desktop takes its list at 60 and at 130; all 130 stay read there.
   - `what_is_kept_of_messages_not_held_is_bounded`: a key lists 240 IDs of messages not held, in two lists; 120 are kept, the latest taken; one goes 30 days after it was taken.
-  - `a_persons_read_from_a_key_that_no_longer_counts_says_nothing`.
+  - `a_persons_read_from_a_key_that_no_longer_counts_says_nothing`, and `a_statement_drops_the_rows_of_a_key_it_does_not_count`.
   - `the_persons_list_waits_for_the_first_fetch_and_for_sync`, and `a_relay_that_answers_another_to_the_persons_list_gets_three_more_at_most`, as the agents' list's tests do.
   - `a_persons_list_handed_back_is_merged`: a store restored from a backup takes its own later list.
-  - `step_20_sets_the_count_of_not_messages_to_0` (`schema.rs`).
-- Units of the command (`msg_cmd.rs`): every line above, word for word, for one and for many, with and without `--since`.
-- Real processes (`msg_e2e.rs`): `one_yes_on_the_laptop_ends_the_hold_on_both_devices`. An agent on the laptop and one on the desktop answer each other until each device refuses with `pair_held`. `log` at the laptop's terminal (`AtTerminal`) is answered yes. The test waits until the desktop's `unread_by_a_person` falls; then a send goes on each device, and `log` at the desktop's terminal lists none of them and says "You have read the `<N>` others, on this device or another." `log_shows_and_marks_only_what_no_person_has_read_here` gains the same on a second device.
+  - `lists_held_before_the_upgrade_are_read_after_it`: a store stepped from 19 that holds a list of form 3 and one of form 4 reads both at the first start, and its count of entries that were not messages is 0.
+- Units of the command (`msg_cmd.rs`): every line above, word for word, for one and for many, with and without `--since`, with sync on and off.
+- Real processes (`msg_e2e.rs`): `one_yes_on_the_laptop_ends_the_hold_on_both_devices`. An agent on the laptop and one on the desktop answer each other until each device refuses with `pair_held`. `log` at the laptop's terminal (`AtTerminal`) is answered yes. The test waits until the desktop's `unread_by_a_person` falls; then a send goes on each device, and `log` at the desktop's terminal lists none of them and says "You have read the `<N>` others, on "laptop"." `log_shows_and_marks_only_what_no_person_has_read_here` gains the same on a second device.
 
 ### Rule 2. A bound for each pair, set only by a person
 
@@ -108,10 +113,11 @@ cordelia msg allow <a> <b> (<n> | any) [--for <time>]
 cordelia msg allow <a> --all (<n> | any) [--for <time>]
 ```
 
-- `<n>` is 1 to 64 (`AGENT_MESSAGE_RING`, one lap of a device's ring: more than that is no hold in practice, and `any` says so plainly). `any` is no hold.
+- `<n>` is 1 to 64 (`AGENT_MESSAGE_RING`, one lap of a device's ring: above it, a bound stops no loop between two agents of one device, and `any` says no hold plainly). `any` is no hold.
 - `--for` takes what `--since` takes (30m, 8h, 2d), from 1 minute to 7 days (`AGENT_MESSAGE_PAIR_BOUND_MAX_SECS`). Where it is not given, 8 hours (`AGENT_MESSAGE_PAIR_BOUND_SECS`).
-- **10 is the usual hold:** `allow <a> <b> 10` goes back to it now, and does not use `--for`.
+- **10 is the usual hold:** `allow <a> <b> 10` goes back to it now. It takes no `--for`: one given is not used.
 - Each name must be one that the personal channel lists, as for `send --to`.
+- In `cordelia msg --help` its line begins "For a person at a terminal:".
 
 **What you see.**
 
@@ -134,6 +140,8 @@ For `<k>` of 1, "1 message waits"; for 0, "no message waits".
 - for `any`: "Allow any number to wait unread, until `<when>`? Until then only the hourly limits stop sending. After `<when>` it stops at 10 again."
 - for 10: "Go back to the usual hold of 10 now?"
 
+With `--all`, the question ends with one sentence more: "`<a>` still sends nothing to every agent while a pair with `<a>` on one side is held." (§6 there refuses `--all` from `<a>` while any of its pairs is at its bound.)
+
 After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other devices hold by it once they hear of it." For `any`: "Done. `<Pair>`, only the hourly limits stop sending until `<when>`. Your other devices hold by it once they hear of it." For 10: "Done. `<Pair>`, sending stops at 10 again. Your other devices hold by it once they hear of it." Any other answer: "Nothing was set."
 
 **Where its input or its output is not a terminal,** it says its first line, then, on standard error with status 1, "Nothing was set: this was not run at a terminal." It asks the node nothing.
@@ -143,65 +151,73 @@ After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other 
 1. The command line: "Give two names, or one name and --all, then a number from 1 to 64, or any."
 2. The number: "`<n>` is not a number you can allow: give 1 to 64, or any."
 3. The time: "`<time>` is not a time you can allow it for: give 1m to 7d, as 30m, 8h or 2d."
-4. The node, and the device: steps 3 and 4 of §4.3 there, as `log` says them, with "so it sets nothing" where `log` says "so it shows no message".
-5. A name: "No device of yours syncs `<name>`, so nothing was set." (`no_such_name`)
-6. Room (rule 3.5): "This device already tells your other devices of 4 bounds, which is as many as it can. End one first: allow its pair 10." (`bounds_full`)
+4. The node, the device and sync: steps 3, 4 and 5 of §4.3 there, as `send` says them, with "so it sets nothing" and "nothing was set" where `send` says "so it sends no message" and "nothing was sent".
+5. Not fetched (step 8 there): "This device has not yet read its own messages back from a relay since it started, and sets nothing until it has. Try again in a minute." (`not_fetched`) A bound is set only after the device has read what the relays hold, so it is set after what they hold (rule 3.1).
+6. A name: "No device of yours syncs `<name>`, so nothing was set." (`no_such_name`)
+7. Room (rule 3.6), with each pair the list holds, as `<pair>, until <when>`, under it: "This device's list of bounds is full: it holds what you set here for these pairs, each until 7 days after you set it. You can still set any of them again:" (`bounds_full`)
 
-**What is stored, and where.** A new table, `message_bounds` (step 20): for each key, this device's own among them, each bound its list holds: the pair; the bound (none for `any`); `set`, when the yes was typed, by that device's clock; `for`, in seconds; and when this device first held it. Nothing is in the configuration: a file that an agent can write is not a person at a terminal.
+**What is stored, and where.** A new table, `message_bounds` (step 20): for each key, this device's own among them, each bound its latest list holds: the pair; the bound (none for `any`); `set` (rule 3.1); `for`, in seconds; and when this device first held it (rule 3.3). Nothing is in the configuration: a file that an agent can write is not a person at a terminal.
 
-**The route.** `POST /api/v1/messages/allow`, a sixth route of §4.2 there, behind the token: `a`, `b` (null for every agent), `bound` (1 to 64, or null for `any`), `for_secs` and `set`. With `set` false it answers the look that the command prints first: `waiting` (`<k>`), and the bound in force (rule 3) with its `until` and the device it was set on, or null for the usual hold. With `set` true it sets the bound, in the write that writes the list. The command asks for the look, asks its question, and asks the node again (steps 3 and 4) before it sets, as `log` does before it marks.
+**The route.** `POST /api/v1/messages/allow`, a sixth route of §4.2 there, behind the token: `a`, `b` (null for every agent), `bound` (1 to 64, or null for `any`), `for_secs` and `yes`. It checks the names, the bound and `for_secs` again, as the command does. With `yes` false it answers the look that the command prints first: `waiting` (`<k>`), and the bound in force (rule 3) with its `until` and the device it was set on, or null for the usual hold. With `yes` true it sets the bound, in the write that writes the list. The command asks for the look, asks its question, and asks the node again (steps 3 to 5) before it sets, as `log` does before it marks.
 
-**What travels, and how it is sealed.** Each device writes one entry more in the messages channel, in the slot `hold/<its key>` (`AGENT_MESSAGE_PAIR_BOUNDS_PREFIX`), of form 4: the byte `4`; a count, one byte, from 0 to 4 (`AGENT_MESSAGE_PAIR_BOUNDS_MAX`); then each bound: `a` (two bytes of length and a name); the kind of `b` (1: a name, 2: every agent); `b` (two bytes of length and a name, for kind 1 only); the bound (one byte: 0 for `any`, else 1 to 64); `set` (8 bytes, seconds since 1970); and `for` (4 bytes, seconds); and zeros to 1,936 bytes.
+**What travels, and how it is sealed.** Each device writes one entry more in the messages channel, in the slot `hold/<its key>` (`AGENT_MESSAGE_PAIR_BOUNDS_PREFIX`), of form 4: the byte `4`; a count, one byte; then each bound, the latest `set` first: `a` (two bytes of length and a name); the kind of `b` (1: a name, 2: every agent); `b` (two bytes of length and a name, for kind 1 only); the bound (one byte: 0 for `any`, else 1 to 64); `set` (8 bytes, seconds since 1970); and `for` (4 bytes, seconds); and zeros to 1,936 bytes.
 
-- For a pair of two names, `a` is the lower in byte order, so a pair has one spelling.
-- Four bounds at the longest names come to 1,674 bytes; five would not fit.
-- A reader takes as no list one whose count is over 4, with a name that is not a name, a bound over 64, a `for` outside 60 to 604,800, two bounds of one pair, or a fill that is not zeros.
-- It is sealed, signed, sized and written by the rules of rule 1's list, wherever what it should hold changes (rule 3.4). Its name, `hold/` and a key, is 75 bytes.
+- For a pair of two names, `a` is not above `b` in byte order, so a pair has one spelling; they may be equal.
+- **As many bounds as fit:** at the longest names 4 (1,674 bytes; five would need 2,092), at names of 30 bytes 24.
+- A reader takes as no list one with a name that is not a name, a kind other than 1 or 2, `a` above `b` for kind 1, a bound over 64, a `for` outside 60 to 604,800, two bounds of one pair, bytes that run past the value, or a fill that is not zeros. **Where a newer list of a key is no list, that key's bounds go:** a bound that cannot be read holds nothing, and the pair is at what the others list.
+- **The device's own list, handed back by a relay from its later life** (a store restored from a backup), replaces the device's own rows of `message_bounds`, in the door's write; its next list goes above it. A restored store sets nothing before its first fetch (refusal 5), so nothing it set is lost.
+- It is sealed, signed, sized and written by the rules of rule 1's list, wherever what it lists changes (rule 3.5). Its name, `hold/` and a key, is 75 bytes.
 
-**Beside the version before.** `cordelia msg allow` is not there, and a device of the version before holds every pair at 10. It counts each list of bounds as an entry that was not a message, as in rule 1. So where your agents run on two devices of two versions, the older one stops its side at 10, whatever you allow. The help of `cordelia msg allow` says so: "A device of yours on an older version holds every pair at 10, and does not hear of this."
+**Beside the version before.** `cordelia msg allow` is not there, and a device of the version before holds every pair at 10. It counts each list of bounds as an entry that was not a message, as in rule 1. So where your agents run on two devices of two versions, the older one stops its side at 10, whatever you allow. The help of `cordelia msg allow` says so: "A device of yours on an older version holds every pair at 10, and does not hear of this." When it takes this version it reads the list it holds (rule 1).
 
 **Tests.**
 
-- Units (`msg_cmd.rs`): `allow_is_refused_away_from_a_terminal` (input a pipe; output a pipe), and asks the node nothing; `allow_takes_a_number_any_and_a_time` (0, 65, `none`, `0m` and `8d` refused; 10 with `--for` goes back to the usual hold); every line above, word for word.
-- Units (`messages.rs`): `the_look_says_the_count_and_the_bound_in_force`; `allow_refuses_a_name_no_device_syncs`; `a_fifth_bound_on_one_device_is_refused`; `a_bound_is_listed_and_taken_by_another_device`; `a_list_of_bounds_that_is_not_one_is_no_list`, one case for each check above.
-- Real processes (`msg_e2e.rs`): `a_bound_set_on_the_desktop_holds_on_both`. A pair is held at 10 on both devices. At the desktop's terminal (`AtTerminal`), `cordelia msg allow X Y 20 --for 1h`, and yes. Once the laptop holds the list, each device sends up to 20, and the 21st is refused with `pair_held` and rule 4's line naming 20. `cordelia status` on the laptop says rule 4's line, with "you set it on "desktop"". Then `cordelia msg allow X Y 10` on the laptop, and both hold at 10 again. And `allow_into_a_pipe_sets_nothing`: with its output a pipe, nothing is set and the pair stays held.
+- Units (`msg_cmd.rs`): `allow_is_refused_away_from_a_terminal` (input a pipe; output a pipe), and asks the node nothing; `allow_takes_a_number_any_and_a_time` (0, 65, `none`, `0m` and `8d` refused; 10 with `--for` is the usual hold); every line above, word for word, `--all`'s among them.
+- Units (`messages.rs`): `the_look_says_the_count_and_the_bound_in_force`; `the_allow_route_refuses_what_the_command_refuses` (a bound of 0 or 65, a `for_secs` of 59 or 604,801, a name no device syncs); `allow_is_refused_before_the_first_fetch_and_with_sync_off`; `a_full_list_of_bounds_refuses_a_new_pair_and_takes_one_it_holds`; `a_bound_is_listed_and_taken_by_another_device`; `a_list_of_bounds_that_is_not_one_is_no_list`, one case for each check above, and that it drops that key's bounds; `a_restored_store_takes_its_own_later_bounds`.
+- Real processes (`msg_e2e.rs`): `a_bound_set_on_the_desktop_holds_on_both`. Two agents, X on the laptop and Y on the desktop, answer each other until the pair is held at 10 on both. At the desktop's terminal (`AtTerminal`), `cordelia msg allow X Y 20 --for 1h`, and yes. Once the laptop holds the list, they answer each other again until the pair counts 20 on both devices (each sends five more, so neither folder nears its 20 an hour), and the next send is refused with `pair_held` and rule 4's line naming 20. `cordelia status` on the laptop says rule 4's line, with "you set it on "desktop"". Then `cordelia msg allow X Y 10` on the laptop, and both hold at 10 again. And `allow_into_a_pipe_sets_nothing`: with its output a pipe, nothing is set and the pair stays held.
 
 ### Rule 3. Which bound holds a pair, and for how long
 
-1. **A bound starts,** on each device, at its `set`, or 10 minutes after that device first held it where `set` is later than that (`AGENT_MESSAGE_AHEAD_MAX_SECS`, as a sender's clock is allowed to be ahead, §7.1 there). **It ends** `for` seconds after it starts. So the order is the same on every device whose clocks agree within 10 minutes, and a clock far ahead gains nothing.
-2. **The bound in force for a pair is the one that started last,** among this device's own and those of the keys that count. Of two that start in the same second, the lower decides (a number before `any`), then the lower key. **Where the one that started last has ended, the pair is at the usual hold,** whatever an older one would still allow: your last act decides, and when it ends nothing older comes back. Where there is none, the usual hold.
-3. **When a bound ends,** nothing is said. The pair is at 10 again on every device, and `cordelia status` no longer shows it. Where 10 or more wait unread, the next send is refused at once.
-4. **What a device lists.** Its own bound for a pair, until a bound for that pair that started later is in the list of another key that counts: then it drops its own. An own bound that has ended stays listed while another key that counts lists a bound for that pair that started earlier and has not ended, so that the older one does not come back; otherwise it leaves the list when it ends, by the hourly task at the latest. A new bound for a pair replaces the device's own for that pair.
-5. **Room.** A list holds 4 bounds. A bound that would need a fifth place is refused by the command (rule 2). 10 for a pair takes no place where no other key lists a bound for that pair: the device drops its own.
-6. **A statement ends every bound.** When a device applies a statement (a removal, a renewal, a settlement or a recovery), it drops every row of `message_bounds`, its own and the others', in the transaction that applies it, and writes no list of bounds in the new generation until one is set again. Nothing of messages is carried (§9.1 there), and a change of your devices is a moment to be back at the usual hold.
-7. **A key that no longer counts says nothing:** its bounds stop holding at once, and the hourly task drops them.
+1. **Each bound has a `set`:** the clock of the device it is set on when the yes is typed, or one second after the latest `set` that device holds for that pair from any key, whichever is later. So a bound set after another was heard of is later than it, whatever the clocks say.
+2. **The bound in force for a pair is the one with the latest `set`,** among this device's own and those of the keys that count. Of two with one `set`, the lower decides (a number before `any`), then the lower key. Every device decides the same from the same lists. **Where that bound has ended, the pair is at the usual hold,** whatever an older one would still allow. With none, the usual hold. **Two acts on two devices, neither of which had heard of the other,** are ordered by those devices' clocks: the one case in which a clock decides. Your devices keep time within seconds (§7.1 there), so it is the order you made them in, unless a clock is wrong.
+3. **How long it holds.** A bound holds on a device from when the device holds it. It ends `for` seconds after the earlier of its `set` and when that device first held it, as a message's shown time is worked out (§7.1 there), so a clock ahead gains nothing. That first holding is kept for the bound (its key, pair and `set`) across that key's later lists. A 10 carries `for` 604,800.
+4. **When a bound ends** nothing is said. The pair is at 10 again, and `cordelia status` no longer shows it. Where 10 or more wait unread, the next send is refused at once.
+5. **What a device lists:** for each pair, the latest bound set on it, a 10 among them, **until 7 days and 10 minutes after its `set`** (`AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS`: the longest an older bound can hold, and a clock's 10 minutes), or until it holds a bound for that pair with a later `set` from another key, which then decides in its place and is listed as long. A new bound for a pair replaces the device's own. So no older bound comes back, from a device that was off or from a relay that is behind: whatever it overrode has ended before it leaves the list.
+6. **Room.** A bound for a pair that the list does not hold, and that would not fit, is refused (rule 2, refusal 7). A pair it holds can always be set again, in its place.
+7. **A statement ends every bound.** When a device applies a statement (a removal, a renewal, a settlement or a recovery), it drops every row of `message_bounds`, its own and the others', in the transaction that applies it, and writes no list of bounds in the new generation until one is set again. Nothing of messages is carried (§9.1 there), and a change of your devices is a moment to be back at the usual hold.
+8. **A key that no longer counts says nothing:** its bounds stop holding at once.
 
-**What you see** is rule 2's look and rule 4's lines. **What is stored, and what travels,** is rule 2's, and nothing more. **Beside the version before,** it holds at 10 (rule 2).
+**What you see** is rule 2's look and rule 4's lines. **What is stored, and what travels,** is rule 2's. **Beside the version before,** it holds at 10 (rule 2).
 
 **Tests.** Units, in-process with the node's clock (`SyncControl::set_now`), over `Several`:
 
-- `the_bound_that_started_last_decides`: the desktop sets 30, then the laptop sets `any`; both hold by `any`; when the laptop's ends, both hold at 10, though the desktop's 30 would still run.
+- `the_bound_set_last_decides`: the desktop sets 30, then the laptop, having heard of it, sets `any`; both hold by `any`; when the laptop's ends, both hold at 10, though the desktop's 30 would still run.
+- `a_later_act_decides_whatever_the_clocks_say`: the desktop's clock 9 minutes ahead sets `any`; the laptop, having heard of it, sets 10; the 10's `set` is a second after the `any`'s, and both hold at 10. And with the laptop's clock an hour behind, the same.
+- `a_ten_set_before_an_older_bound_is_heard_of_still_decides`: the desktop, with no relay, sets `any`; an hour later the laptop sets 10; the desktop reaches a relay; both hold at 10, and the desktop no longer lists its `any`.
+- `an_older_bound_does_not_come_back_from_a_relay_that_is_behind`: the laptop lists `any`, the desktop then 20 for an hour; relay2 holds only the laptop's first list; a third device pulls from relay2 and from relay1, and holds at 10 once the 20 has ended.
 - `two_bounds_set_in_one_second`: the lower decides on both devices.
-- `a_clock_ahead_gains_nothing`: a bound whose `set` is an hour ahead starts 10 minutes after it was first held.
+- `a_clock_ahead_gains_nothing`: a bound whose `set` is an hour ahead ends `for` after it was first held, and does so across that key's next list.
 - `a_bound_that_ends_holds_a_pair_over_10_at_once`.
 - `a_bound_set_while_a_pair_is_held`: raised above the count, a send goes at once and nothing is marked read; lowered to the count, a send is refused at once.
-- `a_device_drops_its_own_bound_once_a_later_one_is_listed`, and `an_ended_bound_stays_listed_while_an_older_one_runs`.
+- `a_bound_stays_listed_for_seven_days_and_ten_minutes`.
 - `a_statement_ends_every_bound`: a renewal, and a removal.
 - `a_bound_from_a_key_that_no_longer_counts_says_nothing`.
 
-Real processes: rule 2's test, whose last step is 3.2 and 3.4.
+Real processes: rule 2's test, whose last step is 3.1 and 3.2.
 
 ### Rule 4. What the hold says
 
 **To an agent**, by `send`, refused with `pair_held` (step 12 of §4.3 there):
 
-> `<k>` messages between `<from>` and `<to>` wait for your user to read them, and sending between them stops at `<n>`. No more are sent between them until your user reads them with cordelia msg log at a terminal, on this device or another. Tell your user.
+> `<k>` messages between `<from>` and `<to>` wait for your user to read them, and sending between them stops at `<n>`. No more are sent between them until your user reads them with cordelia msg log at a terminal, on this device or another, or they expire. Tell your user.
 
-> Messages between `<from>` and `<other>` wait for your user to read them, so `<from>` sends nothing to every agent until your user reads them with cordelia msg log at a terminal, on this device or another. Tell your user.
+For `<k>` of 1: "1 message between `<from>` and `<to>` waits for your user to read it, and sending between them stops at 1. No more are sent between them until your user reads it with cordelia msg log at a terminal, on this device or another, or it expires. Tell your user."
+
+> Messages between `<from>` and `<other>` wait for your user to read them, so `<from>` sends nothing to every agent until your user reads them with cordelia msg log at a terminal, on this device or another, or they expire. Tell your user.
 
 `<n>` is the bound in force (rule 3), and `<k>` the count, which can be above it where a bound was lowered or messages came from another device. The node's refusal carries both, as `bound` and `waiting`. The line does not name `cordelia msg allow`: that is for you, and not for an agent.
 
-**To you**, in `cordelia status`, under `Node:` after `Devices:`, one line for each pair whose bound in force is not the usual hold:
+**To you**, in `cordelia status`, under `Node:` after `Devices:`, one line for each pair whose bound in force is not the usual hold (a listed 10 is the usual hold):
 
 > `  Messages:  <pair>, sending stops at <n> until <when> (you set it on <device>)`
 
@@ -211,25 +227,26 @@ Real processes: rule 2's test, whose last step is 3.2 and 3.4.
 
 **What is stored, and what travels:** nothing more; it is worked out from rules 1 to 3. **Beside the version before:** the command and the node of one version only work together (the record of 2026-10-04, 10.1, rule 6), and a device of the version before says its own line with "Ten".
 
-**Tests.** Units: `msg_cmd.rs`, `the_held_line_names_the_bound_and_the_count` (10 of 10, 12 of 5, and the line for every agent, each word for word); `main.rs`, `the_status_says_each_bound_in_force` (a number, `any`, every agent, this device and a label; nothing for the usual hold or for one that has ended); `messages.rs`, `the_status_object_carries_the_bounds`. Real processes: rule 2's test asserts the refusal's line and the status's line.
+**Tests.** Units: `msg_cmd.rs`, `the_held_line_names_the_bound_and_the_count` (10 of 10, 12 of 5, 1 of 1, and the line for every agent, each word for word); `main.rs`, `the_status_says_each_bound_in_force` (a number, `any`, every agent, this device and a label; nothing for the usual hold, a listed 10, or one that has ended); `messages.rs`, `the_status_object_carries_the_bounds`. Real processes: rule 2's test asserts the refusal's line and the status's line.
 
 ### Rule 5. A terminal is the only sign of a person
 
 **The known limit, as it is:**
 
-> **The only test for a person is that the command's input and output are terminals, and a pseudo-terminal (`script`, `expect`) passes it. So a program that gives `cordelia msg log` or `cordelia msg allow` a pseudo-terminal and types yes ends a hold on every device of yours, and can set any bound. The hold relies on agents keeping to "stop here".**
+> **The only test for a person is that the command's input and output are terminals, and a pseudo-terminal (`script`, `expect`) passes it. Any program that can read the node's token, as every program you run can, calls the node's routes with no terminal at all. So such a program can mark messages read by you, which ends a hold and hides them from `log` on every device of yours, and can set any bound. The hold relies on agents keeping to "stop here".**
 
 - **The same sentence goes into the known limits of R1's gate 12,** and into the threat model's row T22 (`docs/security/threat-model.md`), in place of "a program that ends a hold with a pseudo-terminal and a yes".
-- **Rules 1 and 2 widen what it reaches.** Today such a program ends a hold on the one device it runs on. After them, it ends it on every device, and can lift the hold for up to 7 days. What bounds it does not change: the rates (20 an hour from a folder, 60 from a device), and `log` and `cordelia status`, which show what was done and where.
+- **Rules 1 and 2 widen what it reaches.** Today such a program ends a hold on the one device it runs on, and cannot hide a message from `log` on any. After them, it ends a hold on every device, hides what it marks from `log` on each, and can lift the hold for up to 7 days. What bounds it does not change: the rates (20 an hour from a folder, 60 from a device). What shows it: `log` says on which device you read each message it does not show (rule 1), and `cordelia status` says each bound and where it was set (rule 4). A device that counts, or a holder of its key, can do the same by its list.
 - **Nothing here tries to tell a person from a program:** not timing, not the kind of terminal, not a word typed back. Each is one more thing a program can copy, and you would pay for it.
 
-**What you see:** nothing new. **Stored, travels, beside the version before:** nothing. **Tests:** none new. Every test of a person's act, `log`'s yes and `allow`'s among them, runs at a pseudo-terminal (`AtTerminal`): that they pass is the limit, shown.
+**What you see:** rule 1's `<where>`. **Stored, travels, beside the version before:** nothing. **Tests:** `the_route_sets_a_bound_with_no_terminal` and `the_route_marks_with_no_terminal` (units, `messages.rs`, named in T22): each shows the limit, and fails where it is no longer so, so that the record is changed with the code. Every test of a person's act, `log`'s yes and `allow`'s among them, runs at a pseudo-terminal (`AtTerminal`).
 
 ## 2. The defaults, and why
 
 - **Before you set a bound,** every pair holds at 10, as today. Ten was chosen with the folder's rate (parameter-rationale.md §12.12); nothing has measured against it since.
-- **"For a set time"** is `--for`, from the yes, on the clock of the device it was set on (rule 3.1): 8 hours where you give none, a working day, so that what you allow for a task is gone by the next morning; and at most 7 days, so that a bound you forget ends by itself. With no hold, a loop is bounded by the rates alone: 20 an hour from a folder, 3,360 in 7 days.
-- **When it ends,** the pair is at 10 again, on every device, with nothing said (rule 3.3).
+- **"For a set time"** is `--for`, from the yes (rule 3.3): 8 hours where you give none, a working day, so that what you allow for a task is gone by the next morning; and at most 7 days, so that a bound you forget ends by itself.
+- **What `any` lets through:** only the rates. A loop between two folders sends up to 40 an hour, 6,720 in 7 days. And one folder at 20 an hour goes round its device's ring of 64 in about three hours, so the device's other agents' messages can be overwritten before they are read (§2.5 there). That is why `any` has an end.
+- **When it ends,** the pair is at 10 again, on every device, with nothing said (rule 3.4).
 - **What an agent sees when held** is rule 4's line: the count, the bound, that only its user ends it, and "Tell your user". It is not told how a bound is set.
 - **A bound is per pair, and per person:** one for each pair, the same on every device, set on any of them.
   - **Per pair,** so that you allow the two agents you are watching, and every other pair keeps its guard against a loop.
@@ -237,10 +254,10 @@ Real processes: rule 2's test, whose last step is 3.2 and 3.4.
 
 ## 3. The hard cases
 
-1. **Two devices set different bounds at once.** The one that started last decides, on every device, once both lists have reached it; of two in one second, the lower (rule 3.2). Until then each device holds by what it knows, for a pass or two. The device whose bound lost drops it (rule 3.4). `cordelia status` says which bound holds, and where it was set.
+1. **Two devices set different bounds.** The later act decides, on every device, once both lists have reached it: one set after the other was heard of is later whatever the clocks say (rule 3.1); two that neither had heard of go by their clocks, and in one second the lower decides (rule 3.2). Until a list has reached a device, that device holds by what it knows. A bound stays listed until whatever it overrode has ended (rule 3.5), so a device that was off, or a relay that is behind, brings no older one back. `cordelia status` says which bound holds, and where it was set.
 2. **A bound set while messages are held.** It holds from the next send, and marks nothing read. Raised above the count, the pair sends again. Set at or below it, the pair stays held, and the question says so before the yes (rule 2).
-3. **A removed device's marks.** A person's read and a bound say something only while the key that listed them counts (rules 1 and 3.7). Once a device applies the removal, a message that only a person on the removed device read is unread by a person again, and may hold a pair until you read it on a device that remains. That is the safe side: the removed device may not be yours any more. A removal is a statement, so every bound ends too (rule 3.6). What the removed device writes after goes into the old generation, and reaches only devices that have not applied the removal.
-4. **A recovery.** It is a statement, so every bound ends. The new machine holds no message, no person's read and no bound. A device added again keeps its own reads (rule 1's table 1, with their messages), and counts another key's again once that key is added again. Each writes its first list of the new generation from its own table.
+3. **A removed device's marks.** A person's read and a bound say something only while the key that listed them counts (rules 1 and 3.8), and the removal drops that key's rows in the transaction that applies it. A message that only a person on the removed device read is then unread by a person again, and may hold a pair until you read it on a device that remains. That is the safe side: the removed device may not be yours any more. A removal is a statement, so every bound ends too (rule 3.7). What the removed device writes after goes into the old generation, and reaches only devices that have not applied the removal.
+4. **A recovery.** It is a statement, so every bound ends. The new machine holds no message, no person's read and no bound. A device added again keeps its own reads (rule 1's table 1, with their messages). It dropped the rows of each other key when it applied the recovery's statement, so it counts that key's reads again only from that key's first list in the new generation, its newest 120. What is not in it is unread by a person there, the safe side.
 5. **A person's read arrives for a message this device does not hold yet.** It is kept under the key that listed it, among that key's 120 of messages not held, for 30 days (rule 1). When the message comes, it is read by a person at once: it never counts toward a hold, and `log` never lists it as new. Where it went first (the key listed more than 120 that are not held here, or 30 days passed), the message is unread by a person here: it counts toward the hold, the safe side, and `log` asks about it again.
 
 ## 4. Constants
@@ -251,9 +268,9 @@ Each in `cordelia-core/src/protocol.rs`, with its reason in `docs/specs/paramete
 |---|---|---|
 | `AGENT_MESSAGE_PERSON_PREFIX` | `person/` | The first part of the name of a device's list of what a person read on it (rule 1). With a key it is 77 bytes, the longest name that the channel's value is sized by (`AGENT_MESSAGE_VALUE_BYTES`), so the size does not change; a longer prefix would need a smaller value. No prefix of the channel begins another |
 | `AGENT_MESSAGE_PAIR_BOUNDS_PREFIX` | `hold/` | The first part of the name of a device's list of the bounds a person set on it (rule 2): 75 bytes with a key |
-| `AGENT_MESSAGE_PAIR_BOUNDS_MAX` | 4 (derived) | The bounds at the longest names that fit in one value after the form and the count: (1,936 − 2) / (2 × (2 + 200) + 1 + 1 + 8 + 4) = 4. A person watches few pairs at once |
 | `AGENT_MESSAGE_PAIR_BOUND_SECS` | 28,800 | `--for` where none is given: 8 hours, a working day, so that what is allowed for a task is gone by the next morning |
-| `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS` | 604,800 | The longest `--for`: 7 days, a week away, after which a bound that was forgotten ends by itself. With no hold, a folder's 20 an hour bounds a loop to 3,360 messages in that time |
+| `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS` | 604,800 | The longest `--for`, and the `for` of a 10: 7 days, a week away, after which a bound that was forgotten ends by itself. Under `any`, two folders' 20 an hour bound a loop to 6,720 messages in that time |
+| `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS` | 605,400 (derived) | `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS` and `AGENT_MESSAGE_AHEAD_MAX_SECS`: how long a device lists the latest bound it set for a pair (rule 3.5), so that every bound it overrode has ended first, with a clock's 10 minutes |
 
 **Existing constants with a new use,** whose reasons gain a sentence:
 
@@ -262,9 +279,9 @@ Each in `cordelia-core/src/protocol.rs`, with its reason in `docs/specs/paramete
 - `AGENT_MESSAGE_READ_MARKS_MAX` (120): the IDs in a person's list, and the rows of messages not held kept for each key.
 - `AGENT_MESSAGE_KEPT_DAYS` (30): how long such a row is kept.
 - `AGENT_MESSAGE_SENDS_MAX` (4): the revisions of each list, as for the agents' list.
-- `AGENT_MESSAGE_AHEAD_MAX_SECS` (600): how far ahead of its first holding a bound's `set` may be (rule 3.1).
+- `AGENT_MESSAGE_AHEAD_MAX_SECS` (600): the clock's margin in `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS`.
 
-No label is added: a person's read is an ID, not a hash. `protocol.rs` checks when it is compiled: each new name with a key is at most 77 bytes; no prefix of the channel begins another; a full list of form 3 and of form 4 each fits in `AGENT_MESSAGE_VALUE_BYTES`; and five bounds of form 4 would not.
+No label is added: a person's read is an ID, not a hash. `protocol.rs` checks when it is compiled: each new name with a key is at most 77 bytes; no prefix of the channel begins another; a full list of form 3 fits in `AGENT_MESSAGE_VALUE_BYTES`, and so do four bounds of form 4 at the longest names.
 
 ## 5. Sentences of other records that change
 
@@ -281,30 +298,38 @@ Listed here, and changed when this is built.
 | §1, property 10 | "once ten messages between them ... have not been read by a person there, until a person reads them there with `cordelia msg log` at a terminal and types yes, or until ..." | "once as many messages between them as the pair's bound (decision 2026-10-25, rule 3) ... have not been read by a person on any device that counts, until a person reads them with `cordelia msg log` at a terminal on any such device and types yes, or sets a higher bound, or until ..." |
 | §1, property 14 | "`log` marks as read by a person only the messages it printed, ..." | adds: "and says so to the other devices (decision 2026-10-25, rule 1)" |
 | §1, property 17 | "a device's room there is 64 slots for its messages and one for its read marks" | "... 64 slots for its messages and three for its lists" |
-| §1, property 21 | "and one list of what that signer's agents read ... at most 150,784 bytes of fields for each signer" | adds the rows of rule 1's table 2 and of `message_bounds`, and the figure of section 7 below |
+| §1, property 21 | "and one list of what that signer's agents read ... at most 150,784 bytes of fields for each signer"; "its list of read marks never does" | adds the rows of rule 1's table 2 and of `message_bounds`, the figure of section 7, and "nor do its lists of a person's reads and of bounds" |
+| §2.2 | "The messages channel holds three forms of entry" | "five forms of entry" (forms 3 and 4, decision 2026-10-25) |
 | §2.2, the names | `msg/...` and `read/...` | adds `person/<the device's key>` and `hold/<the device's key>`; "The names are 75 bytes ..." adds `hold/` (75) and `person/` (77) |
 | §2.2, "A reader refuses ... a form it does not know" | forms 0 to 2 | forms 3 and 4 are known, with the checks of rules 1 and 2 |
+| §2.3 | "**So the channel never holds more than 65 entries for each device that has written in it.**" | "67 entries" |
+| §2.5 | "No other entry of K raises H ...: not one in another slot, and least of all its list of read marks" | "... least of all its lists (of read marks, of a person's reads and of bounds)" |
 | §4.1, `log` | "It shows only the messages that no person has read on this device," | "It shows only the messages that no person has read on any device that counts (decision 2026-10-25, rule 1)," |
 | §4.1, `log`'s question, and the lines "You have read the `<N>` others here.", "Not read by a person here.", "You have read `<N>` other messages here, so they are not shown." and "Marked `<N>` messages as read by a person on this device." with their forms | as today | rule 1's words |
 | §4.1, `read`'s header | "`<U>` of them not yet read by a person here." | "`<U>` of them not yet read by a person." |
 | §4.2 | "Five routes"; the row of `/api/v1/messages/log`, "only the messages that no person has read here" | "Six routes", with `/api/v1/messages/allow` (rule 2); "... on any device that counts" |
-| §4.2 | "**It can give `mark`,** and so end a hold (section 6)." | "... and so end a hold on every device; and it can give `allow`, and set any bound (decision 2026-10-25, rule 5)." |
+| §4.2 | "**It can give `mark`,** and so end a hold (section 6)." | "... and so end a hold, and hide what it marks from `log`, on every device; and it can give `allow`, and set any bound (decision 2026-10-25, rule 5)." |
 | §4.3, step 12 | the two `pair_held` lines | rule 4's lines |
-| §6, the row of `AGENT_MESSAGE_PAIR_UNREAD_MAX` | "stop this device sending between them" | "the usual hold: the bound of a pair until a person sets another (decision 2026-10-25)" |
+| §6, the table, `AGENT_MESSAGE_RING` | "With its list, 65 slots of 3,072 bytes: ... 12.2 MiB" | "With its three lists, 67 slots ...: 12.6 MiB" |
+| §6, the table, `AGENT_MESSAGE_PAIR_UNREAD_MAX` | "stop this device sending between them" | "the usual hold: the bound of a pair until a person sets another (decision 2026-10-25)" |
+| §6, after the table | "that 64 devices' 65 slots of 3,072 bytes are within `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`" | "67 slots" |
 | §6, the hold | "... and that no person has read on this device." | "... and that no person has read on any device that counts (decision 2026-10-25, rule 1)." |
 | §6, the hold | "At 10 it refuses, with `pair_held`."; "where any pair that has X on one side is at 10 on this device" | "At the pair's bound (decision 2026-10-25, rule 3) it refuses ..."; "... is at its bound on this device" |
 | §6, the hold | "A person's `cordelia msg log` at a terminal, with yes, marks what it printed read, and the count starts again. A loop ... is stopped on each device where it runs, and each needs a person there to read it." | "... and the count starts again on every device once it hears of it. A loop ... is stopped on each device where it runs, and a person's read on any of them ends it on all." |
 | §6, "It is a guard against agents that keep the rules, ..." | as today | adds rule 5's sentence |
 | §7.2 | "**Three marks, of which one is said to the other devices.**"; "**Read by a person** is a device's own: ... It is never synced." | "Three marks, of which two are said ..."; "**Read by a person:** only `log` at a terminal, with yes, marks it, and only of the messages that it printed. It is said to the other devices in the device's list of a person's reads, and kept there as a union (decision 2026-10-25, rule 1)." |
+| §7.2, what a device that lies in its list can do | "It cannot hide them from `log`, which shows every message that no person has read here, with the devices whose lists say it was read." | "It cannot hide them from `log` by that list. By its list of a person's reads it can: `log` then says on which device you read each one it does not show (decision 2026-10-25, rules 1 and 5)." |
 | §7.2, its last paragraph | "'Announced' and 'read by a person' stay on each device: a person who reads on the laptop has not read what waits on the desktop, and the hold is for the device where a loop runs." | "'Announced' stays on each device. What a person read on the laptop is read on the desktop too (decision 2026-10-25, rule 1)." |
 | §8 | `unread_by_a_person`: "... and no person has read here" | "... and no person has read on any device that counts"; the object gains `bounds` (rule 4) |
-| §9.1 | "The hold and the rates count what the index holds, from either generation, so a statement frees no pair." | adds: "A statement ends every bound (decision 2026-10-25, rule 3.6)." |
-| §9.2 | "The schema's step 19" | adds step 20: `message_person_marks` and `message_bounds`, and each `not_messages` set to 0 |
+| §9.1 | "The hold and the rates count what the index holds, from either generation, so a statement frees no pair." | adds: "A statement ends every bound (decision 2026-10-25, rule 3.7)." |
+| §9.2 | "The schema's step 19"; "There is no first-start step: no row of the version before means anything to messages." | adds step 20: `message_person_marks` and `message_bounds`; and "Step 20 has one: the lists held before it are read once, and each `not_messages` is set to 0 (decision 2026-10-25, rule 1)." |
 | §10 | "for each device, up to 65 slots"; "when a device's list of what its agents read is pushed again: so when its agents read" | "67 slots"; adds: "and when its lists of a person's reads and of bounds are pushed: so when a person reads at a terminal, and sets a bound" |
 | §11 | "It can send between two agents until ten messages between them that have a place are unread by a person on its device" | "... until as many as the pair's bound ... are unread by a person on any device" |
 | §11, D6 | "until a person there reads `log` and types yes" | "until a person reads `log` on any device and types yes" |
-| §11 | "It can give `cordelia msg log` a pseudo-terminal and type yes ..., and so end a hold" | "... and so end a hold on every device, and give `cordelia msg allow` one and set any bound (decision 2026-10-25, rule 5)" |
+| §11 | "It can give `cordelia msg log` a pseudo-terminal and type yes ..., and so end a hold" | "... and so end a hold, and hide what it marks from `log`, on every device, and give `cordelia msg allow` one and set any bound (decision 2026-10-25, rule 5)" |
+| §11, a holder of the device's key | "list in its list of what was read messages that nobody read (7.2)" | adds: "and list in its list of a person's reads messages that no person read, which ends their hold and hides them from `log` on every device but says whose word it is; and list any bound (decision 2026-10-25)" |
 | §12 | "at most 65 entries of 3,072 bytes ... 199,680 bytes (195 KiB) ... At 64 devices, 12,779,520 bytes (12.2 MiB)" | "67 entries ... 205,824 bytes (201 KiB) ... 13,172,736 bytes (12.6 MiB)" |
+| §13 | `a_device_never_has_more_than_sixty_five_slots`: "leave 65 of its entries in the channel" | `..._sixty_seven_slots`, with a person's reads and a bound among what it does: "67" |
 | §13, item 10 | `a_misled_agent_on_one_device_holds_two_other_names_on_another`: "until a person at a terminal on desktop reads `log`" | "... on either device" |
 | §14, item 8 | "announced and read by a person are not said" | "announced is not said; read by a person is (decision 2026-10-25, rule 1)" |
 | §15 | "**The terminal and a yes are the only sign of a person**" | adds rule 5's sentence |
@@ -318,7 +343,7 @@ Listed here, and changed when this is built.
 | The same table | | A row: `bounds`: each bound in force that is not the usual hold, with `a`, `b` (null for every agent), `bound` (null for `any`), `until` and `set_on` (decision 2026-10-25, rule 4) |
 | `cordelia status --json`, `messages` | "It changes no `state`, `level`, `summary` or `holds`, and plain `cordelia status`, `--line` and `--waybar` say nothing of messages." | "It changes no `state`, `level`, `summary` or `holds`. `--line` and `--waybar` say nothing of messages, and plain `cordelia status` says only each bound in force (decision 2026-10-25, rule 4)." |
 
-The threat model's T22 (rule 5) and the table of constants in `CLAUDE.md` change too.
+**Elsewhere.** The threat model's T22: rule 5's sentence; and "and not from `log` or `read`" becomes "and not from `read`; from `log` only by its list of a person's reads, which `log` names". The table of constants in `CLAUDE.md` gains section 4's rows.
 
 ## 6. Set aside, and why
 
@@ -326,16 +351,45 @@ The threat model's T22 (rule 5) and the table of constants in `CLAUDE.md` change
 - **A bound for every pair at once.** Every other pair keeps its guard against a loop.
 - **A bound per device.** Section 2.
 - **Telling a person from a program beyond the terminal.** Rule 5.
+- **Listing again what another device says you read.** `log` names the device and the count (rule 1); a way to show those messages can follow.
 - **A held pair in `cordelia status`, or on its line.** The line is for sync (§8 there). A hold is said to the agent that is held, and `log` shows what waits.
-- **Carrying bounds across a statement.** Rule 3.6.
+- **Carrying bounds across a statement.** Rule 3.7.
+- **A pair as a hash in the list of bounds,** which would fit about 66. A reader would have to find the names to say a bound in `cordelia status`. Names fit 4 at the longest and 24 at names of 30 bytes, and a full list names its pairs (rule 2).
+- **A number for each bound, one above the highest held for its pair** (the review's way). Two acts that had not heard of each other would then go by their numbers, not their times, so an act made later could lose. Rule 3.1's `set` orders by what was heard first and by the clock after.
 - **A person's read in the agents' list,** with a name that no agent has. It would be silent on the version before, but 120 marks would serve two kinds, and the agents' reads would fall out twice as soon.
 - **A person's read as a hash, as an agent's is.** It has no name to bind, and the entry is sealed.
 
 ## 7. What it costs
 
 - **At a relay:** two entries more for each device in each generation, 6,144 bytes as counted. A device has 67 slots, 205,824 bytes (201 KiB); 64 devices 13,172,736 bytes (12.6 MiB), under a channel's 16 MiB.
-- **Pushes:** a list of a person's reads after each yes, and a list of bounds after each `allow` and each change of rule 3.4, each pushed at most once each two seconds (`OUTBOX_FLUSH_INTERVAL_SECS`).
+- **Pushes:** a list of a person's reads after each yes, and a list of bounds after each `allow` and each change of rule 3.5, each pushed at most once each two seconds (`OUTBOX_FLUSH_INTERVAL_SECS`).
 - **What a relay learns:** when a person reads at a terminal and when a bound is set, by when the lists are pushed; and that each device has two slots more. Nothing of what is in them.
-- **On a device:** for each key that counts, a row of 56 bytes for each message held that its list names, at most 120 rows of messages not held (6,720 bytes), and at most 4 bounds (1,816 bytes as fields): property 21's 150,784 bytes for each signer become 159,320, with 56 bytes more for each message held and each key whose list names it. And the schema's step 20, from which going back is by the copy, as from step 19 (§9.2 there).
+- **On a device:** for each key that counts, a row of 56 bytes for each message held that its list names; at most 120 rows of messages not held (6,720 bytes); and its bounds, at most one list's 1,934 bytes and 40 for each bound's key and first holding, 113 at the most (6,454 bytes). Property 21's 150,784 bytes for each signer become 163,958, with 56 bytes more for each message held and each key whose list names it. A list of bounds is listed 7 days and 10 minutes, so a device holds the pairs set in the last week.
+- **The schema's step 20,** and one read of the lists held, at the first start after it. Going back from it is by the copy, as from step 19 (§9.2 there).
 - **On a device of the version before:** a count of entries that were not messages, in `log`, which grows until it takes this version.
-- **The tests** of rules 1 to 4.
+- **The tests** of rules 1 to 5.
+
+## 8. After its review
+
+The first form (commit 2160a7f3, pull request #212) had one independent review: one high, six medium and eleven low findings. The high and every medium were settled; the lows were taken where they were right.
+
+| # | Level | Finding | Settled |
+|---|---|---|---|
+| H1 | high | A 10 could lose to an older bound that it had not heard of; an older bound could come back from a relay that was behind | Settled with M1. `allow` is refused before the first fetch (refusal 5) and with sync off. Every bound a device sets, a 10 among them, is listed for 7 days and 10 minutes after its `set`, or until a later one for its pair is held (rule 3.5, `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS`). A listed 10 is the usual hold in the look and the status. Room: a list holds as many as fit, and a full one names its pairs (rule 2). Both tests added (rule 3) |
+| M1 | medium | The order was by the clock, so a later act could lose; a bound whose start was ahead was unclear | `set` is the clock, or one second after the latest `set` held for that pair: what was heard of first is ordered first, whatever the clocks say; only two acts that neither had heard of go by the clocks, as said (rule 3.1, 3.2). A bound holds from when it is held, and its end alone uses the first holding (rule 3.3). The review's numbers were weighed and set aside (section 6) |
+| M2 | medium | A restored store's own later list of bounds was not said | It replaces the device's own rows, in the door's write; nothing is set before the first fetch (rule 2). Test added |
+| M3 | medium | A device's list of a person's reads hides messages from `log` on every device; the record of 2026-10-09 and T22 say it cannot | Said in rule 5; `log` names on which device you read what it does not show (`<where>`, rule 1); the sentences of §7.2, §11 and T22 listed (section 5). Test added |
+| M4 | medium | The limit named a pseudo-terminal, not the routes, which need none | Rule 5's sentence names the token and the routes; tests `the_route_sets_a_bound_with_no_terminal` and `the_route_marks_with_no_terminal` |
+| M5 | medium | Lists stored by the version before are never read after the upgrade (`take.rs:226-232`) | Read once at the first start after step 20, before the count is set to 0; the notes say that 0 clears a real count too (rule 1). Test added |
+| M6 | medium | `allow X --all any` says only the hourly limits stop sending, but X's other held pairs still stop `--all`; `allow X Y any` does not free X's `--all` | The first is right: the question for `--all` says so (rule 2). The second is not: the words for X and Y speak of sending between X and Y, which they free, and X's `--all` is the pair of X and every agent |
+| L1 | low | First holding stamped again at each list lets a bound run twice its time | Kept for each bound across later lists (rule 3.3); test extended |
+| L2 | low | Form 4's checks: `a` and `b` order, the kind, a kind 2 with a `b`, a bad newer list | Taken, but `a` equal to `b` is a pair (`pairs_with`, `messages.rs:1061` in storage), so only `a` above `b` is refused; a kind 2 has no `b` field to carry, and bytes past its end fail the checks. A bad newer list drops that key's bounds (rule 2) |
+| L3 | low | The `for` of a 10, and `10 --for`, unstated | A 10 carries 604,800; `--for` with 10 is not used, as rule 2 said (rule 3.3) |
+| L4 | low | "1 messages"; "until your user reads them" untrue where they expire; `allow` in the help | The singular, ", or they expire" (rule 4); `allow`'s help line begins "For a person at a terminal:" (rule 2). A lower bound that ends is your act, and is left unsaid |
+| L5 | low | With sync off, or beside the version before, the words are untrue | `allow` is refused with sync off; `log` says that sync is off (rule 1); the help and the notes say what an older device does not hear |
+| L6 | low | Ended bounds take places unseen; "allow its pair 10" frees nothing | The full list's refusal names each pair and when it leaves, and a pair held can be set again in its place (rule 2, rule 3.6) |
+| L7 | low | 64, and 3,360, were overstated or one-sided; `any` overwrites the ring | The reason for 64 is said rightly; 6,720 for two folders; the ring in three hours (rule 2, section 2, section 4) |
+| L8 | low | A key's rows came back or not by when the hourly task ran | Dropped in the statement's transaction (rule 1, hard cases 3 and 4) |
+| L9 | low | Rule 2's real-process test could not pass as written | The pair's count across both devices; each side sends five, under the folder's rate (rule 2) |
+| L10 | low | §5 missed sentences of the record of 2026-10-09 | Added: three forms, 65 entries, H and the lists, 65 slots twice, §7.2's `log`, §11's holder of the key, the test of 65 slots, §9.2's first-start step, T22 |
+| L11 | low | For the build: `set` named twice; one count of lists sent again; `marks::answered`; `pairs_with` needs the keys; the route's own checks | The route's field is `yes`; each list counts apart and `answered` matches its slot (rule 1); `pairs_with` is passed the keys (rule 1); the route checks again, with its test (rule 2) |
