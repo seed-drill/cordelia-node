@@ -650,7 +650,11 @@ impl RelayEntries {
         let _sweep = taking(Kind::Sweep);
         lock(&self.room).forget_old(now);
         let Ok(db) = db.lock() else { return };
-        self.uses_written(&db);
+        // A use that could not be written is in memory alone: a sweep now
+        // could drop a channel in use. It waits for the next hour.
+        if !self.uses_written(&db) {
+            return;
+        }
         match relay::sweep_unused(&db, now) {
             Ok(dropped) => self.dropped(&dropped, "unused"),
             Err(e) => tracing::warn!(error = %e, "could not sweep the channels nobody uses"),
@@ -674,9 +678,10 @@ impl RelayEntries {
         self.uses_written(&db);
     }
 
-    /// [`Self::write_uses`], with the database's lock held. What could not
-    /// be written is kept, for the next time.
-    fn uses_written(&self, db: &TimedGuard<'_, Connection>) {
+    /// [`Self::write_uses`], with the database's lock held: whether every
+    /// use kept was written. What could not be written is kept, for the
+    /// next time.
+    fn uses_written(&self, db: &TimedGuard<'_, Connection>) -> bool {
         let mut uses = db.nested(Nested::Uses, &self.uses);
         let kept = uses.len();
         match relay::write_uses(db, &mut uses) {
@@ -684,8 +689,12 @@ impl RelayEntries {
                 if kept > 0 {
                     tracing::debug!(kept, written, "wrote when channels of entries were used");
                 }
+                true
             }
-            Err(e) => tracing::warn!(error = %e, kept, "could not write when channels were used"),
+            Err(e) => {
+                tracing::warn!(error = %e, kept, "could not write when channels were used");
+                false
+            }
         }
     }
 
@@ -3264,6 +3273,54 @@ mod tests {
         assert_eq!(at.held(2), None);
         assert_eq!(used_at(3), t + 90 * DAY - 10);
         assert_eq!(used_at(1), t + 2 * HOUR + 2);
+    }
+
+    /// A sweep whose uses could not be written drops nothing (the review
+    /// of #217): a use in memory alone may be of a channel in use. Channel
+    /// 1 is proved ten seconds before its 90 days are up, the database
+    /// refuses the uses' write at the sweep, and the channel stays; once writes are
+    /// taken again, the next sweep writes the use first.
+    #[test]
+    fn a_sweep_whose_uses_could_not_be_written_drops_nothing() {
+        let at = relay();
+        let t = NOW;
+        at.hold(&small(1, 1, 5), t);
+        let session = Session {
+            value: [0x52; 32],
+            prover: peer(1).0,
+        };
+        let proof = proof::make(&secret(1), &session.value, &session.prover).unwrap();
+        let answer = at.entries.proving(
+            &at.db,
+            Some(&session),
+            &mut Proved::default(),
+            &ChannelProve {
+                channel: channel(1),
+                proof,
+            },
+            t + 90 * DAY - 10,
+        );
+        assert!(proved_said(answer));
+        // The uses' write (an update) is refused; the sweep's (a delete)
+        // is not.
+        let updates_refused = |on: bool| {
+            let db = at.db.lock().unwrap();
+            let sql = match on {
+                true => {
+                    "CREATE TEMP TRIGGER no_update BEFORE UPDATE ON relay_channels \
+                         BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                }
+                false => "DROP TRIGGER no_update",
+            };
+            db.execute_batch(sql).unwrap();
+        };
+        updates_refused(true);
+        at.entries.sweep_at(&at.db, t + 90 * DAY);
+        updates_refused(false);
+        assert!(at.held(1).is_some(), "a channel in use was dropped");
+        assert_eq!(at.kept(1), Some(t + 90 * DAY - 10));
+        at.entries.sweep_at(&at.db, t + 90 * DAY + HOUR);
+        assert_eq!(at.held(1).unwrap().used_at, t + 90 * DAY - 10);
     }
 
     /// The lock's hold for a proof, from the node's counters (issue #214):
