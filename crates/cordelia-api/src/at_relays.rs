@@ -88,7 +88,6 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::proof;
 use cordelia_crypto::reached::CarriedWord;
 use cordelia_crypto::slots::slot_id;
-use cordelia_crypto::statement::SignedStatement;
 use cordelia_crypto::version;
 use cordelia_storage::at_relays::{self as kept_rows};
 use cordelia_storage::entries;
@@ -130,16 +129,16 @@ pub enum Stands {
 /// device has applied a statement, from what it knows of removals
 /// (decision 2026-10-24 (removal), rule 3): so a device is closed from
 /// the commit that keeps a removed key or a record that hands one the
-/// secret, and not from a later pass (rule 5). The statement is not
-/// checked again here: whoever goes on to read a channel checks what it
-/// reads.
+/// secret, and not from a later pass (rule 5). Whether the change is clear
+/// is worked out once for each write that can change it, and read after
+/// that from one row ([`crate::person::follows_a_clear_change`]). The
+/// statement is not checked again here: whoever goes on to read a channel
+/// checks what it reads.
 pub fn stands(conn: &Connection) -> Result<Stands, PersonError> {
     Ok(match held_rows::person(conn)? {
         None => Stands::NoPhrase,
         Some(person) if person.state == State::Applied => {
-            let statement = SignedStatement::from_bytes(&person.statement)
-                .map_err(|e| PersonError::Held(format!("the applied statement: {e}")))?;
-            match crate::person::is_clear(conn, &statement.statement, true)? {
+            match crate::person::follows_a_clear_change(conn)? {
                 true => Stands::Applied,
                 false => Stands::Closed,
             }

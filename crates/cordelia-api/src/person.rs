@@ -454,12 +454,43 @@ pub(crate) fn counting(
     statement: &Statement,
     kept: &[KeptAddition],
 ) -> Result<Counting, PersonError> {
-    Ok(Counting::of(
-        statement,
-        kept,
-        &held_rows::removed_keys(conn)?,
-    ))
+    Ok(Counting::of(statement, kept, &known_removed(conn)?))
 }
+
+/// Every key this device keeps as removed (decision 2026-10-24 (removal),
+/// rule 2), as the database holds them. The door asks who counts for each
+/// entry, so they are read once for each mark of `person_clear_mark`
+/// (schema step 21), which every write of them makes anew, and kept only
+/// where the mark is the same after the read as before it: as
+/// [`follows_a_clear_change`] keeps what it works out.
+fn known_removed(conn: &Connection) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PersonError> {
+    let mark = held_rows::clear_mark(conn)?;
+    if let Some(mark) = mark {
+        let kept = REMOVED_READ
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, keys)) = kept.as_ref()
+            && *at == mark
+        {
+            return Ok(keys.clone());
+        }
+    }
+    let keys = std::sync::Arc::new(held_rows::removed_keys(conn)?);
+    if let Some(mark) = mark
+        && held_rows::clear_mark(conn)? == Some(mark)
+    {
+        *REMOVED_READ
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mark, keys.clone()));
+    }
+    Ok(keys)
+}
+
+/// The removed keys as this process last read them ([`known_removed`]),
+/// with the mark they were read under.
+#[allow(clippy::type_complexity)]
+static REMOVED_READ: std::sync::Mutex<Option<([u8; 16], std::sync::Arc<Vec<[u8; 32]>>)>> =
+    std::sync::Mutex::new(None);
 
 // ── What a device knows of removals ──────────────────────────────────
 
@@ -500,7 +531,7 @@ pub(crate) fn is_clear(
     if held_rows::holders_past_bound(conn, link.number, &link.hash)? {
         return Ok(false);
     }
-    let removed = Counting::of(statement, &[], &held_rows::removed_keys(conn)?);
+    let removed = Counting::of(statement, &[], &known_removed(conn)?);
     let mut holders: Vec<[u8; 32]> = statement.devices.iter().map(|device| device.key).collect();
     holders.extend(held_rows::holders(conn, link.number, &link.hash)?);
     if followed {
@@ -511,9 +542,53 @@ pub(crate) fn is_clear(
 
 /// Whether the change that this device follows is clear (decision
 /// 2026-10-24 (removal), rules 3 and 4): one that stands applied under a
-/// change that is not is closed. `held` is what it holds.
-pub fn follows_a_clear_change(conn: &Connection, held: &Held) -> Result<bool, PersonError> {
-    is_clear(conn, &held.statement.statement, true)
+/// change that is not is closed. False where it follows no phrase.
+///
+/// It is asked at the door for each entry, for each request on a
+/// connection and as each stream opens, under the node's lock, so it is
+/// worked out once for each mark of `person_clear_mark` (schema step 21),
+/// and not on every read: every write of what it is worked out from makes
+/// a new mark, by a trigger, whichever code writes it. Under a mark it has
+/// worked out, it reads the mark alone. It is worked out from the row of
+/// the person as the database holds it, and kept only where the mark is
+/// the same after as before: so no write, kept or undone, leaves a "clear"
+/// to be read under a mark that it is not true of. It fails closed.
+pub fn follows_a_clear_change(conn: &Connection) -> Result<bool, PersonError> {
+    let mark = held_rows::clear_mark(conn)?;
+    if let Some(mark) = mark
+        && let Some(clear) = clear_worked_out(&mark)
+    {
+        return Ok(clear);
+    }
+    let clear = match held(conn)? {
+        Some(held) => is_clear(conn, &held.statement.statement, true)?,
+        None => false,
+    };
+    if let Some(mark) = mark
+        && held_rows::clear_mark(conn)? == Some(mark)
+    {
+        *CLEAR_WORKED_OUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mark, clear));
+    }
+    Ok(clear)
+}
+
+/// Whether the change followed is clear, as this process last worked it
+/// out ([`follows_a_clear_change`]), with the mark it was worked out
+/// under. A mark is 16 random bytes, made anew by every write: one is
+/// never the mark of two databases, or of two states of one.
+static CLEAR_WORKED_OUT: std::sync::Mutex<Option<([u8; 16], bool)>> = std::sync::Mutex::new(None);
+
+/// What was worked out under `mark`, where the last worked out was.
+fn clear_worked_out(mark: &[u8; 16]) -> Option<bool> {
+    match *CLEAR_WORKED_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some((kept, clear)) if kept == *mark => Some(clear),
+        _ => None,
+    }
 }
 
 /// The key that a chain names by `signer`, its first 16 bytes (decision
@@ -7096,7 +7171,7 @@ mod tests {
     /// Whether the change this device follows is clear, as every rule
     /// asks it.
     fn clear(conn: &Connection) -> bool {
-        follows_a_clear_change(conn, &held(conn).unwrap().unwrap()).unwrap()
+        follows_a_clear_change(conn).unwrap()
     }
 
     fn removed(conn: &Connection) -> Vec<[u8; 32]> {
@@ -7127,6 +7202,58 @@ mod tests {
         );
         // The row of the person is as it was: closed is worked out.
         assert_eq!(state(&conn), State::Applied);
+    }
+
+    /// Whether the change followed is clear is worked out once for each
+    /// mark, and no "clear" is read after a removal is known: not after a
+    /// key is kept, not after a write that made the change clear is undone,
+    /// and not from another database read in turn (schema step 21).
+    #[test]
+    fn test_no_clear_worked_out_before_a_removal_is_read_after_it() {
+        let conn = under_three();
+        let closed =
+            || crate::at_relays::stands(&conn).unwrap() == crate::at_relays::Stands::Closed;
+        assert!(clear(&conn) && !closed());
+        let mark = held_rows::clear_mark(&conn).unwrap();
+        // Read again under the same mark, it is what was worked out.
+        assert!(clear(&conn));
+        assert_eq!(held_rows::clear_mark(&conn).unwrap(), mark);
+
+        held_rows::keep_removed(&conn, &[key(1)], NOW).unwrap();
+        assert_ne!(held_rows::clear_mark(&conn).unwrap(), mark);
+        assert!(!clear(&conn) && closed());
+
+        // A write that makes it clear, read and then undone: not clear.
+        conn.execute_batch("SAVEPOINT undone").unwrap();
+        conn.execute("DELETE FROM person_removed_keys", []).unwrap();
+        assert!(clear(&conn) && !closed());
+        conn.execute_batch("ROLLBACK TO undone; RELEASE undone")
+            .unwrap();
+        assert!(!clear(&conn) && closed());
+
+        // Another database, clear, read in turn with this one.
+        let other = under_three();
+        for _ in 0..3 {
+            assert!(clear(&other));
+            assert!(!clear(&conn) && closed());
+        }
+        // A record that hands a removed key the secret, through the door's
+        // own function: not clear from its commit.
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        assert!(clear(&other));
+        see_addition(&other, &added(&three, 1, 2), NOW).unwrap();
+        assert!(!clear(&other));
+        // The mark past the bound of removed keys, set alone.
+        let third = under_three();
+        assert!(clear(&third));
+        cordelia_storage::meta::set(
+            &third,
+            cordelia_storage::meta::PERSON_REMOVED_PAST_BOUND,
+            "1",
+        )
+        .unwrap();
+        assert!(!clear(&third));
     }
 
     /// A record under the change followed that adds a removed key makes
@@ -7472,5 +7599,96 @@ mod tests {
         let conn = under_three();
         let begun = crate::leaving::begin(&conn, &device(0), NOW).unwrap();
         assert!(begun.word.is_some());
+    }
+
+    /// The hold of the node's lock on the hot paths that ask whether the
+    /// change followed is clear (decision 2026-10-24 (removal), rule 5): a
+    /// read of where the device stands, as `Leave::has` and `keeps` ask it,
+    /// and the door, for each entry of a page of 100. Under a statement of
+    /// 64 devices with long labels and 200 removed keys, with 200 more kept
+    /// as removed. Measured by the lock's own counters (decision 2026-10-22
+    /// §1.1), and printed. Run alone, in release:
+    /// `cargo test --release -p cordelia-api --lib measure_the_hold -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_the_hold_of_the_paths_that_ask_whether_a_change_is_clear() {
+        use cordelia_core::load::{HistogramRead, Kind};
+        use cordelia_core::lock::{TimedLock, taking};
+        let phrase = phrase();
+        let [_, _, three, _] = statements(&phrase);
+        let mut devices = listed(&[0, 1]);
+        for n in 10..72u16 {
+            let label = format!("{:-<60}", format!("device {n}"));
+            devices.push(Device::new(key(n), &label).unwrap());
+        }
+        let removed: Vec<[u8; 32]> = (100..300u16).map(key).collect();
+        let big = three.next(key(0), &secret(9), devices, &removed).unwrap();
+        let conn = db::open_in_memory().unwrap();
+        follow(&conn, 0, &phrase, &big, secret(9));
+        hold_name(&conn, "team", NOW).unwrap();
+        let more: Vec<[u8; 32]> = (300..500u16).map(key).collect();
+        held_rows::keep_removed(&conn, &more, NOW).unwrap();
+        assert_eq!(
+            crate::at_relays::stands(&conn).unwrap(),
+            crate::at_relays::Stands::Applied
+        );
+        let page: Vec<CheckedEntry> = (0..100u64)
+            .map(|n| {
+                Entry::seal(
+                    &own(9, "team"),
+                    &device(1),
+                    at(4, 10 + n),
+                    &Inside {
+                        name: format!("f{n}.md"),
+                        value: text("a line"),
+                        chain: Some(Vec::new()),
+                    },
+                )
+                .unwrap()
+                .check()
+                .unwrap()
+            })
+            .collect();
+        let db = TimedLock::new(conn);
+        let said = |what: &str, read: HistogramRead| {
+            let mut sum = 0;
+            let median = read
+                .buckets
+                .iter()
+                .position(|n| {
+                    sum += n;
+                    sum * 2 >= read.count
+                })
+                .unwrap();
+            println!(
+                "{what}: {} takes, mean {:.1} us, median at most {} us, longest {} us",
+                read.count,
+                read.sum_nanos as f64 / read.count as f64 / 1000.0,
+                1u64 << median,
+                read.max_micros
+            );
+        };
+        for _ in 0..1000 {
+            let _kind = taking(Kind::Pass);
+            let guard = db.lock().unwrap();
+            crate::at_relays::stands(&guard).unwrap();
+        }
+        said("stands", db.times().hold(Kind::Pass));
+        for entry in &page {
+            let _kind = taking(Kind::Cycle);
+            let guard = db.lock().unwrap();
+            let taken = crate::take::take(&guard, &device(0), entry, NOW).unwrap();
+            assert!(
+                matches!(
+                    taken,
+                    crate::take::Taken::Own {
+                        stored: Outcome::Stored,
+                        ..
+                    }
+                ),
+                "{taken:?}"
+            );
+        }
+        said("the door, a page of 100", db.times().hold(Kind::Cycle));
     }
 }

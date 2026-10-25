@@ -622,8 +622,7 @@ fn of_its_person(
     let reader = Reader::of(conn, statement, &kept)?;
     // A device that stands applied under a change that is not clear is
     // closed (decision 2026-10-24 (removal), rules 3 and 10).
-    let closed =
-        held.state == State::Applied && !crate::person::follows_a_clear_change(conn, held)?;
+    let closed = held.state == State::Applied && !crate::person::follows_a_clear_change(conn)?;
 
     look.state = match held.state {
         State::Applied if closed => "closed",

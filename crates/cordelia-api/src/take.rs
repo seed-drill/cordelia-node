@@ -262,7 +262,7 @@ fn taken_as_its_own(
     // 2026-10-24 (removal), rules 5 and 10): from the commit that kept the
     // record or the key that made its change not clear, the next entry is
     // refused here.
-    if taker == Taker::Device && !crate::person::follows_a_clear_change(conn, &held)? {
+    if taker == Taker::Device && !crate::person::follows_a_clear_change(conn)? {
         return Ok(Some(Taken::Refused(NotTaken::Closed)));
     }
     // Who counts reads every key the device knows to be removed, on any

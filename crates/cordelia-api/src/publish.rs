@@ -432,7 +432,7 @@ impl Standing {
         if standing.held.state != State::Applied {
             return Err(PersonError::Stopped(standing.held.state));
         }
-        if !crate::person::follows_a_clear_change(conn, &standing.held)? {
+        if !crate::person::follows_a_clear_change(conn)? {
             return Err(PersonError::NotClear);
         }
         Ok(standing)
