@@ -1478,6 +1478,62 @@ impl DeviceEntries {
         }
     }
 
+    /// Write the device's list of what a person read on it, where its table
+    /// holds an ID that the list lacks (decision 2026-10-25, rule 1;
+    /// [`cordelia_api::marks::write_person_list`]): only once the messages
+    /// channel was fetched since the node started. Says whether it wrote
+    /// one.
+    fn write_person_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        match marks::write_person_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of what a person read here");
+                false
+            }
+        }
+    }
+
+    /// Write the device's list of the bounds a person set on it, where what
+    /// it lists changed (decision 2026-10-25, rules 2 and 3.5;
+    /// [`cordelia_api::bounds::write_bounds_list`]): a bound that left the
+    /// list 7 days and 10 minutes after it was set, or that another
+    /// device's later bound overrode, goes. Only once the messages channel
+    /// was fetched since the node started. Says whether it wrote one.
+    fn write_bounds_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        let written = cordelia_api::bounds::write_bounds_list(
+            &db,
+            identity,
+            self.unix(),
+            fetched.unwrap_or(false),
+        );
+        match written {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of bounds set here");
+                false
+            }
+        }
+    }
+
+    /// Read once the lists of a person's reads and of bounds that the store
+    /// held from before step 20 (decision 2026-10-25, rule 1;
+    /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
+    /// which the device stands applied, where the start did not.
+    fn read_held_lists(&self) {
+        let db = lock(&self.state.db);
+        match cordelia_api::reader::read_held_lists(&db, &self.state.identity, self.unix()) {
+            Ok(true) => tracing::info!("read the lists of messages held from before this version"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
+        }
+    }
+
     /// Drop each message of the device's own that every relay it is set up
     /// with has taken (decision 2026-10-09 §2.3). Which relays those are
     /// is known by their keys only while every one is connected
@@ -2141,8 +2197,20 @@ impl DeviceEntries {
             // the device's list of what its agents read, where its table
             // holds a mark the list lacks: a mark made before the first
             // fetch, the first list of a generation, or the list after the
-            // device's own later one that the pull handed back (§2.4).
-            if messages && (self.write_again() | self.write_list()) {
+            // device's own later one that the pull handed back (§2.4). And
+            // its lists of what a person read on it and of the bounds a
+            // person set on it, by the same rules, the lists the store held
+            // from before step 20 having been read first (decision
+            // 2026-10-25, rules 1 and 2).
+            if messages {
+                self.read_held_lists();
+            }
+            if messages
+                && (self.write_again()
+                    | self.write_list()
+                    | self.write_person_list()
+                    | self.write_bounds_list())
+            {
                 sent = match self.push(&at, channel, Which::Since).await {
                     Step::Done(sent) => sent,
                     Step::Stop => return self.stopped(&at, stopped),

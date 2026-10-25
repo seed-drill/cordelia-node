@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -896,6 +896,60 @@ CREATE TABLE message_kept_taken (
 );
 "#;
 
+/// Migration v20: what a device keeps of a person's hold on messages
+/// (decision 2026-10-25, rules 1 to 3), beside the tables of step 19.
+///
+/// - `message_person_marks`: what other devices said a person read. For
+///   each key, the IDs that its lists of a person's reads held, each with
+///   when it was taken here (`taken_at`, the device's clock). **It is a
+///   union:** a later list that leaves an ID out takes nothing away. A
+///   row whose message the device holds goes with that message's row
+///   ([`crate::messages::drop_row`]); of the rest a device keeps at most
+///   120 for each key, the latest taken first, each for 30 days from when
+///   it was taken. Its own key's rows are those of its own later list,
+///   handed back to a store restored from a backup, whose messages it did
+///   not hold. The rows of a key that a statement does not count go in the
+///   transaction that applies it. A person's read here stays a row of
+///   `message_read_by_a_person`, whose rowid is its order.
+/// - `message_bounds`: for each key, this device's own among them, each
+///   bound its latest list holds (rule 2): the pair, `a` and the other
+///   side (`b_kind` 1, a name in `b`; or 2, every agent, and `b` empty);
+///   the bound, 1 to 64, or NULL for any; `set_order` and `at_clock`, the
+///   unsigned `set` and `at` of rule 3.1 as 8 bytes big-endian; `for_secs`;
+///   `first_held`, when this device first held it, kept for the bound (its
+///   key, pair and `set`) across that key's later lists (rule 3.3); and
+///   `start`, the start of the node in which this device set it, for its
+///   own rows alone. A statement drops every row (rule 3.7).
+///
+/// A relay keeps nothing in either.
+const MIGRATION_V20: &str = r#"
+CREATE TABLE message_person_marks (
+    key       BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    id        BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    taken_at  INTEGER NOT NULL CHECK(typeof(taken_at) = 'integer'),
+    PRIMARY KEY (key, id)
+);
+
+CREATE INDEX idx_message_person_marks_id ON message_person_marks(id);
+
+CREATE TABLE message_bounds (
+    key         BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    a           TEXT NOT NULL CHECK(typeof(a) = 'text' AND length(a) >= 1),
+    b_kind      INTEGER NOT NULL CHECK(b_kind IN (1, 2)),
+    b           TEXT NOT NULL CHECK(typeof(b) = 'text'),
+    bound       INTEGER CHECK(bound IS NULL
+                              OR (typeof(bound) = 'integer' AND bound >= 1 AND bound <= 64)),
+    set_order   BLOB NOT NULL CHECK(typeof(set_order) = 'blob' AND length(set_order) = 8),
+    at_clock    BLOB NOT NULL CHECK(typeof(at_clock) = 'blob' AND length(at_clock) = 8),
+    for_secs    INTEGER NOT NULL CHECK(typeof(for_secs) = 'integer'
+                                       AND for_secs >= 60 AND for_secs <= 604800),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    start       INTEGER CHECK(start IS NULL OR typeof(start) = 'integer'),
+    CHECK((b_kind = 1) = (length(b) >= 1)),
+    PRIMARY KEY (key, a, b_kind, b)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1106,6 +1160,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 19 {
         tracing::info!("applying migration v19 (messages between the person's own agents)");
         migrate_in_one(conn, MIGRATION_V19, 19)?;
+    }
+
+    if current < 20 {
+        tracing::info!("applying migration v20 (a person's hold on messages)");
+        migrate_in_one(conn, MIGRATION_V20, 20)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -3036,18 +3095,335 @@ mod tests {
         "message_signers",
     ];
 
-    /// What a database holds of the step to version 19, by name.
+    /// What a database holds of the step to version 19, by name: of the
+    /// names of messages, those that the step to version 20 does not add.
     fn new_in_v19(conn: &Connection) -> Vec<String> {
-        conn.prepare(
-            "SELECT name FROM sqlite_master
-             WHERE name LIKE '%message%' AND name NOT LIKE 'sqlite_autoindex%'
-             ORDER BY name",
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name LIKE '%message%' AND name NOT LIKE 'sqlite_autoindex%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|name| !NEW_IN_V20.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// What the step to version 20 adds: two tables, and an index.
+    const NEW_IN_V20: [&str; 3] = [
+        "idx_message_person_marks_id",
+        "message_bounds",
+        "message_person_marks",
+    ];
+
+    /// What a database holds of the step to version 20, by name.
+    fn new_in_v20(conn: &Connection) -> Vec<String> {
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|name| NEW_IN_V20.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// A database at version 19, as the version before leaves one, with
+    /// what [`at_v18`] holds and a message, a person's read of it, and a
+    /// list of what an agent read.
+    fn at_v19() -> Connection {
+        let conn = at_v18();
+        migrate_in_one(&conn, MIGRATION_V19, 19).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_generations (id, channel, statement, first_held)
+                 VALUES (1, zeroblob(32), 1, 8);
+             INSERT INTO message_index (id, signer, label, generation, to_kind, to_name,
+                                        from_name, sent, subject, thread, answers, asks,
+                                        link, body, first_held, placed_at)
+                 VALUES (X'01010101010101010101010101010101', zeroblob(32), 'laptop', 1, 1,
+                         'notes', '~', 9, 'a', zeroblob(16), zeroblob(16), 0, NULL, 'a', 9, 10);
+             INSERT INTO message_read_by_a_person (id)
+                 VALUES (X'01010101010101010101010101010101');
+             INSERT INTO message_signers (signer, generation, highest, not_messages)
+                 VALUES (zeroblob(32), 1, 1, 2);
+             INSERT INTO message_lists (key, mark) VALUES (zeroblob(32), zeroblob(16));",
         )
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
+        .unwrap();
+        conn
+    }
+
+    /// Everything a database holds: each definition, and each row of each
+    /// table, in the order of their names, but what the step to version 20
+    /// adds.
+    fn everything_but_v20(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V20.contains(&name.as_str())
+                || NEW_IN_V20
+                    .iter()
+                    .any(|new| name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 20 adds the tables of a person's hold, empty,
+    /// and changes no older row or definition (decision 2026-10-25, rule 1,
+    /// section 7): it is made in one step with its version, so a failure
+    /// between them leaves none of it, and the step asked for twice is run
+    /// once. What the tables keep stays across a start, and each takes no
+    /// row that cannot be what a device keeps.
+    #[test]
+    fn step_20_adds_its_tables_and_changes_no_older_row() {
+        let conn = at_v19();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v20(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 19);
+        assert!(new_in_v20(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V20} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 20).is_err());
+        assert_eq!(version(&conn), 19);
+        assert!(
+            new_in_v20(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 20);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v20(&conn), NEW_IN_V20);
+        assert_eq!(everything_but_v20(&conn), before);
+        assert!(
+            definition_of(&conn, "idx_message_person_marks_id")
+                .contains("message_person_marks(id)")
+        );
+
+        let set = "X'0000000000000001'";
+        let kept_rows = format!(
+            "INSERT INTO message_person_marks (key, id, taken_at)
+                 VALUES (zeroblob(32), zeroblob(16), 9);
+             INSERT INTO message_bounds (key, a, b_kind, b, bound, set_order, at_clock,
+                                         for_secs, first_held, start)
+                 VALUES (zeroblob(32), 'notes', 1, 'work', 20, {set}, {set}, 3600, 9, 1),
+                        (zeroblob(32), 'notes', 2, '', NULL, {set}, {set}, 60, 9, NULL);"
+        );
+        conn.execute_batch(&kept_rows).unwrap();
+        let counted = |conn: &Connection| -> Vec<i64> {
+            ["message_person_marks", "message_bounds"]
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [1, 2]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, vec![1, 2])
+        );
+        assert_eq!(everything_but_v20(&conn), before);
+
+        // A row that cannot be what a device keeps is refused, and the same
+        // row with a value of its type and bound is taken.
+        let bound = |change: (usize, &str)| {
+            let mut values = [
+                "X'0202020202020202020202020202020202020202020202020202020202020202'",
+                "'plans'",
+                "1",
+                "'work'",
+                "20",
+                set,
+                set,
+                "3600",
+                "9",
+                "NULL",
+            ];
+            values[change.0] = change.1;
+            format!(
+                "INSERT INTO message_bounds (key, a, b_kind, b, bound, set_order, at_clock,
+                                             for_secs, first_held, start)
+                 VALUES ({})",
+                values.join(", ")
+            )
+        };
+        let mark = |key: &str, id: &str, at: &str| {
+            format!(
+                "INSERT INTO message_person_marks (key, id, taken_at) VALUES ({key}, {id}, {at})"
+            )
+        };
+        let cases: Vec<(String, String, &str)> = vec![
+            (
+                mark("zeroblob(31)", "X'03030303030303030303030303030303'", "9"),
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "X'03030303030303030303030303030303'",
+                    "9",
+                ),
+                "DELETE FROM message_person_marks WHERE taken_at = 9 AND key <> zeroblob(32)",
+            ),
+            (
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "zeroblob(17)",
+                    "9",
+                ),
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "X'03030303030303030303030303030303'",
+                    "9",
+                ),
+                "DELETE FROM message_person_marks WHERE key <> zeroblob(32)",
+            ),
+            (
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "'aaaaaaaaaaaaaaaa'",
+                    "9",
+                ),
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "X'03030303030303030303030303030303'",
+                    "9",
+                ),
+                "DELETE FROM message_person_marks WHERE key <> zeroblob(32)",
+            ),
+            (
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "X'03030303030303030303030303030303'",
+                    "9.5",
+                ),
+                mark(
+                    "X'0303030303030303030303030303030303030303030303030303030303030303'",
+                    "X'03030303030303030303030303030303'",
+                    "9",
+                ),
+                "DELETE FROM message_person_marks WHERE key <> zeroblob(32)",
+            ),
+            (
+                bound((0, "zeroblob(31)")),
+                bound((
+                    0,
+                    "X'0202020202020202020202020202020202020202020202020202020202020202'",
+                )),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((1, "''")),
+                bound((1, "'plans'")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((2, "3")),
+                bound((2, "1")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((3, "''")),
+                bound((3, "'work'")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((4, "0")),
+                bound((4, "64")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((4, "65")),
+                bound((4, "1")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((4, "1.5")),
+                bound((4, "NULL")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((5, "X'00'")),
+                bound((5, set)),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((6, "7")),
+                bound((6, set)),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((7, "59")),
+                bound((7, "60")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((7, "604801")),
+                bound((7, "604800")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((8, "'then'")),
+                bound((8, "10")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+            (
+                bound((9, "1.5")),
+                bound((9, "2")),
+                "DELETE FROM message_bounds WHERE a = 'plans'",
+            ),
+        ];
+        for (refused, taken, undo) in cases {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+            conn.execute_batch(undo).unwrap();
+        }
+        // Of every agent, the other side is empty: a name there is refused.
+        assert!(
+            conn.execute(&bound((2, "2")), []).is_err(),
+            "every agent with a name"
+        );
+        assert_eq!(counted(&conn), [1, 2]);
     }
 
     /// Everything a database holds: each definition, and each row of
@@ -3109,9 +3485,9 @@ mod tests {
             "the tables go with the version"
         );
 
-        // The next start runs the step from the beginning.
+        // The next start runs the step from the beginning, and the steps
+        // after it.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 19);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v19(&conn), NEW_IN_V19);
         assert_eq!(everything_but_v19(&conn), before);
@@ -4104,33 +4480,34 @@ mod tests {
         assert_eq!(held_after_the_steps("personal.db", true), 1);
     }
 
-    /// The version before, whose schema is at step 18, stops on a
-    /// database that was stepped to 19 (decision 2026-10-09 §9.2), as
-    /// every version stops on one from a later version: it is refused
-    /// with both versions, and nothing of it is changed. A database at
-    /// step 18 it opens.
+    /// The version before, whose schema is at step 19, stops on a
+    /// database that was stepped to 20 (decision 2026-10-09 §9.2, decision
+    /// 2026-10-25, section 7), as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed. A database at step 19 it opens. Going back from step 20 is
+    /// by the copy, as from step 19.
     #[test]
-    fn the_version_before_stops_on_a_database_of_step_19() {
+    fn the_version_before_stops_on_a_database_of_step_20() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cordelia.db");
         drop(crate::db::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
 
         let conn = Connection::open(&path).unwrap();
-        let refused = refuse_a_later_version(&conn, 18);
+        let refused = refuse_a_later_version(&conn, 19);
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 19, own: 18 })
+                Err(StorageError::LaterVersion { found: 20, own: 19 })
             ),
             "{refused:?}"
         );
         drop(conn);
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        let at_18 = at_v18();
-        assert!(refuse_a_later_version(&at_18, 18).is_ok());
-        assert!(refuse_a_later_version(&at_18, 17).is_err());
+        let at_19 = at_v19();
+        assert!(refuse_a_later_version(&at_19, 19).is_ok());
+        assert!(refuse_a_later_version(&at_19, 18).is_err());
     }
 
     /// A database that is stepped from any version has what every later
@@ -4153,7 +4530,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 11] = [
+        let from: [(u32, Connection); 12] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -4165,6 +4542,7 @@ mod tests {
             (16, at_v16()),
             (17, at_v17()),
             (18, at_v18()),
+            (19, at_v19()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -4187,6 +4565,7 @@ mod tests {
             assert_eq!(new_in_v17(&conn), NEW_IN_V17, "from version {at}");
             assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
             assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
+            assert_eq!(new_in_v20(&conn), NEW_IN_V20, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }

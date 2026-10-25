@@ -297,6 +297,12 @@ impl Several {
         self[n].key()
     }
 
+    /// The keys that count on device `n`, as the store's SQL is passed
+    /// them (decision 2026-10-25, rule 1.3).
+    pub(crate) fn keys_counting(&self, n: usize) -> Vec<[u8; 32]> {
+        who_counts(&self[n].conn).unwrap().keys()
+    }
+
     /// The devices numbered so, as a statement lists them.
     pub(crate) fn listed(&self, numbers: &[usize]) -> Vec<Device> {
         numbers.iter().map(|n| self[*n].listed()).collect()

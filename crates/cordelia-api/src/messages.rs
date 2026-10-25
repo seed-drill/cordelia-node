@@ -25,10 +25,16 @@
 //!   lookup of the message a reply answers ([`answering`]), which it calls
 //!   at step 9.
 //! - **`log`** ([`log_of`]) gives places, lists the messages of the
-//!   folder's agent, or of every name, that no person has read here, and
-//!   counts those a person has, with what is counted of each signer and of
-//!   the device's own messages, and marks read by a person what the
-//!   command printed, after a yes: the one act that ends a hold (§6, §7.2).
+//!   folder's agent, or of every name, that no person has read on any
+//!   device that counts (decision 2026-10-25, rule 1), and counts those a
+//!   person has, by where they were read, with what is counted of each
+//!   signer and of the device's own messages, and marks read by a person
+//!   what the command printed, after a yes, writing the device's list of a
+//!   person's reads in the same write: the act that ends a hold, on every
+//!   device (§6, §7.2).
+//! - **`allow`** ([`allow_of`], decision 2026-10-25, rule 2) answers the
+//!   look of a pair, and sets a bound for it after a yes: the other act of
+//!   a person at a terminal.
 //!
 //! **Text that another device chose** is cleaned by one function
 //! ([`cleaned`]): the set of §4.1, seven Unicode general categories and
@@ -483,6 +489,7 @@ pub async fn summary(
     let Some(db) = db_by(&state, deadline).await else {
         return Ok(nothing());
     };
+    lists_read(&db, &state);
     let now = state.sync_control.now();
     match summary_of(&db, &state.identity, &state.own_channels, &body.folder, now) {
         Ok(Some(summary)) => Ok(HttpResponse::Ok().json(summary.answered())),
@@ -575,7 +582,8 @@ pub struct Readout {
     /// is printed.
     pub its_own: bool,
     /// The messages between the two sides of its pair that are shown
-    /// here, and how many of them no person has read here.
+    /// here, and how many of them no person has read on any device that
+    /// counts.
     pub pair_count: usize,
     pub pair_unread_by_a_person: usize,
     /// The labels of the devices whose lists say that an agent of this
@@ -657,15 +665,18 @@ fn read_in(
 
     let pair = pair_of(&message);
     let shown = kept(held::shown(conn, now))?;
+    let standing = Standing::of(conn)?;
+    // Read by a person on any device that counts (decision 2026-10-25,
+    // rule 1.3).
+    let person = marks::person_read_now(conn, &standing.counting)?;
     let mut pair_count = 0;
     let mut pair_unread_by_a_person = 0;
     for other in shown.iter().filter(|other| pair_of(other) == pair) {
         pair_count += 1;
-        if !kept(held::is_read_by_a_person(conn, &id_of(&other.id)?))? {
+        if !person.is_read(&id_of(&other.id)?) {
             pair_unread_by_a_person += 1;
         }
     }
-    let standing = Standing::of(conn)?;
     let statement = &standing.held.statement.statement;
     let mut read_on = Vec::new();
     // A device keeps no list of its own beside its table: every key here
@@ -756,6 +767,7 @@ pub async fn read(
     let now = state.sync_control.now();
     let done = {
         let db = db_of(&state);
+        lists_read(&db, &state);
         let fetched = sender::fetched(&db, &state.own_channels, Instant::now()).map_err(refused)?;
         read_of(&db, &state.identity, &body.folder, &body.id, now, fetched)
             .map(|(readout, list)| (readout, list, ()))
@@ -1012,6 +1024,7 @@ pub async fn send(
     asked(&req, &state)?;
     let done = {
         let db = db_of(&state);
+        lists_read(&db, &state);
         let at = SendAt {
             now: state.sync_control.now(),
             fetched: sender::fetched(&db, &state.own_channels, Instant::now()).map_err(refused)?,
@@ -1053,8 +1066,12 @@ pub struct Counts {
     /// message to every name once for each folder.
     pub unread_by_an_agent: u64,
     /// The messages to a name mapped here or to every name, not sent
-    /// here, that no person has read here.
+    /// here, that no person has read on any device that counts (decision
+    /// 2026-10-25, rule 1).
     pub unread_by_a_person: u64,
+    /// Each bound in force that is not the usual hold (decision
+    /// 2026-10-25, rule 4).
+    pub bounds: Vec<BoundSaid>,
     /// This device's messages that wait to be sent.
     pub waiting: u64,
     /// Of those, the ones a relay refused for room.
@@ -1105,6 +1122,7 @@ pub fn status_of(
         // messages and with the names, and not with the two multiplied by
         // a read of the store.
         let read = marks::read_now(conn, &counting)?;
+        let person = marks::person_read_now(conn, &counting)?;
         let mut unread_by_an_agent = 0;
         let mut unread_by_a_person = 0;
         for message in kept(held::shown(conn, now))? {
@@ -1120,19 +1138,18 @@ pub fn status_of(
                 .to
                 .as_ref()
                 .is_none_or(|to| names.iter().any(|name| name == to));
-            if to_here
-                && message.signer[..] != own[..]
-                && !kept(held::is_read_by_a_person(conn, &id))?
-            {
+            if to_here && message.signer[..] != own[..] && !person.is_read(&id) {
                 unread_by_a_person += 1;
             }
         }
         let room = room_of(conn, &own, now, |channel| {
             own_channels.no_room_for_messages(channel)
         })?;
+        let bounds = bounds_said(conn, &own, &counting, now)?;
         Ok(Some(Counts {
             unread_by_an_agent,
             unread_by_a_person,
+            bounds,
             waiting: match kept(held::generation_of(conn, &channel))? {
                 Some(generation) => kept(held::kept_count(conn, generation, now))?,
                 None => 0,
@@ -1153,9 +1170,11 @@ impl Counts {
             .filled_by
             .as_ref()
             .map(|(label, entries)| json!({ "label": label, "entries": entries }));
+        let bounds: Vec<Value> = self.bounds.iter().map(BoundSaid::answered).collect();
         json!({
             "unread_by_an_agent": self.unread_by_an_agent,
             "unread_by_a_person": self.unread_by_a_person,
+            "bounds": bounds,
             "waiting": self.waiting,
             "refused_for_room": self.refused_for_room,
             "filled_by": filled_by,
@@ -1164,6 +1183,86 @@ impl Counts {
             "no_place": self.no_place,
         })
     }
+}
+
+/// A bound in force that is not the usual hold, as the status says it
+/// (decision 2026-10-25, rule 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundSaid {
+    pub pair: crate::bounds::Pair,
+    /// 1 to 64, or `None` for any.
+    pub bound: Option<u8>,
+    /// When it ends, by the node's clock.
+    pub until: i64,
+    /// The label and the fingerprint's words of the device it was set on,
+    /// or `None` where it is this device.
+    pub set_on: Option<(String, String)>,
+}
+
+impl BoundSaid {
+    /// As the status answers it: `a`, `b` (null for every agent), `bound`
+    /// (null for any), `until` in RFC 3339, and `set_on`.
+    pub fn answered(&self) -> Value {
+        json!({
+            "a": self.pair.a,
+            "b": self.pair.b,
+            "bound": self.bound,
+            "until": rfc3339(self.until),
+            "set_on": set_on(&self.set_on),
+        })
+    }
+}
+
+/// A moment by the node's clock in RFC 3339.
+fn rfc3339(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// The device a bound was set on, as a route says it: `"this"`, or its
+/// label and fingerprint.
+fn set_on(on: &Option<(String, String)>) -> Value {
+    match on {
+        None => json!("this"),
+        Some((label, fingerprint)) => json!({ "label": label, "fingerprint": fingerprint }),
+    }
+}
+
+/// The device whose key is `key`, as [`BoundSaid::set_on`] holds it.
+fn device_of(
+    conn: &Connection,
+    own: &[u8; 32],
+    key: &[u8; 32],
+) -> Result<Option<(String, String)>, PersonError> {
+    if key == own {
+        return Ok(None);
+    }
+    let standing = Standing::of(conn)?;
+    let label = signer_label(conn, &standing.held.statement.statement, key)?;
+    Ok(Some((label, fingerprint::shown(key))))
+}
+
+/// Each bound in force at `now` that is not the usual hold, with the
+/// device it was set on (decision 2026-10-25, rule 4).
+fn bounds_said(
+    conn: &Connection,
+    own: &[u8; 32],
+    counting: &crate::person::Counting,
+    now: i64,
+) -> Result<Vec<BoundSaid>, PersonError> {
+    let mut said = Vec::new();
+    for (pair, in_force) in crate::bounds::set_now(conn, own, counting, now)? {
+        if let crate::bounds::InForce::Set { bound, until, on } = in_force {
+            said.push(BoundSaid {
+                pair,
+                bound,
+                until,
+                set_on: device_of(conn, own, &on)?,
+            });
+        }
+    }
+    Ok(said)
 }
 
 // ── log ──────────────────────────────────────────────────────────────
@@ -1230,11 +1329,17 @@ pub struct Log {
     pub name: Option<String>,
     /// Each thread, newest first by the shown time of its newest message,
     /// with its messages oldest first: only the messages that no person
-    /// has read here.
+    /// has read on any device that counts.
     pub threads: Vec<(Id, Vec<Logged>)>,
-    /// How many messages it would list but that a person here has read:
-    /// they are not listed (decision 2026-10-09 §4.1).
+    /// How many messages it would list but that a person has read: they
+    /// are not listed (decision 2026-10-09 §4.1).
     pub already_read: usize,
+    /// Where a person read them (decision 2026-10-25, rule 1): this device
+    /// first, as `None`, and then each device by its label and its
+    /// fingerprint's words, in order of label, each with its count. A
+    /// message read here and elsewhere counts as here; one read on two
+    /// other devices counts under the first label, in order of label.
+    pub already_read_on: Vec<(Option<(String, String)>, usize)>,
     /// What is counted of each signer that has anything counted, in order
     /// of key.
     pub signers: Vec<Counted>,
@@ -1250,6 +1355,12 @@ pub struct Log {
     pub not_every_device: Vec<Id>,
     /// How many were marked read by a person.
     pub marked: usize,
+    /// The revision of the list of a person's reads written after them,
+    /// where one was.
+    pub list: Option<u64>,
+    /// Whether sync is on: where it is off, the other devices hear of what
+    /// was marked once it is on.
+    pub sync_on: bool,
 }
 
 /// What a request asks of `log`.
@@ -1262,6 +1373,10 @@ pub struct LogAsked<'a> {
     pub since: Option<i64>,
     /// The messages to mark read by a person: those the command printed.
     pub mark: &'a [Id],
+    /// Whether the messages channel was fetched since the node started:
+    /// the list of a person's reads is written only after (decision
+    /// 2026-10-25, rule 1).
+    pub fetched: bool,
 }
 
 /// The names whose agents may have read a message to every name: each
@@ -1359,7 +1474,6 @@ fn log_in(
     let mut listed = Vec::new();
     let shown = kept(held::shown(conn, now))?;
     let mut marked = 0;
-    let mut already_read = 0;
     for message in &shown {
         if !of_the_agent(&message.signer, &message.from, message.to.as_deref()) {
             continue;
@@ -1369,12 +1483,43 @@ fn log_in(
             kept(held::mark_read_by_a_person(conn, &id))?;
             marked += 1;
         }
+    }
+    // What was marked is said to the other devices in the same write,
+    // where it may be (decision 2026-10-25, rule 1).
+    let list = match marked {
+        0 => None,
+        _ => marks::person_list_written(conn, identity, now, asked.fetched, None)?,
+    };
+    // Read by a person on any device that counts (decision 2026-10-25,
+    // rule 1.3), worked out once, after what is marked here.
+    let person = marks::person_read_now(conn, &counting)?;
+    let mut already_read = 0;
+    let mut read_where: Vec<(Option<String>, Option<[u8; 32]>)> = Vec::new();
+    for message in &shown {
+        if !of_the_agent(&message.signer, &message.from, message.to.as_deref()) {
+            continue;
+        }
+        let id = id_of(&message.id)?;
         if asked.since.is_some_and(|since| message.shown_at < since) {
             continue;
         }
-        // What a person here has read is counted, and not listed again.
-        if kept(held::is_read_by_a_person(conn, &id))? {
+        // What a person has read, here or on a device that counts, is
+        // counted by where, and not listed again.
+        let on = person.on(&id);
+        if on.is_read() {
             already_read += 1;
+            match on.here {
+                true => read_where.push((None, None)),
+                false => {
+                    let mut labels = Vec::new();
+                    for key in &on.devices {
+                        labels.push((signer_label(conn, statement, key)?, *key));
+                    }
+                    labels.sort();
+                    let (label, key) = labels.swap_remove(0);
+                    read_where.push((Some(label), Some(key)));
+                }
+            }
             continue;
         }
         // Away from a terminal, nothing that such a signer wrote.
@@ -1536,16 +1681,36 @@ fn log_in(
             }
         }
     }
+    // This device first, then each label in its order, each once.
+    read_where.sort();
+    let mut already_read_on: Vec<(Option<(String, String)>, usize)> = Vec::new();
+    for (label, key) in read_where {
+        let device = label.zip(key.map(|key| fingerprint::shown(&key)));
+        match already_read_on.last_mut() {
+            Some((last, count))
+                if last.as_ref().map(|(label, _)| label)
+                    == device.as_ref().map(|(label, _)| label) =>
+            {
+                *count += 1
+            }
+            _ => already_read_on.push((device, 1)),
+        }
+    }
     Ok(Log {
         name,
         threads,
         already_read,
+        already_read_on,
         signers,
         waiting,
         room,
         not_every_relay,
         not_every_device,
         marked,
+        list,
+        sync_on: meta::get(conn, meta::SYNC_CLAUDE_DIR)
+            .map_err(PersonError::from)?
+            .is_some(),
     })
 }
 
@@ -1667,10 +1832,17 @@ impl Log {
             .filled_by
             .as_ref()
             .map(|(label, entries)| json!({ "label": label, "entries": entries }));
+        let already_read_on: Vec<Value> = self
+            .already_read_on
+            .iter()
+            .map(|(device, count)| json!({ "device": set_on(device), "count": count }))
+            .collect();
         json!({
             "name": self.name,
             "threads": threads,
             "already_read": self.already_read,
+            "already_read_on": already_read_on,
+            "sync_on": self.sync_on,
             "signers": signers,
             "waiting": ids(&self.waiting),
             "refused_for_room": ids(&self.room.refused),
@@ -1733,16 +1905,162 @@ pub async fn log(
     }
     let now = state.sync_control.now();
     let db = db_of(&state);
+    lists_read(&db, &state);
     let asked_of = LogAsked {
         folder: body.folder.as_deref(),
         since,
         mark: &mark,
+        fetched: sender::fetched(&db, &state.own_channels, Instant::now()).map_err(refused)?,
     };
     let no_room = |channel: &[u8; 32]| state.own_channels.no_room_for_messages(channel);
     match log_of(&db, &state.identity, &asked_of, now, no_room) {
-        Ok(log) => Ok(HttpResponse::Ok().json(log.answered())),
+        Ok(log) => {
+            // A list written waits to be sent.
+            if log.list.is_some() {
+                state.own_channels.written();
+            }
+            Ok(HttpResponse::Ok().json(log.answered()))
+        }
         Err(NotRead::Refused(why)) => refusal(&db, &why),
         Err(NotRead::Failed(e)) => Err(refused(e)),
+    }
+}
+
+// ── allow ────────────────────────────────────────────────────────────
+
+/// What a request asks of `allow` (decision 2026-10-25, rule 2).
+#[derive(Debug, Deserialize)]
+pub struct AllowRequest {
+    pub a: String,
+    /// The other name, or null for every agent.
+    pub b: Option<String>,
+    /// 1 to 64, or null for any.
+    pub bound: Option<u8>,
+    /// How long it holds: 60 to 604,800 seconds.
+    pub for_secs: u32,
+    /// False for the look; true sets it.
+    #[serde(default)]
+    pub yes: bool,
+}
+
+/// What `allow` answers ([`allow_of`]): the pair as it is spelt, the
+/// look, and whether it was set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowSaid {
+    pub pair: crate::bounds::Pair,
+    pub bound: Option<u8>,
+    pub allowed: crate::bounds::Allowed,
+    /// The device the bound in force before was set on, where one was.
+    pub was_on: Option<Option<(String, String)>>,
+}
+
+impl AllowSaid {
+    /// As the route answers it: `a`, `b`, `bound`, `waiting`, `until` (by
+    /// the node's clock, in seconds), `in_force` (null for the usual hold,
+    /// or its `bound`, `until` and `set_on`), and `set`.
+    pub fn answered(&self) -> Value {
+        let in_force = match (&self.allowed.was, &self.was_on) {
+            (crate::bounds::InForce::Set { bound, until, .. }, Some(on)) => {
+                json!({ "bound": bound, "until": until, "set_on": set_on(on) })
+            }
+            _ => Value::Null,
+        };
+        json!({
+            "a": self.pair.a,
+            "b": self.pair.b,
+            "bound": self.bound,
+            "waiting": self.allowed.waiting,
+            "until": self.allowed.until,
+            "in_force": in_force,
+            "set": self.allowed.set,
+        })
+    }
+}
+
+/// `allow` at `now` by the node's clock (decision 2026-10-25, rule 2): what
+/// the command checks alone is checked again, before anything (a bound of
+/// 1 to 64 or any, and a `for_secs` of 60 to 604,800); then
+/// [`crate::bounds::allow`] makes the node's checks in their order, and
+/// answers the look, or sets the bound after a yes. Nothing tells a person
+/// from a program here: whoever holds the token is answered (rule 5).
+pub fn allow_of(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    asked: &AllowRequest,
+    now: i64,
+    fetched: bool,
+) -> Result<AllowSaid, NotSentHere> {
+    use cordelia_core::protocol::{
+        AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS, AGENT_MESSAGE_RING,
+    };
+    if asked
+        .bound
+        .is_some_and(|bound| bound == 0 || usize::from(bound) > AGENT_MESSAGE_RING)
+    {
+        return Err(NotSentHere::Asked(format!(
+            "{} is not a number you can allow: give 1 to 64, or any",
+            asked.bound.unwrap_or(0)
+        )));
+    }
+    if !(AGENT_MESSAGE_PAIR_BOUND_MIN_SECS..=AGENT_MESSAGE_PAIR_BOUND_MAX_SECS)
+        .contains(&asked.for_secs)
+    {
+        return Err(NotSentHere::Asked(format!(
+            "{} seconds is not a time you can allow it for: give 60 to 604800",
+            asked.for_secs
+        )));
+    }
+    let pair = crate::bounds::Pair::of(&asked.a, asked.b.as_deref());
+    let allow = crate::bounds::Allow {
+        pair: pair.clone(),
+        bound: asked.bound,
+        for_secs: asked.for_secs,
+    };
+    let allowed = match crate::bounds::allow(conn, identity, &allow, now, fetched, asked.yes) {
+        Ok(allowed) => allowed,
+        Err(crate::bounds::AllowNot::Refused(why)) => return Err(NotSentHere::Refused(why)),
+        Err(crate::bounds::AllowNot::Failed(e)) => return Err(NotSentHere::Failed(e)),
+    };
+    let was_on = match &allowed.was {
+        crate::bounds::InForce::Set { on, .. } => {
+            Some(device_of(conn, &identity.public_key(), on).map_err(NotSentHere::Failed)?)
+        }
+        crate::bounds::InForce::Usual => None,
+    };
+    Ok(AllowSaid {
+        pair,
+        bound: asked.bound,
+        allowed,
+        was_on,
+    })
+}
+
+// ── POST /api/v1/messages/allow ──────────────────────────────────────
+
+/// `cordelia msg allow` (decision 2026-10-25, rule 2): the look with `yes`
+/// false, and the bound set with it true. A list of bounds written waits
+/// to be sent as anything a device writes does.
+pub async fn allow(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<AllowRequest>,
+) -> Result<HttpResponse, ApiError> {
+    asked(&req, &state)?;
+    let now = state.sync_control.now();
+    let db = db_of(&state);
+    lists_read(&db, &state);
+    let fetched = sender::fetched(&db, &state.own_channels, Instant::now()).map_err(refused)?;
+    match allow_of(&db, &state.identity, &body, now, fetched) {
+        Ok(said) => {
+            if said.allowed.list.is_some() {
+                state.own_channels.written();
+            }
+            Ok(HttpResponse::Ok().json(said.answered()))
+        }
+        Err(NotSentHere::Refused(why)) => refusal(&db, &why),
+        Err(NotSentHere::Said(word, says)) => Ok(refused_with(word, &says, json!({}))),
+        Err(NotSentHere::Asked(says)) => Err(ApiError::BadRequest(says)),
+        Err(NotSentHere::Failed(e)) => Err(refused(e)),
     }
 }
 
@@ -1770,8 +2088,22 @@ fn refusal(conn: &Connection, why: &Refused) -> Result<HttpResponse, ApiError> {
             again,
             next_at,
         } => json!({ "sends": sends, "again": again, "next_at": next_at }),
-        Refused::PairHeld { from, other, every } => {
-            json!({ "from": from, "other": other, "every": every })
+        Refused::PairHeld {
+            from,
+            other,
+            every,
+            waiting,
+            bound,
+        } => {
+            json!({ "from": from, "other": other, "every": every, "waiting": waiting,
+                    "bound": bound })
+        }
+        Refused::BoundsFull(pairs) => {
+            let pairs: Vec<Value> = pairs
+                .iter()
+                .map(|(pair, until)| json!({ "a": pair.a, "b": pair.b, "until": until }))
+                .collect();
+            json!({ "pairs": pairs })
         }
         Refused::NoSuchMessage(id) | Refused::SignerRemoved(id) | Refused::AsksNothing(id) => {
             json!({ "id": id })
@@ -1793,6 +2125,16 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
 }
 
 // ── Plumbing ─────────────────────────────────────────────────────────
+
+/// The lists of a person's reads and of bounds that the store held from
+/// before step 20 are read before any route of messages answers, where
+/// they were not yet (decision 2026-10-25, rule 1). An error is logged:
+/// the next asks again.
+fn lists_read(db: &Connection, state: &AppState) {
+    if let Err(e) = crate::reader::read_held_lists(db, &state.identity, state.sync_control.now()) {
+        tracing::warn!(error = %e, "messages: could not read the lists held");
+    }
+}
 
 fn db_of(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
@@ -1991,6 +2333,7 @@ mod tests {
             folder: of.as_deref(),
             since: None,
             mark,
+            fetched: true,
         };
         match log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false) {
             Ok(log) => Ok(log),
@@ -2827,6 +3170,7 @@ mod tests {
             folder: Some("/nowhere"),
             since: None,
             mark: &[],
+            fetched: true,
         };
         assert!(matches!(
             log_of(&s[1].conn, &s[1].identity, &log_unmapped, now, |_| false),
@@ -2949,6 +3293,7 @@ mod tests {
             folder: Some("/home/sam/unmapped"),
             since: None,
             mark: &[],
+            fetched: true,
         };
         assert!(matches!(
             log_of(&s[1].conn, &s[1].identity, &asked, now, |_| false),
@@ -2959,6 +3304,7 @@ mod tests {
             folder: None,
             since: Some(t + 3),
             mark: &[],
+            fetched: true,
         };
         let since = log_of(&s[1].conn, &s[1].identity, &asked, now, |_| false).unwrap();
         let mut late = logged_ids(&since);
@@ -3034,13 +3380,13 @@ mod tests {
         // Only a person's mark: no agent read them.
         assert_eq!(summary_on(&s, 1, "work", now).unwrap().lines.len(), 3);
         // The pair counts what is left.
-        let pairs = held::pairs_with(&s[1].conn, "work", now).unwrap();
+        let pairs = held::pairs_with(&s[1].conn, "work", now, &s.keys_counting(1)).unwrap();
         assert_eq!(pairs, [(Some("notes".to_string()), 1)]);
         // Marked again, it is counted, and is one mark.
         let again = log_on(&s, 1, None, &[ids[0], to_plans], now).unwrap();
         assert_eq!(again.marked, 2);
         assert_eq!(
-            held::pairs_with(&s[1].conn, "plans", now).unwrap(),
+            held::pairs_with(&s[1].conn, "plans", now, &s.keys_counting(1)).unwrap(),
             Vec::<(held::Other, u64)>::new()
         );
     }
@@ -3091,6 +3437,7 @@ mod tests {
             folder: None,
             since: Some(t + 1),
             mark: &[],
+            fetched: true,
         };
         let since = log_of(&s[1].conn, &s[1].identity, &asked, now, |_| false).unwrap();
         assert_eq!((logged_ids(&since), since.already_read), (vec![new], 1));
@@ -3369,19 +3716,23 @@ mod tests {
             from: "a".into(),
             other: Some("b".into()),
             every: true,
+            waiting: 12,
+            bound: 5,
         };
         assert_eq!(
             said(held),
-            json!({ "from": "a", "other": "b", "every": true })
+            json!({ "from": "a", "other": "b", "every": true, "waiting": 12, "bound": 5 })
         );
         let held = Refused::PairHeld {
             from: "a".into(),
             other: None,
             every: false,
+            waiting: 10,
+            bound: 10,
         };
         assert_eq!(
             said(held),
-            json!({ "from": "a", "other": null, "every": false })
+            json!({ "from": "a", "other": null, "every": false, "waiting": 10, "bound": 10 })
         );
         for (why, word) in [
             (Refused::NoSuchMessage("0123abcd".into()), "no_such_message"),
@@ -4372,6 +4723,7 @@ mod tests {
         for key in [
             "unread_by_an_agent",
             "unread_by_a_person",
+            "bounds",
             "waiting",
             "refused_for_room",
             "filled_by",
@@ -4381,7 +4733,7 @@ mod tests {
         ] {
             assert!(answered.get(key).is_some(), "{key}");
         }
-        assert_eq!(answered.as_object().unwrap().len(), 8);
+        assert_eq!(answered.as_object().unwrap().len(), 9);
         // A message refused whose 30 days are up waits no more, and is
         // refused of those that wait no more, until the hourly task.
         conn.execute(
@@ -4474,5 +4826,1339 @@ mod tests {
             assert_eq!(unread, names as u64 * 3 * messages, "{names} {messages}");
             assert_eq!(more, work, "{names} names, {messages} messages");
         }
+    }
+
+    // ── A person's read on every device (decision 2026-10-25, rule 1) ──
+
+    /// The status's counts of device `n` at `now`.
+    fn counts_on(s: &Several, n: usize, now: i64) -> Counts {
+        status_of(&s[n].conn, &s[n].identity, &OwnChannels::default(), now)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The entry of device `n`'s own list of a person's reads that its
+    /// store holds, in the generation it stands applied under.
+    fn person_list_of(s: &Several, n: usize) -> Option<cordelia_crypto::entry::CheckedEntry> {
+        let secret = derive::messages_secret(&s[n].secret()).unwrap();
+        let slot = cordelia_crypto::slots::slot_id(
+            &derive::slot_key(&secret).unwrap(),
+            &cordelia_crypto::message::person_name(&s.key(n)).unwrap(),
+        );
+        let channel = derive::channel_id(&secret).unwrap();
+        cordelia_storage::entries::author_entry(&s[n].conn, &channel, &slot, &s.key(n))
+            .unwrap()
+            .map(|stored| stored.entry.check().unwrap())
+    }
+
+    /// Device `to` takes `entry` through the door at `now`.
+    fn takes(s: &Several, to: usize, entry: &cordelia_crypto::entry::CheckedEntry, now: i64) {
+        let taken = crate::take::take(&s[to].conn, &s[to].identity, entry, now).unwrap();
+        assert!(matches!(taken, crate::take::Taken::Own { .. }), "{taken:?}");
+    }
+
+    /// Where `log` on device `n` says a person read what it does not show.
+    fn read_where(s: &Several, n: usize, now: i64) -> Vec<(Option<String>, usize)> {
+        log_on(s, n, None, &[], now)
+            .unwrap()
+            .already_read_on
+            .into_iter()
+            .map(|(device, count)| (device.map(|(label, _)| label), count))
+            .collect()
+    }
+
+    /// The laptop's `log` marks three messages read by a person; the
+    /// desktop takes its list, and its pair count, its status's
+    /// `unread_by_a_person` and its `log`'s `already_read` count all three
+    /// as read by a person (decision 2026-10-25, rule 1).
+    #[test]
+    fn a_persons_read_on_one_device_counts_on_another() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        let ids: Vec<Id> = (0..3)
+            .map(|k| {
+                sent(
+                    &s,
+                    0,
+                    &asking("notes", Some("work"), &format!("{k}")),
+                    t + k,
+                )
+            })
+            .collect();
+        s.pass(0, 1);
+        let now = t + MINUTE;
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 3);
+        let pairs = |s: &Several| held::pairs_with(&s[1].conn, "work", now, &s.keys_counting(1));
+        assert_eq!(pairs(&s).unwrap(), [(Some("notes".to_string()), 3)]);
+
+        let marked = log_on(&s, 0, None, &ids, now).unwrap();
+        assert_eq!(marked.marked, 3);
+        assert_eq!(marked.list, Some(1));
+        s.pass(0, 1);
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 0);
+        assert!(pairs(&s).unwrap().is_empty());
+        let log = log_on(&s, 1, None, &[], now).unwrap();
+        assert!(logged_ids(&log).is_empty());
+        assert_eq!(log.already_read, 3);
+        assert_eq!(read_where(&s, 1, now), [(Some("device 0".to_string()), 3)]);
+        // Nothing of it was marked here.
+        for id in &ids {
+            assert!(!held::is_read_by_a_person(&s[1].conn, id).unwrap());
+        }
+        // `read`'s header counts the same.
+        let id = hex::encode(ids[0]);
+        let readout = reads(&s, 1, "work", &id, now).unwrap();
+        assert_eq!(
+            (readout.pair_count, readout.pair_unread_by_a_person),
+            (3, 0)
+        );
+    }
+
+    /// `log` says where a person read what it does not show (decision
+    /// 2026-10-25, rule 1): 3 read here and 7 by the laptop's list, one of
+    /// them read both here and there, which counts as here; with a third
+    /// device, one read on two other devices counts under the first label,
+    /// in order of label, and this device is first.
+    #[test]
+    fn log_says_where_you_read_what_it_does_not_show() {
+        let mut s = devices(3);
+        let t = s.now + MINUTE;
+        // Two pairs, so that no pair holds on the sender.
+        let ids: Vec<Id> = (0..11)
+            .map(|k| {
+                let to = if k % 2 == 0 { "work" } else { "plans" };
+                sent(&s, 0, &asking("notes", Some(to), &format!("{k}")), t + k)
+            })
+            .collect();
+        s.pass(0, 1);
+        s.pass(0, 2);
+        let now = t + MINUTE;
+        log_on(&s, 1, None, &ids[..3], now).unwrap();
+        log_on(&s, 0, None, &ids[2..10], now).unwrap();
+        s.pass(0, 1);
+        assert_eq!(
+            read_where(&s, 1, now),
+            [(None, 3), (Some("device 0".to_string()), 7)]
+        );
+        log_on(&s, 2, None, &ids[9..11], now).unwrap();
+        s.pass(2, 1);
+        assert_eq!(
+            read_where(&s, 1, now),
+            [
+                (None, 3),
+                (Some("device 0".to_string()), 7),
+                (Some("device 2".to_string()), 1)
+            ]
+        );
+        let log = log_on(&s, 1, None, &[], now).unwrap();
+        assert_eq!(log.already_read, 11);
+        assert_eq!(
+            log.answered()["already_read_on"][1]["device"]["fingerprint"],
+            fingerprint::shown(&s.key(0))
+        );
+        assert_eq!(log.answered()["already_read_on"][0]["device"], "this");
+    }
+
+    /// A person's read that arrives before its message loses nothing
+    /// (decision 2026-10-25, rule 1, hard case 5): the desktop takes the
+    /// laptop's list, then the message, which is read by a person at once
+    /// and is never in a pair's count.
+    #[test]
+    fn a_persons_read_that_arrives_before_its_message_loses_nothing() {
+        let mut s = devices(3);
+        let t = s.now + MINUTE;
+        let id = sent(&s, 0, &asking("notes", Some("work"), "early"), t);
+        s.pass(0, 2);
+        let now = t + MINUTE;
+        log_on(&s, 2, None, &[id], now).unwrap();
+        let list = person_list_of(&s, 2).unwrap();
+        takes(&s, 1, &list, now);
+        let counting = who_counts(&s[1].conn).unwrap();
+        assert!(!held::holds_message(&s[1].conn, &id).unwrap());
+        assert!(
+            marks::person_read_now(&s[1].conn, &counting)
+                .unwrap()
+                .is_read(&id)
+        );
+        s.pass(0, 1);
+        assert!(held::holds_message(&s[1].conn, &id).unwrap());
+        assert!(
+            held::pairs_with(&s[1].conn, "work", now, &s.keys_counting(1))
+                .unwrap()
+                .is_empty()
+        );
+        let log = log_on(&s, 1, None, &[], now).unwrap();
+        assert!(logged_ids(&log).is_empty());
+        assert_eq!(log.already_read, 1);
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 0);
+    }
+
+    /// Device `n` holds `count` messages to `work` from `notes`, as a
+    /// reader holds them, from three signers that write nothing else: the
+    /// same IDs on each device asked.
+    fn held_many(s: &Several, on: &[usize], count: usize, now: i64) -> Vec<Id> {
+        let ids: Vec<Id> = (0..count)
+            .map(|k| {
+                let mut id = [0xe0; 16];
+                id[..8].copy_from_slice(&(k as u64).to_be_bytes());
+                id
+            })
+            .collect();
+        for n in on {
+            for (k, id) in ids.iter().enumerate() {
+                let signer = [0xa1 + (k % 3) as u8; 32];
+                let number = (k / 3 + 1) as u64;
+                held_as(
+                    s,
+                    *n,
+                    *id,
+                    signer,
+                    "notes",
+                    Some("work"),
+                    false,
+                    (now, now),
+                    number,
+                );
+            }
+        }
+        ids
+    }
+
+    /// A person's read that falls out of the newest list stays read
+    /// (decision 2026-10-25, rule 1.2): the laptop marks 130; the desktop
+    /// takes its list at 60 and at 130, which holds the newest 120; all 130
+    /// stay read there, and the pair counts none.
+    #[test]
+    fn a_persons_read_that_falls_out_of_the_newest_list_stays_read() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        let ids = held_many(&s, &[0, 1], 130, now);
+        log_on(&s, 0, None, &ids[..60], now).unwrap();
+        let first = person_list_of(&s, 0).unwrap();
+        takes(&s, 1, &first, now);
+        log_on(&s, 0, None, &ids[60..], now).unwrap();
+        let second = person_list_of(&s, 0).unwrap();
+        assert_eq!(second.rev, 2);
+        let listed = cordelia_crypto::message::PersonReads::from_value(
+            &second
+                .open(&derive::messages_secret(&s[0].secret()).unwrap())
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        assert_eq!(listed.ids.len(), 120);
+        assert!(!listed.ids.contains(&ids[0]));
+        takes(&s, 1, &second, now + 1);
+        let counting = who_counts(&s[1].conn).unwrap();
+        let read = marks::person_read_now(&s[1].conn, &counting).unwrap();
+        for id in &ids {
+            assert!(read.is_read(id), "{}", hex::encode(id));
+        }
+        assert!(
+            held::pairs_with(&s[1].conn, "work", now, &s.keys_counting(1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Device `n`'s list of a person's reads at `rev`, holding `ids`.
+    fn person_list(
+        s: &Several,
+        n: usize,
+        rev: u64,
+        ids: &[Id],
+    ) -> cordelia_crypto::entry::CheckedEntry {
+        let value = cordelia_crypto::message::PersonReads { ids: ids.to_vec() }
+            .to_value()
+            .unwrap();
+        cordelia_crypto::entry::Entry::seal(
+            &derive::messages_secret(&s[n].secret()).unwrap(),
+            &s[n].identity,
+            rev,
+            &cordelia_crypto::message::inside(
+                cordelia_crypto::message::person_name(&s.key(n)).unwrap(),
+                value,
+            ),
+        )
+        .unwrap()
+        .check()
+        .unwrap()
+    }
+
+    /// The IDs device `n` keeps of `key`'s lists of a person's reads.
+    fn kept_of(s: &Several, n: usize, key: &[u8; 32]) -> Vec<Id> {
+        let mut ids: Vec<Id> = held::person_reads(&s[n].conn)
+            .unwrap()
+            .lists
+            .into_iter()
+            .filter(|(of, _)| of == key)
+            .map(|(_, id)| id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// What is kept of messages not held is bounded (decision 2026-10-25,
+    /// rule 1.2): a key lists 240 IDs of messages the desktop does not
+    /// hold, in two lists; 120 are kept, the latest taken; a third list's
+    /// one more keeps it and the newest 119; and each goes 30 days after
+    /// it was taken.
+    #[test]
+    fn what_is_kept_of_messages_not_held_is_bounded() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        let id = |k: usize| -> Id {
+            let mut id = [0xd0; 16];
+            id[..8].copy_from_slice(&(k as u64).to_be_bytes());
+            id
+        };
+        let first: Vec<Id> = (0..120).map(id).collect();
+        let second: Vec<Id> = (120..240).map(id).collect();
+        takes(&s, 1, &person_list(&s, 0, 1, &first), t);
+        takes(&s, 1, &person_list(&s, 0, 2, &second), t + 1);
+        let mut newest = second.clone();
+        newest.sort();
+        assert_eq!(kept_of(&s, 1, &s.key(0)), newest);
+        // One more, taken later: it and the newest 119 of the second, the
+        // first of that list being its newest.
+        let one = id(240);
+        let mut third = vec![one];
+        third.extend(&second[..119]);
+        takes(&s, 1, &person_list(&s, 0, 3, &third), t + 2);
+        let kept = kept_of(&s, 1, &s.key(0));
+        assert_eq!(kept.len(), 120);
+        assert!(kept.contains(&one) && !kept.contains(&second[119]));
+        // Each goes 30 days after it was taken.
+        let month = i64::from(cordelia_core::protocol::AGENT_MESSAGE_KEPT_DAYS) * 24 * 60 * 60;
+        let hourly = |now: i64| {
+            crate::reader::hourly(&s[1].conn, &s[1].identity, now, true).unwrap();
+        };
+        hourly(t + 1 + month - 1);
+        assert_eq!(kept_of(&s, 1, &s.key(0)).len(), 120);
+        hourly(t + 1 + month);
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [one]);
+        hourly(t + 2 + month);
+        assert!(kept_of(&s, 1, &s.key(0)).is_empty());
+    }
+
+    /// What another device said a person read goes with its message's row
+    /// (decision 2026-10-25, rule 1.2): the desktop takes the laptop's list
+    /// twenty days after it holds the message; when the message's row goes
+    /// at its 30 days, the row of the list goes with it, though a row of a
+    /// message not held would be kept 30 days from when it was taken.
+    #[test]
+    fn a_persons_read_from_another_device_goes_with_its_messages_row() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        let id = sent(&s, 0, &asking("notes", Some("work"), "a month"), t);
+        // The desktop first holds it at t.
+        for entry in s[0].stored() {
+            crate::take::take(&s[1].conn, &s[1].identity, &entry, t).unwrap();
+        }
+        assert!(held::holds_message(&s[1].conn, &id).unwrap());
+        let day = 24 * 60 * MINUTE;
+        takes(&s, 1, &person_list(&s, 0, 1, &[id]), t + 20 * day);
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [id]);
+        let month = i64::from(cordelia_core::protocol::AGENT_MESSAGE_KEPT_DAYS) * day;
+        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month - 1, true).unwrap();
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [id]);
+        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month, true).unwrap();
+        assert!(!held::holds_message(&s[1].conn, &id).unwrap());
+        assert!(kept_of(&s, 1, &s.key(0)).is_empty());
+    }
+
+    /// A person's read from a key that no longer counts says nothing
+    /// (decision 2026-10-25, rule 1): what is kept of it is not read by a
+    /// person, and counts towards the pair.
+    #[test]
+    fn a_persons_read_from_a_key_that_no_longer_counts_says_nothing() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        let id = sent(&s, 0, &asking("notes", Some("work"), "once"), t);
+        s.pass(0, 1);
+        let now = t + MINUTE;
+        held::keep_person_list(&s[1].conn, &[0x99; 32], &[id], now).unwrap();
+        // The status gives places, as a show does.
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 1);
+        let counting = who_counts(&s[1].conn).unwrap();
+        assert!(
+            !marks::person_read_now(&s[1].conn, &counting)
+                .unwrap()
+                .is_read(&id)
+        );
+        assert_eq!(
+            held::pairs_with(&s[1].conn, "work", now, &s.keys_counting(1)).unwrap(),
+            [(Some("notes".to_string()), 1)]
+        );
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 1);
+        let log = log_on(&s, 1, None, &[], now).unwrap();
+        assert_eq!(logged_ids(&log), [id]);
+        // The control: under a key that counts, it is read.
+        held::keep_person_list(&s[1].conn, &s.key(0), &[id], now).unwrap();
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 0);
+    }
+
+    /// A statement drops the rows of a key it does not count (decision
+    /// 2026-10-25, rule 1.2, hard case 3): in the transaction that applies
+    /// it, so the message only the removed device's person read is unread
+    /// by a person again, and holds again; the rows of a key it counts
+    /// stay.
+    #[test]
+    fn a_statement_drops_the_rows_of_a_key_it_does_not_count() {
+        let mut s = devices(3);
+        let t = s.now + MINUTE;
+        let ids: Vec<Id> = (0..2)
+            .map(|k| {
+                sent(
+                    &s,
+                    0,
+                    &asking("notes", Some("work"), &format!("{k}")),
+                    t + k,
+                )
+            })
+            .collect();
+        s.pass(0, 1);
+        s.pass(0, 2);
+        let now = t + MINUTE;
+        log_on(&s, 2, None, &ids[..1], now).unwrap();
+        log_on(&s, 0, None, &ids[1..], now).unwrap();
+        s.pass(2, 1);
+        s.pass(0, 1);
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 0);
+        s.change(0, &[0, 1], &[2]);
+        s.meet(&[0, 1]);
+        assert_eq!(s[1].number(), 2);
+        assert!(kept_of(&s, 1, &s.key(2)).is_empty());
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [ids[1]]);
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 1);
+        let log = log_on(&s, 1, None, &[], now).unwrap();
+        assert_eq!(logged_ids(&log), [ids[0]]);
+    }
+
+    /// A store restored from a backup takes its own later list of a
+    /// person's reads (decision 2026-10-25, rule 1): each ID whose message
+    /// it holds goes to its own table, and the rest are kept under its own
+    /// key, so each is read by a person; its next list goes above it.
+    #[test]
+    fn a_persons_list_handed_back_is_merged() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        let ids: Vec<Id> = (0..2)
+            .map(|k| {
+                sent(
+                    &s,
+                    0,
+                    &asking("notes", Some("work"), &format!("{k}")),
+                    t + k,
+                )
+            })
+            .collect();
+        s.pass(0, 1);
+        let now = t + MINUTE;
+        let not_held = [0xcc; 16];
+        let later = person_list(&s, 1, 4, &[ids[1], not_held, ids[0]]);
+        takes(&s, 1, &later, now);
+        for id in &ids {
+            assert!(held::is_read_by_a_person(&s[1].conn, id).unwrap());
+        }
+        assert_eq!(kept_of(&s, 1, &s.key(1)), [not_held]);
+        let counting = who_counts(&s[1].conn).unwrap();
+        assert!(
+            marks::person_read_now(&s[1].conn, &counting)
+                .unwrap()
+                .is_read(&not_held)
+        );
+        // Its next list goes above it, and holds the two it holds.
+        let third = sent(&s, 0, &asking("notes", Some("work"), "third"), now);
+        s.pass(0, 1);
+        let marked = log_on(&s, 1, None, &[third], now + 1).unwrap();
+        assert_eq!(marked.list, Some(5));
+    }
+
+    /// The lists of a person's reads and of bounds that a store held from
+    /// before step 20 are read once after it (decision 2026-10-25, rule
+    /// 1): the version before stored them unread and counted each as no
+    /// message; the first read takes both, sets the count to 0, and marks
+    /// itself done; a device that does not stand applied does nothing and
+    /// marks nothing.
+    #[test]
+    fn lists_held_before_the_upgrade_are_read_after_it() {
+        let mut s = devices(3);
+        let t = s.now + MINUTE;
+        let id = sent(&s, 0, &asking("notes", Some("work"), "read on laptop"), t);
+        s.pass(0, 1);
+        let now = t + MINUTE;
+        log_on(&s, 0, None, &[id], now).unwrap();
+        let allow = crate::bounds::Allow {
+            pair: crate::bounds::Pair::of("notes", Some("work")),
+            bound: Some(20),
+            for_secs: 3600,
+        };
+        crate::bounds::allow(&s[0].conn, &s[0].identity, &allow, now, true, true).unwrap();
+        // The version before stored both as a relay does, and counted each
+        // as an entry in a slot it did not know.
+        let secret = derive::messages_secret(&s[0].secret()).unwrap();
+        let channel = derive::channel_id(&secret).unwrap();
+        let generation = held::generation_of(&s[1].conn, &channel).unwrap().unwrap();
+        let lists: Vec<_> = s[0]
+            .stored_in(&secret)
+            .into_iter()
+            .filter(|entry| entry.author == s.key(0) && entry.rev == 1)
+            .collect();
+        assert_eq!(lists.len(), 2, "the list of a person's reads and of bounds");
+        for entry in &lists {
+            cordelia_storage::entries::store(&s[1].conn, entry, now).unwrap();
+            held::not_a_message(&s[1].conn, &s.key(0), generation).unwrap();
+        }
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 1);
+        let not_messages = |s: &Several| {
+            held::signer(&s[1].conn, &s.key(0), generation)
+                .unwrap()
+                .unwrap()
+                .not_messages
+        };
+        assert_eq!(not_messages(&s), 2);
+        assert!(crate::reader::read_held_lists(&s[1].conn, &s[1].identity, now).unwrap());
+        assert_eq!(not_messages(&s), 0);
+        assert_eq!(counts_on(&s, 1, now).unread_by_a_person, 0);
+        assert_eq!(counts_on(&s, 1, now).bounds.len(), 1);
+        assert!(
+            meta::get(&s[1].conn, meta::MESSAGES_LISTS_READ)
+                .unwrap()
+                .is_some()
+        );
+        // Once only.
+        assert!(!crate::reader::read_held_lists(&s[1].conn, &s[1].identity, now).unwrap());
+
+        // A device that does not stand applied does nothing, and marks
+        // nothing done.
+        s.change(0, &[0, 1], &[2]);
+        s.pass(0, 2);
+        assert!(!matches!(
+            crate::at_relays::stands(&s[2].conn).unwrap(),
+            Stands::Applied
+        ));
+        assert!(!crate::reader::read_held_lists(&s[2].conn, &s[2].identity, now).unwrap());
+        assert!(
+            meta::get(&s[2].conn, meta::MESSAGES_LISTS_READ)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The known limit (decision 2026-10-25, rule 5, T22): the route of
+    /// `log` marks what it is given read by a person for whoever holds the
+    /// token, with no terminal at all, and so ends a hold and hides those
+    /// messages from `log`. This test fails where that is no longer so, so
+    /// that the record is changed with the code.
+    #[actix_web::test]
+    async fn the_route_marks_with_no_terminal() {
+        let (state, id) = a_node_with_a_message();
+        let (status, said) =
+            answer(log(asked(), state.clone(), log_asked(None, &[id])).await).await;
+        assert_eq!(status, 200, "{said}");
+        assert_eq!(said["marked"], 1);
+        let (_, said) = answer(log(asked(), state.clone(), log_asked(None, &[])).await).await;
+        assert_eq!(said["threads"], json!([]));
+        assert_eq!(said["already_read"], 1);
+    }
+
+    // ── A bound for each pair, set only by a person (decision 2026-10-25,
+    // rules 2 and 4) ──────────────────────────────────────────────────
+
+    fn allow_asked(
+        a: &str,
+        b: Option<&str>,
+        bound: Option<u8>,
+        for_secs: u32,
+        yes: bool,
+    ) -> AllowRequest {
+        AllowRequest {
+            a: a.into(),
+            b: b.map(String::from),
+            bound,
+            for_secs,
+            yes,
+        }
+    }
+
+    /// `allow` on device `n` at `now`, the channel fetched: what it said,
+    /// or the word of its refusal.
+    fn allows_on(
+        s: &Several,
+        n: usize,
+        asked: &AllowRequest,
+        now: i64,
+    ) -> Result<AllowSaid, &'static str> {
+        allowed_on(s, n, asked, now, true)
+    }
+
+    fn allowed_on(
+        s: &Several,
+        n: usize,
+        asked: &AllowRequest,
+        now: i64,
+        fetched: bool,
+    ) -> Result<AllowSaid, &'static str> {
+        match allow_of(&s[n].conn, &s[n].identity, asked, now, fetched) {
+            Ok(said) => Ok(said),
+            Err(NotSentHere::Refused(why)) => Err(why.word()),
+            Err(NotSentHere::Asked(_)) => Err("asked"),
+            Err(NotSentHere::Said(word, _)) => Err(word),
+            Err(NotSentHere::Failed(e)) => panic!("{e}"),
+        }
+    }
+
+    /// Device `n`'s own list of bounds that its store holds.
+    fn bounds_list_of(s: &Several, n: usize) -> Option<cordelia_crypto::entry::CheckedEntry> {
+        let secret = derive::messages_secret(&s[n].secret()).unwrap();
+        let slot = cordelia_crypto::slots::slot_id(
+            &derive::slot_key(&secret).unwrap(),
+            &cordelia_crypto::message::hold_name(&s.key(n)).unwrap(),
+        );
+        let channel = derive::channel_id(&secret).unwrap();
+        cordelia_storage::entries::author_entry(&s[n].conn, &channel, &slot, &s.key(n))
+            .unwrap()
+            .map(|stored| stored.entry.check().unwrap())
+    }
+
+    /// Device `n`'s list of bounds at `rev`, holding the bytes `value`.
+    fn bounds_entry(
+        s: &Several,
+        n: usize,
+        rev: u64,
+        value: Vec<u8>,
+    ) -> cordelia_crypto::entry::CheckedEntry {
+        cordelia_crypto::entry::Entry::seal(
+            &derive::messages_secret(&s[n].secret()).unwrap(),
+            &s[n].identity,
+            rev,
+            &cordelia_crypto::message::inside(
+                cordelia_crypto::message::hold_name(&s.key(n)).unwrap(),
+                value,
+            ),
+        )
+        .unwrap()
+        .check()
+        .unwrap()
+    }
+
+    /// The bound in force for `pair` on device `n` at `now`.
+    fn in_force_on(
+        s: &Several,
+        n: usize,
+        pair: &crate::bounds::Pair,
+        now: i64,
+    ) -> crate::bounds::InForce {
+        let counting = who_counts(&s[n].conn).unwrap();
+        crate::bounds::in_force(&s[n].conn, &s.key(n), &counting, pair, now).unwrap()
+    }
+
+    /// The look says how many messages of the pair wait, and the bound in
+    /// force with when it ends and the device it was set on, or null for
+    /// the usual hold (decision 2026-10-25, rule 2): of two names, and of
+    /// a name and every agent.
+    #[test]
+    fn the_look_says_the_count_and_the_bound_in_force() {
+        let mut s = devices(2);
+        let t = s.now + MINUTE;
+        for k in 0..3 {
+            sent(
+                &s,
+                0,
+                &asking("notes", Some("work"), &format!("{k}")),
+                t + k,
+            );
+        }
+        sent(&s, 0, &asking("notes", None, "to all"), t + 3);
+        s.pass(0, 1);
+        let now = t + MINUTE;
+        // The status gives places, as a show does.
+        counts_on(&s, 1, now);
+        let look = allows_on(
+            &s,
+            1,
+            &allow_asked("work", Some("notes"), Some(20), 3600, false),
+            now,
+        )
+        .unwrap();
+        assert_eq!(look.pair, crate::bounds::Pair::of("notes", Some("work")));
+        assert_eq!(look.allowed.waiting, 3);
+        assert!(!look.allowed.set);
+        let said = look.answered();
+        assert_eq!(said["a"], "notes");
+        assert_eq!(said["b"], "work");
+        assert_eq!(said["waiting"], 3);
+        assert_eq!(said["until"], now + 3600);
+        assert_eq!(said["in_force"], Value::Null);
+        assert_eq!(said["set"], false);
+        let all = allows_on(&s, 1, &allow_asked("notes", None, None, 3600, false), now).unwrap();
+        assert_eq!(all.allowed.waiting, 1);
+        assert_eq!(all.answered()["b"], Value::Null);
+        // Nothing was set by a look.
+        assert!(bounds_list_of(&s, 1).is_none());
+
+        // The laptop sets 20; the desktop holds it, and says so.
+        allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), Some(20), 3600, true),
+            now,
+        )
+        .unwrap();
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
+        let look = allows_on(
+            &s,
+            1,
+            &allow_asked("notes", Some("work"), None, 3600, false),
+            now + 1,
+        )
+        .unwrap();
+        let in_force = &look.answered()["in_force"];
+        assert_eq!(in_force["bound"], 20);
+        assert_eq!(in_force["until"], now + 3600);
+        assert_eq!(in_force["set_on"]["label"], "device 0");
+        assert_eq!(
+            in_force["set_on"]["fingerprint"],
+            fingerprint::shown(&s.key(0))
+        );
+        let mine = allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), None, 3600, false),
+            now + 1,
+        )
+        .unwrap();
+        assert_eq!(mine.answered()["in_force"]["set_on"], "this");
+        // An any in force is a null bound.
+        allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), None, 3600, true),
+            now + 2,
+        )
+        .unwrap();
+        let any = allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), Some(5), 3600, false),
+            now + 3,
+        )
+        .unwrap();
+        assert_eq!(any.answered()["in_force"]["bound"], Value::Null);
+        assert_eq!(any.answered()["in_force"]["until"], now + 2 + 3600);
+    }
+
+    /// The route checks again what the command checks (decision
+    /// 2026-10-25, rule 2): a bound of 0 or 65, a `for_secs` of 59 or
+    /// 604,801, and a name no device syncs, each before anything is set;
+    /// the bounds and the times at their edges are taken.
+    #[test]
+    fn the_allow_route_refuses_what_the_command_refuses() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        for (bound, for_secs) in [
+            (Some(0), 3600),
+            (Some(65), 3600),
+            (Some(5), 59),
+            (None, 604_801),
+        ] {
+            assert_eq!(
+                allows_on(
+                    &s,
+                    0,
+                    &allow_asked("notes", Some("work"), bound, for_secs, true),
+                    now
+                )
+                .err(),
+                Some("asked"),
+                "{bound:?} {for_secs}"
+            );
+        }
+        assert_eq!(
+            allows_on(
+                &s,
+                0,
+                &allow_asked("notes", Some("nowhere"), Some(5), 3600, true),
+                now
+            )
+            .err(),
+            Some("no_such_name")
+        );
+        assert_eq!(
+            allows_on(
+                &s,
+                0,
+                &allow_asked("nowhere", None, Some(5), 3600, true),
+                now
+            )
+            .err(),
+            Some("no_such_name")
+        );
+        assert!(bounds_list_of(&s, 0).is_none());
+        assert!(held::bounds(&s[0].conn).unwrap().is_empty());
+        for (bound, for_secs) in [(Some(1), 60), (Some(64), 604_800), (None, 3600)] {
+            let said = allows_on(
+                &s,
+                0,
+                &allow_asked("notes", Some("work"), bound, for_secs, true),
+                now,
+            )
+            .unwrap();
+            assert!(said.allowed.set);
+        }
+    }
+
+    /// `allow` is refused where the device does not stand applied, with
+    /// sync off, and before its first fetch since the node started, in
+    /// that order (decision 2026-10-25, rule 2, refusals 4 and 5): a bound
+    /// is set only after the device has read what the relays hold.
+    #[test]
+    fn allow_is_refused_before_the_first_fetch_and_with_sync_off() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        let asked = allow_asked("notes", Some("work"), Some(20), 3600, true);
+        assert_eq!(
+            allowed_on(&s, 0, &asked, now, false).err(),
+            Some("not_fetched")
+        );
+        meta::remove(&s[0].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(
+            allowed_on(&s, 0, &asked, now, false).err(),
+            Some("sync_off")
+        );
+        assert_eq!(allowed_on(&s, 0, &asked, now, true).err(), Some("sync_off"));
+        held_rows::set_state(&s[0].conn, State::Fork).unwrap();
+        assert_eq!(
+            allowed_on(&s, 0, &asked, now, true).err(),
+            Some("not_applied")
+        );
+        held_rows::set_state(&s[0].conn, State::Applied).unwrap();
+        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
+        assert!(held::bounds(&s[0].conn).unwrap().is_empty());
+        assert!(allowed_on(&s, 0, &asked, now, true).unwrap().allowed.set);
+    }
+
+    /// A full list of bounds refuses a new pair and takes one it holds
+    /// (decision 2026-10-25, rules 2 and 3.6): at the longest names four
+    /// bounds fit; a fifth pair is refused with each pair the list holds
+    /// and when it leaves the list; each of the four can be set again, in
+    /// its place.
+    #[test]
+    fn a_full_list_of_bounds_refuses_a_new_pair_and_takes_one_it_holds() {
+        let s = devices(1);
+        let now = s.now + MINUTE;
+        let long = |c: char| format!("{c}{}", "x".repeat(199));
+        let names: Vec<String> = "abcdez".chars().map(long).collect();
+        for name in &names {
+            crate::names::say(&s[0].conn, &s[0].identity, name, now).unwrap();
+        }
+        let z = names[5].as_str();
+        for (k, name) in names[..4].iter().enumerate() {
+            let said = allows_on(
+                &s,
+                0,
+                &allow_asked(name, Some(z), Some(5), 3600, true),
+                now + k as i64,
+            )
+            .unwrap();
+            assert!(said.allowed.set);
+        }
+        let full = allow_of(
+            &s[0].conn,
+            &s[0].identity,
+            &allow_asked(&names[4], Some(z), Some(5), 3600, true),
+            now + 10,
+            true,
+        );
+        let Err(NotSentHere::Refused(Refused::BoundsFull(pairs))) = full else {
+            panic!("{full:?}");
+        };
+        let listed_secs = cordelia_core::protocol::AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS as i64;
+        let mut expected: Vec<(crate::bounds::Pair, i64)> = names[..4]
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                (
+                    crate::bounds::Pair::of(name, Some(z)),
+                    now + k as i64 + listed_secs,
+                )
+            })
+            .collect();
+        expected.reverse();
+        assert_eq!(pairs, expected);
+        let said = refusal_said(&s[0].conn, &Refused::BoundsFull(pairs));
+        assert_eq!(said["error"]["code"], "bounds_full");
+        assert_eq!(said["refused"]["pairs"][0]["until"], now + 3 + listed_secs);
+        // A look is refused alike, before the question.
+        assert_eq!(
+            allows_on(
+                &s,
+                0,
+                &allow_asked(&names[4], Some(z), Some(5), 3600, false),
+                now + 10
+            )
+            .err(),
+            Some("bounds_full")
+        );
+        // Each held can be set again, in its place.
+        let again = allows_on(
+            &s,
+            0,
+            &allow_asked(&names[1], Some(z), None, 3600, true),
+            now + 11,
+        )
+        .unwrap();
+        assert!(again.allowed.set);
+        assert_eq!(held::bounds(&s[0].conn).unwrap().len(), 4);
+    }
+
+    /// A bound is listed and taken by another device (decision 2026-10-25,
+    /// rule 2): the yes writes the list in the same write; the desktop
+    /// takes it, holds by it, and its status says it.
+    #[test]
+    fn a_bound_is_listed_and_taken_by_another_device() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        let said = allows_on(
+            &s,
+            0,
+            &allow_asked("work", Some("notes"), Some(20), 3600, true),
+            now,
+        )
+        .unwrap();
+        assert_eq!(said.allowed.list, Some(1));
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        assert_eq!(in_force_on(&s, 1, &pair, now + 1).stops_at(), Some(10));
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
+        assert_eq!(in_force_on(&s, 1, &pair, now + 1).stops_at(), Some(20));
+        let bounds = counts_on(&s, 1, now + 1).bounds;
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].bound, Some(20));
+        assert_eq!(bounds[0].set_on.as_ref().unwrap().0, "device 0");
+    }
+
+    /// A list of bounds that is not one is no list (decision 2026-10-25,
+    /// rule 2): one case for each check, each counted as no message, and
+    /// each drops that key's bounds where it is of form 4; a form this
+    /// version does not know keeps them.
+    #[test]
+    fn a_list_of_bounds_that_is_not_one_is_no_list() {
+        use cordelia_core::protocol::AGENT_MESSAGE_VALUE_BYTES;
+        let good_bound = |a: &str, b: Option<&str>| cordelia_crypto::message::PairBound {
+            a: a.into(),
+            b: b.map(String::from),
+            bound: Some(20),
+            set: 1_900_000_000,
+            at: 1_800_000_000,
+            for_secs: 3600,
+        };
+        let good = cordelia_crypto::message::PairBounds {
+            bounds: vec![good_bound("notes", Some("work"))],
+        }
+        .to_value(crate::names::is_a_name)
+        .unwrap();
+        let written = |bytes: &[u8]| {
+            let mut value = bytes.to_vec();
+            value.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+            value
+        };
+        // One bound, by hand: a, kind, b, bound, set, at, for.
+        let by_hand = |a: &[u8], kind: u8, b: &[u8], bound: u8, for_secs: u32| {
+            let mut out = vec![4, 1, 0, a.len() as u8];
+            out.extend_from_slice(a);
+            out.push(kind);
+            if kind == 1 {
+                out.extend_from_slice(&[0, b.len() as u8]);
+                out.extend_from_slice(b);
+            }
+            out.push(bound);
+            out.extend_from_slice(&1_900_000_000u64.to_be_bytes());
+            out.extend_from_slice(&1_800_000_000u64.to_be_bytes());
+            out.extend_from_slice(&for_secs.to_be_bytes());
+            written(&out)
+        };
+        let mut twice = cordelia_crypto::message::PairBounds {
+            bounds: vec![good_bound("notes", Some("work")), good_bound("notes", None)],
+        }
+        .to_value(crate::names::is_a_name)
+        .unwrap();
+        // The second bound made the first's pair.
+        let at = twice.iter().rposition(|b| *b == 2).unwrap();
+        let mut second_as_first = twice[..at].to_vec();
+        second_as_first.extend_from_slice(&[1, 0, 4]);
+        second_as_first.extend_from_slice(b"work");
+        second_as_first.extend_from_slice(&twice[at + 1..]);
+        second_as_first.truncate(AGENT_MESSAGE_VALUE_BYTES);
+        twice = second_as_first;
+        let mut past = good.clone();
+        past[1] = 2;
+        let mut fill = good.clone();
+        fill[AGENT_MESSAGE_VALUE_BYTES - 1] = 7;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "a name that is not a name",
+                by_hand(b"NOTES", 1, b"work", 20, 3600),
+            ),
+            (
+                "a kind other than 1 or 2",
+                by_hand(b"notes", 3, b"work", 20, 3600),
+            ),
+            ("a above b", by_hand(b"work", 1, b"notes", 20, 3600)),
+            ("a bound over 64", by_hand(b"notes", 1, b"work", 65, 3600)),
+            ("a for below 60", by_hand(b"notes", 1, b"work", 20, 59)),
+            (
+                "a for over 604,800",
+                by_hand(b"notes", 1, b"work", 20, 604_801),
+            ),
+            ("two bounds of one pair", twice),
+            ("bytes that run past the value", past),
+            ("a fill that is not zeros", fill),
+        ];
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        for (case, bad) in cases {
+            let s = devices(2);
+            let now = s.now + MINUTE;
+            takes(&s, 1, &bounds_entry(&s, 0, 1, good.clone()), now);
+            assert_eq!(
+                in_force_on(&s, 1, &pair, now).stops_at(),
+                Some(20),
+                "{case}"
+            );
+            let generation = held::generation_of(
+                &s[1].conn,
+                &derive::channel_id(&derive::messages_secret(&s[1].secret()).unwrap()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            let before = held::signer(&s[1].conn, &s.key(0), generation)
+                .unwrap()
+                .unwrap_or_default()
+                .not_messages;
+            takes(&s, 1, &bounds_entry(&s, 0, 2, bad), now);
+            assert_eq!(
+                in_force_on(&s, 1, &pair, now).stops_at(),
+                Some(10),
+                "{case}"
+            );
+            assert!(held::bounds(&s[1].conn).unwrap().is_empty(), "{case}");
+            let after = held::signer(&s[1].conn, &s.key(0), generation)
+                .unwrap()
+                .unwrap()
+                .not_messages;
+            assert_eq!(after, before + 1, "{case}");
+        }
+        // A form this version does not know leaves that key's bounds as
+        // they were.
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        takes(&s, 1, &bounds_entry(&s, 0, 1, good.clone()), now);
+        takes(&s, 1, &bounds_entry(&s, 0, 2, written(&[9, 1, 2, 3])), now);
+        assert_eq!(in_force_on(&s, 1, &pair, now).stops_at(), Some(20));
+    }
+
+    /// A store restored from a backup takes its own later list of bounds
+    /// (decision 2026-10-25, rule 2): merged into its own bounds by pair,
+    /// the later `set` kept; an own bound that the later list lacks is kept
+    /// only where it was set since this start; its next list goes above it.
+    #[test]
+    fn a_restored_store_takes_its_own_later_bounds() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        crate::bounds::started(&s[0].conn).unwrap();
+        let asks = |a: &str, b: Option<&str>, bound: u8, at: i64| {
+            allows_on(&s, 0, &allow_asked(a, b, Some(bound), 3600, true), at).unwrap();
+        };
+        asks("notes", Some("work"), 20, now);
+        let held_set = held::bounds(&s[0].conn).unwrap()[0].set;
+        asks("work", None, 6, now);
+        // The restored store starts again, and a person sets a pair.
+        crate::bounds::started(&s[0].conn).unwrap();
+        asks("plans", Some("work"), 4, now + 1);
+        let later = cordelia_crypto::message::PairBounds {
+            bounds: vec![
+                cordelia_crypto::message::PairBound {
+                    a: "notes".into(),
+                    b: Some("work".into()),
+                    bound: None,
+                    set: held_set + 5,
+                    at: (now + 5) as u64,
+                    for_secs: 3600,
+                },
+                cordelia_crypto::message::PairBound {
+                    a: "plans".into(),
+                    b: None,
+                    bound: Some(3),
+                    set: (now + 4) as u64,
+                    at: (now + 4) as u64,
+                    for_secs: 3600,
+                },
+            ],
+        }
+        .to_value(crate::names::is_a_name)
+        .unwrap();
+        takes(&s, 0, &bounds_entry(&s, 0, 6, later), now + 10);
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        assert_eq!(in_force_on(&s, 0, &pair, now + 10).stops_at(), None);
+        assert_eq!(
+            in_force_on(&s, 0, &crate::bounds::Pair::of("plans", None), now + 10).stops_at(),
+            Some(3)
+        );
+        // Set before this start, and lacked by the later list: it goes.
+        let before = crate::bounds::Pair::of("work", None);
+        assert_eq!(in_force_on(&s, 0, &before, now + 10).stops_at(), Some(10));
+        // Set since this start: it stays.
+        let since = crate::bounds::Pair::of("plans", Some("work"));
+        assert_eq!(in_force_on(&s, 0, &since, now + 10).stops_at(), Some(4));
+        let set = allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), Some(30), 3600, true),
+            now + 11,
+        )
+        .unwrap();
+        assert_eq!(set.allowed.list, Some(7));
+        assert_eq!(in_force_on(&s, 0, &pair, now + 12).stops_at(), Some(30));
+    }
+
+    /// A restored store that reaches its later list late keeps both lives'
+    /// last acts (decision 2026-10-25, rule 2, the review's two cases):
+    /// its first life set any, its later life ended it with a 10, and the
+    /// store went back to the any. After the restart a person sets a pair
+    /// of its own. Where a relay answers another to its list, it drops its
+    /// own bounds set before this start, the any among them, and keeps
+    /// what was set since; where a relay answers that it holds a later
+    /// list, nothing changes until the next pull hands that back, which is
+    /// merged: the 10 decides, and what was set since stays.
+    #[test]
+    fn a_restored_store_that_reaches_its_later_list_late_keeps_both_lives_last_acts() {
+        use crate::at_relays::{Kind, Pushed};
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        let since = crate::bounds::Pair::of("plans", Some("work"));
+        for answered_another in [true, false] {
+            let s = devices(2);
+            let now = s.now + MINUTE;
+            crate::bounds::started(&s[0].conn).unwrap();
+            allows_on(
+                &s,
+                0,
+                &allow_asked("notes", Some("work"), None, 3600, true),
+                now,
+            )
+            .unwrap();
+            let backup_set = held::bounds(&s[0].conn).unwrap()[0].set;
+            // The later life's list, which the relays hold: the 10.
+            let later = cordelia_crypto::message::PairBounds {
+                bounds: vec![cordelia_crypto::message::PairBound {
+                    a: "notes".into(),
+                    b: Some("work".into()),
+                    bound: Some(10),
+                    set: backup_set + 1,
+                    at: (now + 60) as u64,
+                    for_secs: 604_800,
+                }],
+            }
+            .to_value(crate::names::is_a_name)
+            .unwrap();
+            // At the revision the restored store next writes, where a relay
+            // answers another; above it, where it answers that it holds a
+            // later one.
+            let later = bounds_entry(&s, 0, if answered_another { 2 } else { 5 }, later);
+            // The restored store starts again, and a person sets a pair.
+            crate::bounds::started(&s[0].conn).unwrap();
+            allows_on(
+                &s,
+                0,
+                &allow_asked("plans", Some("work"), Some(4), 3600, true),
+                now + 120,
+            )
+            .unwrap();
+            assert_eq!(in_force_on(&s, 0, &pair, now + 121).stops_at(), None);
+            let pushed = bounds_list_of(&s, 0).unwrap().into_entry();
+            let channels = crate::at_relays::channels(&s[0].conn, &s[0].identity).unwrap();
+            let channel = channels
+                .iter()
+                .find(|own| own.kind == Kind::Messages)
+                .unwrap();
+            let answer = match answered_another {
+                true => Pushed::HoldsAnother,
+                false => Pushed::HoldsLater,
+            };
+            crate::marks::answered(
+                &s[0].conn,
+                &s[0].identity,
+                channel,
+                std::slice::from_ref(&pushed),
+                &[answer],
+                now + 122,
+                true,
+            )
+            .unwrap();
+            match answered_another {
+                true => {
+                    assert_eq!(in_force_on(&s, 0, &pair, now + 123).stops_at(), Some(10));
+                    assert_eq!(bounds_list_of(&s, 0).unwrap().rev, pushed.rev + 1);
+                }
+                false => {
+                    assert_eq!(in_force_on(&s, 0, &pair, now + 123).stops_at(), None);
+                    takes(&s, 0, &later, now + 124);
+                    assert_eq!(in_force_on(&s, 0, &pair, now + 125).stops_at(), Some(10));
+                }
+            }
+            assert_eq!(in_force_on(&s, 0, &since, now + 125).stops_at(), Some(4));
+        }
+    }
+
+    /// A relay that answers another cannot end a 10 (decision 2026-10-25,
+    /// rule 2, the review of the build): the laptop allows any for a week;
+    /// the desktop, having heard of it, goes back to 10, and allows any for
+    /// every agent of notes; the laptop does not hear of either. The
+    /// desktop starts again, hears the laptop's any for plans and work,
+    /// and sets 5 there. An answer of another to a list it no longer holds
+    /// changes nothing. One to the list it holds drops its own any of
+    /// before the start, keeps its 10 and the 5 set since, and leaves the
+    /// laptop's bounds; the list written above lists the 10, and the laptop
+    /// that hears it holds at 10. A fourth answer in a row writes nothing.
+    #[test]
+    fn a_relay_that_answers_another_cannot_end_a_ten() {
+        use crate::at_relays::{Kind, Pushed};
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        let to_all = crate::bounds::Pair::of("notes", None);
+        let since = crate::bounds::Pair::of("plans", Some("work"));
+        let asks = |n: usize, a: &str, b: Option<&str>, bound: Option<u8>, at: i64| {
+            allows_on(&s, n, &allow_asked(a, b, bound, 604_800, true), at).unwrap();
+        };
+        crate::bounds::started(&s[1].conn).unwrap();
+        asks(0, "notes", Some("work"), None, now);
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
+        asks(1, "notes", Some("work"), Some(10), now + 2);
+        asks(1, "notes", None, None, now + 3);
+        asks(0, "plans", Some("work"), None, now + 4);
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 5);
+        // The desktop starts again, and a person sets 5 for plans and work.
+        crate::bounds::started(&s[1].conn).unwrap();
+        let older = bounds_list_of(&s, 1).unwrap().into_entry();
+        asks(1, "plans", Some("work"), Some(5), now + 6);
+        let held = bounds_list_of(&s, 1).unwrap().into_entry();
+        assert_eq!(held.rev, older.rev + 1);
+        let channels = crate::at_relays::channels(&s[1].conn, &s[1].identity).unwrap();
+        let channel = channels
+            .iter()
+            .find(|own| own.kind == Kind::Messages)
+            .unwrap();
+        let another = |entry: &cordelia_crypto::entry::Entry, at: i64| {
+            crate::marks::answered(
+                &s[1].conn,
+                &s[1].identity,
+                channel,
+                std::slice::from_ref(entry),
+                &[Pushed::HoldsAnother],
+                at,
+                true,
+            )
+            .unwrap();
+        };
+        let stops =
+            |n: usize, pair: &crate::bounds::Pair| in_force_on(&s, n, pair, now + 10).stops_at();
+        assert_eq!(stops(1, &to_all), None);
+        // To a list it no longer holds: nothing.
+        another(&older, now + 7);
+        assert_eq!(stops(1, &to_all), None);
+        assert_eq!(bounds_list_of(&s, 1).unwrap().rev, held.rev);
+        // To the list it holds.
+        another(&held, now + 8);
+        assert_eq!(stops(1, &pair), Some(10));
+        assert_eq!(
+            stops(1, &to_all),
+            Some(10),
+            "its own any of before the start goes"
+        );
+        assert_eq!(stops(1, &since), Some(5));
+        let rows = held::bounds(&s[1].conn).unwrap();
+        assert_eq!(rows.iter().filter(|row| row.key == s.key(0)).count(), 2);
+        let written = bounds_list_of(&s, 1).unwrap();
+        assert_eq!(written.rev, held.rev + 1);
+        // The laptop hears it, and holds at 10.
+        assert_eq!(stops(0, &pair), None);
+        takes(&s, 0, &written, now + 9);
+        assert_eq!(stops(0, &pair), Some(10));
+        // Three in a row are written again, and no fourth.
+        for k in 0..3 {
+            let newest = bounds_list_of(&s, 1).unwrap().into_entry();
+            another(&newest, now + 11 + k);
+        }
+        let capped = bounds_list_of(&s, 1).unwrap().rev;
+        assert_eq!(capped, held.rev + 3);
+        another(&bounds_list_of(&s, 1).unwrap().into_entry(), now + 20);
+        assert_eq!(bounds_list_of(&s, 1).unwrap().rev, capped);
+        assert_eq!(stops(1, &pair), Some(10));
+    }
+
+    /// The known limit (decision 2026-10-25, rule 5, T22): the route of
+    /// `allow` sets any bound for whoever holds the token, with no terminal
+    /// at all. This test fails where that is no longer so, so that the
+    /// record is changed with the code.
+    #[actix_web::test]
+    async fn the_route_sets_a_bound_with_no_terminal() {
+        let (state, _) = a_node_with_a_message();
+        // A node set up with no relay has fetched what there is to fetch.
+        state.own_channels.set_up_with(0);
+        let body = web::Json(allow_asked("notes", Some("work"), None, 604_800, true));
+        let (status, said) = answer(allow(asked(), state.clone(), body).await).await;
+        assert_eq!(status, 200, "{said}");
+        assert_eq!(said["set"], true);
+        let rows = held::bounds(&state.db.lock().unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bound, None);
+        // Without the token, nothing.
+        let body = web::Json(allow_asked("notes", Some("work"), Some(3), 3600, true));
+        let (status, _) = answer(allow(not_asked(), state.clone(), body).await).await;
+        assert_eq!(status, 401);
+    }
+
+    /// The status object carries each bound in force that is not the usual
+    /// hold (decision 2026-10-25, rule 4): `a`, `b` (null for every agent),
+    /// `bound` (null for any), `until` in RFC 3339 and `set_on`; nothing
+    /// for a listed 10, or for one that has ended.
+    #[test]
+    fn the_status_object_carries_the_bounds() {
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        allows_on(
+            &s,
+            0,
+            &allow_asked("notes", Some("work"), Some(20), 3600, true),
+            now,
+        )
+        .unwrap();
+        allows_on(&s, 0, &allow_asked("plans", None, None, 7200, true), now).unwrap();
+        allows_on(
+            &s,
+            1,
+            &allow_asked("notes", Some("plans"), Some(10), 3600, true),
+            now,
+        )
+        .unwrap();
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
+        let said = counts_on(&s, 1, now + 1).answered();
+        let bounds = said["bounds"].as_array().unwrap();
+        assert_eq!(bounds.len(), 2, "{said}");
+        assert_eq!(
+            bounds[0],
+            json!({ "a": "notes", "b": "work", "bound": 20,
+                    "until": rfc3339(now + 3600),
+                    "set_on": { "label": "device 0", "fingerprint": fingerprint::shown(&s.key(0)) } })
+        );
+        assert_eq!(bounds[1]["a"], "plans");
+        assert_eq!(bounds[1]["b"], Value::Null);
+        assert_eq!(bounds[1]["bound"], Value::Null);
+        let mine = counts_on(&s, 0, now + 1).answered();
+        assert_eq!(mine["bounds"][0]["set_on"], "this");
+        assert!(rfc3339(now).ends_with('Z'));
+        // Ended: nothing.
+        let later = counts_on(&s, 1, now + 7200).answered();
+        assert_eq!(later["bounds"], json!([]));
     }
 }

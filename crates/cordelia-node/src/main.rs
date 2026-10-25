@@ -473,18 +473,49 @@ enum MsgCommand {
     },
     /// For a person at a terminal
     ///
-    /// It shows only the messages you have not read here yet, and says how
-    /// many others you have read. At a terminal it shows those of every
-    /// agent of yours on this device, with on which devices an agent read
-    /// each, and asks whether to mark them read by a person here: that ends
-    /// any hold between the agents they are between. Where there is
-    /// nothing new, it says so and asks nothing. Anywhere else it shows
-    /// only those of this folder's agent, and marks nothing.
+    /// It shows only the messages you have not read yet, on this device or
+    /// another, and says how many others you have read, and where. At a
+    /// terminal it shows those of every agent of yours on this device,
+    /// with on which devices an agent read each, and asks whether to mark
+    /// them read by you: that ends any hold between the agents they are
+    /// between, here and on your other devices. A device of yours on an
+    /// older version does not hear of it. Where there is nothing new, it
+    /// says so and asks nothing. Anywhere else it shows only those of this
+    /// folder's agent, and marks nothing.
     Log {
         /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
         /// the last while (30m, 2h, 3d)
         #[arg(long)]
         since: Option<String>,
+    },
+    /// For a person at a terminal: how many messages may wait unread
+    /// between two agents
+    ///
+    /// Sending between two agents of yours stops when 10 of their
+    /// messages wait for you to read them with `cordelia msg log`. Give
+    /// another number for a while, from 1 to 64, or any: then only the
+    /// hourly limits stop them. 10 goes back to the usual hold now. It
+    /// holds on every device of yours, and the latest you set decides.
+    /// `cordelia status` says each one. With --all it is for one agent's
+    /// messages to every agent. A device of yours on an older version
+    /// holds every pair at 10, and does not hear of this.
+    ///
+    /// cordelia msg allow notes work 20 --for 2h
+    #[command(
+        override_usage = "cordelia msg allow <a> <b> (<n> | any) [--for <time>]\n       \
+                                cordelia msg allow <a> --all (<n> | any) [--for <time>]"
+    )]
+    Allow {
+        /// Two names, or one with --all, then a number from 1 to 64, or any
+        #[arg(num_args = 0.., allow_negative_numbers = true, value_name = "A B N")]
+        words: Vec<String>,
+        /// The pair of the first name and every agent
+        #[arg(long)]
+        all: bool,
+        /// For how long: 30m, 8h, 2d, from 1m to 7d (8h where none is
+        /// given)
+        #[arg(long = "for", value_name = "TIME")]
+        for_time: Option<String>,
     },
 }
 
@@ -755,6 +786,18 @@ fn main() -> anyhow::Result<()> {
                 },
             ),
             MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
+            MsgCommand::Allow {
+                words,
+                all,
+                for_time,
+            } => msg_cmd::allow(
+                &cli.config,
+                &msg_cmd::AllowArgs {
+                    words,
+                    all,
+                    for_time,
+                },
+            ),
         },
         Some(Commands::SwarmInit {
             index,
@@ -1568,6 +1611,12 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                         println!("    {line}");
                     }
                 }
+                // Each bound a person set for a pair that is in force, and
+                // is not the usual hold (decision 2026-10-25, rule 4).
+                let now = chrono::Utc::now().timestamp();
+                for line in msg_cmd::status_bound_lines(&live["messages"], now) {
+                    println!("{line}");
+                }
             }
         }
         // A node whose address is refused is not asked, and is not known
@@ -2322,6 +2371,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             // as it is stored, and writes it off itself.
             if state.held.why().is_none() {
                 scope_off(&state);
+                messages_at_start(&state);
             }
             tokio::spawn(run_sync_loop(state.clone()));
         }
@@ -2644,6 +2694,26 @@ fn scope_off(state: &cordelia_api::state::AppState) {
     }
 }
 
+/// What a personal node does of messages at its start, once its first
+/// start on this version is done, before its first pass and before any
+/// route of messages answers (decision 2026-10-25, rules 1 and 2): the
+/// start is counted, so that a bound set from now on is known to be of
+/// this start; and the lists of a person's reads and of bounds that the
+/// store held from before step 20 are read once, where the device stands
+/// applied (at its first pass after it does, where it does not).
+fn messages_at_start(state: &cordelia_api::state::AppState) {
+    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = cordelia_api::bounds::started(&db) {
+        tracing::warn!(error = %e, "messages: could not count this start");
+    }
+    let now = state.sync_control.now();
+    match cordelia_api::reader::read_held_lists(&db, &state.identity, now) {
+        Ok(true) => tracing::info!("messages: read the lists held from before this version"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "messages: could not read the lists held"),
+    }
+}
+
 /// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
 /// node whose first start on this version is not done runs none: it
 /// tries the first start again when a cycle would have run, after a wait
@@ -2661,6 +2731,7 @@ fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
             // written off as at any start with sync on.
             if done {
                 scope_off(state);
+                messages_at_start(state);
             }
             done
         }
@@ -9022,6 +9093,127 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("At the start of each task, run `cordelia msg summary`."));
+    }
+
+    /// `cordelia msg --help` lists `allow` with a line that begins "For a
+    /// person at a terminal:", and its own help says what a device of an
+    /// older version does; `log`'s says that such a device does not hear
+    /// of a person's read (decision 2026-10-25, rules 1 and 2).
+    #[test]
+    fn the_help_of_allow_and_log_says_whom_it_is_for() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let msg = cli.find_subcommand_mut("msg").expect("msg is a command");
+        let help = msg.render_help().to_string();
+        let line = help
+            .lines()
+            .find(|line| line.trim_start().starts_with("allow "))
+            .unwrap_or_else(|| panic!("{help}"));
+        assert!(
+            line.trim_start()
+                .trim_start_matches("allow")
+                .trim_start()
+                .starts_with("For a person at a terminal:"),
+            "{line}"
+        );
+        let allow = msg
+            .find_subcommand_mut("allow")
+            .expect("msg allow is a command")
+            .render_long_help()
+            .to_string();
+        assert!(
+            allow.contains("A device of yours on an older version holds every pair at 10, and"),
+            "{allow}"
+        );
+        assert!(
+            allow.contains("cordelia msg allow <a> --all (<n> | any)"),
+            "{allow}"
+        );
+        let log = msg
+            .find_subcommand_mut("log")
+            .expect("msg log is a command")
+            .render_long_help()
+            .to_string();
+        assert!(
+            log.contains("A device of yours on an older version does not hear of it."),
+            "{log}"
+        );
+    }
+
+    /// `cordelia msg allow`'s command line is read whole, its flags after
+    /// its words or among them, and a word that is a negative number is a
+    /// word: the command refuses each with its own line, and not with the
+    /// parser's (decision 2026-10-25, rule 2).
+    #[test]
+    fn allows_command_line_is_read_whole() {
+        let parsed = |line: &[&str]| -> (Vec<String>, bool, Option<String>) {
+            let line: Vec<&str> = [&["cordelia", "msg", "allow"][..], line].concat();
+            match super::Cli::try_parse_from(line).map(|cli| cli.command) {
+                Ok(Some(super::Commands::Msg {
+                    what:
+                        super::MsgCommand::Allow {
+                            words,
+                            all,
+                            for_time,
+                        },
+                })) => (words, all, for_time),
+                Ok(_) => panic!("no msg allow"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let words =
+            |words: &[&str]| -> Vec<String> { words.iter().map(|w| w.to_string()).collect() };
+        assert_eq!(
+            parsed(&["notes", "work", "20", "--for", "1h"]),
+            (words(&["notes", "work", "20"]), false, Some("1h".into()))
+        );
+        assert_eq!(
+            parsed(&["--for", "2d", "notes", "--all", "any"]),
+            (words(&["notes", "any"]), true, Some("2d".into()))
+        );
+        assert_eq!(
+            parsed(&["notes", "work", "-1"]),
+            (words(&["notes", "work", "-1"]), false, None)
+        );
+        assert_eq!(parsed(&[]), (Vec::new(), false, None));
+    }
+
+    /// Plain `cordelia status` says each bound in force that is not the
+    /// usual hold, under `Node:` after `Devices:`, one line for each pair
+    /// (decision 2026-10-25, rule 4): a number and any, a pair of two names
+    /// and of every agent, set on this device and on another by its label;
+    /// nothing for the usual hold, for a listed 10, or for one that has
+    /// ended.
+    #[test]
+    fn the_status_says_each_bound_in_force() {
+        let now = 1_800_000_000;
+        let at = |at: i64| {
+            chrono::DateTime::from_timestamp(at, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let laptop = serde_json::json!({ "label": "laptop", "fingerprint": "a b c d" });
+        let messages = serde_json::json!({ "bounds": [
+            { "a": "notes", "b": "work", "bound": 20, "until": at(now + 3_600),
+              "set_on": "this" },
+            { "a": "plans", "b": null, "bound": null, "until": at(now + 3 * 86_400),
+              "set_on": laptop },
+            { "a": "notes", "b": "plans", "bound": 10, "until": at(now + 3_600),
+              "set_on": "this" },
+            { "a": "work", "b": "work", "bound": 5, "until": at(now), "set_on": "this" },
+        ]});
+        assert_eq!(
+            msg_cmd::status_bound_lines(&messages, now),
+            [
+                "  Messages:  between notes and work, sending stops at 20 until 09:00 UTC (you \
+                 set it on this device)",
+                "  Messages:  from plans to every agent, only the hourly limits stop sending \
+                 until 08:00 UTC on 2027-01-18 (you set it on \"laptop\")",
+            ]
+        );
+        // The usual hold says nothing: no bound, or no object at all.
+        assert!(msg_cmd::status_bound_lines(&serde_json::json!({ "bounds": [] }), now).is_empty());
+        assert!(msg_cmd::status_bound_lines(&serde_json::Value::Null, now).is_empty());
     }
 
     /// `cordelia msg summary --help` says when to give `--folder`, and

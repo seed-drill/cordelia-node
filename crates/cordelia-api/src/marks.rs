@@ -33,18 +33,46 @@
 //!   nothing, and one from a key that no longer counts says nothing.
 //!
 //! **What a device that lies in its list can do:** hide a message from the
-//! summaries of the other devices' agents of that name. Not from `log`,
-//! nor from `read`, which show every message that is named or held, with
-//! the devices whose lists say it was read.
+//! summaries of the other devices' agents of that name. Not from `log` by
+//! that list, nor from `read`, which show every message that is named or
+//! held, with the devices whose lists say it was read.
+//!
+//! ## What a person read (decision 2026-10-25, rule 1)
+//!
+//! **Read by a person** counts on every device of the person's. A device
+//! keeps a person's read here in its own table, and says the newest 120 to
+//! the other devices in its list of a person's reads, the one entry in its
+//! slot `person/<its key>`, of form 3 ([`write_person_list`]), by the rules
+//! of the agents' list: never before the first fetch, nor where the device
+//! does not stand applied or has sync off; wherever the table holds an ID
+//! that the list held lacks, so `log`'s write that marks writes it too; one
+//! revision above the list held; and again above a relay's answer of
+//! another, at most three times in a row, counted apart from the agents'
+//! list.
+//!
+//! - **A list taken** ([`person_list_taken`]): another key's adds each of
+//!   its IDs to what is kept of that key, **as a union**, so that a read
+//!   that falls out of a newer list stays read. The device's own, from its
+//!   later life, adds each ID whose message it holds to its own table, and
+//!   keeps the rest under its own key.
+//! - **Whether a message is read by a person** is worked out when it is
+//!   asked ([`person_read_now`]): a row of its own table, or a row of
+//!   another key's lists under a key that counts now.
+//!
+//! **What a device that lies in that list can do:** hide a message from
+//! `log` on every device, and end its hold. `log` then says on which device
+//! a person read each message it does not show (rule 5).
 
 use rusqlite::Connection;
+
+use std::collections::{HashMap, HashSet};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{AGENT_MESSAGE_SENDS_MAX, REV_BAND_HALF};
 use cordelia_crypto::derive;
-use cordelia_crypto::entry::Entry;
+use cordelia_crypto::entry::{Entry, Value};
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_crypto::message::{self, ReadMarks, read_name};
+use cordelia_crypto::message::{self, PersonReads, ReadMarks, hold_name, person_name, read_name};
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::StorageError;
 use cordelia_storage::entries::{self, Outcome};
@@ -237,14 +265,30 @@ pub fn answered(
             return Ok(None);
         }
         // The slot is the list's in the generation applied: its name is
-        // made under that channel's slot key.
+        // made under that channel's slot key. Each of the three lists is
+        // matched by its own slot, and written again apart (decision
+        // 2026-10-25, rules 1 and 2).
         let own = identity.public_key();
         let held = Held::of(conn, &own)?;
-        let another = entries.iter().zip(answers).find(|(entry, answer)| {
-            **answer == Pushed::HoldsAnother && entry.author == own && entry.slot == held.slot
-        });
-        match another {
-            Some((entry, _)) => list_written(conn, identity, now, fetched, Some(entry.rev)),
+        let another = |slot: &[u8; 32]| {
+            entries
+                .iter()
+                .zip(answers)
+                .find(|(entry, answer)| {
+                    **answer == Pushed::HoldsAnother && entry.author == own && entry.slot == *slot
+                })
+                .map(|(entry, _)| entry.rev)
+        };
+        let person = HeldList::of(conn, &own, PersonList::Reads)?;
+        if let Some(rev) = another(&person.slot) {
+            person_list_written(conn, identity, now, fetched, Some(rev))?;
+        }
+        let bounds = HeldList::of(conn, &own, PersonList::Bounds)?;
+        if let Some(rev) = another(&bounds.slot) {
+            crate::bounds::answered_another(conn, identity, now, fetched, rev)?;
+        }
+        match another(&held.slot) {
+            Some(rev) => list_written(conn, identity, now, fetched, Some(rev)),
             None => Ok(None),
         }
     })
@@ -281,11 +325,14 @@ fn mapped(conn: &Connection) -> Result<Vec<String>, PersonError> {
 /// `now`, in the caller's write: the list of each key that no longer
 /// counts goes, where who counts can be read; each bare hash whose message
 /// the device now holds is given its ID and name, and one still bare 30
-/// days after it was merged goes.
+/// days after it was merged goes. And what is kept of other devices'
+/// lists of a person's reads is kept within its bounds: 120 of each key of
+/// messages not held, for 30 days (decision 2026-10-25, rule 1.2).
 pub(crate) fn hourly(conn: &Connection, now: i64) -> Result<(), PersonError> {
     if let Ok(counting) = who_counts(conn) {
         kept(held::drop_lists_but(conn, &counting.keys()))?;
     }
+    kept(held::keep_person_marks(conn, now))?;
     kept(held::keep_bare_marks(conn, &mapped(conn)?, now)).map(|_| ())
 }
 
@@ -382,6 +429,290 @@ pub fn unread(
         }
     }
     Ok(unread)
+}
+
+// ── What a person read (decision 2026-10-25, rule 1) ────────────────
+
+/// One of the device's lists of what a person did at a terminal (decision
+/// 2026-10-25, rules 1 and 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersonList {
+    /// What a person read on it, in `person/<its key>`.
+    Reads,
+    /// The bounds a person set on it, in `hold/<its key>`.
+    Bounds,
+}
+
+impl PersonList {
+    fn name(self, own: &[u8; 32]) -> Result<String, PersonError> {
+        Ok(match self {
+            Self::Reads => person_name(own)?,
+            Self::Bounds => hold_name(own)?,
+        })
+    }
+
+    /// The count of lists written again in a row for a relay's answer of
+    /// another: each list's apart from the others'.
+    fn again_key(self) -> &'static str {
+        match self {
+            Self::Reads => meta::MESSAGES_PERSON_AGAIN,
+            Self::Bounds => meta::MESSAGES_BOUNDS_AGAIN,
+        }
+    }
+}
+
+/// The slot of one of those lists in the generation applied, and the list
+/// of the device's own that its store holds there: its revision, and its
+/// value where it opens.
+pub(crate) struct HeldList {
+    list: PersonList,
+    secret: [u8; 32],
+    pub(crate) slot: [u8; 32],
+    pub(crate) held: Option<(u64, Option<Value>)>,
+}
+
+impl HeldList {
+    pub(crate) fn of(
+        conn: &Connection,
+        own: &[u8; 32],
+        list: PersonList,
+    ) -> Result<Self, PersonError> {
+        let standing = Standing::to_write(conn)?;
+        let secret = derive::messages_secret(&standing.secret)?;
+        let channel = derive::channel_id(&secret)?;
+        let slot = slot_id(&derive::slot_key(&secret)?, &list.name(own)?);
+        let held = match entries::author_entry(conn, &channel, &slot, own)? {
+            Some(stored) => {
+                let entry = stored.entry.check()?;
+                let value = entry.open(&secret).ok().map(|inside| inside.value);
+                Some((entry.rev, value))
+            }
+            None => None,
+        };
+        Ok(Self {
+            list,
+            secret,
+            slot,
+            held,
+        })
+    }
+
+    /// The revision of the list held, or 0.
+    pub(crate) fn rev(&self) -> u64 {
+        self.held.as_ref().map_or(0, |(rev, _)| *rev)
+    }
+
+    /// Write `value` as the list, one revision above the list held, at
+    /// `now`, where it is due (decision 2026-10-25, rules 1 and 2, as
+    /// decision 2026-10-09 §2.4 has the agents' list written): `changed`,
+    /// it holds what the list held does not; or, with `above`, a relay
+    /// answered that it holds another of the device's at that revision, the
+    /// revision of the list held, and it has been written again so fewer
+    /// than three times in a row. The caller has checked that it may write
+    /// ([`may_write`]): never before the first fetch, nor where the device
+    /// does not stand applied or has sync off. A list stays in the bottom
+    /// half of band 0. Returns the revision written, where one was. In the
+    /// caller's write.
+    pub(crate) fn write(
+        &self,
+        conn: &Connection,
+        identity: &NodeIdentity,
+        now: i64,
+        above: Option<u64>,
+        changed: bool,
+        value: Vec<u8>,
+    ) -> Result<Option<u64>, PersonError> {
+        let rev = self.rev();
+        let due = match above {
+            Some(answered) => self.takes_answer(conn, answered)?,
+            None => changed,
+        };
+        let next = rev + 1;
+        if !due || next >= REV_BAND_HALF {
+            return Ok(None);
+        }
+        let again = match above {
+            Some(_) => self.again(conn)? + 1,
+            None => 0,
+        };
+        meta::set(conn, self.list.again_key(), &again.to_string())?;
+        let inside = message::inside(self.list.name(&identity.public_key())?, value);
+        let entry = Entry::seal(&self.secret, identity, next, &inside)?.check()?;
+        if entries::store(conn, &entry, now)? != Outcome::Stored {
+            return Err(PersonError::Held(
+                "the store holds a list of this device's at or above that revision".into(),
+            ));
+        }
+        Ok(Some(next))
+    }
+}
+
+impl HeldList {
+    /// How many times in a row the list was written again for a relay's
+    /// answer of another.
+    fn again(&self, conn: &Connection) -> Result<usize, PersonError> {
+        Ok(meta::get(conn, self.list.again_key())?
+            .and_then(|again| again.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Whether a relay's answer that it holds another list of the device's
+    /// at `answered` is one the list is written again for (decision
+    /// 2026-10-09 §2.4, decision 2026-10-25, rules 1 and 2): it names the
+    /// revision of the list held, and the list has been written again so
+    /// fewer than three times in a row (`AGENT_MESSAGE_SENDS_MAX`).
+    pub(crate) fn takes_answer(
+        &self,
+        conn: &Connection,
+        answered: u64,
+    ) -> Result<bool, PersonError> {
+        Ok(self.rev() == answered && self.again(conn)? + 1 < AGENT_MESSAGE_SENDS_MAX)
+    }
+}
+
+/// Whether the device may write a list in the messages channel now: it
+/// has fetched the channel since the node started, stands applied, and has
+/// sync on (decision 2026-10-09 §2.4).
+pub(crate) fn may_write(conn: &Connection, fetched: bool) -> Result<bool, PersonError> {
+    Ok(fetched
+        && stands(conn)? == Stands::Applied
+        && meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_some())
+}
+
+/// Write the device's list of what a person read on it, at `now`, where it
+/// is due (decision 2026-10-25, rule 1): its table of a person's reads
+/// holds an ID that the list of its own in its store lacks. Never before
+/// the first fetch (`fetched`), nor where the device does not stand
+/// applied or has sync off. Returns the revision written, where one was.
+/// One transaction.
+pub fn write_person_list(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: bool,
+) -> Result<Option<u64>, PersonError> {
+    in_one(conn, || {
+        person_list_written(conn, identity, now, fetched, None)
+    })
+}
+
+/// [`write_person_list`], in the caller's write; with `above`, a relay
+/// answered that it holds another list of the device's at that revision.
+pub(crate) fn person_list_written(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: bool,
+    above: Option<u64>,
+) -> Result<Option<u64>, PersonError> {
+    if !may_write(conn, fetched)? {
+        return Ok(None);
+    }
+    let held = HeldList::of(conn, &identity.public_key(), PersonList::Reads)?;
+    // A list of its own that does not read is a list of no IDs: the next
+    // goes above it all the same.
+    let listed: HashSet<held::Id> = held
+        .held
+        .as_ref()
+        .and_then(|(_, value)| value.as_ref())
+        .and_then(|value| PersonReads::from_value(value).ok())
+        .map(|list| list.ids.into_iter().collect())
+        .unwrap_or_default();
+    let ids = kept(held::person_ids_to_list(conn))?;
+    let changed = ids.iter().any(|id| !listed.contains(id));
+    let value = PersonReads { ids }
+        .to_value()
+        .map_err(|e| PersonError::Held(format!("a list of a person's reads: {e}")))?;
+    held.write(conn, identity, now, above, changed, value)
+}
+
+/// The reader took `ids`, the list of a person's reads of the device whose
+/// key is `signer`, which the store kept over what it held (decision
+/// 2026-10-25, rule 1), in the door's write. Another key's IDs are each
+/// added to what is kept of it, and nothing is taken away. The device's
+/// own, `own`, is one a relay handed back from its later life: each ID
+/// whose message it holds is added to its own table, and the rest are kept
+/// under its own key.
+pub(crate) fn person_list_taken(
+    conn: &Connection,
+    own: &[u8; 32],
+    signer: &[u8; 32],
+    ids: &[held::Id],
+    now: i64,
+) -> Result<(), PersonError> {
+    if signer != own {
+        return kept(held::keep_person_list(conn, signer, ids, now));
+    }
+    let mut not_held = Vec::new();
+    // The oldest first, so that the newest of the list is the newest here.
+    for id in ids.iter().rev() {
+        match kept(held::holds_message(conn, id))? {
+            true => {
+                kept(held::mark_read_by_a_person(conn, id))?;
+            }
+            false => not_held.push(*id),
+        }
+    }
+    not_held.reverse();
+    kept(held::keep_person_list(conn, own, &not_held, now))
+}
+
+/// Where a person read a message, as it is worked out now (decision
+/// 2026-10-25, rule 1.3): on this device, or by the lists of the keys that
+/// count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonReadOn {
+    pub here: bool,
+    /// The keys that count whose lists say so, in order of key.
+    pub devices: Vec<[u8; 32]>,
+}
+
+impl PersonReadOn {
+    /// Whether it is read by a person.
+    pub fn is_read(&self) -> bool {
+        self.here || !self.devices.is_empty()
+    }
+}
+
+/// What a person read, read with two statements for every message at once
+/// (decision 2026-10-25, rule 1.3): the device's own table, and the lists
+/// of the keys that count by `counting`, which the caller works out once.
+pub struct PersonRead {
+    here: HashSet<held::Id>,
+    lists: HashMap<held::Id, Vec<[u8; 32]>>,
+}
+
+/// What a person read, now.
+pub fn person_read_now(conn: &Connection, counting: &Counting) -> Result<PersonRead, PersonError> {
+    let read = kept(held::person_reads(conn))?;
+    let mut lists: HashMap<held::Id, Vec<[u8; 32]>> = HashMap::new();
+    for (key, id) in read.lists {
+        if counting.counts(&key) {
+            lists.entry(id).or_default().push(key);
+        }
+    }
+    for keys in lists.values_mut() {
+        keys.sort();
+    }
+    Ok(PersonRead {
+        here: read.here.into_iter().collect(),
+        lists,
+    })
+}
+
+impl PersonRead {
+    /// Where a person read message `id`.
+    pub fn on(&self, id: &held::Id) -> PersonReadOn {
+        PersonReadOn {
+            here: self.here.contains(id),
+            devices: self.lists.get(id).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Whether a person read message `id`, here or on a device that counts.
+    pub fn is_read(&self, id: &held::Id) -> bool {
+        self.here.contains(id) || self.lists.contains_key(id)
+    }
 }
 
 /// What the store answered, with its error as the device's.
@@ -1361,6 +1692,7 @@ mod tests {
             folder: None,
             since: None,
             mark: &[],
+            fetched: true,
         };
         let log = crate::messages::log_of(&s[2].conn, &s[2].identity, &asked, t, |_| false)
             .unwrap_or_else(|e| panic!("{e:?}"));
@@ -1435,5 +1767,117 @@ mod tests {
             true,
         );
         assert_eq!(answer.unwrap(), None);
+    }
+
+    /// Device `n`'s own list of a person's reads that its store holds, as
+    /// its revision and IDs.
+    fn person_listed(s: &Several, n: usize) -> Option<(u64, Vec<held::Id>)> {
+        let secret = messages_secret(s, n);
+        let slot = slot_id(
+            &derive::slot_key(&secret).unwrap(),
+            &person_name(&s.key(n)).unwrap(),
+        );
+        let channel = derive::channel_id(&secret).unwrap();
+        let entry = entries::author_entry(&s[n].conn, &channel, &slot, &s.key(n))
+            .unwrap()?
+            .entry
+            .check()
+            .unwrap();
+        let inside = entry.open(&secret).unwrap();
+        Some((
+            entry.rev,
+            PersonReads::from_value(&inside.value).unwrap().ids,
+        ))
+    }
+
+    /// A device writes no list of a person's reads before its first fetch
+    /// of the messages channel since it started, nor with sync off, and
+    /// writes it once both hold (decision 2026-10-25, rule 1, as decision
+    /// 2026-10-09 §2.4 has the agents' list): nothing new, nothing again.
+    #[test]
+    fn the_persons_list_waits_for_the_first_fetch_and_for_sync() {
+        let s = devices(2);
+        let t = s.now;
+        // A person here read what it sent, as `sends` marks it.
+        let id = sends(&s, 0, "~", "notes", "read early", t);
+        let write = |fetched: bool| write_person_list(&s[0].conn, &s[0].identity, t, fetched);
+        assert_eq!(write(false).unwrap(), None);
+        assert!(person_listed(&s, 0).is_none());
+        meta::remove(&s[0].conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(write(true).unwrap(), None);
+        assert!(person_listed(&s, 0).is_none());
+        meta::set(&s[0].conn, meta::SYNC_CLAUDE_DIR, "/home/laptop/.claude").unwrap();
+        assert_eq!(write(true).unwrap(), Some(1));
+        assert_eq!(person_listed(&s, 0), Some((1, vec![id])));
+        assert_eq!(write(true).unwrap(), None);
+    }
+
+    /// A relay that answers another to every list of a person's reads
+    /// pushed makes the device write it under at most four revisions: three
+    /// written again, and no fourth, until it is written for an ID it
+    /// lacked, which starts the count again (decision 2026-10-25, rule 1).
+    /// The count is the list's own: the agents' list is written again for
+    /// its own answer all the same.
+    #[test]
+    fn a_relay_that_answers_another_to_the_persons_list_gets_three_more_at_most() {
+        let mut s = devices(2);
+        let t = s.now;
+        sends(&s, 0, "~", "notes", "first", t);
+        assert_eq!(
+            write_person_list(&s[0].conn, &s[0].identity, t, true).unwrap(),
+            Some(1)
+        );
+        let own = crate::at_relays::channels(&s[0].conn, &s[0].identity).unwrap();
+        let channel = own.iter().find(|own| own.kind == Kind::Messages).unwrap();
+        let person_entry = |s: &Several| {
+            let secret = messages_secret(s, 0);
+            let slot = slot_id(
+                &derive::slot_key(&secret).unwrap(),
+                &person_name(&s.key(0)).unwrap(),
+            );
+            let channel = derive::channel_id(&secret).unwrap();
+            entries::author_entry(&s[0].conn, &channel, &slot, &s.key(0))
+                .unwrap()
+                .unwrap()
+                .entry
+        };
+        let answer_newest = |s: &Several| {
+            answered(
+                &s[0].conn,
+                &s[0].identity,
+                channel,
+                std::slice::from_ref(&person_entry(s)),
+                &[Pushed::HoldsAnother],
+                t,
+                true,
+            )
+            .unwrap();
+            person_listed(s, 0).unwrap().0
+        };
+        let written: Vec<u64> = (0..4).map(|_| answer_newest(&s)).collect();
+        assert_eq!(written, [2, 3, 4, 4]);
+        sends(&s, 0, "~", "work", "second", t);
+        assert_eq!(
+            write_person_list(&s[0].conn, &s[0].identity, t, true).unwrap(),
+            Some(5)
+        );
+        let written: Vec<u64> = (0..4).map(|_| answer_newest(&s)).collect();
+        assert_eq!(written, [6, 7, 8, 8]);
+        // The agents' list counts apart: its first answer of another
+        // writes it again.
+        let id = sends(&s, 1, "~", "notes", "for laptop", t);
+        s.pass(1, 0);
+        assert_eq!(reads(&s, 0, "notes", &id, t, true).list, Some(1));
+        let list = own_list(&s, 0).unwrap().entry;
+        let again = answered(
+            &s[0].conn,
+            &s[0].identity,
+            channel,
+            std::slice::from_ref(&list),
+            &[Pushed::HoldsAnother],
+            t,
+            true,
+        );
+        assert_eq!(again.unwrap(), Some(2));
     }
 }
