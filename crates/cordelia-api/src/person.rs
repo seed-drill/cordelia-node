@@ -1080,8 +1080,17 @@ pub fn shown(
         };
         // It is a change of the phrase's, checked: whatever it is to this
         // device, the keys it removes are removed from now on, on any
-        // branch (decision 2026-10-24 (removal), rule 2).
-        know_removed(conn, &opened.statement.statement, now)?;
+        // branch (decision 2026-10-24 (removal), rule 2). But for this
+        // device's own key where the change stops it as removed: it seals
+        // nothing from then, its way on is a new key, and it still reads
+        // its own store, what it carried and has yet to let go among it.
+        // Made apart, a change that removes it does keep its key, and the
+        // device is closed.
+        let mut removes = opened.statement.statement.clone();
+        if judgement == Judgement::Removed {
+            removes.removed.retain(|key| *key != identity.public_key());
+        }
+        know_removed(conn, &removes, now)?;
         match judgement {
             Judgement::Behind => Ok(Shown::Behind),
             Judgement::Fork => {
@@ -7217,7 +7226,9 @@ mod tests {
             shown(&conn, &device(2), &removal, NOW).unwrap(),
             Shown::Removed
         );
-        assert_eq!(removed(&conn), vec![key(2)]);
+        // Its own key is not kept: it is stopped as removed, and still
+        // reads its own store.
+        assert!(removed(&conn).is_empty());
     }
 
     /// A change shown that could be applied, and that lists a key this
