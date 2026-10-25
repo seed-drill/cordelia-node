@@ -1458,9 +1458,6 @@ fn log_in(
     let counting = who_counts(conn)?;
     let standing = Standing::of(conn)?;
     let statement = &standing.held.statement.statement;
-    // Read by a person on any device that counts (decision 2026-10-25,
-    // rule 1.3), worked out once, after what is marked here.
-    let mut person: Option<marks::PersonRead> = None;
     let current = match messages_channel(conn)? {
         Some(channel) => kept(held::generation_of(conn, &channel))?,
         None => None,
@@ -1493,7 +1490,9 @@ fn log_in(
         0 => None,
         _ => marks::person_list_written(conn, identity, now, asked.fetched, None)?,
     };
-    let person = person.insert(marks::person_read_now(conn, &counting)?);
+    // Read by a person on any device that counts (decision 2026-10-25,
+    // rule 1.3), worked out once, after what is marked here.
+    let person = marks::person_read_now(conn, &counting)?;
     let mut already_read = 0;
     let mut read_where: Vec<(Option<String>, Option<[u8; 32]>)> = Vec::new();
     for message in &shown {
@@ -5834,19 +5833,22 @@ mod tests {
 
     /// A store restored from a backup takes its own later list of bounds
     /// (decision 2026-10-25, rule 2): merged into its own bounds by pair,
-    /// the later `set` kept; its next list goes above it.
+    /// the later `set` kept; an own bound that the later list lacks is kept
+    /// only where it was set since this start; its next list goes above it.
     #[test]
     fn a_restored_store_takes_its_own_later_bounds() {
         let s = devices(2);
         let now = s.now + MINUTE;
-        allows_on(
-            &s,
-            0,
-            &allow_asked("notes", Some("work"), Some(20), 3600, true),
-            now,
-        )
-        .unwrap();
+        crate::bounds::started(&s[0].conn).unwrap();
+        let asks = |a: &str, b: Option<&str>, bound: u8, at: i64| {
+            allows_on(&s, 0, &allow_asked(a, b, Some(bound), 3600, true), at).unwrap();
+        };
+        asks("notes", Some("work"), 20, now);
         let held_set = held::bounds(&s[0].conn).unwrap()[0].set;
+        asks("work", None, 6, now);
+        // The restored store starts again, and a person sets a pair.
+        crate::bounds::started(&s[0].conn).unwrap();
+        asks("plans", Some("work"), 4, now + 1);
         let later = cordelia_crypto::message::PairBounds {
             bounds: vec![
                 cordelia_crypto::message::PairBound {
@@ -5876,6 +5878,12 @@ mod tests {
             in_force_on(&s, 0, &crate::bounds::Pair::of("plans", None), now + 10).stops_at(),
             Some(3)
         );
+        // Set before this start, and lacked by the later list: it goes.
+        let before = crate::bounds::Pair::of("work", None);
+        assert_eq!(in_force_on(&s, 0, &before, now + 10).stops_at(), Some(10));
+        // Set since this start: it stays.
+        let since = crate::bounds::Pair::of("plans", Some("work"));
+        assert_eq!(in_force_on(&s, 0, &since, now + 10).stops_at(), Some(4));
         let set = allows_on(
             &s,
             0,
