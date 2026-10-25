@@ -241,6 +241,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` | 16MB (derived) | parameter-rationale.md §12.7 |
 | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` | 256 | parameter-rationale.md §12.7 |
 | `ENTRY_CHANNEL_UNUSED_DAYS`, `ENTRY_CHANNEL_USED_STEP_SECS`, `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS` | 90, 3600s, 3600s (derived) | parameter-rationale.md §12.7 |
+| `RELAY_USES_WRITE_INTERVAL_SECS` | 60s (a relay writes the uses of channels it keeps in memory: a proof and a show are reads; also at the sweep and a clean stop) | parameter-rationale.md §12.7 |
 | `ENTRY_OFFER_INTERVAL_SECS`, `RELAY_ENTRY_PULL_INTERVAL_SECS` | 5s, 10s (derived) | parameter-rationale.md §12.7 |
 | `RELAY_ENTRY_PULL_PAGES`, `RELAY_CHANNEL_PAGES_PER_PASS` | 10, 10 | parameter-rationale.md §12.7 |
 | `ENTRY_REQUESTS_PER_PEER_PER_MINUTE`, `OWN_ENTRY_REQUESTS_PER_MINUTE` | 3000, 2250 (derived) | parameter-rationale.md §12.8 |
