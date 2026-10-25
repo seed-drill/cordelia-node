@@ -982,6 +982,54 @@ cordelia_items_synced_total 45
 - `cordelia_replication_lag_seconds` is computed as `now() - last_successful_sync_at` per channel. High values indicate replication problems.
 - SPOs already run Prometheus/Grafana for Cardano nodes. Same stack, zero learning curve.
 
+### 3.15a GET /api/v1/metrics/load
+
+> **v1 status.** The counters of the scale test
+> ([decision 2026-10-22](../decisions/2026-10-22-a-scale-test-for-r1.md)
+> §1.1, rule 3; §7.3; `crates/cordelia-core/src/load.rs`). Served by every
+> role.
+
+The same text form as §3.15. Bearer token authentication required; it is
+answered while a node is held up, as every GET is. **It takes no lock:** the
+token is checked and atomics are read, so a read neither waits for the
+node's work nor holds it up. Each counter counts from the node's start; a
+gauge is what it was when last set.
+
+- `cordelia_lock_wait_microseconds` and `cordelia_lock_hold_microseconds`:
+  histograms of the node's lock on its database, `kind` one of `show_whole`,
+  `show_short`, `proof`, `pull`, `push`, `relays`, `sweep`, `checkpoint`,
+  `pass`, `cycle`, `api` and `other`; buckets of powers of two from 1 µs to
+  16 s, with `_sum`, `_count`, `_max` and `_over{ms="5"|"50"|"100"|"250"}`.
+  A take that tries the lock until its time is up (`cordelia msg summary`,
+  for at most 100 ms) has its wait counted from its first try.
+- `cordelia_lock_given_up_total{kind}`: the takes that tried until their time
+  was up and were not had; each is a summary that printed nothing.
+- `cordelia_lock_nested_wait_microseconds{mutex="rates"|"room"}`: the waits
+  for a relay's rates and room while the lock is held.
+- `cordelia_requests_total{kind}`, `cordelia_answers_total{kind,answer}`
+  (`answered`, once the answer is written; `not_now`, `refused_for_rate`,
+  `not_served`, `stray`, and `large_later`, a frame over a small message for
+  which no large permit came, of which only the length was read),
+  `cordelia_entries_refused_total{kind,answer}` (`refused_for_room`,
+  `refused_for_new_channels`, each entry refused in an answer given) and
+  `cordelia_stream_bytes_total{kind,direction}`: what a relay is asked on the
+  streams of entries. A request is counted as it is read, with its bytes in.
+- `cordelia_connections_open`, `cordelia_connections_closed_total` (gone for
+  any reason, warm churn's among them),
+  `cordelia_connections_turned_away_total{why="bound"|"address"|"subnet"|"refused_for_a_time"}`
+  and `cordelia_relay_link_closures_total{relay}`.
+- `cordelia_churns_total`, `cordelia_closed_by_warm_churn_total{peer="device"|"relay"}`
+  and `cordelia_governor_peers{state="hot"|"warm"|"cold"}`, the governor's
+  own count at its tick.
+- `cordelia_device_requests_total{relay,kind}`,
+  `cordelia_device_request_bytes_total{relay,kind}`,
+  `cordelia_device_held_back_total{relay}` and
+  `cordelia_device_refused_for_now_total{relay}`: what a device asked of
+  each relay, by its key in hex. Refused for now is what the relay reset
+  with `ERR_RATE_LIMIT`, which a relay's `refused_for_rate` and `not_now`
+  both are: a device cannot tell them apart, and its count is checked
+  against the two together.
+
 ---
 
 ### 3.16 The Local API of a Device, for the Names It Holds
@@ -1111,7 +1159,7 @@ of the device's own. Nothing of the older kind is read.
 
 | Route | What it does |
 |-------|--------------|
-| `POST /api/v1/devices/list` | Everything `cordelia devices` and `cordelia status` say of this device and its person: where it stands (`state`: `no_phrase`, `applied`, `fork`, `removed`, `not_listed`, `not_opened`); the devices of the statement it has applied, each with whether it has applied the statement and sent what it carried; the devices added since, with who added each; the removed keys, each with the label that this device knew it by; the keys that are in neither list of the last change; the devices that have said they left; for each relay, whether it holds the latest change entry; the keys typed at `accept`; the notices that a person has not cleared; the names that no device lists yet; and what this device has still to send. Each device is shown with its label and the first four words of its key's fingerprint. What a status goes by for its level is here too: for each relay `holds_latest`, `heard_since_woke`, `connected_secs` (for how long the node has been connected to it, by the node's own clock) and `no_room_at` (when it last refused something for room, or for the address's allowance); `applied_at` (when this device applied the change) and `removed_a_key` (whether that change removed a key that the statement before had not); `names` (`sent`, `to_go`, and `to_go_since`, since when the first of them has waited); `not_reached` (the relays it is set up with and is not connected to); and `waiting` (for each connected relay, how many of the device's channels have something still to send there, with the address it is reached at as `relay` and, as `name`, the name that the configuration gives it, where it answers with that relay's key: `cordelia devices` lists a relay once, by its name, with both things said on its line); and, only where the request's body carries `"sent_to_no_relay": true`, `sent_to_no_relay` (`versions` and `names`: how many versions, of how many names, this device holds that it signed and has sent to no relay, however the device stands; what another key signed came from a relay, and is not counted, decision 2026-10-17 §4.5). `cordelia phrase`, `cordelia init --new-key` and `cordelia accept` on a device alone under a phrase ask for it, and say it before their yes; a status does not ask, since it calls this route every few seconds and the count reads every entry of every name |
+| `POST /api/v1/devices/list` | Everything `cordelia devices` and `cordelia status` say of this device and its person: where it stands (`state`: `no_phrase`, `applied`, `fork`, `removed`, `not_listed`, `not_opened`); the devices of the statement it has applied, each with whether it has applied the statement and sent what it carried; the devices added since, with who added each; the removed keys, each with the label that this device knew it by; the keys that are in neither list of the last change; the devices that have said they left; for each relay, whether it holds the latest change entry; the keys typed at `accept`; the notices that a person has not cleared; the names that no device lists yet; and what this device has still to send. Each device is shown with its label and the first four words of its key's fingerprint. What a status goes by for its level is here too: for each relay `holds_latest`, `heard_since_woke`, `connected_secs` (for how long the node has been connected to it, by the node's own clock) and `no_room_at` (when it last refused something for room, or for the address's allowance); `applied_at` (when this device applied the change) and `removed_a_key` (whether that change removed a key that the statement before had not); `names` (`sent`, `to_go`, and `to_go_since`, since when the first of them has waited); `not_reached` (the relays it is set up with and is not connected to); and `waiting` (for each connected relay, how many of the device's channels have something still to send there, with the address it is reached at as `relay` and, as `name`, the name that the configuration gives it, where the connection is that relay's own: by its key, or for a relay given none, the connection that the dial loop made to it (decision 2026-10-24, rule 2); and, as `names`, every relay whose own connection it is, where two relays given no key share one, the row then having no `name`. `cordelia devices` lists a relay once, by its name, with both things said on its line, and no line that a person reads says `relay`); and, only where the request's body carries `"sent_to_no_relay": true`, `sent_to_no_relay` (`versions` and `names`: how many versions, of how many names, this device holds that it signed and has sent to no relay, however the device stands; what another key signed came from a relay, and is not counted, decision 2026-10-17 §4.5). `cordelia phrase`, `cordelia init --new-key` and `cordelia accept` on a device alone under a phrase ask for it, and say it before their yes; a status does not ask, since it calls this route every few seconds and the count reads every entry of every name |
 | `POST /api/v1/devices/clear` | `{ "notice": "<hex>" }`: a person clears a notice on this device. `404` where it shows no such notice |
 | `POST /api/v1/devices/add/look` | `{ "device": "cordelia_pk1...", "label": "desktop" }`: what adding that key would do, with nothing written: `would` is `add`, or `hand_again` for a key that the statement already lists |
 | `POST /api/v1/devices/add` | The same body with `would`, which says what the yes was for. The device writes the hand-over in the pair channel and, where a record is made, the record in the personal channel. `409` where adding the key would by then do the other |
@@ -1479,7 +1527,7 @@ This is a clean break. Zero backward compatibility with the pre-pivot API. No mi
 > | `/api/v1/channels/*` | `publish`, `entries`, `delete-key`, `identity` for the names it holds (§3.16) | The Channels API of the older kind (§3.1 to §3.14) |
 > | `/api/v1/devices/*`, `/api/v1/phrase/make`, `/api/v1/change/*` | A person's devices (§3.17) | Served |
 > | `/api/v1/sync/*`, `/api/v1/history/*` | Sync and local history (§3.18) | Served |
-> | `/api/v1/status`, `/api/v1/metrics`, `/api/v1/health`, `/api/v1/peers` | Yes | Yes |
+> | `/api/v1/status`, `/api/v1/metrics`, `/api/v1/metrics/load`, `/api/v1/health`, `/api/v1/peers` | Yes | Yes |
 >
 > `/api/v1/diagnostics` is not served.
 

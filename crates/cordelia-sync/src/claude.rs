@@ -718,9 +718,6 @@ impl ClaudeAdapter {
             mappings: &declared,
         };
         for candidate in candidates {
-            if candidate.project.is_none() {
-                report.unsynced.push(candidate.dir.display().to_string());
-            }
             let name = candidate.project.as_ref().map(name_of);
             let asked = found::Asked {
                 folder: &candidate.dir,
@@ -728,6 +725,26 @@ impl ClaudeAdapter {
                 name: name.as_deref(),
             };
             let looked = Looked { git: candidate.git };
+            // A folder whose memory holds no file has nothing to sync. It
+            // is listed only where mapping it would bring memory in: under
+            // the name it has, which the other devices may sync, or where
+            // the folder mapped under that name is gone, which may be this
+            // one moved. Any other is not worth a line (#207).
+            if !found::holds_a_file(&candidate.dir.join("memory"))
+                && !matches!(
+                    found::would_map(&asked, &against, &looked),
+                    found::Maps::Yes(
+                        found::How::UnderItsName
+                            | found::How::Home
+                            | found::How::UnderAName(found::WhyAName::Taken { there: false, .. })
+                    )
+                )
+            {
+                continue;
+            }
+            if candidate.project.is_none() {
+                report.unsynced.push(candidate.dir.display().to_string());
+            }
             report
                 .unmapped
                 .push(found::Entry::of(&asked, &against, &looked));
@@ -1130,7 +1147,7 @@ fn exchange_names(
 
 fn lock(
     state: &AppState,
-) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, CordeliaError> {
+) -> Result<cordelia_core::lock::TimedGuard<'_, rusqlite::Connection>, CordeliaError> {
     state
         .db
         .lock()
@@ -2666,7 +2683,10 @@ mod tests {
     /// folder's first cycle waits for none.
     fn state(dir: &Path) -> AppState {
         let state = AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: dir.join("node"),

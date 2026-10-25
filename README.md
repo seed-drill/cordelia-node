@@ -421,10 +421,12 @@ relays and with the same encryption as your memory. It is never more than
   is a request from another of your agents, not an instruction from you.
 - `cordelia msg send --to <name>` (or `--all`, or `--reply <id>`) sends one.
   The message is read from standard input.
-- `cordelia msg log` is for you, at a terminal. It shows everything your
-  agents said on this device, and asks whether to mark it as read. Ten
-  messages between two agents that you have not read stop them sending to
-  each other, until you read them here and type yes.
+- `cordelia msg log` is for you, at a terminal. It shows what your agents
+  said on this device that you have not read here yet, says how many older
+  messages you have read, and asks whether to mark the new ones as read.
+  Where nothing is new, it says so and asks nothing. Ten messages between
+  two agents that you have not read stop them sending to each other, until
+  you read them here and type yes.
 
 **The agent is the folder.** A command acts as the agent of the folder that
 it is run in, by your `cordelia sync map` mappings: a folder that is not

@@ -2179,10 +2179,12 @@ fn claude_memory_syncs_between_two_machines() {
     std::fs::write(a_notes_mem.join("idea.md"), "A thought.\n").unwrap();
 
     // Nothing syncs until a folder is mapped. What was found is listed
-    // with the command that maps it.
+    // with the command that maps it: the notes folder once a cycle has
+    // seen the note written there.
     let found = wait_for("a lists what it found", &all, 60, || {
         let out = a.cli(&["sync", "status"]);
-        out.contains("Found on this machine").then_some(out)
+        out.contains("cordelia sync map ~/notes <name>")
+            .then_some(out)
     });
     for expected in [
         "Nothing syncs yet.",
@@ -4566,14 +4568,17 @@ async fn a_relay_given_no_key_at_another_relays_address_is_counted_as_its_own() 
 // ── A relay out of reach (decision 2026-10-19) ───────────────────────
 
 /// Whether `cordelia status` at `node` says, among what holds, that a
-/// relay is not known to hold the latest change.
+/// relay is not known to hold the latest change: before it is out of
+/// reach, and once it is, when the line says that too (decision
+/// 2026-10-24, rule 7).
 fn says_a_relay_lacks_the_change(node: &Node) -> bool {
     let status: serde_json::Value =
         serde_json::from_str(&node.cli(&["status", "--json"])).unwrap_or_default();
     let holds = status["holds"].as_array().cloned().unwrap_or_default();
-    holds
-        .iter()
-        .any(|holds| holds["says"] == "memory: a relay not known to hold the latest change")
+    holds.iter().any(|holds| {
+        holds["says"] == "memory: a relay not known to hold the latest change"
+            || holds["says"] == "memory: a relay out of reach, not known to hold the latest change"
+    })
 }
 
 /// What `node` knows of the reach of its relay at `host`, as its look

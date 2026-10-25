@@ -58,7 +58,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn db(state: &AppState) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+fn db(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, rusqlite::Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -277,29 +277,56 @@ fn relays_reached(state: &AppState) -> Vec<(String, [u8; 32])> {
         .collect()
 }
 
-/// The relays that the device is set up with, each by the key that its
-/// configuration gives for it and the name that the configuration dials
-/// it at. One that is set up with no key is not among them: which
-/// connection is its own is then known only by its address.
-fn relays_named(state: &AppState) -> Vec<([u8; 32], String)> {
+/// The relays that the device is set up with, each by the name that the
+/// configuration dials it at, and by the key that its configuration gives
+/// for it; or, for one given none, by the key that answers on the
+/// connection that the dial loop made to it and that is its own, while
+/// one is (decision 2026-10-24, rule 2). Each says whether it was given
+/// its key.
+fn relays_named(state: &AppState) -> Vec<([u8; 32], bool, String)> {
     let known = state.relays.read().unwrap_or_else(|e| e.into_inner());
     known
         .iter()
         .filter_map(|relay| {
-            let key = decode_public_key(relay.key.as_deref()?).ok()?;
-            Some((key, relay.host.clone()))
+            let (key, keyed) = match relay.key.as_deref() {
+                Some(key) => (decode_public_key(key).ok()?, true),
+                None => (relay.connection?, false),
+            };
+            Some((key, keyed, relay.host.clone()))
         })
         .collect()
+}
+
+/// The relays of the configuration whose own connection is the one that
+/// `key` answers on ([`relays_named`]): the first given that key, since
+/// one key is one relay; or, where none was given it, each relay given no
+/// key whose connection it is. Two names given no key at one address are
+/// two relays on the one connection (decision 2026-10-17 §1).
+fn names_of<'a>(named: &'a [([u8; 32], bool, String)], key: &[u8; 32]) -> Vec<&'a str> {
+    let given = |keyed: bool| {
+        named
+            .iter()
+            .filter(move |(of, k, _)| of == key && *k == keyed)
+    };
+    match given(true).next() {
+        Some((_, _, name)) => vec![name.as_str()],
+        None => given(false).map(|(_, _, name)| name.as_str()).collect(),
+    }
 }
 
 /// For each relay that the node is connected to, how many of this
 /// device's channels have something that waits to be sent there.
 ///
 /// `relay` is the address that it is reached at. **`name` is the name
-/// that the device's configuration gives it,** where it answers with the
-/// key of a relay that the device is set up with ([`relays_named`]), and
-/// null where it does not: where a device stands at its relays is said by
-/// that name, and a command lists a relay once (decision 2026-10-04 §8).
+/// that the device's configuration gives it,** where the connection is
+/// that of one relay that the device is set up with ([`names_of`]), a
+/// relay given no key among them, and null where it is not: where a device
+/// stands at its relays is said by that name, and a command lists a relay
+/// once (decision 2026-10-04 §8). `names` is every relay whose own
+/// connection it is: two given no key at one address share one, and the
+/// row then has no `name`, so that `cordelia devices` finds it for each by
+/// the address. No line that a person reads says `relay` (decision
+/// 2026-10-24, rule 2).
 fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
     let relays = relays_reached(state);
     let named = relays_named(state);
@@ -308,9 +335,12 @@ fn waiting(state: &AppState) -> Result<Vec<serde_json::Value>, ApiError> {
         .iter()
         .map(|(address, key)| {
             let waits = leaving::waits_at(&conn, &state.identity, key).map_err(refused)?;
-            let name = named.iter().find(|(of, _)| of == key);
-            let name = name.map(|(_, name)| name.as_str());
-            Ok(json!({ "relay": address, "name": name, "waits": waits }))
+            let names = names_of(&named, key);
+            let name = match names[..] {
+                [one] => Some(one),
+                _ => None,
+            };
+            Ok(json!({ "relay": address, "name": name, "names": names, "waits": waits }))
         })
         .collect()
 }
@@ -1774,8 +1804,9 @@ exit 0"#,
     /// device's configuration gives that relay, where it answers with the
     /// key that the configuration gives for it (decision 2026-10-04 §8):
     /// a command then lists the relay once, by its name. A relay that
-    /// answers with another key, or that is set up with none, has its
-    /// address and no name.
+    /// answers with another key has its address and no name; so has one
+    /// set up with none whose connection the dial loop has not said is its
+    /// own ([`a_relay_given_no_key_is_named_in_its_row_as_configured`]).
     #[test]
     fn test_what_waits_at_a_relay_is_said_with_the_relays_name() {
         use crate::state::RelaySnapshot;
@@ -1793,6 +1824,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried: Default::default(),
+            connection: None,
         };
         // Before the node has listed its relays, none has a name.
         let rows = waiting(&state).unwrap();
@@ -1819,6 +1851,91 @@ exit 0"#,
         );
         // What waits there is said as before.
         assert!(rows.iter().all(|row| row["waits"].is_u64()), "{rows:?}");
+    }
+
+    /// **A relay given no key is named in its row as configured**
+    /// (decision 2026-10-24, rule 2): the dial loop says which connection
+    /// is its own, and the row of what waits there names it by the name of
+    /// the configuration, never by the address it was reached at. A
+    /// connection that no relay of the configuration says is its own has
+    /// no name.
+    #[test]
+    fn a_relay_given_no_key_is_named_in_its_row_as_configured() {
+        use crate::state::RelaySnapshot;
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let (keyless, other) = ([8u8; 32], [9u8; 32]);
+        connected(&state, &keyless, "127.0.0.1:9474");
+        connected(&state, &other, "192.0.2.3:9474");
+        let set_up = |name: &str, connection: Option<[u8; 32]>| RelaySnapshot {
+            host: name.into(),
+            key: None,
+            state: "connected".into(),
+            unreachable_secs: None,
+            last_tried_secs: None,
+            error: None,
+            tried: Default::default(),
+            connection,
+        };
+        *state.relays.write().unwrap() = vec![
+            set_up("localhost:9474", Some(keyless)),
+            set_up("down.example:9474", None),
+        ];
+        let rows = waiting(&state).unwrap();
+        let said: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|row| (row["relay"].as_str().unwrap(), row["name"].as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("127.0.0.1:9474", Some("localhost:9474")),
+                ("192.0.2.3:9474", None),
+            ]
+        );
+        assert_eq!(rows[0]["names"], json!(["localhost:9474"]));
+        assert_eq!(rows[1]["names"], json!([]));
+    }
+
+    /// **Two relays given no key whose names resolve to one address share
+    /// one connection** (decision 2026-10-24, rule 2; decision 2026-10-17
+    /// §1): its row names both, and has no `name`, so that `cordelia
+    /// devices` says what waits there on the line of each, by the address.
+    /// A relay given a key is one relay, whatever other name is given the
+    /// same key: the first is named.
+    #[test]
+    fn a_connection_that_two_relays_given_no_key_share_names_both() {
+        use crate::state::RelaySnapshot;
+        let s = Several::of_one_person(1);
+        let state = state_of(s.machines.into_iter().next().unwrap());
+        let (shared, keyed) = ([8u8; 32], [9u8; 32]);
+        connected(&state, &shared, "127.0.0.1:9474");
+        connected(&state, &keyed, "192.0.2.3:9474");
+        let set_up =
+            |name: &str, key: Option<&[u8; 32]>, connection: Option<[u8; 32]>| RelaySnapshot {
+                host: name.into(),
+                key: key.map(|key| encode_public_key(key).unwrap()),
+                state: "connected".into(),
+                unreachable_secs: None,
+                last_tried_secs: None,
+                error: None,
+                tried: Default::default(),
+                connection,
+            };
+        *state.relays.write().unwrap() = vec![
+            set_up("localhost:9474", None, Some(shared)),
+            set_up("loopback.example:9474", None, Some(shared)),
+            set_up("one.example:9474", Some(&keyed), Some(keyed)),
+            set_up("again.example:9474", Some(&keyed), None),
+        ];
+        let rows = waiting(&state).unwrap();
+        assert!(rows[0]["name"].is_null(), "{rows:?}");
+        assert_eq!(
+            rows[0]["names"],
+            json!(["localhost:9474", "loopback.example:9474"])
+        );
+        assert_eq!(rows[1]["name"], "one.example:9474");
+        assert_eq!(rows[1]["names"], json!(["one.example:9474"]));
     }
 
     /// A relay that the device is set up with and that the node is not
@@ -1854,6 +1971,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried: Default::default(),
+            connection: None,
         };
         // Before the node has listed its relays, none is known to be
         // connected.
@@ -1915,6 +2033,7 @@ exit 0"#,
             last_tried_secs: None,
             error: None,
             tried,
+            connection: None,
         };
         *state.relays.write().unwrap() = vec![
             known(names[0], "connected", Tried::Dialled),

@@ -2674,7 +2674,15 @@ pub async fn p2p_loop(
 
     let our_node_id = NodeId(state.identity.public_key());
 
-    let mut governor = governor_for(&node_role, &gov_config, &trusted_peer_ids);
+    // The node's counters (decision 2026-10-22 §7.3): its connections, the
+    // closures of the link to each relay it is set up with, and its
+    // governor count in them.
+    conn_mgr.count_into(state.load.connections.clone());
+    for key in relays_set_up.iter().filter_map(|relay| relay.key) {
+        state.load.connections.counts_relay(&key);
+    }
+    let mut governor = governor_for(&node_role, &gov_config, &trusted_peer_ids)
+        .counting(state.load.governor.clone());
 
     // Connection tracker (§3.1): per-IP, per-subnet, global limits
 
@@ -2748,7 +2756,8 @@ pub async fn p2p_loop(
                     relay_addrs.clone(),
                     relay_ask_again,
                 )
-                .remembering_at_most(most_proved),
+                .remembering_at_most(most_proved)
+                .counting(state.load.streams.clone()),
             )
         });
     // The large permits, across all this node's connections (decision
@@ -2987,17 +2996,22 @@ pub async fn p2p_loop(
                         let refused = refused_addresses
                             .get(&address)
                             .is_some_and(|until| *until > std::time::Instant::now());
-                        let room = {
-                            let arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
-                            cordelia_network::rate_limit::ConnectionTracker::from_ips(
-                                conn_mgr
-                                    .inbound_ips(&NodeId([0u8; 32]))
-                                    .into_iter()
-                                    .chain(arriving.iter().copied()),
-                            )
-                            .would_allow(address)
+                        let turned_away = match refused {
+                            true => Some(cordelia_core::load::TurnedAway::RefusedForATime),
+                            false => {
+                                let arriving = arriving.lock().unwrap_or_else(|e| e.into_inner());
+                                cordelia_network::rate_limit::ConnectionTracker::from_ips(
+                                    conn_mgr
+                                        .inbound_ips(&NodeId([0u8; 32]))
+                                        .into_iter()
+                                        .chain(arriving.iter().copied()),
+                                )
+                                .turns_away(address)
+                            }
                         };
-                        if refused || !room {
+                        if let Some(why) = turned_away {
+                            // Counted by why (decision 2026-10-22 §1.2).
+                            state.load.connections.turned_away(why);
                             tracing::debug!(%address, refused, "turning an inbound connection away before the handshake");
                             incoming.refuse();
                             continue;
@@ -3069,7 +3083,8 @@ pub async fn p2p_loop(
                             let open = cordelia_network::rate_limit::ConnectionTracker::from_ips(
                                 conn_mgr.inbound_ips(&outcome.node_id),
                             );
-                            if !open.would_allow(ip) {
+                            if let Some(why) = open.turns_away(ip) {
+                                state.load.connections.turned_away(why);
                                 tracing::warn!(peer = %outcome.node_id, ip = %ip, "rejecting: connection limit exceeded");
                                 outcome.conn.close(0u32.into(), b"limit");
                                 continue;
@@ -3159,6 +3174,9 @@ pub async fn p2p_loop(
                                 if let Ok(mut ask_next) = ask_next.lock() {
                                     ask_next.remove(&node_id);
                                 }
+                                // Which relay the connection is, before the
+                                // peers list it (decision 2026-10-24, rule 2).
+                                publish_relays_now(&state, &relays_set_up, &relay_addrs, &relay_tries, &conn_mgr);
                                 post_connect(
                                     &node_id, &conn_mgr, &mut governor, &shared_peers,
                                     &state, &node_role, &repush_tx, &delivery_tx, &peer_rates, &peer_states,
@@ -3478,19 +3496,7 @@ pub async fn p2p_loop(
                 // sweeps a key only when every author has deleted it.
                 if carries_older_kind(&node_role) {
                     let gc_state = state.clone();
-                    let members_known = false;
-                    tokio::task::spawn_blocking(move || {
-                        let Ok(db) = gc_state.db.lock() else { return };
-                        match cordelia_storage::items::gc_keyed_tombstones(
-                            &db,
-                            cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
-                            members_known,
-                        ) {
-                            Ok(0) => {}
-                            Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
-                            Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
-                        }
-                    });
+                    tokio::task::spawn_blocking(move || sweep_older_deletes(&gc_state.db));
                 }
                 // Of the entries of channels from their secrets: a relay
                 // sweeps what it holds, and a device its own store.
@@ -3904,6 +3910,9 @@ pub async fn p2p_loop(
                         )
                     })
                     .collect();
+                // Which relay each connection is, before the peers list it
+                // or drop it (decision 2026-10-24, rule 2).
+                publish_relays_now(&state, &relays_set_up, &relay_addrs, &relay_tries, &conn_mgr);
                 publish_peers(&state, &connected, &conn_mgr);
                 sightings.note(&state, &connected);
 
@@ -5171,6 +5180,7 @@ fn relay_snapshots(
                     last_tried_secs: None,
                     error: Some(format!("the same relay as {}", set_up[first].host)),
                     tried: Default::default(),
+                    connection: None,
                 };
             }
             let found = resolved
@@ -5185,6 +5195,7 @@ fn relay_snapshots(
                     last_tried_secs: None,
                     error: Some(NAME_DOES_NOT_RESOLVE.into()),
                     tried: cordelia_api::state::Tried::LookedUp,
+                    connection: None,
                 };
             };
             let tried = tries.get(&tried_relay(relay));
@@ -5235,13 +5246,58 @@ fn relay_snapshots(
                     (false, true) => cordelia_api::state::Tried::NoKey,
                     (false, false) => cordelia_api::state::Tried::Dialled,
                 },
+                connection: None,
             }
         })
         .collect()
 }
 
+/// Where each relay that the node is set up with stands now
+/// ([`relay_snapshots`]), with the connection that the dial loop made to
+/// it and that is its own, where one is (decision 2026-10-24, rule 2): the
+/// one that a pass is given for it ([`one_relay_each_now`]). So each
+/// connection says the configured relay it was made to, a relay given no
+/// key among them, and what waits there is said by that relay's name. A
+/// relay that is the same relay as one before it has none: the first is
+/// the one named.
+fn relays_now(
+    set_up: &[cordelia_network::bootstrap::Relay],
+    resolved: &[cordelia_network::bootstrap::RelayAddr],
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) -> Vec<cordelia_api::state::RelaySnapshot> {
+    let (peers, one) = one_relay_each_now(set_up, resolved, conn_mgr);
+    let mut list = relay_snapshots(set_up, resolved, tries, &one, &|relay| {
+        relay_connected(conn_mgr, relay)
+    });
+    for ((relay, peer), one) in list.iter_mut().zip(peers).zip(&one) {
+        if !matches!(one, OneRelay::SameAs(_)) {
+            relay.connection = peer.map(|peer| peer.0);
+        }
+    }
+    list
+}
+
+/// [`publish_relays`], with the relays as their names resolve now: at a
+/// connection, and at the governor's tick, so that the connection that
+/// each relay has as its own is known before the peers that list it are
+/// (decision 2026-10-24, rule 2).
+fn publish_relays_now(
+    state: &cordelia_api::state::AppState,
+    set_up: &[cordelia_network::bootstrap::Relay],
+    relay_addrs: &RelayAddrs,
+    tries: &std::collections::HashMap<TriedRelay, RelayTry>,
+    conn_mgr: &cordelia_network::connection::ConnectionManager,
+) {
+    let resolved = relay_addrs
+        .read()
+        .map(|resolved| resolved.clone())
+        .unwrap_or_default();
+    publish_relays(state, set_up, &resolved, tries, conn_mgr);
+}
+
 /// Publish where each relay that the node is set up with stands
-/// ([`relay_snapshots`]).
+/// ([`relays_now`]).
 fn publish_relays(
     state: &cordelia_api::state::AppState,
     set_up: &[cordelia_network::bootstrap::Relay],
@@ -5249,10 +5305,7 @@ fn publish_relays(
     tries: &std::collections::HashMap<TriedRelay, RelayTry>,
     conn_mgr: &cordelia_network::connection::ConnectionManager,
 ) {
-    let (_, one) = one_relay_each_now(set_up, resolved, conn_mgr);
-    let list = relay_snapshots(set_up, resolved, tries, &one, &|relay| {
-        relay_connected(conn_mgr, relay)
-    });
+    let list = relays_now(set_up, resolved, tries, conn_mgr);
     // Which of them are connected now: the node keeps since when each
     // has been, and since when none has, by its own clock.
     let connected: Vec<&str> = list
@@ -5624,6 +5677,26 @@ pub async fn handle_peer_streams(
             duration_ms = stream_start.elapsed().as_millis() as u64,
             "stream closed"
         );
+    }
+}
+
+/// Sweep the older kind's deletes held for KEYED_TOMBSTONE_RETENTION_DAYS
+/// (decision 2026-09-30 §4.4), on a node that carries that kind. No such
+/// node holds a channel's member list, so it sweeps a key only when every
+/// author has deleted it. Its takes of the lock are a sweep's (decision
+/// 2026-10-22 §1.1, rule 4).
+fn sweep_older_deletes(db: &cordelia_core::lock::TimedLock<rusqlite::Connection>) {
+    let _sweep = cordelia_core::lock::taking(cordelia_core::load::Kind::Sweep);
+    let Ok(db) = db.lock() else { return };
+    let members_known = false;
+    match cordelia_storage::items::gc_keyed_tombstones(
+        &db,
+        cordelia_core::protocol::KEYED_TOMBSTONE_RETENTION_DAYS,
+        members_known,
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(items = n, "collected expired deleted keys"),
+        Err(e) => tracing::warn!(error = %e, "tombstone gc failed"),
     }
 }
 
@@ -7147,7 +7220,10 @@ mod tests {
     /// A node's state over a database in memory, with no network.
     fn a_state() -> web::Data<cordelia_api::state::AppState> {
         web::Data::new(cordelia_api::state::AppState {
-            db: std::sync::Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+            load: Default::default(),
+            db: cordelia_core::lock::TimedLock::new(
+                cordelia_storage::db::open_in_memory().unwrap(),
+            ),
             identity: cordelia_crypto::identity::NodeIdentity::generate().unwrap(),
             bearer_token: "t".into(),
             home_dir: std::env::temp_dir().join("cordelia-p2p-test-no-such-directory"),
@@ -7166,6 +7242,20 @@ mod tests {
             held: Default::default(),
             history: Default::default(),
         })
+    }
+
+    /// The sweep of the older kind's old deletes takes the lock as a
+    /// sweep, and as no other kind (decision 2026-10-22 §1.1, rule 4).
+    #[test]
+    fn the_sweep_of_the_older_kinds_deletes_takes_the_lock_as_a_sweep() {
+        use cordelia_core::load::Kind;
+        let state = a_state();
+        sweep_older_deletes(&state.db);
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|kind| state.db.times().hold(*kind).count > 0)
+            .collect();
+        assert_eq!(kinds, [Kind::Sweep]);
     }
 
     /// A request for items that a peer sent on a sync of the older kind is
@@ -10512,6 +10602,69 @@ mod tests {
         // One of them alone is one relay, by its key.
         let one = relays_with_links(&set_up[..1], &addrs, &conn_mgr, &own);
         assert!(by_key(&one, own.relays_set_up()).is_some());
+        conn_mgr.shutdown();
+    }
+
+    /// **Each connection says the configured relay it was made to**
+    /// (decision 2026-10-24, rule 2): where each relay stands names the
+    /// connection that is its own, the one a pass is given for it. A relay
+    /// given no key has its connection by the address its name resolves
+    /// to; one that is down has none; a relay that is the same relay as one
+    /// before it has none, and the first is the one named; and a relay
+    /// given no key at a keyed relay's place has none, for the connection
+    /// there is that relay's.
+    #[tokio::test]
+    async fn each_connection_says_the_configured_relay_it_was_made_to() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        let (mut conn_mgr, key, addr, _relay) = connected_to_a_relay().await;
+        let named = |host: &str, key: Option<[u8; 32]>| Relay {
+            host: host.into(),
+            key,
+        };
+        let at = |relay: &Relay, addr| RelayAddr {
+            host: relay.host.clone(),
+            addr,
+            key: relay.key,
+        };
+        let tries = std::collections::HashMap::new();
+        let made_to =
+            |set_up: &[Relay], resolved: &[RelayAddr]| -> Vec<(String, Option<[u8; 32]>)> {
+                relays_now(set_up, resolved, &tries, &conn_mgr)
+                    .into_iter()
+                    .map(|relay| (relay.host, relay.connection))
+                    .collect()
+            };
+        let keyless = named("localhost.test:9474", None);
+        let down = named("down.test:9474", None);
+        let resolved = [
+            at(&keyless, addr),
+            at(&down, "127.0.0.1:9".parse().unwrap()),
+        ];
+        assert_eq!(
+            made_to(&[keyless.clone(), down.clone()], &resolved),
+            [
+                ("localhost.test:9474".to_string(), Some(key)),
+                ("down.test:9474".to_string(), None),
+            ]
+        );
+        let keyed = named("keyed.test:9474", Some(key));
+        let again = named("again.test:9474", Some(key));
+        assert_eq!(
+            made_to(&[keyed.clone(), again], &[]),
+            [
+                ("keyed.test:9474".to_string(), Some(key)),
+                ("again.test:9474".to_string(), None),
+            ]
+        );
+        let set_up = [keyed.clone(), keyless.clone()];
+        let resolved = [at(&keyed, addr), at(&keyless, addr)];
+        assert_eq!(
+            made_to(&set_up, &resolved),
+            [
+                ("keyed.test:9474".to_string(), Some(key)),
+                ("localhost.test:9474".to_string(), None),
+            ]
+        );
         conn_mgr.shutdown();
     }
 

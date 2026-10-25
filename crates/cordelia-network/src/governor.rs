@@ -7,9 +7,11 @@
 //! Changes: NodeId = [u8; 32], Multiaddr -> String, ERA_0 -> GovernorConfig.
 
 use cordelia_core::NodeId;
+use cordelia_core::load::{GovernorCounts, Peer};
 use cordelia_core::protocol;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Ban tier per spec §5.6 (parameter-rationale.md §3).
@@ -272,6 +274,9 @@ pub struct Governor {
     /// The jitter added to the interval before the next churn, in seconds:
     /// drawn once for each churn and kept until it runs, or none yet.
     churn_jitter: Option<u64>,
+    /// Its churns, what warm churn closed, and its peers at each tick:
+    /// counted, and read by nothing here (decision 2026-10-22 §1.2, §7.3).
+    counted: Arc<GovernorCounts>,
 }
 
 /// The system's time in nanoseconds since the epoch.
@@ -313,7 +318,15 @@ impl Governor {
             keeps_its_relays: false,
             clock_nanos: system_nanos,
             churn_jitter: None,
+            counted: Arc::default(),
         }
+    }
+
+    /// The same governor, counting in `counts`: the node's counters
+    /// (decision 2026-10-22 §7.3).
+    pub fn counting(mut self, counts: Arc<GovernorCounts>) -> Self {
+        self.counted = counts;
+        self
     }
 
     /// Churn closes no connection to a relay this node is set up with
@@ -699,6 +712,10 @@ impl Governor {
         // 7. Evict excess cold
         self.evict_excess_cold(&mut actions);
 
+        // Its own count of its peers, at its tick: apart from the count of
+        // connections (decision 2026-10-22 §1.2).
+        let (hot, warm, cold, _) = self.counts();
+        self.counted.set_peers(hot, warm, cold);
         actions
     }
 
@@ -977,6 +994,11 @@ impl Governor {
         self.last_churn = Instant::now();
         self.churn_jitter = Some(self.draw_churn_jitter());
 
+        // A churn is counted here, where the interval has passed and
+        // before warm churn looks at its peers: warm churn returns early
+        // where it may close none, and a churn counted there would read
+        // none (decision 2026-10-22 §1.2).
+        self.counted.churned();
         self.churn_warm(actions);
         self.churn_hot(actions);
     }
@@ -1021,6 +1043,12 @@ impl Governor {
         for id in &warm_ids {
             if let Some(peer) = self.peers.get_mut(id) {
                 tracing::debug!(peer = %id, "gov: churn warm -> cold");
+                // A warm peer is connected: its connection is closed by
+                // warm churn, of a device or of a relay (§1.2).
+                self.counted.closed_by_warm_churn(match peer.is_relay {
+                    true => Peer::Relay,
+                    false => Peer::Device,
+                });
                 peer.set_state(PeerState::Cold);
                 peer.connected_since = None;
                 actions.disconnect.push(id.clone());
@@ -2943,5 +2971,108 @@ mod tests {
             .filter(|(_, _, to)| to == "warm")
             .collect();
         assert!(demotions.is_empty(), "no demotions expected: {demotions:?}");
+    }
+    /// Targets for the tests of the counters: churn once an hour, no hot
+    /// peer to fill and no warm peer to keep, so that what churn does is
+    /// all that moves a peer.
+    fn counted_targets(churn_fraction: f64) -> GovernorTargets {
+        GovernorTargets {
+            hot_min: 0,
+            hot_max: 0,
+            hot_min_relays: 0,
+            warm_min: 0,
+            warm_max: 50,
+            cold_max: 200,
+            churn_interval_secs: 3600,
+            churn_jitter_secs: 0,
+            churn_fraction,
+        }
+    }
+
+    /// A governor counting in `counts`, with `devices` warm peers that are
+    /// not relays and `relays` warm relays, numbered from 1, and `cold`
+    /// cold peers after them.
+    fn counted(
+        churn_fraction: f64,
+        (devices, relays, cold): (u8, u8, u8),
+        counts: &Arc<GovernorCounts>,
+    ) -> Governor {
+        let mut gov =
+            Governor::new(counted_targets(churn_fraction), vec![]).counting(counts.clone());
+        for i in 1..=devices + relays + cold {
+            let id = make_node_id(i);
+            gov.add_peer(id.clone(), vec![], vec![]);
+            gov.set_peer_relay(&id, i > devices && i <= devices + relays);
+            if i <= devices + relays {
+                gov.mark_connected(&id);
+            }
+        }
+        assert_eq!(
+            gov.counts(),
+            (0, usize::from(devices + relays), usize::from(cold), 0)
+        );
+        gov
+    }
+
+    /// A churn is counted where warm churn closes nothing (decision
+    /// 2026-10-22 §1.2, §7.3): with warm peers and no cold one, warm churn
+    /// returns at once, and each churn is counted all the same. A tick
+    /// before the interval has passed counts none, and nothing is counted
+    /// as closed.
+    #[test]
+    fn a_churn_is_counted_where_warm_churn_closes_nothing() {
+        let counts = Arc::new(GovernorCounts::default());
+        let mut gov = counted(0.2, (4, 1, 0), &counts);
+        assert!(gov.tick().disconnect.is_empty());
+        assert_eq!(counts.churns(), 0, "the interval has not passed");
+        for churn in 1..=3 {
+            gov.last_churn = Instant::now() - Duration::from_secs(3601);
+            let actions = gov.tick();
+            assert!(actions.disconnect.is_empty(), "{:?}", actions.disconnect);
+            assert_eq!(counts.churns(), churn);
+        }
+        assert_eq!(counts.closed_by_warm_churn_of(Peer::Device), 0);
+        assert_eq!(counts.closed_by_warm_churn_of(Peer::Relay), 0);
+    }
+
+    /// Warm churn counts each connection it closes, of a device and of a
+    /// relay apart (decision 2026-10-22 §1.2): with a cold peer, a churn
+    /// that closes every warm peer counts the four devices and the relay
+    /// it closed, and the one churn.
+    #[test]
+    fn warm_churn_counts_what_it_closes_of_devices_and_of_relays() {
+        let counts = Arc::new(GovernorCounts::default());
+        let mut gov = counted(1.0, (4, 1, 1), &counts);
+        gov.last_churn = Instant::now() - Duration::from_secs(3601);
+        let closed = gov.tick().disconnect;
+        assert_eq!(closed.len(), 5, "{closed:?}");
+        assert_eq!(counts.churns(), 1);
+        assert_eq!(counts.closed_by_warm_churn_of(Peer::Device), 4);
+        assert_eq!(counts.closed_by_warm_churn_of(Peer::Relay), 1);
+    }
+
+    /// The governor's own count of its peers is taken at its tick, after
+    /// the tick's moves (decision 2026-10-22 §1.2): it is what the
+    /// governor counts, and not the count of connections.
+    #[test]
+    fn the_governors_peers_are_counted_at_its_tick() {
+        let counts = Arc::new(GovernorCounts::default());
+        let mut gov = counted(1.0, (2, 1, 2), &counts);
+        assert_eq!(
+            counts.peers(),
+            (0, 0, 0),
+            "nothing is counted before a tick"
+        );
+        gov.tick();
+        assert_eq!(counts.peers(), (0, 3, 2));
+        gov.last_churn = Instant::now() - Duration::from_secs(3601);
+        gov.tick();
+        let (hot, warm, cold, _) = gov.counts();
+        assert_eq!(counts.peers(), (hot as u64, warm as u64, cold as u64));
+        assert_eq!(
+            counts.peers().1,
+            0,
+            "warm churn moved every warm peer to cold"
+        );
     }
 }

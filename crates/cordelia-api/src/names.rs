@@ -625,7 +625,7 @@ fn words_kept(
 ///
 /// A cycle of sync does this before it reads the words under the lock:
 /// at the first cycle after a node starts, every entry is read afresh.
-pub fn read_ahead(db: &std::sync::Mutex<Connection>) -> Result<(), PersonError> {
+pub fn read_ahead(db: &cordelia_core::lock::TimedLock<Connection>) -> Result<(), PersonError> {
     with_kept(|slot| read_ahead_in(db, slot))
 }
 
@@ -677,7 +677,10 @@ pub fn not_read_ahead(conn: &Connection) -> Result<usize, PersonError> {
 }
 
 /// [`read_ahead`], keeping what it finds in `slot`.
-fn read_ahead_in(db: &std::sync::Mutex<Connection>, slot: &Slot) -> Result<(), PersonError> {
+fn read_ahead_in(
+    db: &cordelia_core::lock::TimedLock<Connection>,
+    slot: &Slot,
+) -> Result<(), PersonError> {
     match found_ahead(db, slot)? {
         Some((channel, read)) => keep_ahead(db, slot, &channel, read),
         None => Ok(()),
@@ -694,7 +697,7 @@ type FoundAhead = Vec<(([u8; 32], [u8; 32]), (Entry, Found))>;
 /// where there was nothing to check, or the device follows no phrase, or
 /// keeps nothing of what it reads ([`keeps_what_it_reads`]).
 fn found_ahead(
-    db: &std::sync::Mutex<Connection>,
+    db: &cordelia_core::lock::TimedLock<Connection>,
     slot: &Slot,
 ) -> Result<Option<([u8; 32], FoundAhead)>, PersonError> {
     let (personal, stored) = {
@@ -740,7 +743,7 @@ fn found_ahead(
 /// it. The lock is taken again for this, as a read of the words takes the
 /// two, in the same order.
 fn keep_ahead(
-    db: &std::sync::Mutex<Connection>,
+    db: &cordelia_core::lock::TimedLock<Connection>,
     slot: &Slot,
     channel: &[u8; 32],
     read: FoundAhead,
@@ -2638,7 +2641,7 @@ mod tests {
         assert_eq!(listed(&s[2].conn).unwrap().len(), 2);
         assert!(!kept_of(&channel), "a read on a removed device kept it");
         let removed = s.machines.remove(2);
-        let db = std::sync::Mutex::new(removed.conn);
+        let db = cordelia_core::lock::TimedLock::new(removed.conn);
         read_ahead(&db).unwrap();
         assert!(
             !kept_of(&channel),
@@ -2657,7 +2660,7 @@ mod tests {
         );
         // And a read ahead after reads nothing back in.
         let on = s.machines.remove(1);
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         read_ahead(&db).unwrap();
         assert!(!kept_of(&channel));
     }
@@ -2679,7 +2682,7 @@ mod tests {
         // found.
         let on = s.machines.remove(2);
         let channel = derive::channel_id(&on.personal()).unwrap();
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         let control = Slot::new(None);
         let (read_of, read) = found_ahead(&db, &control).unwrap().unwrap();
         assert_eq!(read_of, channel);
@@ -2695,7 +2698,7 @@ mod tests {
         s.change(0, &[0, 1], &[2]);
         assert_eq!(s.pass(0, 2)[0], Taken::Shown(crate::person::Shown::Removed));
         let on = s.machines.remove(2);
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         keep_ahead(&db, &slot, &read_of, read).unwrap();
         assert!(
             slot.lock().unwrap().is_none(),
@@ -2706,7 +2709,7 @@ mod tests {
 
         // Device 1 reads ahead, and forgets before it keeps what it found.
         let on = s.machines.remove(1);
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         let slot = Slot::new(None);
         let (read_of, read) = found_ahead(&db, &slot).unwrap().unwrap();
         let conn = db.lock().unwrap();
@@ -2733,7 +2736,7 @@ mod tests {
         s.pass(1, 0);
         let slot = Slot::new(None);
         let on = s.machines.remove(0);
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         read_ahead_in(&db, &slot).unwrap();
         let ahead = afresh(&slot);
         assert!(ahead >= 3, "{ahead}");
@@ -2744,7 +2747,7 @@ mod tests {
         };
         assert_eq!(kept_is_afresh(&on, &slot), 0);
         // Read ahead again with nothing new: nothing.
-        let db = std::sync::Mutex::new(on.conn);
+        let db = cordelia_core::lock::TimedLock::new(on.conn);
         read_ahead_in(&db, &slot).unwrap();
         assert_eq!(afresh(&slot), ahead);
         let on = Machine {
@@ -2757,7 +2760,7 @@ mod tests {
         assert_eq!(kept_is_afresh(&on, &slot), 1);
         // A device that follows no phrase reads nothing ahead.
         let alone = Machine::new(7);
-        let db = std::sync::Mutex::new(alone.conn);
+        let db = cordelia_core::lock::TimedLock::new(alone.conn);
         let empty = Slot::new(None);
         read_ahead_in(&db, &empty).unwrap();
         assert_eq!(afresh(&empty), 0);

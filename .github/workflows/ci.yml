@@ -78,11 +78,15 @@ jobs:
   # made longer, and is run here, on every pull request, beside it. They
   # are the ignored tests of cordelia-node's test files, and only those:
   # the other crates' ignored tests are timed for a release build, or are
-  # no part of this. Each runs whatever another fails. About half an hour
-  # of tests after the build.
+  # no part of this. Each runs whatever another fails. The scale test's
+  # ignored tests return at once here: its stages and its small runs run
+  # only where their variables are set (scale.yml runs the small runs).
   out-of-reach:
     name: out of reach
     runs-on: ubuntu-latest
+    # About twice what the job takes on main (53 minutes): a test that
+    # waits for ever fails the job in this time.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,7 +140,10 @@ jobs:
       - name: Run tests with coverage
         env:
           CARGO_INCREMENTAL: 0
-          RUSTFLAGS: '-Cinstrument-coverage'
+          # `--cfg coverage` leaves out the test of what timing a take of
+          # the node's lock costs (lock.rs): under coverage its counters are
+          # in what it measures. The test job runs it.
+          RUSTFLAGS: '-Cinstrument-coverage --cfg coverage'
           LLVM_PROFILE_FILE: '/tmp/cordelia-cov/cordelia-%p-%m.profraw'
         run: |
           mkdir -p /tmp/cordelia-cov

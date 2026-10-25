@@ -5,6 +5,7 @@
 //!
 //! Spec: seed-drill/specs/network-protocol.md §9
 
+use cordelia_core::load::TurnedAway;
 use cordelia_core::protocol;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -285,19 +286,27 @@ impl ConnectionTracker {
 
     /// Check if a new inbound connection from `addr` would be allowed.
     pub fn would_allow(&self, addr: IpAddr) -> bool {
+        self.turns_away(addr).is_none()
+    }
+
+    /// Why a new inbound connection from `addr` would be turned away: the
+    /// bound on connections, the bound for an address, or the bound for a
+    /// subnet, in that order; `None` where it would be allowed. Each is
+    /// counted apart (decision 2026-10-22 §1.2).
+    pub fn turns_away(&self, addr: IpAddr) -> Option<TurnedAway> {
         if self.total >= MAX_INBOUND_CONNECTIONS {
-            return false;
+            return Some(TurnedAway::Bound);
         }
         let ip_count = self.per_ip.get(&addr).copied().unwrap_or(0);
         if ip_count >= MAX_CONNECTIONS_PER_IP {
-            return false;
+            return Some(TurnedAway::Address);
         }
         let subnet = subnet_key(addr);
         let subnet_count = self.per_subnet.get(&subnet).copied().unwrap_or(0);
         if subnet_count >= MAX_CONNECTIONS_PER_SUBNET {
-            return false;
+            return Some(TurnedAway::Subnet);
         }
-        true
+        None
     }
 
     /// Record a new inbound connection.
@@ -573,5 +582,41 @@ mod tests {
         let one_closed = ConnectionTracker::from_ips(vec![ip; MAX_CONNECTIONS_PER_IP - 1]);
         assert!(one_closed.would_allow(ip));
         assert!(ConnectionTracker::from_ips(Vec::new()).would_allow(ip));
+    }
+    /// A connection turned away is turned away for one reason, the first
+    /// of the bound on connections, the address's and the subnet's, so
+    /// that each is counted apart (decision 2026-10-22 §1.2); one that is
+    /// allowed has none.
+    #[test]
+    fn a_connection_is_turned_away_for_the_bound_the_address_or_the_subnet() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let neighbour: IpAddr = "203.0.113.8".parse().unwrap();
+        let elsewhere: IpAddr = "198.51.100.1".parse().unwrap();
+        let at_address = ConnectionTracker::from_ips(vec![ip; MAX_CONNECTIONS_PER_IP]);
+        assert_eq!(at_address.turns_away(ip), Some(TurnedAway::Address));
+        assert_eq!(at_address.turns_away(neighbour), None);
+        let subnet: Vec<IpAddr> = (1..=MAX_CONNECTIONS_PER_SUBNET as u8)
+            .map(|n| IpAddr::from([203, 0, 113, n.wrapping_add(100)]))
+            .collect();
+        let at_subnet = ConnectionTracker::from_ips(subnet);
+        assert_eq!(at_subnet.turns_away(neighbour), Some(TurnedAway::Subnet));
+        assert_eq!(at_subnet.turns_away(elsewhere), None);
+        let all: Vec<IpAddr> = (0..MAX_INBOUND_CONNECTIONS)
+            .map(|n| IpAddr::from([10, (n / 256) as u8, (n % 256) as u8, 1]))
+            .collect();
+        let at_bound = ConnectionTracker::from_ips(all);
+        assert_eq!(at_bound.turns_away(elsewhere), Some(TurnedAway::Bound));
+        // The bound comes first: an address at its own bound as well is
+        // counted for the bound.
+        let mut both: Vec<IpAddr> = vec![ip; MAX_CONNECTIONS_PER_IP];
+        both.extend(
+            (both.len()..MAX_INBOUND_CONNECTIONS)
+                .map(|n| IpAddr::from([10, (n / 256) as u8, (n % 256) as u8, 1])),
+        );
+        assert_eq!(
+            ConnectionTracker::from_ips(both).turns_away(ip),
+            Some(TurnedAway::Bound)
+        );
+        assert!(!at_bound.would_allow(elsewhere) && at_address.would_allow(neighbour));
     }
 }

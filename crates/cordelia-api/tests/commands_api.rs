@@ -3,7 +3,6 @@
 //! the node for, and what none of them does for a node that no longer
 //! runs under the device's key, or for whoever has not the node's token.
 
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
@@ -33,7 +32,8 @@ fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let push_tx = network.then(|| tokio::sync::mpsc::unbounded_channel().0);
     let state = web::Data::new(AppState {
-        db: Mutex::new(cordelia_storage::db::open_in_memory().unwrap()),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(cordelia_storage::db::open_in_memory().unwrap()),
         identity: NodeIdentity::generate().unwrap(),
         bearer_token: TOKEN.into(),
         home_dir: dir.path().to_path_buf(),
@@ -1375,6 +1375,7 @@ async fn test_the_look_carries_the_word_to_come_each_class_and_how_each_relay_is
         last_tried_secs: None,
         error: None,
         tried,
+        connection: None,
     };
     *state.relays.write().unwrap() = vec![
         known(names[0], "unreachable", Tried::LookedUp),

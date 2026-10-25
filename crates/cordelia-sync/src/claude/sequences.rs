@@ -514,7 +514,8 @@ impl World {
                 // Nothing here waits for a disk.
                 db.execute_batch("PRAGMA synchronous = OFF;").unwrap();
                 let st = AppState {
-                    db: Mutex::new(db),
+                    load: Default::default(),
+                    db: cordelia_core::lock::TimedLock::new(db),
                     identity: identity_of(i),
                     bearer_token: "t".into(),
                     home_dir: home,

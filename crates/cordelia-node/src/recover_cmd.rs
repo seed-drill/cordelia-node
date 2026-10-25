@@ -2459,6 +2459,10 @@ trait AfterTheChange {
     fn another_version(&self) -> anyhow::Result<Option<String>>;
     /// The time between two askings.
     fn pause(&self);
+    /// The time of day, in seconds, that each line of the wait is said at:
+    /// the wall clock, or one that a test moves (decision 2026-10-24, rule
+    /// 3).
+    fn now(&self) -> i64;
 }
 
 /// The node of the configuration at the path it holds.
@@ -2488,6 +2492,10 @@ impl AfterTheChange for TheNode<'_> {
 
     fn pause(&self) {
         std::thread::sleep(Duration::from_secs(1));
+    }
+
+    fn now(&self) -> i64 {
+        chrono::Utc::now().timestamp()
     }
 }
 
@@ -2568,8 +2576,12 @@ fn after_the_recovery(
 /// §4, rule 9), from the look `seen` that the lines before the wait were
 /// said of. **Where every relay holds the change,** it says R1 and ends
 /// with status 0. **Otherwise** it says R0, says S2 and S3 as they come,
-/// and ends at the first of its two ends ([`wait::recovery_end_of`]),
-/// with what that end says. There is no condition on what waits, nor on
+/// and the count of each relay that lacks the change while it is waited
+/// out ([`wait::count_line`], decision 2026-10-24, rule 4), each with its
+/// time, and once a minute where none comes ([`wait::Told`], rule 3), and
+/// ends at the first of its two ends ([`wait::recovery_end_of`]), with the
+/// line that each end begins with and then what that end says. There is no
+/// condition on what waits, nor on
 /// the machine's own word: its look may stay pending until the next
 /// statement, and then neither `sent` nor the carried word is written. It
 /// never says that the machine may be closed.
@@ -2584,40 +2596,59 @@ fn waits_for_the_change(
     node: &impl AfterTheChange,
     mut say: impl FnMut(String),
 ) -> anyhow::Result<Recovered> {
-    let mut said: Vec<String> = Vec::new();
-    let mut first = true;
+    // What the wait has said, from R0 on: a wait that has begun. Before
+    // R0 there is none.
+    let mut told: Option<wait::Told> = None;
     loop {
         // A node of another version, put in this one's place during the
         // wait, may say what this command reads otherwise.
         if let Some(note) = node.another_version()? {
             anyhow::bail!(note);
         }
+        let at = node.now();
+        // Each end of a wait that has begun begins with a line of its own.
+        let ended = |told: &Option<wait::Told>| told.as_ref().map(|_| wait::Told::ended(at));
         if seen["change"].as_u64() != Some(number) {
+            ended(&told).into_iter().for_each(&mut say);
             say("This device has since applied another change: `cordelia devices` says.".into());
             return Ok(Recovered::Another);
         }
         if let Some(line) = wait::no_longer_stands(&seen) {
+            ended(&told).into_iter().for_each(&mut say);
             say(line);
             return Ok(Recovered::NoLongerStands);
         }
-        let at = chrono::Utc::now().timestamp();
         let (relays, end) = wait::recovery_end_of_look(&seen)?;
-        if first && end != Some(RecoveryEnd::Recovered) {
+        if told.is_none() && end != Some(RecoveryEnd::Recovered) {
             say(format!("\n{}", wait::recovery_first_line()));
+            told = Some(wait::Told::from(at));
         }
-        first = false;
-        let now: Vec<String> = relays
+        let mut now: Vec<String> = Vec::new();
+        for relay in relays
             .iter()
-            .filter(|relay| relay.out_of_reach() && wait::is_about_the_kept_entry(relay, &seen))
-            .map(|relay| wait::out_of_reach_line(relay, at))
-            .collect();
-        for line in &now {
-            if !said.contains(line) {
-                say(format!("  {line}"));
+            .filter(|relay| wait::is_about_the_kept_entry(relay, &seen))
+        {
+            if relay.out_of_reach() {
+                now.push(wait::out_of_reach_line(relay, at));
+            }
+            // The count while a relay is waited out (decision 2026-10-24,
+            // rule 4): only of one that lacks the change, which is all
+            // that a recovery waits for.
+            if !relay.holds() {
+                now.extend(wait::count_line(relay, at));
             }
         }
-        said = now;
+        match told.as_mut() {
+            Some(told) => told
+                .of_look(now, at, end.is_some())
+                .into_iter()
+                .for_each(&mut say),
+            // Where every relay holds the change at the first look there
+            // is no wait: its lines are said as they were, with no time.
+            None => now.into_iter().for_each(|line| say(format!("  {line}"))),
+        }
         if let Some(end) = end {
+            ended(&told).into_iter().for_each(&mut say);
             for line in wait::recovery_end_lines(end, &relays, at) {
                 say(line);
             }
@@ -5596,7 +5627,8 @@ mod tests {
             "This command stays until every relay holds the change. It ends sooner, with status \
              3, once each relay that is not known to hold it cannot be reached, or refuses it, \
              for five minutes. Stopping it stops nothing: the node goes on, and the recovery \
-             stays made."
+             stays made. Until the wait ends, each line below starts with the time it was said, \
+             in UTC."
         );
         assert_eq!(
             wait::recovery_end_lines(RecoveryEnd::Recovered, &[], 0),
@@ -5756,7 +5788,15 @@ mod tests {
         fails: bool,
         asked: std::cell::Cell<usize>,
         version: Option<String>,
+        /// The time of day that the wait goes by, which each pause moves on
+        /// by `step` seconds.
+        clock: std::cell::Cell<i64>,
+        step: i64,
     }
+
+    /// 10:53:00 UTC on 2026-10-19, in seconds: when the stand-in's clock
+    /// starts.
+    const AT_10_53: i64 = 1_792_407_180;
 
     impl Stands {
         fn of(progress: Value, looks: Vec<Value>) -> Self {
@@ -5766,6 +5806,8 @@ mod tests {
                 fails: false,
                 asked: std::cell::Cell::new(0),
                 version: None,
+                clock: std::cell::Cell::new(AT_10_53),
+                step: 1,
             }
         }
     }
@@ -5795,7 +5837,12 @@ mod tests {
                 _ => Ok(looks.remove(0)),
             }
         }
-        fn pause(&self) {}
+        fn pause(&self) {
+            self.clock.set(self.clock.get() + self.step);
+        }
+        fn now(&self) -> i64 {
+            self.clock.get()
+        }
     }
 
     /// A look after change 3 whose relays met the events of each scenario,
@@ -5823,6 +5870,22 @@ mod tests {
         (ended, said)
     }
 
+    /// A line of a recovery's wait by its words: where it starts with its
+    /// time (decision 2026-10-24, rule 3), as it would be said without it.
+    fn without_its_time(line: &str) -> String {
+        let b = line.as_bytes();
+        let digit = |at: usize| b.get(at).is_some_and(u8::is_ascii_digit);
+        let timed = line.starts_with("  ")
+            && [2, 3, 5, 6, 8, 9].into_iter().all(digit)
+            && b.get(4) == Some(&b':')
+            && b.get(7) == Some(&b':')
+            && line.get(10..12) == Some("  ");
+        match timed {
+            true => format!("  {}", &line[12..]),
+            false => line.to_string(),
+        }
+    }
+
     /// **A recovery whose look stays pending ends at 3** (decision
     /// 2026-10-19 §4, rule 9; its first review, finding 6). The look says
     /// that the new channels were not read whole, so it stays pending,
@@ -5842,7 +5905,10 @@ mod tests {
         assert!(all.contains("The look took nothing"), "{all}");
         assert!(all.contains(&wait::recovery_first_line()), "{all}");
         assert!(
-            all.contains("  relay-1.example:9474 is not known to hold the change, and has not"),
+            all.contains(
+                "  relay-1.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it has not"
+            ),
             "{all}"
         );
         assert!(
@@ -5897,18 +5963,21 @@ mod tests {
         );
         let (ended, said) = after(&node);
         assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::NotDone));
+        // Each line of the wait by its words, without its time.
+        let words: Vec<String> = said.iter().map(|line| without_its_time(line)).collect();
         let at = |says: &str| {
-            let at = said.iter().position(|line| line.starts_with(says));
+            let at = words.iter().position(|line| line.starts_with(says));
             at.unwrap_or_else(|| panic!("{says}: {said:?}"))
         };
         let r0 = at("\nThis command stays until every relay holds");
-        let s3 = at("  relay-0.example:9474 holds the change, and ");
+        let s3 =
+            at("  relay-0.example:9474 holds the change, and cannot be reached from here: it ");
         let s2 = at(
-            "  keep this machine on: relay-1.example:9474 is not known to hold the change yet, \
-             and ",
+            "  keep this machine on: relay-1.example:9474 cannot be reached from here, and is not \
+             known to hold the change yet: it ",
         );
         assert!(r0 < s3 && s3 < s2, "{said:?}");
-        let once = |says: &str| said.iter().filter(|line| line.starts_with(says)).count();
+        let once = |says: &str| words.iter().filter(|line| line.starts_with(says)).count();
         assert_eq!(
             once("  relay-0.example:9474 holds the change"),
             1,
@@ -5916,14 +5985,18 @@ mod tests {
         );
         assert_eq!(once("  keep this machine on: relay-1"), 1, "{said:?}");
         assert_eq!(
-            once("  relay-1.example:9474 is not known to hold the change, and"),
+            once(
+                "  relay-1.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it"
+            ),
             1
         );
-        assert_eq!(
-            once("  relay-0.example:9474 holds the change."),
-            0,
-            "{said:?}"
-        );
+        // No S8 of the relay that holds the change: S3 alone, which has its
+        // time.
+        let s8 = |line: &&String| {
+            line.starts_with("  relay-0.example:9474 holds") && line.ends_with('.')
+        };
+        assert_eq!(said.iter().filter(s8).count(), 0, "{said:?}");
         // A relay that refuses the change, beside one that holds it and
         // refuses what waits: not done, S8 of the one that refuses.
         let node = Stands::of(finished(false), vec![looked(&[Stuck, Refusing])]);
@@ -5973,6 +6046,214 @@ mod tests {
                 "No relay can be reached from here. None is known to hold the change."
             ),
             "{said:?}"
+        );
+    }
+
+    /// **Each line of a recovery's wait starts with its time, and is said
+    /// once** (decision 2026-10-24, rule 3): R0 says that the times are in
+    /// UTC, and every line after it, to the line that the end begins with,
+    /// starts with its time; S3 and S2 are each said once, at the time of
+    /// the look that first had them.
+    #[test]
+    fn each_line_of_a_recoverys_wait_starts_with_its_time_and_is_said_once() {
+        use wait::tests::Scenario::{Dialling, Ok as Reached, OutHolding, OutLacking};
+        let node = Stands::of(
+            finished(false),
+            vec![
+                looked(&[Reached, Dialling]),
+                looked(&[OutHolding, Dialling]),
+                looked(&[OutHolding, Dialling]),
+                looked(&[OutHolding, OutLacking]),
+            ],
+        );
+        let (_, said) = after(&node);
+        let r0 = said
+            .iter()
+            .position(|line| line == &format!("\n{}", wait::recovery_first_line()))
+            .unwrap_or_else(|| panic!("{said:?}"));
+        assert!(
+            said[r0].ends_with(
+                "Until the wait ends, each line below starts with the time it was said, in UTC."
+            ),
+            "{said:?}"
+        );
+        let ended = said
+            .iter()
+            .position(|line| line.ends_with("  The wait has ended."))
+            .unwrap_or_else(|| panic!("{said:?}"));
+        assert!(r0 + 1 < ended, "{said:?}");
+        for line in &said[r0 + 1..=ended] {
+            assert_ne!(without_its_time(line), *line, "{line}: {said:?}");
+        }
+        // R0 at 10:53:01, after the look's first pause; the next look a
+        // second later.
+        let s3 = "  10:53:02  relay-0.example:9474 holds the change, and cannot be reached from \
+                  here: it ";
+        assert_eq!(
+            said.iter().filter(|line| line.starts_with(s3)).count(),
+            1,
+            "{said:?}"
+        );
+        assert_eq!(said[ended], "  10:53:04  The wait has ended.");
+    }
+
+    /// **Where no line has come for a minute, a recovery's wait says that
+    /// it is still waiting** (decision 2026-10-24, rule 3), naming the time
+    /// of R0, the last line that was not that, and again a minute later.
+    /// R0 is said at 10:53:10, after the look's first pause.
+    #[test]
+    fn a_recoverys_wait_says_it_is_still_waiting_after_a_minute_with_no_new_line() {
+        use wait::tests::Scenario::{Dialling, Ok as Reached};
+        let mut node = Stands::of(finished(false), vec![looked(&[Reached, Dialling])]);
+        node.step = 10;
+        let (ended, said) = after(&node);
+        assert!(ended.is_err(), "the stand-in's bound: {said:?}");
+        let still: Vec<&String> = said
+            .iter()
+            .filter(|line| line.contains("still waiting"))
+            .collect();
+        assert_eq!(
+            still[..2],
+            [
+                "  10:54:10  still waiting: no new line since 10:53:10",
+                "  10:55:10  still waiting: no new line since 10:53:10",
+            ],
+            "{said:?}"
+        );
+        // Once a minute, and at no other time.
+        let minutes = (node.clock.get() - AT_10_53 - 10) / 60;
+        assert_eq!(still.len() as i64, minutes, "{said:?}");
+    }
+
+    /// **Each end of a recovery's wait begins with the line that the wait
+    /// has ended** (decision 2026-10-24, rule 3), with its time, and the
+    /// lines of the end come under it with none: not done, and R1 after
+    /// R0. Where every relay holds the change at once, there is no wait,
+    /// and R1 is said alone.
+    #[test]
+    fn each_end_of_a_recoverys_wait_begins_with_the_wait_has_ended() {
+        use wait::tests::Scenario::{
+            Dialling, LacksForAMoment, Ok as Reached, OutHolding, OutLacking,
+        };
+        for (looks, end) in [
+            (
+                vec![looked(&[Reached, Dialling]), looked(&[Reached, OutLacking])],
+                RecoveryEnd::NotDone,
+            ),
+            (
+                vec![
+                    looked(&[Reached, LacksForAMoment]),
+                    looked(&[Reached, Reached]),
+                ],
+                RecoveryEnd::Recovered,
+            ),
+        ] {
+            let last = looks.last().unwrap().clone();
+            let node = Stands::of(finished(false), looks);
+            let (ended, said) = after(&node);
+            assert_eq!(ended.unwrap(), Recovered::Ended(end));
+            let at = said
+                .iter()
+                .position(|line| line == "  10:53:02  The wait has ended.")
+                .unwrap_or_else(|| panic!("{said:?}"));
+            let (relays, _) = wait::recovery_end_of_look(&last).unwrap();
+            let lines = wait::recovery_end_lines(end, &relays, AT_10_53 + 2);
+            assert_eq!(said[at + 1..], lines, "{said:?}");
+        }
+        let node = Stands::of(finished(false), vec![looked(&[Reached, OutHolding])]);
+        let (_, said) = after(&node);
+        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        assert!(
+            !said.iter().any(|line| line.contains("The wait has ended.")),
+            "{said:?}"
+        );
+        // S3 of the relay that holds the change and cannot be reached is
+        // said before R1 as it was, with no time: R0, which says that the
+        // lines have their times in UTC, is not said.
+        assert!(
+            said.iter().any(|line| line.starts_with(
+                "  relay-1.example:9474 holds the change, and cannot be reached from here"
+            )),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|line| without_its_time(line) != *line),
+            "{said:?}"
+        );
+    }
+
+    /// **No line says that a recovery's wait is still waiting at a look
+    /// that ends it** (decision 2026-10-24, rule 3): a minute after R0, the
+    /// look that ends the wait, with no new line, says the line that it has
+    /// ended, and not that it is still waiting.
+    #[test]
+    fn no_still_waiting_line_comes_beside_the_end_of_a_recoverys_wait() {
+        use wait::tests::Scenario::{LacksForAMoment, Ok as Reached};
+        // Neither look has a line of its own: the relay that lacks the
+        // change is reached, and has refused it for no minute yet.
+        let mut node = Stands::of(
+            finished(false),
+            vec![
+                looked(&[Reached, LacksForAMoment]),
+                looked(&[Reached, Reached]),
+            ],
+        );
+        node.step = 60;
+        let (ended, said) = after(&node);
+        assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::Recovered));
+        assert!(
+            !said.iter().any(|line| line.contains("still waiting")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line.ends_with("  The wait has ended.")),
+            "{said:?}"
+        );
+    }
+
+    /// **A recovery's wait counts the minutes of each relay that lacks the
+    /// change while it is waited out** (decision 2026-10-24, rule 4), as
+    /// the wait after a change does: a recovery waits for no other relay,
+    /// so one that holds the change and is not reached has no count.
+    #[test]
+    fn a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change() {
+        use wait::tests::Scenario::{Dialling, Ok as Reached};
+        // Relay 1 lacks the change, and relay 2 holds it; neither is
+        // reached, both since 190 seconds before the clock starts.
+        let mut seen = looked(&[Reached, Dialling, Dialling]);
+        for at in [1, 2] {
+            seen["relays"][at]["reach"]["reference"] = json!(AT_10_53 - 190);
+        }
+        seen["relays"][2]["reach"]["holds"] = json!("holds");
+        let node = Stands::of(finished(false), vec![seen]);
+        let (ended, said) = after(&node);
+        assert!(ended.is_err(), "the stand-in's bound: {said:?}");
+        let count = "relay-1.example:9474 has not been reached for 3 of the 5 minutes that this \
+                     command waits for it";
+        assert_eq!(
+            said.iter().filter(|line| line.ends_with(count)).count(),
+            1,
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line.starts_with("  10:53:01  ") && line.ends_with(count)),
+            "{said:?}"
+        );
+        // A minute on, the next minute.
+        assert!(
+            said.iter().any(|line| line.ends_with(
+                "relay-1.example:9474 has not been reached for 4 of the 5 minutes that this \
+                 command waits for it"
+            )),
+            "{said:?}"
+        );
+        assert!(
+            !said
+                .iter()
+                .any(|line| line.contains("relay-2.example:9474 has not been reached")),
+            "a relay that holds the change has no count: {said:?}"
         );
     }
 
@@ -6106,9 +6387,11 @@ mod tests {
             vec![one.clone(), looked(&[Reached, OutLacking])],
         );
         let (_, said) = after(&node);
+        let said: Vec<String> = said.iter().map(|line| without_its_time(line)).collect();
         let s3 = "  relay-1.example:9474 holds the change, and ";
         assert!(!said.iter().any(|line| line.starts_with(s3)), "{said:?}");
-        let s2 = "  keep this machine on: relay-1.example:9474 is not known to hold";
+        let s2 = "  keep this machine on: relay-1.example:9474 cannot be reached from here, and is \
+                  not known to hold";
         assert_eq!(
             said.iter().filter(|line| line.starts_with(s2)).count(),
             1,

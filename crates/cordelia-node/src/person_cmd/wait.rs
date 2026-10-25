@@ -17,7 +17,7 @@
 
 use cordelia_api::look::{ReachLook, joined};
 use cordelia_api::state::{Class, Holds, LacksFor};
-use cordelia_core::protocol::{BACKOFF_BASE_SECS, BOOTNODE_RESOLVE_RETRY_SECS};
+use cordelia_core::protocol::{BACKOFF_BASE_SECS, BOOTNODE_RESOLVE_RETRY_SECS, OUT_OF_REACH_SECS};
 use serde_json::Value;
 
 use super::{NOT_AT_EVERY_RELAY_STATUS, is_own, list, text};
@@ -379,13 +379,14 @@ pub(crate) fn no_longer_stands(seen: &Value) -> Option<String> {
 }
 
 /// R0: what a recovery says where a relay does not hold the change when
-/// its look has ended (decision 2026-10-19 §5).
+/// its look has ended (decision 2026-10-19 §5), and that each line after
+/// it has its time (decision 2026-10-24, rule 3).
 pub(crate) fn recovery_first_line() -> String {
     format!(
         "This command stays until every relay holds the change. It ends sooner, with status \
          {NOT_AT_EVERY_RELAY_STATUS}, once each relay that is not known to hold it cannot be \
          reached, or refuses it, for five minutes. Stopping it stops nothing: the node goes on, \
-         and the recovery stays made."
+         and the recovery stays made. {TIMES_SAID}"
     )
 }
 
@@ -434,7 +435,8 @@ fn names(relays: &[&RelayAt]) -> String {
     joined(&names)
 }
 
-/// The first line of the wait (decision 2026-10-19 §5, S1).
+/// The first line of the wait (decision 2026-10-19 §5, S1), and that each
+/// line after it has its time (decision 2026-10-24, rule 3).
 pub(crate) fn first_line() -> String {
     format!(
         "You may close this machine once every relay holds the change, and what this device \
@@ -443,20 +445,161 @@ pub(crate) fn first_line() -> String {
          minutes a relay that is not known to hold the change cannot be reached or refuses it, \
          or where no relay that this machine reaches has what this device carried. It then \
          does not say that you may close this machine. Stopping it stops nothing: the node \
-         goes on."
+         goes on. {TIMES_SAID}"
     )
 }
 
+/// What S1 and R0 end with (decision 2026-10-24, rule 3): the lines of
+/// an end, under the line that the wait has ended, have no time.
+const TIMES_SAID: &str = "Until the wait ends, each line below starts with the time it was said, \
+                          in UTC.";
+
 /// What the wait says of a relay that is out of reach, while it goes on
-/// (decision 2026-10-19 §5, S2 and S3).
+/// (decision 2026-10-19 §5, S2 and S3; decision 2026-10-24, rule 7): that
+/// it cannot be reached from here, and since what.
 pub(crate) fn out_of_reach_line(relay: &RelayAt, now: i64) -> String {
     let since = since_of(relay, now);
     match relay.holds() {
-        true => format!("{} holds the change, and {since}", relay.name),
-        false => format!(
-            "keep this machine on: {} is not known to hold the change yet, and {since}",
+        true => format!(
+            "{} holds the change, and cannot be reached from here: it {since}",
             relay.name
         ),
+        false => format!(
+            "keep this machine on: {} cannot be reached from here, and is not known to hold the \
+             change yet: it {since}",
+            relay.name
+        ),
+    }
+}
+
+/// The minutes for which the wait waits out a relay (decision 2026-10-19
+/// §1): what its count says it waits (decision 2026-10-24, rule 4).
+const WAITED_MINUTES: u64 = OUT_OF_REACH_SECS / 60;
+
+/// What the wait says, once each minute counted, of a relay that it waits
+/// out (decision 2026-10-24, rule 4), at `now`: one that is not reached
+/// and not out of reach, by the whole minutes since its reference; and one
+/// that is reached and refuses the change, by those since it came to
+/// refuse it, from minute 1 to minute 4. Nothing at minute 0, and nothing
+/// of a relay in a class: once it is out of reach S2 or S3 says so. The
+/// count is a word to the person: the node's own clock ends the wait.
+///
+/// The minutes are those of the wait, from the reference: from minute 5
+/// the line says that the relay has not been reached in them, and not for
+/// how long it has not been, since it may have been lost before the
+/// reference (`<since>` says when it was last reached).
+pub(crate) fn count_line(relay: &RelayAt, now: i64) -> Option<String> {
+    let reach = relay.reach.as_ref().filter(|reach| reach.class.is_none())?;
+    let minutes = |since: i64| u64::try_from(now.saturating_sub(since)).unwrap_or(0) / 60;
+    let name = &relay.name;
+    if !reach.reached {
+        if reach.out_of_reach_since.is_some() {
+            return None;
+        }
+        return match minutes(reach.reference) {
+            0 => None,
+            m if m < WAITED_MINUTES => Some(format!(
+                "{name} has not been reached for {m} of the {WAITED_MINUTES} minutes that this \
+                 command waits for it"
+            )),
+            m => Some(format!(
+                "{name} has not been reached in the {m} minutes that this command has waited \
+                 for it. This command stops waiting for it once this machine has tried it again \
+                 and failed."
+            )),
+        };
+    }
+    if reach.holds != Holds::Lacks {
+        return None;
+    }
+    let m = minutes(reach.refused_since?);
+    (1..WAITED_MINUTES).contains(&m).then(|| {
+        format!(
+            "{name} has refused the change for {m} of the {WAITED_MINUTES} minutes that this \
+             command waits for it"
+        )
+    })
+}
+
+/// How long the wait goes with no new line before it says that it is
+/// still waiting, and again after (decision 2026-10-24, rule 3).
+const STILL_WAITING_SECS: i64 = 60;
+
+/// A time of day as each line of the wait says it, in UTC, with seconds
+/// (decision 2026-10-24, rule 3).
+fn clock(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|at| at.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("{at}"))
+}
+
+/// A line of the wait as it is said at `at`: two spaces in, its time, two
+/// spaces, and its words.
+fn timed(at: i64, line: &str) -> String {
+    format!("  {}  {line}", clock(at))
+}
+
+/// What the wait has said, and when (decision 2026-10-24, rule 3).
+///
+/// - **A line is new** where it was not in the last look, judged by its
+///   words without the time: it is said once, with the time it is said. A
+///   line that drops out of the look says nothing.
+/// - **Where no line has been said for a minute,** the wait says that it
+///   is still waiting, with the time of the last line that was not that
+///   (S1 or R0 where none has come since), and again a minute after the
+///   last line of any kind. Not at a look that ends the wait: the line
+///   that it has ended is said then.
+/// - **Each end begins with a line of its own,** with its time
+///   ([`Self::ended`]); the lines of the end come under it, with none.
+///
+/// The time is read from the clock that the wait is given, and nothing of
+/// what the wait decides reads a time it says.
+pub(crate) struct Told {
+    /// The lines of the last look, by their words.
+    said: Vec<String>,
+    /// When the last line was said that was not the line that the wait is
+    /// still waiting.
+    last_line: i64,
+    /// When the last line of any kind was said.
+    last_said: i64,
+}
+
+impl Told {
+    /// A wait whose first line was said at `at`.
+    pub fn from(at: i64) -> Self {
+        Self {
+            said: Vec::new(),
+            last_line: at,
+            last_said: at,
+        }
+    }
+
+    /// What the wait says of a look at `at` whose lines are `now`, a line
+    /// each, as each is printed. `ends` is whether the look ends the wait.
+    pub fn of_look(&mut self, now: Vec<String>, at: i64, ends: bool) -> Vec<String> {
+        let new: Vec<String> = now
+            .iter()
+            .filter(|line| !self.said.contains(line))
+            .map(|line| timed(at, line))
+            .collect();
+        self.said = now;
+        if !new.is_empty() {
+            (self.last_line, self.last_said) = (at, at);
+            return new;
+        }
+        if ends || at.saturating_sub(self.last_said) < STILL_WAITING_SECS {
+            return Vec::new();
+        }
+        self.last_said = at;
+        vec![timed(
+            at,
+            &format!("still waiting: no new line since {}", clock(self.last_line)),
+        )]
+    }
+
+    /// The line that each end of the wait begins with, said at `at`.
+    pub fn ended(at: i64) -> String {
+        timed(at, "The wait has ended.")
     }
 }
 
@@ -519,12 +662,13 @@ fn warned_lines(relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
                 let since = since_of(relay, now);
                 lines.push(match held.iter().any(|at| at.name == relay.name) {
                     true => format!(
-                        "  {} holds the change and all that this device carried, and {since}.",
+                        "  {} holds the change and all that this device carried, and cannot be \
+                         reached from here: it {since}.",
                         relay.name
                     ),
                     false => format!(
-                        "  {} holds the change, and {since}. Some of what this device carried \
-                         is not there yet.",
+                        "  {} holds the change, and cannot be reached from here: it {since}. \
+                         Some of what this device carried is not there yet.",
                         relay.name
                     ),
                 });
@@ -605,13 +749,13 @@ fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<Str
     for relay in said_of {
         match relay.class() {
             Some(Class::OutLacking) => lines.push(format!(
-                "  {} is not known to hold the change, and {}.",
+                "  {} cannot be reached from here, and is not known to hold the change: it {}.",
                 relay.name,
                 since_of(relay, now)
             )),
             Some(Class::Refusing) => lines.push(refusing_line(relay, now)),
             Some(Class::OutHolding) => lines.push(format!(
-                "  {} holds the change, and {}.",
+                "  {} holds the change, and cannot be reached from here: it {}.",
                 relay.name,
                 since_of(relay, now)
             )),
@@ -1702,7 +1846,9 @@ pub(crate) mod tests {
                 out_of_reach_since: matches!(class, Some(Class::OutHolding | Class::OutLacking))
                     .then_some(noon() - 60),
                 reference: noon() - 600,
+                reference_by: cordelia_api::state::ReferenceBy::Change,
                 last_reached: None,
+                refused_since: None,
                 waits: None,
                 refusing_waits_since: (class == Some(Class::Stuck)).then_some(noon() - 420),
                 no_room: None,
@@ -1752,8 +1898,11 @@ pub(crate) mod tests {
 
     /// Each line of the wait after a change, word for word (decision
     /// 2026-10-19 §5): S1, S2, S3, S6, S6b, S7, S8, S9, S10, S10b and S11;
-    /// `<since>` in both forms and `<when>` with and without its date;
-    /// what is said on an error in the wait; and H1 and H2 (rule 14).
+    /// `<since>` in its forms and `<when>` with and without its date;
+    /// what is said on an error in the wait; and H1 and H2 (rule 14). S1
+    /// says that each line has its time, and S2, S3, S6 and S8 that a
+    /// relay out of reach cannot be reached from here (decision 2026-10-24,
+    /// rules 3 and 7).
     #[test]
     fn each_line_word_for_word() {
         let now = noon();
@@ -1764,7 +1913,8 @@ pub(crate) mod tests {
              what is missing. It ends sooner, with status 3, where for five minutes a relay \
              that is not known to hold the change cannot be reached or refuses it, or where no \
              relay that this machine reaches has what this device carried. It then does not say \
-             that you may close this machine. Stopping it stops nothing: the node goes on."
+             that you may close this machine. Stopping it stops nothing: the node goes on. Until \
+             the wait ends, each line below starts with the time it was said, in UTC."
         );
 
         // `<when>`, today and not; `<since>`, both forms.
@@ -1777,22 +1927,30 @@ pub(crate) mod tests {
             Dial::Dialled,
         );
         let mut reach = a.reach.clone().unwrap();
-        assert_eq!(since(&reach, now), "has not answered since 11:50 UTC");
-        reach.last_reached = Some(now - 300);
-        reach.reference = now - 300;
         assert_eq!(
             since(&reach, now),
-            "has not been reached from here since 11:55 UTC"
+            "has not answered since this device applied the change at 11:50 UTC"
         );
-        // Reached, and then the kept entry changed: since the change.
+        reach.last_reached = Some(now - 300);
+        reach.reference = now - 300;
+        reach.reference_by = cordelia_api::state::ReferenceBy::Reached;
+        assert_eq!(since(&reach, now), "has not been reached since 11:55 UTC");
+        // Reached, and then the kept entry changed: since the change, and
+        // when it was last reached.
         reach.reference = now - 120;
-        assert_eq!(since(&reach, now), "has not answered since 11:58 UTC");
+        reach.reference_by = cordelia_api::state::ReferenceBy::Change;
+        assert_eq!(
+            since(&reach, now),
+            "has not answered since this device applied the change at 11:58 UTC (it was last \
+             reached at 11:55 UTC)"
+        );
 
         // S2 and S3.
         assert_eq!(
             out_of_reach_line(&a, now),
-            "keep this machine on: a.example:9474 is not known to hold the change yet, and has \
-             not answered since 11:50 UTC"
+            "keep this machine on: a.example:9474 cannot be reached from here, and is not known \
+             to hold the change yet: it has not answered since this device applied the change at \
+             11:50 UTC"
         );
         let b = relay_at(
             "b.example:9474",
@@ -1802,7 +1960,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             out_of_reach_line(&b, now),
-            "b.example:9474 holds the change, and has not answered since 11:50 UTC"
+            "b.example:9474 holds the change, and cannot be reached from here: it has not \
+             answered since this device applied the change at 11:50 UTC"
         );
 
         // End 2: S6 in both forms, S6b, and S7.
@@ -1824,8 +1983,9 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change and all that this device carried, and has \
-                 not answered since 11:50 UTC.",
+                "  b.example:9474 holds the change and all that this device carried, and cannot \
+                 be reached from here: it has not answered since this device applied the change \
+                 at 11:50 UTC.",
                 "Every relay holds the change. You may close this machine. All that this device \
                  carried is at a.example:9474 and b.example:9474. What this device writes from \
                  now on waits for b.example:9474. `cordelia devices` shows which devices have \
@@ -1841,8 +2001,9 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change, and has not answered since 11:50 UTC. Some \
-                 of what this device carried is not there yet.",
+                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                 answered since this device applied the change at 11:50 UTC. Some of what this \
+                 device carried is not there yet.",
                 "  c.example:9474 holds the change. It has refused for room what this device \
                  still has to send there since 11:53 UTC.",
                 "Every relay holds the change. You may close this machine. All that this device \
@@ -1939,9 +2100,10 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  a.example:9474 is not known to hold the change, and has not answered since \
-                 11:50 UTC.",
-                "  b.example:9474 holds the change, and has not answered since 11:50 UTC.",
+                "  a.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                 answered since this device applied the change at 11:50 UTC.",
                 "  c.example:9474 holds the change. It has refused for room what this device \
                  still has to send there since 11:53 UTC.",
                 "  d.example:9474 is reached, and has not taken the change: it had no room for \
@@ -1951,12 +2113,12 @@ pub(crate) mod tests {
                 "  f.example:9474 is reached, and holds a change that this device does not take \
                  (another key than the phrase's wrote it). It does not take this one in its \
                  place.",
-                "  g.example:9474 is not known to hold the change, and has not answered since \
-                 11:50 UTC.",
-                "  h.example:9474 is not known to hold the change, and has not answered since \
-                 11:50 UTC.",
-                "  i.example:9474 is not known to hold the change, and has not answered since \
-                 11:50 UTC.",
+                "  g.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                "  h.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                "  i.example:9474 cannot be reached from here, and is not known to hold the \
+                 change: it has not answered since this device applied the change at 11:50 UTC.",
                 "A device of yours that reaches only a.example:9474, d.example:9474, \
                  e.example:9474, f.example:9474, g.example:9474, h.example:9474 and \
                  i.example:9474 may not have heard of the change. Until it does, it goes on in \
@@ -2116,7 +2278,8 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change, and has not answered since 11:50 UTC.",
+                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                 answered since this device applied the change at 11:50 UTC.",
                 "No relay can be reached from here. This command ends here, with status 3. It \
                  does not say that you may close this machine. Keep it on, on a network from \
                  which a relay can be reached. `cordelia devices` says what is missing.",

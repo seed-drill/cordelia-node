@@ -1,0 +1,61 @@
+name: Scale, the small runs
+
+# Manual only. Section 6's tests 4 and 5 of the scale test (decision
+# 2026-10-22): two relays and seven devices on loopback, some minutes each
+# and one after the other, in a release build as the record runs a stage.
+# They return at once unless CORDELIA_SCALE_SMALL is set, so the job of
+# ignored tests in ci.yml passes over them. A run on a runner that is
+# busy with other work is INVALID for the machine (§6, rule 5), and test
+# 5, which must say FAIL, fails then: the runs that decide go on a machine
+# of their own. The stages themselves (100 and 190) run for hours, and
+# not here.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  small-runs:
+    name: the small runs
+    runs-on: ubuntu-latest
+    # The build in release, and two runs of about ten minutes each.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release -p cordelia-node --tests
+
+      - name: The small runs (tests 4 and 5)
+        env:
+          CORDELIA_SCALE_SMALL: "1"
+          CORDELIA_SCALE_OUT: ${{ runner.temp }}/scale
+        run: >-
+          cargo test --release -p cordelia-node --test scale a_small_run
+          -- --ignored --nocapture
+
+      - name: What the runs left
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-small-runs
+          path: |
+            ${{ runner.temp }}/scale/*/SUMMARY.md
+            ${{ runner.temp }}/scale/*/edits.csv
+            ${{ runner.temp }}/scale/*/samples.jsonl
+          if-no-files-found: ignore

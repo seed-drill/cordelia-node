@@ -296,10 +296,29 @@ pub fn recorded_directory(folder: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether the memory folder `memory` holds a file that a cycle would
+/// look at: a plain file whose name does not start with a dot (#207). One
+/// that cannot be read is taken to hold one, so that it is listed; one
+/// that is not there, or is no folder, holds none.
+pub fn holds_a_file(memory: &Path) -> bool {
+    let entries = match std::fs::read_dir(memory) {
+        Ok(entries) => entries,
+        Err(e) => {
+            use std::io::ErrorKind::{NotADirectory, NotFound};
+            return !matches!(e.kind(), NotFound | NotADirectory);
+        }
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        !entry.file_name().to_string_lossy().starts_with('.')
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    })
+}
+
 /// What is found on disk for the directory `given`, under the Claude Code
 /// directory `claude_dir`, as the node looks itself (decision 2026-10-04
-/// §10.1): each folder directly under `projects` that holds memory and
-/// belongs to that directory ([`recorded_directory`]), as its folder and
+/// §10.1): each folder directly under `projects` whose memory holds a
+/// file ([`holds_a_file`]) and that belongs to that directory
+/// ([`recorded_directory`]), as its folder and
 /// its directory as recorded, in order of folder. Directories are
 /// compared by their real paths.
 ///
@@ -320,7 +339,7 @@ pub fn found_for(claude_dir: &Path, given: &Path, machine: &dyn Machine) -> Vec<
     let mut found: Vec<(String, String)> = listed
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|folder| folder.join("memory").is_dir())
+        .filter(|folder| holds_a_file(&folder.join("memory")))
         .filter_map(|folder| Some((shown(&folder), recorded_directory(&folder)?)))
         .filter(|(_, directory)| real(directory) == given)
         .map(|(folder, directory)| (folder, shown(&directory)))
@@ -463,8 +482,16 @@ pub enum WhyAName {
     HasNone,
     /// The name it has is not one that a folder can be mapped under.
     NotUsable,
-    /// Another folder is mapped under the name it has: that folder.
-    Taken(String),
+    /// Another folder is mapped under the name it has.
+    Taken {
+        /// The name, as `map` would send it.
+        name: String,
+        /// The folder that is mapped under it.
+        folder: String,
+        /// Whether that folder is there: one that is gone may be this
+        /// one, moved.
+        there: bool,
+    },
 }
 
 /// Why `cordelia sync map` would not sync a folder that was found.
@@ -552,15 +579,39 @@ impl WhyNot {
 }
 
 impl WhyAName {
-    /// Why a name is needed, in words.
-    pub fn says(&self) -> String {
+    /// Why a name is needed, in words, with a folder under `home` shown
+    /// from `~`.
+    pub fn says(&self, home: Option<&Path>) -> String {
         match self {
             WhyAName::HasNone => "needs a name (not a git project)".into(),
             WhyAName::NotUsable => "needs a name (the one it has cannot be mapped)".into(),
-            WhyAName::Taken(folder) => {
-                format!("needs another name (its own is mapped from {folder})")
+            WhyAName::Taken {
+                name,
+                folder,
+                there,
+            } => {
+                let folder = from_home(Path::new(folder), home);
+                match there {
+                    true => format!(
+                        "{name} already syncs from {folder}: give this one its own name, or \
+                         unmap {folder} first"
+                    ),
+                    false => format!(
+                        "{name} is mapped from {folder}, which is gone: unmap it first, or give \
+                         this one its own name"
+                    ),
+                }
             }
         }
+    }
+}
+
+/// `path` as a person reads it: from `~` where it is under `home`.
+fn from_home(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -657,7 +708,11 @@ pub fn would_map(asked: &Asked, against: &Against, machine: &dyn Machine) -> Map
         return Maps::Yes(How::UnderAName(WhyAName::NotUsable));
     }
     if let Some(mapped) = against.mappings.iter().find(|mapping| mapping.name == name) {
-        return Maps::Yes(How::UnderAName(WhyAName::Taken(mapped.folder.clone())));
+        return Maps::Yes(How::UnderAName(WhyAName::Taken {
+            name,
+            folder: mapped.folder.clone(),
+            there: machine.is_dir(Path::new(&mapped.folder)),
+        }));
     }
     Maps::Yes(How::UnderItsName)
 }
@@ -668,8 +723,10 @@ const HOME_NAME: &str = "~";
 // ── An entry, as a status carries it ─────────────────────────────────
 
 /// A folder that was found and is not mapped, as a status carries it:
-/// the adapter's report lists one for each folder it found, and the
-/// node's status one for each folder that a notice names.
+/// the adapter's report lists one for each folder it found that it lists
+/// (one whose memory holds no file is listed only where mapping it would
+/// bring memory in), and the node's status one for each folder that a
+/// notice names.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Entry {
     /// Claude Code's folder for it.
@@ -734,7 +791,7 @@ impl Entry {
                     How::Home => entry.home = true,
                     How::UnderAName(why) => {
                         entry.needs_name = true;
-                        entry.says = Some(why.says());
+                        entry.says = Some(why.says(against.home));
                     }
                 }
             }
@@ -1515,7 +1572,95 @@ mod tests {
         // under: it needs a name of its own.
         assert_eq!(
             asks_of("/home/sam/src/cn", Some("github.com/o/cn"), &mapped),
-            Maps::Yes(How::UnderAName(WhyAName::Taken("/home/sam/Work/cn".into())))
+            Maps::Yes(How::UnderAName(WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+                there: true,
+            }))
+        );
+    }
+
+    /// What a memory folder holds, as the found list counts it (#207): a
+    /// plain file whose name does not start with a dot. One that is not
+    /// there, or is no folder, holds none; one that cannot be read is
+    /// taken to hold one, so that it is listed.
+    #[test]
+    fn test_a_memory_folder_holds_a_file_only_where_a_cycle_would_look_at_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = tmp.path().join("memory");
+        assert!(!holds_a_file(&memory), "not there");
+        std::fs::write(tmp.path().join("a-file"), "x").unwrap();
+        assert!(!holds_a_file(&tmp.path().join("a-file")), "no folder");
+        std::fs::create_dir(&memory).unwrap();
+        assert!(!holds_a_file(&memory), "empty");
+        std::fs::write(memory.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir(memory.join("kept")).unwrap();
+        assert!(!holds_a_file(&memory), "a dotfile and a folder");
+        std::fs::write(memory.join("a.md"), "x").unwrap();
+        assert!(holds_a_file(&memory));
+
+        use std::os::unix::fs::PermissionsExt;
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // One who may read anything (root) reads it, and it is empty.
+        if std::fs::read_dir(&locked).is_err() {
+            assert!(holds_a_file(&locked), "cannot be read");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A name that another folder is mapped under: whether that folder is
+    /// there, and the words for each, with a folder under the home
+    /// directory shown from `~`.
+    #[test]
+    fn test_a_name_mapped_from_another_folder_says_whether_that_folder_is_there() {
+        let mapped = [mapping("/home/sam/Work/cn", "github.com/o/cn")];
+        let Maps::Yes(How::UnderAName(there)) =
+            asks_of("/home/sam/src/cn", Some("github.com/o/cn"), &mapped)
+        else {
+            panic!("not a name taken");
+        };
+        assert_eq!(
+            there.says(Some(Path::new(HOME))),
+            "github.com/o/cn already syncs from ~/Work/cn: give this one its own name, or unmap \
+             ~/Work/cn first"
+        );
+        let gone = Said {
+            gone: vec!["/home/sam/Work/cn"],
+            ..Default::default()
+        };
+        let folder = folder_of("/home/sam/src/cn");
+        let asked = asks(
+            &folder,
+            Some("/home/sam/src/cn"),
+            Some("github.com/o/cn"),
+            &mapped,
+            &gone,
+            Some(HOME),
+        );
+        let Maps::Yes(How::UnderAName(why)) = asked else {
+            panic!("{asked:?}");
+        };
+        assert_eq!(
+            why,
+            WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+                there: false,
+            }
+        );
+        assert_eq!(
+            why.says(Some(Path::new(HOME))),
+            "github.com/o/cn is mapped from ~/Work/cn, which is gone: unmap it first, or give \
+             this one its own name"
+        );
+        // Outside the home directory, or with none known, as it is.
+        assert!(why.says(None).contains("mapped from /home/sam/Work/cn,"));
+        assert_eq!(from_home(Path::new(HOME), Some(Path::new(HOME))), "~");
+        assert_eq!(
+            from_home(Path::new("/home/samantha"), Some(Path::new(HOME))),
+            "/home/samantha"
         );
     }
 
@@ -1545,7 +1690,11 @@ mod tests {
         let mapped = [mapping("/home/sam/Work/cn", "github.com/o/cn")];
         assert_eq!(
             asks_of("/home/sam/src/cn", Some("github.com/o/cn.git"), &mapped),
-            Maps::Yes(How::UnderAName(WhyAName::Taken("/home/sam/Work/cn".into())))
+            Maps::Yes(How::UnderAName(WhyAName::Taken {
+                name: "github.com/o/cn".into(),
+                folder: "/home/sam/Work/cn".into(),
+                there: true,
+            }))
         );
     }
 
@@ -1946,6 +2095,7 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             if memory {
                 std::fs::create_dir_all(folder.join("memory")).unwrap();
+                std::fs::write(folder.join("memory/a.md"), "a\n").unwrap();
             }
             let lines: Vec<String> = records
                 .iter()
@@ -1960,10 +2110,13 @@ mod tests {
         let own = folder(&own_name, &[&other, &work], true);
         let tree = folder("workspace", &[&work, &other], true);
         // In no list: a tree that records another directory first, one
-        // that holds no memory, one with no transcript, and a folder
-        // that Claude Code named after another directory.
+        // that holds no memory, one whose memory folder is empty, one with
+        // no transcript, and a folder that Claude Code named after another
+        // directory.
         folder("second", &[&other, &work], true);
         folder("emptied", &[&work], false);
+        let empty = folder("empty", &[&work], false);
+        std::fs::create_dir(empty.join("memory")).unwrap();
         folder("bare", &[], true);
         folder(&claude_folder_name(&root.join("gone")), &[&work], true);
 

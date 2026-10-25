@@ -13,10 +13,12 @@
 //! name is cut at 48 Unicode scalar values; and every command line is
 //! quoted for a shell.
 //!
-//! **`log` is for a person** ([`log`]): at a terminal it shows every name,
-//! and asks a yes, which marks what it printed read by a person, the one
-//! act that ends a hold between two agents; anywhere else it shows the
-//! folder's agent's messages, as `read` reaches them, and marks nothing.
+//! **`log` is for a person** ([`log`]): it shows only what no person has
+//! read here, and says how many it left out that a person has. At a
+//! terminal it shows every name, and asks a yes, which marks what it
+//! printed read by a person, the one act that ends a hold between two
+//! agents; anywhere else it shows the folder's agent's messages, as
+//! `read` reaches them, and marks nothing.
 //!
 //! **`summary` prints nothing, and exits 0, on anything at all:** it is
 //! what an agent's hook runs, at every prompt. It keeps to 100 ms from the
@@ -124,7 +126,7 @@ pub const NOT_MARKED: &str = "Not marked as read by a person: this was not run a
 
 /// The question `log` asks at a terminal, of the `printed` messages it
 /// printed with their bodies, where it was given `--since` or not
-/// (decision 2026-10-09 §4.1, §7.2): older messages are not shown then,
+/// (decision 2026-10-09 §4.1, §7.2): messages a person has read are not shown then,
 /// and may hold a pair.
 pub fn log_question(printed: usize, since: bool) -> String {
     let (these, between, them) = match printed {
@@ -1240,11 +1242,12 @@ fn of_the_log(posted: Posted) -> Posted {
 
 /// `cordelia msg log [--since <time>]` (decision 2026-10-09 §4.1, §4.2,
 /// §7.2). It begins with the line that says it is a person's, whatever
-/// follows. Where its input and its output are both terminals it lists
-/// every name, and asks; only `yes` marks, and it marks the messages it
-/// printed with their bodies and no other: the node is sent their IDs.
-/// Anywhere else it lists the folder's agent's messages, and marks
-/// nothing.
+/// follows. It lists only the messages that no person has read here, as
+/// the node answers them. Where its input and its output are both
+/// terminals it lists every name, and asks; only `yes` marks, and it marks
+/// the messages it printed with their bodies and no other: the node is
+/// sent their IDs. Where it lists none it asks nothing. Anywhere else it
+/// lists the folder's agent's messages, and marks nothing.
 pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
     written(&format!("{FOR_A_PERSON}\n"));
     // 2. What the command checks alone.
@@ -1278,8 +1281,12 @@ pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
         written(&format!("{NOT_MARKED}\n"));
         return Ok(());
     }
+    // Nothing printed with its body: nothing is asked. Where it listed no
+    // message at all, its first line said so, and that is all it says.
     if printed.is_empty() {
-        written("No message was printed with what it says, so none is marked.\n");
+        if answer["threads"].as_array().is_some_and(|t| !t.is_empty()) {
+            written("No message was printed with what it says, so none is marked.\n");
+        }
         return Ok(());
     }
     let terminal = crate::terminal::Terminal::at()?;
@@ -1336,26 +1343,43 @@ fn device_named(device: &Value) -> String {
     }
 }
 
+/// What `log` says of the `already` messages it did not list because a
+/// person here has read them, where it listed others (decision 2026-10-09
+/// §4.1).
+fn already_read_says(already: u64) -> String {
+    match already {
+        1 => "You have read 1 other message here, so it is not shown.\n".into(),
+        _ => format!("You have read {already} other messages here, so they are not shown.\n"),
+    }
+}
+
 /// What `log` prints of what the node answered (decision 2026-10-09
 /// §4.1), each frame with a value of its own from `marker`: the threads,
-/// and after them what is so of each signer and of the device's own
-/// messages. With it, the whole IDs of the messages it printed with their
-/// bodies, which are all that a yes marks.
+/// which hold only what no person has read here, and after them how many
+/// a person has read, and what is so of each signer and of the device's
+/// own messages. With it, the whole IDs of the messages it printed with
+/// their bodies, which are all that a yes marks.
 pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, Vec<String>) {
     let text = |value: &Value| cleaned(value.as_str().unwrap_or_default());
     let mut out = String::new();
     let mut printed = Vec::new();
     let threads = answer["threads"].as_array().cloned().unwrap_or_default();
+    let already = answer["already_read"].as_u64().unwrap_or(0);
     let (whose, any) = match answer["name"].as_str() {
         Some(name) => (format!("the agent {}", name_shown(name)), None),
         None => ("every agent".into(), Some("any agent")),
     };
-    match threads.is_empty() {
-        true => out.push_str(&format!(
-            "No message of {} is held on this device.\n",
-            any.unwrap_or(&whose)
+    let any = any.unwrap_or(&whose);
+    match (threads.is_empty(), already) {
+        (true, 0) => out.push_str(&format!("No message of {any} is held on this device.\n")),
+        (true, 1) => out.push_str(&format!(
+            "No new message of {any} is held on this device. You have read the other one here.\n"
         )),
-        false => out.push_str(&format!("Messages of {whose} on this device:\n")),
+        (true, _) => out.push_str(&format!(
+            "No new message of {any} is held on this device. You have read the {already} \
+             others here.\n"
+        )),
+        (false, _) => out.push_str(&format!("Messages of {whose} on this device:\n")),
     }
     for thread in &threads {
         out.push_str(&format!("\nThread {}:\n", short(&text(&thread["thread"]))));
@@ -1407,10 +1431,8 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
                 true => out.push_str("Not read by an agent on any device.\n"),
                 false => out.push_str(&format!("Read by an agent {}.\n", read_on.join(", "))),
             }
-            match message["read_by_a_person"] == true {
-                true => out.push_str("Read by a person here.\n"),
-                false => out.push_str("Not read by a person here.\n"),
-            }
+            // The node lists no message that a person here has read.
+            out.push_str("Not read by a person here.\n");
             if message["before_the_last_change"] == true {
                 out.push_str("From before the last change of your devices.\n");
             }
@@ -1423,6 +1445,9 @@ pub fn log_says(answer: &Value, mut marker: impl FnMut() -> String) -> (String, 
     }
 
     let mut after = String::new();
+    if !threads.is_empty() && already > 0 {
+        after.push_str(&already_read_says(already));
+    }
     for signer in answer["signers"].as_array().into_iter().flatten() {
         let from = device_named(&signer["device"]);
         let count = |field: &str| signer[field].as_u64().unwrap_or(0);
@@ -1520,7 +1545,8 @@ mod tests {
 
     /// A log as the node answers it: a thread of two messages from laptop,
     /// the first shown and the second held back; a thread of one of this
-    /// device's own, to every agent; and what is counted after.
+    /// device's own, to every agent; two that a person here has read, which
+    /// are not listed; and what is counted after.
     fn a_log() -> Value {
         let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
         let laptop = json!({ "label": "laptop", "fingerprint": "apple banana cherry date" });
@@ -1532,7 +1558,7 @@ mod tests {
                       "ago_secs": 120, "before_the_last_change": false,
                       "signer_removed": true, "held_back": false, "asks": true,
                       "link": "owner/repo#7", "body": "the body\n", "read_on": ["desktop"],
-                      "read_here": true, "read_by_a_person": false },
+                      "read_here": true },
                     { "id": b, "thread": a, "from": "notes", "to": "work", "device": laptop,
                       "ago_secs": 60, "before_the_last_change": false,
                       "signer_removed": false, "held_back": true },
@@ -1541,10 +1567,10 @@ mod tests {
                     { "id": c, "thread": c, "from": "work", "to": null, "device": "this",
                       "ago_secs": 7200, "before_the_last_change": true,
                       "signer_removed": false, "held_back": false, "asks": false,
-                      "link": null, "body": "to all", "read_on": [], "read_here": false,
-                      "read_by_a_person": true },
+                      "link": null, "body": "to all", "read_on": [], "read_here": false },
                 ]},
             ],
+            "already_read": 2,
             "signers": [
                 { "device": laptop, "overwritten": 3, "not_messages": 2, "held_back": 1 },
                 { "device": "this", "overwritten": 0, "not_messages": 0, "held_back": 0 },
@@ -2019,10 +2045,11 @@ mod tests {
                 "",
                 own.as_str(),
                 "Not read by an agent on any device.",
-                "Read by a person here.",
+                "Not read by a person here.",
                 "From before the last change of your devices.",
                 "to all",
                 "",
+                "You have read 2 other messages here, so they are not shown.",
                 "3 messages from \"laptop\" were overwritten before they were shown on this \
                  device.",
                 "2 entries from \"laptop\" were not messages, and were not shown.",
@@ -2070,6 +2097,7 @@ mod tests {
         // Where nothing is held.
         let mut nothing = a_log();
         nothing["threads"] = json!([]);
+        nothing["already_read"] = json!(0);
         assert!(
             log_says(&nothing, marker)
                 .0
@@ -2081,6 +2109,18 @@ mod tests {
                 .0
                 .starts_with("No message of the agent work is held on this device.\n")
         );
+        // Where nothing is new, in one line that counts what a person read.
+        nothing["already_read"] = json!(3);
+        assert!(log_says(&nothing, marker).0.starts_with(
+            "No new message of the agent work is held on this device. You have read the 3 \
+             others here.\n"
+        ));
+        nothing["name"] = Value::Null;
+        nothing["already_read"] = json!(1);
+        assert!(log_says(&nothing, marker).0.starts_with(
+            "No new message of any agent is held on this device. You have read the other one \
+             here.\n"
+        ));
         // What a yes says.
         assert_eq!(
             marked_says(2, 2),
@@ -2132,10 +2172,11 @@ mod tests {
     /// What `log` prints of each message, and after the threads (decision
     /// 2026-10-09 §4.1): each body framed as `read` frames it, with a value
     /// of its own; a message held back by its ID and its sender alone; on
-    /// which devices an agent read it, whether a person here did, whether
-    /// it asks, and where they apply that it is from before the last change
-    /// or from a device that is no longer one of yours; and then what is so
-    /// of each signer and of this device's own messages.
+    /// which devices an agent read it, that no person here did, whether it
+    /// asks, and where they apply that it is from before the last change or
+    /// from a device that is no longer one of yours; and then how many a
+    /// person here has read, and what is so of each signer and of this
+    /// device's own messages.
     #[test]
     fn log_frames_each_body_as_read_does_and_lists_what_is_held_back_without_it() {
         let mut values = ["0a0a0a0a0a0a", "0b0b0b0b0b0b"].into_iter();
@@ -2176,10 +2217,11 @@ mod tests {
              Message {c} from work on this device to every agent, sent 2h ago. It asks for \
              nothing.\n\
              Not read by an agent on any device.\n\
-             Read by a person here.\n\
+             Not read by a person here.\n\
              From before the last change of your devices.\n\
              {own}\
              \n\
+             You have read 2 other messages here, so they are not shown.\n\
              3 messages from \"laptop\" were overwritten before they were shown on this device.\n\
              2 entries from \"laptop\" were not messages, and were not shown.\n\
              1 messages from \"laptop\" are held back by this device's hour, and are shown when \
@@ -2222,6 +2264,7 @@ mod tests {
         let mut of_work = a_log();
         of_work["name"] = json!("work");
         of_work["threads"] = json!([]);
+        of_work["already_read"] = json!(0);
         of_work["filled_by"] = Value::Null;
         let (said, printed) = log_says(&of_work, marker);
         assert!(printed.is_empty());
@@ -2262,6 +2305,58 @@ mod tests {
             marked_says(1, 2),
             "Marked 1 of the 2 messages printed as read by a person on this device: the others \
              are no longer shown here.\n"
+        );
+    }
+
+    /// `log` prints only what the node lists, which is what no person has
+    /// read here, and after it how many a person here has read; where it
+    /// lists nothing new it says so in one line that counts them, and
+    /// prints nothing a yes would mark (decision 2026-10-09 §4.1).
+    #[test]
+    fn log_prints_only_what_is_new_and_counts_what_a_person_has_read() {
+        let a = "a".repeat(32);
+        let one = json!({
+            "name": null,
+            "threads": [{ "thread": a, "messages": [
+                { "id": a, "thread": a, "from": "notes", "to": "work", "device": "this",
+                  "ago_secs": 60, "before_the_last_change": false, "signer_removed": false,
+                  "held_back": false, "asks": false, "link": null, "body": "new\n",
+                  "read_on": [], "read_here": false },
+            ]}],
+            "already_read": 1,
+            "signers": [], "waiting": [], "refused_for_room": [], "filled_by": null,
+            "not_every_relay": [], "not_every_device": [], "marked": 0,
+        });
+        let (said, printed) = log_says(&one, marker);
+        assert_eq!(printed, std::slice::from_ref(&a));
+        assert!(
+            said.starts_with("Messages of every agent on this device:\n"),
+            "{said}"
+        );
+        assert!(
+            said.ends_with("\n\nYou have read 1 other message here, so it is not shown.\n"),
+            "{said}"
+        );
+        let mut two = one.clone();
+        two["already_read"] = json!(2);
+        assert!(
+            log_says(&two, marker)
+                .0
+                .ends_with("\n\nYou have read 2 other messages here, so they are not shown.\n")
+        );
+        // None read before: no count.
+        two["already_read"] = json!(0);
+        assert!(!log_says(&two, marker).0.contains("You have read"));
+        // Nothing new: one line, and nothing to mark.
+        let mut none = one.clone();
+        none["threads"] = json!([]);
+        none["already_read"] = json!(4);
+        let (said, printed) = log_says(&none, marker);
+        assert!(printed.is_empty());
+        assert_eq!(
+            said,
+            "No new message of any agent is held on this device. You have read the 4 others \
+             here.\n"
         );
     }
 
@@ -2863,6 +2958,13 @@ mod tests {
              connection: close\r\n\r\n{body}",
             body.len()
         );
+        // What the request still sends is read to its end before the
+        // stream is closed: one read can take its head alone, and a stream
+        // closed with bytes unread is reset, which can lose the answer
+        // before the command reads it (seen on a busy runner).
+        let _ = asked.shutdown(std::net::Shutdown::Write);
+        let _ = asked.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = std::io::copy(&mut asked, &mut std::io::sink());
     }
 
     // ── summary ──────────────────────────────────────────────────────

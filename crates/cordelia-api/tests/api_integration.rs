@@ -5,7 +5,6 @@
 
 use actix_web::{App, test, web};
 use serde_json::json;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use cordelia_api::state::AppState;
@@ -19,7 +18,8 @@ fn test_state() -> web::Data<AppState> {
     let identity = NodeIdentity::generate().unwrap();
 
     web::Data::new(AppState {
-        db: Mutex::new(conn),
+        load: Default::default(),
+        db: cordelia_core::lock::TimedLock::new(conn),
         identity,
         bearer_token: TEST_TOKEN.into(),
         home_dir: dir.keep(),
@@ -1676,6 +1676,7 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     // records one directory, and Claude Code's own folder for another.
     let by_hand = format!("{claude}/projects/workspace");
     std::fs::create_dir_all(format!("{by_hand}/memory")).unwrap();
+    std::fs::write(format!("{by_hand}/memory/kept.md"), "kept by hand\n").unwrap();
     let tree_dir = format!("{home}/code/app");
     let own_dir = format!("{home}/code/lib");
     let folder_of = |dir: &str| {

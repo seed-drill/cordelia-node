@@ -9,6 +9,7 @@ use crate::handshake::{self, HANDSHAKE_TIMEOUT_SECS, HandshakeResult};
 use crate::keepalive::KeepAliveState;
 use crate::transport::{TransportError, extract_peer_node_id};
 use cordelia_core::NodeId;
+use cordelia_core::load::ConnectionCounts;
 use cordelia_crypto::identity::NodeIdentity;
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
@@ -143,6 +144,9 @@ pub struct ConnectionManager {
     p2p_port: u16,
     /// The configs of a connection with a relay listed by key.
     listed: Option<crate::transport::ListedConfigs>,
+    /// The connections open and those gone, counted as each is made or
+    /// goes, and read by nothing here (decision 2026-10-22 §1.2, §7.3).
+    counts: Arc<ConnectionCounts>,
 }
 
 impl ConnectionManager {
@@ -168,7 +172,22 @@ impl ConnectionManager {
             roles,
             p2p_port,
             listed,
+            counts: Arc::default(),
         }
+    }
+
+    /// Count the connections open, and each that goes, in `counts`: the
+    /// node's counters (decision 2026-10-22 §7.3).
+    pub fn count_into(&mut self, counts: Arc<ConnectionCounts>) {
+        counts.set_open(self.connections.len());
+        self.counts = counts;
+    }
+
+    /// The connection to `node_id` has gone from those kept: counted, and
+    /// the gauge set again.
+    fn gone(&self, node_id: &NodeId) {
+        self.counts.closed(&node_id.0);
+        self.counts.set_open(self.connections.len());
     }
 
     /// Number of active connections.
@@ -250,6 +269,7 @@ impl ConnectionManager {
             }
             if let Some(old) = self.connections.remove(&outcome.node_id) {
                 old.conn.close(0u32.into(), CLOSED_AS_REPLACED);
+                self.gone(&outcome.node_id);
                 debug!(peer = %outcome.node_id, "replaced the peer's earlier connection");
             }
         }
@@ -266,6 +286,7 @@ impl ConnectionManager {
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
+        self.counts.set_open(self.connections.len());
         Ok(node_id)
     }
 
@@ -323,6 +344,7 @@ impl ConnectionManager {
         };
 
         self.connections.insert(node_id.clone(), peer_conn);
+        self.counts.set_open(self.connections.len());
         Ok(node_id)
     }
 
@@ -339,6 +361,7 @@ impl ConnectionManager {
             .collect();
         for id in &closed {
             self.connections.remove(id);
+            self.gone(id);
         }
         closed
     }
@@ -378,6 +401,7 @@ impl ConnectionManager {
     pub fn disconnect(&mut self, node_id: &NodeId) {
         if let Some(peer) = self.connections.remove(node_id) {
             peer.conn.close(0u32.into(), b"governor disconnect");
+            self.gone(node_id);
             debug!(peer = %node_id, "disconnected");
         }
     }
@@ -416,9 +440,13 @@ impl ConnectionManager {
 
     /// Close all connections and the endpoint.
     pub fn shutdown(&mut self) {
+        let gone: Vec<NodeId> = self.connections.keys().cloned().collect();
         for (id, peer) in self.connections.drain() {
             peer.conn.close(0u32.into(), b"shutdown");
             debug!(peer = %id, "shutdown disconnect");
+        }
+        for id in &gone {
+            self.gone(id);
         }
         self.endpoint.close(0u32.into(), b"shutdown");
     }
@@ -987,5 +1015,64 @@ mod tests {
 
         mgr_a.shutdown();
         mgr_b.shutdown();
+    }
+    /// The connections open are a gauge set as each is made and each goes,
+    /// and each that goes is counted, as a closure of a relay's link
+    /// where its peer is a relay that is counted (decision 2026-10-22
+    /// §1.2): one made, one disconnected, and one closed and reaped.
+    #[tokio::test]
+    async fn the_connections_open_and_gone_are_counted_as_each_is_made_and_goes() {
+        let id_a = make_test_identity();
+        let mut mgr_a =
+            ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], vec![], 9474);
+        let counts = Arc::new(ConnectionCounts::default());
+        mgr_a.count_into(counts.clone());
+        let mut peers = Vec::new();
+        let mut accepting = Vec::new();
+        for _ in 0..2 {
+            let id = make_test_identity();
+            let mgr = ConnectionManager::new(id.clone(), make_endpoint(&id), vec![], vec![], 9474);
+            let (endpoint, ctx, addr) = (
+                mgr.endpoint(),
+                mgr.connect_context(),
+                mgr.local_addr().unwrap(),
+            );
+            accepting.push(tokio::spawn(async move {
+                let incoming = endpoint.accept().await.unwrap();
+                inbound_accept(&ctx, incoming).await.unwrap()
+            }));
+            peers.push((mgr, addr));
+        }
+        let relay = mgr_a.connect_to(peers[0].1).await.unwrap();
+        counts.counts_relay(&relay.0);
+        assert_eq!(counts.open(), 1);
+        let device = mgr_a.connect_to(peers[1].1).await.unwrap();
+        assert_eq!((counts.open(), counts.closed_so_far()), (2, 0));
+
+        mgr_a.disconnect(&device);
+        assert_eq!((counts.open(), counts.closed_so_far()), (1, 1));
+        assert_eq!(
+            counts.closures_of(&relay.0),
+            0,
+            "a device's link is no relay's"
+        );
+
+        // The relay's connection closes, and is reaped.
+        mgr_a
+            .get_connection(&relay)
+            .unwrap()
+            .close(0u32.into(), b"gone");
+        assert_eq!(mgr_a.reap_closed(), std::slice::from_ref(&relay));
+        assert_eq!((counts.open(), counts.closed_so_far()), (0, 2));
+        assert_eq!(counts.closures_of(&relay.0), 1);
+        assert_eq!(counts.closures_of(&device.0), 0);
+
+        for task in accepting {
+            let _ = task.await;
+        }
+        mgr_a.shutdown();
+        for (mut mgr, _) in peers {
+            mgr.shutdown();
+        }
     }
 }

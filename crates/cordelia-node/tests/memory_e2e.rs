@@ -1021,7 +1021,8 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     assert_eq!(status, Some(3), "{said}");
     assert!(
         said.contains(&format!(
-            "  {name} is not known to hold the change, and has not been reached from here since"
+            "  {name} cannot be reached from here, and is not known to hold the change: it has \
+             not been reached since"
         )),
         "{said}"
     );
@@ -1040,9 +1041,10 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
 
 /// A relay that is set up with no key, by a name, is one line in
 /// `cordelia devices`, whatever waits to be sent there (decision
-/// 2026-10-04 §8). The node gives the row of what waits there no name,
-/// only the address it reached the relay at: the command finds that
-/// address under the relay's name, and says it on the relay's line. Here
+/// 2026-10-04 §8). The node gives the row of what waits there the name of
+/// the configuration, from the connection that the dial loop made to it
+/// (decision 2026-10-24, rule 2), and the command says it on the relay's
+/// line, never by the address it reached the relay at. Here
 /// the relay has too little room for the folder, so something of it
 /// waits there for as long as the test looks, once the relay has refused
 /// it. The test looks only then: before it, what waits may be only what
@@ -1072,7 +1074,8 @@ fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
     }
     syncs_notes_as_lab(&device, &notes);
     // The relay has refused something for room, the name is still to
-    // send, and the row with no name says that something waits there.
+    // send, and the row of the relay's name says that something waits
+    // there.
     // Each holds from then on: the relay never has room for the folder.
     wait_for(
         "the relay refuses for room what waits there",
@@ -1088,10 +1091,9 @@ fn a_relay_set_up_with_no_key_is_one_line_in_devices() {
                 .as_array()?
                 .iter()
                 .any(|to_go| to_go == "lab");
-            let waits = seen["waiting"]
-                .as_array()?
-                .iter()
-                .any(|row| row["name"].is_null() && row["waits"].as_u64().is_some_and(|n| n > 0));
+            let waits = seen["waiting"].as_array()?.iter().any(|row| {
+                row["name"] == name.as_str() && row["waits"].as_u64().is_some_and(|n| n > 0)
+            });
             (refused && to_go && waits).then_some(())
         },
     );
