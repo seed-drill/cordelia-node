@@ -2958,6 +2958,13 @@ mod tests {
              connection: close\r\n\r\n{body}",
             body.len()
         );
+        // What the request still sends is read to its end before the
+        // stream is closed: one read can take its head alone, and a stream
+        // closed with bytes unread is reset, which can lose the answer
+        // before the command reads it (seen on a busy runner).
+        let _ = asked.shutdown(std::net::Shutdown::Write);
+        let _ = asked.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = std::io::copy(&mut asked, &mut std::io::sink());
     }
 
     // ── summary ──────────────────────────────────────────────────────
