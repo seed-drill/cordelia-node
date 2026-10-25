@@ -2847,6 +2847,27 @@ bytes, since a relay holds whatever a member pushed there; and 16 channels
 of 16 MiB, each read again from its start once a day, are 256 MiB, within
 the 720 MiB it hands in a day. `protocol.rs` checks both.
 
+#### SHARED_TAKE_OUT_STEP_ENTRIES = 65
+
+**Derivation:** `AGENT_MESSAGE_RING` + 1: one key's 64 slots of messages
+and its anew record.
+
+**Rationale:** A device takes a shared channel's entries out of its store
+when the channel is dropped or moved from, when a key stops being known,
+and when a key is quiet (record §6.3). At the bound that is some 42 MiB of
+one channel, overwritten under `secure_delete`: in one hold of the device's
+lock it would break bar 5 of the scale test (decision 2026-10-22: at most
+one wait over 100 ms for a device in an hour). So a take-out runs in
+steps, each under a hold of its own, the lock let go between them, and a
+step is the entries of one key: 214,016 bytes as a relay counts them at
+most. A step never splits a key, so a key's entries go in the same write
+as the revisions its row keeps, and the door's refusal at or below them
+holds from the moment they are gone. Deleting one key's 65 entries of
+their sizes under `secure_delete` in WAL mode took 1.4 ms at the median
+and 22 ms at worst over 200 keys on a test machine: under a quarter of the
+bar at worst. A step smaller than a key would gain nothing a person sees
+and split what must go together.
+
 #### SHARED_READ_AGAIN_SECS = 86,400
 
 **Rationale:** A device reads a channel again from its start, at each relay,

@@ -47,7 +47,7 @@ cordelia-node/
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds). A shared channel
                          #   (decision 2026-10-10, not yet used): share (the card and
-                         #   the share), shared (forms 3 and 5, and the anew seal),
+                         #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
     cordelia-storage/    # SQLite (schema.rs: steps 1 to 22). entries; person and acts (what a
@@ -331,6 +331,7 @@ parameter-rationale.md §12.13:
 | `SHARED_WORDS_WRITTEN_AGAIN_DAYS` | 30 (derived: a third of `KEYED_TOMBSTONE_RETENTION_DAYS`) | parameter-rationale.md §12.13 |
 | `SHARED_ACT_TIME_MAX` | 2^40 (the latest time and the highest count an act may say) | parameter-rationale.md §12.13 |
 | `SHARED_MAX_KEYS`, `SHARED_KEYS_KEPT` | 64, 1,024 | parameter-rationale.md §12.13 |
+| `SHARED_TAKE_OUT_STEP_ENTRIES` | 65 (derived: one key's entries, taken out of a device's store under one hold of its lock) | parameter-rationale.md §12.13 |
 | `SHARED_BYTES_PER_MINUTE`, `SHARED_PUSH_BYTES_PER_MINUTE` | 512KB, 384KB (derived: a quarter of what a relay hands, and of what a device pushes) | parameter-rationale.md §12.13 |
 | `SHARED_READ_AGAIN_SECS`, `SHARED_REQUESTS_PER_MINUTE` | 86400s, 600 (with the device's own 2,250 and its 72 shows, 2,922 of 3,000) | parameter-rationale.md §12.13 |
 | `SHARED_KEY_WORDS_SHOWN` | 6 (66 bits, as `CARRY_FROM_WORDS`) | parameter-rationale.md §12.13 |

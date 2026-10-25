@@ -1,6 +1,9 @@
 //! The entries of a shared channel (decision 2026-10-10 §2.3, §6.1, §7):
-//! a message of form 3, the entry that clears one (form 0), and a device's
+//! a message of form 6, the entry that clears one (form 0), and a device's
 //! anew record (form 5), with the seal of a new seed to each key that stays.
+//! The forms are numbered as one with the messages channel's (0 to 4,
+//! decision 2026-10-09 and decision 2026-10-25), so that no value of one
+//! channel reads as another's.
 //!
 //! Everything here is pure, as [`crate::message`] is: what each value is
 //! byte for byte, the name of each slot, and what a reader takes from an
@@ -9,7 +12,7 @@
 //! ## The slots
 //!
 //! ```text
-//! msg/<the signer's key>/<n>   a message of form 3, or its clearing: 2,048 bytes
+//! msg/<the signer's key>/<n>   a message of form 6, or its clearing: 2,048 bytes
 //! anew/<the signer's key>      the device's anew record, an offer or empty: 16,384
 //! ```
 //!
@@ -17,7 +20,7 @@
 //! ([`crate::message::message_name`], [`crate::message::message_rev`]). A
 //! reader takes from a slot only what the key in its name signed.
 //!
-//! ## A message (form 3)
+//! ## A message (form 6)
 //!
 //! The messages record's form 1 without `from`, `to` and the kind of `to`:
 //! it names no agent of the sender's, and no recipient. Of kind 2 and of
@@ -25,7 +28,7 @@
 //! 2,048 through [`crate::entry::Entry::seal`] as it is.
 //!
 //! ```text
-//! form       1    3
+//! form       1    6
 //! flags      1    bit 0: it asks for an answer; every other bit 0
 //! sent       8    seconds since 1970, by the sender's clock
 //! nonce      16   random
@@ -75,7 +78,7 @@ use crate::statement::{Reader, put_count};
 
 /// The first byte of each form of value that a shared channel holds.
 const FORM_CLEARING: u8 = 0;
-const FORM_MESSAGE: u8 = 3;
+const FORM_MESSAGE: u8 = 6;
 const FORM_ANEW: u8 = 5;
 
 /// A message of a shared channel, as its value holds it (decision
@@ -133,7 +136,7 @@ impl SharedMessage {
 
     /// Read a message from an entry's value of a shared channel, as a
     /// reader does (decision 2026-10-10 §2.3). A value of the messages
-    /// channel's forms, 1 and 2, is no message here, nor one of form 4.
+    /// channel's forms, 1 to 4, is no message here, nor one of form 5.
     pub fn from_value(value: &Value) -> Result<Self, NotAMessage> {
         let mut reader = Reader::new(whole(value)?);
         let form = byte(&mut reader)?;
@@ -645,7 +648,7 @@ mod tests {
         assert_eq!(over.to_value(), Err(NotAMessage::BodyTooLong(1025)));
     }
 
-    /// A message of form 3, byte for byte: no agent, no recipient.
+    /// A message of form 6, byte for byte: no agent, no recipient.
     #[test]
     fn a_shared_messages_value_is_its_fields_in_their_places() {
         let message = SharedMessage {
@@ -658,7 +661,7 @@ mod tests {
             body: "hi\nthere".into(),
         };
         let value = message.to_value().unwrap();
-        let mut expected = vec![3, 1, 1, 2, 3, 4, 5, 6, 7, 8];
+        let mut expected = vec![6, 1, 1, 2, 3, 4, 5, 6, 7, 8];
         expected.extend_from_slice(&[0xa1; 16]);
         expected.extend_from_slice(&[0xb2; 16]);
         expected.extend_from_slice(&[0xc3; 16]);
@@ -693,7 +696,7 @@ mod tests {
     }
 
     /// A reader of a shared channel refuses each value that is not a
-    /// message of form 3: the messages channel's forms, form 4, a flag but
+    /// message of form 6: the messages channel's forms, form 5, a flag but
     /// bit 0, a link that is none, a body empty, too long or not text, and
     /// a fill that is not zeros. The sender refuses the same.
     #[test]
@@ -710,8 +713,8 @@ mod tests {
             changed.resize(length, 0);
             assert_eq!(read(changed), Err(NotAMessage::Length(length)));
         }
-        // The messages channel's message, list and clearing, form 4, and
-        // the anew record's form.
+        // The messages channel's message, list and clearing, its forms 3
+        // and 4 (a person's reads and bounds), and the anew record's form.
         let names = |name: &str| !name.is_empty();
         let own = Message {
             asks: false,
@@ -730,7 +733,7 @@ mod tests {
         let list = ReadMarks::default().to_value().unwrap();
         assert_eq!(read(list), Err(NotAMessage::Form(2)));
         assert_eq!(read(clearing_value()), Err(NotAMessage::AnotherForm(0)));
-        for form in [4, 5, 6, 0xff] {
+        for form in [3, 4, 5, 7, 0xff] {
             let mut changed = value.clone();
             changed[0] = form;
             let refused = read(changed).unwrap_err();
@@ -742,7 +745,7 @@ mod tests {
         // And a shared message is no message of the messages channel.
         assert_eq!(
             Message::from_value(&Value::Other(value.clone()), names),
-            Err(NotAMessage::AnotherForm(3))
+            Err(NotAMessage::Form(6))
         );
 
         for flags in [0b10, 0b11, 0x80] {

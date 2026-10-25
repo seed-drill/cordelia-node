@@ -2653,6 +2653,19 @@ pub const SHARED_KEYS_KEPT: usize = 1_024;
 /// Derived: a quarter of PUSH_BYTES_PER_PEER_PER_MINUTE.
 pub const SHARED_BYTES_PER_MINUTE: u64 = PUSH_BYTES_PER_PEER_PER_MINUTE / 4;
 
+/// The most entries of a shared channel that one step of a take-out takes
+/// out of a device's store under one hold of the device's lock (decision
+/// 2026-10-10 §6.3, "in steps"): the entries of one key, its 64 slots of
+/// messages and its anew record, so that a step takes a key's entries out
+/// with the revisions its row keeps, and never splits a key. That is at
+/// most 214,016 bytes as a relay counts them, overwritten under
+/// `secure_delete`: some milliseconds, far below the 100 ms of the scale
+/// test's bar 5 (decision 2026-10-22). A drop, a move, a key that stops
+/// being known and a quiet key each take their entries out a step at a
+/// time, the lock let go between steps.
+/// Derived: AGENT_MESSAGE_RING + 1.
+pub const SHARED_TAKE_OUT_STEP_ENTRIES: usize = AGENT_MESSAGE_RING + 1;
+
 /// How often a device reads a shared channel again from its start, at most
 /// (decision 2026-10-10 §6.3, §8.4): once a day. One asked for within the
 /// day begins when the day is up.
@@ -4508,6 +4521,14 @@ mod tests {
         assert_eq!(SHARED_MAX_KEYS, 64);
         assert_eq!(SHARED_MAX_KEYS, MAX_COUNTED_DEVICES);
         assert_eq!(SHARED_KEYS_KEPT, 1_024);
+        // A take-out's step is one key's entries: 65, and 214,016 bytes as
+        // a relay counts them at most.
+        assert_eq!(SHARED_TAKE_OUT_STEP_ENTRIES, 65);
+        assert_eq!(
+            AGENT_MESSAGE_RING as u64 * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
+                + entry_cost(SHARED_ANEW_CONTENT_BYTES),
+            214_016
+        );
         let message = entry_cost(AGENT_MESSAGE_CONTENT_BYTES);
         let keys = MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / message;
         assert_eq!(keys, 5_461);
