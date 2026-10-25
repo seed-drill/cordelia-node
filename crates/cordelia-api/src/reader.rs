@@ -346,7 +346,7 @@ pub fn hourly(
     }
     // The shared channels' part (decision 2026-10-10 §6.3), in writes of
     // its own: an error there takes back nothing of the rest.
-    if let Err(e) = crate::shared::hourly(conn, now) {
+    if let Err(e) = crate::shared::hourly(conn, &identity.public_key(), now) {
         tracing::warn!(error = %e, "could not keep this device's shared channels");
     }
     // The checkpoint runs whether or not the drop, the marks' part or the

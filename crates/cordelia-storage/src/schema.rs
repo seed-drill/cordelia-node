@@ -951,67 +951,40 @@ CREATE TABLE message_bounds (
 "#;
 
 /// Migration v21: what a device holds of the person's lists of shared
-/// channels (decision 2026-10-10 §3.4, §14). Its list itself is an entry
-/// of the personal channel, as every word of a device is; what is here is
-/// what the device keeps beside it, to take the lists of the others.
+/// channels (decision 2026-10-10 §3.4, §14, §20). Its list itself is an
+/// entry of the personal channel, as every word of a device is; what is in
+/// force is worked out from the lists each time, and nothing of when the
+/// device first held a list or an act is kept for any rule of 3.4 to read.
+/// What is here:
 ///
-/// An item is named by its part (1: a channel, filed or dropped; 2: a
-/// subscription; 3: a label) and the bytes that name it within the part:
-/// a channel's ID (32 bytes), the ID and an agent's name (33 to 232), or
-/// a key (32). A time and a count are at most `SHARED_ACT_TIME_MAX`, and a
-/// list's value at most `SHARED_LIST_MAX_VALUE_BYTES`; each column takes
-/// only its type and its bound.
+/// - `shared_lists`: one row, or none where the device has written no
+///   list. `list` is the value of the list this device last wrote
+///   (`Kept.list`), at most `SHARED_LIST_MAX_VALUE_BYTES`, and `rev` the
+///   revision it wrote it at, at most `MAX_REV`: a device brought back from
+///   a copy of its data reads its own entry where that is at a higher
+///   revision.
+/// - `shared_list_taken`: for each act the lists it reads carry, by its
+///   signature, the generation it was taken in and when this device first
+///   took it, by its clock. No rule of order reads it: it is what the
+///   removal record's cut asks of an act of a removed key (decision
+///   2026-10-24, rule 6; decision 2026-10-10 property 9).
 ///
-/// - `shared_lists`: one row, or none where the device has held no list.
-///   `list` is the value of the device's own list as it holds it: what it
-///   last wrote, or writes at once; `left_out`, the value of a list of
-///   the items it left out past a bound, which it still holds and does
-///   not take as in force; `written_at`, when it last wrote its list, by
-///   its clock, NULL where it never has; and `fetched_at`, the time of its
-///   last whole fetch of the personal channel, NULL where it has made none
-///   since it held a list.
-/// - `shared_list_first_held`: for each item of those two, the act held
-///   (by its signature) and when this device first held it: what an
-///   undone act is freed by, 90 days on, and what says that it held an
-///   item at its previous whole fetch.
-/// - `shared_list_freed`: for each item, the undone act that this device
-///   took out of its list, with its time, its count, its maker and its
-///   bytes as a list writes them, and when it was taken out: while a fresh
-///   list carries the item, no act on it at or below this one is taken.
-///
-/// A relay keeps nothing in any of them.
+/// Each column takes only its type and its bound. A relay keeps nothing in
+/// either.
 const MIGRATION_V21: &str = r#"
 CREATE TABLE shared_lists (
-    one         INTEGER PRIMARY KEY CHECK(one = 1),
-    list        BLOB NOT NULL CHECK(typeof(list) = 'blob'
-                                    AND length(list) >= 13 AND length(list) <= 41341),
-    left_out    BLOB NOT NULL CHECK(typeof(left_out) = 'blob'
-                                    AND length(left_out) >= 13 AND length(left_out) <= 41341),
-    written_at  INTEGER CHECK(written_at IS NULL OR typeof(written_at) = 'integer'),
-    fetched_at  INTEGER CHECK(fetched_at IS NULL OR typeof(fetched_at) = 'integer')
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    list  BLOB NOT NULL CHECK(typeof(list) = 'blob'
+                              AND length(list) >= 5 AND length(list) <= 41333),
+    rev   INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                 AND rev >= 0 AND rev <= 9007199254740991)
 );
 
-CREATE TABLE shared_list_first_held (
-    part        INTEGER NOT NULL CHECK(part IN (1, 2, 3)),
-    item        BLOB NOT NULL CHECK(typeof(item) = 'blob'
-                                    AND length(item) >= 32 AND length(item) <= 232),
-    signature   BLOB NOT NULL CHECK(typeof(signature) = 'blob' AND length(signature) = 64),
-    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
-    PRIMARY KEY (part, item)
-);
-
-CREATE TABLE shared_list_freed (
-    part      INTEGER NOT NULL CHECK(part IN (1, 2, 3)),
-    item      BLOB NOT NULL CHECK(typeof(item) = 'blob'
-                                  AND length(item) >= 32 AND length(item) <= 232),
-    time      INTEGER NOT NULL CHECK(typeof(time) = 'integer'
-                                     AND time >= 0 AND time <= 1099511627776),
-    count     INTEGER NOT NULL CHECK(typeof(count) = 'integer'
-                                     AND count >= 0 AND count <= 1099511627776),
-    maker     BLOB NOT NULL CHECK(typeof(maker) = 'blob' AND length(maker) = 32),
-    act       BLOB NOT NULL CHECK(typeof(act) = 'blob' AND length(act) >= 1),
-    freed_at  INTEGER NOT NULL CHECK(typeof(freed_at) = 'integer'),
-    PRIMARY KEY (part, item)
+CREATE TABLE shared_list_taken (
+    signature   BLOB PRIMARY KEY CHECK(typeof(signature) = 'blob' AND length(signature) = 64),
+    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer'
+                                       AND generation >= 0 AND generation <= 256),
+    taken_at    INTEGER NOT NULL CHECK(typeof(taken_at) = 'integer')
 );
 "#;
 
@@ -4808,12 +4781,8 @@ mod tests {
         assert!(refuse_a_later_version(&at_20, 19).is_err());
     }
 
-    /// What the step to version 21 adds: three tables.
-    const NEW_IN_V21: [&str; 3] = [
-        "shared_list_first_held",
-        "shared_list_freed",
-        "shared_lists",
-    ];
+    /// What the step to version 21 adds: two tables.
+    const NEW_IN_V21: [&str; 2] = ["shared_list_taken", "shared_lists"];
 
     /// What a database holds of the step to version 21, by name.
     fn new_in_v21(conn: &Connection) -> Vec<String> {
@@ -4912,16 +4881,17 @@ mod tests {
 
     /// The step to version 21 adds the tables of the person's lists,
     /// empty, and changes no older row or definition (decision 2026-10-10
-    /// §14, "the upgrade"): it is made in one step with its version, so a
-    /// failure between them leaves none of it, and the step asked for
-    /// twice is run once. What the tables keep stays across a start, and
-    /// each takes no row that cannot be what a device keeps: a list's
-    /// value that is no blob, shorter than an empty list or longer than a
-    /// list at every bound; a time that is no integer; a part there is
-    /// not; an item shorter than a channel's ID or longer than an ID and
-    /// a name; a signature or a maker of another length; a time or a
-    /// count past `SHARED_ACT_TIME_MAX`; a second row for the list, or
-    /// for an item.
+    /// §14, "the upgrade", and §20, item 8): it is made in one step with its
+    /// version, so a failure between them leaves none of it, and the step
+    /// asked for twice is run once. It keeps the list this device last
+    /// wrote with its revision, and when each act was taken, and nothing of
+    /// a list's freshness or of acts freed. What the tables keep stays
+    /// across a start, and each takes no row that cannot be what a device
+    /// keeps: a list's value that is no blob, shorter than an empty list or
+    /// longer than a list at every bound; a revision past `MAX_REV` or below
+    /// 0; a signature of another length; a generation past the last
+    /// statement; a time that is no integer; a second row for the list, or
+    /// for an act.
     #[test]
     fn each_step_of_this_record_adds_its_tables_and_changes_no_older_row() {
         let conn = at_v20();
@@ -4960,23 +4930,27 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(counted(&conn), [0, 0, 0]);
+        assert_eq!(counted(&conn), [0, 0]);
+        // Nothing of a list's freshness, of when a list or an act was first
+        // held, or of an act freed (§20, items 1, 2 and 8).
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('shared_lists') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, ["one", "list", "rev"]);
 
         // What the device keeps, at the bounds of each column.
         conn.execute_batch(
-            "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
-                 VALUES (1, zeroblob(13), zeroblob(41341), NULL, 9);
-             INSERT INTO shared_list_first_held (part, item, signature, first_held)
-                 VALUES (1, zeroblob(32), zeroblob(64), 9), (2, zeroblob(232), zeroblob(64), 9),
-                        (3, zeroblob(32), zeroblob(64), 9);
-             INSERT INTO shared_list_freed (part, item, time, count, maker, act, freed_at)
-                 VALUES (1, zeroblob(32), 1099511627776, 1099511627776, zeroblob(32),
-                         zeroblob(144), 9),
-                        (2, zeroblob(33), 0, 0, zeroblob(32), zeroblob(146), 9);",
+            "INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(41333), 9007199254740991);
+             INSERT INTO shared_list_taken (signature, generation, taken_at)
+                 VALUES (zeroblob(64), 256, 9), (X'01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0, -9);",
         )
         .unwrap();
         let kept = counted(&conn);
-        assert_eq!(kept, [3, 2, 1]);
+        assert_eq!(kept, [2, 1]);
         // A start after that, and the step asked for again, change
         // nothing: what the device keeps stays.
         init_db(&conn).unwrap();
@@ -4987,52 +4961,33 @@ mod tests {
         );
         assert_eq!(everything_but_v21(&conn), before);
 
-        let lists = |values: &str| {
+        let lists =
+            |values: &str| format!("INSERT INTO shared_lists (one, list, rev) VALUES ({values})");
+        let taken = |values: &str| {
             format!(
-                "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
-                 VALUES ({values})"
+                "INSERT INTO shared_list_taken (signature, generation, taken_at) VALUES ({values})"
             )
         };
-        let first_held = |values: &str| {
-            format!(
-                "INSERT INTO shared_list_first_held (part, item, signature, first_held)
-                 VALUES ({values})"
-            )
-        };
-        let freed = |values: &str| {
-            format!(
-                "INSERT INTO shared_list_freed (part, item, time, count, maker, act, freed_at)
-                 VALUES ({values})"
-            )
-        };
+        let another = format!("X'02{}'", "00".repeat(63));
         conn.execute("DELETE FROM shared_lists", []).unwrap();
         let refused = [
-            lists("2, zeroblob(13), zeroblob(13), NULL, NULL"),
-            lists("1, zeroblob(12), zeroblob(13), NULL, NULL"),
-            lists("1, zeroblob(13), zeroblob(41342), NULL, NULL"),
-            lists("1, 'a list of thirteen', zeroblob(13), NULL, NULL"),
-            lists("1, zeroblob(13), NULL, NULL, NULL"),
-            lists("1, zeroblob(13), zeroblob(13), 1.5, NULL"),
-            lists("1, zeroblob(13), zeroblob(13), NULL, 'nine'"),
-            first_held("0, X'01', zeroblob(64), 9"),
-            first_held("4, zeroblob(32), zeroblob(64), 9"),
-            first_held("1, zeroblob(31), zeroblob(64), 9"),
-            first_held("2, zeroblob(233), zeroblob(64), 9"),
-            first_held(
-                "1, X'0101010101010101010101010101010101010101010101010101010101010101', zeroblob(63), 9",
-            ),
-            first_held(
-                "1, X'0101010101010101010101010101010101010101010101010101010101010101', zeroblob(64), NULL",
-            ),
-            first_held("1, zeroblob(32), zeroblob(64), 10"),
-            freed("3, zeroblob(32), 1099511627777, 0, zeroblob(32), zeroblob(146), 9"),
-            freed("3, zeroblob(32), 0, 1099511627777, zeroblob(32), zeroblob(146), 9"),
-            freed("3, zeroblob(32), -1, 0, zeroblob(32), zeroblob(146), 9"),
-            freed("3, zeroblob(32), 0, 0, zeroblob(31), zeroblob(146), 9"),
-            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(0), 9"),
-            freed("3, zeroblob(32), 'none', 0, zeroblob(32), zeroblob(146), 9"),
-            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(146), NULL"),
-            freed("1, zeroblob(32), 0, 0, zeroblob(32), zeroblob(144), 9"),
+            lists("2, zeroblob(5), 0"),
+            lists("1, zeroblob(4), 0"),
+            lists("1, zeroblob(41334), 0"),
+            lists("1, 'a list of five', 0"),
+            lists("1, NULL, 0"),
+            lists("1, zeroblob(5), -1"),
+            lists("1, zeroblob(5), 9007199254740992"),
+            lists("1, zeroblob(5), 1.5"),
+            lists("1, zeroblob(5), NULL"),
+            taken("zeroblob(64), 0, 9"),
+            taken("zeroblob(63), 0, 9"),
+            taken("zeroblob(65), 0, 9"),
+            taken(&format!("{another}, 257, 9")),
+            taken(&format!("{another}, -1, 9")),
+            taken(&format!("{another}, 0, 'nine'")),
+            taken(&format!("{another}, 0, NULL")),
+            taken(&format!("{another}, 'one', 9")),
         ];
         for refused in refused {
             assert!(conn.execute(&refused, []).is_err(), "{refused}");
@@ -5040,8 +4995,8 @@ mod tests {
         // Each refused in its place is taken where it is of its type and
         // within its bound.
         for taken in [
-            lists("1, zeroblob(13), zeroblob(13), 1, 2"),
-            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(146), 9"),
+            lists("1, zeroblob(5), 0"),
+            taken(&format!("{another}, 1, 9")),
         ] {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
@@ -5064,11 +5019,8 @@ mod tests {
         };
         let conn = at_v20();
         migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
-        conn.execute_batch(
-            "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
-                 VALUES (1, zeroblob(13), zeroblob(13), NULL, 9);",
-        )
-        .unwrap();
+        conn.execute_batch("INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(5), 9);")
+            .unwrap();
         let before = everything_but_v22(&conn);
         assert!(before.iter().any(|row| row.starts_with("shared_lists: ")));
         assert!(new_in_v22(&conn).is_empty());
@@ -5290,35 +5242,20 @@ mod tests {
 
     /// The bounds that step 21 writes as numbers in its SQL are those of
     /// protocol.rs (decision 2026-10-10 §3.4): a list's value at every
-    /// bound, the latest time and the highest count, and an item's length,
-    /// a channel's ID and an agent's name at its longest.
+    /// bound and an empty list, a revision's most, and the last statement.
     #[test]
-    fn step_20s_bounds_are_those_of_protocol_rs() {
-        use cordelia_core::protocol::{
-            AGENT_MESSAGE_NAME_MAX_BYTES, SHARED_ACT_TIME_MAX, SHARED_LIST_MAX_VALUE_BYTES,
-        };
+    fn the_bounds_of_step_21_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::{MAX_REV, MAX_STATEMENT_NUMBER, SHARED_LIST_MAX_VALUE_BYTES};
         let count = |text: &str| MIGRATION_V21.matches(text).count();
         assert_eq!(
             count(&format!("length(list) <= {SHARED_LIST_MAX_VALUE_BYTES})")),
             1
         );
-        assert_eq!(
-            count(&format!(
-                "length(left_out) <= {SHARED_LIST_MAX_VALUE_BYTES})"
-            )),
-            1
-        );
-        assert_eq!(count(&SHARED_LIST_MAX_VALUE_BYTES.to_string()), 2);
-        assert_eq!(count(&format!("time <= {SHARED_ACT_TIME_MAX})")), 1);
-        assert_eq!(count(&format!("count <= {SHARED_ACT_TIME_MAX})")), 1);
-        assert_eq!(count(&SHARED_ACT_TIME_MAX.to_string()), 2);
-        assert_eq!(
-            count(&format!(
-                "length(item) <= {})",
-                32 + AGENT_MESSAGE_NAME_MAX_BYTES
-            )),
-            2
-        );
+        assert_eq!(count(&SHARED_LIST_MAX_VALUE_BYTES.to_string()), 1);
+        // An empty list: its form and four counts of nothing.
+        assert_eq!(count("length(list) >= 5 "), 1);
+        assert_eq!(count(&format!("rev <= {MAX_REV})")), 1);
+        assert_eq!(count(&format!("generation <= {MAX_STATEMENT_NUMBER})")), 1);
     }
 
     /// A database that is stepped from any version has what every later

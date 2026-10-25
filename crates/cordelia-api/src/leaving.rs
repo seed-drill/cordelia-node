@@ -763,7 +763,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            !cordelia_storage::shared_lists::first_held(&on.conn)
+            !cordelia_storage::shared_lists::taken(&on.conn)
                 .unwrap()
                 .is_empty()
         );
@@ -793,7 +793,7 @@ mod tests {
             None
         );
         assert!(
-            cordelia_storage::shared_lists::first_held(&on.conn)
+            cordelia_storage::shared_lists::taken(&on.conn)
                 .unwrap()
                 .is_empty()
         );

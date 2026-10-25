@@ -215,8 +215,10 @@ pub fn take(
                     ..
                 })
         );
+        // The person's lists are worked out again, and the device's own
+        // written where it changed (§3.4, "What a device writes").
         if knows_anew {
-            crate::shared::keep(conn, now)?;
+            crate::lists::follow(conn, identity, now)?;
         }
         Ok(taken)
     })?;

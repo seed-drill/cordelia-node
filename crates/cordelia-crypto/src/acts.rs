@@ -14,7 +14,6 @@
 //!
 //! ```text
 //! form            1    1
-//! fetched         8    the device's last whole fetch of the personal channel
 //! filings         a count, 0 to 16; then each: the channel's ID 32; the
 //!                 card, 65 or 97; the name the person files it under,
 //!                 behind a length of one byte; how it came, a byte (0 made
@@ -34,7 +33,7 @@
 //! v2 act`, the item's kind (1 a filing, 2 a drop, 3 a subscription, 4 a
 //! label) and every other field of the item, as they are written here up to
 //! the signature. A copy keeps both, so a list holds acts made on other
-//! devices exactly as they were made. At every bound a list is 41,341
+//! devices exactly as they were made. At every bound a list is 41,333
 //! bytes, which seals at 65,536.
 //!
 //! An item is a channel (a filing or a drop), a channel and an agent (a
@@ -111,11 +110,8 @@ pub enum ListError {
     #[error("a filing's card is not a card: {0}")]
     Card(ShareError),
 
-    #[error("a list is at most 41341 bytes, and this is {0}")]
+    #[error("a list is at most 41333 bytes, and this is {0}")]
     TooLong(usize),
-
-    #[error("a list's fetched time is at most 2^40, and this is {0}")]
-    FetchedPastTheBound(u64),
 }
 
 /// How a channel came to be filed (decision 2026-10-10 §3.4).
@@ -452,9 +448,6 @@ impl<T: Item> Act<T> {
 /// A device's list (decision 2026-10-10 §3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedList {
-    /// The time of the device's last whole fetch of the personal channel,
-    /// by its clock.
-    pub fetched: u64,
     pub filings: Vec<Act<Filing>>,
     pub drops: Vec<Act<Dropped>>,
     pub subscriptions: Vec<Act<Subscription>>,
@@ -468,7 +461,6 @@ impl SharedList {
     pub fn to_value(&self, is_a_name: impl Fn(&str) -> bool) -> Result<Vec<u8>, ListError> {
         self.check()?;
         let mut out = vec![FORM_LIST];
-        out.extend_from_slice(&self.fetched.to_be_bytes());
         write_part(&mut out, &self.filings, &is_a_name)?;
         write_part(&mut out, &self.drops, &is_a_name)?;
         write_part(&mut out, &self.subscriptions, &is_a_name)?;
@@ -496,7 +488,6 @@ impl SharedList {
             return Err(ListError::Form(form));
         }
         let list = Self {
-            fetched: reader.u64().ok_or(ListError::Truncated)?,
             filings: read_part(
                 &mut reader,
                 ("filings", SHARED_MAX_CHANNELS),
@@ -529,13 +520,9 @@ impl SharedList {
         Ok(list)
     }
 
-    /// The fetched time within its bound, each part within its bound, and
-    /// one act on each item: a filing and a drop of one channel are one
-    /// item.
+    /// Each part within its bound, and one act on each item: a filing and
+    /// a drop of one channel are one item.
     fn check(&self) -> Result<(), ListError> {
-        if self.fetched > SHARED_ACT_TIME_MAX {
-            return Err(ListError::FetchedPastTheBound(self.fetched));
-        }
         for (part, most, count) in [
             ("filings", SHARED_MAX_CHANNELS, self.filings.len()),
             ("drops", SHARED_MAX_DROPPED, self.drops.len()),
@@ -683,7 +670,6 @@ mod tests {
         let (laptop, desktop) = (device(1), device(2));
         let long = |n: usize, at: usize| format!("{n:0>at$}");
         SharedList {
-            fetched: SHARED_ACT_TIME_MAX,
             filings: (0..16)
                 .map(|n| act(filing(n as u8, &long(n, 200)), &laptop))
                 .collect(),
@@ -723,7 +709,7 @@ mod tests {
         }
     }
 
-    /// At every bound a list is 41,341 bytes, which seal at 65,536 with
+    /// At every bound a list is 41,333 bytes, which seal at 65,536 with
     /// its name through `Entry::seal` as it is, and 64 lists are 4,259,840
     /// bytes as a relay counts them. A filing at its longest is 475 bytes,
     /// a drop 144, a subscription 346 and a label 210.
@@ -732,7 +718,7 @@ mod tests {
         let list = at_every_bound();
         let value = list.to_value(names).unwrap();
         assert_eq!(value.len(), SHARED_LIST_MAX_VALUE_BYTES);
-        assert_eq!(value.len(), 41_341);
+        assert_eq!(value.len(), 41_333);
         assert_eq!(
             SharedList::from_value(&Value::Other(value.clone()), names).unwrap(),
             list
@@ -755,7 +741,7 @@ mod tests {
 
         // Each item at its longest, as one more of it adds to a list.
         let empty = SharedList::default().to_value(names).unwrap().len();
-        assert_eq!(empty, 1 + 8 + 4);
+        assert_eq!(empty, 1 + 4);
         let one = |list: SharedList| list.to_value(names).unwrap().len() - empty;
         let sizes = [
             one(SharedList {
@@ -776,10 +762,25 @@ mod tests {
             }),
         ];
         assert_eq!(sizes, [475, 144, 346, 210]);
+
+        // A list that carries two acts on one item is passed over whole.
+        let mut twice = list.clone();
+        twice.labels[1] = twice.labels[0].clone();
+        assert_eq!(twice.to_value(names), Err(ListError::ItemTwice));
+        let mut written = list.to_value(names).unwrap();
+        let first = written.len() - 64 * 210;
+        let (one, two) = (first..first + 210, first + 210..first + 420);
+        let copy = written[one].to_vec();
+        written[two].copy_from_slice(&copy);
+        assert_eq!(
+            SharedList::from_value(&Value::Other(written), names),
+            Err(ListError::ItemTwice)
+        );
     }
 
-    /// A list, byte for byte: the form, the fetched time, and each part's
-    /// count and items, each with its act.
+    /// A list, byte for byte: the form, and each part's count and items,
+    /// each with its act. Nothing in it says when it was written or
+    /// fetched (decision 2026-10-10 §3.4, "What a device reads").
     #[test]
     fn a_list_is_its_parts_in_their_places() {
         let laptop = device(1);
@@ -798,14 +799,13 @@ mod tests {
             &laptop,
         );
         let list = SharedList {
-            fetched: 0x00ff_0102_0304,
             filings: vec![filing.clone()],
             labels: vec![label.clone()],
             ..SharedList::default()
         };
         let value = list.to_value(names).unwrap();
 
-        let mut expected = vec![1, 0, 0, 0, 0xff, 1, 2, 3, 4, 1];
+        let mut expected = vec![1, 1];
         expected.extend_from_slice(&filing.item.channel);
         expected.extend_from_slice(&card(9).to_bytes());
         expected.push(6);
@@ -1016,7 +1016,7 @@ mod tests {
         .to_value(names)
         .unwrap();
         let written = made.written().unwrap();
-        assert_eq!(written, value[13..]);
+        assert_eq!(written, value[5..]);
         assert_eq!(written.len(), 32 + 2 + 3 + 8 + 8 + 32 + 64);
         assert_eq!(written[written.len() - 64..], made.signature);
     }
@@ -1038,7 +1038,6 @@ mod tests {
         let secret = derive::personal_secret(&[0x22; 32]).unwrap();
         for writer in [&laptop, &desktop, &phone] {
             let list = SharedList {
-                fetched: 7,
                 labels: vec![made.clone()],
                 ..SharedList::default()
             };
@@ -1075,36 +1074,17 @@ mod tests {
         let mut changed = empty.clone();
         changed[0] = 2;
         assert_eq!(read(changed), Err(ListError::Form(2)));
-        assert_eq!(read(empty[..12].to_vec()), Err(ListError::Truncated));
+        assert_eq!(read(empty[..4].to_vec()), Err(ListError::Truncated));
         let mut longer = empty.clone();
         longer.push(0);
         assert_eq!(read(longer), Err(ListError::TrailingBytes));
 
-        // A fetched time past 2^40, written and read; at it, a list.
-        let past = SharedList {
-            fetched: SHARED_ACT_TIME_MAX + 1,
-            ..SharedList::default()
-        };
-        assert_eq!(
-            past.to_value(names),
-            Err(ListError::FetchedPastTheBound(SHARED_ACT_TIME_MAX + 1))
-        );
-        let mut changed = empty.clone();
-        changed[1..9].copy_from_slice(&(SHARED_ACT_TIME_MAX + 1).to_be_bytes());
-        assert_eq!(
-            read(changed),
-            Err(ListError::FetchedPastTheBound(SHARED_ACT_TIME_MAX + 1))
-        );
-        let mut changed = empty.clone();
-        changed[1..9].copy_from_slice(&SHARED_ACT_TIME_MAX.to_be_bytes());
-        assert_eq!(read(changed).unwrap().fetched, SHARED_ACT_TIME_MAX);
-
         // Each part's count past its bound, read and written.
         for (at, part, most) in [
-            (9, "filings", 16),
-            (10, "drops", 64),
-            (11, "subscriptions", 32),
-            (12, "labels", 64),
+            (1, "filings", 16),
+            (2, "drops", 64),
+            (3, "subscriptions", 32),
+            (4, "labels", 64),
         ] {
             let mut changed = empty.clone();
             changed[at] = most as u8 + 1;
@@ -1176,7 +1156,6 @@ mod tests {
         for list in twice {
             assert_eq!(list.to_value(names), Err(ListError::ItemTwice));
             let mut written = vec![1];
-            written.extend_from_slice(&0u64.to_be_bytes());
             write_part(&mut written, &list.filings, &names).unwrap();
             write_part(&mut written, &list.drops, &names).unwrap();
             write_part(&mut written, &list.subscriptions, &names).unwrap();
@@ -1207,8 +1186,8 @@ mod tests {
         }
         .to_value(names)
         .unwrap();
-        // The name's length at 10 + 32 + 97, and how it came after it.
-        let name_at = 10 + 32 + 97;
+        // The name's length at 2 + 32 + 97, and how it came after it.
+        let name_at = 2 + 32 + 97;
         let mut changed = one.clone();
         changed[name_at + 1] = b'R';
         assert_eq!(read(changed), Err(ListError::Name));
@@ -1226,7 +1205,7 @@ mod tests {
         assert_eq!(read(changed), Err(ListError::Came(3)));
         // The card's count of relays: three.
         let mut changed = one.clone();
-        changed[10 + 32 + 32] = 3;
+        changed[2 + 32 + 32] = 3;
         assert_eq!(
             read(changed),
             Err(ListError::Card(ShareError::TooManyRelays(3)))
@@ -1248,7 +1227,7 @@ mod tests {
         }
         .to_value(names)
         .unwrap();
-        let state_at = 12 + 32 + 1 + 200;
+        let state_at = 4 + 32 + 1 + 200;
         assert_eq!(subscribed[state_at], 1);
         let mut changed = subscribed.clone();
         changed[state_at] = 2;
@@ -1261,7 +1240,7 @@ mod tests {
         }
         .to_value(names)
         .unwrap();
-        let length_at = 13 + 32;
+        let length_at = 5 + 32;
         let mut changed = labelled.clone();
         changed[length_at..length_at + 2].copy_from_slice(&65u16.to_be_bytes());
         assert_eq!(read(changed), Err(ListError::Label));

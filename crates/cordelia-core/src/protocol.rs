@@ -2598,8 +2598,8 @@ const SHARED_ACT_BYTES: usize = 8 + 8 + 32 + 64;
 
 /// The most a device's list in the personal channel takes, at every bound
 /// (decision 2026-10-10 §3.4).
-/// Derived from the bounds above and the widths of the form: the form and
-/// the fetched time; then each part, a count of one byte and its items. A
+/// Derived from the bounds above and the widths of the form: the form;
+/// then each part, a count of one byte and its items. A
 /// filing is the channel's ID, the card (the seed, and the relays behind
 /// their count), the name behind a length of one byte, and how it came (a
 /// byte, and a key or a channel's ID); a drop is a channel's ID; a
@@ -2607,7 +2607,6 @@ const SHARED_ACT_BYTES: usize = 8 + 8 + 32 + 64;
 /// one byte, and its state; a label is a key, and the label behind a
 /// length of two bytes, as a statement writes one. Each carries its act.
 pub const SHARED_LIST_MAX_VALUE_BYTES: usize = 1
-    + 8
     + 1
     + SHARED_MAX_CHANNELS
         * (32
@@ -2622,17 +2621,10 @@ pub const SHARED_LIST_MAX_VALUE_BYTES: usize = 1
     + 1
     + SHARED_MAX_LABELS * (32 + (2 + SHARED_LABEL_MAX_BYTES) + SHARED_ACT_BYTES);
 
-/// How often a device writes its list again when nothing in it changed,
-/// after a whole fetch of the personal channel (decision 2026-10-10 §3.4):
-/// every 30 days, so that a list is fresh within each 90 days with two
-/// writings to spare.
-/// Derived: a third of KEYED_TOMBSTONE_RETENTION_DAYS.
-pub const SHARED_WORDS_WRITTEN_AGAIN_DAYS: u32 = KEYED_TOMBSTONE_RETENTION_DAYS / 3;
-
-/// The latest time, in seconds since 1970, that an act or a list's fetched
-/// time may say, and the highest count an item may say (decision
-/// 2026-10-10 §3.4): 2^40, some 34,000 years from 1970. A new act is never
-/// dated above it, and at this time alone the count orders acts.
+/// The latest time, in seconds since 1970, that an act may say, and the
+/// highest count an item may say (decision 2026-10-10 §3.4): 2^40, some
+/// 34,000 years from 1970. A new act is never dated above it, and at this
+/// time alone the count orders acts.
 pub const SHARED_ACT_TIME_MAX: u64 = 1 << 40;
 
 /// The most keys a device shows in one shared channel, and the most that
@@ -4398,7 +4390,7 @@ mod tests {
 
     /// A device's list in the personal channel (decision 2026-10-10 §3.4):
     /// a filing of 475 bytes, a drop of 144, a subscription of 346 and a
-    /// label of 210, each with its act of 112; at every bound 41,341
+    /// label of 210, each with its act of 112; at every bound 41,333
     /// bytes, which seal at 65,536 and are counted at 66,560; 64 lists are
     /// 4,259,840 bytes as counted.
     #[test]
@@ -4427,15 +4419,15 @@ mod tests {
         let label = 32 + (2 + SHARED_LABEL_MAX_BYTES) + SHARED_ACT_BYTES;
         assert_eq!((filing, drop, subscription, label), (475, 144, 346, 210));
         let parts = [
-            1 + 8,
+            1,
             1 + SHARED_MAX_CHANNELS * filing,
             1 + SHARED_MAX_DROPPED * drop,
             1 + SHARED_MAX_SUBSCRIPTIONS * subscription,
             1 + SHARED_MAX_LABELS * label,
         ];
-        assert_eq!(parts, [9, 7_601, 9_217, 11_073, 13_441]);
+        assert_eq!(parts, [1, 7_601, 9_217, 11_073, 13_441]);
         assert_eq!(parts.iter().sum::<usize>(), SHARED_LIST_MAX_VALUE_BYTES);
-        assert_eq!(SHARED_LIST_MAX_VALUE_BYTES, 41_341);
+        assert_eq!(SHARED_LIST_MAX_VALUE_BYTES, 41_333);
 
         assert_eq!(PERSONAL_SHARED_PREFIX, "shared/");
         let name = PERSONAL_SHARED_PREFIX.len() + 70;
@@ -4461,12 +4453,6 @@ mod tests {
             assert!(!other.starts_with(PERSONAL_SHARED_PREFIX), "{other}");
         }
 
-        // Written again within each 90 days, with two writings to spare.
-        assert_eq!(SHARED_WORDS_WRITTEN_AGAIN_DAYS, 30);
-        assert_eq!(
-            3 * SHARED_WORDS_WRITTEN_AGAIN_DAYS,
-            KEYED_TOMBSTONE_RETENTION_DAYS
-        );
         // The time bound: 2^40 seconds, some 34,000 years from 1970, and
         // above the last second that RFC 3339 writes.
         assert_eq!(SHARED_ACT_TIME_MAX, 1_099_511_627_776);
