@@ -2767,8 +2767,8 @@ take someone out; it would double each of those costs.
 
 **Rationale:** The bounds of the parts of a device's list (record §3.4).
 Drops are kept apart from the 16 places, four times as many, so that
-dropping a channel frees its place at once and a drop is still held for its
-90 days. Subscriptions are of an agent and a channel. Labels are as many as
+dropping a channel frees its place at once, and a drop is kept until 64
+newer drops push it out, never for its age. Subscriptions are of an agent and a channel. Labels are as many as
 the keys a channel shows (`SHARED_MAX_KEYS`). Each part's count is one
 byte.
 
@@ -2780,15 +2780,15 @@ byte.
 is the length of a device's label in a statement, and is written as a
 statement writes one, behind a length of two bytes.
 
-#### SHARED_LIST_MAX_VALUE_BYTES = 41,341
+#### SHARED_LIST_MAX_VALUE_BYTES = 41,333
 
-**Derivation:** The form and the fetched time, 9; then each part's count
+**Derivation:** The form, 1; then each part's count
 and items, each item with its act (time 8, count 8, maker 32, signature 64:
 112): 16 filings of 475 (the ID 32, the card 97, a name of 200 behind a
 length of one byte, how it came 33), 64 drops of 144 (an ID), 32
 subscriptions of 346 (the ID, an agent's name of 200 behind a length of one
 byte, and its state) and 64 labels of 210 (a key, and a label of 64 behind
-a length of two): 9 + 7,601 + 9,217 + 11,073 + 13,441.
+a length of two): 1 + 7,601 + 9,217 + 11,073 + 13,441.
 
 **Rationale:** A list at every bound, which with its name of 77 bytes is
 within `MAX_ENTRY_NAME_AND_VALUE_BYTES` and seals at 65,536, counted at a
@@ -2796,21 +2796,11 @@ relay as 66,560 (record §3.4). At 64 devices that count the lists are
 4,259,840 bytes as counted, under a channel's 16 MiB. A person with four
 devices and a few channels writes lists of some 4 KB each.
 
-#### SHARED_WORDS_WRITTEN_AGAIN_DAYS = 30
-
-**Derivation:** A third of `KEYED_TOMBSTONE_RETENTION_DAYS`.
-
-**Rationale:** A device whose list did not change writes it again after a
-whole fetch once 30 days have passed (record §3.4): a list is fresh to the
-others for 90 days, so it is written within each 90 with two writings to
-spare. A device that reaches no relay writes nothing, and does not look
-fresh because it is running.
-
 #### SHARED_ACT_TIME_MAX = 2^40
 
-**Rationale:** The latest time in seconds that an act or a fetched time may
-say, and the highest count an item may say (record §3.4): some 34,000 years
-from 1970, above the last second that a time in RFC 3339 can be
+**Rationale:** The latest time in seconds that an act may say, and the
+highest count an item may say (record §3.4): some 34,000 years from 1970,
+above the last second that a time in RFC 3339 can be
 (9999-12-31T23:59:59Z, 253,402,300,799), which `protocol.rs` checks. A new
 act is dated one above the newest it holds, and never above this; at this
 time alone the item's count orders acts, so the next act on an item still
