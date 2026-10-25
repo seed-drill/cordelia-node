@@ -6184,18 +6184,23 @@ mod tests {
 
     /// **No line says that a recovery's wait is still waiting at a look
     /// that ends it** (decision 2026-10-24, rule 3): a minute after R0, the
-    /// look that ends the wait says the line that it has ended, and not
-    /// that it is still waiting.
+    /// look that ends the wait, with no new line, says the line that it has
+    /// ended, and not that it is still waiting.
     #[test]
     fn no_still_waiting_line_comes_beside_the_end_of_a_recoverys_wait() {
-        use wait::tests::Scenario::{Dialling, Ok as Reached, OutLacking};
+        use wait::tests::Scenario::{LacksForAMoment, Ok as Reached};
+        // Neither look has a line of its own: the relay that lacks the
+        // change is reached, and has refused it for no minute yet.
         let mut node = Stands::of(
             finished(false),
-            vec![looked(&[Reached, Dialling]), looked(&[Reached, OutLacking])],
+            vec![
+                looked(&[Reached, LacksForAMoment]),
+                looked(&[Reached, Reached]),
+            ],
         );
         node.step = 60;
         let (ended, said) = after(&node);
-        assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::NotDone));
+        assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::Recovered));
         assert!(
             !said.iter().any(|line| line.contains("still waiting")),
             "{said:?}"
