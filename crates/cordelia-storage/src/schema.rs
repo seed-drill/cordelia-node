@@ -4779,6 +4779,35 @@ mod tests {
         conn
     }
 
+    /// The version before, whose schema is at step 20 (decision 2026-10-25),
+    /// stops on a database that was stepped past 20 (decision 2026-10-10
+    /// §14, "going back"), as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed. A database at step 20 it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_stepped_past_20() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 20);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 22, own: 20 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let at_20 = at_v20();
+        assert!(refuse_a_later_version(&at_20, 20).is_ok());
+        assert!(refuse_a_later_version(&at_20, 19).is_err());
+    }
+
     /// What the step to version 21 adds: three tables.
     const NEW_IN_V21: [&str; 3] = [
         "shared_list_first_held",

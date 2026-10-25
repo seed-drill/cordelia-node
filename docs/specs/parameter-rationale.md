@@ -2942,11 +2942,12 @@ One length, so a relay learns nothing from its size.
 pair channel; `anew/` and a key a device's anew record in a shared
 channel, beside the messages record's `msg/`; `sread/` and a key a
 device's list of the shared messages its agents read and sent, in the
-messages channel, 76 bytes with its key, so that a device has 66 slots of
-3,072 bytes there, 12,976,128 bytes at 64 devices, which `protocol.rs`
-checks; and `shared/` and a key a device's list in the personal channel.
-None of `sread/`, `read/` and `msg/` begins another, and `shared/` begins
-no other prefix of the personal channel, nor does any begin it.
+messages channel, 76 bytes with its key, so that a device has 68 slots of
+3,072 bytes there with the `person/` and `hold/` of decision 2026-10-25,
+13,369,344 bytes at 64 devices, which `protocol.rs` checks; and `shared/`
+and a key a device's list in the personal channel. None of `sread/`,
+`read/`, `msg/`, `person/` and `hold/` begins another, and `shared/`
+begins no other prefix of the personal channel, nor does any begin it.
 
 ---
 
