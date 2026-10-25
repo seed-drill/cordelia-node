@@ -153,8 +153,14 @@ fn writes_a_record_adding(adder: &Node, added: &[u8; 32], label: &str) {
 ///   which lists no removed device, is the way on: the laptop applies it
 ///   and goes on, and the file it edited while closed reaches the desktop.
 ///
-/// Taken out: rule 3's holders (the laptop goes on: (a) fails); rule 4's
-/// gate in `Standing::to_write` and `stands` (it publishes: (b) fails).
+/// Taken out: rule 3's keys of records, both those kept apart and those of
+/// the records kept (the laptop goes on: (a) fails); rule 4's gate in
+/// `Standing::to_write` and `stands` (it publishes: (b) fails). The
+/// holders kept apart alone, taken out, are not caught here: the laptop
+/// keeps the one record, and reads its key from it. Only a record dropped
+/// by the bound of 256 is read from the holders alone, and the unit test
+/// `test_a_record_that_adds_a_removed_key_makes_the_change_not_clear_past_the_bound`
+/// (`cordelia-api`, `person.rs`) takes the record past it.
 #[test]
 fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
     let relay = relay_started();
