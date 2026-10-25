@@ -905,53 +905,44 @@ fn a_relay_holds_the_change_only_on_the_word_of_a_device_that_applied_it() {
 }
 
 /// The carry ends only when each remaining device holds every version the
-/// others carried, read from it: at the revision carried with an entry of
-/// the carrier's among its authors, or at a later one (bar 10b).
+/// others carried, read from it: the same version (its revision and its
+/// content), or a later one (bar 10b). An older revision, or another
+/// content at the same revision, is not it; whose entry holds it does not
+/// matter.
 #[test]
 fn a_carry_ends_only_where_each_device_holds_what_the_others_carried() {
     use serde_json::json;
-    let keys: HashMap<usize, String> = [(0, "key-0".to_string()), (1, "key-1".to_string())].into();
-    let mut theirs = removal::Held::new();
-    removal::read_entries(
-        "n01",
-        &json!({ "entries": [{ "key": "f001.md", "rev": 5, "authors": ["key-1"] }] }),
-        &mut theirs,
-    );
-    let carried: HashMap<usize, removal::Held> =
-        [(1, theirs.clone()), (0, removal::Held::new())].into();
-    let held_by_0 = |rev: u64, authors: &[&str]| {
+    let entries = |rev: u64, content: &str, authors: &[&str]| {
         let mut held = removal::Held::new();
         removal::read_entries(
             "n01",
-            &json!({ "entries": [{ "key": "f001.md", "rev": rev, "authors": authors }] }),
+            &json!({ "entries": [
+                { "key": "f001.md", "rev": rev, "content": content, "authors": authors },
+            ] }),
             &mut held,
         );
         held
     };
-    assert!(!removal::holds_what_was_carried(
-        0,
-        &held_by_0(5, &["key-0"]),
-        &carried,
-        &keys
-    ));
-    assert!(removal::holds_what_was_carried(
-        0,
-        &held_by_0(5, &["key-0", "key-1"]),
-        &carried,
-        &keys
-    ));
-    assert!(removal::holds_what_was_carried(
-        0,
-        &held_by_0(6, &["key-0"]),
-        &carried,
-        &keys
-    ));
-    assert!(!removal::holds_what_was_carried(
-        0,
-        &removal::Held::new(),
-        &carried,
-        &keys
-    ));
+    let carried: HashMap<usize, removal::Held> = [
+        (1, entries(5, "the fifth", &["key-1"])),
+        (0, removal::Held::new()),
+    ]
+    .into();
+    let holds = |held: removal::Held| removal::holds_what_was_carried(0, &held, &carried);
+    assert!(
+        holds(entries(5, "the fifth", &["key-0"])),
+        "the version, by its own entry"
+    );
+    assert!(holds(entries(6, "the sixth", &["key-0"])), "a later one");
+    assert!(
+        !holds(entries(4, "the fourth", &["key-0", "key-1"])),
+        "an older one"
+    );
+    assert!(
+        !holds(entries(5, "another fifth", &["key-0"])),
+        "another version at its revision"
+    );
+    assert!(!holds(removal::Held::new()), "nothing of the key");
 }
 
 // ── Every read of a node is bounded ─────────────────────────────────

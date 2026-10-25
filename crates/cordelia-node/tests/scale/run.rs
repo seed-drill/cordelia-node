@@ -1106,9 +1106,8 @@ impl Run {
             if round.settled && carried.len() == remaining.len() && now - last_look >= 2.0 {
                 last_look = now;
                 let all = remaining.iter().all(|d| {
-                    self.entries_of(k, *d).is_some_and(|held| {
-                        removal::holds_what_was_carried(*d, &held, &carried, &keys)
-                    })
+                    self.entries_of(k, *d)
+                        .is_some_and(|held| removal::holds_what_was_carried(*d, &held, &carried))
                 });
                 if all {
                     carry_end = Some(self.now());

@@ -72,10 +72,19 @@ pub fn read_round(
     round
 }
 
-/// What a device holds of one name: each key's current version, its
-/// revision and the keys of the devices whose entries hold it, from the
-/// local API (`POST /api/v1/channels/entries`).
-pub type Held = HashMap<(String, String), (u64, Vec<String>)>;
+/// What a device holds of one name: each key's current version, as its
+/// revision and its content, and the keys of the devices whose entries
+/// hold it, from the local API (`POST /api/v1/channels/entries`).
+pub type Held = HashMap<(String, String), Version>;
+
+/// A version as a device holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub rev: u64,
+    /// The content, as the route shows it (`null` for a delete).
+    pub content: String,
+    pub authors: Vec<String>,
+}
 
 /// Read one answer of the local entries route for `name` into `held`.
 pub fn read_entries(name: &str, answer: &serde_json::Value, held: &mut Held) {
@@ -89,28 +98,30 @@ pub fn read_entries(name: &str, answer: &serde_json::Value, held: &mut Held) {
             .flatten()
             .filter_map(|a| a.as_str().map(str::to_string))
             .collect();
-        held.insert((name.to_string(), key.to_string()), (rev, authors));
+        let version = Version {
+            rev,
+            content: entry["content"].to_string(),
+            authors,
+        };
+        held.insert((name.to_string(), key.to_string()), version);
     }
 }
 
 /// Whether device `d`, which holds `held`, holds every version each other
 /// remaining device carried (bar 10b): for each version `carried[o]`
 /// lists (what `o` held at the change's line, which it carries), `d` holds
-/// that key at a later revision, or at the same one with an entry of
-/// `o`'s among its authors.
-pub fn holds_what_was_carried(
-    d: usize,
-    held: &Held,
-    carried: &HashMap<usize, Held>,
-    keys: &HashMap<usize, String>,
-) -> bool {
-    carried.iter().filter(|(o, _)| **o != d).all(|(o, theirs)| {
-        let Some(key_of_o) = keys.get(o) else {
-            return false;
-        };
-        theirs.iter().all(|(slot, (rev, _))| {
-            held.get(slot).is_some_and(|(held_rev, authors)| {
-                *held_rev > *rev || (*held_rev == *rev && authors.iter().any(|a| a == key_of_o))
+/// that key at a later revision, or the same version: at the same
+/// revision, with the same content.
+///
+/// It is the version that is held, whoever's entry holds it: a device
+/// that held a version by its own entry was seen not to store another
+/// device's carried entry of it, and holds it all the same.
+pub fn holds_what_was_carried(d: usize, held: &Held, carried: &HashMap<usize, Held>) -> bool {
+    carried.iter().filter(|(o, _)| **o != d).all(|(_, theirs)| {
+        theirs.iter().all(|(slot, carried)| {
+            held.get(slot).is_some_and(|held| {
+                held.rev > carried.rev
+                    || (held.rev == carried.rev && held.content == carried.content)
             })
         })
     })
