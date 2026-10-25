@@ -534,11 +534,11 @@ fn the_observer_counts_an_edit_only_by_its_own_line() {
     let mut late = written(6, "late.md");
     late.at = 350.0;
     o.wrote(late, vec![(1, b.clone())]);
-    o.gone(0, 1, 400.0, Some(0.0));
+    o.gone(0, 1, observer::no_chance_from(&[(0.0, true)], 400.0));
     assert_eq!(o.gone, [(6, 1)]);
     assert_eq!(o.pending(), 2, "the old misses stay waited for");
-    // Where it was not running, nothing more is waited for on it.
-    o.gone(0, 1, 400.0, None);
+    // Where it never ran, it had no chance at anything.
+    o.gone(0, 1, f64::NEG_INFINITY);
     assert_eq!(o.pending(), 0);
     assert_eq!(o.gone.len(), 3);
 }

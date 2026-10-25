@@ -449,3 +449,157 @@ fn a_device_closed_lately_is_read_up_to_its_next_sample() {
     assert!(closed_lately(&read, 2, 600.0));
     assert!(!closed_lately(&read, 2, 845.0));
 }
+
+// ── High 1, second round: replaced by intent only without a minute's run ──
+
+/// Two edits of one file by person 0's first device: `n` at `n_at`, and
+/// `m` over it at `m_at`, which reaches the second device (node 3) at
+/// `m_at` + 10 s; `n` never reaches it.
+fn n_then_m(run: &Run, n_at: f64, m_at: f64) {
+    let mut o = run.observer.lock().unwrap();
+    let edit = |number: u64, at: f64, replaced: Option<u64>| Written {
+        number,
+        person: 0,
+        writer: 0,
+        name: 0,
+        file: "f001.md".into(),
+        size: 600,
+        at,
+        burst: false,
+        new: false,
+        replaced,
+    };
+    let dir = run.out.clone();
+    o.wrote(edit(10, n_at, None), vec![(1, dir.clone())]);
+    o.wrote(edit(11, m_at, Some(10)), vec![(1, dir)]);
+    o.arrivals.insert(
+        (11, 1),
+        Arrival {
+            at: m_at + 10.0,
+            in_copy: false,
+        },
+    );
+}
+
+/// The review's catch-up: the second device is off from 220 s to 280 s,
+/// `n` is written at 230 s, the device then runs to 1500 s and never takes
+/// `n`, and `m` is written over it at 1500 s. It ran twenty minutes while
+/// `n` was the newest: `n` is not replaced by intent there, it is lost, and
+/// the device did not catch up.
+#[test]
+fn an_edit_a_device_ran_twenty_minutes_without_is_lost_though_replaced_later() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    becomes(&run, 3, 220.0, Is::Stopped);
+    becomes(&run, 3, 280.0, Is::Running);
+    n_then_m(&run, 230.0, 1500.0);
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    let n_at_d = edits.pairs.iter().find(|p| p.edit.number == 10).unwrap();
+    assert!(!n_at_d.replaced);
+    let bar = bar_3(&read, &edits);
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    assert!(bar.figure.contains("1 not found"), "{}", bar.figure);
+    assert!(
+        bar.figure.contains("1 edits not held within 60 s"),
+        "{}",
+        bar.figure
+    );
+}
+
+/// The review's late edit: the second device runs from 200 s to 1000 s and
+/// never takes `n`, written at 200 s; it is off from 1000 s to 1100 s; `m`
+/// is written over `n` at 1200 s. A running device missed `n` for 120 s:
+/// bar 2 counts it late.
+#[test]
+fn an_edit_a_running_device_missed_for_two_minutes_is_late_though_replaced_later() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    becomes(&run, 3, 1000.0, Is::Stopped);
+    becomes(&run, 3, 1100.0, Is::Running);
+    n_then_m(&run, 200.0, 1200.0);
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    let (_, late) = latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
+    assert_eq!(late, 1);
+    // Where the device ran no minute between the two, `m` replaced `n` by
+    // intent there, and nothing is late.
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    becomes(&run, 3, 190.0, Is::Stopped);
+    becomes(&run, 3, 1240.0, Is::Running);
+    n_then_m(&run, 200.0, 1200.0);
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    assert!(
+        edits
+            .pairs
+            .iter()
+            .find(|p| p.edit.number == 10)
+            .unwrap()
+            .replaced
+    );
+    let (_, late) = latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
+    assert_eq!(late, 0);
+}
+
+// ── Medium 2, second round: a removed device's old misses stay misses ──
+
+/// The review's sequence: person 1's second device runs from 1000 s to
+/// 2000 s and never takes `n`, written at 1000 s; it goes off at 2000 s and
+/// is removed at 2100 s while off. It had its chance at `n`: `n` is not
+/// gone, it is lost (bar 3) and late (bar 2). What was written in the
+/// 120 s before it went down is gone.
+#[test]
+fn a_device_removed_while_off_still_owed_what_it_ran_through() {
+    let (_dir, run) = made_up();
+    all_running(&run, 1000.0);
+    window(&run, 1000.0, 2400.0);
+    becomes(&run, 5, 2000.0, Is::Stopped);
+    run.removals.lock().unwrap().push(Removal {
+        person: 1,
+        removed: 1,
+        line_at: Some(2100.0),
+        carry_end: Some(2150.0),
+        ..Removal::default()
+    });
+    let since = crate::observer::no_chance_from(&[(1000.0, true), (2000.0, false)], 2100.0);
+    assert_eq!(since, 1880.0);
+    {
+        let mut o = run.observer.lock().unwrap();
+        let edit = |number: u64, at: f64| Written {
+            number,
+            person: 1,
+            writer: 0,
+            name: 0,
+            file: format!("f{number:03}.md"),
+            size: 600,
+            at,
+            burst: false,
+            new: false,
+            replaced: None,
+        };
+        let dir = run.out.clone();
+        o.wrote(edit(10, 1000.0), vec![(1, dir.clone())]);
+        o.wrote(edit(12, 1990.0), vec![(1, dir)]);
+        o.gone(1, 1, since);
+        assert_eq!(o.gone, [(12, 1)], "only what it had no chance at");
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    let bar = bar_3(&read, &edits);
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    let (_, late) = latencies(&read, edits.pairs.iter());
+    assert_eq!(late, 1);
+    // Back less than a minute before the line: the time down before counts.
+    let back = [(0.0, true), (500.0, false), (2060.0, true)];
+    assert_eq!(crate::observer::no_chance_from(&back, 2100.0), 380.0);
+    // Running long before the line: the 120 s before it alone.
+    assert_eq!(
+        crate::observer::no_chance_from(&[(0.0, true)], 2100.0),
+        1980.0
+    );
+}

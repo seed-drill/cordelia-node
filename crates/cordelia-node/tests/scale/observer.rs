@@ -155,14 +155,11 @@ impl Observer {
         self.pending.len()
     }
 
-    /// Device `device` of `person` is removed at `line`. What it had no
-    /// chance at is waited for on it no more: what was written in the
-    /// 120 s before the line, everything where it is not running (`up` is
-    /// when it last began to run), and what was written before it began
-    /// where that was less than a minute before the line, its catch-up not
-    /// yet over (bar 3). An older edit that a running device still lacks is
-    /// a miss, and stays waited for, so that it counts as not arrived.
-    pub fn gone(&mut self, person: usize, device: usize, line: f64, up: Option<f64>) {
+    /// Device `device` of `person` is removed: what was written from
+    /// `since` on, which it had no chance at ([`no_chance_from`]), is
+    /// waited for on it no more. An older edit it still lacks is a miss,
+    /// and stays waited for, so that it counts as not arrived.
+    pub fn gone(&mut self, person: usize, device: usize, since: f64) {
         let edits = &self.edits;
         let at = &self.at;
         let mut gone = Vec::new();
@@ -170,9 +167,7 @@ impl Observer {
             let Some(edit) = at.get(&w.edit).map(|i| &edits[*i]) else {
                 return true;
             };
-            let no_chance =
-                edit.at >= line - 120.0 || up.is_none_or(|up| edit.at < up && line - up < 60.0);
-            let goes = edit.person == person && w.device == device && no_chance;
+            let goes = edit.person == person && w.device == device && edit.at >= since;
             if goes {
                 gone.push((w.edit, w.device));
             }
@@ -224,4 +219,40 @@ impl Observer {
             );
         }
     }
+}
+
+/// From when a device removed at `line` had no chance at an edit, given
+/// whether it ran after each change of its life, in their order
+/// (`history`): the 120 s before the line; and, where it was down at the
+/// line, the 120 s before it went down; and where it ran again less than
+/// a minute before the line (its catch-up not over, bar 3), the 120 s
+/// before it went down the time before. An older edit it ran through and
+/// lacks is a miss.
+pub fn no_chance_from(history: &[(f64, bool)], line: f64) -> f64 {
+    let mut since = line - 120.0;
+    let (mut down_since, mut up, mut down_before) = (None, None, None);
+    for (t, runs) in history.iter().filter(|(t, _)| *t <= line) {
+        match (*runs, down_since) {
+            (true, Some(down)) => {
+                down_before = Some(down);
+                down_since = None;
+                up = Some(*t);
+            }
+            (true, None) => {
+                up = up.or(Some(*t));
+            }
+            (false, None) => down_since = Some(*t),
+            (false, Some(_)) => {}
+        }
+    }
+    match (down_since, up) {
+        (Some(down), _) => since = since.min(down - 120.0),
+        (None, Some(up)) if line - up < 60.0 => {
+            if let Some(down) = down_before {
+                since = since.min(down - 120.0);
+            }
+        }
+        _ => {}
+    }
+    since
 }

@@ -144,6 +144,27 @@ impl Lives {
                 .any(|(at, is)| *at > a && *at <= b && *is != Is::Running)
     }
 
+    /// The longest stretch it ran without a stop or a freeze inside [a, b].
+    fn longest_run_within(&self, node: usize, a: f64, b: f64) -> f64 {
+        let mut longest: f64 = 0.0;
+        let mut since = (self.at(node, a) == Is::Running).then_some(a);
+        for (at, is) in self.of[node].iter().filter(|(at, _)| *at > a && *at <= b) {
+            match (is, since) {
+                (Is::Running, None) => since = Some(*at),
+                (Is::Running, Some(_)) => {}
+                (_, Some(from)) => {
+                    longest = longest.max(at - from);
+                    since = None;
+                }
+                (_, None) => {}
+            }
+        }
+        if let Some(from) = since {
+            longest = longest.max(b - from);
+        }
+        longest
+    }
+
     fn frozen_within(&self, node: usize, t: f64, secs: f64) -> bool {
         self.at(node, t - secs) == Is::Frozen
             || self.of[node]
@@ -803,6 +824,8 @@ struct Pair {
     /// Replaced by intent: its writer's next edit held it.
     replaced: bool,
     gone: bool,
+    /// The line of the removal of its device, where it was removed.
+    gone_at: Option<f64>,
 }
 
 struct Edits {
@@ -829,9 +852,10 @@ struct Counted {
 
 /// Whether edit `n` was replaced by intent as device `node` sees it: a
 /// later edit M was written over it where its line headed the file (M's
-/// writer held it), the device was off or frozen at some time between
-/// the two, and M arrived at the device, or was itself so replaced. A
-/// device that ran all through had its chance at `n`, and is owed it.
+/// writer held it), the device ran no stretch of a minute between the two
+/// (bar 3's catch-up: it had no time to take `n` while `n` was the newest),
+/// and M arrived at the device, or was itself so replaced. A device that
+/// ran a minute while `n` was the newest had its chance, and is owed it.
 fn replaced_at(
     read: &Read,
     n: &crate::observer::Written,
@@ -846,11 +870,16 @@ fn replaced_at(
     }
     by.get(&n.number).into_iter().flatten().any(|m| {
         m.writer != device
-            && !read.lives.ran_through(node, n.at, m.at)
+            && read.lives.longest_run_within(node, n.at, m.at) < CATCH_UP_SECS
             && (arrivals.contains_key(&(m.number, device))
                 || replaced_at(read, m, device, node, by, arrivals, depth + 1))
     })
 }
+
+/// The time a device that runs is given to take an edit it lacks (bar 3:
+/// a device that was off holds its person's edits within 60 s of running
+/// again).
+const CATCH_UP_SECS: f64 = 60.0;
 
 impl Edits {
     fn of(read: &Read, observer: &crate::observer::Observer) -> Edits {
@@ -873,7 +902,16 @@ impl Edits {
                 continue;
             };
             let node = read.run.fleet.device(edit.person, *device);
+            let gone_at = read
+                .run
+                .removals
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.person == edit.person && r.removed == *device)
+                .and_then(|r| r.line_at);
             pairs.push(Pair {
+                gone_at,
                 edit: edit.clone(),
                 device: *device,
                 node,
@@ -1082,7 +1120,17 @@ fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> (Vec<f64
     let mut l = Vec::new();
     let mut late = 0;
     for p in pairs {
-        if p.gone || p.edit.at < read.start {
+        if p.edit.at < read.start {
+            continue;
+        }
+        // A device removed later was still owed what it ran 120 s through
+        // before its removal's line.
+        if p.gone {
+            let owed = p.arrived.is_none()
+                && !p.replaced
+                && p.gone_at.is_some_and(|line| p.edit.at + 120.0 <= line)
+                && read.lives.ran_through(p.node, p.edit.at, p.edit.at + 120.0);
+            late += usize::from(owed);
             continue;
         }
         match Edits::latency(p) {

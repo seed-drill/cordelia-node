@@ -568,9 +568,13 @@ impl PersonPlan {
     /// chosen again, and its times off from then on are dropped. Where it is
     /// the active device, its session ends at `at`.
     pub fn remove(&mut self, device: usize, at: f64) {
+        // Its session is cut at `at`: the next begins there, with the steady
+        // edits drawn again from it (those drawn past it were the cut
+        // session's, and are dropped where they wait to be written).
         if self.active == Some(device) && at < self.next_start {
             self.next_start = at;
             self.active = None;
+            self.next_steady = at + self.edits.wait_at(self.profile.edits_an_hour());
         }
         self.devices.retain(|d| *d != device);
         self.drawn_offs.retain(|o| o.device != device);

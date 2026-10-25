@@ -750,15 +750,17 @@ impl Run {
             ));
             return;
         }
-        let at = self.now();
         let person = &self.plan.population.people[planned.person];
         // A device that was removed is the person's no longer; one stopped
-        // for good (test 5) still is, and is waited for.
-        let removed = self.removed.lock().unwrap().clone();
+        // for good (test 5) still is, and is waited for. The edit is stamped
+        // under the lock a removal's line is stamped under.
+        let removed = self.removed.lock().unwrap();
+        let at = self.now();
         let others: Vec<(usize, PathBuf)> = (0..person.devices)
             .filter(|d| *d != planned.device && !removed.contains(&(planned.person, *d)))
             .map(|d| (d, self.folders[&(planned.person, d, planned.name)].clone()))
             .collect();
+        drop(removed);
         self.observer.lock().unwrap().wrote(
             Written {
                 number,
@@ -796,6 +798,9 @@ impl Run {
                         end: next.session.end + start,
                         ..next.session
                     });
+                    // What was queued from the new session's start on is a cut
+                    // session's: its device was removed.
+                    queued.retain(|e| e.at < next.session.start);
                     queued.extend(next.edits);
                     let mut queue = queue.lock().unwrap();
                     for off in next.offs {
@@ -1047,7 +1052,15 @@ impl Run {
             self.busy.lock().unwrap().remove(&k);
             return;
         }
-        let line_at = self.now();
+        // The device is the person's no longer from the line: the line is
+        // stamped under the lock an edit takes to stamp itself and choose
+        // whom it waits for, so that an edit before the line waits for the
+        // device and one after it does not (check 3).
+        let line_at = {
+            let mut set = self.removed.lock().unwrap();
+            set.insert((k, removed));
+            self.now()
+        };
         removal.line_at = Some(line_at);
         removal.change = at
             .said
@@ -1058,14 +1071,21 @@ impl Run {
         // The removed device is the person's no longer, and is stopped for
         // good. What it had no chance at is waited for no more.
         let i_removed = self.fleet.device(k, removed);
-        let up = match self.fleet.is(i_removed) {
-            (Is::Running, since) => Some(since),
-            _ => None,
-        };
-        self.removed.lock().unwrap().insert((k, removed));
+        let history: Vec<(f64, bool)> = self
+            .fleet
+            .changes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.node == i_removed)
+            .map(|c| (c.t, c.is == Is::Running))
+            .collect();
         self.gone.lock().unwrap().insert((k, removed));
         self.plans.lock().unwrap()[k].remove(removed, line_at - self.window_start());
-        self.observer.lock().unwrap().gone(k, removed, line_at, up);
+        self.observer
+            .lock()
+            .unwrap()
+            .gone(k, removed, observer::no_chance_from(&history, line_at));
         self.stop_node(i_removed);
         let index = {
             let mut removals = self.removals.lock().unwrap();
@@ -1097,18 +1117,21 @@ impl Run {
             && carry_end.is_none()
             && !self.fleet.stop_early.load(Ordering::SeqCst)
         {
-            for d in &remaining {
+            let seen: Vec<(usize, serde_json::Value)> = remaining
+                .iter()
+                .filter_map(|d| Some((*d, self.person_seen_by(k, *d)?)))
+                .collect();
+            let round = removal::read_round(change, &remaining, &seen, &keys);
+            // What a device carries: what it holds once it has applied the
+            // change, read from it then, and not before (what reaches it
+            // before it applies is carried too).
+            for d in &round.applied {
                 if !carried.contains_key(d)
                     && let Some(held) = self.entries_of(k, *d)
                 {
                     carried.insert(*d, held);
                 }
             }
-            let seen: Vec<(usize, serde_json::Value)> = remaining
-                .iter()
-                .filter_map(|d| Some((*d, self.person_seen_by(k, *d)?)))
-                .collect();
-            let round = removal::read_round(change, &remaining, &seen, &keys);
             let now = self.now();
             for d in &round.applied {
                 applied.entry(*d).or_insert(now);
