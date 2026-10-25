@@ -1022,12 +1022,20 @@ impl Run {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 // Of each other device added since the last change: it
-                // stays.
-                let which = at.says_one_of(&["Type `stays`", "Make this change?"]);
-                if which == 1 {
-                    break;
-                }
-                at.types("stays");
+                // stays. Of the remover, where it was added since (it is
+                // not, being the first device): it is listed, in the words
+                // of either version of the prompt.
+                let which = at.says_one_of(&[
+                    "Type `stays` or `removed`",
+                    "Type `list` to list this machine",
+                    "Type `stays` to list this device",
+                    "Make this change?",
+                ]);
+                match which {
+                    0 | 2 => at.types("stays"),
+                    1 => at.types("list"),
+                    _ => break,
+                };
             }
             at.says("Type yes to go on").types("yes");
             at.says(common::ASKS_THE_PHRASE).types(&words);
