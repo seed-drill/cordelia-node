@@ -1409,13 +1409,73 @@ Whole each time, that is some 280 MB a day from each idle device to each
 relay, and a tenth of what a connection may push in a minute. That is why a
 show is short after the first on a connection (decision §2.4, item 5).
 
-#### CHANGE_ENTRY_PHRASE_PART_BYTES = 4 KB, CHANGE_ENTRY_DEVICES_PART_BYTES = 28 KB
+#### CHANGE_ENTRY_DEVICES_PART_BYTES = 28,672, CHANGE_ENTRY_PHRASE_PART_BYTES = 1,024, CHANGE_ENTRY_LINEAGE_BYTES = 3,072
 
-**Rationale:** The last 4 KB is the part for the phrase, and the rest is
-the part for the devices. Each part is one size whatever it says.
+**Rationale:** A change entry's content is the part for the devices (the
+first 28,672 bytes), the part for the phrase (1,024 bytes after it), and
+the lineage in the clear (the last 3,072), which a relay reads to tell
+which change was made after which (decision 2026-10-24 rule 13). Each
+sealed part is one size whatever it says.
 
-**Why 4 KB:** chosen with `MAX_EARLIER_SECRETS`: at its bound the part says
-382 bytes. No measurement behind it yet. The other part is what it leaves.
+**Why the part for the devices is fixed, and not derived:** a device of
+the version before (0.2.0-alpha.16) opens that part at this place and of
+this size. It was derived there as what the part for the phrase leaves;
+left so, it would grow to 31,744 bytes when the part for the phrase
+shrinks, and every device of the version before would refuse every new
+entry as no change entry, with no leave at that relay (decision
+2026-10-24, the first review, item 10). `protocol.rs` checks at compile
+time that it is 28,672, and unit test 14 pins it in
+`docs/reference/change-entry-test-vectors.json`.
+
+**Why 1,024 for the phrase:** at every bound it needs 382 bytes sealed (a
+nonce, a tag, the secret, a count, and eight earlier secrets with their
+numbers). 1,024 holds that with room, and leaves the lineage the 3,072
+that a chain at its bound needs with room too. Chosen with the record
+(decision 2026-10-24 §11); no measurement behind it. It was 4,096.
+
+**The lineage** is what the two parts leave: 3,072 bytes, of which a
+chain of 256 takes 2,074 (`MAX_LINEAGE_BYTES`).
+
+#### CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES = 4,096
+
+**Derivation:** `CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES`: the
+part for the phrase in the layout of the version before, which had no
+lineage. A command of this version opens the part for the phrase of an
+entry of either layout, so that a change is made over a change entry made
+there; an entry whose lineage region does not open with the mark is of
+that layout (decision 2026-10-24 rule 13).
+
+#### LINEAGE_HASH_BYTES = 8
+
+**Rationale:** How much of a statement's hash names it in a lineage: the
+statement's own hash, and each hash on its chain. A relay uses them only
+to tell apart the statements of one phrase, and only the phrase makes
+one: two of 256 share 8 bytes with a chance of about 2^-49 (decision
+2026-10-24 rule 13).
+
+**Why the whole chain:** a relay can then tell that one entry is behind
+another without having seen those between.
+
+#### LINEAGE_MARK_BYTES = 8, LABEL_CHANGE_LINEAGE = `cordelia v2 lineage`
+
+**Rationale:** A lineage opens with the first 8 bytes of SHA-256 of
+`LABEL_CHANGE_LINEAGE`, its mark. An entry of the version before has the
+ciphertext of its part for the phrase there, which is the mark with a
+chance of 2^-64; an entry with the mark, and not then a lineage in its
+form followed by zeros, is refused. The label begins no other label, and
+none begins it.
+
+#### MAX_LINEAGE_BYTES = 2,074
+
+**Derivation:** the mark (8), the time the change was made by its maker's
+clock (8, in seconds), the statement's hash (8), a count (2), and 256
+hashes of 8: a chain at its bound (`MAX_STATEMENT_CHAIN`). It fits the
+3,072 of `CHANGE_ENTRY_LINEAGE_BYTES`, which `protocol.rs` checks when it is
+compiled.
+
+**What the time is:** the maker's word. Nothing checks it against another
+clock; the entry's two signatures cover it, so only the phrase writes it.
+A maker's clock that is wrong is the limit of decision 2026-10-24 rule 7.
 
 #### SEALED_SECRET_BYTES = 92
 
@@ -1434,7 +1494,9 @@ reads back as far as these go.
 eight earlier generations for 90 days, which no other device holds for a
 generation it was never in (decision §12).
 
-**Why 8:** chosen with the part's 4 KB; no measurement behind it yet.
+**Why 8:** chosen with the part's first 4 KB; at its bound the part says
+354 bytes, which its 1,024 hold (decision 2026-10-24 rule 13). No
+measurement behind it yet.
 
 ### 12.4 An Entry
 

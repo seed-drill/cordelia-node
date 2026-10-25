@@ -1,11 +1,12 @@
 //! The change entry: how a statement reaches a device (decision 2026-10-04
-//! §4.6, §9).
+//! §4.6, §9), and its lineage (decision 2026-10-24 rule 13).
 //!
 //! Each statement is published as one entry in the phrase's channel. This
 //! module makes that entry and opens it. Its content is always 32 KB, and
-//! has two parts. Each is sealed with AES-256-GCM under a key of its own,
-//! and bound to the statement's number and the phrase's public key, so
-//! that a part is no part of another entry.
+//! has two sealed parts and a lineage in the clear. Each part is sealed
+//! with AES-256-GCM under a key of its own, and bound to the statement's
+//! number and the phrase's public key, so that a part is no part of another
+//! entry.
 //!
 //! - **For the devices**, under the statement key, which every device that
 //!   follows the phrase holds: the statement, and, for each device it
@@ -19,29 +20,51 @@
 //!   secret, and the secrets of the generations before it, as many as
 //!   eight, the newest first, each with its statement's number. Nothing
 //!   else.
+//! - **The lineage**, in the clear, which a relay reads (decision 2026-10-24
+//!   rule 13): when the change was made, by its maker's clock, the hash of
+//!   its statement, and the hash of each statement on its chain. The
+//!   entry's two signatures cover it, so only the phrase writes one.
 //!
 //! ## Layout
 //!
 //! ```text
-//! the part for the devices   28672 bytes: nonce 12, ciphertext, tag 16
-//! the part for the phrase     4096 bytes: nonce 12, ciphertext, tag 16
+//! offset     0  the part for the devices  28672 bytes: nonce 12, ciphertext, tag 16
+//! offset 28672  the part for the phrase    1024 bytes: nonce 12, ciphertext, tag 16
+//! offset 29696  the lineage                3072 bytes, in the clear
 //! ```
 //!
+//! The part for the devices is where, and as large as, it is in the layout
+//! of the version before (0.2.0-alpha.16), whose part for the phrase was
+//! the last 4096 bytes and which had no lineage ([`Layout::Before`]). A
+//! device of that version opens the part for the devices of an entry of
+//! this layout as it opens its own; its commands, which open the part for
+//! the phrase at 4096 bytes, find that it does not open, and refuse
+//! (decision 2026-10-24 §6).
+//!
 //! Each part is one size whatever it says: what it says is filled up with
-//! zeros inside the encryption. So a relay holds 32 KB that say nothing,
-//! not even how many devices there are. What a part says, with a count or
-//! a length as two bytes and a number as eight, the higher byte first:
+//! zeros inside the encryption. So a relay holds sealed parts that say
+//! nothing, not even how many devices there are. What a part says, with a
+//! count or a length as two bytes and a number as eight, the higher byte
+//! first:
 //!
 //! ```text
 //! for the devices   the signed statement's length, the signed statement,
 //!                   a count, and for each device the sealed secret (92)
 //! for the phrase    the secret (32), a count, and for each earlier
 //!                   generation its number and its secret (32)
+//! the lineage       a mark (8: the first bytes of SHA-256 of the label
+//!                   `cordelia v2 lineage`), the time the change was made
+//!                   (8, in seconds), the first 8 bytes of the statement's
+//!                   hash, a count, and the first 8 bytes of the hash of
+//!                   each statement on its chain, in the chain's order;
+//!                   then zeros
 //! ```
 //!
-//! Building refuses what does not fit, and never cuts it. At every bound
-//! together both parts fit, which `cordelia_core::protocol` checks when it
-//! is compiled.
+//! An entry whose lineage region does not open with the mark has no
+//! lineage: it was made in the layout of the version before. Building
+//! refuses what does not fit, and never cuts it. At every bound together
+//! both parts and the lineage fit, which `cordelia_core::protocol` checks
+//! when it is compiled.
 //!
 //! ## Opening
 //!
@@ -77,13 +100,21 @@
 //! - **Bytes that are no list at all** (a count above the number of
 //!   devices, or anything after the sealed secrets but zeros) are refused,
 //!   whoever reads.
+//!
+//! **A lineage that does not match its statement** (another statement's
+//! hash, or another chain) is refused, whoever reads: the entry is not well
+//! formed ([`ChangeEntryError::LineageNotItsStatement`]). So is a lineage
+//! that is not in its form. An entry with no lineage is judged by its
+//! statement alone.
 
 use std::fmt;
 
 use cordelia_core::protocol::{
-    CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
-    CHANGE_ENTRY_PHRASE_PART_BYTES, ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_DEVICES,
-    LABEL_CHANGE_PHRASE, LABEL_CHANGE_SECRET, MAX_EARLIER_SECRETS, SEALED_SECRET_BYTES,
+    CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_LINEAGE_BYTES,
+    CHANGE_ENTRY_NAME, CHANGE_ENTRY_PHRASE_PART_BYTES, ITEM_SEAL_OVERHEAD_BYTES,
+    LABEL_CHANGE_DEVICES, LABEL_CHANGE_LINEAGE, LABEL_CHANGE_PHRASE, LABEL_CHANGE_SECRET,
+    LINEAGE_HASH_BYTES, LINEAGE_MARK_BYTES, MAX_EARLIER_SECRETS, MAX_STATEMENT_CHAIN,
+    SEALED_SECRET_BYTES,
 };
 
 use crate::aes_gcm::{item_decrypt, item_encrypt};
@@ -91,7 +122,7 @@ use crate::ecies::{EciesEnvelope, ecies_decrypt_for, ecies_encrypt_for};
 use crate::entry::CheckedEntry;
 use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
 use crate::slots::slot_id;
-use crate::statement::{Reader, SignedStatement, StatementError, put_count};
+use crate::statement::{Reader, SignedStatement, Statement, StatementError, put_count};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Why a change entry's content was not made, or not opened.
@@ -123,6 +154,9 @@ pub enum ChangeEntryError {
 
     #[error("the entry is for statement {entry}, and the statement in it is number {statement}")]
     Number { entry: u64, statement: u64 },
+
+    #[error("the entry's lineage does not match its statement")]
+    LineageNotItsStatement,
 
     #[error("the statement in the entry is under another phrase")]
     AnotherPhrase,
@@ -206,6 +240,146 @@ pub enum DeviceSecret {
     DidNotOpen,
     /// The statement does not list the device: nothing is sealed to it.
     NotListed,
+}
+
+/// The layout of a change entry's content (decision 2026-10-24 rule 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// The layout of the version before (0.2.0-alpha.16): the part for the
+    /// devices, and the part for the phrase in the last 4096 bytes. No
+    /// lineage.
+    Before,
+    /// The part for the devices where it was, the part for the phrase in
+    /// 1024 bytes after it, and the lineage in the last 3072.
+    WithLineage,
+}
+
+/// What a change entry's lineage says, in the clear (decision 2026-10-24
+/// rule 13). A relay reads it to tell which change was made after which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    /// When the change was made, by its maker's clock, in seconds since
+    /// the Unix epoch. Nothing checks it against another clock.
+    pub made_at: u64,
+    /// The first 8 bytes of the statement's hash.
+    pub statement: [u8; LINEAGE_HASH_BYTES],
+    /// The first 8 bytes of the hash of each statement on its chain, in
+    /// the chain's order.
+    pub chain: Vec<[u8; LINEAGE_HASH_BYTES]>,
+}
+
+impl Lineage {
+    /// The lineage of `statement`, made at `made_at`: its hash and its
+    /// chain's, each cut to its first 8 bytes.
+    pub fn of(statement: &Statement, made_at: u64) -> Result<Self, ChangeEntryError> {
+        Ok(Self {
+            made_at,
+            statement: short(&statement.hash()?),
+            chain: statement
+                .chain
+                .iter()
+                .map(|link| short(&link.hash))
+                .collect(),
+        })
+    }
+
+    /// Whether this lineage is `statement`'s: its hash, and its chain's,
+    /// in order. The time is the maker's word, and is not asked.
+    pub fn is_of(&self, statement: &Statement) -> Result<bool, ChangeEntryError> {
+        Ok(*self == Self::of(statement, self.made_at)?)
+    }
+
+    /// The lineage as it is in an entry: exactly `CHANGE_ENTRY_LINEAGE_BYTES`,
+    /// its mark first and zeros after it. A chain over its bound does not
+    /// fit, and is refused.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ChangeEntryError> {
+        if self.chain.len() > MAX_STATEMENT_CHAIN {
+            return Err(ChangeEntryError::Malformed);
+        }
+        let mut out = Vec::with_capacity(CHANGE_ENTRY_LINEAGE_BYTES);
+        out.extend_from_slice(&lineage_mark());
+        out.extend_from_slice(&self.made_at.to_be_bytes());
+        out.extend_from_slice(&self.statement);
+        put_count(&mut out, self.chain.len());
+        for hash in &self.chain {
+            out.extend_from_slice(hash);
+        }
+        if out.len() > CHANGE_ENTRY_LINEAGE_BYTES {
+            return Err(ChangeEntryError::DoesNotFit {
+                needed: out.len(),
+                room: CHANGE_ENTRY_LINEAGE_BYTES,
+            });
+        }
+        out.resize(CHANGE_ENTRY_LINEAGE_BYTES, 0);
+        Ok(out)
+    }
+
+    /// Read a lineage from the region of an entry that holds it: `None`
+    /// where the region does not open with the mark (an entry of the layout
+    /// before). A region that opens with it, and is not then a lineage in
+    /// its form followed by zeros, is refused.
+    fn from_bytes(region: &[u8]) -> Result<Option<Self>, ChangeEntryError> {
+        if region.get(..LINEAGE_MARK_BYTES) != Some(&lineage_mark()[..]) {
+            return Ok(None);
+        }
+        let short = || ChangeEntryError::Malformed;
+        let mut reader = Reader::new(&region[LINEAGE_MARK_BYTES..]);
+        let made_at = reader.u64().ok_or_else(short)?;
+        let statement = reader.array().ok_or_else(short)?;
+        let count = reader.count().ok_or_else(short)?;
+        if count > MAX_STATEMENT_CHAIN {
+            return Err(ChangeEntryError::Malformed);
+        }
+        let mut chain = Vec::with_capacity(count);
+        for _ in 0..count {
+            chain.push(reader.array().ok_or_else(short)?);
+        }
+        if !only_zeros(reader.rest()) {
+            return Err(ChangeEntryError::Malformed);
+        }
+        Ok(Some(Self {
+            made_at,
+            statement,
+            chain,
+        }))
+    }
+}
+
+/// The mark that opens a lineage: the first 8 bytes of SHA-256 of
+/// `LABEL_CHANGE_LINEAGE`.
+pub fn lineage_mark() -> [u8; LINEAGE_MARK_BYTES] {
+    let digest = crate::sha256(LABEL_CHANGE_LINEAGE);
+    let mut mark = [0u8; LINEAGE_MARK_BYTES];
+    mark.copy_from_slice(&digest[..LINEAGE_MARK_BYTES]);
+    mark
+}
+
+/// The lineage of a change entry's content, read in the clear, as a relay
+/// reads it: `None` for an entry of the layout before, which has none.
+/// Refused: content that is not of a change entry's size, and a lineage
+/// that is not in its form. Whether it is its statement's is asked where
+/// the statement is opened.
+pub fn lineage(content: &[u8]) -> Result<Option<Lineage>, ChangeEntryError> {
+    if content.len() != CHANGE_ENTRY_BYTES {
+        return Err(ChangeEntryError::Size(content.len()));
+    }
+    Lineage::from_bytes(&content[CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES..])
+}
+
+/// The layout of a change entry's content: with a lineage where its
+/// lineage region opens with the mark, and the layout before otherwise.
+pub fn layout(content: &[u8]) -> Result<Layout, ChangeEntryError> {
+    Ok(match lineage(content)? {
+        Some(_) => Layout::WithLineage,
+        None => Layout::Before,
+    })
+}
+
+/// The first 8 bytes of a statement's hash.
+fn short(hash: &[u8]) -> [u8; LINEAGE_HASH_BYTES] {
+    let mut out = [0u8; LINEAGE_HASH_BYTES];
+    out.copy_from_slice(&hash[..LINEAGE_HASH_BYTES]);
+    out
 }
 
 impl ForPhrase {
@@ -303,13 +477,16 @@ impl ForPhrase {
     }
 }
 
-/// Make the content of the change entry of `statement`: exactly 32 KB.
+/// Make the content of the change entry of `statement`: exactly 32 KB, in
+/// the layout with a lineage.
 ///
 /// `for_phrase` is what the part for the phrase says, and its secret is
 /// the one sealed to each device that the statement lists. `statement_key`
 /// and `seal_key` are the phrase's
 /// ([`crate::phrase::Phrase::statement_key`],
-/// [`crate::phrase::Phrase::seal_key`]).
+/// [`crate::phrase::Phrase::seal_key`]). `made_at` is when the change is
+/// made, by the maker's clock, in seconds: the lineage says it, with the
+/// statement's hash and its chain's (decision 2026-10-24 rule 13).
 ///
 /// Refused: a statement that its phrase's key did not sign; a secret that
 /// the statement does not commit to; a device key that nothing can be
@@ -320,6 +497,7 @@ pub fn build(
     for_phrase: &ForPhrase,
     statement_key: &[u8; 32],
     seal_key: &[u8; 32],
+    made_at: u64,
 ) -> Result<Vec<u8>, ChangeEntryError> {
     statement.verify()?;
     let number = statement.statement.number;
@@ -358,6 +536,7 @@ pub fn build(
         seal_key,
         &bound_to(LABEL_CHANGE_PHRASE, number, phrase_key),
     )?);
+    content.extend_from_slice(&Lineage::of(&statement.statement, made_at)?.to_bytes()?);
     Ok(content)
 }
 
@@ -366,7 +545,8 @@ pub fn build(
 /// [`build`] makes, its author is the phrase's key, and its revision is
 /// the statement's number. It is signed by the phrase's key and by the
 /// key of the phrase's channel, as every entry is by its author and its
-/// channel, so only what was given the phrase can make one.
+/// channel, so only what was given the phrase can make one. `made_at` is
+/// what its lineage says of when the change was made ([`build`]).
 ///
 /// The channel holds this one entry, in the change entry's slot
 /// ([`slot`]): each statement's entry takes the place of the one before
@@ -378,6 +558,7 @@ pub fn entry_of(
     phrase: &crate::phrase::Phrase,
     statement: &SignedStatement,
     for_phrase: &ForPhrase,
+    made_at: u64,
 ) -> Result<crate::entry::Entry, ChangeEntryError> {
     let author = phrase.signing_key().map_err(crypto)?;
     if statement.statement.phrase_key != author.public_key() {
@@ -388,6 +569,7 @@ pub fn entry_of(
         for_phrase,
         &*phrase.statement_key().map_err(crypto)?,
         &*phrase.seal_key().map_err(crypto)?,
+        made_at,
     )?;
     let channel = phrase.channel_secret().map_err(crypto)?;
     let channel_key = crate::derive::signing_key(&channel).map_err(crypto)?;
@@ -510,6 +692,12 @@ pub fn open_for_device(
 /// Open the part of a change entry that is for the phrase, with the key
 /// that only the phrase gives. `entry`, `phrase_key` and `phrase_channel`
 /// are as [`open_statement`] takes them.
+///
+/// It opens the part in either layout ([`Layout`]): 1024 bytes after the
+/// part for the devices in an entry with a lineage, and the last 4096 in
+/// one of the version before. So a change is made over an entry of either
+/// (decision 2026-10-24 rule 13). A lineage that is not in its form is
+/// refused.
 pub fn open_for_phrase(
     entry: &CheckedEntry,
     phrase_key: &[u8; 32],
@@ -517,7 +705,7 @@ pub fn open_for_phrase(
     seal_key: &[u8; 32],
 ) -> Result<ForPhrase, ChangeEntryError> {
     the_phrases(entry, phrase_key, phrase_channel)?;
-    let (_, part) = parts(&entry.content)?;
+    let part = parts(&entry.content)?.phrase;
     // What the part says holds the secrets: it is overwritten when it
     // has been read.
     let said = Zeroizing::new(open_part(
@@ -541,9 +729,9 @@ fn open_devices_part(
 ) -> Result<(SignedStatement, SealedList), ChangeEntryError> {
     the_phrases(entry, phrase_key, phrase_channel)?;
     let number = entry.rev;
-    let (part, _) = parts(&entry.content)?;
+    let parts = parts(&entry.content)?;
     let said = open_part(
-        part,
+        parts.devices,
         statement_key,
         &bound_to(LABEL_CHANGE_DEVICES, number, phrase_key),
     )?;
@@ -566,6 +754,14 @@ fn open_devices_part(
     }
     let sealed = sealed_list(reader.rest(), statement.statement.devices.len())
         .ok_or(ChangeEntryError::Malformed)?;
+    // The lineage, where there is one, is this statement's: its hash and
+    // its chain's (decision 2026-10-24 rule 13). An entry of the layout
+    // before has none, and is judged by its statement alone.
+    if let Some(lineage) = &parts.lineage
+        && !lineage.is_of(&statement.statement)?
+    {
+        return Err(ChangeEntryError::LineageNotItsStatement);
+    }
     Ok((statement, sealed))
 }
 
@@ -626,12 +822,31 @@ fn open_sealed(
     secret.try_into().ok()
 }
 
-/// The two parts of a change entry's content, which is of its one size.
-fn parts(content: &[u8]) -> Result<(&[u8], &[u8]), ChangeEntryError> {
-    if content.len() != CHANGE_ENTRY_BYTES {
-        return Err(ChangeEntryError::Size(content.len()));
-    }
-    Ok(content.split_at(CHANGE_ENTRY_DEVICES_PART_BYTES))
+/// The places of a change entry's content, in the layout it has.
+struct Parts<'a> {
+    /// The part for the devices: the first 28672 bytes in either layout.
+    devices: &'a [u8],
+    /// The part for the phrase: 1024 bytes after the part for the devices
+    /// where there is a lineage, and all that follows it where there is
+    /// none (the layout before).
+    phrase: &'a [u8],
+    /// The lineage, read; `None` in the layout before.
+    lineage: Option<Lineage>,
+}
+
+/// The places of a change entry's content, which is of its one size.
+fn parts(content: &[u8]) -> Result<Parts<'_>, ChangeEntryError> {
+    let lineage = lineage(content)?;
+    let (devices, rest) = content.split_at(CHANGE_ENTRY_DEVICES_PART_BYTES);
+    let phrase = match lineage {
+        Some(_) => &rest[..CHANGE_ENTRY_PHRASE_PART_BYTES],
+        None => rest,
+    };
+    Ok(Parts {
+        devices,
+        phrase,
+        lineage,
+    })
 }
 
 /// Seal what a part says as a part of `size` bytes: filled up with zeros,
@@ -716,6 +931,158 @@ impl fmt::Debug for DeviceSecret {
     }
 }
 
+/// The change entry as the version before (0.2.0-alpha.16) makes and opens
+/// it, for the tests of the two layouts (decision 2026-10-24 rule 13, §6).
+///
+/// Its rules are those of that version's `change_entry.rs`, with its sizes
+/// written out as it derived them: the content is 32768 bytes, the part for
+/// the phrase the last 4096, and the part for the devices what that leaves.
+/// It knows of no lineage. The helpers it calls (`the_phrases`, `open_part`,
+/// `bound_to`, `sealed_list`, `open_sealed`, `sealed_part`) are unchanged
+/// since that version.
+#[cfg(test)]
+pub(crate) mod before {
+    use super::*;
+
+    /// The content of a change entry, in that version.
+    const CONTENT_BYTES: usize = 32_768;
+    /// Its part for the phrase: the last 4 KB.
+    const PHRASE_PART_BYTES: usize = 4096;
+    /// Its part for the devices, derived there as what the part for the
+    /// phrase leaves.
+    const DEVICES_PART_BYTES: usize = CONTENT_BYTES - PHRASE_PART_BYTES;
+
+    /// That version's `parts`: the content is of its one size, and is cut
+    /// where the part for the phrase begins.
+    fn parts(content: &[u8]) -> Result<(&[u8], &[u8]), ChangeEntryError> {
+        if content.len() != CONTENT_BYTES {
+            return Err(ChangeEntryError::Size(content.len()));
+        }
+        Ok(content.split_at(DEVICES_PART_BYTES))
+    }
+
+    /// That version's `open_devices_part`.
+    fn open_devices_part(
+        entry: &CheckedEntry,
+        phrase_key: &[u8; 32],
+        phrase_channel: &[u8; 32],
+        statement_key: &[u8; 32],
+    ) -> Result<(SignedStatement, SealedList), ChangeEntryError> {
+        the_phrases(entry, phrase_key, phrase_channel)?;
+        let number = entry.rev;
+        let (part, _) = parts(&entry.content)?;
+        let said = open_part(
+            part,
+            statement_key,
+            &bound_to(LABEL_CHANGE_DEVICES, number, phrase_key),
+        )?;
+        let mut reader = Reader::new(&said);
+        let length = reader.count().ok_or(ChangeEntryError::Malformed)?;
+        let signed = reader.take(length).ok_or(ChangeEntryError::Malformed)?;
+        let statement = SignedStatement::from_bytes(signed)?;
+        if statement.statement.phrase_key != *phrase_key {
+            return Err(ChangeEntryError::AnotherPhrase);
+        }
+        statement.verify()?;
+        if statement.statement.number != number {
+            return Err(ChangeEntryError::Number {
+                entry: number,
+                statement: statement.statement.number,
+            });
+        }
+        let sealed = sealed_list(reader.rest(), statement.statement.devices.len())
+            .ok_or(ChangeEntryError::Malformed)?;
+        Ok((statement, sealed))
+    }
+
+    /// That version's `open_statement`.
+    pub(crate) fn open_statement(
+        entry: &CheckedEntry,
+        phrase_key: &[u8; 32],
+        phrase_channel: &[u8; 32],
+        statement_key: &[u8; 32],
+    ) -> Result<SignedStatement, ChangeEntryError> {
+        let (statement, sealed) =
+            open_devices_part(entry, phrase_key, phrase_channel, statement_key)?;
+        match sealed {
+            SealedList::Whole(_) => Ok(statement),
+            SealedList::MissingOrShort => Err(ChangeEntryError::Malformed),
+        }
+    }
+
+    /// That version's `open_for_device`.
+    pub(crate) fn open_for_device(
+        entry: &CheckedEntry,
+        phrase_key: &[u8; 32],
+        phrase_channel: &[u8; 32],
+        statement_key: &[u8; 32],
+        device: &NodeIdentity,
+    ) -> Result<ForDevice, ChangeEntryError> {
+        let (statement, sealed) =
+            open_devices_part(entry, phrase_key, phrase_channel, statement_key)?;
+        let own = device.public_key();
+        let listed = &statement.statement.devices;
+        let secret = match (listed.iter().position(|one| one.key == own), sealed) {
+            (None, SealedList::Whole(_)) => DeviceSecret::NotListed,
+            (None, SealedList::MissingOrShort) => return Err(ChangeEntryError::Malformed),
+            (Some(_), SealedList::MissingOrShort) => DeviceSecret::DidNotOpen,
+            (Some(place), SealedList::Whole(sealed)) => {
+                match open_sealed(&sealed[place], device, entry.rev, phrase_key) {
+                    Some(secret) if statement.statement.commits_to(&secret) => {
+                        DeviceSecret::Opened(secret)
+                    }
+                    _ => DeviceSecret::DidNotOpen,
+                }
+            }
+        };
+        Ok(ForDevice { statement, secret })
+    }
+
+    /// That version's `open_for_phrase`: the part for the phrase is the
+    /// last 4096 bytes.
+    pub(crate) fn open_for_phrase(
+        entry: &CheckedEntry,
+        phrase_key: &[u8; 32],
+        phrase_channel: &[u8; 32],
+        seal_key: &[u8; 32],
+    ) -> Result<ForPhrase, ChangeEntryError> {
+        the_phrases(entry, phrase_key, phrase_channel)?;
+        let (_, part) = parts(&entry.content)?;
+        let said = Zeroizing::new(open_part(
+            part,
+            seal_key,
+            &bound_to(LABEL_CHANGE_PHRASE, entry.rev, phrase_key),
+        )?);
+        let for_phrase = ForPhrase::from_bytes(&said)?;
+        for_phrase.validate(entry.rev)?;
+        Ok(for_phrase)
+    }
+
+    /// That version's `build`: the part for the devices, sealed as this
+    /// version seals it (its making has not changed), and the part for the
+    /// phrase sealed in the last 4096 bytes. No lineage.
+    pub(crate) fn build(
+        statement: &SignedStatement,
+        for_phrase: &ForPhrase,
+        statement_key: &[u8; 32],
+        seal_key: &[u8; 32],
+    ) -> Result<Vec<u8>, ChangeEntryError> {
+        let made = super::build(statement, for_phrase, statement_key, seal_key, 0)?;
+        let mut content = made[..DEVICES_PART_BYTES].to_vec();
+        content.extend_from_slice(&sealed_part(
+            &for_phrase.to_bytes(),
+            PHRASE_PART_BYTES,
+            seal_key,
+            &bound_to(
+                LABEL_CHANGE_PHRASE,
+                statement.statement.number,
+                &statement.statement.phrase_key,
+            ),
+        )?);
+        Ok(content)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +1090,9 @@ mod tests {
     use crate::phrase::Phrase;
     use crate::statement::testing::*;
     use crate::statement::{Device, Judgement, Statement, judge};
+
+    /// When the changes of these tests were made, by their maker's clock.
+    const MADE_AT: u64 = 1_790_000_000;
 
     /// What an entry of one phrase is made and opened with.
     #[derive(Clone, Copy)]
@@ -827,6 +1197,7 @@ mod tests {
             for_phrase,
             &keys.statement_key,
             &keys.seal_key,
+            MADE_AT,
         )
         .unwrap()
     }
@@ -863,7 +1234,10 @@ mod tests {
     }
 
     /// The content of an entry whose part for the devices says `said`: made
-    /// as an entry of statement `number` is made, but saying anything.
+    /// as an entry of statement `number` is made, but saying anything. It
+    /// has no lineage, as an entry of the layout before has none: what the
+    /// part for the devices may say is the same in both layouts, and the
+    /// lineage is asked of it in the tests of the lineage.
     fn content_saying(said: &[u8], number: u64, keys: &Keys) -> Vec<u8> {
         let mut content = sealed_part(
             said,
@@ -877,7 +1251,20 @@ mod tests {
             number,
             keys,
         ));
+        content.resize(CHANGE_ENTRY_BYTES, 0);
         content
+    }
+
+    /// A lineage in its form, of no statement: what the part for the
+    /// phrase is opened beside, which does not ask whose it is.
+    fn some_lineage() -> Vec<u8> {
+        Lineage {
+            made_at: MADE_AT,
+            statement: [0x11; 8],
+            chain: vec![[0x22; 8]],
+        }
+        .to_bytes()
+        .unwrap()
     }
 
     /// A part for the phrase that says `said`, for statement `number`.
@@ -967,20 +1354,25 @@ mod tests {
         assert_eq!(first_entry.len(), 32 * 1024);
         assert_eq!(second_entry.len(), first_entry.len());
         assert_eq!(
-            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES,
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
             first_entry.len()
         );
 
         // Made again, it is sealed afresh: the same size, and nothing of
-        // one content is in the other.
+        // one sealed part is in the other. The lineage, in the clear, is
+        // the same where the time is.
         let again = entry(&phrase, &one, &for_phrase_of(1));
         assert_eq!(again.len(), first_entry.len());
-        let same = first_entry
+        let sealed = CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES;
+        let same = first_entry[..sealed]
             .iter()
-            .zip(&again)
+            .zip(&again[..sealed])
             .filter(|(a, b)| a == b)
             .count();
-        assert!(same < 400, "{same} bytes of 32768 are the same");
+        assert!(same < 400, "{same} sealed bytes of {sealed} are the same");
+        assert_eq!(first_entry[sealed..], again[sealed..]);
 
         // Content of any other size that an entry may have is no change
         // entry.
@@ -1010,9 +1402,12 @@ mod tests {
         let keys = keys(&phrase);
         let [_, two, ..] = statements(&phrase);
         let content = entry(&phrase, &two, &for_phrase_of(2));
-        let (devices_part, phrase_part) = parts(&content).unwrap();
+        let places = parts(&content).unwrap();
+        let (devices_part, phrase_part) = (places.devices, places.phrase);
         assert_eq!(devices_part.len(), 28_672);
-        assert_eq!(phrase_part.len(), 4096);
+        assert_eq!(phrase_part.len(), 1024);
+        assert_eq!(content[..28_672], *devices_part);
+        assert_eq!(content[28_672..29_696], *phrase_part);
 
         // For the devices: the statement's length, the statement with its
         // signature, a count, a sealed secret of 92 bytes for each device,
@@ -1042,7 +1437,7 @@ mod tests {
             &bound_to(b"cordelia v2 change phrase", 2, &keys.phrase_key),
         )
         .unwrap();
-        assert_eq!(said.len(), 4096 - 12 - 16);
+        assert_eq!(said.len(), 1024 - 12 - 16);
         let mut expected = secret(2).to_vec();
         expected.extend_from_slice(&[0, 1]);
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
@@ -1050,6 +1445,20 @@ mod tests {
         assert_eq!(said[..expected.len()], expected);
         assert!(only_zeros(&said[expected.len()..]));
         assert_eq!(*for_phrase_of(2).to_bytes(), expected);
+
+        // The lineage, in the clear in the last 3072 bytes: the mark, the
+        // time, the first 8 bytes of the statement's hash, a count, and the
+        // first 8 of the hash of each statement on its chain. Then zeros.
+        let lineage = &content[29_696..];
+        assert_eq!(lineage.len(), 3072);
+        let mark = &crate::sha256(b"cordelia v2 lineage")[..8];
+        assert_eq!(lineage[..8], *mark);
+        assert_eq!(lineage[8..16], MADE_AT.to_be_bytes());
+        assert_eq!(lineage[16..24], two.hash().unwrap()[..8]);
+        assert_eq!(lineage[24..26], [0, 1]);
+        assert_eq!(lineage[26..34], two.chain[0].hash[..8]);
+        assert!(only_zeros(&lineage[34..]));
+        assert_eq!(places.lineage, Some(Lineage::of(&two, MADE_AT).unwrap()));
     }
 
     // ── Opening for a device ─────────────────────────────────────────
@@ -1797,8 +2206,9 @@ mod tests {
         // The parts of two entries do not make a third: each opens only at
         // its own number.
         let next = entry(&phrase, &three, &for_phrase_of(3));
-        let mut mixed = parts(&content).unwrap().0.to_vec();
-        mixed.extend_from_slice(parts(&next).unwrap().1);
+        let mut mixed = parts(&content).unwrap().devices.to_vec();
+        mixed.extend_from_slice(parts(&next).unwrap().phrase);
+        mixed.extend_from_slice(&content[CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES..]);
         assert!(read_statement(&mixed, 2, &keys).is_ok());
         assert_eq!(
             read_for_phrase(&mixed, 2, &keys),
@@ -1810,7 +2220,7 @@ mod tests {
         );
         // Nor does a part open as the other part.
         let mut swapped = vec![0u8; CHANGE_ENTRY_BYTES];
-        swapped[..4096].copy_from_slice(parts(&content).unwrap().1);
+        swapped[..1024].copy_from_slice(parts(&content).unwrap().phrase);
         assert_eq!(
             read_statement(&swapped, 2, &keys),
             Err(ChangeEntryError::DidNotOpen)
@@ -1881,7 +2291,8 @@ mod tests {
                 &forged,
                 &for_phrase_of(2),
                 &keys.statement_key,
-                &keys.seal_key
+                &keys.seal_key,
+                MADE_AT
             ),
             Err(unsigned)
         );
@@ -1925,11 +2336,13 @@ mod tests {
             );
             assert_eq!(read_for_phrase(&damaged, 2, &keys).unwrap(), said);
         }
+        let phrase_end = devices_end + CHANGE_ENTRY_PHRASE_PART_BYTES;
         for at in [
             devices_end,
             devices_end + 12,
-            devices_end + 2000,
-            CHANGE_ENTRY_BYTES - 1,
+            devices_end + 500,
+            phrase_end - 17,
+            phrase_end - 1,
         ] {
             let mut damaged = content.clone();
             damaged[at] ^= 0x04;
@@ -1961,6 +2374,7 @@ mod tests {
                 said,
                 &keys.statement_key,
                 &keys.seal_key,
+                MADE_AT,
             )
         };
         assert!(make(&two, &for_phrase_of(2)).is_ok());
@@ -1995,7 +2409,8 @@ mod tests {
                 &as_if_signed,
                 &for_phrase_of(2),
                 &keys.statement_key,
-                &keys.seal_key
+                &keys.seal_key,
+                MADE_AT
             ),
             Err(ChangeEntryError::Statement(
                 StatementError::DeviceKeyNotUsable
@@ -2009,7 +2424,8 @@ mod tests {
                 &not_one,
                 &for_phrase_of(2),
                 &keys.statement_key,
-                &keys.seal_key
+                &keys.seal_key,
+                MADE_AT
             ),
             Err(ChangeEntryError::Statement(StatementError::InBothLists))
         );
@@ -2074,7 +2490,14 @@ mod tests {
         assert_eq!(said.earlier.len(), MAX_EARLIER_SECRETS);
         assert_eq!(said.validate(256), Ok(()));
 
-        let content = build(&signed_full, &said, &keys.statement_key, &keys.seal_key).unwrap();
+        let content = build(
+            &signed_full,
+            &said,
+            &keys.statement_key,
+            &keys.seal_key,
+            MADE_AT,
+        )
+        .unwrap();
         assert_eq!(content.len(), 32_768);
 
         // What each part says, of the room it has.
@@ -2086,9 +2509,18 @@ mod tests {
         let phrase_says = said.to_bytes().len();
         assert_eq!(phrase_says, 32 + 2 + 8 * 40);
         assert_eq!(phrase_says, 354);
-        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES - 12 - 16, 4068);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES - 12 - 16, 996);
+        // The lineage of a chain of 256: 2,074 of its 3,072 bytes.
+        let lineage = Lineage::of(&full, MADE_AT).unwrap();
+        assert_eq!(lineage.chain.len(), 256);
+        let lineage_says = 8 + 8 + 8 + 2 + 256 * 8;
+        assert_eq!(lineage_says, 2074);
+        let region = &content[CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES..];
+        assert!(!only_zeros(&region[lineage_says - 8..lineage_says]));
+        assert!(only_zeros(&region[lineage_says..]));
+        assert_eq!(super::lineage(&content), Ok(Some(lineage)));
 
-        let (devices_part, _) = parts(&content).unwrap();
+        let devices_part = parts(&content).unwrap().devices;
         let opened = open_part(
             devices_part,
             &keys.statement_key,
@@ -2302,11 +2734,13 @@ mod tests {
                     &said,
                     &keys.statement_key,
                     &keys.seal_key,
+                    MADE_AT,
                 );
                 assert_eq!(made, Err(why.clone()));
             }
             let mut content = vec![0u8; CHANGE_ENTRY_DEVICES_PART_BYTES];
             content.extend_from_slice(&phrase_part_saying(&said.to_bytes(), number, &keys));
+            content.extend_from_slice(&some_lineage());
             assert_eq!(read_for_phrase(&content, number, &keys), Err(why));
         };
 
@@ -2363,6 +2797,7 @@ mod tests {
         let open = |said: &[u8]| {
             let mut content = vec![0u8; CHANGE_ENTRY_DEVICES_PART_BYTES];
             content.extend_from_slice(&phrase_part_saying(said, 5, &keys));
+            content.extend_from_slice(&some_lineage());
             read_for_phrase(&content, 5, &keys)
         };
         let good = for_phrase_of(5);
@@ -2460,7 +2895,7 @@ mod tests {
         let [one, two, ..] = statements(&phrase);
         let channel = phrase.channel_secret().unwrap();
 
-        let made = entry_of(&phrase, &signed(&two, &phrase), &for_phrase_of(2)).unwrap();
+        let made = entry_of(&phrase, &signed(&two, &phrase), &for_phrase_of(2), MADE_AT).unwrap();
         assert_eq!(made.channel, derive::channel_id(&channel).unwrap());
         assert_eq!(made.author, keys.phrase_key);
         assert_eq!(made.rev, 2);
@@ -2495,14 +2930,20 @@ mod tests {
 
         // Each statement's entry is in the one slot of the one channel, at
         // its statement's number: it takes the place of the one before.
-        let before = entry_of(&phrase, &signed(&one, &phrase), &for_phrase_of(1)).unwrap();
+        let before = entry_of(&phrase, &signed(&one, &phrase), &for_phrase_of(1), MADE_AT).unwrap();
         assert_eq!((before.channel, before.slot), (made.channel, made.slot));
         assert_eq!((before.author, before.rev), (made.author, 1));
         assert!(before.check().is_ok());
 
         // Another phrase's entry is in another channel, by another author.
         let other = Phrase::parse(OTHER_WORDS).unwrap();
-        let theirs = entry_of(&other, &signed(&first(&other), &other), &for_phrase_of(1)).unwrap();
+        let theirs = entry_of(
+            &other,
+            &signed(&first(&other), &other),
+            &for_phrase_of(1),
+            MADE_AT,
+        )
+        .unwrap();
         assert_ne!(theirs.channel, made.channel);
         assert_ne!(theirs.author, made.author);
         assert_ne!(theirs.slot, made.slot);
@@ -2517,22 +2958,457 @@ mod tests {
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         let theirs = signed(&first(&other), &other);
         assert_eq!(
-            entry_of(&phrase, &theirs, &for_phrase_of(1)),
+            entry_of(&phrase, &theirs, &for_phrase_of(1), MADE_AT),
             Err(ChangeEntryError::AnotherPhrase)
         );
         // A secret that the statement does not commit to.
         let ours = signed(&first(&phrase), &phrase);
         assert_eq!(
-            entry_of(&phrase, &ours, &ForPhrase::first(secret(2))),
+            entry_of(&phrase, &ours, &ForPhrase::first(secret(2)), MADE_AT),
             Err(ChangeEntryError::SecretNotCommitted)
         );
         // A statement that its phrase's key did not sign.
         let mut forged = ours.clone();
         forged.signature[0] ^= 1;
         assert_eq!(
-            entry_of(&phrase, &forged, &for_phrase_of(1)),
+            entry_of(&phrase, &forged, &for_phrase_of(1), MADE_AT),
             Err(ChangeEntryError::Statement(StatementError::Signature))
         );
-        assert!(entry_of(&phrase, &ours, &for_phrase_of(1)).is_ok());
+        assert!(entry_of(&phrase, &ours, &for_phrase_of(1), MADE_AT).is_ok());
+    }
+
+    // ── The lineage, and the layout before (decision 2026-10-24 rule 13) ─
+
+    /// Where an entry's lineage is in its content.
+    const LINEAGE_AT: usize = CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES;
+
+    /// The content of the entry of `statement` as the version before makes
+    /// it: no lineage, and the part for the phrase in the last 4096 bytes.
+    fn entry_before(phrase: &Phrase, statement: &Statement, for_phrase: &ForPhrase) -> Vec<u8> {
+        let keys = keys(phrase);
+        before::build(
+            &signed(statement, phrase),
+            for_phrase,
+            &keys.statement_key,
+            &keys.seal_key,
+        )
+        .unwrap()
+    }
+
+    /// `content` with its lineage region holding `lineage`'s bytes.
+    fn with_lineage(content: &[u8], lineage: &Lineage) -> Vec<u8> {
+        let mut changed = content.to_vec();
+        changed[LINEAGE_AT..].copy_from_slice(&lineage.to_bytes().unwrap());
+        changed
+    }
+
+    /// Unit test 14: the lineage and its time are built from the statement
+    /// and the clock, and read back, for a first statement, statements made
+    /// after others, a settlement and a chain at its bound.
+    #[test]
+    fn the_lineage_and_its_time_are_built_from_the_statement_and_read_back() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let all = statements(&phrase);
+        for (i, statement) in all.iter().enumerate() {
+            let number = i as u64 + 1;
+            for made_at in [0, 1, MADE_AT, u64::MAX] {
+                let content = build(
+                    &signed(statement, &phrase),
+                    &for_phrase_of(number as u8),
+                    &keys.statement_key,
+                    &keys.seal_key,
+                    made_at,
+                )
+                .unwrap();
+                let read = lineage(&content).unwrap().unwrap();
+                assert_eq!(read.made_at, made_at);
+                assert_eq!(read.statement, statement.hash().unwrap()[..8]);
+                let chain: Vec<[u8; 8]> = statement
+                    .chain
+                    .iter()
+                    .map(|link| link.hash[..8].try_into().unwrap())
+                    .collect();
+                assert_eq!(read.chain, chain);
+                assert_eq!(read.chain.len(), i, "statement {number}");
+                assert!(read.is_of(statement).unwrap());
+                assert_eq!(layout(&content), Ok(Layout::WithLineage));
+                // And the entry opens, with its lineage checked.
+                assert_eq!(
+                    read_statement(&content, number, &keys).unwrap(),
+                    signed(statement, &phrase)
+                );
+            }
+        }
+
+        // A settlement: two statements at one number on its chain, both
+        // named, in the chain's order.
+        let [_, two, ..] = &all;
+        let apart = two
+            .next(key(1), &secret(0x33), devices(&[1, 0]), &[])
+            .unwrap();
+        let ours = two.next(key(0), &secret(3), devices(&[0, 1]), &[]).unwrap();
+        let settled =
+            Statement::settle(&ours, &apart, key(0), &secret(4), devices(&[0, 1]), &[]).unwrap();
+        let read = Lineage::of(&settled, MADE_AT).unwrap();
+        assert_eq!(read.chain.len(), settled.chain.len());
+        assert_eq!(read.chain.len(), 4);
+        for (hash, link) in read.chain.iter().zip(&settled.chain) {
+            assert_eq!(hash[..], link.hash[..8]);
+        }
+
+        // A chain at its bound: 256 hashes, read back whole.
+        let full = at_every_bound(&phrase);
+        let read = Lineage::of(&full, MADE_AT).unwrap();
+        let bytes = read.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 3072);
+        assert_eq!(Lineage::from_bytes(&bytes), Ok(Some(read)));
+    }
+
+    /// Unit test 14: an entry whose lineage does not match its statement is
+    /// refused, whoever reads it: another statement's hash, a chain with a
+    /// hash changed, one missing, one more, or out of its order. Its time
+    /// is the maker's word, and a lineage at another time is its own.
+    #[test]
+    fn an_entry_whose_lineage_does_not_match_its_statement_is_refused() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let all = statements(&phrase);
+        let five = &all[4];
+        let content = entry(&phrase, five, &for_phrase_of(5));
+        let good = Lineage::of(five, MADE_AT).unwrap();
+        assert_eq!(good.chain.len(), 4);
+
+        let mut not_its_own = Vec::new();
+        // Another statement's.
+        not_its_own.push(Lineage::of(&all[3], MADE_AT).unwrap());
+        let mut other = good.clone();
+        other.statement[7] ^= 1;
+        not_its_own.push(other);
+        // A hash on its chain changed.
+        for at in 0..4 {
+            let mut other = good.clone();
+            other.chain[at][0] ^= 0x80;
+            not_its_own.push(other);
+        }
+        // One missing, one more, none, and two in each other's place.
+        let mut other = good.clone();
+        other.chain.pop();
+        not_its_own.push(other);
+        let mut other = good.clone();
+        other.chain.push([0x5a; 8]);
+        not_its_own.push(other);
+        let mut other = good.clone();
+        other.chain.clear();
+        not_its_own.push(other);
+        let mut other = good.clone();
+        other.chain.swap(1, 2);
+        not_its_own.push(other);
+
+        let refused = ChangeEntryError::LineageNotItsStatement;
+        for (i, lineage) in not_its_own.iter().enumerate() {
+            let changed = with_lineage(&content, lineage);
+            assert_eq!(
+                read_statement(&changed, 5, &keys),
+                Err(refused.clone()),
+                "{i}"
+            );
+            // A device it lists, and one it does not.
+            for n in [0, 1, 3, 9] {
+                assert_eq!(
+                    read_as(&changed, 5, &keys, n),
+                    Err(refused.clone()),
+                    "{i} {n}"
+                );
+            }
+        }
+
+        // The time is not asked.
+        for made_at in [0, MADE_AT + 1, u64::MAX] {
+            let at_another_time = Lineage {
+                made_at,
+                ..good.clone()
+            };
+            let changed = with_lineage(&content, &at_another_time);
+            assert_eq!(
+                read_statement(&changed, 5, &keys).unwrap(),
+                signed(five, &phrase)
+            );
+            assert_eq!(
+                opened_by(&changed, 5, &keys, 1).secret,
+                DeviceSecret::Opened(secret(5))
+            );
+        }
+        // The control: the entry as it was made.
+        assert_eq!(
+            opened_by(&content, 5, &keys, 1).secret,
+            DeviceSecret::Opened(secret(5))
+        );
+    }
+
+    /// A lineage that opens with the mark and is not then in its form is
+    /// refused, by every opener and by the read a relay makes: a count over
+    /// its bound, and anything but zeros after it.
+    #[test]
+    fn a_lineage_that_is_not_in_its_form_is_refused() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [_, two, ..] = statements(&phrase);
+        let content = entry(&phrase, &two, &for_phrase_of(2));
+        let malformed = ChangeEntryError::Malformed;
+
+        let mut broken = Vec::new();
+        // A count of 257, and of 65535.
+        for count in [257u16, u16::MAX] {
+            let mut changed = content.clone();
+            changed[LINEAGE_AT + 24..LINEAGE_AT + 26].copy_from_slice(&count.to_be_bytes());
+            broken.push(changed);
+        }
+        // A byte after the lineage that is not zero, at its first place
+        // and at the last.
+        for at in [LINEAGE_AT + 34, CHANGE_ENTRY_BYTES - 1] {
+            let mut changed = content.clone();
+            changed[at] = 1;
+            broken.push(changed);
+        }
+        for (i, changed) in broken.iter().enumerate() {
+            assert_eq!(lineage(changed), Err(malformed.clone()), "{i}");
+            assert_eq!(layout(changed), Err(malformed.clone()), "{i}");
+            assert_eq!(
+                read_statement(changed, 2, &keys),
+                Err(malformed.clone()),
+                "{i}"
+            );
+            assert_eq!(read_as(changed, 2, &keys, 0), Err(malformed.clone()), "{i}");
+            assert_eq!(
+                read_for_phrase(changed, 2, &keys),
+                Err(malformed.clone()),
+                "{i}"
+            );
+        }
+
+        // A lineage of more than 256 is never made.
+        let too_long = Lineage {
+            made_at: 0,
+            statement: [0; 8],
+            chain: vec![[1; 8]; 257],
+        };
+        assert_eq!(too_long.to_bytes(), Err(malformed.clone()));
+
+        // A region with a mark that is one bit off is no lineage: the
+        // entry is read as one of the layout before, whose part for the
+        // phrase is then not there.
+        let mut off = content.clone();
+        off[LINEAGE_AT] ^= 1;
+        assert_eq!(lineage(&off), Ok(None));
+        assert_eq!(layout(&off), Ok(Layout::Before));
+        assert_eq!(
+            read_for_phrase(&off, 2, &keys),
+            Err(ChangeEntryError::DidNotOpen)
+        );
+        assert!(read_statement(&off, 2, &keys).is_ok());
+    }
+
+    /// Unit test 14: the three sizes, and where each place is. The part for
+    /// the devices is where the version before has it, and as large.
+    #[test]
+    fn the_part_for_the_devices_does_not_move_and_the_three_fit_32_kb() {
+        assert_eq!(CHANGE_ENTRY_DEVICES_PART_BYTES, 28_672);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES, 1024);
+        assert_eq!(CHANGE_ENTRY_LINEAGE_BYTES, 3072);
+        assert_eq!(LINEAGE_AT, 29_696);
+        let phrase = phrase();
+        let [_, two, ..] = statements(&phrase);
+        let content = entry(&phrase, &two, &for_phrase_of(2));
+        let places = parts(&content).unwrap();
+        assert_eq!(places.devices.len(), 28_672);
+        assert_eq!(places.phrase.len(), 1024);
+        // Of the version before: the same part for the devices, and 4096
+        // for the phrase.
+        let made_before = entry_before(&phrase, &two, &for_phrase_of(2));
+        let places = parts(&made_before).unwrap();
+        assert_eq!(places.devices.len(), 28_672);
+        assert_eq!(places.phrase.len(), 4096);
+        assert_eq!(places.lineage, None);
+    }
+
+    /// Unit test 14 and section 6: a device of the version before opens the
+    /// part for the devices of an entry of this layout as it opens its own,
+    /// by that version's rules: it reads the statement, and each device the
+    /// statement lists opens its secret. Its commands open the part for the
+    /// phrase at 4096 bytes, find that it does not open, and refuse.
+    #[test]
+    fn a_device_of_the_version_before_reads_an_entry_of_this_layout() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let all = statements(&phrase);
+        let made = |content: &[u8], number: u64| carrying(content, number);
+        for (i, statement) in all.iter().enumerate() {
+            let number = i as u64 + 1;
+            let content = entry(&phrase, statement, &for_phrase_of(number as u8));
+            assert_eq!(layout(&content), Ok(Layout::WithLineage));
+            let entry = made(&content, number);
+            assert_eq!(
+                before::open_statement(
+                    &entry,
+                    &keys.phrase_key,
+                    &keys.channel,
+                    &keys.statement_key
+                )
+                .unwrap(),
+                signed(statement, &phrase)
+            );
+            for n in 0..4u16 {
+                let opened = before::open_for_device(
+                    &entry,
+                    &keys.phrase_key,
+                    &keys.channel,
+                    &keys.statement_key,
+                    &identity(n),
+                )
+                .unwrap();
+                let expected = if statement.lists(&key(n)) {
+                    DeviceSecret::Opened(secret(number as u8))
+                } else {
+                    DeviceSecret::NotListed
+                };
+                assert_eq!(opened.secret, expected, "statement {number}, device {n}");
+                // It judges what it read as this version reads it.
+                assert_eq!(
+                    opened,
+                    open_for_device(
+                        &entry,
+                        &keys.phrase_key,
+                        &keys.channel,
+                        &keys.statement_key,
+                        &identity(n)
+                    )
+                    .unwrap()
+                );
+            }
+            assert_eq!(
+                before::open_for_phrase(&entry, &keys.phrase_key, &keys.channel, &keys.seal_key),
+                Err(ChangeEntryError::DidNotOpen)
+            );
+        }
+
+        // At every bound together, too.
+        let full = at_every_bound(&phrase);
+        let said = ForPhrase::first(secret(9));
+        let content = build(
+            &signed(&full, &phrase),
+            &said,
+            &keys.statement_key,
+            &keys.seal_key,
+            MADE_AT,
+        );
+        // The statement at its bound commits to secret 9 only where it was
+        // made so: `at_every_bound` does.
+        let content = content.unwrap();
+        let entry = made(&content, 256);
+        for n in [0, 63] {
+            assert_eq!(
+                before::open_for_device(
+                    &entry,
+                    &keys.phrase_key,
+                    &keys.channel,
+                    &keys.statement_key,
+                    &identity(n),
+                )
+                .unwrap()
+                .secret,
+                DeviceSecret::Opened(secret(9))
+            );
+        }
+
+        // The control: that version's rules open its own entries whole.
+        let [_, two, ..] = &all;
+        let made_before = entry_before(&phrase, two, &for_phrase_of(2));
+        let entry = made(&made_before, 2);
+        assert_eq!(
+            before::open_for_phrase(&entry, &keys.phrase_key, &keys.channel, &keys.seal_key),
+            Ok(for_phrase_of(2))
+        );
+        assert_eq!(
+            before::open_for_device(
+                &entry,
+                &keys.phrase_key,
+                &keys.channel,
+                &keys.statement_key,
+                &identity(1),
+            )
+            .unwrap()
+            .secret,
+            DeviceSecret::Opened(secret(2))
+        );
+    }
+
+    /// Unit test 14: the part for the phrase opens in both layouts, to what
+    /// it says, and an entry of the layout before is judged by its
+    /// statement alone. Each is read in its own place: a bit changed past
+    /// the first 1024 bytes of the part for the phrase of an entry of the
+    /// layout before does not let it open.
+    #[test]
+    fn the_part_for_the_phrase_opens_in_both_layouts() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let all = statements(&phrase);
+        for (i, statement) in all.iter().enumerate() {
+            let number = i as u64 + 1;
+            let said = for_phrase_of(number as u8);
+            let with = entry(&phrase, statement, &said);
+            let made_before = entry_before(&phrase, statement, &said);
+            assert_eq!(layout(&made_before), Ok(Layout::Before));
+            assert_eq!(lineage(&made_before), Ok(None));
+            for content in [&with, &made_before] {
+                assert_eq!(read_for_phrase(content, number, &keys).unwrap(), said);
+                assert_eq!(
+                    read_statement(content, number, &keys).unwrap(),
+                    signed(statement, &phrase)
+                );
+                assert_eq!(
+                    opened_by(content, number, &keys, 0).secret,
+                    DeviceSecret::Opened(secret(number as u8))
+                );
+            }
+        }
+
+        let [_, two, ..] = &all;
+        let made_before = entry_before(&phrase, two, &for_phrase_of(2));
+        for at in [28_672 + 1024, 28_672 + 2000, CHANGE_ENTRY_BYTES - 1] {
+            let mut damaged = made_before.clone();
+            damaged[at] ^= 0x04;
+            // Still no lineage: the mark is not made by one bit.
+            assert_eq!(layout(&damaged), Ok(Layout::Before), "{at}");
+            assert_eq!(
+                read_for_phrase(&damaged, 2, &keys),
+                Err(ChangeEntryError::DidNotOpen),
+                "{at}"
+            );
+        }
+        // And in the layout with a lineage the part ends at 1024: a bit
+        // changed after it is in the lineage, not in the part.
+        let with = entry(&phrase, two, &for_phrase_of(2));
+        let mut changed = with.clone();
+        changed[LINEAGE_AT + 8] ^= 0x04;
+        assert_eq!(read_for_phrase(&changed, 2, &keys), Ok(for_phrase_of(2)));
+    }
+
+    /// The mark is the first 8 bytes of SHA-256 of its label, and the
+    /// label is no other label's beginning, nor another its.
+    #[test]
+    fn the_mark_is_of_its_own_label() {
+        assert_eq!(
+            lineage_mark()[..],
+            crate::sha256(b"cordelia v2 lineage")[..8]
+        );
+        for other in cordelia_core::protocol::LABELS {
+            if other != LABEL_CHANGE_LINEAGE {
+                assert!(!other.starts_with(LABEL_CHANGE_LINEAGE));
+                assert!(!LABEL_CHANGE_LINEAGE.starts_with(other));
+            }
+        }
+        // Content of no change entry's size has no lineage to read.
+        assert_eq!(lineage(&[0u8; 16_384]), Err(ChangeEntryError::Size(16_384)));
     }
 }

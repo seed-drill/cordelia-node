@@ -355,14 +355,23 @@ fn stays_among(maker: &[u8; 32], stay: &[Device]) -> Result<(), PersonError> {
     Ok(())
 }
 
-/// The change entry of `statement`, signed and sealed with the phrase.
+/// The change entry of `statement`, signed and sealed with the phrase. Its
+/// lineage says that it was made now, by this process's clock (decision
+/// 2026-10-24 rule 13).
 fn entry_of(
     phrase: &Phrase,
     statement: Statement,
     for_phrase: &ForPhrase,
 ) -> Result<CheckedEntry, PersonError> {
     let signed = statement.sign(&phrase.signing_key()?)?;
-    Ok(change_entry::entry_of(phrase, &signed, for_phrase)?.check()?)
+    Ok(change_entry::entry_of(phrase, &signed, for_phrase, made_now())?.check()?)
+}
+
+/// When a change is made, by the clock of the process that makes it, in
+/// seconds since the Unix epoch: what its change entry's lineage says
+/// (decision 2026-10-24 rule 13). A clock set before the epoch says 0.
+pub(crate) fn made_now() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1029,5 +1038,155 @@ mod tests {
             settle(&by_1, &[0, 1, 2], &[]),
             Err(PersonError::Statement(StatementError::InBothLists))
         ));
+    }
+
+    // ── The lineage, and entries of the version before (decision
+    // 2026-10-24 rule 13) ────────────────────────────────────────────
+
+    /// `entry` as the version before (0.2.0-alpha.16) made it: the same
+    /// part for the devices, the part for the phrase in the last 4096
+    /// bytes, and no lineage. Signed by the phrase, at its revision.
+    fn as_the_version_before_made_it(s: &Several, entry: &CheckedEntry) -> CheckedEntry {
+        use cordelia_core::protocol::{
+            CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES,
+            ITEM_SEAL_OVERHEAD_BYTES, LABEL_CHANGE_PHRASE,
+        };
+        let phrase = &s.phrase;
+        let (_, for_phrase) = read(s, entry);
+        // The secret, a count, and each earlier secret behind its number.
+        let mut said = for_phrase.secret.to_vec();
+        said.extend_from_slice(&(for_phrase.earlier.len() as u16).to_be_bytes());
+        for earlier in &for_phrase.earlier {
+            said.extend_from_slice(&earlier.number.to_be_bytes());
+            said.extend_from_slice(&earlier.secret);
+        }
+        said.resize(
+            CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES - ITEM_SEAL_OVERHEAD_BYTES,
+            0,
+        );
+        let mut bound = LABEL_CHANGE_PHRASE.to_vec();
+        bound.extend_from_slice(&entry.rev.to_be_bytes());
+        bound.extend_from_slice(&phrase.public_key().unwrap());
+        let mut content = entry.content[..CHANGE_ENTRY_DEVICES_PART_BYTES].to_vec();
+        content.extend_from_slice(
+            &cordelia_crypto::item_encrypt(&phrase.seal_key().unwrap(), &said, &bound).unwrap(),
+        );
+        crate::several::signed_in(
+            &phrase.channel_secret().unwrap(),
+            &phrase.signing_key().unwrap(),
+            entry.slot,
+            entry.rev,
+            content,
+        )
+    }
+
+    /// The change entry that a command makes says its lineage: its
+    /// statement's hash and its chain's, and when it was made, by the
+    /// clock of the process that made it. So does the first change, which
+    /// `cordelia phrase` makes.
+    #[test]
+    fn test_a_change_entry_says_its_lineage_and_when_it_was_made() {
+        let mut s = Several::of_one_person(3);
+        let before = made_now();
+        let entry = change_on_0(&s, &[0, 1, 2], &[]).unwrap();
+        let after = made_now();
+        let (signed, _) = read(&s, &entry);
+        let lineage = change_entry::lineage(&entry.content).unwrap().unwrap();
+        assert!(lineage.is_of(&signed.statement).unwrap());
+        assert_eq!(lineage.chain.len(), 1);
+        assert!(
+            (before..=after).contains(&lineage.made_at),
+            "{before} {} {after}",
+            lineage.made_at
+        );
+
+        // A settlement's lineage names both statements it settles.
+        let by_0 = s.change(0, &[0, 1, 2], &[]);
+        let by_1 = s.change(1, &[0, 1, 2], &[]);
+        assert_eq!((by_0.rev, by_1.rev), (2, 2));
+        let on = &s[0];
+        let settlement = make_settlement(
+            &s.phrase,
+            &on.held().statement,
+            &on.latest(),
+            &by_1,
+            &on.key(),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap();
+        let (settled, _) = read(&s, &settlement);
+        let lineage = change_entry::lineage(&settlement.content).unwrap().unwrap();
+        assert!(lineage.is_of(&settled.statement).unwrap());
+        assert_eq!(lineage.chain.len(), 3);
+
+        // The first change.
+        let before = made_now();
+        let made = crate::person::first_entry(&s.phrase, &s.key(0), "desktop").unwrap();
+        let after = made_now();
+        let lineage = change_entry::lineage(&made.entry.content).unwrap().unwrap();
+        assert!(lineage.chain.is_empty());
+        assert!((before..=after).contains(&lineage.made_at));
+    }
+
+    /// A command of this version makes a change over the change entry of
+    /// the version before, whose part for the phrase is the last 4096
+    /// bytes: a change, a settlement of two such entries, and the read
+    /// that a carry with the phrase and a recovery make. What it makes is
+    /// in the layout with a lineage.
+    #[test]
+    fn test_a_change_is_made_over_an_entry_of_the_version_before() {
+        use cordelia_crypto::change_entry::Layout;
+        let mut s = Several::of_one_person(3);
+        let first = s[0].secret();
+        let held = as_the_version_before_made_it(&s, &s[0].latest());
+        assert_eq!(change_entry::layout(&held.content), Ok(Layout::Before));
+
+        let entry = make_change(
+            &s.phrase,
+            &s[0].held().statement,
+            &held,
+            &s.key(0),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            change_entry::layout(&entry.content),
+            Ok(Layout::WithLineage)
+        );
+        let (_, for_phrase) = read(&s, &entry);
+        assert_eq!(
+            for_phrase.earlier,
+            [Earlier {
+                number: 1,
+                secret: first
+            }]
+        );
+        let (statement, read_back) = read_with(&s.phrase, &held).unwrap();
+        assert_eq!(statement, s[0].held().statement);
+        assert_eq!(read_back.secret, first);
+
+        // A settlement of two changes made apart, each as the version
+        // before made it.
+        let by_0 = s.change(0, &[0, 1, 2], &[]);
+        let by_1 = s.change(1, &[0, 1, 2], &[]);
+        let (one, other) = (read(&s, &by_0).1, read(&s, &by_1).1);
+        let on = &s[0];
+        let settlement = make_settlement(
+            &s.phrase,
+            &on.held().statement,
+            &as_the_version_before_made_it(&s, &on.latest()),
+            &as_the_version_before_made_it(&s, &by_1),
+            &on.key(),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap();
+        let (_, for_phrase) = read(&s, &settlement);
+        let secrets: Vec<[u8; 32]> = for_phrase.earlier.iter().map(|e| e.secret).collect();
+        assert!(secrets[..2].contains(&one.secret));
+        assert!(secrets[..2].contains(&other.secret));
+        assert_eq!(secrets[2], first);
     }
 }
