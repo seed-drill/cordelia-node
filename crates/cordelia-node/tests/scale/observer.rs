@@ -223,36 +223,34 @@ impl Observer {
 
 /// From when a device removed at `line` had no chance at an edit, given
 /// whether it ran after each change of its life, in their order
-/// (`history`): the 120 s before the line; and, where it was down at the
-/// line, the 120 s before it went down; and where it ran again less than
-/// a minute before the line (its catch-up not over, bar 3), the 120 s
-/// before it went down the time before. An older edit it ran through and
-/// lacks is a miss.
+/// (`history`): the 120 s before the line; where it was down at the line,
+/// the 120 s before it went down; and for each run before that too short
+/// for its catch-up (under a minute, bar 3), the 120 s before it went down
+/// the time before. An older edit it ran through and lacks is a miss.
 pub fn no_chance_from(history: &[(f64, bool)], line: f64) -> f64 {
-    let mut since = line - 120.0;
-    let (mut down_since, mut up, mut down_before) = (None, None, None);
-    for (t, runs) in history.iter().filter(|(t, _)| *t <= line) {
-        match (*runs, down_since) {
-            (true, Some(down)) => {
-                down_before = Some(down);
-                down_since = None;
-                up = Some(*t);
-            }
-            (true, None) => {
-                up = up.or(Some(*t));
-            }
-            (false, None) => down_since = Some(*t),
-            (false, Some(_)) => {}
+    // Its runs up to the line: from a start to when it went down, if it did.
+    let mut runs: Vec<(f64, Option<f64>)> = Vec::new();
+    for (t, runs_now) in history.iter().filter(|(t, _)| *t <= line) {
+        match (runs_now, runs.last_mut()) {
+            (true, Some((_, None))) => {}
+            (true, _) => runs.push((*t, None)),
+            (false, Some((_, end @ None))) => *end = Some(*t),
+            (false, _) => {}
         }
     }
-    match (down_since, up) {
-        (Some(down), _) => since = since.min(down - 120.0),
-        (None, Some(up)) if line - up < 60.0 => {
-            if let Some(down) = down_before {
-                since = since.min(down - 120.0);
-            }
+    let mut since = line - 120.0;
+    if let Some((_, Some(down))) = runs.last() {
+        since = since.min(down - 120.0);
+    }
+    let mut rest = runs.as_slice();
+    while let Some(((start, end), before)) = rest.split_last() {
+        if end.unwrap_or(line) - start >= 60.0 {
+            break;
         }
-        _ => {}
+        if let Some((_, Some(down))) = before.last() {
+            since = since.min(down - 120.0);
+        }
+        rest = before;
     }
     since
 }

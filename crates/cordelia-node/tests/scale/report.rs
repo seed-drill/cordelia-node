@@ -855,7 +855,10 @@ struct Counted {
 /// writer held it), the device ran no stretch of a minute between the two
 /// (bar 3's catch-up: it had no time to take `n` while `n` was the newest),
 /// and M arrived at the device, or was itself so replaced. A device that
-/// ran a minute while `n` was the newest had its chance, and is owed it.
+/// ran a minute while `n` was the newest had its chance, and is owed it;
+/// and so is one that ran all through from `n` to M where M came
+/// [`HELD_BY_A_RUNNING_DEVICE_SECS`] or more after `n`: a running device
+/// holds an edit within that, and the record calls `n` lost (bar 3).
 fn replaced_at(
     read: &Read,
     n: &crate::observer::Written,
@@ -871,6 +874,8 @@ fn replaced_at(
     by.get(&n.number).into_iter().flatten().any(|m| {
         m.writer != device
             && read.lives.longest_run_within(node, n.at, m.at) < CATCH_UP_SECS
+            && !(read.lives.ran_through(node, n.at, m.at)
+                && m.at - n.at >= HELD_BY_A_RUNNING_DEVICE_SECS)
             && (arrivals.contains_key(&(m.number, device))
                 || replaced_at(read, m, device, node, by, arrivals, depth + 1))
     })
@@ -880,6 +885,11 @@ fn replaced_at(
 /// a device that was off holds its person's edits within 60 s of running
 /// again).
 const CATCH_UP_SECS: f64 = 60.0;
+
+/// Within this a device that runs holds an edit of its person (bar 2's
+/// four waits, of 20 s at most; §2.1 item 8 writes nothing twice on a
+/// device within 15 s): an edit replaced sooner may never be seen.
+const HELD_BY_A_RUNNING_DEVICE_SECS: f64 = 20.0;
 
 impl Edits {
     fn of(read: &Read, observer: &crate::observer::Observer) -> Edits {
@@ -1679,15 +1689,16 @@ fn bar_9(read: &Read) -> Line {
                 match read.lives.at(node, s.t) {
                     Is::Running => {
                         hi += 1.0;
-                        // A device that a connection closed on in the last
-                        // 150 s dials again 10 s later at the soonest (the
-                        // record of a relay out of reach §2): it is not
-                        // looked for.
+                        // A device that this relay's warm churn closed on in
+                        // the last 150 s dials again 10 s later at the
+                        // soonest (the record of a relay out of reach §2):
+                        // it is not looked for. A closure with no churn, or
+                        // start, of this relay is not excused.
                         if read
                             .lives
                             .running_since(node, s.t)
                             .is_some_and(|since| s.t - since >= 120.0)
-                            && !closed_lately(read, node, s.t)
+                            && !(closed_lately(read, node, s.t) && churned_lately(read, i, s.t))
                         {
                             lo += 1.0;
                         }
@@ -1760,7 +1771,8 @@ fn bar_9(read: &Read) -> Line {
         said.join("; "),
         "at each sample, between the devices running 120 s or more and every device running \
          or frozen in the last 90 s, with one or two for the other relay and the office's 5 \
-         (a device that counts a connection closed in the last 150 s is not looked for); none \
+         (a device that counts a connection closed in the last 150 s is not looked for where \
+         this relay's warm churn closed a device's connection, or it started, then); none \
          turned away for the bound or the subnet",
         holds,
     )
@@ -1787,6 +1799,27 @@ fn closed_lately(read: &Read, node: usize, t: f64) -> bool {
         .unwrap_or_default()
         .windows(2)
         .any(|w| w[1].device.map(|d| d.closed) != w[0].device.map(|d| d.closed))
+}
+
+/// Whether relay `relay` closed a device's connection by warm churn, or
+/// started, in the 150 s before `t`: read as [`closed_lately`] reads a
+/// device, from its last sample that carries the count before then to its
+/// first at or after `t`.
+fn churned_lately(read: &Read, relay: usize, t: f64) -> bool {
+    let from = t - 150.0;
+    if read
+        .lives
+        .running_since(relay, t)
+        .is_some_and(|since| since > from)
+    {
+        return true;
+    }
+    let key = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+    let series = read.series(relay);
+    let carrying = || series.iter().filter(|s| metric(s, key).is_some());
+    let a = carrying().rev().find(|s| s.t < from).map_or(from, |s| s.t);
+    let b = carrying().find(|s| s.t >= t).map_or(t, |s| s.t);
+    rise(&series, key, a, b, &|_, _| true) > 0.0
 }
 
 fn bar_10(read: &Read, edits: &Edits) -> Line {

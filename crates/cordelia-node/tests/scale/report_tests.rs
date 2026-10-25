@@ -602,6 +602,102 @@ fn a_device_removed_while_off_still_owed_what_it_ran_through() {
         crate::observer::no_chance_from(&[(0.0, true)], 2100.0),
         1980.0
     );
+    // Down at the line after a run of 30 s, too short for its catch-up: the
+    // time down before that run counts too. Only the run of 100 s before it
+    // gave it a chance.
+    let short = [(0.0, true), (100.0, false), (200.0, true), (230.0, false)];
+    assert_eq!(crate::observer::no_chance_from(&short, 300.0), -20.0);
+}
+
+// ── The third round: replaced soon, and the floor of bar 9 ──
+
+/// A device that runs all through from `n` to `m` is owed `n` where `m`
+/// came 20 s or more after it; where `m` came sooner, `n` may never be
+/// seen, and is replaced by intent.
+#[test]
+fn a_running_device_is_owed_an_edit_not_replaced_within_twenty_seconds() {
+    for (m_at, replaced) in [(230.0, false), (210.0, true)] {
+        let (_dir, run) = made_up();
+        all_running(&run, 0.0);
+        window(&run, 0.0, 2000.0);
+        n_then_m(&run, 200.0, m_at);
+        let read = read_of(&run);
+        let edits = edits_of(&read);
+        let n_at_d = edits.pairs.iter().find(|p| p.edit.number == 10).unwrap();
+        assert_eq!(n_at_d.replaced, replaced, "m at {m_at}");
+        let bar = bar_3(&read, &edits);
+        assert_eq!(bar.verdict == Verdict::Fail, !replaced, "{}", bar.figure);
+    }
+}
+
+/// The low end of bar 9's band for relay 1 at 300 s, from its figure,
+/// where person 0's first device (node 2) counts a closure between 100 s
+/// and 310 s, and relay 1 counts `churned` warm-churn closures of devices
+/// over the same time. With `restarted`, relay 1 is down from 180 s to
+/// 200 s, and the band is read at 330 s, the first sample checked after
+/// its start (each time 30 s later).
+fn bar_9_floor(closed: bool, churned: f64, restarted: bool) -> f64 {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 150.0, 900.0);
+    let at = if restarted {
+        becomes(&run, 0, 180.0, Is::Stopped);
+        becomes(&run, 0, 200.0, Is::Running);
+        330.0
+    } else {
+        300.0
+    };
+    let key = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+    relay_at(&run, 0, 100.0, Some(&[(key, 0.0)]));
+    relay_at(
+        &run,
+        0,
+        at,
+        Some(&[(key, churned), ("cordelia_connections_open", 0.0)]),
+    );
+    for (t, n) in [(100.0, 0.0), (at + 10.0, if closed { 1.0 } else { 0.0 })] {
+        device_at(
+            &run,
+            2,
+            t,
+            Some(DeviceCounts {
+                closed: n,
+                ..DeviceCounts::default()
+            }),
+        );
+    }
+    let read = read_of(&run);
+    let bar = bar_9(&read);
+    let said = format!("0 at {at:.0} s (band ");
+    let from = bar.figure.find(&said).expect(&bar.figure);
+    let rest = &bar.figure[from + said.len()..];
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+/// A device that counts a closure of its own is left out of the floor only
+/// where this relay's warm churn closed a device's connection then: a
+/// relay that keeps closing connections for another reason is seen.
+#[test]
+fn bar_9_leaves_out_a_closed_device_only_where_its_relay_churned() {
+    let floor = bar_9_floor(false, 0.0, false);
+    assert!(floor >= 1.0, "{floor}");
+    assert_eq!(
+        bar_9_floor(true, 0.0, false),
+        floor,
+        "a closure with no churn"
+    );
+    assert_eq!(
+        bar_9_floor(true, 1.0, false),
+        floor - 1.0,
+        "a closure by churn"
+    );
+    // A relay that started in those 150 s closed every connection.
+    let floor = bar_9_floor(false, 0.0, true);
+    assert_eq!(
+        bar_9_floor(true, 0.0, true),
+        floor - 1.0,
+        "a closure by a start"
+    );
 }
 
 // ── Bar 12: the model counts a device where its relay holds it ──
