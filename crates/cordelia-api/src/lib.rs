@@ -39,6 +39,7 @@
 pub mod adding;
 pub mod at_relays;
 pub mod auth;
+pub mod bounds;
 pub mod carry;
 pub mod carrying;
 pub mod change;
@@ -147,14 +148,16 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
         web::get().to(handlers::metrics_load),
     );
     // Messages between the person's own agents (decision 2026-10-09
-    // §4.2): each needs the node's token, and is a personal node's.
+    // §4.2, and the sixth of decision 2026-10-25, rule 2): each needs the
+    // node's token, and is a personal node's.
     cfg.service(
         web::scope("/api/v1/messages")
             .route("/summary", web::post().to(messages::summary))
             .route("/announced", web::post().to(messages::announced))
             .route("/read", web::post().to(messages::read))
             .route("/send", web::post().to(messages::send))
-            .route("/log", web::post().to(messages::log)),
+            .route("/log", web::post().to(messages::log))
+            .route("/allow", web::post().to(messages::allow)),
     );
     shared_routes(cfg);
 }

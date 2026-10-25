@@ -35,8 +35,8 @@ use rusqlite::Connection;
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    AGENT_MESSAGE_PAIR_UNREAD_MAX, AGENT_MESSAGE_RING, AGENT_MESSAGE_SENDS_MAX,
-    AGENT_MESSAGES_PER_DEVICE_PER_HOUR, AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+    AGENT_MESSAGE_RING, AGENT_MESSAGE_SENDS_MAX, AGENT_MESSAGES_PER_DEVICE_PER_HOUR,
+    AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
 };
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry, Value};
@@ -123,13 +123,23 @@ pub enum Refused {
     },
     /// The pair is held (step 12, §6). `other` is the other side of the
     /// held pair, or `None` where it is the sender's own to every name;
-    /// `every` says that the refused message was to every name.
+    /// `every` says that the refused message was to every name. `waiting`
+    /// is the pair's count and `bound` the bound in force (decision
+    /// 2026-10-25, rule 4), which the count can be above where a bound was
+    /// lowered or messages came from another device.
     #[error("messages between {from} and another agent wait to be read by a person")]
     PairHeld {
         from: String,
         other: held::Other,
         every: bool,
+        waiting: u64,
+        bound: u64,
     },
+    /// The device's list of bounds is full, and holds no bound for the
+    /// pair asked (decision 2026-10-25, rule 3.6): each pair it holds, with
+    /// when it leaves the list.
+    #[error("this device's list of bounds is full")]
+    BoundsFull(Vec<(held::Pair, i64)>),
 }
 
 impl Refused {
@@ -152,6 +162,7 @@ impl Refused {
             Self::FolderRate { .. } => "folder_rate",
             Self::DeviceRate { .. } => "device_rate",
             Self::PairHeld { .. } => "pair_held",
+            Self::BoundsFull(_) => "bounds_full",
         }
     }
 }
@@ -411,11 +422,13 @@ fn sends(
         });
     }
     // 12. The hold.
-    if let Some(other) = held_pair(conn, &request.from, &to, now)? {
+    if let Some(held) = held_pair(conn, &ring.own, &request.from, &to, now)? {
         return refused(Refused::PairHeld {
             from: request.from.clone(),
-            other,
+            other: held.other,
             every: to == To::All,
+            waiting: held.waiting,
+            bound: held.bound,
         });
     }
 
@@ -473,33 +486,54 @@ fn device_full(lately: &held::SentLately) -> Option<i64> {
     Some(frees_at(&all, AGENT_MESSAGES_PER_DEVICE_PER_HOUR))
 }
 
+/// A pair that holds a send ([`held_pair`]): its other side, its count,
+/// and the bound in force, at which it stops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPair {
+    pub other: held::Other,
+    pub waiting: u64,
+    pub bound: u64,
+}
+
 /// Whether a send from the agent `from` to `to` is held at `now` by the
-/// pair of agents (decision 2026-10-09 §6, C8, D6, F2): the other side of
-/// the held pair where it is. Counted are the messages the device holds
-/// with a place, not expired, live, and that no person has read here
-/// (`message_read_by_a_person`, which `log`'s yes writes). A message to
-/// every name is of the pair of its sender and all.
+/// pair of agents (decision 2026-10-09 §6, C8, D6, F2): the held pair where
+/// it is. Counted are the messages the device holds with a place, not
+/// expired, live, and that no person has read on any device that counts
+/// (decision 2026-10-25, rule 1.3). A message to every name is of the pair
+/// of its sender and all. Each pair holds at its bound in force (decision
+/// 2026-10-25, rule 3): the usual 10, the bound a person set, or none
+/// where `any` was set. `own` is this device's key.
 ///
-/// - To a name Y, the pair of `from` and Y holds at ten.
-/// - To every name, any pair with `from` on one side holds: the first in
-///   order of name, and its own to every name after them.
+/// - To a name Y, the pair of `from` and Y holds at its bound.
+/// - To every name, any pair with `from` on one side holds at its bound:
+///   the first in order of name, and its own to every name after them.
 pub fn held_pair(
     conn: &Connection,
+    own: &[u8; 32],
     from: &str,
     to: &To,
     now: i64,
-) -> Result<Option<held::Other>, PersonError> {
-    let pairs = kept(held::pairs_with(conn, from, now))?;
-    let held = |count: u64| count >= AGENT_MESSAGE_PAIR_UNREAD_MAX as u64;
+) -> Result<Option<HeldPair>, PersonError> {
+    let counting = crate::person::who_counts(conn)?;
+    let pairs = kept(held::pairs_with(conn, from, now, &counting.keys()))?;
+    let rows = kept(held::bounds(conn))?;
+    let held_at = |other: &held::Other, count: u64| -> Option<u64> {
+        let pair = held::Pair::of(from, other.as_deref());
+        crate::bounds::in_force_of(&rows, own, &counting, &pair, now)
+            .stops_at()
+            .filter(|bound| count >= *bound)
+    };
+    let mut held = pairs.into_iter().filter_map(|(other, count)| {
+        let bound = held_at(&other, count)?;
+        Some(HeldPair {
+            other,
+            waiting: count,
+            bound,
+        })
+    });
     Ok(match to {
-        To::Name(name) => pairs
-            .into_iter()
-            .find(|(other, count)| other.as_deref() == Some(name.as_str()) && held(*count))
-            .map(|(other, _)| other),
-        To::All => pairs
-            .into_iter()
-            .find(|(_, count)| held(*count))
-            .map(|(other, _)| other),
+        To::Name(name) => held.find(|pair| pair.other.as_deref() == Some(name.as_str())),
+        To::All => held.next(),
     })
 }
 
@@ -953,12 +987,20 @@ mod tests {
         sends_at(s, n, request, now).unwrap_or_else(|e| panic!("{e:?}"))
     }
 
-    /// Device `n` sends `request` at `now`, which it must, and a person
-    /// then reads everything it holds: for a test of something else than
-    /// the hold.
+    /// Device `n` sends `request` at `now`, which it must, and everything
+    /// it holds is then read by a person there, written in its table as
+    /// `log`'s yes writes it and nowhere else: for a test of something
+    /// else than the hold, whose slots are its ring's and its lists' of
+    /// what agents read (a person's read is said in a list of its own,
+    /// decision 2026-10-25, rule 1, which `log` writes).
     fn sent_read(s: &Several, n: usize, request: &Request, now: i64) -> Sent {
         let done = sent(s, n, request, now);
-        read_all(s, n, now);
+        s[n].conn
+            .execute(
+                "INSERT OR IGNORE INTO message_read_by_a_person (id) SELECT id FROM message_index",
+                [],
+            )
+            .unwrap();
         done
     }
 
@@ -969,6 +1011,7 @@ mod tests {
             folder: None,
             since: None,
             mark,
+            fetched: true,
         };
         crate::messages::log_of(&s[n].conn, &s[n].identity, &asked, now, |_| false)
             .unwrap_or_else(|e| panic!("{e:?}"))
@@ -1832,7 +1875,9 @@ mod tests {
                 Refused::PairHeld {
                     from: from.into(),
                     other: Some(to.into()),
-                    every: false
+                    every: false,
+                    waiting: 10,
+                    bound: 10,
                 }
             );
         }
@@ -1843,7 +1888,9 @@ mod tests {
                 Refused::PairHeld {
                     from: from.into(),
                     other: Some(other.into()),
-                    every: true
+                    every: true,
+                    waiting: 10,
+                    bound: 10,
                 }
             );
         }
@@ -1874,7 +1921,9 @@ mod tests {
             Refused::PairHeld {
                 from: "home".into(),
                 other: None,
-                every: true
+                every: true,
+                waiting: 10,
+                bound: 10,
             }
         );
         sent(&s, 0, &says("home", "notes", "to a name"), later);
@@ -2953,16 +3002,29 @@ mod tests {
 
     // ── One room, and restores ──────────────────────────────────────
 
-    /// 200 messages and 50 lists of one device leave 65 of its entries in
-    /// the messages channel, each the newest of its slot (decision
-    /// 2026-10-09 §2.3, property 17).
+    /// 200 messages and 50 lists of one device, a person's reads at a
+    /// terminal after each message and three bounds set, leave 67 of its
+    /// entries in the messages channel, each the newest of its slot: 64 of
+    /// its ring and its three lists (decision 2026-10-09 §2.3, property
+    /// 17; decision 2026-10-25, section 7).
     #[test]
-    fn a_device_never_has_more_than_sixty_five_slots() {
+    fn a_device_never_has_more_than_sixty_seven_slots() {
         let s = devices(2);
         let t = s.now;
         for k in 0..200i64 {
             let from = NAMES[usize::try_from(k % 4).unwrap()];
-            sent_read(&s, 0, &says(from, "*", &format!("{k}")), t + k * 4 * 60);
+            let now = t + k * 4 * 60;
+            sent(&s, 0, &says(from, "*", &format!("{k}")), now);
+            read_all(&s, 0, now);
+        }
+        for (k, bound) in [Some(5), None, Some(30)].into_iter().enumerate() {
+            let allow = crate::bounds::Allow {
+                pair: held::Pair::of("notes", Some("work")),
+                bound,
+                for_secs: 3600,
+            };
+            let now = t + 200 * 4 * 60 + k as i64;
+            crate::bounds::allow(&s[0].conn, &s[0].identity, &allow, now, true, true).unwrap();
         }
         let name = read_name(&s.key(0)).unwrap();
         for rev in 1..=50 {
@@ -2980,9 +3042,11 @@ mod tests {
             entries::store(&s[0].conn, &entry, t).unwrap();
         }
         let revs = revs_of(&s, 0, 0);
-        assert_eq!(revs.len(), 65);
+        assert_eq!(revs.len(), 67);
+        // The list of what agents read at 50, of the bounds at 3, of a
+        // person's reads at 200, and the ring's newest 64.
         let mut newest: Vec<u64> = (137..=200).map(|number| 2 * number).collect();
-        newest.insert(0, 50);
+        newest.splice(0..0, [3, 50, 200]);
         assert_eq!(revs, newest);
     }
 

@@ -501,7 +501,7 @@ pub enum NotShared {
 /// its signer, a message at its place in the ring, and a value of its
 /// kind's length and form. Anything else is taken as nothing: an entry in
 /// a slot named for another key among them, and a list of the messages
-/// channel.
+/// channel (`read/`, `person/` or `hold/`).
 pub fn take(
     name: &str,
     signer: &[u8; 32],
@@ -520,7 +520,9 @@ pub fn take(
             is_clearing(value)?;
             Ok(SharedTaken::Clearing { number })
         }
-        Some(Place::List) | None => Err(NotShared::NotInItsSlots),
+        Some(Place::List | Place::PersonList | Place::Bounds) | None => {
+            Err(NotShared::NotInItsSlots)
+        }
     }
 }
 
@@ -740,7 +742,7 @@ mod tests {
         // And a shared message is no message of the messages channel.
         assert_eq!(
             Message::from_value(&Value::Other(value.clone()), names),
-            Err(NotAMessage::Form(3))
+            Err(NotAMessage::AnotherForm(3))
         );
 
         for flags in [0b10, 0b11, 0x80] {

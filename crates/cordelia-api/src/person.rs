@@ -1623,6 +1623,16 @@ fn come_to(
     held_rows::drop_change_entry(conn, Kept::Apart)?;
     // Records are not carried: the statement's own list is what stands.
     held_rows::clear_additions(conn)?;
+    // What other devices said a person read is kept only of the keys this
+    // statement counts, so that a key added again later counts only what
+    // it lists from then; and a statement ends every bound a person set,
+    // this device's own and the others' (decision 2026-10-25, rules 1.2
+    // and 3.7). Nothing of messages is carried (decision 2026-10-09 §9.1).
+    let counted: Vec<[u8; 32]> = statement.devices.iter().map(|device| device.key).collect();
+    cordelia_storage::messages::drop_person_marks_but(conn, &counted)
+        .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
+    cordelia_storage::messages::drop_all_bounds(conn)
+        .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
     // A key that was shown as left out is shown no more once a statement
     // lists it, in either list. And the notices that a person cleared
     // were of the statement that is left: its records, and the words in

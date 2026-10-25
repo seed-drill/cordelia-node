@@ -1357,7 +1357,8 @@ never held, comes in only under **a word that the phrase signed:**
   | Field | What it is |
   |-------|------------|
   | `unread_by_an_agent` | For each mapped folder, the messages unread by its agent (§7.2 there), from a signer that counts: a message to every name once for each folder |
-  | `unread_by_a_person` | The messages to a name mapped here or to every name, that have a place, have not expired, were not sent here, and that no person has read here |
+  | `unread_by_a_person` | The messages to a name mapped here or to every name, that have a place, have not expired, were not sent here, and that no person has read on any device that counts (decision 2026-10-25, rule 1) |
+  | `bounds` | Each bound in force that is not the usual hold, with `a`, `b` (null for every agent), `bound` (null for `any`), `until` (RFC 3339) and `set_on` (`"this"`, or `label` and `fingerprint`) (decision 2026-10-25, rule 4) |
   | `waiting` | This device's messages that not every relay it is set up with has taken |
   | `refused_for_room` | Of those, the ones a relay refused for room, each once |
   | `filled_by` | Where a relay refused the messages channel for room since the node started, the signer whose entries fill it, by the count of each author's entries the device holds there: `label` and `entries`. Null otherwise |
@@ -1394,8 +1395,9 @@ never held, comes in only under **a word that the phrase signed:**
     `no_relay_secs`; `peers`; `outbox_waiting` and `outbox_refused`.
   - **`messages`,** at the top level, as the node gave it, where it gave
     it, and nothing else of messages (decision 2026-10-09 §8). It changes
-    no `state`, `level`, `summary` or `holds`, and plain `cordelia status`,
-    `--line` and `--waybar` say nothing of messages.
+    no `state`, `level`, `summary` or `holds`. `--line` and `--waybar` say
+    nothing of messages, and plain `cordelia status` says only each bound
+    in force (decision 2026-10-25, rule 4).
   - Under `sync`: the settings; `projects`, one for each folder that syncs;
     `unmapped`, the found entries; `available`; `stands` and `moved_on`;
     `publishes_nothing`, why nothing is published from this device where

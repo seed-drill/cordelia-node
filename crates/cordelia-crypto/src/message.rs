@@ -36,6 +36,25 @@
 //! of two bytes from 0 to 120, that many marks of 16 bytes, the newest
 //! first, and zeros.
 //!
+//! A device's list of what a person read on it (form 3, decision
+//! 2026-10-25, rule 1) is the byte 3, a count of two bytes from 0 to 120,
+//! that many message IDs of 16 bytes, the newest first, and zeros. Its
+//! list of the bounds a person set on it (form 4, rule 2) is the byte 4, a
+//! count of one byte, and each bound, the latest `set` first:
+//!
+//! ```text
+//! a          2 + 1 to 200     a name
+//! b, kind    1    1: a name; 2: every agent
+//! b          2 + 1 to 200     a name, for kind 1 only
+//! bound      1    0 for any, else 1 to 64
+//! set        8    unsigned (rule 3.1)
+//! at         8    unsigned, seconds since 1970 (rule 3.1)
+//! for        4    seconds, 60 to 604,800
+//! ```
+//!
+//! then zeros. For a pair of two names `a` is not above `b` in byte order,
+//! so a pair has one spelling; they may be equal.
+//!
 //! A reader refuses anything else as no message ([`NotAMessage`]), and the
 //! node that sends checks the same before it seals: a value is written
 //! only where it reads back.
@@ -44,7 +63,9 @@
 //!
 //! A device's message number k goes in the slot `msg/<its key>/<k mod
 //! 64>` at revision 2k, and the entry that clears it in the same slot at
-//! 2k + 1. Its list is in `read/<its key>`. A reader takes from those slots
+//! 2k + 1. Its list is in `read/<its key>`, its list of what a person read
+//! on it in `person/<its key>`, and its list of bounds in `hold/<its key>`
+//! (decision 2026-10-25). A reader takes from those slots
 //! only what the key in the name signed, at a number that the slot's
 //! place agrees with ([`place_of`]).
 
@@ -52,9 +73,11 @@ use cordelia_core::protocol::{
     AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_LINK_MAX_BYTES,
     AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS, AGENT_MESSAGE_LINK_OWNER_MAX_BYTES,
     AGENT_MESSAGE_LINK_REPO_MAX_BYTES, AGENT_MESSAGE_NAME_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX,
-    AGENT_MESSAGE_PREFIX, AGENT_MESSAGE_READ_MARK_BYTES, AGENT_MESSAGE_READ_MARKS_MAX,
-    AGENT_MESSAGE_READ_PREFIX, AGENT_MESSAGE_RING, AGENT_MESSAGE_VALUE_BYTES,
-    LABEL_AGENT_MESSAGE_ID, LABEL_AGENT_MESSAGE_READ,
+    AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS,
+    AGENT_MESSAGE_PAIR_BOUNDS_PREFIX, AGENT_MESSAGE_PERSON_PREFIX, AGENT_MESSAGE_PREFIX,
+    AGENT_MESSAGE_READ_MARK_BYTES, AGENT_MESSAGE_READ_MARKS_MAX, AGENT_MESSAGE_READ_PREFIX,
+    AGENT_MESSAGE_RING, AGENT_MESSAGE_VALUE_BYTES, LABEL_AGENT_MESSAGE_ID,
+    LABEL_AGENT_MESSAGE_READ,
 };
 
 use crate::CryptoError;
@@ -66,6 +89,12 @@ use crate::statement::{Reader, put_count};
 const FORM_CLEARING: u8 = 0;
 const FORM_MESSAGE: u8 = 1;
 const FORM_LIST: u8 = 2;
+/// A device's list of what a person read on it (decision 2026-10-25, rule
+/// 1).
+const FORM_PERSON: u8 = 3;
+/// A device's list of the bounds a person set on it (decision 2026-10-25,
+/// rule 2).
+pub const FORM_BOUNDS: u8 = 4;
 
 /// The one flag: the message asks for an answer.
 pub(crate) const FLAG_ASKS: u8 = 0b0000_0001;
@@ -123,6 +152,24 @@ pub enum NotAMessage {
 
     #[error("a list holds at most 120 marks, and this says {0}")]
     Marks(usize),
+
+    #[error("a list of a person's reads holds at most 120 IDs, and this says {0}")]
+    Ids(usize),
+
+    #[error("a bound's other side is a name (1) or every agent (2), and this says {0}")]
+    BoundKind(u8),
+
+    #[error("a bound's pair is spelt with its first name not above its second")]
+    BoundOrder,
+
+    #[error("a bound is 0 for any or 1 to 64, and this is {0}")]
+    Bound(u8),
+
+    #[error("a bound is for 60 to 604800 seconds, and this is {0}")]
+    BoundFor(u32),
+
+    #[error("a list of bounds holds one pair twice")]
+    BoundTwice,
 
     #[error("the entry is not in its signer's ring")]
     NotInRing,
@@ -360,6 +407,214 @@ impl ReadMarks {
     }
 }
 
+/// A device's list of what a person read on it (decision 2026-10-25, rule
+/// 1, form 3): the IDs of the messages a person read there, the newest
+/// first, at most 120. It is the agents' list with IDs in place of marks:
+/// a person's read has no name to bind into a hash, and the entry is
+/// sealed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PersonReads {
+    pub ids: Vec<[u8; AGENT_MESSAGE_ID_BYTES]>,
+}
+
+impl PersonReads {
+    /// The list's value. A list of more than 120 IDs is refused: the
+    /// device writes its newest 120.
+    pub fn to_value(&self) -> Result<Vec<u8>, NotAMessage> {
+        if self.ids.len() > AGENT_MESSAGE_READ_MARKS_MAX {
+            return Err(NotAMessage::Ids(self.ids.len()));
+        }
+        let mut out = Vec::with_capacity(AGENT_MESSAGE_VALUE_BYTES);
+        out.push(FORM_PERSON);
+        put_count(&mut out, self.ids.len());
+        for id in &self.ids {
+            out.extend_from_slice(id);
+        }
+        out.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+        Ok(out)
+    }
+
+    /// Read a list from an entry's value, as a reader does: a count over
+    /// 120, or a fill that is not zeros, is no list.
+    pub fn from_value(value: &Value) -> Result<Self, NotAMessage> {
+        let mut reader = Reader::new(whole(value)?);
+        let form = byte(&mut reader)?;
+        if form != FORM_PERSON {
+            return Err(form_refused(form));
+        }
+        let count = reader.count().ok_or(NotAMessage::Field)?;
+        if count > AGENT_MESSAGE_READ_MARKS_MAX {
+            return Err(NotAMessage::Ids(count));
+        }
+        let ids = (0..count)
+            .map(|_| reader.array().ok_or(NotAMessage::Field))
+            .collect::<Result<_, _>>()?;
+        filled(&reader)?;
+        Ok(Self { ids })
+    }
+}
+
+/// One bound a person set for a pair (decision 2026-10-25, rules 2 and 3),
+/// as a list of bounds holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairBound {
+    /// The first name of the pair: for a pair of two names, not above `b`
+    /// in byte order.
+    pub a: String,
+    /// The other side: a name, or `None` for every agent.
+    pub b: Option<String>,
+    /// The bound: 1 to 64, or `None` for any (no hold).
+    pub bound: Option<u8>,
+    /// What orders it among the bounds of its pair (rule 3.1).
+    pub set: u64,
+    /// The clock of the device it was set on when the yes was typed, in
+    /// seconds since 1970 (rule 3.1): what times its end and its listing.
+    pub at: u64,
+    /// How long it holds, in seconds: 60 to 604,800 (rule 3.3).
+    pub for_secs: u32,
+}
+
+impl PairBound {
+    /// Its bytes in a list of bounds.
+    fn bytes(&self) -> usize {
+        2 + self.a.len() + 1 + self.b.as_ref().map_or(0, |b| 2 + b.len()) + 1 + 8 + 8 + 4
+    }
+}
+
+/// A device's list of the bounds a person set on it (decision 2026-10-25,
+/// rule 2, form 4): as many bounds as fit, the latest `set` first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairBounds {
+    pub bounds: Vec<PairBound>,
+}
+
+/// The kinds of a bound's other side.
+const BOUND_TO_ONE: u8 = 1;
+const BOUND_TO_ALL: u8 = 2;
+
+impl PairBounds {
+    /// Whether these bounds fit in one list's value.
+    pub fn fit(bounds: &[PairBound]) -> bool {
+        bounds.len() <= usize::from(u8::MAX)
+            && 1 + 1 + bounds.iter().map(PairBound::bytes).sum::<usize>()
+                <= AGENT_MESSAGE_VALUE_BYTES
+    }
+
+    /// The list's value. Refused, and never cut to fit, where a reader
+    /// would refuse it or it does not fit: the device sets no bound that
+    /// would not fit (rule 3.6).
+    pub fn to_value(&self, is_a_name: impl Fn(&str) -> bool) -> Result<Vec<u8>, NotAMessage> {
+        if !Self::fit(&self.bounds) {
+            return Err(NotAMessage::Field);
+        }
+        let mut out = Vec::with_capacity(AGENT_MESSAGE_VALUE_BYTES);
+        out.push(FORM_BOUNDS);
+        out.push(self.bounds.len() as u8);
+        for bound in &self.bounds {
+            if bound.a.len() > AGENT_MESSAGE_NAME_MAX_BYTES
+                || bound
+                    .b
+                    .as_ref()
+                    .is_some_and(|b| b.len() > AGENT_MESSAGE_NAME_MAX_BYTES)
+            {
+                return Err(NotAMessage::Field);
+            }
+            put_count(&mut out, bound.a.len());
+            out.extend_from_slice(bound.a.as_bytes());
+            match &bound.b {
+                Some(b) => {
+                    out.push(BOUND_TO_ONE);
+                    put_count(&mut out, b.len());
+                    out.extend_from_slice(b.as_bytes());
+                }
+                None => out.push(BOUND_TO_ALL),
+            }
+            out.push(bound.bound.unwrap_or(0));
+            out.extend_from_slice(&bound.set.to_be_bytes());
+            out.extend_from_slice(&bound.at.to_be_bytes());
+            out.extend_from_slice(&bound.for_secs.to_be_bytes());
+        }
+        out.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+        if Self::from_value(&Value::Other(out.clone()), is_a_name)? != *self {
+            return Err(NotAMessage::Field);
+        }
+        Ok(out)
+    }
+
+    /// Read a list of bounds from an entry's value, as a reader does
+    /// (decision 2026-10-25, rule 2). No list where a name is not a name,
+    /// a kind is not 1 or 2, `a` is above `b` for kind 1, a bound is over
+    /// 64, a `for` is outside 60 to 604,800, one pair is bound twice, the
+    /// bytes run past the value, or the fill is not zeros.
+    pub fn from_value(
+        value: &Value,
+        is_a_name: impl Fn(&str) -> bool,
+    ) -> Result<Self, NotAMessage> {
+        let mut reader = Reader::new(whole(value)?);
+        let form = byte(&mut reader)?;
+        if form != FORM_BOUNDS {
+            return Err(form_refused(form));
+        }
+        let count = byte(&mut reader)?;
+        let mut bounds: Vec<PairBound> = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let a = name_in(
+                field(&mut reader, AGENT_MESSAGE_NAME_MAX_BYTES)?,
+                &is_a_name,
+            )?;
+            let b = match byte(&mut reader)? {
+                BOUND_TO_ONE => {
+                    let b = name_in(
+                        field(&mut reader, AGENT_MESSAGE_NAME_MAX_BYTES)?,
+                        &is_a_name,
+                    )?;
+                    if a.as_bytes() > b.as_bytes() {
+                        return Err(NotAMessage::BoundOrder);
+                    }
+                    Some(b)
+                }
+                BOUND_TO_ALL => None,
+                other => return Err(NotAMessage::BoundKind(other)),
+            };
+            let bound = match byte(&mut reader)? {
+                0 => None,
+                n if usize::from(n) <= AGENT_MESSAGE_RING => Some(n),
+                n => return Err(NotAMessage::Bound(n)),
+            };
+            let set = reader.u64().ok_or(NotAMessage::Field)?;
+            let at = reader.u64().ok_or(NotAMessage::Field)?;
+            let for_secs = u32::from_be_bytes(reader.array().ok_or(NotAMessage::Field)?);
+            if !(AGENT_MESSAGE_PAIR_BOUND_MIN_SECS..=AGENT_MESSAGE_PAIR_BOUND_MAX_SECS)
+                .contains(&for_secs)
+            {
+                return Err(NotAMessage::BoundFor(for_secs));
+            }
+            if bounds.iter().any(|held| held.a == a && held.b == b) {
+                return Err(NotAMessage::BoundTwice);
+            }
+            bounds.push(PairBound {
+                a,
+                b,
+                bound,
+                set,
+                at,
+                for_secs,
+            });
+        }
+        filled(&reader)?;
+        Ok(Self { bounds })
+    }
+}
+
+/// The form of a value of the messages channel: its first byte, where it
+/// is of kind 2 and of its one length. What a reader goes by where a value
+/// in a list's slot is no list (decision 2026-10-25, rule 2): a list of
+/// bounds of form 4 that does not read drops that key's bounds, and a form
+/// this version does not know leaves them.
+pub fn form_of(value: &Value) -> Option<u8> {
+    whole(value).ok().map(|bytes| bytes[0])
+}
+
 /// What an entry of the messages channel is, once its place and its
 /// value agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +625,12 @@ pub enum Taken {
     Clearing { number: u64 },
     /// The signer's list of what its agents read.
     List(ReadMarks),
+    /// The signer's list of what a person read on it (decision 2026-10-25,
+    /// rule 1).
+    PersonList(PersonReads),
+    /// The signer's list of the bounds a person set on it (decision
+    /// 2026-10-25, rule 2).
+    Bounds(PairBounds),
 }
 
 /// Where an entry stands in its signer's slots, by its name and revision.
@@ -378,6 +639,10 @@ pub enum Place {
     Message(u64),
     Clearing(u64),
     List,
+    /// The list of a person's reads (decision 2026-10-25, rule 1).
+    PersonList,
+    /// The list of bounds (decision 2026-10-25, rule 2).
+    Bounds,
 }
 
 /// Where the entry named `name`, signed by `signer`, at revision `rev`,
@@ -389,13 +654,20 @@ pub enum Place {
 ///   half is its number, from 1 to the highest;
 /// - a clearing is in the same slot at an odd revision, whose half,
 ///   rounded down, is the number it clears;
-/// - a list is in `read/<signer>`, at any revision.
+/// - a list is in `read/<signer>`, at any revision, and so are the lists
+///   in `person/<signer>` and `hold/<signer>` (decision 2026-10-25).
 ///
 /// Whether the number is live is the reader's to say, with what it holds
 /// ([`is_live`]).
 pub fn place_of(name: &str, signer: &[u8; 32], rev: u64) -> Option<Place> {
     if name == read_name(signer).ok()? {
         return Some(Place::List);
+    }
+    if name == person_name(signer).ok()? {
+        return Some(Place::PersonList);
+    }
+    if name == hold_name(signer).ok()? {
+        return Some(Place::Bounds);
     }
     let number = number_of(rev);
     if !is_a_number(number) || name != message_name(signer, number).ok()? {
@@ -429,6 +701,8 @@ pub fn take(
             Ok(Taken::Clearing { number })
         }
         Place::List => Ok(Taken::List(ReadMarks::from_value(value)?)),
+        Place::PersonList => Ok(Taken::PersonList(PersonReads::from_value(value)?)),
+        Place::Bounds => Ok(Taken::Bounds(PairBounds::from_value(value, is_a_name)?)),
     }
 }
 
@@ -458,6 +732,24 @@ pub fn message_name(signer: &[u8; 32], number: u64) -> Result<String, CryptoErro
 pub fn read_name(signer: &[u8; 32]) -> Result<String, CryptoError> {
     Ok(format!(
         "{AGENT_MESSAGE_READ_PREFIX}{}",
+        encode_public_key(signer)?
+    ))
+}
+
+/// The name of a device's list of what a person read on it: `person/` and
+/// the device's key as it is written (decision 2026-10-25, rule 1).
+pub fn person_name(signer: &[u8; 32]) -> Result<String, CryptoError> {
+    Ok(format!(
+        "{AGENT_MESSAGE_PERSON_PREFIX}{}",
+        encode_public_key(signer)?
+    ))
+}
+
+/// The name of a device's list of the bounds a person set on it: `hold/`
+/// and the device's key as it is written (decision 2026-10-25, rule 2).
+pub fn hold_name(signer: &[u8; 32]) -> Result<String, CryptoError> {
+    Ok(format!(
+        "{AGENT_MESSAGE_PAIR_BOUNDS_PREFIX}{}",
         encode_public_key(signer)?
     ))
 }
@@ -573,7 +865,9 @@ pub(crate) fn whole(value: &Value) -> Result<&[u8], NotAMessage> {
 /// A form that is known, at a place of another, or one that is not.
 fn form_refused(form: u8) -> NotAMessage {
     match form {
-        FORM_CLEARING | FORM_MESSAGE | FORM_LIST => NotAMessage::AnotherForm(form),
+        FORM_CLEARING | FORM_MESSAGE | FORM_LIST | FORM_PERSON | FORM_BOUNDS => {
+            NotAMessage::AnotherForm(form)
+        }
         other => NotAMessage::Form(other),
     }
 }
@@ -1227,13 +1521,21 @@ mod tests {
             Err(NotAMessage::Length(2_048))
         );
 
-        // A form there is not, and a flag bit but bit 0.
+        // A form there is not, and a flag bit but bit 0. Forms 3 and 4
+        // are the lists of decision 2026-10-25, of another place.
+        assert_eq!(
+            read(Forged {
+                form: 5,
+                ..Forged::new()
+            }),
+            Err(NotAMessage::Form(5))
+        );
         assert_eq!(
             read(Forged {
                 form: 3,
                 ..Forged::new()
             }),
-            Err(NotAMessage::Form(3))
+            Err(NotAMessage::AnotherForm(3))
         );
         for flags in [0b10, 0b11, 0x80] {
             assert_eq!(
@@ -1571,5 +1873,238 @@ mod tests {
         assert_eq!(with("only").subject(), "only");
         assert_eq!(with("\nsecond").subject(), "");
         assert_eq!(with("a\r\nb").subject(), "a\r");
+    }
+
+    /// A bound of the names `a` and `b`, or of `a` and every agent.
+    fn bound_of(a: &str, b: Option<&str>, bound: Option<u8>) -> PairBound {
+        PairBound {
+            a: a.into(),
+            b: b.map(String::from),
+            bound,
+            set: 1_800_000_000,
+            at: 1_800_000_000,
+            for_secs: 28_800,
+        }
+    }
+
+    /// A device's list of what a person read on it (form 3) and its list
+    /// of bounds (form 4) read back as they were written, stand only in
+    /// their own slots, `person/` and `hold/` with the signer's key, and
+    /// a value of either in another's slot is of another form (decision
+    /// 2026-10-25, rules 1 and 2).
+    #[test]
+    fn a_persons_list_and_a_list_of_bounds_read_back_and_stand_in_their_own_slots() {
+        let laptop = device(1).public_key();
+        let desktop = device(2).public_key();
+        let key = encode_public_key(&laptop).unwrap();
+        assert_eq!(person_name(&laptop).unwrap(), format!("person/{key}"));
+        assert_eq!(person_name(&laptop).unwrap().len(), 77);
+        assert_eq!(hold_name(&laptop).unwrap(), format!("hold/{key}"));
+        assert_eq!(hold_name(&laptop).unwrap().len(), 75);
+
+        let ids: Vec<[u8; 16]> = (1..=120u8).map(|k| [k; 16]).collect();
+        let person = PersonReads { ids: ids.clone() };
+        let value = person.to_value().unwrap();
+        assert_eq!(value.len(), AGENT_MESSAGE_VALUE_BYTES);
+        assert_eq!(&value[..3], &[3, 0, 120]);
+        assert_eq!(
+            PersonReads::from_value(&Value::Other(value.clone())),
+            Ok(person)
+        );
+        let over = PersonReads {
+            ids: (0..121u8).map(|k| [k; 16]).collect(),
+        };
+        assert_eq!(over.to_value(), Err(NotAMessage::Ids(121)));
+        let mut said = value.clone();
+        said[2] = 121;
+        assert_eq!(
+            PersonReads::from_value(&Value::Other(said)),
+            Err(NotAMessage::Ids(121))
+        );
+        let mut filled = PersonReads::default().to_value().unwrap();
+        filled[100] = 1;
+        assert_eq!(
+            PersonReads::from_value(&Value::Other(filled)),
+            Err(NotAMessage::Fill)
+        );
+
+        let bounds = PairBounds {
+            bounds: vec![
+                bound_of("notes", Some("work"), Some(20)),
+                bound_of("notes", None, None),
+                bound_of("work", Some("work"), Some(1)),
+            ],
+        };
+        let hold = bounds.to_value(names).unwrap();
+        assert_eq!(hold.len(), AGENT_MESSAGE_VALUE_BYTES);
+        assert_eq!(&hold[..2], &[4, 3]);
+        assert_eq!(
+            PairBounds::from_value(&Value::Other(hold.clone()), names),
+            Ok(bounds.clone())
+        );
+        assert_eq!(form_of(&Value::Other(hold.clone())), Some(FORM_BOUNDS));
+
+        let person = Value::Other(value);
+        let hold = Value::Other(hold);
+        let person_slot = person_name(&laptop).unwrap();
+        let hold_slot = hold_name(&laptop).unwrap();
+        assert_eq!(place_of(&person_slot, &laptop, 7), Some(Place::PersonList));
+        assert_eq!(place_of(&hold_slot, &laptop, 7), Some(Place::Bounds));
+        assert!(matches!(
+            take(&person_slot, &laptop, 7, &person, names),
+            Ok(Taken::PersonList(_))
+        ));
+        assert_eq!(
+            take(&hold_slot, &laptop, 7, &hold, names),
+            Ok(Taken::Bounds(bounds))
+        );
+        // In another key's slots, or each in the other's.
+        assert_eq!(
+            take(&person_slot, &desktop, 7, &person, names),
+            Err(NotAMessage::NotInRing)
+        );
+        assert_eq!(
+            take(&hold_slot, &laptop, 7, &person, names),
+            Err(NotAMessage::AnotherForm(3))
+        );
+        assert_eq!(
+            take(&person_slot, &laptop, 7, &hold, names),
+            Err(NotAMessage::AnotherForm(4))
+        );
+        let marks = Value::Other(ReadMarks::default().to_value().unwrap());
+        assert_eq!(
+            take(&hold_slot, &laptop, 7, &marks, names),
+            Err(NotAMessage::AnotherForm(2))
+        );
+    }
+
+    /// A list of bounds is no list where a name is not a name, the kind of
+    /// `b` is not 1 or 2, `a` is above `b` for kind 1, a bound is over 64,
+    /// a `for` is outside 60 to 604,800, one pair is bound twice, the
+    /// bytes run past the value, or the fill is not zeros; `a` equal to
+    /// `b` is a pair. Four bounds at the longest names fit, and a fifth
+    /// does not (decision 2026-10-25, rule 2).
+    #[test]
+    fn a_reader_refuses_each_list_of_bounds_that_is_not_one() {
+        let read = |value: Vec<u8>| PairBounds::from_value(&Value::Other(value), names);
+        let one = |bound: PairBound| {
+            // Written by hand, so that what the writer refuses can be said.
+            let mut out = vec![4, 1];
+            put_count(&mut out, bound.a.len());
+            out.extend_from_slice(bound.a.as_bytes());
+            match &bound.b {
+                Some(b) => {
+                    out.push(1);
+                    put_count(&mut out, b.len());
+                    out.extend_from_slice(b.as_bytes());
+                }
+                None => out.push(2),
+            }
+            out.push(bound.bound.unwrap_or(0));
+            out.extend_from_slice(&bound.set.to_be_bytes());
+            out.extend_from_slice(&bound.at.to_be_bytes());
+            out.extend_from_slice(&bound.for_secs.to_be_bytes());
+            out.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+            out
+        };
+        let good = bound_of("notes", Some("work"), Some(20));
+        assert!(read(one(good.clone())).is_ok());
+        // A name that is not a name, in either place.
+        assert_eq!(
+            read(one(bound_of("Notes", Some("work"), None))),
+            Err(NotAMessage::Name)
+        );
+        assert_eq!(
+            read(one(bound_of("notes", Some("WORK"), None))),
+            Err(NotAMessage::Name)
+        );
+        // A kind other than 1 or 2.
+        let mut kind = one(good.clone());
+        kind[2 + 2 + 5] = 3;
+        assert_eq!(read(kind), Err(NotAMessage::BoundKind(3)));
+        // `a` above `b`; equal is a pair.
+        assert_eq!(
+            read(one(bound_of("work", Some("notes"), None))),
+            Err(NotAMessage::BoundOrder)
+        );
+        assert!(read(one(bound_of("work", Some("work"), None))).is_ok());
+        // A bound over 64; 64 is one.
+        assert_eq!(
+            read(one(bound_of("notes", Some("work"), Some(65)))),
+            Err(NotAMessage::Bound(65))
+        );
+        assert!(read(one(bound_of("notes", Some("work"), Some(64)))).is_ok());
+        // A `for` outside 60 to 604,800.
+        for (for_secs, taken) in [(59, false), (60, true), (604_800, true), (604_801, false)] {
+            let bound = PairBound {
+                for_secs,
+                ..good.clone()
+            };
+            match taken {
+                true => assert!(read(one(bound)).is_ok(), "{for_secs}"),
+                false => assert_eq!(
+                    read(one(bound)),
+                    Err(NotAMessage::BoundFor(for_secs)),
+                    "{for_secs}"
+                ),
+            }
+        }
+        // Two bounds of one pair.
+        let twice = PairBounds {
+            bounds: vec![
+                good.clone(),
+                PairBound {
+                    set: 7,
+                    ..good.clone()
+                },
+            ],
+        };
+        assert_eq!(twice.to_value(names), Err(NotAMessage::BoundTwice));
+        // A fill that is not zeros.
+        let mut fill = one(good.clone());
+        fill[AGENT_MESSAGE_VALUE_BYTES - 1] = 1;
+        assert_eq!(read(fill), Err(NotAMessage::Fill));
+        // Of every agent: no `b` is carried.
+        assert!(read(one(bound_of("notes", None, Some(3)))).is_ok());
+
+        // Four at the longest names fit, 1,706 bytes; a fifth does not.
+        let long = |c: char| c.to_string().repeat(AGENT_MESSAGE_NAME_MAX_BYTES);
+        let four: Vec<PairBound> = ['a', 'b', 'c', 'd']
+            .iter()
+            .map(|c| PairBound {
+                a: long(*c),
+                b: Some(long('z')),
+                ..good.clone()
+            })
+            .collect();
+        assert!(PairBounds::fit(&four));
+        let value = PairBounds {
+            bounds: four.clone(),
+        }
+        .to_value(names)
+        .unwrap();
+        assert!(value[1706..].iter().all(|b| *b == 0));
+        assert_ne!(value[1705], 0);
+        // Bytes that run past the value: a fifth whose `b` would end past
+        // it.
+        let mut past = value.clone();
+        past[1] = 5;
+        let mut at = 1706;
+        for part in [&[0u8, 200][..], &[b'e'; 200], &[1, 0, 200]] {
+            past[at..at + part.len()].copy_from_slice(part);
+            at += part.len();
+        }
+        assert_eq!(read(past), Err(NotAMessage::Field));
+        let mut five = four;
+        five.push(PairBound {
+            a: long('e'),
+            b: Some(long('z')),
+            ..good
+        });
+        assert!(!PairBounds::fit(&five));
+        assert_eq!(
+            PairBounds { bounds: five }.to_value(names),
+            Err(NotAMessage::Field)
+        );
     }
 }

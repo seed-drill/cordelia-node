@@ -2486,16 +2486,35 @@ the entry that clears one, and `read/` and the device's key for its list.
 Neither begins the other. Each device writes only in slots named for its
 own key, and a reader takes from them only what that key signed.
 
+#### AGENT_MESSAGE_PERSON_PREFIX = `person/`, AGENT_MESSAGE_PAIR_BOUNDS_PREFIX = `hold/`
+
+**Rationale:** The first parts of the names of a device's two lists of what
+a person did at a terminal ([decision 2026-10-25](../decisions/2026-10-25-a-persons-hold-on-messages.md),
+rules 1 and 2): `person/` and the device's key for its list of what a
+person read on it, and `hold/` and the key for its list of the bounds a
+person set on it. With a key, `person/` is 77 bytes, the longest name that
+the channel's value is sized by (`AGENT_MESSAGE_VALUE_BYTES`), so the size
+does not change; a longer prefix would need a smaller value. `hold/` is 75.
+No prefix of the channel begins another, which `protocol.rs` tests.
+
 #### AGENT_MESSAGE_RING = 64
 
 **Rationale:** A device's slots for its messages (record §2.3), the live
 numbers of one signer at a reader (§2.5), and the places a reader gives one
-signer in an hour (§6). With its list, a device has 65 slots of 3,072 bytes
-as counted: at the cap of 64 devices that count, 12,779,520 bytes, under a
-channel's 16 MiB at a relay, so no honest device's first message is refused
-for room. It is above the device's hourly limit, so an honest device's hour
-of messages is never overwritten within the hour, and a reader that was
-away is shown a whole ring at once.
+signer in an hour (§6). With its three lists (of what its agents read, of
+what a person read on it, and of the bounds a person set on it, decision
+2026-10-25), a device has 67 slots of 3,072 bytes as counted: 205,824
+bytes, and at the cap of 64 devices that count 13,172,736 bytes (12.6 MiB),
+under a channel's 16 MiB at a relay, so no honest device's first message is
+refused for room. `protocol.rs` checks `AGENT_MESSAGE_RING + 3`. It is above
+the device's hourly limit, so an honest device's hour of messages is never
+overwritten within the hour, and a reader that was away is shown a whole
+ring at once.
+
+It is also the highest bound a person can set for a pair (decision
+2026-10-25, rule 2): one lap of a device's ring. Above it a bound stops no
+loop between two agents of one device, whose messages overwrite each other
+before anyone reads them, and `any` says no hold plainly.
 
 #### AGENT_MESSAGE_CONTENT_BYTES = 2,048, AGENT_MESSAGE_VALUE_BYTES = 1,936
 
@@ -2555,13 +2574,21 @@ read (record §2.4). One that reads more between two fetches by another
 device loses the oldest for that device, which then shows them unread: at
 worst one request is acted on twice.
 
+It is also the most IDs in a device's list of what a person read on it,
+whose IDs are 16 bytes as marks are, and the most rows of messages it does
+not hold that a device keeps of each key's lists of a person's reads
+(decision 2026-10-25, rule 1): a person's read that arrives before its
+message loses nothing while it is among them.
+
 #### AGENT_MESSAGE_KEPT_DAYS = 30
 
 **Rationale:** A message is shown for 30 days from its shown time, and its
 sender clears it at the relays at its 30 days (record §7.1). Messages are
 coordination, not a record. Long enough for a laptop closed over a holiday
 to hear what was asked of it. Also how long a kept value waits for every
-relay to take it (§2.3).
+relay to take it (§2.3), and how long a device keeps a person's read of a
+message it does not hold, from when it was taken (decision 2026-10-25, rule
+1): a message older than that is not shown when it comes.
 
 #### AGENT_MESSAGE_AHEAD_MAX_SECS = 600
 
@@ -2571,6 +2598,9 @@ ahead is passed over, so a device whose clock was ahead for a moment, and
 sent then, is not locked out until that row goes. The person's machines
 keep time by the network to within seconds, and ten minutes covers one that
 has woken and not yet set its clock. A reader uses no such bound.
+
+It is also the clock's margin in `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS`
+(decision 2026-10-25, rule 3.5).
 
 #### AGENT_MESSAGE_SENDS_MAX = 4
 
@@ -2584,7 +2614,9 @@ most four, so a relay that answers `Another` falsely makes the device write
 its list again at most three times for each list written for a new mark.
 The same figure serves, since a list is answered so for the same causes as
 a message, a store restored behind one relay or two, and each list written
-again is the one entry in its slot, so the margin costs nothing.
+again is the one entry in its slot, so the margin costs nothing. So it
+bounds the revisions of a device's list of a person's reads, and of its list
+of bounds, each counted apart (decision 2026-10-25, rules 1 and 2).
 
 #### AGENT_MESSAGES_PER_FOLDER_PER_HOUR = 20, AGENT_MESSAGES_PER_DEVICE_PER_HOUR = 60
 
@@ -2599,9 +2631,39 @@ every name counts as one, and each sending again counts as one.
 #### AGENT_MESSAGE_PAIR_UNREAD_MAX = 10
 
 **Rationale:** Ten messages between two agents that are shown on a device
-and that no person there has read stop that device sending between them,
-until a person reads them there (record §6). Chosen with the folder's rate;
-no measurement behind it yet.
+and that no person has read stop that device sending between them, until a
+person reads them on any device (record §6). Chosen with the folder's rate;
+no measurement behind it yet. It is the usual hold: the bound of every pair
+until a person sets another, and again when it ends (decision 2026-10-25,
+rule 3).
+
+#### AGENT_MESSAGE_PAIR_BOUND_SECS = 28,800
+
+**Rationale:** How long a bound that a person sets for a pair with `cordelia
+msg allow` holds where `--for` gives none ([decision 2026-10-25](../decisions/2026-10-25-a-persons-hold-on-messages.md),
+rule 2): 8 hours, a working day, so that what is allowed for a task is gone
+by the next morning.
+
+#### AGENT_MESSAGE_PAIR_BOUND_MAX_SECS = 604,800, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS = 60
+
+**Rationale:** The longest `--for`, and the `for` of a 10 (decision
+2026-10-25, rules 2 and 3.3): 7 days, a week away, after which a bound that
+was forgotten ends by itself. Under `any`, two folders' 20 an hour bound a
+loop to 6,720 messages in that time. The shortest is a minute, as `--for` is
+given in minutes at the least (`1m`); a list of bounds that says a `for`
+outside the two is no list.
+
+#### AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS = 605,400
+
+**Derivation:** `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS` and
+`AGENT_MESSAGE_AHEAD_MAX_SECS`: 604,800 + 600.
+
+**Rationale:** How long after its `at`, by its own clock, a device lists the
+latest bound it set for a pair (decision 2026-10-25, rule 3.5): every bound
+it overrode has ended before it leaves the list, with a clock's 10 minutes,
+so no older bound comes back from a device that was off or a relay that is
+behind. A list of bounds is listed that long, so a device holds the pairs
+set in the last week.
 
 #### AGENT_MESSAGE_SUMMARY_LINES = 5, AGENT_MESSAGE_SUBJECT_CHARS = 80, AGENT_MESSAGE_AGENT_NAME_CHARS = 48
 
