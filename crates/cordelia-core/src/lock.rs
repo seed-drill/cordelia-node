@@ -13,10 +13,11 @@
 //! guard is dropped, and [`take_as`] for a future, each time it is polled,
 //! on whatever thread. A take that nothing said a kind for is `Other`.
 //!
-//! **The two mutexes taken while the lock is held at a relay,** its rates
-//! and its room, are taken through the guard ([`TimedGuard::nested`]):
-//! the time spent waiting for them is recorded apart, so that a wait on
-//! them is not read as a long hold of the store. It is in the hold all the
+//! **The three mutexes taken while the lock is held at a relay,** its
+//! rates, its room and the uses of channels it keeps, are taken through
+//! the guard ([`TimedGuard::nested`]): the time spent waiting for them is
+//! recorded apart, so that a wait on them is not read as a long hold of
+//! the store. It is in the hold all the
 //! same: a hold is how long the store was held.
 //!
 //! **What timing costs** is a read of the monotonic clock and an addition
@@ -109,17 +110,21 @@ pub enum Nested {
     Rates,
     /// A relay's room for entries.
     Room,
+    /// The uses of channels that a relay keeps until they are written
+    /// (issue #214).
+    Uses,
 }
 
 impl Nested {
     /// Each of them, in the order they are served.
-    pub const ALL: [Nested; 2] = [Nested::Rates, Nested::Room];
+    pub const ALL: [Nested; 3] = [Nested::Rates, Nested::Room, Nested::Uses];
 
     /// Its name, as the route serves it.
     pub fn name(self) -> &'static str {
         match self {
             Nested::Rates => "rates",
             Nested::Room => "room",
+            Nested::Uses => "uses",
         }
     }
 }

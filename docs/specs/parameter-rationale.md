@@ -1923,6 +1923,45 @@ channel is kept, an hour is nothing.
 **Derivation:** As often as expired deletes are collected,
 `TOMBSTONE_GC_INTERVAL_SECS`. Hourly is plenty against 90 days.
 
+The sweep writes the uses that the relay keeps in memory first, in the
+same hold of the lock (`RELAY_USES_WRITE_INTERVAL_SECS`), so that it reads
+every use there was.
+
+#### RELAY_USES_WRITE_INTERVAL_SECS = 60
+
+**Rationale:** How often a relay writes the uses of channels that it keeps
+in memory (issue #214). A proof, and an entry shown that the relay holds,
+are reads: neither writes with the relay's lock held. In stage 100 of the
+scale test a proof held the lock 16.4 ms at p99, against 1 ms for a read,
+because where the time kept was more than an hour old it was written, a
+commit for each, and after churn or a restart every device proves all its
+channels at once. The relay keeps each channel's latest use in memory and
+writes them in one transaction: at this interval, at its hourly sweep
+(before the sweep reads them, in the same hold of the lock), and at a clean
+stop. The rule of `ENTRY_CHANNEL_USED_STEP_SECS` holds at the write itself:
+a time more than an hour later than the one kept, never an earlier one.
+
+**Why a minute, and not an existing constant:** the two at hand are an
+hour. `ENTRY_CHANNEL_USED_STEP_SECS` says how much later a time must be to
+be written, not when writes are made. `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS`
+would do for the sweep alone, but a relay tells a relay it works with when
+each channel was last used from what it has written (§2.4 item 6), and an
+hour more of lag there, and an hour of uses lost when a relay stops
+uncleanly, buy nothing: a channel is written at most once in the step
+whatever the interval, so a minute writes no more rows in an hour than an
+hour does, in smaller transactions, each a short hold of the lock. Under a
+minute would be more commits for no gain against 90 days.
+
+**What it costs:** a time on disk, and what a listed relay is told, lags
+the last use by at most the step and a minute. A relay that stops
+uncleanly loses at most a minute of uses: a channel in use is proved again
+on its devices' next passes, and one that is not had its time kept at most
+an hour and a minute early, which brings its drop that much nearer after
+90 days. Measured with 2,000 proofs on one relay with its database on
+disk, each of a channel whose time kept was two hours old: a proof's hold
+of the lock went from a mean of 517 µs (at most 31 ms) to 10 µs (at most
+0.2 ms), and the one write of the 2,000 uses held it for about 6 ms.
+
 #### KEYED_TOMBSTONE_RETENTION_DAYS = 90, for a delete among entries
 
 **Rationale:** The value is the one that the record of 2026-09-30 gives a

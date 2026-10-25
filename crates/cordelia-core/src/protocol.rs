@@ -1683,10 +1683,22 @@ pub const ENTRY_CHANNEL_UNUSED_DAYS: u32 = 90;
 pub const ENTRY_CHANNEL_USED_STEP_SECS: u64 = 60 * 60;
 
 /// How often a relay drops the channels from their secrets that nobody
-/// uses (decision 2026-10-04 §2.5), and when it starts.
+/// uses (decision 2026-10-04 §2.5), and when it starts. The uses that the
+/// relay keeps in memory are written first, in the same hold of its lock.
 /// Derived: as often as expired deletes are collected,
 /// TOMBSTONE_GC_INTERVAL_SECS. Hourly is plenty against 90 days.
 pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
+
+/// How often a relay writes the uses of channels that it keeps in memory:
+/// once a minute, in one transaction, and at its sweep and a clean stop as
+/// well (issue #214). A proof, and an entry shown that the relay holds,
+/// are reads: none writes with the relay's lock held. Each channel's time
+/// is still written at most once in ENTRY_CHANNEL_USED_STEP_SECS, so a
+/// shorter interval writes no more rows in an hour, in smaller batches. A
+/// time on disk, and what a listed relay is told of it, lags the last use
+/// by at most this and the step; a relay that stops uncleanly loses at
+/// most this much of its uses, against ENTRY_CHANNEL_UNUSED_DAYS.
+pub const RELAY_USES_WRITE_INTERVAL_SECS: u64 = 60;
 
 /// How often a device sweeps from its own store the deletes that it has
 /// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
@@ -3687,6 +3699,11 @@ mod tests {
         assert!(
             ENTRY_CHANNEL_USED_STEP_SECS * 1000 < u64::from(ENTRY_CHANNEL_UNUSED_DAYS) * 86_400
         );
+        // The uses kept in memory are written well within the step, and
+        // so within the sweep's hour.
+        assert_eq!(RELAY_USES_WRITE_INTERVAL_SECS, 60);
+        const { assert!(RELAY_USES_WRITE_INTERVAL_SECS < ENTRY_CHANNEL_USED_STEP_SECS) };
+        const { assert!(RELAY_USES_WRITE_INTERVAL_SECS < ENTRY_CHANNEL_SWEEP_INTERVAL_SECS) };
         // One entry of the largest size is within what a channel may hold.
         assert!(entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
         // And is what a pull leaves room for, in what a key may be handed

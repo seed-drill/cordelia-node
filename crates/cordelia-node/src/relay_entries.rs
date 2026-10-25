@@ -46,6 +46,20 @@
 //! - **Push** (§2.4 items 1 and 2). Each entry is checked and taken by the
 //!   store's rule, and each is answered for.
 //!
+//! ## When a channel was used
+//!
+//! A proof that holds for a channel the relay holds, and an entry shown,
+//! whole or in short, that the relay holds, are use of the channel
+//! (decision 2026-10-04 §2.5). None of them writes: each is answered by
+//! reading, and the use is kept in memory ([`Uses`]), with the database's
+//! lock held, so that a sweep that holds it sees every use before it. The
+//! uses are written in one transaction once a minute
+//! (RELAY_USES_WRITE_INTERVAL_SECS), at the hourly sweep, before it reads
+//! them, and at a clean stop ([`RelayEntries::write_uses`]), by the rule
+//! of §16: a time more than an hour later than the one kept, never an
+//! earlier one (issue #214). The same is done with when a listed relay
+//! says a channel was last used.
+//!
 //! ## Who asks
 //!
 //! A peer is its address, for the room's allowance of new channels, or it
@@ -115,7 +129,7 @@ use std::time::{Duration, Instant};
 
 use cordelia_core::NodeId;
 use cordelia_core::load::{Answered, Kind, Refusal, Stream, StreamCounts};
-use cordelia_core::lock::{LockWhole, Nested, TimedLock, take_as, taking};
+use cordelia_core::lock::{LockWhole, Nested, TimedGuard, TimedLock, take_as, taking};
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     FRAME_LENGTH_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
@@ -124,7 +138,6 @@ use cordelia_core::protocol::{
     SMALL_WINDOWS_PULL_ENTRIES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
-use cordelia_crypto::proof;
 use cordelia_network::codec;
 use cordelia_network::messages::{
     ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryRefused,
@@ -132,7 +145,9 @@ use cordelia_network::messages::{
     RelayChannelsHeld, RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
 };
 use cordelia_network::transport;
-use cordelia_storage::relay::{self, Asker, Mark, Refused, Room, Shown, Taken};
+use cordelia_storage::relay::{
+    self, Asker, Mark, Proof, Refused, Room, Shown, ShownShort, Taken, Uses,
+};
 use rusqlite::Connection;
 
 use crate::p2p::{OverLimit, Rates, RelayAddrs};
@@ -531,6 +546,10 @@ pub struct RelayEntries {
     /// of more channels than one pass reads: the next goes on after that
     /// ID. A relay whose list was read to its end has none.
     stopped_at: Mutex<HashMap<NodeId, [u8; 32]>>,
+    /// When the channels it holds were used, as it saw them, until they
+    /// are written: once a minute, at the hourly sweep, and at a clean
+    /// stop. Taken with the database's lock held.
+    uses: Mutex<Uses>,
     /// How long a channel that found no room here is left before it is
     /// pulled again from a listed relay.
     ask_again: Duration,
@@ -553,6 +572,7 @@ impl RelayEntries {
             places: Mutex::default(),
             pulling: Mutex::default(),
             stopped_at: Mutex::default(),
+            uses: Mutex::default(),
             ask_again,
             most_proved: MAX_CHANNELS_PROVED_ON_A_CONNECTION,
             counts: Arc::default(),
@@ -623,15 +643,56 @@ impl RelayEntries {
         self.sweep_at(db, unix_now());
     }
 
-    /// [`Self::sweep`], at `now`, this relay's time in seconds.
+    /// [`Self::sweep`], at `now`, this relay's time in seconds. The uses
+    /// that the relay kept are written first, in the same hold of the
+    /// lock: the sweep reads every use there was before it.
     fn sweep_at(&self, db: &TimedLock<Connection>, now: i64) {
         let _sweep = taking(Kind::Sweep);
         lock(&self.room).forget_old(now);
         let Ok(db) = db.lock() else { return };
+        self.uses_written(&db);
         match relay::sweep_unused(&db, now) {
             Ok(dropped) => self.dropped(&dropped, "unused"),
             Err(e) => tracing::warn!(error = %e, "could not sweep the channels nobody uses"),
         }
+    }
+
+    /// Write the uses of channels that the relay kept, in one transaction
+    /// (issue #214): once a minute, RELAY_USES_WRITE_INTERVAL_SECS, and at
+    /// a clean stop. The hourly sweep writes them as well, before it reads
+    /// them.
+    ///
+    /// A relay that stops uncleanly loses the uses of one interval at
+    /// most. That is harmless: a channel that is in use is proved again on
+    /// its devices' next passes, and one that is not was last used at most
+    /// an hour and a minute after the time kept (the step and the
+    /// interval), which brings its drop at most that much nearer at the
+    /// end of 90 days.
+    pub fn write_uses(&self, db: &TimedLock<Connection>) {
+        let _sweep = taking(Kind::Sweep);
+        let Ok(db) = db.lock() else { return };
+        self.uses_written(&db);
+    }
+
+    /// [`Self::write_uses`], with the database's lock held. What could not
+    /// be written is kept, for the next time.
+    fn uses_written(&self, db: &TimedGuard<'_, Connection>) {
+        let mut uses = db.nested(Nested::Uses, &self.uses);
+        let kept = uses.len();
+        match relay::write_uses(db, &mut uses) {
+            Ok(written) => {
+                if kept > 0 {
+                    tracing::debug!(kept, written, "wrote when channels of entries were used");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, kept, "could not write when channels were used"),
+        }
+    }
+
+    /// The relay saw `channel` used at `at` (decision 2026-10-04 §2.5): it
+    /// is kept, with the database's lock held, until it is written.
+    fn used(&self, db: &TimedGuard<'_, Connection>, channel: &[u8; 32], at: i64) {
+        db.nested(Nested::Uses, &self.uses).used(channel, at);
     }
 
     /// Drop each slot in which every entry is a delete that the relay has
@@ -779,6 +840,10 @@ impl RelayEntries {
                     return Answer::Nothing;
                 }
             };
+            // An entry held: use of its channel, kept and not written.
+            if found == Shown::Held {
+                self.used(&db, &entry.channel, now);
+            }
             // The entry that goes back counts against the asker's limits
             // as anything fetched does. It goes back while neither
             // allowance is over already, also where it takes the asker
@@ -845,15 +910,19 @@ impl RelayEntries {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            relay::show_short(
+            let found = relay::show_short(
                 &db,
                 &show.channel,
                 &show.slot,
                 &show.author,
                 show.rev,
                 &show.id,
-                now,
-            )
+            );
+            // An entry held: use of its channel, kept and not written.
+            if matches!(found, Ok(ShownShort::Held)) {
+                self.used(&db, &show.channel, now);
+            }
+            found
         };
         match found {
             Ok(found) => Answer::of(WireMessage::EntryShown(EntryShown {
@@ -892,27 +961,26 @@ impl RelayEntries {
             return no;
         }
         // The signature, before the channel is looked up and before the
-        // database is held.
-        if !proof::check(
+        // database is held, and only here: what the store is given is a
+        // proof that was checked, and it does not check it again.
+        let Some(checked) = relay::check_proof(
             &prove.channel,
             &session.value,
             &session.prover,
             &prove.proof,
-        ) {
+        ) else {
             return no;
-        }
+        };
+        // A read: the use of a channel held is kept, and not written.
         let found = {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            relay::prove(
-                &db,
-                &prove.channel,
-                &session.value,
-                &session.prover,
-                &prove.proof,
-                now,
-            )
+            let found = relay::prove(&db, &checked);
+            if matches!(found, Ok(Proof::Holds { channel_held: true })) {
+                self.used(&db, checked.channel(), now);
+            }
+            found
         };
         let found = match found {
             Ok(found) => found,
@@ -1247,8 +1315,10 @@ impl RelayEntries {
             if told.held_since > 0 && told.held_since < held.held_since {
                 let _ = relay::listed_relay_says(&db, &told.channel, told.held_since);
             }
+            // When it was last used is kept with this relay's own uses,
+            // and written with them: never later than this relay's clock.
             if told.used_at > held.used_at {
-                let _ = relay::listed_relay_used(&db, &told.channel, told.used_at, now);
+                self.used(&db, &told.channel, told.used_at.min(now));
             }
         }
         let kept = lock(&self.places).get(relay, &told.channel);
@@ -1988,6 +2058,7 @@ mod tests {
     use cordelia_crypto::derive;
     use cordelia_crypto::entry::{Entry, Inside, Value};
     use cordelia_crypto::identity::NodeIdentity;
+    use cordelia_crypto::proof;
     use cordelia_network::bootstrap::RelayAddr;
     use cordelia_network::messages::EntryRefused;
 
@@ -2338,6 +2409,12 @@ mod tests {
         /// The channel numbered `c` as the relay holds it.
         fn held(&self, c: u16) -> Option<relay::HeldChannel> {
             relay::held_channel(&lock(&self.db), &channel(c)).unwrap()
+        }
+
+        /// The use of the channel numbered `c` that the relay keeps, not
+        /// yet written.
+        fn kept(&self, c: u16) -> Option<i64> {
+            lock(&self.entries.uses).of(&channel(c))
         }
 
         /// What the relay holds of this kind, as entries are counted.
@@ -3074,13 +3151,19 @@ mod tests {
         // None of it was use of the channel, and nothing is remembered of
         // a proof that failed.
         assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(1), None);
         assert_eq!(proved.len(), 0);
         assert!(!proved.holds(&channel(1)));
 
-        // The proof: yes, and the channel was used.
+        // The proof: yes, and the channel was used. The use is kept, and
+        // written with the others: the proof wrote nothing.
         let good = proof::make(&secret(1), &session.value, &session.prover).unwrap();
         assert!(prove(1, good, Some(&session), &mut proved));
+        assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(1), Some(NOW));
+        at.entries.write_uses(&at.db);
         assert_eq!(at.held(1).unwrap().used_at, NOW);
+        assert_eq!(at.kept(1), None);
         // The same proof on a connection with another value, or from
         // another peer, is none: the connection is what it is checked
         // against, and nothing in the message says who proves.
@@ -3214,6 +3297,7 @@ mod tests {
         // Nothing is remembered for it, and it was no use of the channel.
         assert!(!prove(2000, &mut proved));
         assert_eq!(at.held(2000).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(2000), None);
         assert!(!proved.holds(&channel(2000)));
         // Nor any after it.
         assert!(!prove(2001, &mut proved));
@@ -3224,6 +3308,8 @@ mod tests {
             .execute("UPDATE relay_channels SET used_at = ?1", [NOW - 2 * HOUR])
             .unwrap();
         assert!(prove(7, &mut proved));
+        assert_eq!(at.kept(7), Some(NOW));
+        at.entries.write_uses(&at.db);
         assert_eq!(at.held(7).unwrap().used_at, NOW);
         assert_eq!(proved.len(), 1024);
 
@@ -4646,15 +4732,13 @@ mod tests {
         // One of them was used since: its key was proved there.
         let session = [0x51; 32];
         let proof = proof::make(&secret(3), &session, &peer(1).0).unwrap();
-        relay::prove(
-            &lock(&other.db),
-            &channel(3),
-            &session,
-            &peer(1).0,
-            &proof,
-            then + 2 * HOUR,
-        )
-        .unwrap();
+        let checked = relay::check_proof(&channel(3), &session, &peer(1).0, &proof).unwrap();
+        {
+            let db = other.db.lock().unwrap();
+            assert!(relay::prove(&db, &checked).unwrap().answer());
+            other.entries.used(&db, &channel(3), then + 2 * HOUR);
+        }
+        other.entries.write_uses(&other.db);
 
         let link = Link::to(&other);
         this.entries.pull_from(&link, peer(8), &this.db).await;
@@ -4882,6 +4966,11 @@ mod tests {
             .unwrap();
         this.entries.pull_from(&link, peer(8), &this.db).await;
         assert!(link.pulls().is_empty());
+        // When it was last used is kept with this relay's uses, and
+        // written with them.
+        assert_eq!(this.held(1).unwrap().used_at, now - 3 * HOUR);
+        assert_eq!(this.kept(1), Some(now - 5));
+        this.entries.write_uses(&this.db);
         let first = this.held(1).unwrap();
         assert_eq!(
             (first.held_since, first.used_at),
