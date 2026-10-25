@@ -3578,6 +3578,43 @@ mod tests {
         assert!(listed_relay_says(&conn, &channel(1), NOW - DAY).unwrap());
     }
 
+    /// A proof, a show of an entry held, a short show and a pull change
+    /// nothing in the database (issue #214): its count of changes is the
+    /// same after each, at any time after the time kept. A show that the
+    /// relay takes from is the control.
+    #[test]
+    fn test_a_proof_a_show_and_a_pull_write_nothing() {
+        let (conn, mut room) = relay();
+        let held_entry = small(1, 1, 5);
+        take(&conn, &mut room, &held_entry, &from(1), NOW).unwrap();
+        let proof = proof::make(&secret(1), &SESSION, &peer()).unwrap();
+        let changes = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = changes(&conn);
+        for at in [NOW + 600, NOW + HOUR + 1, NOW + 89 * DAY] {
+            assert_eq!(
+                answer_proof(&conn, &channel(1), &SESSION, &peer(), &proof).unwrap(),
+                Proof::Holds { channel_held: true }
+            );
+            assert_eq!(
+                show(&conn, &mut room, &held_entry, &from(2), at).unwrap(),
+                Shown::Held
+            );
+            assert_eq!(short(&conn, &held_entry).unwrap(), ShownShort::Held);
+            assert_eq!(paged(&conn, 1, true, 0, 100).entries.len(), 1);
+            assert_eq!(changes(&conn), before, "{}", at - NOW);
+        }
+        assert_eq!(used_at(&conn, 1), Some(NOW));
+        // The control: a show that is taken writes.
+        assert_eq!(
+            show(&conn, &mut room, &small(1, 1, 6), &from(2), NOW + 600).unwrap(),
+            Shown::Taken
+        );
+        assert!(changes(&conn) > before);
+    }
+
     // ── Relays that work together ────────────────────────────────────
 
     /// A channel was last used at the later of two times: when this relay

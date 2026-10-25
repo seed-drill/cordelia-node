@@ -3101,6 +3101,274 @@ mod tests {
         assert_eq!(breaches(&at, 5), (1, 1));
     }
 
+    // ── When a channel was used ──────────────────────────────────────
+
+    /// The rows the relay's database has changed since it was opened.
+    fn changes(at: &Relay) -> i64 {
+        lock(&at.db)
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A proof, a show of an entry held, whole and in short, and a pull
+    /// write nothing with the lock held (issue #214), where the time kept
+    /// is two hours old and each would have been written: the database's
+    /// count of changes is as it was. The use of the channel is kept in
+    /// memory, at the time of the request. What is no use (a proof that
+    /// fails, an earlier entry shown, a pull) keeps nothing.
+    #[test]
+    fn a_proof_a_show_and_a_pull_write_nothing_and_keep_the_use() {
+        let at = relay();
+        let held_entry = small(1, 1, 5);
+        at.hold(&held_entry, NOW - 2 * HOUR);
+        at.hold(&small(2, 1, 5), NOW - 2 * HOUR);
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        let before = changes(&at);
+        let prove = |c: u16, proof: [u8; 64], proved: &mut Proved| {
+            proved_said(at.answer(
+                1,
+                Protocol::ChannelProve,
+                WireMessage::ChannelProve(ChannelProve {
+                    channel: channel(c),
+                    proof,
+                }),
+                Some(&session),
+                proved,
+            ))
+        };
+
+        // What is no use: a proof that fails, an earlier entry of channel
+        // 2 shown, and a pull of it.
+        let mut proved = Proved::default();
+        assert!(!prove(2, [7; 64], &mut proved));
+        assert!(matches!(
+            at.show(1, small(2, 1, 4).to_wire()),
+            Answer::Message(..)
+        ));
+        let none = Proved::default();
+        page(at.pull(1, 2, &none, relay::NO_MARK, 0));
+        assert_eq!(at.kept(2), None);
+
+        // A proof that holds.
+        let good = proof::make(&secret(1), &session.value, &session.prover).unwrap();
+        assert!(prove(1, good, &mut proved));
+        assert_eq!(changes(&at), before, "a proof wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        *lock(&at.entries.uses) = Uses::default();
+        // An entry held, shown whole, and then in short.
+        let mut whole = ShownWhole::default();
+        let show = WireMessage::EntryShow(EntryShow {
+            entry: held_entry.to_wire(),
+        });
+        assert_eq!(at.show_on(1, &mut whole, show), ShowAnswer::Held);
+        assert_eq!(changes(&at), before, "a show wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        *lock(&at.entries.uses) = Uses::default();
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&held_entry)),
+            ShowAnswer::Held
+        );
+        assert_eq!(changes(&at), before, "a short show wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        // A pull of the channel proved.
+        assert_eq!(
+            page(at.pull(1, 1, &proved, relay::NO_MARK, 0))
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(changes(&at), before, "a pull wrote");
+        assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+
+        // The control: the uses kept are written, as one.
+        at.entries.write_uses(&at.db);
+        assert_eq!(at.held(1).unwrap().used_at, NOW);
+        assert_eq!(at.held(2).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(changes(&at), before + 1);
+    }
+
+    /// The uses that a relay keeps are written at its hourly sweep, before
+    /// the sweep reads them, and at a clean stop ([`RelayEntries::write_uses`]),
+    /// by the rule of decision 2026-10-04 §16: a time is written only where
+    /// it is more than an hour later than the time kept, and an earlier one
+    /// never. From made-up times.
+    #[test]
+    fn the_uses_kept_are_written_at_the_sweep_and_at_a_stop_more_than_an_hour_later_only() {
+        let at = relay();
+        let t = NOW;
+        for c in 1..=3 {
+            at.hold(&small(c, 1, 5), t);
+        }
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        // Channel `c` proved at `when`, by the stream.
+        let prove_at = |c: u16, when: i64| {
+            let proof = proof::make(&secret(c), &session.value, &session.prover).unwrap();
+            let answer = at.entries.proving(
+                &at.db,
+                Some(&session),
+                &mut Proved::default(),
+                &ChannelProve {
+                    channel: channel(c),
+                    proof,
+                },
+                when,
+            );
+            assert!(proved_said(answer));
+        };
+        let used_at = |c: u16| at.held(c).unwrap().used_at;
+
+        // Channel 1 past the hour, channel 2 within it, and channel 1
+        // again earlier: the latest is kept, and nothing is written.
+        prove_at(1, t + HOUR + 1);
+        prove_at(2, t + 600);
+        prove_at(1, t + 60);
+        assert_eq!(
+            (at.kept(1), at.kept(2)),
+            (Some(t + HOUR + 1), Some(t + 600))
+        );
+        assert_eq!((used_at(1), used_at(2)), (t, t));
+
+        // The sweep writes them: channel 1, more than an hour later, and
+        // not channel 2. Nothing is kept after.
+        at.entries.sweep_at(&at.db, t + 2 * HOUR);
+        assert_eq!((used_at(1), used_at(2)), (t + HOUR + 1, t));
+        assert_eq!((at.kept(1), at.kept(2)), (None, None));
+
+        // A clock that was set back: an earlier time is never written.
+        for earlier in [t + HOUR, t, 1] {
+            prove_at(1, earlier);
+            at.entries.write_uses(&at.db);
+            assert_eq!(used_at(1), t + HOUR + 1, "{earlier}");
+        }
+        // An hour later to the second is not more than an hour later;
+        // a second past it is.
+        prove_at(1, t + 2 * HOUR + 1);
+        at.entries.write_uses(&at.db);
+        assert_eq!(used_at(1), t + HOUR + 1);
+        prove_at(1, t + 2 * HOUR + 2);
+        at.entries.write_uses(&at.db);
+        assert_eq!(used_at(1), t + 2 * HOUR + 2);
+
+        // The sweep reads every use there was before it: channel 3 is
+        // proved ten seconds before its 90 days are up, and the sweep at
+        // 90 days keeps it. Channel 2, used last at `t`, goes.
+        prove_at(3, t + 90 * DAY - 10);
+        assert_eq!(used_at(3), t);
+        at.entries.sweep_at(&at.db, t + 90 * DAY);
+        assert_eq!(at.held(2), None);
+        assert_eq!(used_at(3), t + 90 * DAY - 10);
+        assert_eq!(used_at(1), t + 2 * HOUR + 2);
+    }
+
+    /// The lock's hold for a proof, from the node's counters (issue #214):
+    /// many proofs on one relay with a database on disk, each of a channel
+    /// whose time kept is two hours old, as after churn or a restart.
+    /// Printed, not asserted: run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn bench_the_locks_hold_for_many_proofs() {
+        const N: u16 = 2000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut at = relay();
+        at.db = TimedLock::new(cordelia_storage::db::open(&dir.path().join("relay.db")).unwrap());
+        for c in 1..=N {
+            at.hold(&small(c, 1, 5), NOW - 2 * HOUR);
+        }
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        let proofs: Vec<[u8; 64]> = (1..=N)
+            .map(|c| proof::make(&secret(c), &session.value, &session.prover).unwrap())
+            .collect();
+        let read = |what: &str| {
+            let hold = at.db.times().hold(Kind::Proof);
+            // The upper bound of the bucket that holds the quantile.
+            let upper = |q: f64| {
+                let target = (q * hold.count as f64).ceil() as u64;
+                let mut seen = 0;
+                for (i, n) in hold.buckets.iter().enumerate() {
+                    seen += n;
+                    if seen >= target {
+                        return 1u64 << i;
+                    }
+                }
+                u64::MAX
+            };
+            println!(
+                "{what}: {} holds, mean {:.1} us, p50 <= {} us, p99 <= {} us, max {} us, over 5/50/100/250 ms {:?}",
+                hold.count,
+                hold.sum_nanos as f64 / hold.count.max(1) as f64 / 1000.0,
+                upper(0.50),
+                upper(0.99),
+                hold.max_micros,
+                hold.over,
+            );
+        };
+        let round = || {
+            let started = Instant::now();
+            for (i, proof) in proofs.iter().enumerate() {
+                // A connection remembers so many proofs: one for each.
+                let mut proved = Proved::default();
+                let c = i as u16 + 1;
+                assert!(proved_said(at.answer(
+                    1,
+                    Protocol::ChannelProve,
+                    WireMessage::ChannelProve(ChannelProve {
+                        channel: channel(c),
+                        proof: *proof,
+                    }),
+                    Some(&session),
+                    &mut proved,
+                )));
+            }
+            started.elapsed()
+        };
+        let took = round();
+        read(&format!(
+            "first round, every time kept 2 h old ({took:?} in all)"
+        ));
+        let sweep = Instant::now();
+        at.entries.write_uses(&at.db);
+        let sweep_hold = at.db.times().hold(Kind::Sweep);
+        println!(
+            "the {N} uses written in one transaction: hold {} us ({:?} in all)",
+            sweep_hold.max_micros,
+            sweep.elapsed()
+        );
+        let took = round();
+        read(&format!(
+            "both rounds, the second with every time kept new ({took:?} in all)"
+        ));
+    }
+
+    /// A listed relay whose clock runs ahead says a channel was used later
+    /// than this relay's time: the use is kept at this relay's time, and
+    /// written so (decision 2026-10-04 §2.4 item 6).
+    #[test]
+    fn a_listed_relays_word_of_use_is_kept_no_later_than_this_relays_clock() {
+        let at = relay_of(u64::MAX, &[8]);
+        at.hold(&small(1, 1, 5), NOW - 2 * HOUR);
+        let held = at.held(1).unwrap();
+        let told = RelayChannel {
+            channel: channel(1),
+            mark: held.mark,
+            held_since: held.held_since,
+            used_at: NOW + 10 * DAY,
+            places: 1,
+        };
+        at.entries.wants(&at.db, &peer(8), &told, NOW);
+        assert_eq!(at.kept(1), Some(NOW));
+        at.entries.write_uses(&at.db);
+        assert_eq!(at.held(1).unwrap().used_at, NOW);
+    }
+
     // ── Prove ────────────────────────────────────────────────────────
 
     /// A proof holds where the channel's key signed this connection's
