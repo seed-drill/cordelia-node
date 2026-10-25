@@ -78,11 +78,15 @@ jobs:
   # made longer, and is run here, on every pull request, beside it. They
   # are the ignored tests of cordelia-node's test files, and only those:
   # the other crates' ignored tests are timed for a release build, or are
-  # no part of this. Each runs whatever another fails. About half an hour
-  # of tests after the build.
+  # no part of this. Each runs whatever another fails. The scale test's
+  # ignored tests return at once here: its stages and its small runs run
+  # only where their variables are set (scale.yml runs the small runs).
   out-of-reach:
     name: out of reach
     runs-on: ubuntu-latest
+    # About twice what the job takes on main (53 minutes): a test that
+    # waits for ever fails the job in this time.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
