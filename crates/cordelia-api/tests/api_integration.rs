@@ -1676,6 +1676,7 @@ async fn test_map_is_refused_where_it_would_sync_another_folder_than_was_found()
     // records one directory, and Claude Code's own folder for another.
     let by_hand = format!("{claude}/projects/workspace");
     std::fs::create_dir_all(format!("{by_hand}/memory")).unwrap();
+    std::fs::write(format!("{by_hand}/memory/kept.md"), "kept by hand\n").unwrap();
     let tree_dir = format!("{home}/code/app");
     let own_dir = format!("{home}/code/lib");
     let folder_of = |dir: &str| {
