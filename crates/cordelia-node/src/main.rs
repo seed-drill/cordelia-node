@@ -507,7 +507,7 @@ enum MsgCommand {
     )]
     Allow {
         /// Two names, or one with --all, then a number from 1 to 64, or any
-        #[arg(num_args = 0.., allow_hyphen_values = true, value_name = "A B N")]
+        #[arg(num_args = 0.., allow_negative_numbers = true, value_name = "A B N")]
         words: Vec<String>,
         /// The pair of the first name and every agent
         #[arg(long)]
@@ -9138,6 +9138,44 @@ mod tests {
             log.contains("A device of yours on an older version does not hear of it."),
             "{log}"
         );
+    }
+
+    /// `cordelia msg allow`'s command line is read whole, its flags after
+    /// its words or among them, and a word that is a negative number is a
+    /// word: the command refuses each with its own line, and not with the
+    /// parser's (decision 2026-10-25, rule 2).
+    #[test]
+    fn allows_command_line_is_read_whole() {
+        let parsed = |line: &[&str]| -> (Vec<String>, bool, Option<String>) {
+            let line: Vec<&str> = [&["cordelia", "msg", "allow"][..], line].concat();
+            match super::Cli::try_parse_from(line).map(|cli| cli.command) {
+                Ok(Some(super::Commands::Msg {
+                    what:
+                        super::MsgCommand::Allow {
+                            words,
+                            all,
+                            for_time,
+                        },
+                })) => (words, all, for_time),
+                Ok(_) => panic!("no msg allow"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let words =
+            |words: &[&str]| -> Vec<String> { words.iter().map(|w| w.to_string()).collect() };
+        assert_eq!(
+            parsed(&["notes", "work", "20", "--for", "1h"]),
+            (words(&["notes", "work", "20"]), false, Some("1h".into()))
+        );
+        assert_eq!(
+            parsed(&["--for", "2d", "notes", "--all", "any"]),
+            (words(&["notes", "any"]), true, Some("2d".into()))
+        );
+        assert_eq!(
+            parsed(&["notes", "work", "-1"]),
+            (words(&["notes", "work", "-1"]), false, None)
+        );
+        assert_eq!(parsed(&[]), (Vec::new(), false, None));
     }
 
     /// Plain `cordelia status` says each bound in force that is not the
