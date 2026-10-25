@@ -548,7 +548,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 
 **The wait after a change** (`cordelia change-made`, from `remove-device`, `renew` and `settle`):
 
-- **S1, its first line:** "You may close this machine once every relay holds the change, and what this device carried is at a relay that it reaches. This command stays until then, and says what is missing. It ends sooner, with status 3, where for five minutes a relay that is not known to hold the change cannot be reached or refuses it, or where no relay that this machine reaches has what this device carried. It then does not say that you may close this machine. Stopping it stops nothing: the node goes on. Each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3)
+- **S1, its first line:** "You may close this machine once every relay holds the change, and what this device carried is at a relay that it reaches. This command stays until then, and says what is missing. It ends sooner, with status 3, where for five minutes a relay that is not known to hold the change cannot be reached or refuses it, or where no relay that this machine reaches has what this device carried. It then does not say that you may close this machine. Stopping it stops nothing: the node goes on. Until the wait ends, each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3)
 - **S2,** for a relay that lacks the change and is out of reach, while the wait goes on: "keep this machine on: <relay> cannot be reached from here, and is not known to hold the change yet: it <since>"
 - **S3,** for a relay that holds the change and is out of reach: "<relay> holds the change, and cannot be reached from here: it <since>"
 - **S4,** where the device's own word is the carried word: "this device has sent what it carried to <held>; not yet to <not yet>"
@@ -590,7 +590,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 
 **A recovery:**
 
-- **R0,** where a relay does not hold the change when the look has ended: "This command stays until every relay holds the change. It ends sooner, with status 3, once each relay that is not known to hold it cannot be reached, or refuses it, for five minutes. Stopping it stops nothing: the node goes on, and the recovery stays made. Each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3)
+- **R0,** where a relay does not hold the change when the look has ended: "This command stays until every relay holds the change. It ends sooner, with status 3, once each relay that is not known to hold it cannot be reached, or refuses it, for five minutes. Stopping it stops nothing: the node goes on, and the recovery stays made. Until the wait ends, each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3)
 - **R1:** "Every relay holds the change."
 - **R2,** before the yes, with the lines that say how the personal channel was read. It has a first part, and one of two endings.
   - **The first part:** "<device> wrote that it had sent what it carried to <held>." Then, where `<not yet>` is not 0: "It had not yet sent it to <not yet> other relay<s> that it was set up with." Then: "This machine has read none of <them | it>. The look of this recovery is made once, so what that device carried may be only there."

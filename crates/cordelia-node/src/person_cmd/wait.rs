@@ -449,8 +449,10 @@ pub(crate) fn first_line() -> String {
     )
 }
 
-/// What S1 and R0 end with (decision 2026-10-24, rule 3).
-const TIMES_SAID: &str = "Each line below starts with the time it was said, in UTC.";
+/// What S1 and R0 end with (decision 2026-10-24, rule 3): the lines of
+/// an end, under the line that the wait has ended, have no time.
+const TIMES_SAID: &str = "Until the wait ends, each line below starts with the time it was said, \
+                          in UTC.";
 
 /// What the wait says of a relay that is out of reach, while it goes on
 /// (decision 2026-10-19 §5, S2 and S3; decision 2026-10-24, rule 7): that
@@ -481,6 +483,11 @@ const WAITED_MINUTES: u64 = OUT_OF_REACH_SECS / 60;
 /// refuse it, from minute 1 to minute 4. Nothing at minute 0, and nothing
 /// of a relay in a class: once it is out of reach S2 or S3 says so. The
 /// count is a word to the person: the node's own clock ends the wait.
+///
+/// The minutes are those of the wait, from the reference: from minute 5
+/// the line says that the relay has not been reached in them, and not for
+/// how long it has not been, since it may have been lost before the
+/// reference (`<since>` says when it was last reached).
 pub(crate) fn count_line(relay: &RelayAt, now: i64) -> Option<String> {
     let reach = relay.reach.as_ref().filter(|reach| reach.class.is_none())?;
     let minutes = |since: i64| u64::try_from(now.saturating_sub(since)).unwrap_or(0) / 60;
@@ -496,8 +503,9 @@ pub(crate) fn count_line(relay: &RelayAt, now: i64) -> Option<String> {
                  command waits for it"
             )),
             m => Some(format!(
-                "{name} has not been reached for {m} minutes. This command stops waiting for it \
-                 once this machine has tried it again and failed."
+                "{name} has not been reached in the {m} minutes that this command has waited \
+                 for it. This command stops waiting for it once this machine has tried it again \
+                 and failed."
             )),
         };
     }
@@ -537,8 +545,10 @@ fn timed(at: i64, line: &str) -> String {
 ///   words without the time: it is said once, with the time it is said. A
 ///   line that drops out of the look says nothing.
 /// - **Where no line has been said for a minute,** the wait says that it
-///   is still waiting, with the time of the last line that was not that,
-///   and again a minute after the last line of any kind.
+///   is still waiting, with the time of the last line that was not that
+///   (S1 or R0 where none has come since), and again a minute after the
+///   last line of any kind. Not at a look that ends the wait: the line
+///   that it has ended is said then.
 /// - **Each end begins with a line of its own,** with its time
 ///   ([`Self::ended`]); the lines of the end come under it, with none.
 ///
@@ -565,8 +575,8 @@ impl Told {
     }
 
     /// What the wait says of a look at `at` whose lines are `now`, a line
-    /// each, as each is printed.
-    pub fn of_look(&mut self, now: Vec<String>, at: i64) -> Vec<String> {
+    /// each, as each is printed. `ends` is whether the look ends the wait.
+    pub fn of_look(&mut self, now: Vec<String>, at: i64, ends: bool) -> Vec<String> {
         let new: Vec<String> = now
             .iter()
             .filter(|line| !self.said.contains(line))
@@ -577,7 +587,7 @@ impl Told {
             (self.last_line, self.last_said) = (at, at);
             return new;
         }
-        if at.saturating_sub(self.last_said) < STILL_WAITING_SECS {
+        if ends || at.saturating_sub(self.last_said) < STILL_WAITING_SECS {
             return Vec::new();
         }
         self.last_said = at;
@@ -1903,8 +1913,8 @@ pub(crate) mod tests {
              what is missing. It ends sooner, with status 3, where for five minutes a relay \
              that is not known to hold the change cannot be reached or refuses it, or where no \
              relay that this machine reaches has what this device carried. It then does not say \
-             that you may close this machine. Stopping it stops nothing: the node goes on. Each \
-             line below starts with the time it was said, in UTC."
+             that you may close this machine. Stopping it stops nothing: the node goes on. Until \
+             the wait ends, each line below starts with the time it was said, in UTC."
         );
 
         // `<when>`, today and not; `<since>`, both forms.
