@@ -427,7 +427,7 @@ pub fn read_generation(
                 came_to_count,
                 came_to_add,
                 ..
-            } = take::take(&conn, &reader, entry, now)?
+            } = take::take_to_read(&conn, &reader, entry, now)?
             {
                 again |= came_to_count + came_to_add > 0;
                 if let Some(Record::Seen(_)) = record {

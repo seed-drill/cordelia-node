@@ -158,7 +158,9 @@ pub fn add_device(
         let own = identity.public_key();
         let statement = &standing.held.statement.statement;
         let pair = derive::pair_secret(identity, new)?;
-        if statement.removes(new) {
+        // A key removed on any branch this device knows is not added again
+        // (decision 2026-10-24 (removal), rule 6).
+        if standing.counting.is_removed(new) {
             return Err(PersonError::KeyRemoved);
         }
         if !standing.counting.may_add(&own) {
@@ -231,7 +233,7 @@ pub fn would_add(
     let own = identity.public_key();
     let statement = &standing.held.statement.statement;
     derive::pair_secret(identity, new)?;
-    if statement.removes(new) {
+    if standing.counting.is_removed(new) {
         return Err(PersonError::KeyRemoved);
     }
     if !standing.counting.may_add(&own) {
@@ -653,6 +655,10 @@ pub enum NotAccepted {
     Removed,
     /// This device is in a fork: the fork is settled first.
     InAFork,
+    /// The hand-over's change is not clear: a key that this device knows
+    /// to be removed holds its secret (decision 2026-10-24 (removal),
+    /// rule 8). Nothing is sealed under it here.
+    NotClear,
     /// The key was typed, and its yes said, where the device stood in
     /// another row of §5.1 than it stands in now. `typed` is that row,
     /// and `None` for a key typed before rows were kept; `now` is the row
@@ -748,6 +754,9 @@ pub fn accept(
         Err(PersonError::RecordNotCounted(why)) => {
             Ok(Accepted::Refused(NotAccepted::RecordDoesNotCount(why)))
         }
+        // Its change is not clear, and nothing was applied (decision
+        // 2026-10-24 (removal), rules 4 and 8).
+        Err(PersonError::NotClear) => Ok(Accepted::Refused(NotAccepted::NotClear)),
         accepted => accepted,
     }
 }
@@ -948,6 +957,11 @@ impl NotAccepted {
             Self::Removed => "this device was removed: `cordelia init --new-key` first".into(),
             Self::InAFork => "this device has seen two changes made apart: the fork is settled \
                               first (`cordelia settle`)"
+                .into(),
+            Self::NotClear => "the change that was handed over lists a device that this device \
+                               knows was removed, or hands one its secret: it was not taken. \
+                               Add this device from a device whose last change lists no \
+                               removed device"
                 .into(),
             Self::StoodElsewhere { typed, now } => format!(
                 "that key was typed {}, and its yes was for that. This device {} now: what the \
@@ -1265,6 +1279,10 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
         }
     }
     held_rows::forget_secrets(conn)?;
+    // What it knew of removals was of the phrase it leaves (decision
+    // 2026-10-24 (removal), rule 2): under another phrase they are another
+    // person's keys.
+    held_rows::forget_removals(conn)?;
     sync_state::forget_folders_except(conn, &[])?;
     held_rows::forget_names_before(conn, None)?;
     meta::remove(conn, meta::PERSON_NOT_CARRIED)?;

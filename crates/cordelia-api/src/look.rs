@@ -618,10 +618,15 @@ fn of_its_person(
     let own = identity.public_key();
     let statement = &held.statement.statement;
     let kept = held_rows::additions(conn)?;
-    let counting = Counting::of(statement, &kept);
+    let counting = crate::person::counting(conn, statement, &kept)?;
     let reader = Reader::of(conn, statement, &kept)?;
+    // A device that stands applied under a change that is not clear is
+    // closed (decision 2026-10-24 (removal), rules 3 and 10).
+    let closed =
+        held.state == State::Applied && !crate::person::follows_a_clear_change(conn, held)?;
 
     look.state = match held.state {
+        State::Applied if closed => "closed",
         State::Applied => "applied",
         State::Fork => "fork",
         State::Removed => "removed",
@@ -634,7 +639,7 @@ fn of_its_person(
         Among::Several(others) => ("several", others),
         Among::Stopped(_) => ("stopped", 0),
     };
-    look.may_add = held.state == State::Applied && counting.may_add(&own);
+    look.may_add = held.state == State::Applied && !closed && counting.may_add(&own);
     look.change = Some(statement.number);
     // It left the generation before when it applied this one.
     let left = held_rows::secrets(conn)?;
@@ -726,6 +731,12 @@ fn of_its_person(
 
     // Why it cannot go on.
     let why = match held.state {
+        State::Applied if closed => {
+            look.short = Some(CLOSED_SHORT.into());
+            look.says.push(CLOSED_WHY.into());
+            look.cannot_go_on = Some(CLOSED_WHY.into());
+            return Ok(());
+        }
         State::Applied => match &at_relays.cannot_go_on {
             Some(CannotGoOn::NotApplied { relay, why }) => Some(format!(
                 "this device was answered with a change by {relay} and could not apply it \
@@ -763,6 +774,20 @@ fn of_its_person(
     look.cannot_go_on = why;
     Ok(())
 }
+
+/// Why a closed device cannot go on, in a few words (decision 2026-10-24
+/// (removal), rule 10): what `cordelia devices` says first, and what a
+/// command that a closed device refuses says.
+pub const CLOSED_SHORT: &str = "a removed device holds the secret this device follows";
+
+/// Why a closed device cannot go on, and the way on (decision 2026-10-24
+/// (removal), rules 3, 4 and 10). In this slice of its build the way on is
+/// a change made with the phrase on this device, which lists no removed
+/// device.
+pub const CLOSED_WHY: &str = "a device that was removed holds the secret of the change this \
+     device follows, as far as it knows: this device seals nothing, sends nothing and takes \
+     nothing in a channel of its own, and keeps new content in its folders. Make a change \
+     with the recovery phrase here (`cordelia renew`)";
 
 /// Why a device in `state` cannot go on, in a few words: what `cordelia
 /// devices` says first, and what a command that the state refuses says.
@@ -3121,13 +3146,13 @@ mod tests {
         let statement = &held.statement.statement;
         let kept = held_rows::additions(&s[1].conn).unwrap();
         let reader = Reader::of(&s[1].conn, statement, &kept).unwrap();
-        let counts = Counting::of(statement, &kept);
+        let counts = Counting::of(statement, &kept, &[]);
         let key = s.key(0);
         let word = reader.carried_word(&s[1].conn, &key, &counts).unwrap();
         assert_eq!(word, Some(looked(&[a], 0, 1)));
         let mut alone = statement.clone();
         alone.devices.retain(|device| device.key != key);
-        let not = Counting::of(&alone, &[]);
+        let not = Counting::of(&alone, &[], &[]);
         assert!(!not.counts(&key));
         let word = reader.carried_word(&s[1].conn, &key, &not).unwrap();
         assert_eq!(word, None);

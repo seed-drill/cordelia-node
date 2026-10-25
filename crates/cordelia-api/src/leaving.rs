@@ -125,7 +125,7 @@ pub struct Begun {
 /// under [`left_name`], one revision above the one it wrote there before,
 /// which says when. Run twice, it says so twice, and the later word
 /// stands. A device that is alone has nobody to tell, and one that has
-/// stopped publishes nothing: neither writes a word.
+/// stopped, or is closed, publishes nothing: neither writes a word.
 ///
 /// Every hand-over that the device made goes from its store, and a delete
 /// is written over each that a relay was sent
@@ -136,7 +136,11 @@ pub struct Begun {
 pub fn begin(conn: &Connection, identity: &NodeIdentity, now: i64) -> Result<Begun, PersonError> {
     in_one(conn, || {
         let mut begun = Begun::default();
-        if let Among::Several(_) = among(conn, identity)? {
+        // A closed device leaves without its word: it would be sealed
+        // under a secret that a removed key holds (decision 2026-10-24
+        // (removal), rule 4).
+        let closed = crate::at_relays::stands(conn)? == crate::at_relays::Stands::Closed;
+        if let (Among::Several(_), false) = (among(conn, identity)?, closed) {
             begun.word = Some(say_left(conn, identity, now)?);
         }
         if held(conn)?.is_some() {
@@ -265,7 +269,11 @@ pub fn forget(
         let Some(held) = held(conn)? else {
             return Ok(false);
         };
-        let word = match keep_word {
+        // Its word is kept only where the secret it was sealed under is
+        // clear (decision 2026-10-24 (removal), rule 5): it is sent after
+        // the device leaves, and a removed key would read it.
+        let clear = crate::at_relays::stands(conn)? != crate::at_relays::Stands::Closed;
+        let word = match keep_word && clear {
             true => own_word(conn, identity)?,
             false => None,
         };

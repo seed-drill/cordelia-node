@@ -1161,6 +1161,9 @@ pub enum CannotGoOn {
     NotListed,
     /// Two changes were made apart, and it keeps both.
     Fork,
+    /// The change it follows is not clear: a key it knows to be removed
+    /// holds its secret (decision 2026-10-24 (removal), rule 10).
+    Closed,
     /// A change lists it, and it could not open the change.
     NotOpened,
     /// It was answered with a change that it could not apply, by the

@@ -20,8 +20,10 @@
 //!   among the others: its one entry is read where a person accepts
 //!   ([`crate::adding::accept`]), and nowhere else.
 //!
-//! A device that has stopped, or is in a fork, takes nothing in its own
-//! channels (§4.3, §4.5). It still looks at the phrase's channel: that is
+//! A device that has stopped, is in a fork, or is closed takes nothing in
+//! its own channels (§4.3, §4.5; decision 2026-10-24 (removal), rule 10).
+//! Nor does any device take what a key it knows to be removed signed, on
+//! any branch (rule 6). It still looks at the phrase's channel: that is
 //! how a device in a fork is shown the statement that settles it.
 //!
 //! Each outcome says what it was ([`Taken`]), so that a caller can count
@@ -66,8 +68,8 @@ use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, State};
 
 use crate::person::{
-    AdditionSeen, Counting, PersonError, Shown, added_name, applied_secret, held, in_one,
-    see_addition, shown, who_counts,
+    AdditionSeen, PersonError, Shown, added_name, applied_secret, held, in_one, see_addition,
+    shown, who_counts,
 };
 
 /// What became of an entry from outside.
@@ -117,6 +119,10 @@ pub enum NotTaken {
     /// This device has stopped, or is in a fork: it takes nothing in its
     /// own channels.
     Stopped(State),
+    /// This device is closed: the change it follows is not clear, and it
+    /// takes nothing in its own channels (decision 2026-10-24 (removal),
+    /// rule 10).
+    Closed,
     /// The key that signed it does not count, as this device knows them
     /// (decision 2026-10-04 §4.4).
     SignerDoesNotCount,
@@ -173,7 +179,43 @@ pub fn take(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Taken, PersonError> {
-    match in_one(conn, || taken_as_its_own(conn, identity, entry, now))? {
+    taken_by(conn, identity, entry, now, Taker::Device)
+}
+
+/// [`take`], for a reader that seals nothing: a recovery's look, which
+/// reads the personal channel of a generation in a database of its own
+/// and drops it (decision 2026-10-04 §9, step 3). It takes as a device
+/// does in every rule, who counts among them, but for one: it is not
+/// refused where that generation's secret is not clear (decision
+/// 2026-10-24 (removal), rule 10). A record there that hands a removed
+/// key the secret is what it reads, and the recovery's own change lists
+/// one device, so is clear by construction (rule 22).
+pub fn take_to_read(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<Taken, PersonError> {
+    taken_by(conn, identity, entry, now, Taker::Reader)
+}
+
+/// Who takes an entry through the door.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Taker {
+    /// A device, into the channels it seals in.
+    Device,
+    /// A reader that seals nothing ([`take_to_read`]).
+    Reader,
+}
+
+fn taken_by(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+    taker: Taker,
+) -> Result<Taken, PersonError> {
+    match in_one(conn, || taken_as_its_own(conn, identity, entry, now, taker))? {
         Some(taken) => Ok(taken),
         // Of no channel that this device takes from: it is refused, and
         // only then is the refusal given its name.
@@ -190,6 +232,7 @@ fn taken_as_its_own(
     identity: &NodeIdentity,
     entry: &CheckedEntry,
     now: i64,
+    taker: Taker,
 ) -> Result<Option<Taken>, PersonError> {
     let Some(held) = held(conn)? else {
         return Ok(Some(Taken::Refused(NotTaken::FollowsNoPhrase)));
@@ -215,7 +258,16 @@ fn taken_as_its_own(
     if held.state != State::Applied {
         return Ok(Some(Taken::Refused(NotTaken::Stopped(held.state))));
     }
-    let counting = Counting::of(statement, &held_rows::additions(conn)?);
+    // A closed device takes nothing in a channel of its own (decision
+    // 2026-10-24 (removal), rules 5 and 10): from the commit that kept the
+    // record or the key that made its change not clear, the next entry is
+    // refused here.
+    if taker == Taker::Device && !crate::person::follows_a_clear_change(conn, &held)? {
+        return Ok(Some(Taken::Refused(NotTaken::Closed)));
+    }
+    // Who counts reads every key the device knows to be removed, on any
+    // branch: what such a key signed is not taken (rule 6).
+    let counting = crate::person::counting(conn, statement, &held_rows::additions(conn)?)?;
     if !counting.counts(&entry.author) {
         return Ok(Some(Taken::Refused(NotTaken::SignerDoesNotCount)));
     }
@@ -1305,7 +1357,7 @@ mod tests {
         let additions = held_rows::additions(conn).unwrap();
         let counting = who_counts(conn).unwrap();
         let other = identity_of(7).public_key();
-        let counted = |counting: &Counting| {
+        let counted = |counting: &crate::person::Counting| {
             let keys = [key, s[1].key(), other];
             (counting.adders(), keys.map(|key| counting.counts(&key)))
         };

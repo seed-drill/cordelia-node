@@ -408,7 +408,11 @@ impl Standing {
     pub(crate) fn of(conn: &Connection) -> Result<Self, PersonError> {
         let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
         let secret = applied_secret(conn, &held.statement.statement)?;
-        let counting = Counting::of(&held.statement.statement, &held_rows::additions(conn)?);
+        let counting = crate::person::counting(
+            conn,
+            &held.statement.statement,
+            &held_rows::additions(conn)?,
+        )?;
         Ok(Self {
             held,
             secret,
@@ -418,11 +422,18 @@ impl Standing {
 
     /// Where this device stands, as one that may write in its own
     /// channels: it has applied a statement, and has not stopped since
-    /// (decision 2026-10-04 §4.3, §4.5).
+    /// (decision 2026-10-04 §4.3, §4.5); and the change it follows is
+    /// clear (decision 2026-10-24 (removal), rule 4). Every seal outside an
+    /// apply takes its secret here: an entry in a channel of its own, a
+    /// record of an addition and its hand-over, a name's word, a word that
+    /// it left, the carried word, a message, and what an agent read.
     pub(crate) fn to_write(conn: &Connection) -> Result<Self, PersonError> {
         let standing = Self::of(conn)?;
         if standing.held.state != State::Applied {
             return Err(PersonError::Stopped(standing.held.state));
+        }
+        if !crate::person::follows_a_clear_change(conn, &standing.held)? {
+            return Err(PersonError::NotClear);
         }
         Ok(standing)
     }
