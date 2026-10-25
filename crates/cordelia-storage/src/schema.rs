@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -950,6 +950,46 @@ CREATE TABLE message_bounds (
 );
 "#;
 
+/// Migration v21: what a device knows of removals (decision 2026-10-24
+/// (removal), rules 2 and 3), beside the tables of step 12.
+///
+/// - `person_removed_keys`: every key that a change the device has seen
+///   and checked lists as removed, on any branch, with when it was first
+///   kept here. A key is never taken out while the device follows its
+///   phrase, and at most 2,048 are kept; past that the device is closed
+///   (`meta::PERSON_REMOVED_PAST_BOUND`).
+/// - `person_holders`: for a change, by its statement's number and hash,
+///   each key that a record of an addition under it adds, counted or not.
+///   They are kept apart from the records (`person_additions`), whose
+///   bound of 256 drops a record and never its key from here. At most
+///   2,048 a change.
+/// - `person_holders_past`: each change that a record would have given a
+///   2,049th holder. Such a change is not clear.
+///
+/// A relay keeps nothing in any of them. The step fills none: what a
+/// device knew before it is read from what it holds (the statement it has
+/// applied, and its records) wherever a change is asked whether it is
+/// clear, and the rest it comes to know from then.
+const MIGRATION_V21: &str = r#"
+CREATE TABLE person_removed_keys (
+    key      BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    seen_at  INTEGER NOT NULL CHECK(typeof(seen_at) = 'integer')
+);
+
+CREATE TABLE person_holders (
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    key     BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    PRIMARY KEY (number, hash, key)
+);
+
+CREATE TABLE person_holders_past (
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    PRIMARY KEY (number, hash)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1165,6 +1205,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 20 {
         tracing::info!("applying migration v20 (a person's hold on messages)");
         migrate_in_one(conn, MIGRATION_V20, 20)?;
+    }
+
+    if current < 21 {
+        tracing::info!("applying migration v21 (what a device knows of removals)");
+        migrate_in_one(conn, MIGRATION_V21, 21)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1983,6 +2028,8 @@ mod tests {
                AND name NOT LIKE '%person_cleared%'
                AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE '%person_left%'
+               AND name NOT LIKE '%person_removed_keys%'
+               AND name NOT LIKE '%person_holders%'
                AND name NOT LIKE '%message%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
@@ -2192,6 +2239,8 @@ mod tests {
                    AND name NOT LIKE '%person_cleared%'
                    AND name NOT LIKE '%person_names_before%'
                    AND name NOT LIKE '%person_left%'
+                   AND name NOT LIKE '%person_removed_keys%'
+                   AND name NOT LIKE '%person_holders%'
                    AND name NOT LIKE '%message%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
@@ -3177,10 +3226,12 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            if NEW_IN_V20.contains(&name.as_str())
-                || NEW_IN_V20
-                    .iter()
-                    .any(|new| name == format!("sqlite_autoindex_{new}_1"))
+            // What the step to version 21 adds is no row of a step before
+            // it either.
+            let later = NEW_IN_V20.iter().chain(NEW_IN_V21.iter());
+            if later
+                .clone()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
             }
@@ -3227,9 +3278,8 @@ mod tests {
             "the tables go with the version"
         );
 
-        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
         assert_eq!(version(&conn), 20);
-        assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v20(&conn), NEW_IN_V20);
         assert_eq!(everything_but_v20(&conn), before);
         assert!(
@@ -3439,7 +3489,13 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            if NEW_IN_V19.contains(&name.as_str()) || name.contains("message") {
+            // Nor what the step to version 21 adds.
+            if NEW_IN_V19.contains(&name.as_str())
+                || name.contains("message")
+                || NEW_IN_V21
+                    .iter()
+                    .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
                 continue;
             }
             held.push(format!("{name}: {}", sql.unwrap_or_default()));
@@ -4480,6 +4536,212 @@ mod tests {
         assert_eq!(held_after_the_steps("personal.db", true), 1);
     }
 
+    /// What the step to version 21 adds: three tables.
+    const NEW_IN_V21: [&str; 3] = [
+        "person_holders",
+        "person_holders_past",
+        "person_removed_keys",
+    ];
+
+    /// What a database holds of the step to version 21, by name.
+    fn new_in_v21(conn: &Connection) -> Vec<String> {
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|name| NEW_IN_V21.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// A database at version 20, as main before the removal's first slice
+    /// leaves one, with what [`at_v19`] holds and a person's read and a
+    /// bound of step 20.
+    fn at_v20() -> Connection {
+        let conn = at_v19();
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_person_marks (key, id, taken_at)
+                 VALUES (zeroblob(32), zeroblob(16), 9);
+             INSERT INTO message_bounds (key, a, b_kind, b, bound, set_order, at_clock,
+                                         for_secs, first_held, start)
+                 VALUES (zeroblob(32), 'notes', 2, '', NULL, zeroblob(8), zeroblob(8), 60, 9,
+                         NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 21 adds.
+    fn everything_but_v21(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V21
+                .iter()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 21 adds what a device knows of removals,
+    /// empty, and changes no older row or definition (decision 2026-10-24
+    /// (removal), rules 2 and 3): it is made in one step with its version,
+    /// so a failure between them leaves none of it, and the step asked for
+    /// twice is run once. What its tables keep stays across a start, and
+    /// each takes no row that cannot be what a device keeps.
+    #[test]
+    fn step_21_adds_what_a_device_knows_of_removals_and_changes_no_older_row() {
+        let conn = at_v20();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v21(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 20);
+        assert!(new_in_v21(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V21} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 21).is_err());
+        assert_eq!(version(&conn), 20);
+        assert!(
+            new_in_v21(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 21);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
+        assert_eq!(everything_but_v21(&conn), before);
+
+        conn.execute_batch(
+            "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(32), 9);
+             INSERT INTO person_holders (number, hash, key)
+                 VALUES (3, zeroblob(16), zeroblob(32));
+             INSERT INTO person_holders_past (number, hash) VALUES (3, zeroblob(16));",
+        )
+        .unwrap();
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V21
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [1, 1, 1]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, vec![1, 1, 1])
+        );
+        assert_eq!(everything_but_v21(&conn), before);
+
+        // A row that cannot be what a device keeps is refused, and the
+        // same row with a value of its type and bound is taken.
+        let key = "X'0202020202020202020202020202020202020202020202020202020202020202'";
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (
+                "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(31), 9)".into(),
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 'nine')"),
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (0, {hash}, {key})"),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_holders (number, hash, key) VALUES (1, zeroblob(15), {key})"
+                ),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, 'k')"),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!("INSERT INTO person_holders_past (number, hash) VALUES ('one', {hash})"),
+                format!("INSERT INTO person_holders_past (number, hash) VALUES (1, {hash})"),
+            ),
+            (
+                "INSERT INTO person_holders_past (number, hash) VALUES (1, zeroblob(17))".into(),
+                format!("INSERT INTO person_holders_past (number, hash) VALUES (1, {hash})"),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// The version before, whose schema is at step 20, stops on a database
+    /// that was stepped to 21, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed. A database at step 20 it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_21() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 20);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 21, own: 20 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(refuse_a_later_version(&at_v20(), 20).is_ok());
+    }
+
     /// The version before, whose schema is at step 19, stops on a
     /// database that was stepped to 20 (decision 2026-10-09 §9.2, decision
     /// 2026-10-25, section 7), as every version stops on one from a later
@@ -4498,7 +4760,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 20, own: 19 })
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 19
+                })
             ),
             "{refused:?}"
         );
@@ -4530,7 +4795,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 12] = [
+        let from: [(u32, Connection); 13] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -4543,6 +4808,7 @@ mod tests {
             (17, at_v17()),
             (18, at_v18()),
             (19, at_v19()),
+            (20, at_v20()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -4566,6 +4832,7 @@ mod tests {
             assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
             assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
             assert_eq!(new_in_v20(&conn), NEW_IN_V20, "from version {at}");
+            assert_eq!(new_in_v21(&conn), NEW_IN_V21, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }

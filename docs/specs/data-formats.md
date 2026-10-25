@@ -73,6 +73,13 @@
 >   `message_kept_numbers` and `message_kept_taken`. It changes no older
 >   row.
 >
+> Step 21, per the decision record of 2026-10-24 (removal) (set out in
+> §10.3):
+>
+> - **v21:** what a device knows of removals: `person_removed_keys`,
+>   `person_holders` and `person_holders_past`. It fills none of them, and
+>   changes no older row.
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
@@ -981,7 +988,7 @@ CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
 A device keeps nothing here. The functions that write or drop here refuse a
 database in which a device follows a phrase.
 
-### 10.3 What a Device Holds of Its Person (v12, v13, v17; decision §3 to §6)
+### 10.3 What a Device Holds of Its Person (v12, v13, v17, v21; decision §3 to §6, and decision 2026-10-24 (removal))
 
 They are in the node's database so that they change in one transaction with
 a statement. A relay keeps nothing in any of them.
@@ -1046,6 +1053,24 @@ CREATE TABLE person_names_before (                  -- v17
     left_at  INTEGER NOT NULL,
     PRIMARY KEY (name, said_by)
 );
+
+CREATE TABLE person_removed_keys (                  -- v21
+    key      BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    seen_at  INTEGER NOT NULL CHECK(typeof(seen_at) = 'integer')
+);
+
+CREATE TABLE person_holders (                       -- v21
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    key     BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    PRIMARY KEY (number, hash, key)
+);
+
+CREATE TABLE person_holders_past (                  -- v21
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    PRIMARY KEY (number, hash)
+);
 ```
 
 | Table | What it holds | Decision |
@@ -1057,6 +1082,9 @@ CREATE TABLE person_names_before (                  -- v17
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |
 | `person_names_before` | Each name that a key had said it syncs, in the personal channel of a generation the device left, with when it left it. Written in the transaction that applies a statement. It is what a device shows of the names that no device lists yet in the new generation | §7.3, §8 |
+| `person_removed_keys` | Every key that a change the device has seen and checked lists as removed, on any branch, with when it was first kept. They only grow, and go only where the device leaves its phrase. At most 2,048 (`MAX_KNOWN_REMOVED`); past them the device is closed (`person.removed_past_bound`) | decision 2026-10-24 (removal), rule 2 |
+| `person_holders` | For the change it follows, by its statement's number and hash, each key that a record of an addition under it adds, counted or not, kept apart from `person_additions` and its bound. At most 2,048 a change (`MAX_KNOWN_HOLDERS`) | decision 2026-10-24 (removal), rule 3 |
+| `person_holders_past` | Each change that a record would have given more holders than are kept. Such a change is not clear | decision 2026-10-24 (removal), rule 3 |
 
 **The person secret is in the database,** which its owner alone can read
 (mode 0600), and not in a file beside it: it changes in one transaction with
