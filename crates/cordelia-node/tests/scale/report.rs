@@ -1719,26 +1719,26 @@ fn bar_9(read: &Read) -> Line {
 }
 
 /// Whether device `node` counts a connection of its own closed in the 150 s
-/// before `t`: from its last sample of counts before then to `t`.
+/// before `t`: from its last sample of counts before then to its first at
+/// or after `t`, where a closure just before `t` is first counted.
 fn closed_lately(read: &Read, node: usize, t: f64) -> bool {
     let series = read.series(node);
     let from = t - 150.0;
-    let before = series
+    let counted: Vec<&Sample> = series
         .iter()
-        .rev()
-        .find(|s| s.t < from && s.device.is_some())
-        .and_then(|s| s.device);
-    let closed: Vec<f64> = before
-        .into_iter()
-        .chain(
-            series
-                .iter()
-                .filter(|s| s.t >= from && s.t <= t)
-                .filter_map(|s| s.device),
-        )
-        .map(|d| d.closed)
+        .copied()
+        .filter(|s| s.device.is_some())
         .collect();
-    closed.windows(2).any(|w| w[1] != w[0])
+    let first = counted.iter().rposition(|s| s.t < from).unwrap_or(0);
+    let last = counted
+        .iter()
+        .position(|s| s.t >= t)
+        .unwrap_or(counted.len().saturating_sub(1));
+    counted
+        .get(first..=last.max(first))
+        .unwrap_or_default()
+        .windows(2)
+        .any(|w| w[1].device.map(|d| d.closed) != w[0].device.map(|d| d.closed))
 }
 
 fn bar_10(read: &Read, edits: &Edits) -> Line {

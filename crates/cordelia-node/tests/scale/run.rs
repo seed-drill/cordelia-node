@@ -475,6 +475,13 @@ impl Run {
         }
     }
 
+    /// A sample of every node that runs, the relays first.
+    fn sample_every_node(&self) {
+        for i in 0..self.fleet.made.len() {
+            self.sample_now(i);
+        }
+    }
+
     /// Stop node `i`, with a sample just before, so that what it counted
     /// up to then is kept.
     fn stop_node(&self, i: usize) -> Option<(f64, bool)> {
@@ -1502,6 +1509,10 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
     sleep_for(&fleet, run.plan.timing.settle);
     let start = run.now();
     *run.window.lock().unwrap() = Some((start, None));
+    // A sample of every node at each edge of the window, so that what a
+    // counter gained in the window is read from inside it, and none of it
+    // is lost to a pair of samples that straddles an edge.
+    run.sample_every_node();
     let churns_now: Vec<u64> = (0..run.plan.relays)
         .map(|r| {
             run.relay_metrics(r)
@@ -1579,6 +1590,7 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
         }
     }
     *run.steps.lock().unwrap() = Some(steps);
+    run.sample_every_node();
     let end = run.now();
     *run.window.lock().unwrap() = Some((start, Some(end)));
 

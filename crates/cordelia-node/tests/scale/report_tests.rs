@@ -416,3 +416,36 @@ fn the_edits_add_up_only_where_the_counts_kept_apart_agree() {
     );
     assert_eq!(check_3(&run), Verdict::Fail);
 }
+
+// ── Bar 9: a device that counts a closure of its own is not looked for ──
+
+/// A relay's sample at 502 s finds a device's connection gone; the device
+/// counts the closure in its first sample after it, at 510 s. It is not
+/// looked for at 502 s, and is once 150 s have gone by with no closure.
+#[test]
+fn a_device_closed_lately_is_read_up_to_its_next_sample() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 900.0);
+    for (t, closed) in [
+        (450.0, 0.0),
+        (480.0, 0.0),
+        (510.0, 1.0),
+        (540.0, 1.0),
+        (840.0, 1.0),
+    ] {
+        device_at(
+            &run,
+            2,
+            t,
+            Some(DeviceCounts {
+                closed,
+                ..DeviceCounts::default()
+            }),
+        );
+    }
+    let read = read_of(&run);
+    assert!(closed_lately(&read, 2, 502.0));
+    assert!(closed_lately(&read, 2, 600.0));
+    assert!(!closed_lately(&read, 2, 845.0));
+}
