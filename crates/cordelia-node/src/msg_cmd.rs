@@ -1682,8 +1682,8 @@ pub struct AllowAsked {
 /// first that applies refusing (decision 2026-10-25, rule 2, refusals 1 to
 /// 3): two names, or one and `--all`, then a number from 1 to 64 or `any`;
 /// and `--for` as `--since` takes a while, from a minute to 7 days, or 8
-/// hours where none is given. A 10 is the usual hold: its `--for` is
-/// checked, and not used.
+/// hours where none is given. A 10 is the usual hold: a `--for` given
+/// with it is not used, and not read.
 pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     use cordelia_core::protocol::{
         AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS,
@@ -1712,6 +1712,9 @@ pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     };
     let for_secs = match &args.for_time {
         None => AGENT_MESSAGE_PAIR_BOUND_SECS,
+        // A 10 is the usual hold, which takes no `--for`: one given is not
+        // used, and not read.
+        Some(_) if bound == Some(10) => AGENT_MESSAGE_PAIR_BOUND_SECS,
         Some(time) => {
             let secs = time
                 .char_indices()
@@ -1792,8 +1795,9 @@ pub fn allow_question(answer: &Value, now: i64) -> String {
     let mut question = match answer["bound"].as_u64() {
         Some(10) => "Go back to the usual hold of 10 now?".to_string(),
         Some(n) if n <= waiting => format!(
-            "Allow {n} to wait unread, until {until}? {waiting} wait now, so sending stops at \
-             once, until you read them with cordelia msg log. After {until} it stops at 10 again."
+            "Allow {n} to wait unread, until {until}? {waiting} {wait} now, so sending stops at \
+             once, until you read them with cordelia msg log. After {until} it stops at 10 again.",
+            wait = if waiting == 1 { "waits" } else { "wait" },
         ),
         Some(n) => format!(
             "Allow {n} to wait unread, until {until}? At {n}, sending stops until you read them \
@@ -3883,11 +3887,15 @@ mod tests {
                 for_secs: 3_600,
             })
         );
-        // A 10 with --for is the usual hold: the node sets it for 7 days.
-        assert_eq!(
-            asked(&["notes", "work", "10"], false, Some("1h")).map(|a| a.bound),
-            Ok(Some(10))
-        );
+        // A 10 with --for is the usual hold: the node sets it for 7 days,
+        // and the time given is not used, nor read.
+        for time in ["1h", "8d", "0m", "soon"] {
+            assert_eq!(
+                asked(&["notes", "work", "10"], false, Some(time)).map(|a| a.bound),
+                Ok(Some(10)),
+                "{time}"
+            );
+        }
         let ten = json!({ "a": "notes", "b": "work", "bound": 10, "waiting": 3,
                           "until": 1_800_000_000 + 3_600, "in_force": null, "set": false });
         assert_eq!(
@@ -3955,6 +3963,14 @@ mod tests {
             allow_question(&look(Some("work"), 12, Some(5), Value::Null), now),
             format!(
                 "Allow 5 to wait unread, until 09:00 UTC? 12 wait now, so sending stops at once, \
+                 until you read them with cordelia msg log. After 09:00 UTC it stops at 10 again. \
+                 {ask}"
+            )
+        );
+        assert_eq!(
+            allow_question(&look(Some("work"), 1, Some(1), Value::Null), now),
+            format!(
+                "Allow 1 to wait unread, until 09:00 UTC? 1 waits now, so sending stops at once, \
                  until you read them with cordelia msg log. After 09:00 UTC it stops at 10 again. \
                  {ask}"
             )
