@@ -1,7 +1,7 @@
 # Decision: a removal fails safe
 
 **Date**: 2026-10-24
-**Status**: Proposed. Not built. Revised twice after its reviews.
+**Status**: Proposed. Not built. Revised three times after its reviews. Settled for build after the third read (25 October).
 **Cited as**: "decision 2026-10-24 rule 7", "decision 2026-10-24 §8". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -121,12 +121,12 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 - **What it sent is at the relays,** and the removed device can read it there. Nothing undoes that. It is the window of section 8.
 - **What it holds,** it carries into the change it moves to or applies (rule 9; the record of 2026-10-04, 7.3), but for what the cut leaves out. While it is closed, it keeps it in its store, and carries it at the settlement.
 - **What waited to be sent is never sent under the old secret** (rule 5).
-- **The cut.** At any carry (a move, an apply, a settlement), the device judges each file by its **arrivals**: each time it stored a version that holds a link (`chain.rs`) of a key that the file had not held on this device, with that key, the generation and the time. They are kept per file across carries, so a version carried on keeps when its links first arrived. For each removed key, an arrival of its link is cut where it came:
+- **The cut.** At any carry (a move, an apply, a settlement), the device judges each file by its **arrivals**, each with its key, the generation and the time this device stored it: every version of the file it stored that a key other than its own signed, with that key; and each link (`chain.rs`) of a version it stored, by the link's text hash and key, the first time it stored that link. So a key that wrote the file before the removal makes a new arrival each time it writes it again, and so does each copy carried of that writing. They are kept per file across carries, so a version carried on keeps when its links first arrived. For each removed key, an arrival of a version it signed, or of its link, is cut where it came:
   1. in a generation made apart from a change that removed the key; or
   2. in a generation that such a change was made after, after the key's cut time (rule 2), or at any time where there is none. **Decided by the person on 25 October.**
   The file goes back to the newest version stored before its first arrival cut. That arrival, and every version stored after it in that file, whoever signed it, are left out.
 - **Why arrivals, and not who signed or what descends.** An arrival is when the removed key's text reached this device, whichever device carried it there and through however many carries: the laptop that took the tablet's late writing under change 2, and carried it into its own change 3 before it knew, leaves it out when it moves, and so does a device that took only the phone's carry of it. A line that a remaining device appends over it is stored after it, and goes too. So the cut reads no chain, which keeps 100 links and names versions the store has since replaced. It goes by when this device stored the entry, which the removed device cannot set.
-- **At most 1,024 arrivals a file** (`MAX_FILE_ARRIVALS`), the oldest dropped first. A cut time before the oldest kept takes the file back to the newest version stored before that cut time.
+- **At most 1,024 arrivals a file** (`MAX_FILE_ARRIVALS`), the oldest dropped first. The device's own versions make none. A busy file that other devices write fills them faster, since each version they write is one. A cut time before the oldest kept takes the file back to the newest version stored before that cut time, which fails safe.
 - **In its place.** The slot carries the version the file goes back to. A folder whose file holds what is left out goes back to that version, as `cordelia restore` puts a version back. What is left out is kept in local history alone: not beside the file, where an agent would read it, and in no channel. The status says how many edits were set aside, and that `cordelia history` lists them and `cordelia restore` puts one back.
 - **The put-back of an index line** (the record of 2026-09-30, 4.5) adds lines with no link, so arrivals do not catch them. On a device that knows, it takes no line from a version left out, or that a removed key signed.
 - **Why the first goes by history, and not by time.** A generation made apart from a removal is history that the removal never saw. What the removed key wrote there came after the removal in history, though not always in time: a change made apart before the removal can hold honest work of the removed device, and that work goes to local history (section 9).
@@ -565,3 +565,9 @@ The second form (commit ea601371) had a second adversarial read, checked against
 | S6 | `SHOWS_IN_A_PASS` 17 is short of 23 | Holds | 23 (rule 18, section 11) |
 | S7 | Rule 12's list should add `look.rs` 1117 | The reader holds; the label does not: rule 12 has no list, and the readers are rule 4's | Added to rule 4's readers |
 | Q4 | The shared list | Decided, 25 October | The same cut; acts in force from before stay, named (rule 6; section 5, item 37) |
+
+### The third read
+
+| # | The third read found | Settled |
+|---|---|---|
+| T1 | Rule 7's arrivals missed repeated writing: a key that wrote the file honestly before the removal made no arrival when it wrote again after it, so that late edit, and a second-hand copy of it, was carried | Every version another key signed is an arrival, with that key and its time, and each link the first time it is stored (rule 7). `MAX_FILE_ARRIVALS` fills faster on a busy file, fails safe past it, and the device's own versions make none |
