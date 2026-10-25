@@ -18,6 +18,7 @@ use crate::observer::{self, Observer, Written};
 use crate::population::{
     self, How, OFFICE_ADDRESS, Off, Offs, PersonPlan, Population, Rng, Session, Stage,
 };
+use crate::removal;
 use crate::steps::{Act, Steps, Timing};
 
 /// What a run is to do.
@@ -151,13 +152,16 @@ pub struct Run {
     pub stopped_for_good: Mutex<Option<(usize, usize, f64)>>,
     pub words: Mutex<HashMap<usize, String>>,
     pub folders: HashMap<(usize, usize, usize), PathBuf>,
-    next_edit: AtomicU64,
+    pub next_edit: AtomicU64,
     pub window: Mutex<Option<(f64, Option<f64>)>>,
     pub cut: AtomicBool,
     ended: AtomicBool,
     pub removals: Mutex<Vec<Removal>>,
+    /// How many removals step 8 planned.
+    pub removals_planned: Mutex<usize>,
     pub outage: Mutex<Outage>,
     pub setup: Mutex<Setup>,
+    /// Each relay that did not answer a read, since its first such read.
     pub last_answer: Mutex<HashMap<usize, f64>>,
     pub steps: Mutex<Option<Steps>>,
     /// Each relay's peers' keys at the end: whether every one is of the run.
@@ -183,6 +187,87 @@ fn sleep_for(fleet: &Fleet, secs: f64) {
     let until = fleet.clock.now() + secs;
     while fleet.clock.now() < until && !fleet.stop_early.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100).min(Duration::from_secs_f64(secs.max(0.0))));
+    }
+}
+
+/// Wait up to `secs` for `check`, each call of which is bounded (every
+/// request the harness makes in a wait goes through [`fleet::agent`]):
+/// `Err` with what was waited for, where the time runs out.
+fn wait_within<T>(
+    what: &str,
+    secs: u64,
+    mut check: impl FnMut() -> Option<T>,
+) -> Result<T, String> {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(v) = check() {
+            return Ok(v);
+        }
+        if std::time::Instant::now() > until {
+            return Err(format!("waited {secs} s for: {what}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A node's status, read within a bound.
+fn status_of(made: &Made) -> Option<serde_json::Value> {
+    let text = fleet::get_text(
+        &fleet::agent(),
+        made.node.http,
+        &made.token,
+        "/api/v1/status",
+    )?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Whether the node answers, and is not in the middle of the copy of its
+/// first start, read within a bound (as `common::healthy` reads it, with
+/// no bound).
+fn healthy(made: &Made) -> Option<()> {
+    let status = status_of(made)?;
+    let under_way = status["held"]["why"]
+        .as_str()
+        .is_some_and(|why| why.contains("is under way"));
+    (!under_way).then_some(())
+}
+
+/// A CLI command against `node`, given `secs` to end, and killed then:
+/// what it wrote to its output, where it ended with success.
+fn cli_within(node: &Node, args: &[&str], secs: u64) -> Result<String, String> {
+    let mut child = node
+        .command_for(&[], args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: cordelia {args:?}: {e}", node.name))?;
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{}: cordelia {args:?} did not end in {secs} s",
+                    node.name
+                ));
+            }
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    match out.status.success() {
+        true => Ok(said),
+        false => Err(format!(
+            "{}: cordelia {args:?} failed: {said}{}",
+            node.name,
+            String::from_utf8_lossy(&out.stderr)
+        )),
     }
 }
 
@@ -405,18 +490,16 @@ impl Run {
 
     /// Wait until the device's node answers, and is connected to each
     /// relay it is set up with.
-    fn wait_connected(&self, person: usize, device: usize, secs: u64) {
-        let node = self.node(person, device);
+    fn wait_connected(&self, person: usize, device: usize, secs: u64) -> Result<(), String> {
+        let made = &self.fleet.made[self.fleet.device(person, device)];
         let relays = self.plan.population.people[person]
             .relays_of(device, self.plan.relays)
             .len() as u64;
-        common::wait_for("the device answers", &[node], secs, || {
-            common::healthy(node)
-        });
-        common::wait_for("the device reaches its relays", &[node], secs, || {
-            let status = node.get("/api/v1/status")?;
+        wait_within(&format!("{} answers", made.label), secs, || healthy(made))?;
+        wait_within(&format!("{} reaches its relays", made.label), secs, || {
+            let status = status_of(made)?;
             (status["peers_hot"].as_u64()? >= relays).then_some(())
-        });
+        })
     }
 
     /// Step 3, for one person: devices started, the phrase, each other
@@ -428,13 +511,14 @@ impl Run {
             self.start_node(self.fleet.device(k, d));
         }
         for d in 0..person.devices {
-            self.wait_connected(k, d, 120);
+            self.wait_connected(k, d, 120)
+                .unwrap_or_else(|why| panic!("{why}"));
         }
-        let first = self.node(k, 0);
-        let all: Vec<&Node> = (0..person.devices).map(|d| self.node(k, d)).collect();
         let mut words = None;
         for (d, label) in LABELS.iter().enumerate().take(person.devices).skip(1) {
-            let made = common::pair(first, self.node(k, d), label, &all);
+            let made = self
+                .pair_within(k, d, label)
+                .unwrap_or_else(|why| panic!("{why}"));
             words = words.or(made);
         }
         let words = words.expect("the first device made the phrase");
@@ -442,14 +526,20 @@ impl Run {
         for d in 0..person.devices {
             let node = self.node(k, d);
             let claude = node.home().join(".claude");
-            let out = node.cli(&["sync", "claude", "--dir", claude.to_str().unwrap()]);
+            let out = cli_within(
+                node,
+                &["sync", "claude", "--dir", claude.to_str().unwrap()],
+                60,
+            )
+            .unwrap_or_else(|why| panic!("{why}"));
             assert!(out.starts_with("Sync turned on."), "{}: {out}", node.name);
             for n in 0..person.profile.names() {
                 let name = population::name_of(n);
                 let folder = node.home().join(&name);
                 std::fs::create_dir_all(&folder).unwrap();
                 common::claude_folder(&node.home(), &folder);
-                node.cli(&["sync", "map", folder.to_str().unwrap(), &name]);
+                cli_within(node, &["sync", "map", folder.to_str().unwrap(), &name], 60)
+                    .unwrap_or_else(|why| panic!("{why}"));
             }
         }
         // The first files, 10 in each name at the profile's sizes.
@@ -479,9 +569,8 @@ impl Run {
                 });
             }
         }
-        common::wait_for(
+        wait_within(
             "every device of the person holds every first file",
-            &all,
             1800,
             || {
                 let held = (1..person.devices).all(|d| {
@@ -492,7 +581,71 @@ impl Run {
                 });
                 held.then_some(())
             },
-        );
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
+    }
+
+    /// Make device `d` a device of person `k`, as `common::pair` does it: a
+    /// phrase on the first device where it follows none, then `add-device`
+    /// there and `accept` here, each at a terminal with its yes; then until
+    /// the new device has applied the change. Every read of a node is
+    /// within a bound. The words, where the phrase was made here.
+    fn pair_within(&self, k: usize, d: usize, label: &str) -> Result<Option<String>, String> {
+        let first = &self.fleet.made[self.fleet.device(k, 0)];
+        let new = &self.fleet.made[self.fleet.device(k, d)];
+        let seen = |m: &Made| {
+            fleet::post_json(
+                m.node.http,
+                &m.token,
+                "/api/v1/devices/list",
+                &serde_json::json!({}),
+            )
+        };
+        let state =
+            seen(first).ok_or_else(|| format!("{}: its person was not read", first.label))?;
+        let words =
+            (state["state"] == "no_phrase").then(|| common::makes_a_phrase(&first.node, "desktop"));
+        let mut at = first
+            .node
+            .at_terminal(&["add-device", &new.key, "--name", label]);
+        at.says("Type yes to go on").types("yes");
+        let added = at.done();
+        let accept = added
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("cordelia accept "))
+            .map(|key| key.trim().to_string())
+            .ok_or_else(|| format!("add-device printed no accept line:\n{added}"))?;
+        if accept != first.key {
+            return Err(format!("add-device named {accept}, not {}", first.key));
+        }
+        let mut at = new.node.at_terminal(&["accept", &accept]);
+        at.says("Type yes to go on").types("yes");
+        let accepted = at.done();
+        if accepted.contains("Nothing was taken yet") {
+            wait_within(
+                "a hand-over is read with the key typed at accept",
+                600,
+                || {
+                    let seen = seen(new)?;
+                    let typed = seen["accepting"]
+                        .as_array()?
+                        .iter()
+                        .find(|typed| typed["key"] == accept.as_str())?
+                        .clone();
+                    let said = typed["said"].as_str().is_some_and(|said| !said.is_empty());
+                    (typed["taken"] == true || said).then_some(())
+                },
+            )?;
+        }
+        let change = seen(first)
+            .and_then(|s| s["change"].as_u64())
+            .ok_or_else(|| format!("{}: no change applied", first.label))?;
+        wait_within(
+            &format!("{} applies change {change}", new.label),
+            90,
+            || (seen(new)?["change"].as_u64() == Some(change)).then_some(()),
+        )?;
+        Ok(words)
     }
 
     /// Step 4: the office's devices stopped, given its one address, and
@@ -623,27 +776,28 @@ impl Run {
         let people = self.plan.population.people.len();
         let mut current: Vec<std::collections::VecDeque<population::Planned>> =
             vec![Default::default(); people];
-        let mut ends = vec![0.0f64; people];
         while !self.ended.load(Ordering::SeqCst) && !self.fleet.stop_early.load(Ordering::SeqCst) {
             let now = self.now() - start;
-            for k in 0..people {
-                if now + 5.0 >= ends[k] {
+            for (k, queued) in current.iter_mut().enumerate() {
+                // The plan's own end of the session under way: a removal can
+                // end it early.
+                let end = self.plans.lock().unwrap()[k].session_end();
+                if now + 5.0 >= end {
                     let next = self.plans.lock().unwrap()[k].next_session();
-                    ends[k] = next.session.end;
                     self.sessions.lock().unwrap().push(Session {
                         start: next.session.start + start,
                         end: next.session.end + start,
                         ..next.session
                     });
-                    current[k].extend(next.edits);
+                    queued.extend(next.edits);
                     let mut queue = queue.lock().unwrap();
                     for off in next.offs {
                         queue.push((off.start, true, off));
                         queue.push((off.end, false, off));
                     }
                 }
-                while current[k].front().is_some_and(|e| e.at <= now) {
-                    let planned = current[k].pop_front().unwrap();
+                while queued.front().is_some_and(|e| e.at <= now) {
+                    let planned = queued.pop_front().unwrap();
                     if self.gone.lock().unwrap().contains(&(k, planned.device)) {
                         continue;
                     }
@@ -739,29 +893,32 @@ impl Run {
                 if let Some(why) = self.fleet.exited_untold(i) {
                     self.fleet.fault(why);
                 }
+                let mut answered = false;
                 if let Some(s) = fleet::sample(&self.fleet, &agent, i, room, &self.relay_keys) {
-                    if s.metrics.is_some() || s.device.is_some() {
-                        self.last_answer.lock().unwrap().insert(i, s.t);
-                    }
+                    answered = s.metrics.is_some() || s.device.is_some();
                     self.samples.lock().unwrap().add(&self.fleet, s);
                 }
-                // A relay that does not answer for a minute, outside step 7.
+                // A relay that does not answer for a minute, outside step 7:
+                // from the first read it did not answer, through every read
+                // after it until one answers.
                 if let What::Relay(_) = self.fleet.made[i].what {
                     let (is, since) = self.fleet.is(i);
-                    let last = self
-                        .last_answer
-                        .lock()
-                        .unwrap()
-                        .get(&i)
-                        .copied()
-                        .unwrap_or(since);
                     // One being stopped has no pid for that while.
                     let stopping = self.fleet.pid(i).is_none();
-                    if is == Is::Running && !stopping && self.now() - last.max(since) > 60.0 {
-                        self.fleet.fault(format!(
-                            "{} did not answer for a minute",
-                            self.fleet.made[i].label
-                        ));
+                    let mut failing = self.last_answer.lock().unwrap();
+                    match (answered, is == Is::Running && !stopping) {
+                        (true, _) | (false, false) => {
+                            failing.remove(&i);
+                        }
+                        (false, true) => {
+                            let first = *failing.entry(i).or_insert(self.now().max(since));
+                            if self.now() - first >= 60.0 {
+                                self.fleet.fault(format!(
+                                    "{} did not answer for a minute",
+                                    self.fleet.made[i].label
+                                ));
+                            }
+                        }
                     }
                 }
                 let at = round + every * (i + 1) as f64 / n as f64 * 0.8;
@@ -816,6 +973,11 @@ impl Run {
     /// One removal (step 8; bar 10): `cordelia remove-device` at a
     /// terminal with the phrase, its line timestamped, the removed device
     /// stopped for good, and the spread and the carry read.
+    ///
+    /// The seed alone chooses the device removed, among those added (not
+    /// the first, which made the phrase); the first removes it, as it is in
+    /// every change. Where the device removed is the active one, its
+    /// session ends at the line, and the next is drawn among the others.
     fn remove(self: &Arc<Self>, k: usize) {
         self.busy.lock().unwrap().insert(k);
         let mut removal = Removal {
@@ -823,25 +985,20 @@ impl Run {
             ..Removal::default()
         };
         let person = self.plan.population.people[k].clone();
-        // The remover: the active device, which is on; the removed: by the
-        // seed among the others.
-        let active = self.plans.lock().unwrap()[k].active().unwrap_or(0);
-        for d in 0..person.devices {
-            let i = self.fleet.device(k, d);
-            if d != active {
-                self.turn_on(i, How::Stop);
-            }
-        }
-        let others: Vec<usize> = (0..person.devices).filter(|d| *d != active).collect();
-        let removed = others[Rng::of(self.plan.seed, &format!("removal {k}")).below(others.len())];
-        removal.remover = active;
+        let removed =
+            1 + Rng::of(self.plan.seed, &format!("removal {k}")).below(person.devices - 1);
+        let remover = 0;
+        removal.remover = remover;
         removal.removed = removed;
         let remaining: Vec<usize> = (0..person.devices).filter(|d| *d != removed).collect();
+        // The remaining devices are on for the removal and its carry; the
+        // one removed is left as it is.
         for d in &remaining {
-            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.wait_connected(k, *d, 120)
-            })) {
-                removal.failed = Some(said_by(e));
+            self.turn_on(self.fleet.device(k, *d), How::Stop);
+        }
+        for d in &remaining {
+            if let Err(why) = self.wait_connected(k, *d, 120) {
+                removal.failed = Some(why);
             }
         }
         removal.carried_bytes = self.carried_bytes(k);
@@ -854,12 +1011,11 @@ impl Run {
             .cloned()
             .unwrap_or_default();
         let key = self.fleet.made[self.fleet.device(k, removed)].key.clone();
-        let remover = self.node(k, active);
-        let mut at = remover.at_terminal(&["remove-device", &key]);
+        let mut at = self.node(k, remover).at_terminal(&["remove-device", &key]);
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                // Of each other device added since the last change, and of
-                // the remover where it is one of them: it stays.
+                // Of each other device added since the last change: it
+                // stays.
                 let which = at.says_one_of(&["Type `stays`", "Make this change?"]);
                 if which == 1 {
                     break;
@@ -885,12 +1041,17 @@ impl Run {
             .and_then(|rest| rest.split(')').next())
             .and_then(|n| n.trim().parse().ok());
         // The removed device is the person's no longer, and is stopped for
-        // good.
+        // good. What it had no chance at is waited for no more.
+        let i_removed = self.fleet.device(k, removed);
+        let up = match self.fleet.is(i_removed) {
+            (Is::Running, since) => Some(since),
+            _ => None,
+        };
         self.removed.lock().unwrap().insert((k, removed));
         self.gone.lock().unwrap().insert((k, removed));
-        self.plans.lock().unwrap()[k].remove(removed, line_at);
-        self.observer.lock().unwrap().gone(k, removed);
-        self.stop_node(self.fleet.device(k, removed));
+        self.plans.lock().unwrap()[k].remove(removed, line_at - self.window_start());
+        self.observer.lock().unwrap().gone(k, removed, line_at, up);
+        self.stop_node(i_removed);
         let index = {
             let mut removals = self.removals.lock().unwrap();
             removals.push(removal.clone());
@@ -913,49 +1074,45 @@ impl Run {
             .iter()
             .map(|d| (*d, self.fleet.made[self.fleet.device(k, *d)].key.clone()))
             .collect();
+        // What each remaining device holds at the line: what it carries.
+        let mut carried: HashMap<usize, removal::Held> = HashMap::new();
+        let mut last_look = f64::MIN;
         let until = line_at + bound;
         while self.now() < until
             && carry_end.is_none()
             && !self.fleet.stop_early.load(Ordering::SeqCst)
         {
-            let mut all_sent = true;
             for d in &remaining {
-                let Some(seen) = self.person_seen_by(k, *d) else {
-                    all_sent = false;
-                    continue;
-                };
-                if seen["change"].as_u64() == Some(change) {
-                    applied.entry(*d).or_insert_with(|| self.now());
+                if !carried.contains_key(d)
+                    && let Some(held) = self.entries_of(k, *d)
+                {
+                    carried.insert(*d, held);
                 }
-                for relay in seen["relays"].as_array().into_iter().flatten() {
-                    if relay["holds_latest"] == true
-                        && let Some(name) = relay["relay"].as_str()
-                    {
-                        holds.entry(name.to_string()).or_insert_with(|| self.now());
-                    }
-                }
-                let nothing_to_send = seen["names"]["to_go"]
-                    .as_array()
-                    .is_some_and(|a| a.is_empty())
-                    && seen["waiting"]
-                        .as_array()
-                        .is_some_and(|w| w.iter().all(|r| r["waits"] == 0));
-                let others_sent = remaining.iter().filter(|o| *o != d).all(|o| {
-                    seen["devices"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|listed| {
-                            listed["key"].as_str() == keys.get(o).map(String::as_str)
-                                && listed["applied"].as_u64() == Some(change)
-                                && listed["sent"] == true
-                        })
-                });
-                all_sent &=
-                    nothing_to_send && others_sent && seen["change"].as_u64() == Some(change);
             }
-            if all_sent {
-                carry_end = Some(self.now());
+            let seen: Vec<(usize, serde_json::Value)> = remaining
+                .iter()
+                .filter_map(|d| Some((*d, self.person_seen_by(k, *d)?)))
+                .collect();
+            let round = removal::read_round(change, &remaining, &seen, &keys);
+            let now = self.now();
+            for d in &round.applied {
+                applied.entry(*d).or_insert(now);
+            }
+            for relay in &round.holding {
+                holds.entry(relay.clone()).or_insert(now);
+            }
+            // Once every device has sent what it carried, each must hold
+            // the versions the others carried, read from it (every 2 s).
+            if round.settled && carried.len() == remaining.len() && now - last_look >= 2.0 {
+                last_look = now;
+                let all = remaining.iter().all(|d| {
+                    self.entries_of(k, *d).is_some_and(|held| {
+                        removal::holds_what_was_carried(*d, &held, &carried, &keys)
+                    })
+                });
+                if all {
+                    carry_end = Some(self.now());
+                }
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -965,7 +1122,7 @@ impl Run {
         // Of each other remaining device: the remover applies at once.
         r.applied = remaining
             .iter()
-            .filter(|d| **d != active)
+            .filter(|d| **d != remover)
             .map(|d| (*d, applied.get(d).copied()))
             .collect();
         r.relays_hold = self
@@ -983,23 +1140,40 @@ impl Run {
         self.busy.lock().unwrap().remove(&k);
     }
 
+    /// When the window began, in seconds of the run.
+    fn window_start(&self) -> f64 {
+        self.window.lock().unwrap().map_or(0.0, |(start, _)| start)
+    }
+
+    /// What device `d` of person `k` holds of each of the person's names,
+    /// each request within a bound; `None` where any is not read.
+    fn entries_of(&self, k: usize, d: usize) -> Option<removal::Held> {
+        let made = &self.fleet.made[self.fleet.device(k, d)];
+        let mut held = removal::Held::new();
+        for n in 0..self.plan.population.people[k].profile.names() {
+            let name = population::name_of(n);
+            let answer = fleet::post_json(
+                made.node.http,
+                &made.token,
+                "/api/v1/channels/entries",
+                &serde_json::json!({ "channel": name }),
+            )?;
+            removal::read_entries(&name, &answer, &mut held);
+        }
+        Some(held)
+    }
+
     /// What device `d` of person `k` says of its person (`POST
     /// /api/v1/devices/list`, as `cordelia devices --json` asks), within a
     /// bound.
     fn person_seen_by(&self, k: usize, d: usize) -> Option<serde_json::Value> {
         let made = &self.fleet.made[self.fleet.device(k, d)];
-        let mut resp = fleet::agent()
-            .post(&format!(
-                "http://127.0.0.1:{}/api/v1/devices/list",
-                made.node.http
-            ))
-            .header("Authorization", &format!("Bearer {}", made.token))
-            .send_json(serde_json::json!({}))
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let seen: serde_json::Value = resp.body_mut().read_json().ok()?;
+        let seen = fleet::post_json(
+            made.node.http,
+            &made.token,
+            "/api/v1/devices/list",
+            &serde_json::json!({}),
+        )?;
         seen.is_object().then_some(seen)
     }
 
@@ -1074,7 +1248,7 @@ impl Run {
             .unwrap_or(0);
         let at = self.now();
         self.gone.lock().unwrap().insert((k, d));
-        self.plans.lock().unwrap()[k].remove(d, at);
+        self.plans.lock().unwrap()[k].remove(d, at - self.window_start());
         self.stop_node(self.fleet.device(k, d));
         *self.stopped_for_good.lock().unwrap() = Some((k, d, at));
     }
@@ -1096,6 +1270,123 @@ pub struct Outcome {
     /// Of the edits waited for on other devices: how many, arrived, not
     /// arrived, and on a device removed meanwhile.
     pub waited: (usize, usize, usize, usize),
+}
+
+impl Run {
+    /// The state of a run of `plan` over `fleet`, nothing started:
+    /// `relays` are the relays' addresses and their keys in hex.
+    pub fn of(
+        plan: Plan,
+        out: &Path,
+        fleet: Fleet,
+        relays: (Vec<SocketAddr>, Vec<String>),
+        folders: HashMap<(usize, usize, usize), PathBuf>,
+        plans: Vec<PersonPlan>,
+        thread_said: String,
+    ) -> Run {
+        Run {
+            samples: Arc::new(Mutex::new(Samples::new(out).unwrap())),
+            observer: Arc::new(Mutex::new(Observer::default())),
+            plan,
+            out: out.to_path_buf(),
+            fleet: Arc::new(fleet),
+            relay_addrs: relays.0,
+            relay_keys: relays.1,
+            plans: Mutex::new(plans),
+            sessions: Mutex::new(Vec::new()),
+            offs: Mutex::new(Vec::new()),
+            busy: Mutex::new(HashSet::new()),
+            gone: Mutex::new(HashSet::new()),
+            removed: Mutex::new(HashSet::new()),
+            stopped_for_good: Mutex::new(None),
+            words: Mutex::new(HashMap::new()),
+            folders,
+            next_edit: AtomicU64::new(1),
+            window: Mutex::new(None),
+            cut: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            removals: Mutex::new(Vec::new()),
+            removals_planned: Mutex::new(0),
+            outage: Mutex::new(Outage::default()),
+            setup: Mutex::new(Setup {
+                thread_plan: thread_said,
+                machine: machine::machine_words(),
+                ..Setup::default()
+            }),
+            last_answer: Mutex::new(HashMap::new()),
+            steps: Mutex::new(None),
+            peers_at_end: Mutex::new(Vec::new()),
+            stops_at_end: Mutex::new(Vec::new()),
+            pids_left: Mutex::new(Vec::new()),
+            stopped_why: Mutex::new(None),
+        }
+    }
+
+    /// The state of a run of `plan` over nodes that are made up and never
+    /// started: no configuration, no `init`, no process. For the tests of
+    /// the report, which give it the samples and the changes they read.
+    pub fn made_up(plan: Plan, out: &Path) -> Run {
+        let mut fleet = Fleet::new(Clock::new(), out).unwrap();
+        let mut made = |name: String, what: What| {
+            let key_bytes = [fleet.made.len() as u8 + 1; 32];
+            let settings = Settings {
+                name: name.clone(),
+                role: match what {
+                    What::Relay(_) => Role::Relay,
+                    What::Device { .. } => Role::Device,
+                },
+                http: 0,
+                p2p: 0,
+                listen: IpAddr::V4(RELAY_ADDRESS),
+                relays: Vec::new(),
+                churn_secs: None,
+                data_dir: PathBuf::new(),
+            };
+            fleet.add(Made {
+                node: Node {
+                    name: Box::leak(name.clone().into_boxed_str()),
+                    child: None,
+                    dir: tempfile::tempdir_in(out).unwrap(),
+                    http: 0,
+                    p2p: 0,
+                    bin: None,
+                },
+                what,
+                label: name,
+                key: cordelia_crypto::bech32::encode_public_key(&key_bytes).unwrap(),
+                key_hex: hex::encode(key_bytes),
+                token: String::new(),
+                settings: Mutex::new(settings),
+                mask: None,
+            });
+        };
+        for r in 0..plan.relays {
+            made(format!("relay{}", r + 1), What::Relay(r));
+        }
+        for (person, device) in plan.population.each_device() {
+            made(
+                device_label(person, device),
+                What::Device { person, device },
+            );
+        }
+        let addrs = (0..plan.relays)
+            .map(|r| SocketAddr::new(IpAddr::V4(RELAY_ADDRESS), 21_000 + r as u16))
+            .collect();
+        let keys = fleet
+            .relays
+            .iter()
+            .map(|i| fleet.made[*i].key_hex.clone())
+            .collect();
+        Run::of(
+            plan,
+            out,
+            fleet,
+            (addrs, keys),
+            HashMap::new(),
+            Vec::new(),
+            String::new(),
+        )
+    }
 }
 
 /// A run of `plan`, leaving what it leaves in `out` (§4.4).
@@ -1130,41 +1421,15 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
         .collect();
     // Time zero: the relays' start.
     fleet.clock = Clock::new();
-    let run = Arc::new(Run {
-        samples: Arc::new(Mutex::new(Samples::new(out).unwrap())),
-        observer: Arc::new(Mutex::new(Observer::default())),
+    let run = Arc::new(Run::of(
         plan,
-        out: out.to_path_buf(),
-        fleet: Arc::new(fleet),
-        relay_addrs,
-        relay_keys,
-        plans: Mutex::new(plans),
-        sessions: Mutex::new(Vec::new()),
-        offs: Mutex::new(Vec::new()),
-        busy: Mutex::new(HashSet::new()),
-        gone: Mutex::new(HashSet::new()),
-        removed: Mutex::new(HashSet::new()),
-        stopped_for_good: Mutex::new(None),
-        words: Mutex::new(HashMap::new()),
+        out,
+        fleet,
+        (relay_addrs, relay_keys),
         folders,
-        next_edit: AtomicU64::new(1),
-        window: Mutex::new(None),
-        cut: AtomicBool::new(false),
-        ended: AtomicBool::new(false),
-        removals: Mutex::new(Vec::new()),
-        outage: Mutex::new(Outage::default()),
-        setup: Mutex::new(Setup {
-            thread_plan: thread_said,
-            machine: machine::machine_words(),
-            ..Setup::default()
-        }),
-        last_answer: Mutex::new(HashMap::new()),
-        steps: Mutex::new(None),
-        peers_at_end: Mutex::new(Vec::new()),
-        stops_at_end: Mutex::new(Vec::new()),
-        pids_left: Mutex::new(Vec::new()),
-        stopped_why: Mutex::new(None),
-    });
+        plans,
+        thread_said,
+    ));
     let fleet = run.fleet.clone();
 
     // Step 2: the relays, each healthy and holding the other's connection.
@@ -1187,25 +1452,23 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
             }
         })
     };
-    let relays_up = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let nodes: Vec<&Node> = fleet.relays.iter().map(|i| &fleet.made[*i].node).collect();
-        for node in &nodes {
-            common::wait_for("the relay answers", &nodes, 60, || common::healthy(node));
+    let relays_up = (|| -> Result<(), String> {
+        for i in &fleet.relays {
+            let made = &fleet.made[*i];
+            wait_within(&format!("{} answers", made.label), 60, || healthy(made))?;
         }
         if run.plan.relays == 2 {
             for r in 0..2 {
                 let other = fleet.made[fleet.relays[1 - r]].key.clone();
-                common::wait_for(
-                    "each relay holds the other's connection",
-                    &nodes,
-                    120,
-                    || run.peers_of(r)?.contains(&other).then_some(()),
-                );
+                wait_within("each relay holds the other's connection", 120, || {
+                    run.peers_of(r)?.contains(&other).then_some(())
+                })?;
             }
         }
-    }));
-    if let Err(e) = relays_up {
-        fleet.fault(format!("the relays did not come up: {}", said_by(e)));
+        Ok(())
+    })();
+    if let Err(why) = relays_up {
+        fleet.fault(format!("the relays did not come up: {why}"));
     }
 
     // Step 3: the people, ten at a time.
@@ -1298,6 +1561,7 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
             Some(Act::StartSecond) => run.start_second(),
             Some(Act::Remove) => {
                 let chosen = run.to_remove();
+                *run.removals_planned.lock().unwrap() = chosen.len();
                 let n = chosen.len().max(1) as f64;
                 for (i, k) in chosen.into_iter().enumerate() {
                     let run = run.clone();
@@ -1321,10 +1585,16 @@ pub fn run(plan: Plan, out: &Path) -> Outcome {
 
     // Step 10: it ends.
     run.ended.store(true, Ordering::SeqCst);
-    let _ = edits.join();
-    let _ = offs.join();
+    // A thread of the run that panicked is a fault of the run.
+    for (what, thread) in [("edits", edits), ("devices off and on", offs)] {
+        if let Err(e) = thread.join() {
+            fleet.fault(format!("the thread of {what} failed: {}", said_by(e)));
+        }
+    }
     for r in removals {
-        let _ = r.join();
+        if let Err(e) = r.join() {
+            fleet.fault(format!("a removal's thread failed: {}", said_by(e)));
+        }
     }
     if fleet.is(fleet.relays.last().copied().unwrap()).0 == Is::Stopped && run.plan.relays == 2 {
         run.start_second();

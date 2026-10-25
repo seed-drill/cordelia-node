@@ -165,11 +165,6 @@ pub struct Steps {
     /// The second relay's at the window's start.
     second_before: u64,
     phase: Phase,
-    /// When the second relay stopped, and started again.
-    pub stopped_at: Option<f64>,
-    pub started_at: Option<f64>,
-    /// When the removals began.
-    pub removals_at: Option<f64>,
 }
 
 impl Steps {
@@ -184,9 +179,6 @@ impl Steps {
             first_before: churns[0],
             second_before: churns[1],
             phase: Phase::BeforeStop,
-            stopped_at: None,
-            started_at: None,
-            removals_at: None,
         }
     }
 
@@ -216,13 +208,11 @@ impl Steps {
                 let second = churns[1]?;
                 (second > self.second_before).then(|| {
                     self.phase = Phase::Out(t);
-                    self.stopped_at = Some(t);
                     Act::StopSecond
                 })
             }
             Phase::Out(since) => (t >= since + self.timing.outage).then(|| {
                 self.phase = Phase::BeforeRemovals;
-                self.started_at = Some(t);
                 Act::StartSecond
             }),
             Phase::BeforeRemovals => {
@@ -244,7 +234,6 @@ impl Steps {
 
     fn begin_removals(&mut self, t: f64) -> Act {
         self.phase = Phase::Ending(t + self.timing.removal_spread);
-        self.removals_at = Some(t);
         Act::Remove
     }
 }

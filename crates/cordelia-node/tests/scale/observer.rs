@@ -155,15 +155,24 @@ impl Observer {
         self.pending.len()
     }
 
-    /// Device `device` of `person` is the person's no longer: nothing more
-    /// is waited for on it.
-    pub fn gone(&mut self, person: usize, device: usize) {
+    /// Device `device` of `person` is removed at `line`. What it had no
+    /// chance at is waited for on it no more: what was written in the
+    /// 120 s before the line, everything where it is not running (`up` is
+    /// when it last began to run), and what was written before it began
+    /// where that was less than a minute before the line, its catch-up not
+    /// yet over (bar 3). An older edit that a running device still lacks is
+    /// a miss, and stays waited for, so that it counts as not arrived.
+    pub fn gone(&mut self, person: usize, device: usize, line: f64, up: Option<f64>) {
         let edits = &self.edits;
         let at = &self.at;
         let mut gone = Vec::new();
         self.pending.retain(|w| {
-            let of = at.get(&w.edit).is_some_and(|i| edits[*i].person == person);
-            let goes = of && w.device == device;
+            let Some(edit) = at.get(&w.edit).map(|i| &edits[*i]) else {
+                return true;
+            };
+            let no_chance =
+                edit.at >= line - 120.0 || up.is_none_or(|up| edit.at < up && line - up < 60.0);
+            let goes = edit.person == person && w.device == device && no_chance;
             if goes {
                 gone.push((w.edit, w.device));
             }

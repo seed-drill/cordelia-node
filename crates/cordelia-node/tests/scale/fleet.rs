@@ -101,7 +101,7 @@ impl Starter {
 
 /// `command`, in a process group of its own and given SIGKILL when the
 /// thread that starts it goes.
-fn as_a_node(command: &mut Command) {
+pub fn as_a_node(command: &mut Command) {
     command.process_group(0);
     // SAFETY: between fork and exec only async-signal-safe calls are
     // made: one prctl.
@@ -137,8 +137,6 @@ pub struct State {
     pub child: Option<Child>,
     pub is: Is,
     pub since: f64,
-    /// The harness told it to stop: an exit is no fault.
-    pub told: bool,
 }
 
 /// What a change of a node's state was, for the summary and the bars.
@@ -247,7 +245,6 @@ impl Fleet {
             child: None,
             is: Is::NotStarted,
             since: 0.0,
-            told: false,
         }));
         i
     }
@@ -268,7 +265,10 @@ impl Fleet {
     }
 
     fn changed(&self, i: usize, is: Is, ended: Option<(f64, String)>) {
-        let t = self.clock.now();
+        self.changed_at(i, is, ended, self.clock.now());
+    }
+
+    fn changed_at(&self, i: usize, is: Is, ended: Option<(f64, String)>, t: f64) {
         self.changes.lock().unwrap().push(Change {
             t,
             node: i,
@@ -336,7 +336,6 @@ impl Fleet {
         state.child = Some(child);
         state.is = Is::Running;
         state.since = self.clock.now();
-        state.told = false;
         drop(state);
         self.changed(i, Is::Running, None);
         Ok(())
@@ -364,9 +363,11 @@ impl Fleet {
             if state.is == Is::Frozen {
                 Self::signal(child.id(), rustix::process::Signal::CONT);
             }
-            state.told = true;
             child
         };
+        // A node told to stop is stopped from then: it closes its
+        // connections on the way out.
+        let told_at = self.clock.now();
         Self::signal(child.id(), rustix::process::Signal::TERM);
         let told = Instant::now();
         let allowed = Duration::from_secs(NODE_STOP_TIMEOUT_SECS);
@@ -393,9 +394,9 @@ impl Fleet {
         };
         let mut state = self.state[i].lock().unwrap();
         state.is = Is::Stopped;
-        state.since = self.clock.now();
+        state.since = told_at;
         drop(state);
-        self.changed(i, Is::Stopped, Some((took, said)));
+        self.changed_at(i, Is::Stopped, Some((took, said)), told_at);
         Some((took, well))
     }
 
@@ -470,6 +471,25 @@ pub fn get_text(agent: &ureq::Agent, http: u16, token: &str, path: &str) -> Opti
     resp.body_mut().read_to_string().ok()
 }
 
+/// POST `body` to `path` of the node at `http`, with its token, within the
+/// agent's bound: its answer, where it answered with success.
+pub fn post_json(
+    http: u16,
+    token: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut resp = agent()
+        .post(&format!("http://127.0.0.1:{http}{path}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send_json(body)
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.body_mut().read_json().ok()
+}
+
 /// The lines of `/api/v1/metrics/load` that hold a value, by their name
 /// and labels.
 pub fn parse_metrics(text: &str) -> HashMap<String, f64> {
@@ -504,8 +524,10 @@ pub struct DeviceCounts {
     pub waits_over_100: f64,
     /// Waits given up (a `msg summary` that did not have the lock).
     pub given_up: f64,
-    /// Takes of its lock, of every kind.
-    pub takes: f64,
+    /// Its connections open, and those gone so far, as the device counts
+    /// them: a connection made or closed is the minute of its proofs.
+    pub open: f64,
+    pub closed: f64,
 }
 
 impl DeviceCounts {
@@ -542,8 +564,11 @@ impl DeviceCounts {
             if name.starts_with("cordelia_lock_given_up_total{") {
                 counts.given_up += value;
             }
-            if name.starts_with("cordelia_lock_wait_microseconds_count{") {
-                counts.takes += value;
+            if name == "cordelia_connections_open" {
+                counts.open = *value;
+            }
+            if name == "cordelia_connections_closed_total" {
+                counts.closed = *value;
             }
         }
         counts
@@ -625,6 +650,8 @@ impl Samples {
             line["refused_for_now"] = serde_json::json!(d.refused_for_now);
             line["lock_waits_over_100ms"] = d.waits_over_100.into();
             line["lock_waits_given_up"] = d.given_up.into();
+            line["connections_counted"] = d.open.into();
+            line["connections_closed"] = d.closed.into();
         }
         if let Some(c) = sample.connections {
             line["connections"] = c.into();

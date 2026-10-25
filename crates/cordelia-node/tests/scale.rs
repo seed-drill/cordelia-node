@@ -8,13 +8,24 @@
 //! ```bash
 //! cargo build --release -p cordelia-node
 //! CORDELIA_SCALE_STAGE=100 CORDELIA_SCALE_SEED=1 CORDELIA_SCALE_OUT=/path/to/out \
-//!   cargo test --release -p cordelia-node --test scale -- --ignored --nocapture
+//!   cargo test --release -p cordelia-node --test scale a_stage_of_the_scale_test \
+//!   -- --ignored --nocapture
 //! ```
 //!
 //! `CORDELIA_SCALE_STAGE` is `100` or `190`, the stages of gate 10 for R1;
 //! `small` runs section 6's small run of test 4 (two relays and seven
 //! devices, some minutes). Stages 250 and 500 come after change B and are
-//! refused. `CORDELIA_SCALE_RELAYS=1` runs a stage with one relay (rule 3
+//! refused. Section 6's tests 4 and 5, the small runs, run only where
+//! `CORDELIA_SCALE_SMALL` is set, each some minutes and one after the
+//! other; without it they return at once, as the run of a stage does
+//! without `CORDELIA_SCALE_STAGE`, so that `-- --ignored` passes over
+//! them:
+//!
+//! ```bash
+//! CORDELIA_SCALE_SMALL=1 cargo test --release -p cordelia-node --test scale a_small_run \
+//!   -- --ignored --nocapture
+//! ```
+//! `CORDELIA_SCALE_RELAYS=1` runs a stage with one relay (rule 3
 //! of §2.2). `CORDELIA_SCALE_DEVICE_GROWTH` gives bar 6 the threshold from
 //! stage 100 for stage 190, in MiB an hour. `CORDELIA_E2E_KEEP` keeps each
 //! node's directory and log in the output.
@@ -35,6 +46,8 @@ mod machine;
 mod observer;
 #[path = "scale/population.rs"]
 mod population;
+#[path = "scale/removal.rs"]
+mod removal;
 #[path = "scale/report.rs"]
 mod report;
 #[path = "scale/run.rs"]
@@ -436,11 +449,12 @@ fn the_steps_follow_the_churns_they_are_given() {
 /// counted as not arrived; a later edit of the same file that arrives
 /// first does not count the earlier one as arrived, and the earlier one's
 /// line in a copy kept beside the file does; a file copied with other
-/// content does not count.
+/// content does not count. The observer is given its times, every 250 ms,
+/// as its thread gives them in a run, so that nothing hangs on the
+/// machine's load.
 #[test]
 fn the_observer_counts_an_edit_only_by_its_own_line() {
     use observer::{Observer, Written, text_of};
-    use std::sync::{Arc, Mutex};
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (dir.path().join("a"), dir.path().join("b"));
     std::fs::create_dir_all(&a).unwrap();
@@ -457,94 +471,76 @@ fn the_observer_counts_an_edit_only_by_its_own_line() {
         new: true,
         replaced: None,
     };
-    let observer = Arc::new(Mutex::new(Observer::default()));
-    let zero = std::time::Instant::now();
-    let now = move || zero.elapsed().as_secs_f64();
+    let mut o = Observer::default();
     // Copied after 3 s, observed at 3 s within 0.3 s.
     std::fs::write(a.join("copied.md"), text_of(1, 600, 1)).unwrap();
-    observer
-        .lock()
-        .unwrap()
-        .wrote(written(1, "copied.md"), vec![(1, b.clone())]);
+    o.wrote(written(1, "copied.md"), vec![(1, b.clone())]);
     // Never copied.
     std::fs::write(a.join("never.md"), text_of(2, 600, 2)).unwrap();
-    observer
-        .lock()
-        .unwrap()
-        .wrote(written(2, "never.md"), vec![(1, b.clone())]);
+    o.wrote(written(2, "never.md"), vec![(1, b.clone())]);
     // Two edits of one file; the later arrives first.
-    observer
-        .lock()
-        .unwrap()
-        .wrote(written(3, "twice.md"), vec![(1, b.clone())]);
-    observer
-        .lock()
-        .unwrap()
-        .wrote(written(4, "twice.md"), vec![(1, b.clone())]);
+    o.wrote(written(3, "twice.md"), vec![(1, b.clone())]);
+    o.wrote(written(4, "twice.md"), vec![(1, b.clone())]);
     // A file copied with other content.
-    observer
-        .lock()
-        .unwrap()
-        .wrote(written(5, "other.md"), vec![(1, b.clone())]);
-    let ticking = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let ticks = {
-        let (observer, ticking) = (observer.clone(), ticking.clone());
-        std::thread::spawn(move || {
-            while ticking.load(std::sync::atomic::Ordering::SeqCst) {
-                observer.lock().unwrap().tick(now());
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        })
+    o.wrote(written(5, "other.md"), vec![(1, b.clone())]);
+    let mut t = 0.0;
+    let ticks_to = |o: &mut Observer, until: f64, t: &mut f64| {
+        while *t < until - 1e-9 {
+            o.tick(*t);
+            *t += 0.25;
+        }
     };
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let copied_at = now();
+    ticks_to(&mut o, 2.9, &mut t);
+    // The copy lands just before the tick at 3 s.
+    let copied_at = 2.9;
     std::fs::copy(a.join("copied.md"), b.join("copied.md")).unwrap();
     std::fs::write(b.join("twice.md"), text_of(4, 600, 4)).unwrap();
     std::fs::write(b.join("other.md"), text_of(9, 600, 9)).unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    {
-        let o = observer.lock().unwrap();
-        let at = o.arrivals[&(1, 1)].at;
-        assert!(
-            (at - copied_at).abs() <= 0.3,
-            "observed at {at:.2}, copied at {copied_at:.2}"
-        );
-        assert!(at >= 3.0 && at <= 3.3 + (copied_at - 3.0));
-        assert!(o.arrivals.contains_key(&(4, 1)), "the later edit arrived");
-        assert!(
-            !o.arrivals.contains_key(&(3, 1)),
-            "the earlier one is not arrived by the later's line"
-        );
-        assert!(
-            !o.arrivals.contains_key(&(5, 1)),
-            "other content does not count"
-        );
-    }
+    ticks_to(&mut o, 4.0, &mut t);
+    let at = o.arrivals[&(1, 1)].at;
+    assert!(
+        at >= copied_at && at - copied_at <= 0.3,
+        "observed at {at:.2}, copied at {copied_at:.2}"
+    );
+    assert!(o.arrivals.contains_key(&(4, 1)), "the later edit arrived");
+    assert!(
+        !o.arrivals.contains_key(&(3, 1)),
+        "the earlier one is not arrived by the later's line"
+    );
+    assert!(
+        !o.arrivals.contains_key(&(5, 1)),
+        "other content does not count"
+    );
     // The earlier one's line in a copy kept beside the file does count.
     std::fs::write(b.join("twice.conflict-abcd.md"), text_of(3, 600, 3)).unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    ticking.store(false, std::sync::atomic::Ordering::SeqCst);
-    ticks.join().unwrap();
-    let mut o = observer.lock().unwrap();
+    ticks_to(&mut o, 5.0, &mut t);
     assert!(
         o.arrivals[&(3, 1)].in_copy,
         "found in the copy kept beside the file"
     );
     // Never copied: still waited for at 300 s, so not arrived.
-    o.tick(300.0);
+    ticks_to(&mut o, 300.0, &mut t);
     assert!(!o.arrivals.contains_key(&(2, 1)));
     assert!(!o.arrivals.contains_key(&(5, 1)));
     assert_eq!(o.pending(), 2);
     assert_eq!(o.waited.len(), 5);
-    let gaps = o.gaps.clone();
     assert!(
-        gaps.iter().take(gaps.len() - 1).all(|g| *g < 0.5),
-        "{gaps:?}"
+        o.gaps.iter().all(|g| (*g - 0.25).abs() < 1e-6),
+        "the pace is its own"
     );
-    // A device removed: what is waited for on it is gone, not lost.
-    o.gone(0, 1);
+    // A device removed at 400 s: an edit it lacked for 400 s while it ran
+    // is a miss, and stays waited for; one written in the 120 s before the
+    // line is waited for no more.
+    let mut late = written(6, "late.md");
+    late.at = 350.0;
+    o.wrote(late, vec![(1, b.clone())]);
+    o.gone(0, 1, 400.0, Some(0.0));
+    assert_eq!(o.gone, [(6, 1)]);
+    assert_eq!(o.pending(), 2, "the old misses stay waited for");
+    // Where it was not running, nothing more is waited for on it.
+    o.gone(0, 1, 400.0, None);
     assert_eq!(o.pending(), 0);
-    assert_eq!(o.gone.len(), 2);
+    assert_eq!(o.gone.len(), 3);
 }
 
 // ── 6. The configurations ───────────────────────────────────────────
@@ -787,8 +783,8 @@ fn every_measure_has_a_value(summary: &str) {
         assert!(
             found
                 .iter()
-                .all(|v| !v.trim().is_empty() && !v.starts_with("no value")),
-            "the measure {label:?} has no value: {found:?}"
+                .all(|v| !v.trim().is_empty() && !v.contains("no value")),
+            "the measure {label:?} lacks a value: {found:?}"
         );
     }
 }
@@ -800,8 +796,11 @@ fn every_measure_has_a_value(summary: &str) {
 /// the model for those devices within a fifth; and what was written
 /// equals what arrived and did not.
 #[test]
-#[ignore = "a run of some minutes (decision 2026-10-22 §6, test 4)"]
+#[ignore = "a run of some minutes: set CORDELIA_SCALE_SMALL (decision 2026-10-22 §6, test 4)"]
 fn a_small_run_end_to_end() {
+    if !small_runs_asked() {
+        return;
+    }
     let (out, _kept) = out_for("small");
     let _one = one_run_at_a_time();
     let outcome = run::run(run::Plan::small(1), &out);
@@ -815,15 +814,31 @@ fn a_small_run_end_to_end() {
             "{pulls} pulls, the model's {model}"
         );
     }
-    let (waited, arrived, not, gone) = outcome.waited;
-    assert_eq!(waited, arrived + not + gone);
+    let (_, arrived, _, _) = outcome.waited;
     assert!(arrived > 0);
     for file in ["SUMMARY.md", "samples.jsonl", "edits.csv", "pids"] {
         assert!(out.join(file).exists(), "{file}");
     }
-    // Whether the run was valid is the summary's to say (§6): on a machine
-    // busy with other work it is not, and that is no fault of the harness.
-    println!("checks: {:?}", outcome.checks);
+    // The run measured what it says (§6), the edits adding up among the
+    // checks: on a machine of its own it does, and where it does not the
+    // summary says why.
+    assert!(
+        outcome.checks.iter().all(|(_, held)| *held),
+        "the run is INVALID: {:?}",
+        outcome.checks
+    );
+}
+
+/// Whether the small runs are asked for (`CORDELIA_SCALE_SMALL`): without
+/// it they say so and return at once.
+fn small_runs_asked() -> bool {
+    let asked = std::env::var_os("CORDELIA_SCALE_SMALL").is_some();
+    if !asked {
+        eprintln!(
+            "CORDELIA_SCALE_SMALL is not set: the small run is not run (decision 2026-10-22 §6)"
+        );
+    }
+    asked
 }
 
 /// A run that must fail (§6, test 5): the small run, where one device is
@@ -831,8 +846,11 @@ fn a_small_run_end_to_end() {
 /// person's later edits do not arrive at it, bar 3 fails, and the
 /// summary's first line says FAIL.
 #[test]
-#[ignore = "a run of some minutes (decision 2026-10-22 §6, test 5)"]
+#[ignore = "a run of some minutes: set CORDELIA_SCALE_SMALL (decision 2026-10-22 §6, test 5)"]
 fn a_small_run_that_must_fail() {
+    if !small_runs_asked() {
+        return;
+    }
     let (out, _kept) = out_for("small-that-fails");
     let _one = one_run_at_a_time();
     // The first seed whose plan writes an edit after the stop.
@@ -846,4 +864,180 @@ fn a_small_run_that_must_fail() {
     assert_eq!(bar_3.1, "FAIL", "{}", outcome.summary);
     assert!(outcome.summary.starts_with("FAIL "), "{}", outcome.summary);
     assert!(Path::new(&out.join("SUMMARY.md")).exists());
+}
+
+// ── What the harness reads of a removal, from made-up answers ───────
+
+/// A device still on the change before says `holds_latest` of that one: a
+/// relay is taken to hold change N only on the word of a device that has
+/// applied N (bar 10a).
+#[test]
+fn a_relay_holds_the_change_only_on_the_word_of_a_device_that_applied_it() {
+    use serde_json::json;
+    let keys: HashMap<usize, String> = [(0, "key-0".to_string()), (1, "key-1".to_string())].into();
+    let says = |change: u64, holds: bool| {
+        json!({
+            "change": change,
+            "relays": [{ "relay": "127.0.0.1:21000", "holds_latest": holds }],
+            "names": { "to_go": [] },
+            "waiting": [{ "waits": 0 }],
+            "devices": [
+                { "key": "key-0", "applied": change, "sent": true },
+                { "key": "key-1", "applied": change, "sent": true },
+            ],
+        })
+    };
+    let round = removal::read_round(
+        2,
+        &[0, 1],
+        &[(0, says(2, false)), (1, says(1, true))],
+        &keys,
+    );
+    assert_eq!(round.applied, [0]);
+    assert!(round.holding.is_empty(), "{round:?}");
+    assert!(!round.settled);
+    let round = removal::read_round(2, &[0, 1], &[(0, says(2, true)), (1, says(2, true))], &keys);
+    assert_eq!(round.holding, ["127.0.0.1:21000"]);
+    assert!(round.settled);
+    // A device that did not answer: not settled.
+    let round = removal::read_round(2, &[0, 1], &[(0, says(2, true))], &keys);
+    assert!(!round.settled);
+}
+
+/// The carry ends only when each remaining device holds every version the
+/// others carried, read from it: at the revision carried with an entry of
+/// the carrier's among its authors, or at a later one (bar 10b).
+#[test]
+fn a_carry_ends_only_where_each_device_holds_what_the_others_carried() {
+    use serde_json::json;
+    let keys: HashMap<usize, String> = [(0, "key-0".to_string()), (1, "key-1".to_string())].into();
+    let mut theirs = removal::Held::new();
+    removal::read_entries(
+        "n01",
+        &json!({ "entries": [{ "key": "f001.md", "rev": 5, "authors": ["key-1"] }] }),
+        &mut theirs,
+    );
+    let carried: HashMap<usize, removal::Held> =
+        [(1, theirs.clone()), (0, removal::Held::new())].into();
+    let held_by_0 = |rev: u64, authors: &[&str]| {
+        let mut held = removal::Held::new();
+        removal::read_entries(
+            "n01",
+            &json!({ "entries": [{ "key": "f001.md", "rev": rev, "authors": authors }] }),
+            &mut held,
+        );
+        held
+    };
+    assert!(!removal::holds_what_was_carried(
+        0,
+        &held_by_0(5, &["key-0"]),
+        &carried,
+        &keys
+    ));
+    assert!(removal::holds_what_was_carried(
+        0,
+        &held_by_0(5, &["key-0", "key-1"]),
+        &carried,
+        &keys
+    ));
+    assert!(removal::holds_what_was_carried(
+        0,
+        &held_by_0(6, &["key-0"]),
+        &carried,
+        &keys
+    ));
+    assert!(!removal::holds_what_was_carried(
+        0,
+        &removal::Held::new(),
+        &carried,
+        &keys
+    ));
+}
+
+// ── Every read of a node is bounded ─────────────────────────────────
+
+/// A node that accepts a request and never answers holds up a read of the
+/// harness for no more than the agent's bound (5 s), so no wait of a run
+/// hangs.
+#[test]
+fn a_read_of_a_node_that_never_answers_ends_within_its_bound() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = fleet::get_text(&fleet::agent(), port, "token", "/api/v1/status");
+        let posted = fleet::post_json(
+            port,
+            "token",
+            "/api/v1/devices/list",
+            &serde_json::json!({}),
+        );
+        let _ = done.send((read, posted));
+    });
+    let (read, posted) = ended
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the reads ended within their bounds");
+    assert!(read.is_none() && posted.is_none());
+}
+
+// ── A node goes with the harness ────────────────────────────────────
+
+/// A process started as a node is (in a group of its own, from the thread
+/// that starts nodes) is killed when that thread's process ends outright
+/// (§4.3, rule 6): the harness is started again as a child that starts a
+/// stand-in and exits at once, and the stand-in is gone within seconds.
+#[test]
+fn a_node_goes_when_the_harness_that_started_it_goes() {
+    if let Some(pid_file) = std::env::var_os("CORDELIA_SCALE_DEATH_CHILD") {
+        let starter = fleet::Starter::new();
+        let mut stand_in = std::process::Command::new("sleep");
+        stand_in.arg("60");
+        fleet::as_a_node(&mut stand_in);
+        let child = starter.spawn(stand_in).unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        std::process::exit(0);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_node_goes_when_the_harness_that_started_it_goes",
+        ])
+        .env("CORDELIA_SCALE_DEATH_CHILD", &pid_file)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        })
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let survived = alive();
+    if survived {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    assert!(
+        !survived,
+        "the stand-in outlived the harness that started it"
+    );
 }

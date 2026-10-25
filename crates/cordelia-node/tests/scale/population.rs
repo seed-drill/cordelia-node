@@ -559,9 +559,19 @@ impl PersonPlan {
         self.active
     }
 
+    /// When the session under way ends.
+    pub fn session_end(&self) -> f64 {
+        self.next_start
+    }
+
     /// The device `device` is the person's no longer, from `at`: it is not
-    /// chosen again, and its times off from then on are dropped.
+    /// chosen again, and its times off from then on are dropped. Where it is
+    /// the active device, its session ends at `at`.
     pub fn remove(&mut self, device: usize, at: f64) {
+        if self.active == Some(device) && at < self.next_start {
+            self.next_start = at;
+            self.active = None;
+        }
         self.devices.retain(|d| *d != device);
         self.drawn_offs.retain(|o| o.device != device);
         self.taken_offs
