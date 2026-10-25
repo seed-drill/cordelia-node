@@ -50,7 +50,7 @@ cordelia-node/
                          #   the share), shared (forms 3 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 19). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 20). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -59,7 +59,9 @@ cordelia-node/
                          #   of messages between its agents, a generation being a messages
                          #   channel it held; H and the live numbers, the index, places
                          #   and the shown time; a row overwritten before it goes, in the
-                         #   caller's write); db (secure_delete, set before the steps run,
+                         #   caller's write); shared_lists (step 20: what a device keeps
+                         #   beside its list of shared channels); db (secure_delete, set
+                         #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
                          #   kind: channels, items, psk, search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
@@ -67,8 +69,10 @@ cordelia-node/
                          #   exports the session's value for a proof
     cordelia-api/        # REST API (actix-web). A device: person (applying a statement, who
                          #   counts, carrying), adding, change, leaving, look, names, publish,
-                         #   take (the one door for an entry), at_relays (and known: what a
-                         #   device knows of which relay holds which change), local (the local
+                         #   take (the one door for an entry), lists (the person's lists
+                         #   of shared channels, decision 2026-10-10 §3.4), at_relays (and
+                         #   known: what a device knows of which relay holds which change),
+                         #   local (the local
                          #   API for the names a device holds), commands (the routes behind
                          #   the device commands), carry and carrying (a carry that a person
                          #   asks for, and the phrase's word for it), recover, swept (old

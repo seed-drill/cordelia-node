@@ -51,6 +51,7 @@ pub mod handlers;
 pub mod history;
 pub mod leaving;
 pub mod let_go;
+pub mod lists;
 pub mod local;
 pub mod look;
 pub mod marks;

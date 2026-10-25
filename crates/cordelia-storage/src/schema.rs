@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -896,6 +896,71 @@ CREATE TABLE message_kept_taken (
 );
 "#;
 
+/// Migration v21: what a device holds of the person's lists of shared
+/// channels (decision 2026-10-10 §3.4, §14). Its list itself is an entry
+/// of the personal channel, as every word of a device is; what is here is
+/// what the device keeps beside it, to take the lists of the others.
+///
+/// An item is named by its part (1: a channel, filed or dropped; 2: a
+/// subscription; 3: a label) and the bytes that name it within the part:
+/// a channel's ID (32 bytes), the ID and an agent's name (33 to 232), or
+/// a key (32). A time and a count are at most `SHARED_ACT_TIME_MAX`, and a
+/// list's value at most `SHARED_LIST_MAX_VALUE_BYTES`; each column takes
+/// only its type and its bound.
+///
+/// - `shared_lists`: one row, or none where the device has held no list.
+///   `list` is the value of the device's own list as it holds it: what it
+///   last wrote, or writes at once; `left_out`, the value of a list of
+///   the items it left out past a bound, which it still holds and does
+///   not take as in force; `written_at`, when it last wrote its list, by
+///   its clock, NULL where it never has; and `fetched_at`, the time of its
+///   last whole fetch of the personal channel, NULL where it has made none
+///   since it held a list.
+/// - `shared_list_first_held`: for each item of those two, the act held
+///   (by its signature) and when this device first held it: what an
+///   undone act is freed by, 90 days on, and what says that it held an
+///   item at its previous whole fetch.
+/// - `shared_list_freed`: for each item, the undone act that this device
+///   took out of its list, with its time, its count, its maker and its
+///   bytes as a list writes them, and when it was taken out: while a fresh
+///   list carries the item, no act on it at or below this one is taken.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V21: &str = r#"
+CREATE TABLE shared_lists (
+    one         INTEGER PRIMARY KEY CHECK(one = 1),
+    list        BLOB NOT NULL CHECK(typeof(list) = 'blob'
+                                    AND length(list) >= 13 AND length(list) <= 41341),
+    left_out    BLOB NOT NULL CHECK(typeof(left_out) = 'blob'
+                                    AND length(left_out) >= 13 AND length(left_out) <= 41341),
+    written_at  INTEGER CHECK(written_at IS NULL OR typeof(written_at) = 'integer'),
+    fetched_at  INTEGER CHECK(fetched_at IS NULL OR typeof(fetched_at) = 'integer')
+);
+
+CREATE TABLE shared_list_first_held (
+    part        INTEGER NOT NULL CHECK(part IN (1, 2, 3)),
+    item        BLOB NOT NULL CHECK(typeof(item) = 'blob'
+                                    AND length(item) >= 32 AND length(item) <= 232),
+    signature   BLOB NOT NULL CHECK(typeof(signature) = 'blob' AND length(signature) = 64),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    PRIMARY KEY (part, item)
+);
+
+CREATE TABLE shared_list_freed (
+    part      INTEGER NOT NULL CHECK(part IN (1, 2, 3)),
+    item      BLOB NOT NULL CHECK(typeof(item) = 'blob'
+                                  AND length(item) >= 32 AND length(item) <= 232),
+    time      INTEGER NOT NULL CHECK(typeof(time) = 'integer'
+                                     AND time >= 0 AND time <= 1099511627776),
+    count     INTEGER NOT NULL CHECK(typeof(count) = 'integer'
+                                     AND count >= 0 AND count <= 1099511627776),
+    maker     BLOB NOT NULL CHECK(typeof(maker) = 'blob' AND length(maker) = 32),
+    act       BLOB NOT NULL CHECK(typeof(act) = 'blob' AND length(act) >= 1),
+    freed_at  INTEGER NOT NULL CHECK(typeof(freed_at) = 'integer'),
+    PRIMARY KEY (part, item)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1106,6 +1171,14 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 19 {
         tracing::info!("applying migration v19 (messages between the person's own agents)");
         migrate_in_one(conn, MIGRATION_V19, 19)?;
+    }
+
+    // Step 20 is a person's hold on messages (decision 2026-10-25), which
+    // is not on this branch; the person's lists of shared channels are step
+    // 21 (decision 2026-10-10 §14, "the upgrade", after that record).
+    if current < 21 {
+        tracing::info!("applying migration v21 (the person's lists of shared channels)");
+        migrate_in_one(conn, MIGRATION_V21, 21)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1702,6 +1775,7 @@ mod tests {
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
+                   AND name NOT LIKE '%shared_list%'
                  ORDER BY name",
             )
             .unwrap()
@@ -1925,6 +1999,7 @@ mod tests {
                AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE '%person_left%'
                AND name NOT LIKE '%message%'
+               AND name NOT LIKE '%shared_list%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -2134,6 +2209,7 @@ mod tests {
                    AND name NOT LIKE '%person_names_before%'
                    AND name NOT LIKE '%person_left%'
                    AND name NOT LIKE '%message%'
+                   AND name NOT LIKE '%shared_list%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -3063,7 +3139,11 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            if NEW_IN_V19.contains(&name.as_str()) || name.contains("message") {
+            // What the step to version 19 adds, and what later steps add.
+            if NEW_IN_V19.contains(&name.as_str())
+                || name.contains("message")
+                || name.contains("shared_list")
+            {
                 continue;
             }
             held.push(format!("{name}: {}", sql.unwrap_or_default()));
@@ -3111,7 +3191,7 @@ mod tests {
 
         // The next start runs the step from the beginning.
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 19);
+        assert!(version(&conn) >= 19);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v19(&conn), NEW_IN_V19);
         assert_eq!(everything_but_v19(&conn), before);
@@ -4121,7 +4201,7 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 19, own: 18 })
+                Err(StorageError::LaterVersion { found, own: 18 }) if found == SCHEMA_VERSION
             ),
             "{refused:?}"
         );
@@ -4131,6 +4211,271 @@ mod tests {
         let at_18 = at_v18();
         assert!(refuse_a_later_version(&at_18, 18).is_ok());
         assert!(refuse_a_later_version(&at_18, 17).is_err());
+    }
+
+    /// A database at version 19, as the version before left one: what
+    /// [`at_v18`] holds, and a messages channel it held with a send.
+    fn at_v19() -> Connection {
+        let conn = at_v18();
+        migrate_in_one(&conn, MIGRATION_V19, 19).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_generations (id, channel, statement, first_held)
+                 VALUES (1, zeroblob(32), 1, 8);
+             INSERT INTO message_sends (sent_at, name, to_all) VALUES (9, 'notes', 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// What the step to version 21 adds: three tables.
+    const NEW_IN_V21: [&str; 3] = [
+        "shared_list_first_held",
+        "shared_list_freed",
+        "shared_lists",
+    ];
+
+    /// What a database holds of the step to version 21, by name.
+    fn new_in_v21(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE 'shared%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database holds, each definition and each row, but
+    /// what the step to version 21 adds.
+    fn everything_but_v21(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if name.contains("shared_list") {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 21 adds the tables of the person's lists,
+    /// empty, and changes no older row or definition (decision 2026-10-10
+    /// §14, "the upgrade"): it is made in one step with its version, so a
+    /// failure between them leaves none of it, and the step asked for
+    /// twice is run once. What the tables keep stays across a start, and
+    /// each takes no row that cannot be what a device keeps: a list's
+    /// value that is no blob, shorter than an empty list or longer than a
+    /// list at every bound; a time that is no integer; a part there is
+    /// not; an item shorter than a channel's ID or longer than an ID and
+    /// a name; a signature or a maker of another length; a time or a
+    /// count past `SHARED_ACT_TIME_MAX`; a second row for the list, or
+    /// for an item.
+    #[test]
+    fn each_step_of_this_record_adds_its_tables_and_changes_no_older_row() {
+        let conn = at_v19();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v21(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 19);
+        assert!(new_in_v21(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V21} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 21).is_err());
+        assert_eq!(version(&conn), 19);
+        assert!(
+            new_in_v21(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 21);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
+        assert_eq!(everything_but_v21(&conn), before);
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V21
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0, 0, 0]);
+
+        // What the device keeps, at the bounds of each column.
+        conn.execute_batch(
+            "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
+                 VALUES (1, zeroblob(13), zeroblob(41341), NULL, 9);
+             INSERT INTO shared_list_first_held (part, item, signature, first_held)
+                 VALUES (1, zeroblob(32), zeroblob(64), 9), (2, zeroblob(232), zeroblob(64), 9),
+                        (3, zeroblob(32), zeroblob(64), 9);
+             INSERT INTO shared_list_freed (part, item, time, count, maker, act, freed_at)
+                 VALUES (1, zeroblob(32), 1099511627776, 1099511627776, zeroblob(32),
+                         zeroblob(144), 9),
+                        (2, zeroblob(33), 0, 0, zeroblob(32), zeroblob(146), 9);",
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [3, 2, 1]);
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, kept.clone())
+        );
+        assert_eq!(everything_but_v21(&conn), before);
+
+        let lists = |values: &str| {
+            format!(
+                "INSERT INTO shared_lists (one, list, left_out, written_at, fetched_at)
+                 VALUES ({values})"
+            )
+        };
+        let first_held = |values: &str| {
+            format!(
+                "INSERT INTO shared_list_first_held (part, item, signature, first_held)
+                 VALUES ({values})"
+            )
+        };
+        let freed = |values: &str| {
+            format!(
+                "INSERT INTO shared_list_freed (part, item, time, count, maker, act, freed_at)
+                 VALUES ({values})"
+            )
+        };
+        conn.execute("DELETE FROM shared_lists", []).unwrap();
+        let refused = [
+            lists("2, zeroblob(13), zeroblob(13), NULL, NULL"),
+            lists("1, zeroblob(12), zeroblob(13), NULL, NULL"),
+            lists("1, zeroblob(13), zeroblob(41342), NULL, NULL"),
+            lists("1, 'a list of thirteen', zeroblob(13), NULL, NULL"),
+            lists("1, zeroblob(13), NULL, NULL, NULL"),
+            lists("1, zeroblob(13), zeroblob(13), 1.5, NULL"),
+            lists("1, zeroblob(13), zeroblob(13), NULL, 'nine'"),
+            first_held("0, X'01', zeroblob(64), 9"),
+            first_held("4, zeroblob(32), zeroblob(64), 9"),
+            first_held("1, zeroblob(31), zeroblob(64), 9"),
+            first_held("2, zeroblob(233), zeroblob(64), 9"),
+            first_held(
+                "1, X'0101010101010101010101010101010101010101010101010101010101010101', zeroblob(63), 9",
+            ),
+            first_held(
+                "1, X'0101010101010101010101010101010101010101010101010101010101010101', zeroblob(64), NULL",
+            ),
+            first_held("1, zeroblob(32), zeroblob(64), 10"),
+            freed("3, zeroblob(32), 1099511627777, 0, zeroblob(32), zeroblob(146), 9"),
+            freed("3, zeroblob(32), 0, 1099511627777, zeroblob(32), zeroblob(146), 9"),
+            freed("3, zeroblob(32), -1, 0, zeroblob(32), zeroblob(146), 9"),
+            freed("3, zeroblob(32), 0, 0, zeroblob(31), zeroblob(146), 9"),
+            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(0), 9"),
+            freed("3, zeroblob(32), 'none', 0, zeroblob(32), zeroblob(146), 9"),
+            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(146), NULL"),
+            freed("1, zeroblob(32), 0, 0, zeroblob(32), zeroblob(144), 9"),
+        ];
+        for refused in refused {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        // Each refused in its place is taken where it is of its type and
+        // within its bound.
+        for taken in [
+            lists("1, zeroblob(13), zeroblob(13), 1, 2"),
+            freed("3, zeroblob(32), 0, 0, zeroblob(32), zeroblob(146), 9"),
+        ] {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// The bounds that step 21 writes as numbers in its SQL are those of
+    /// protocol.rs (decision 2026-10-10 §3.4): a list's value at every
+    /// bound, the latest time and the highest count, and an item's length,
+    /// a channel's ID and an agent's name at its longest.
+    #[test]
+    fn step_20s_bounds_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::{
+            AGENT_MESSAGE_NAME_MAX_BYTES, SHARED_ACT_TIME_MAX, SHARED_LIST_MAX_VALUE_BYTES,
+        };
+        let count = |text: &str| MIGRATION_V21.matches(text).count();
+        assert_eq!(
+            count(&format!("length(list) <= {SHARED_LIST_MAX_VALUE_BYTES})")),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "length(left_out) <= {SHARED_LIST_MAX_VALUE_BYTES})"
+            )),
+            1
+        );
+        assert_eq!(count(&SHARED_LIST_MAX_VALUE_BYTES.to_string()), 2);
+        assert_eq!(count(&format!("time <= {SHARED_ACT_TIME_MAX})")), 1);
+        assert_eq!(count(&format!("count <= {SHARED_ACT_TIME_MAX})")), 1);
+        assert_eq!(count(&SHARED_ACT_TIME_MAX.to_string()), 2);
+        assert_eq!(
+            count(&format!(
+                "length(item) <= {})",
+                32 + AGENT_MESSAGE_NAME_MAX_BYTES
+            )),
+            2
+        );
+    }
+
+    /// The version before, whose schema is at step 19, stops on a
+    /// database that was stepped past 19 (decision 2026-10-10 §14, "going
+    /// back"), as every version stops on one from a later version: it is
+    /// refused with both versions, and nothing of it is changed. A
+    /// database at step 19 it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_stepped_past_19() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 19);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 21, own: 19 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let at_19 = at_v19();
+        assert!(refuse_a_later_version(&at_19, 19).is_ok());
+        assert!(refuse_a_later_version(&at_19, 18).is_err());
     }
 
     /// A database that is stepped from any version has what every later
@@ -4153,7 +4498,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 11] = [
+        let from: [(u32, Connection); 12] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -4165,6 +4510,7 @@ mod tests {
             (16, at_v16()),
             (17, at_v17()),
             (18, at_v18()),
+            (19, at_v19()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -4187,6 +4533,7 @@ mod tests {
             assert_eq!(new_in_v17(&conn), NEW_IN_V17, "from version {at}");
             assert_eq!(new_in_v18(&conn), NEW_IN_V18, "from version {at}");
             assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
+            assert_eq!(new_in_v21(&conn), NEW_IN_V21, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }
