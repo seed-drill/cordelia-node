@@ -1189,6 +1189,15 @@ fn default_entity_name() -> String {
 
 // ── cordelia status ────────────────────────────────────────────────
 
+/// The line of the plain `cordelia status` that says what the status line
+/// says (decision 2026-10-24, rule 5): its label says "Memory" once, and
+/// the words come without their first word, as a tooltip's do
+/// ([`indicator::without_memory`]). The line itself, the bar and `--json`
+/// keep their words.
+fn memory_line(summary: &str) -> String {
+    format!("  Memory:    {}", indicator::without_memory(summary))
+}
+
 fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
@@ -1525,7 +1534,7 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 );
             }
             if config.network.role == "personal" {
-                println!("  Memory:    {summary}");
+                println!("{}", memory_line(&summary));
                 for more in &also {
                     println!("    also:     {more}");
                 }
@@ -1831,6 +1840,8 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
                 Some(indicator::NotKnown {
                     lacking_secs: relay["reach"]["lacking_secs"].as_u64()?,
                     said_secs: ago(&relay["reach"]["answered_at"]),
+                    // The line says so (decision 2026-10-24, rule 7).
+                    out_of_reach: relay["reach"]["class"] == "out_lacking",
                 })
             })
             .collect(),
@@ -7082,10 +7093,14 @@ mod tests {
                     indicator::NotKnown {
                         lacking_secs: 400,
                         said_secs: Some(500),
+                        out_of_reach: false,
                     },
+                    // Out of reach, and so said (decision 2026-10-24, rule
+                    // 7).
                     indicator::NotKnown {
                         lacking_secs: 90,
                         said_secs: None,
+                        out_of_reach: true,
                     },
                 ],
                 known_since_secs: Some(7_200),
@@ -8896,6 +8911,80 @@ mod tests {
         assert_eq!(
             cannot_listen_says("127.0.0.1:80", &refused, "linux"),
             format!("the node's API cannot listen at 127.0.0.1:80: {refused}")
+        );
+    }
+
+    /// **The plain status says its label once** (decision 2026-10-24, rule
+    /// 5): for each summary, of each kind the status says, the line of the
+    /// plain `cordelia status` starts with its label, and "memory" is not
+    /// said again after it. The line itself keeps its first word.
+    #[test]
+    fn the_plain_status_says_memory_once() {
+        let facts = |edit: &dyn Fn(&mut indicator::Facts)| {
+            let mut f = indicator::Facts {
+                initialised: true,
+                running: true,
+                role: "personal".into(),
+                stands: "applied".into(),
+                ..Default::default()
+            };
+            edit(&mut f);
+            f
+        };
+        let mut summaries: Vec<String> = [
+            facts(&|_| {}),
+            facts(&|f| f.running = false),
+            facts(&|f| f.stands = "fork".into()),
+            facts(&|f| f.stands = "no_phrase".into()),
+            facts(&|f| {
+                f.devices.not_known_to_hold = vec![indicator::NotKnown {
+                    lacking_secs: 400,
+                    ..Default::default()
+                }];
+            }),
+            facts(&|f| f.devices.said_left = 2),
+        ]
+        .iter()
+        .map(|f| indicator::shown(f).summary)
+        .collect();
+        summaries.extend(
+            [
+                "memory: a relay not known to hold the latest change",
+                "memory not syncing: two changes made apart",
+                "memory sync error",
+                "memory: node stopped",
+                "memory synced",
+            ]
+            .map(String::from),
+        );
+        for summary in &summaries {
+            assert!(summary.starts_with("memory"), "{summary}");
+            let plain = memory_line(summary);
+            let words = plain
+                .strip_prefix("  Memory:    ")
+                .unwrap_or_else(|| panic!("{plain}"));
+            assert!(!words.starts_with("memory"), "{plain}");
+            assert_eq!(words, indicator::without_memory(summary), "{plain}");
+            let shown = indicator::line(
+                indicator::State::Synced,
+                Some(indicator::Level::Amber),
+                summary,
+                false,
+            );
+            assert!(shown.contains(summary.as_str()), "{shown}");
+        }
+        assert_eq!(
+            memory_line("memory: a relay not known to hold the latest change"),
+            "  Memory:    a relay not known to hold the latest change"
+        );
+        assert_eq!(
+            memory_line("memory not syncing: two changes made apart"),
+            "  Memory:    not syncing: two changes made apart"
+        );
+        assert_eq!(memory_line("memory sync error"), "  Memory:    sync error");
+        assert_eq!(
+            memory_line("memory: node stopped"),
+            "  Memory:    node stopped"
         );
     }
 

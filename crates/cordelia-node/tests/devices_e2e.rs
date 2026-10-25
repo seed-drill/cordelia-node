@@ -4568,14 +4568,17 @@ async fn a_relay_given_no_key_at_another_relays_address_is_counted_as_its_own() 
 // ── A relay out of reach (decision 2026-10-19) ───────────────────────
 
 /// Whether `cordelia status` at `node` says, among what holds, that a
-/// relay is not known to hold the latest change.
+/// relay is not known to hold the latest change: before it is out of
+/// reach, and once it is, when the line says that too (decision
+/// 2026-10-24, rule 7).
 fn says_a_relay_lacks_the_change(node: &Node) -> bool {
     let status: serde_json::Value =
         serde_json::from_str(&node.cli(&["status", "--json"])).unwrap_or_default();
     let holds = status["holds"].as_array().cloned().unwrap_or_default();
-    holds
-        .iter()
-        .any(|holds| holds["says"] == "memory: a relay not known to hold the latest change")
+    holds.iter().any(|holds| {
+        holds["says"] == "memory: a relay not known to hold the latest change"
+            || holds["says"] == "memory: a relay out of reach, not known to hold the latest change"
+    })
 }
 
 /// What `node` knows of the reach of its relay at `host`, as its look

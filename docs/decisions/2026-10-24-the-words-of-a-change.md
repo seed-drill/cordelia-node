@@ -1,7 +1,7 @@
 # Decision: the words of a change
 
 **Date**: 2026-10-24
-**Status**: Proposed. Not built. Revised once after its review (section 8). **Rules 1 to 7 are built first; rules 8 and 9, and the parts of rule 10 that state them, are held** until the record of a removal that fails safe (`2026-10-24-removal-fails-safe.md`) is settled. The person ruled on 24 October that a removal must fail safe by construction, and that a warning before the phrase is a nicety, not the fix. Under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes; and its narrow check found two high findings in rules 8 and 9 (section 8). They are written again against that record before they are built.
+**Status**: Rules 1 to 7 built. Revised once after its review (section 8). **Rules 1 to 7 are built first; rules 8 and 9, and the parts of rule 10 that state them, are held** until the record of a removal that fails safe (`2026-10-24-removal-fails-safe.md`) is settled. The person ruled on 24 October that a removal must fail safe by construction, and that a warning before the phrase is a nicety, not the fix. Under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes; and its narrow check found two high findings in rules 8 and 9 (section 8). They are written again against that record before they are built.
 **Cited as**: "decision 2026-10-24, rule 3". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -92,7 +92,9 @@ Anything but `stays` ends with "That was not \`stays\`. Nothing was done." (`per
 
 **`cordelia settle`** says the same, with its second and third sentences so:
 
-> Neither change `<a>` nor change `<b>` lists this machine: both were signed before it was added. `<adder>` added this machine at `<added at>`, as `<this>`.
+> Neither change `<a>` nor change `<b>` lists this machine: both were made without it. `<adder>` added this machine at `<added at>`, as `<this>`.
+
+("Both were made without it", and not "signed before it was added": an addition counts under one change only, so the change made apart may have been signed later, on a device that never saw this machine's addition.)
 > This command makes change `<new>`, which settles the two. The machine that makes a change is always in it, so change `<new>` will list this machine as `<this>`.
 
 **Any answer but `list`:** "You did not type \`list\`. Nothing was changed." **The input ends:** "The input ended before you typed an answer. Nothing was changed." Both with status 1, as today.
@@ -141,6 +143,8 @@ And in `cordelia devices`, for a row that it still matches to no relay: "  a rel
 1. Each row of `waiting` names the relay as configured, a relay given no key among them. **This needs data the node does not hand today.** `relays_reached` (`commands.rs:271-278`) gives each relay connection's address and key, and `RelaySnapshot` (`state.rs:1583-1601`) gives each configured relay's host, key and state; neither says which connection is which configured relay's own. The dial loop (`p2p.rs`) knows it, since it dials each configured host: it is to say, for each connection that it made, the configured host it made it to, and `waiting` takes the name from there.
 2. A line of the wait, of `cordelia init --new-key`, of a recovery or of `cordelia devices` never prints the `relay` field of a row. Where a row has no name, which a personal node that dials only its configured relays never makes, the line says it as above.
 3. `cordelia devices` matches a row to a relay by name, and then by the addresses a name resolves to (`person_cmd.rs:1220-1250`). That matching stays.
+4. **As built.** For each configured relay, the node says which connection is its own, by the matching that gives a pass its link (`one_relay_each_now`). It says so at a connection and at each tick of the governor, before the peers that list the connection, so that a row is never shown without its name.
+5. **Two relays given no key whose names resolve to one address share one connection** (the record of relays, §1). Its row names both, as `names`, and has no `name`, so `cordelia devices` finds it for each by the address, as in 3. The wait and `cordelia init --new-key` name both: "keep this machine on: 2 of this device's channels still to send to relay1 and relay2".
 
 ### Rule 3. Each line of the wait carries its time
 
@@ -150,7 +154,7 @@ And in `cordelia devices`, for a row that it still matches to no relay: "  a rel
 
 **The new words.**
 
-- S1, the first line of the wait after a change, and R0, the first line of a recovery's wait, each end with one sentence more: "Each line below starts with the time it was said, in UTC."
+- S1, the first line of the wait after a change, and R0, the first line of a recovery's wait, each end with one sentence more: "Until the wait ends, each line below starts with the time it was said, in UTC." The lines of an end, below "The wait has ended.", have none.
 - Each line of the wait after the first starts with its time, two spaces in, two spaces after:
 
   > `  10:53:12  relay1 holds the change`
@@ -159,14 +163,14 @@ And in `cordelia devices`, for a row that it still matches to no relay: "  a rel
 
   > `  <time>  still waiting: no new line since <time>`
 
-  where the second `<time>` is the time of the last line that was not this one. It is said again 60 seconds after the last line of any kind, so once a minute while no line comes.
+  where the second `<time>` is the time of the last line that was not this one. Where no line has come since S1 or R0, it is the time S1 or R0 was said: the moment the wait began, which no line shows. It is said again 60 seconds after the last line of any kind, so once a minute while no line comes. It is not said at a look that ends the wait: "The wait has ended." is said then.
 - Each end begins with a line of its own, before the lines it says today: `  <time>  The wait has ended.` The lines of the end (end 1's line, S6 to S11, R1) are said under it as today, with no time.
 
 **Rule 3.**
 
 1. **What is a new line** stays as today: a line of this look that was not in the last look, judged by its words without the time. A line is never said twice because its time changed. A line that drops out of the look says nothing, as today; that is why the line says "no new line", and not "nothing has changed".
 2. **The clock.** The time is read from the clock that the wait is given: the wall clock (`chrono::Utc::now()`) when it runs, and a clock that the test moves in its tests, as the tests of `reach.rs` move theirs. It is written `%H:%M:%S`, in UTC.
-3. The same holds in the wait of a recovery (the record of reach, rule 9; `recover_cmd.rs`), R0 among it.
+3. The same holds in the wait of a recovery (the record of reach, rule 9; `recover_cmd.rs`), R0 among it. Where every relay holds the change at the first look, a recovery says R1 and no R0, and has no wait: what it says before R1 has no time, as today.
 4. Nothing of what the wait decides reads a time it prints.
 
 ### Rule 4. The count while a relay is waited out
@@ -181,7 +185,9 @@ And in `cordelia devices`, for a row that it still matches to no relay: "  a rel
 
 From minute 5, while it is still not out of reach:
 
-> `  <time>  <relay> has not been reached for <m> minutes. This command stops waiting for it once this machine has tried it again and failed.`
+> `  <time>  <relay> has not been reached in the <m> minutes that this command has waited for it. This command stops waiting for it once this machine has tried it again and failed.`
+
+The minutes are those of the wait, from the relay's reference. A relay lost before the change was not reached for longer, and "has not been reached for <m> minutes" would read as though it was reached until the change: `<since>` (rule 6) says when it was last reached.
 
 That sentence is true whether an attempt is in flight or none was made in the last five minutes, the two cases in which a relay is not yet out of reach after five minutes (the record of reach, §1).
 
@@ -195,6 +201,7 @@ For a relay that is reached and refuses the change, once each minute counted, fr
 2. It is said only while the relay is in no class (the record of reach, §1). Once it is out of reach, S2 or S3 says so instead.
 3. The line is new each minute, so rule 3 says it once each minute, with its time.
 4. The count is a word to the person. The five minutes that end the wait are counted by the node's own clock, as today, and the count may read 5 a few seconds before or after the node finds the relay out of reach.
+5. **In a recovery's wait** (the record of reach, rule 9) the count is said only of a relay that lacks the change: a recovery waits for no other. A relay that holds the change and is not reached has no count there.
 
 ### Rule 5. `cordelia status` says its label once
 
@@ -413,10 +420,10 @@ The tests that answer "Type \`stays\` or \`removed\`" (`common/mod.rs:1499-1502`
 
 **New tests.** Each fails on an assertion if its rule is taken out.
 
-- **Rule 1.** `person_e2e.rs`, `a_device_added_since_the_last_change_is_asked_to_list_itself`: a device added after change 2 runs `cordelia renew`; the prompt says "A change is the list of your devices", "Your last change (change 2, made on", the adder, "This command makes change 3", and "Type \`list\`"; typing `stays` stops with "You did not type \`list\`. Nothing was changed." and `cordelia devices` still shows change 2; typing `list` goes on, and "The change that the recovery phrase will sign (change 3)" follows. A unit test in `person_cmd.rs` holds `<new>` equal to the number signed, for a renewal, a removal and a settlement.
-- **Rule 2.** `p2p.rs`, `each_connection_says_the_configured_relay_it_was_made_to`. `commands.rs`, `a_relay_given_no_key_is_named_in_its_row_as_configured`. `person_e2e.rs`, `the_wait_names_a_relay_as_configured`: the device is set up with a relay by a name that resolves to its address (`localhost:<port>`), something waits there, and the wait's line says `localhost:<port>` and never `127.0.0.1:<port>`.
-- **Rule 3.** `person_cmd.rs`, with a clock that the test moves: `each_line_of_the_wait_starts_with_its_time_and_is_said_once` (two looks with the same lines at different times say each line once; every line after the first matches `^  \d\d:\d\d:\d\d  `); `still_waiting_is_said_after_a_minute_with_no_new_line` (nothing at 59 seconds, the line at 60 naming the last line's time, again at 120 naming the same time); `each_end_begins_with_the_wait_has_ended`. The same in `recover_cmd.rs` for R0 and the recovery's wait.
-- **Rule 4.** `person_cmd.rs`, `the_count_of_a_relay_waited_out`: a relay not reached, its reference 30 seconds ago, gives no count; at 3 minutes and 10 seconds, "has not been reached for 3 of the 5 minutes"; at 6 minutes and in no class, "for 6 minutes. This command stops waiting for it once this machine has tried it again and failed."; out of reach, no count. The same for a relay that refuses.
+- **Rule 1.** `person_e2e.rs`, `a_device_added_since_the_last_change_is_asked_to_list_itself`: a device added after change 2 runs `cordelia renew`; the prompt says "A change is the list of your devices", "Your last change (change 2, made on", the adder, "This command makes change 3", and "Type \`list\`"; typing `stays` stops with "You did not type \`list\`. Nothing was changed." and `cordelia devices` still shows change 2; typing `list` goes on, and "The change that the recovery phrase will sign (change 3)" follows. A unit test in `person_cmd.rs` holds `<new>` equal to the number signed, for a renewal, a removal and a settlement; another, `a_settlement_on_a_machine_that_neither_change_lists_names_the_settlement`, answers the settlement's questions on a machine that neither change lists, and the question names the change above both, which is the one prepared.
+- **Rule 2.** `p2p.rs`, `each_connection_says_the_configured_relay_it_was_made_to`. `commands.rs`, `a_relay_given_no_key_is_named_in_its_row_as_configured`. `person_e2e.rs`, `the_wait_names_a_relay_as_configured`: the device is set up with a relay by a name that resolves to its address (`localhost:<port>`), something waits there, and the wait's line says `localhost:<port>` and never `127.0.0.1:<port>`. `commands.rs`, `a_connection_that_two_relays_given_no_key_share_names_both`. `person_cmd.rs`, `init_new_key_names_each_relay_it_could_not_send_to_as_configured`.
+- **Rule 3.** `person_cmd.rs`, with a clock that the test moves: `each_line_of_the_wait_starts_with_its_time_and_is_said_once` (two looks with the same lines at different times say each line once; every line after the first matches `^  \d\d:\d\d:\d\d  `); `still_waiting_is_said_after_a_minute_with_no_new_line` (nothing at 59 seconds, the line at 60 naming the last line's time, again at 120 naming the same time); `each_end_begins_with_the_wait_has_ended`; `no_still_waiting_line_comes_beside_the_end`. The same in `recover_cmd.rs` for R0 and the recovery's wait, and that a recovery whose first look gives R1 says its lines with no time.
+- **Rule 4.** `person_cmd.rs`, `the_count_of_a_relay_waited_out`: a relay not reached, its reference 30 seconds ago, gives no count; at 3 minutes and 10 seconds, "has not been reached for 3 of the 5 minutes"; at 4 minutes, "4 of the 5"; at 5 and 6 minutes and in no class, "has not been reached in the 6 minutes that this command has waited for it. This command stops waiting for it once this machine has tried it again and failed."; out of reach, no count. The same for a relay that refuses. `recover_cmd.rs`, `a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change`.
 - **Rule 5.** `main.rs`, `the_plain_status_says_memory_once`: for each summary of `indicator.rs`, the plain status line starts "  Memory:    " and does not contain "memory" right after it; `--line` keeps "memory: ".
 - **Rule 6.** `look.rs`, `since_says_since_what`: one case for each `reference_by`, with and without `last_reached`; the case of the test reads "has not answered since this device applied the change at 10:53 UTC (it was last reached at 10:48 UTC)". `reach.rs`, `the_reference_says_which_moment_it_is`.
 - **Rule 7.** `look.rs` and `person_cmd.rs`: D4, D5, T2 and T3 each contain "cannot be reached from here"; `person_cmd/wait.rs`: S2, S3, S6 (both forms) and S8 (both forms) each contain it. `indicator.rs`, `the_line_says_out_of_reach_where_every_relay_it_counts_is`: two relays out of reach and lacking give "memory: 2 relays out of reach, not known to hold the latest change"; one of each gives "..., 1 out of reach"; a relay that holds and is out of reach still gives "a relay out of reach for <m> minutes", last. The ignored real-process test `a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached` (`person_e2e.rs:5405`) asserts rule 7's S8 and D4.
@@ -486,3 +493,16 @@ The first form (commit bb91d29) had one independent review: one high, five mediu
 | 12 | low | The answer word `add` | `list`, with the reason (rule 1) |
 | 13 | low | Rule 8's real-process test would be flaky | It waits until the relay shows as not connected (section 4) |
 | 14 | low | R0 had no sentence on times; a time on S8's first line set it apart | R0 gets the sentence; each end begins with a timed line of its own, and its lines have none (rule 3) |
+
+**The review of what was built** (pull request #211): no high, one medium and seven low findings. Each was taken at its least change; where the record's own words were the fault, they changed with the code.
+
+| # | Level | Finding | Settled |
+|---|---|---|---|
+| 1 | medium | From minute 5 the count said "has not been reached for <m> minutes", counted from the reference: of a relay lost before the change it read as though the relay was reached until the change | "has not been reached in the <m> minutes that this command has waited for it" (rule 4) |
+| 2 | low | A recovery whose first look gives R1 said its lines with a time, though no R0 said that the times are UTC; S1 and R0 said that each line below has its time, though the lines of an end have none; "still waiting" could name R0's moment, which no line shows | Before R0 the lines have no time, as before; "Until the wait ends, each line below starts with the time it was said, in UTC."; the record says what the second `<time>` is where no line has come (rule 3) |
+| 3 | low | "Still waiting" and "The wait has ended." could be said at one look | Not at a look that ends the wait (rule 3) |
+| 4 | low | A row could be shown for up to a tick of the dial loop with no name, its relay not yet said to be its connection's | Where each relay stands is said at a connection and at the governor's tick, before the peers (rule 2, 4) |
+| 5 | low | Two relays given no key at one address share a connection, and its row named only the first | The row names both, and has no `name`, so `cordelia devices` matches it by address as before (rule 2, 5) |
+| 6 | low | "both were signed before it was added" could be untrue of the change made apart | "both were made without it" (rule 1) |
+| 7 | low | Rule 4 was not built in a recovery's wait, which "the wait" includes | Built there, for each relay that lacks the change (rule 4, 5) |
+| 8 | low | Four changes passed every test: init's relay by its address, a settlement's question as a renewal's, "5 of the 5 minutes", and an early line of a relay not known to hold the change | A test for each (section 4); the real-process test of the upgrade checks both forms of the line before five minutes |

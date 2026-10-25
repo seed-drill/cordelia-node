@@ -259,6 +259,9 @@ pub struct NotKnown {
     /// seconds, where it gave one: a relay that held the change and then
     /// says that it has no room for it is said for seven days from that.
     pub said_secs: Option<u64>,
+    /// Whether it is out of reach (decision 2026-10-24, rule 7): the line
+    /// says so.
+    pub out_of_reach: bool,
 }
 
 /// How grave what holds is.
@@ -291,15 +294,20 @@ pub struct Holds {
     pub says: String,
 }
 
+/// What the line says, without its first word "memory": what a tooltip
+/// and the plain status say beside their own label (decision 2026-10-24,
+/// rule 5).
+pub fn without_memory(says: &str) -> &str {
+    says.strip_prefix("memory: ")
+        .or_else(|| says.strip_prefix("memory "))
+        .unwrap_or(says)
+}
+
 impl Holds {
     /// What a tooltip and the plain status say of it, beside the line:
     /// what the line would say, without its first word.
     pub fn detail(&self) -> String {
-        let says = self.says.as_str();
-        let said = says
-            .strip_prefix("memory: ")
-            .or_else(|| says.strip_prefix("memory "))
-            .unwrap_or(says);
+        let said = without_memory(&self.says);
         match self.level {
             Level::Red => format!("Needs you: {said}"),
             Level::Amber => format!("To know: {said}"),
@@ -603,21 +611,33 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             d.known_since_secs.is_none_or(|secs| within(&secs))
                 || relay.said_secs.as_ref().is_some_and(within)
         };
-        let lacking = d
+        let lacking: Vec<&NotKnown> = d
             .not_known_to_hold
             .iter()
             .filter(|relay| long(&relay.lacking_secs))
-            .filter(still_shown);
-        match lacking.count() {
-            0 => {}
-            1 => amber(
-                "relay_without_latest",
-                "memory: a relay not known to hold the latest change".into(),
+            .filter(still_shown)
+            .collect();
+        // Each that is out of reach is said so (decision 2026-10-24, rule
+        // 7): the count, its place and its days do not change.
+        let out = lacking.iter().filter(|relay| relay.out_of_reach).count();
+        let said = match (lacking.len(), out) {
+            (0, _) => None,
+            (1, 0) => Some("memory: a relay not known to hold the latest change".to_string()),
+            (n, 0) => Some(format!(
+                "memory: {n} relays not known to hold the latest change"
+            )),
+            (1, _) => Some(
+                "memory: a relay out of reach, not known to hold the latest change".to_string(),
             ),
-            n => amber(
-                "relay_without_latest",
-                format!("memory: {n} relays not known to hold the latest change"),
-            ),
+            (n, out) if out == n => Some(format!(
+                "memory: {n} relays out of reach, not known to hold the latest change"
+            )),
+            (n, out) => Some(format!(
+                "memory: {n} relays not known to hold the latest change, {out} out of reach"
+            )),
+        };
+        if let Some(said) = said {
+            amber("relay_without_latest", said);
         }
     }
     if !of_folders {
@@ -3085,6 +3105,7 @@ mod tests {
             .map(|secs| NotKnown {
                 lacking_secs: *secs,
                 said_secs: None,
+                out_of_reach: false,
             })
             .collect()
     }
@@ -3298,6 +3319,72 @@ mod tests {
             assert_eq!(shown.summary, *says, "{what}");
             assert_eq!(whats(&shown).last(), Some(&"relay_out_of_reach"), "{what}");
         }
+    }
+
+    /// **The line says that a relay is out of reach where every relay it
+    /// counts is** (decision 2026-10-24, rule 7): two relays out of reach
+    /// and lacking the change; one of each, by the count and how many are
+    /// out of reach; one alone. The count, its place and its five minutes
+    /// do not change, and a relay that holds the change and is out of
+    /// reach still gives "a relay out of reach for <m> minutes", last.
+    #[test]
+    fn the_line_says_out_of_reach_where_every_relay_it_counts_is() {
+        let out_of = |out: &[bool]| -> Vec<NotKnown> {
+            out.iter()
+                .map(|out| NotKnown {
+                    lacking_secs: 400,
+                    said_secs: None,
+                    out_of_reach: *out,
+                })
+                .collect()
+        };
+        let with_relays = |out: &[bool]| {
+            with(&|f| {
+                lacking(f);
+                f.devices.not_known_to_hold = out_of(out);
+            })
+        };
+        assert_eq!(
+            with_relays(&[true, true]).summary,
+            "memory: 2 relays out of reach, not known to hold the latest change"
+        );
+        assert_eq!(
+            with_relays(&[true, false]).summary,
+            "memory: 2 relays not known to hold the latest change, 1 out of reach"
+        );
+        assert_eq!(
+            with_relays(&[true]).summary,
+            "memory: a relay out of reach, not known to hold the latest change"
+        );
+        assert_eq!(with_relays(&[false]).summary, NOT_KNOWN);
+        assert_eq!(
+            with_relays(&[false, false]).summary,
+            "memory: 2 relays not known to hold the latest change"
+        );
+        // Not before five minutes, out of reach or not.
+        let soon = with(&|f| {
+            lacking(f);
+            f.devices.not_known_to_hold = out_of(&[true]);
+            f.devices.not_known_to_hold[0].lacking_secs = 300;
+        });
+        assert_eq!(soon.level, None);
+        // Its place is as before, and the warning of a relay that holds the
+        // change and is out of reach is still last.
+        let both = with(&|f| {
+            lacking(f);
+            f.devices.not_known_to_hold = out_of(&[true]);
+            f.devices.out_of_reach_secs = vec![61];
+            f.devices.one_reached = true;
+        });
+        assert_eq!(
+            both.summary,
+            "memory: a relay out of reach, not known to hold the latest change"
+        );
+        assert_eq!(whats(&both), ["relay_without_latest", "relay_out_of_reach"]);
+        assert_eq!(
+            both.holds.last().unwrap().says,
+            "memory: a relay out of reach for 2 minutes"
+        );
     }
 
     /// The two records of 2026-10-19 place their amber lines together: the

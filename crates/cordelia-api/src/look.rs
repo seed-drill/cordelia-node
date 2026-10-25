@@ -68,7 +68,9 @@ use crate::person::{
     Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
     kept_entry, latest_entry, reached_name, read_applied_word,
 };
-use crate::state::{AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, RefusedOf, Waits};
+use crate::state::{
+    AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, ReferenceBy, RefusedOf, Waits,
+};
 
 /// A device, as it is shown to a person: its key, the label it is known
 /// by, and the first words of its key's fingerprint.
@@ -315,8 +317,18 @@ pub struct ReachLook {
     /// Its reference: the latest of the node's start, a sleep, the change
     /// of the kept entry, and the moment it was last reached.
     pub reference: i64,
+    /// Which of those moments its reference is: what `<since>` says it is
+    /// since (decision 2026-10-24, rule 6). Nothing decides by it.
+    #[serde(default)]
+    pub reference_by: ReferenceBy,
     /// When it was last reached, where it was since the node started.
     pub last_reached: Option<i64>,
+    /// Since when it has lacked the change, with every show answered on it
+    /// since saying so, where it is reached and lacks it: what the wait
+    /// after a change counts the minutes of a refusal from (decision
+    /// 2026-10-24, rule 4).
+    #[serde(default)]
+    pub refused_since: Option<i64>,
     /// What waits there, where it is reached.
     pub waits: Option<Waits>,
     /// Since when it has refused what waits there, where it does.
@@ -1539,7 +1551,9 @@ pub fn relays(at_relays: &AtRelays) -> Vec<AtRelayLook> {
                 reached: relay.reach.reached,
                 out_of_reach_since: relay.reach.out_of_reach_since,
                 reference: relay.reach.reference,
+                reference_by: relay.reach.reference_by,
                 last_reached: relay.reach.last_reached,
+                refused_since: relay.reach.refused_since,
                 waits: relay.reach.waits,
                 refusing_waits_since: relay.reach.refusing_waits_since,
                 no_room: relay.no_room.clone(),
@@ -1654,18 +1668,34 @@ pub fn when(at: i64, now: i64) -> String {
     }
 }
 
-/// `<since>` (decision 2026-10-19 §5): "has not been reached from here
-/// since <when>", where the relay was reached since its reference last
-/// moved by a start, a sleep or a change of the kept entry, at the moment
-/// it was last reached; "has not answered since <when>" where it was not,
-/// at its reference.
+/// `<since>` (decision 2026-10-19 §5; decision 2026-10-24, rule 6): it
+/// says since what. "has not been reached since <when>", where the relay
+/// was reached since its reference last moved by a start, a sleep or a
+/// change of the kept entry, at the moment it was last reached. Where it
+/// was not, "has not answered since" that moment, said as what it is:
+/// this device applied the change, started, or woke from sleep, at its
+/// reference; and where the relay was reached before it since the node
+/// started, when that was.
 pub fn since(reach: &ReachLook, now: i64) -> String {
-    match reach.last_reached {
-        Some(at) if at >= reach.reference => {
-            format!("has not been reached from here since {}", when(at, now))
+    let what = match (reach.last_reached, reach.reference_by) {
+        (Some(at), _) if at >= reach.reference => {
+            return format!("has not been reached since {}", when(at, now));
         }
-        _ => format!("has not answered since {}", when(reach.reference, now)),
-    }
+        (_, ReferenceBy::Reached) => {
+            return format!("has not been reached since {}", when(reach.reference, now));
+        }
+        (_, ReferenceBy::Change) => "this device applied the change",
+        (_, ReferenceBy::Start) => "this device started",
+        (_, ReferenceBy::Sleep) => "this device woke from sleep",
+    };
+    let last = reach
+        .last_reached
+        .map(|at| format!(" (it was last reached at {})", when(at, now)))
+        .unwrap_or_default();
+    format!(
+        "has not answered since {what} at {}{last}",
+        when(reach.reference, now)
+    )
 }
 
 /// What is said of a relay's last refusal (decision 2026-10-19 §2, rule
@@ -1725,13 +1755,15 @@ impl AtRelayLook {
         let out = self.out_of_reach(latest);
         if out && self.reach.holds == Holds::Lacks {
             says.push(format!(
-                "{} is not known to hold the latest change, and {}",
+                "{} cannot be reached from here, and is not known to hold the latest change: \
+                 it {}",
                 self.relay,
                 since()
             ));
         } else if out && self.reach.holds == Holds::Holds {
             says.push(format!(
-                "{} {}: this device sends through the others",
+                "{} cannot be reached from here: it {}. It holds the latest change, and this \
+                 device sends through the others",
                 self.relay,
                 since()
             ));
@@ -2504,6 +2536,7 @@ mod tests {
             reached: true,
             out_of_reach_since: None,
             reference: 1_800_000_000,
+            reference_by: ReferenceBy::Reached,
             last_reached: Some(1_800_000_050),
             refused_since: None,
             waits: Some(Waits::Refused),
@@ -2516,7 +2549,9 @@ mod tests {
             holds: Holds::Lacks,
             reached: false,
             out_of_reach_since: Some(1_800_000_300),
+            reference_by: ReferenceBy::Change,
             last_reached: None,
+            refused_since: Some(1_800_000_200),
             waits: None,
             refusing_waits_since: None,
             lacking_secs: Some(400),
@@ -2562,6 +2597,7 @@ mod tests {
                         "about": hex::encode([3; 32]), "lacks_for": null,
                         "class": "stuck", "holds": "holds", "reached": true,
                         "out_of_reach_since": null, "reference": 1_800_000_000,
+                        "reference_by": "reached", "refused_since": null,
                         "last_reached": 1_800_000_050, "waits": "refused",
                         "refusing_waits_since": 1_800_000_060, "no_room": null,
                         "answered_at": 1_800_000_050, "lacking_secs": null,
@@ -2575,6 +2611,7 @@ mod tests {
                                                  "of": "change" } },
                         "class": "out_lacking", "holds": "lacks", "reached": false,
                         "out_of_reach_since": 1_800_000_300, "reference": 1_800_000_000,
+                        "reference_by": "change", "refused_since": 1_800_000_200,
                         "last_reached": null, "waits": null, "refusing_waits_since": null,
                         "no_room": { "at": 1_800_000_100, "over_allowance": false,
                                      "of": "change" },
@@ -3199,7 +3236,9 @@ mod tests {
             reached: false,
             out_of_reach_since: out,
             reference: now - 900,
+            reference_by: ReferenceBy::Change,
             last_reached,
+            refused_since: None,
             waits: None,
             refusing_waits_since: None,
             no_room: None,
@@ -3236,8 +3275,9 @@ mod tests {
             assert_eq!(
                 t2.says(Some(now - 600), latest, now),
                 [
-                    "b.example:9474 is not known to hold the latest change, and has not answered \
-                  since 11:45 UTC"
+                    "b.example:9474 cannot be reached from here, and is not known to hold the \
+                     latest change: it has not answered since this device applied the change at \
+                     11:45 UTC"
                 ]
             );
             let t3 = relay(
@@ -3248,8 +3288,9 @@ mod tests {
             assert_eq!(
                 t3.says(Some(now - 600), latest, now),
                 [
-                    "b.example:9474 has not been reached from here since 11:55 UTC: this device \
-                  sends through the others"
+                    "b.example:9474 cannot be reached from here: it has not been reached since \
+                     11:55 UTC. It holds the latest change, and this device sends through the \
+                     others"
                 ]
             );
         }
@@ -3265,6 +3306,75 @@ mod tests {
         assert_eq!(
             reached.says(Some(now - 600), latest, now),
             ["b.example:9474 does not hold the latest change yet"]
+        );
+    }
+
+    /// **"Since" says since what** (decision 2026-10-24, rule 6): one
+    /// case for each moment a reference can be, with and without when the
+    /// relay was last reached. A relay reached since its reference has not
+    /// been reached since then; one reached only before it says when that
+    /// was. The case that was seen: a relay last reached at 10:48, the
+    /// change applied here at 10:53.
+    #[test]
+    fn since_says_since_what() {
+        // 11:00, 2026-10-21, in UTC.
+        let now = 1_792_580_400;
+        let (at_10_48, at_10_53) = (now - 12 * 60, now - 7 * 60);
+        let reach = |by: ReferenceBy, last_reached: Option<i64>| ReachLook {
+            about: None,
+            class: None,
+            holds: Holds::Lacks,
+            reached: false,
+            out_of_reach_since: Some(now - 60),
+            reference: at_10_53,
+            reference_by: by,
+            last_reached,
+            refused_since: None,
+            waits: None,
+            refusing_waits_since: None,
+            no_room: None,
+            answered_at: None,
+            lacking_secs: None,
+            lacks_for: None,
+        };
+        let cases = [
+            (
+                ReferenceBy::Change,
+                "has not answered since this device applied the change at 10:53 UTC",
+            ),
+            (
+                ReferenceBy::Start,
+                "has not answered since this device started at 10:53 UTC",
+            ),
+            (
+                ReferenceBy::Sleep,
+                "has not answered since this device woke from sleep at 10:53 UTC",
+            ),
+            (ReferenceBy::Reached, "has not been reached since 10:53 UTC"),
+        ];
+        for (by, says) in cases {
+            assert_eq!(since(&reach(by, None), now), says, "{by:?}");
+            // Last reached at the reference, or after it: since then.
+            assert_eq!(
+                since(&reach(by, Some(at_10_53)), now),
+                "has not been reached since 10:53 UTC",
+                "{by:?}"
+            );
+        }
+        assert_eq!(
+            since(&reach(ReferenceBy::Change, Some(at_10_48)), now),
+            "has not answered since this device applied the change at 10:53 UTC (it was last \
+             reached at 10:48 UTC)"
+        );
+        assert_eq!(
+            since(&reach(ReferenceBy::Sleep, Some(at_10_48)), now),
+            "has not answered since this device woke from sleep at 10:53 UTC (it was last \
+             reached at 10:48 UTC)"
+        );
+        assert_eq!(
+            since(&reach(ReferenceBy::Change, Some(at_10_48 - 86_400)), now),
+            "has not answered since this device applied the change at 10:53 UTC (it was last \
+             reached at 10:48 UTC on 2026-10-20)"
         );
     }
 
