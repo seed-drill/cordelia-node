@@ -278,9 +278,14 @@ fn list_written(
 
 /// A relay answered that it holds another list of bounds of the device's
 /// at `rev` (decision 2026-10-25, rule 2), in the caller's write: its store
-/// went back. The device first drops its own bounds set before this start,
-/// which may be ones its later life ended, and then writes its list above
-/// that revision, where it may.
+/// went back, or the relay lies. Only where the device may write its list,
+/// the answer names the revision of the list it holds, and it has written
+/// that list again so fewer than three times in a row, as
+/// [`HeldList::write`] writes again: the device then drops those of its
+/// own bounds set before this start that allow more than the usual hold
+/// (`any`, or a number above 10), which may be ones its later life ended,
+/// and keeps a 10 or a lower number, the safe side either way; and it
+/// writes its list above that revision.
 pub(crate) fn answered_another(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -289,13 +294,24 @@ pub(crate) fn answered_another(
     rev: u64,
 ) -> Result<Option<u64>, PersonError> {
     let own = identity.public_key();
+    if !may_write(conn, fetched)?
+        || !HeldList::of(conn, &own, PersonList::Bounds)?.takes_answer(conn, rev)?
+    {
+        return Ok(None);
+    }
     let start = this_start(conn)?;
     for row in kept(held::bounds(conn))? {
-        if row.key == own && row.start != Some(start) {
+        if row.key == own && row.start != Some(start) && allows_more_than_usual(&row) {
             kept(held::drop_bound(conn, &own, &row.pair))?;
         }
     }
     list_written(conn, identity, now, fetched, Some(rev))
+}
+
+/// Whether `row` allows more to wait than the usual hold: `any`, or a
+/// number above 10 (decision 2026-10-25, rule 2).
+fn allows_more_than_usual(row: &BoundRow) -> bool {
+    row.bound.is_none_or(|bound| bound > USUAL)
 }
 
 /// The reader took `list`, the list of bounds of the device whose key is
@@ -885,6 +901,96 @@ mod tests {
                 assert_eq!(stops_on(&s, n, t + 2), decides, "{laptop:?} {desktop:?}");
             }
         }
+    }
+
+    /// Of two like bounds with one `set`, the lower key decides (decision
+    /// 2026-10-25, rule 3.2): every device names the same device as the
+    /// one it was set on.
+    #[test]
+    fn of_two_like_bounds_in_one_second_the_lower_key_decides() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        allows(&s, 0, Some(20), 3600, t);
+        allows(&s, 1, Some(20), 3600, t);
+        hears(&s, 0, 1, t + 1);
+        hears(&s, 1, 0, t + 1);
+        let lower = s.key(0).min(s.key(1));
+        for n in [0, 1] {
+            match in_force_on(&s, n, t + 2) {
+                InForce::Set { bound, on, .. } => {
+                    assert_eq!(bound, Some(20));
+                    assert_eq!(on, lower, "device {n}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// The list of bounds counts its writes again apart from the list of a
+    /// person's reads (decision 2026-10-25, rules 1 and 2): once the
+    /// person's list has been written again three times in a row for a
+    /// relay's answers, the list of bounds is written again for its own,
+    /// three times, and then the person's list writes no fourth.
+    #[test]
+    fn the_list_of_bounds_counts_its_writes_again_apart() {
+        use crate::at_relays::{Kind, Pushed};
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        allows(&s, 0, Some(20), 3600, t);
+        // A person here read what it sent.
+        sends(&s, 0, "notes", "work", t).unwrap();
+        s[0].conn
+            .execute(
+                "INSERT INTO message_read_by_a_person (id) SELECT id FROM message_index",
+                [],
+            )
+            .unwrap();
+        crate::marks::write_person_list(&s[0].conn, &s[0].identity, t, true).unwrap();
+        let channels = crate::at_relays::channels(&s[0].conn, &s[0].identity).unwrap();
+        let channel = channels
+            .iter()
+            .find(|own| own.kind == Kind::Messages)
+            .unwrap();
+        let slot_of = |name: String| {
+            let secret = secret_of(&s, 0);
+            slot_id(&derive::slot_key(&secret).unwrap(), &name)
+        };
+        let newest = |name: String| {
+            let secret = secret_of(&s, 0);
+            entries::author_entry(
+                &s[0].conn,
+                &derive::channel_id(&secret).unwrap(),
+                &slot_of(name),
+                &s.key(0),
+            )
+            .unwrap()
+            .unwrap()
+            .entry
+        };
+        let person = || newest(message::person_name(&s.key(0)).unwrap());
+        let bounds = || newest(message::hold_name(&s.key(0)).unwrap());
+        let another = |entry: Entry| {
+            crate::marks::answered(
+                &s[0].conn,
+                &s[0].identity,
+                channel,
+                std::slice::from_ref(&entry),
+                &[Pushed::HoldsAnother],
+                t,
+                true,
+            )
+            .unwrap();
+        };
+        for _ in 0..4 {
+            another(person());
+        }
+        assert_eq!(person().rev, 4);
+        for _ in 0..4 {
+            another(bounds());
+        }
+        assert_eq!(bounds().rev, 4);
+        another(person());
+        assert_eq!(person().rev, 4);
     }
 
     /// A clock ahead gains nothing (decision 2026-10-25, rule 3.3): the

@@ -5141,6 +5141,32 @@ mod tests {
         assert!(kept_of(&s, 1, &s.key(0)).is_empty());
     }
 
+    /// What another device said a person read goes with its message's row
+    /// (decision 2026-10-25, rule 1.2): the desktop takes the laptop's list
+    /// twenty days after it holds the message; when the message's row goes
+    /// at its 30 days, the row of the list goes with it, though a row of a
+    /// message not held would be kept 30 days from when it was taken.
+    #[test]
+    fn a_persons_read_from_another_device_goes_with_its_messages_row() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        let id = sent(&s, 0, &asking("notes", Some("work"), "a month"), t);
+        // The desktop first holds it at t.
+        for entry in s[0].stored() {
+            crate::take::take(&s[1].conn, &s[1].identity, &entry, t).unwrap();
+        }
+        assert!(held::holds_message(&s[1].conn, &id).unwrap());
+        let day = 24 * 60 * MINUTE;
+        takes(&s, 1, &person_list(&s, 0, 1, &[id]), t + 20 * day);
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [id]);
+        let month = i64::from(cordelia_core::protocol::AGENT_MESSAGE_KEPT_DAYS) * day;
+        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month - 1, true).unwrap();
+        assert_eq!(kept_of(&s, 1, &s.key(0)), [id]);
+        crate::reader::hourly(&s[1].conn, &s[1].identity, t + month, true).unwrap();
+        assert!(!held::holds_message(&s[1].conn, &id).unwrap());
+        assert!(kept_of(&s, 1, &s.key(0)).is_empty());
+    }
+
     /// A person's read from a key that no longer counts says nothing
     /// (decision 2026-10-25, rule 1): what is kept of it is not read by a
     /// person, and counts towards the pair.
@@ -5981,6 +6007,93 @@ mod tests {
             }
             assert_eq!(in_force_on(&s, 0, &since, now + 125).stops_at(), Some(4));
         }
+    }
+
+    /// A relay that answers another cannot end a 10 (decision 2026-10-25,
+    /// rule 2, the review of the build): the laptop allows any for a week;
+    /// the desktop, having heard of it, goes back to 10, and allows any for
+    /// every agent of notes; the laptop does not hear of either. The
+    /// desktop starts again, hears the laptop's any for plans and work,
+    /// and sets 5 there. An answer of another to a list it no longer holds
+    /// changes nothing. One to the list it holds drops its own any of
+    /// before the start, keeps its 10 and the 5 set since, and leaves the
+    /// laptop's bounds; the list written above lists the 10, and the laptop
+    /// that hears it holds at 10. A fourth answer in a row writes nothing.
+    #[test]
+    fn a_relay_that_answers_another_cannot_end_a_ten() {
+        use crate::at_relays::{Kind, Pushed};
+        let s = devices(2);
+        let now = s.now + MINUTE;
+        let pair = crate::bounds::Pair::of("notes", Some("work"));
+        let to_all = crate::bounds::Pair::of("notes", None);
+        let since = crate::bounds::Pair::of("plans", Some("work"));
+        let asks = |n: usize, a: &str, b: Option<&str>, bound: Option<u8>, at: i64| {
+            allows_on(&s, n, &allow_asked(a, b, bound, 604_800, true), at).unwrap();
+        };
+        crate::bounds::started(&s[1].conn).unwrap();
+        asks(0, "notes", Some("work"), None, now);
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
+        asks(1, "notes", Some("work"), Some(10), now + 2);
+        asks(1, "notes", None, None, now + 3);
+        asks(0, "plans", Some("work"), None, now + 4);
+        takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 5);
+        // The desktop starts again, and a person sets 5 for plans and work.
+        crate::bounds::started(&s[1].conn).unwrap();
+        let older = bounds_list_of(&s, 1).unwrap().into_entry();
+        asks(1, "plans", Some("work"), Some(5), now + 6);
+        let held = bounds_list_of(&s, 1).unwrap().into_entry();
+        assert_eq!(held.rev, older.rev + 1);
+        let channels = crate::at_relays::channels(&s[1].conn, &s[1].identity).unwrap();
+        let channel = channels
+            .iter()
+            .find(|own| own.kind == Kind::Messages)
+            .unwrap();
+        let another = |entry: &cordelia_crypto::entry::Entry, at: i64| {
+            crate::marks::answered(
+                &s[1].conn,
+                &s[1].identity,
+                channel,
+                std::slice::from_ref(entry),
+                &[Pushed::HoldsAnother],
+                at,
+                true,
+            )
+            .unwrap();
+        };
+        let stops =
+            |n: usize, pair: &crate::bounds::Pair| in_force_on(&s, n, pair, now + 10).stops_at();
+        assert_eq!(stops(1, &to_all), None);
+        // To a list it no longer holds: nothing.
+        another(&older, now + 7);
+        assert_eq!(stops(1, &to_all), None);
+        assert_eq!(bounds_list_of(&s, 1).unwrap().rev, held.rev);
+        // To the list it holds.
+        another(&held, now + 8);
+        assert_eq!(stops(1, &pair), Some(10));
+        assert_eq!(
+            stops(1, &to_all),
+            Some(10),
+            "its own any of before the start goes"
+        );
+        assert_eq!(stops(1, &since), Some(5));
+        let rows = held::bounds(&s[1].conn).unwrap();
+        assert_eq!(rows.iter().filter(|row| row.key == s.key(0)).count(), 2);
+        let written = bounds_list_of(&s, 1).unwrap();
+        assert_eq!(written.rev, held.rev + 1);
+        // The laptop hears it, and holds at 10.
+        assert_eq!(stops(0, &pair), None);
+        takes(&s, 0, &written, now + 9);
+        assert_eq!(stops(0, &pair), Some(10));
+        // Three in a row are written again, and no fourth.
+        for k in 0..3 {
+            let newest = bounds_list_of(&s, 1).unwrap().into_entry();
+            another(&newest, now + 11 + k);
+        }
+        let capped = bounds_list_of(&s, 1).unwrap().rev;
+        assert_eq!(capped, held.rev + 3);
+        another(&bounds_list_of(&s, 1).unwrap().into_entry(), now + 20);
+        assert_eq!(bounds_list_of(&s, 1).unwrap().rev, capped);
+        assert_eq!(stops(1, &pair), Some(10));
     }
 
     /// The known limit (decision 2026-10-25, rule 5, T22): the route of

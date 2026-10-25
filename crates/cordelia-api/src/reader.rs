@@ -228,9 +228,12 @@ pub fn read_held_lists(
 ) -> Result<bool, PersonError> {
     use cordelia_storage::entries;
     use cordelia_storage::meta;
-    // Once it is done, a read of one key says so, outside any write: a
-    // route that asks first pays no more.
-    if meta::get(conn, meta::MESSAGES_LISTS_READ)?.is_some() {
+    // Once it is done, or while the device does not stand applied, reads
+    // say so outside any write: a route or a status that asks first pays
+    // no more.
+    if meta::get(conn, meta::MESSAGES_LISTS_READ)?.is_some()
+        || crate::at_relays::stands(conn)? != crate::at_relays::Stands::Applied
+    {
         return Ok(false);
     }
     in_one(conn, || {

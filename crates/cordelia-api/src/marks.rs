@@ -523,11 +523,8 @@ impl HeldList {
         value: Vec<u8>,
     ) -> Result<Option<u64>, PersonError> {
         let rev = self.rev();
-        let again: usize = meta::get(conn, self.list.again_key())?
-            .and_then(|again| again.parse().ok())
-            .unwrap_or(0);
         let due = match above {
-            Some(answered) => rev == answered && again + 1 < AGENT_MESSAGE_SENDS_MAX,
+            Some(answered) => self.takes_answer(conn, answered)?,
             None => changed,
         };
         let next = rev + 1;
@@ -535,7 +532,7 @@ impl HeldList {
             return Ok(None);
         }
         let again = match above {
-            Some(_) => again + 1,
+            Some(_) => self.again(conn)? + 1,
             None => 0,
         };
         meta::set(conn, self.list.again_key(), &again.to_string())?;
@@ -547,6 +544,29 @@ impl HeldList {
             ));
         }
         Ok(Some(next))
+    }
+}
+
+impl HeldList {
+    /// How many times in a row the list was written again for a relay's
+    /// answer of another.
+    fn again(&self, conn: &Connection) -> Result<usize, PersonError> {
+        Ok(meta::get(conn, self.list.again_key())?
+            .and_then(|again| again.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Whether a relay's answer that it holds another list of the device's
+    /// at `answered` is one the list is written again for (decision
+    /// 2026-10-09 §2.4, decision 2026-10-25, rules 1 and 2): it names the
+    /// revision of the list held, and the list has been written again so
+    /// fewer than three times in a row (`AGENT_MESSAGE_SENDS_MAX`).
+    pub(crate) fn takes_answer(
+        &self,
+        conn: &Connection,
+        answered: u64,
+    ) -> Result<bool, PersonError> {
+        Ok(self.rev() == answered && self.again(conn)? + 1 < AGENT_MESSAGE_SENDS_MAX)
     }
 }
 
