@@ -473,32 +473,32 @@ pub(crate) fn counting(
 /// [`follows_a_clear_change`] keeps what it works out.
 fn known_removed(conn: &Connection) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PersonError> {
     let mark = held_rows::clear_mark(conn)?;
-    if let Some(mark) = mark {
-        let kept = REMOVED_READ
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, keys)) = kept.as_ref()
-            && *at == mark
-        {
-            return Ok(keys.clone());
-        }
+    if let Some(mark) = mark
+        && let Some(keys) = REMOVED_READ.with_borrow(|kept| match kept {
+            Some((at, keys)) if *at == mark => Some(keys.clone()),
+            _ => None,
+        })
+    {
+        return Ok(keys);
     }
     let keys = std::sync::Arc::new(held_rows::removed_keys(conn)?);
     if let Some(mark) = mark
         && held_rows::clear_mark(conn)? == Some(mark)
     {
-        *REMOVED_READ
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mark, keys.clone()));
+        REMOVED_READ.set(Some((mark, keys.clone())));
     }
     Ok(keys)
 }
 
-/// The removed keys as this process last read them ([`known_removed`]),
-/// with the mark they were read under.
-#[allow(clippy::type_complexity)]
-static REMOVED_READ: std::sync::Mutex<Option<([u8; 16], std::sync::Arc<Vec<[u8; 32]>>)>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// The removed keys as this thread last read them ([`known_removed`]),
+    /// with the mark they were read under. One for each thread, so that
+    /// what one thread reads of one database does not put out what another
+    /// thread keeps of another.
+    #[allow(clippy::type_complexity)]
+    static REMOVED_READ: std::cell::RefCell<Option<([u8; 16], std::sync::Arc<Vec<[u8; 32]>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 // ── What a device knows of removals ──────────────────────────────────
 
@@ -607,25 +607,24 @@ pub fn follows_a_clear_change(conn: &Connection) -> Result<bool, PersonError> {
     if let Some(mark) = mark
         && held_rows::clear_mark(conn)? == Some(mark)
     {
-        *CLEAR_WORKED_OUT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mark, clear));
+        CLEAR_WORKED_OUT.set(Some((mark, clear)));
     }
     Ok(clear)
 }
 
-/// Whether the change followed is clear, as this process last worked it
-/// out ([`follows_a_clear_change`]), with the mark it was worked out
-/// under. A mark is 16 random bytes, made anew by every write: one is
-/// never the mark of two databases, or of two states of one.
-static CLEAR_WORKED_OUT: std::sync::Mutex<Option<([u8; 16], bool)>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// Whether the change followed is clear, as this thread last worked it
+    /// out ([`follows_a_clear_change`]), with the mark it was worked out
+    /// under. A mark is 16 random bytes, made anew by every write: one is
+    /// never the mark of two databases, or of two states of one. One for
+    /// each thread, as [`REMOVED_READ`] is.
+    static CLEAR_WORKED_OUT: std::cell::Cell<Option<([u8; 16], bool)>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// What was worked out under `mark`, where the last worked out was.
 fn clear_worked_out(mark: &[u8; 16]) -> Option<bool> {
-    match *CLEAR_WORKED_OUT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    match CLEAR_WORKED_OUT.get() {
         Some((kept, clear)) if kept == *mark => Some(clear),
         _ => None,
     }
