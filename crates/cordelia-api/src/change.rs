@@ -1086,10 +1086,13 @@ mod tests {
     /// `cordelia phrase` makes.
     #[test]
     fn test_a_change_entry_says_its_lineage_and_when_it_was_made() {
+        // The clock, read here and not through the code that makes the
+        // change.
+        let clock = || chrono::Utc::now().timestamp() as u64;
         let mut s = Several::of_one_person(3);
-        let before = made_now();
+        let before = clock();
         let entry = change_on_0(&s, &[0, 1, 2], &[]).unwrap();
-        let after = made_now();
+        let after = clock();
         let (signed, _) = read(&s, &entry);
         let lineage = change_entry::lineage(&entry.content).unwrap().unwrap();
         assert!(lineage.is_of(&signed.statement).unwrap());
@@ -1121,9 +1124,9 @@ mod tests {
         assert_eq!(lineage.chain.len(), 3);
 
         // The first change.
-        let before = made_now();
+        let before = clock();
         let made = crate::person::first_entry(&s.phrase, &s.key(0), "desktop").unwrap();
-        let after = made_now();
+        let after = clock();
         let lineage = change_entry::lineage(&made.entry.content).unwrap().unwrap();
         assert!(lineage.chain.is_empty());
         assert!((before..=after).contains(&lineage.made_at));
