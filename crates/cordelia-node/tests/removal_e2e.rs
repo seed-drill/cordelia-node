@@ -145,8 +145,8 @@ fn writes_a_record_adding(adder: &Node, added: &[u8; 32], label: &str) {
 /// It asserts:
 ///
 /// - (a) the laptop takes the record and is closed, with no person's act:
-///   its status says so, in red, and the change it follows is change 2
-///   still;
+///   stored as `fork` by rule 8 (rules 3 and 10, slice 3), its status says
+///   so, in red, and the change it follows is change 2 still;
 /// - (b) a file that the laptop edits while it is closed stays in its
 ///   folder, and no entry that the laptop signs reaches the relay;
 /// - (c) a change made with the phrase on the laptop (`cordelia renew`),
@@ -199,7 +199,7 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
     // (a) The laptop takes it, and is closed.
     let all = [&relay, &laptop, &desktop];
     wait_for("the laptop is closed", &all, 120, || {
-        (stands(&laptop).0 == "closed").then_some(())
+        (stands(&laptop).0 == "fork").then_some(())
     });
     let (_, why) = stands(&laptop);
     assert!(
@@ -227,7 +227,7 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
         closed_at,
         "an entry the laptop signed reached the relay while it was closed"
     );
-    assert_eq!(stands(&laptop).0, "closed");
+    assert_eq!(stands(&laptop).0, "fork");
     assert_eq!(
         read(&l_mem.join("while-closed.md")).as_deref(),
         Some("written while closed\n"),

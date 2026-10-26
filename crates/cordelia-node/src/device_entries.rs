@@ -964,7 +964,8 @@ impl DeviceEntries {
     /// hands over, through the one door for that ([`Leave::pair`]):
     /// keys that a person typed at `cordelia accept` within the last
     /// hour (decision 2026-10-04 §4.6, §5.1). Says whether a hand-over
-    /// was taken.
+    /// was taken, or what the device keeps of its person's changes changed
+    /// by one that was refused.
     ///
     /// One asking runs at a time at a relay: one that finds another
     /// running there does nothing.
@@ -977,6 +978,10 @@ impl DeviceEntries {
             return false;
         };
         let sync_on = |db: &Connection| cordelia_api::commands::sync_is_on(db).unwrap_or(true);
+        // A refusal can close the device too (decision 2026-10-24
+        // (removal), rule 8): a change in what it keeps wakes the pass
+        // (rule 19).
+        let kept_before = at_relays::what_it_keeps(&lock(&self.state.db));
         let mut taken = false;
         for key in typed {
             let read = self.leave.pair(&self.state, link, key, sync_on).await;
@@ -997,7 +1002,8 @@ impl DeviceEntries {
                 }
             }
         }
-        taken
+        let kept_after = at_relays::what_it_keeps(&lock(&self.state.db));
+        taken || kept_before.is_none() || kept_before != kept_after
     }
 
     /// [`Self::pass`], for the channels of the device's own. Says
@@ -1842,14 +1848,14 @@ impl DeviceEntries {
                     return false;
                 }
                 ShowAnswer::Other { id, .. } => {
-                    // The relay holds another. One that the device keeps,
-                    // made apart from its own, it asks no more about. For
-                    // any other it shows its own whole, and is answered
-                    // with the entry.
+                    // The relay holds another. One that the device keeps
+                    // as a head set aside it asks no more about. For any
+                    // other it shows its own whole, and is answered with
+                    // the entry.
                     self.holds(link, entry, false);
                     round.said = Some(Said::Lacks);
                     self.lacks_for_another(link, None);
-                    if !short || shows.apart == Some(id) {
+                    if !short || shows.set_aside.contains(&id) {
                         return false;
                     }
                     whole = true;
@@ -1891,6 +1897,13 @@ impl DeviceEntries {
     /// behind the statement it has applied, one that is refused. A relay
     /// answers with such an entry as often as it is shown one, and a
     /// cycle is not stopped for it.
+    ///
+    /// **Nor does a head set aside, or a close** (decision 2026-10-24
+    /// (removal), rules 5 and 10): the transaction that keeps the head and
+    /// the keys it removes commits at once, and is not undone to wait for
+    /// the cycle. A closed device seals nothing from that commit, whatever
+    /// a running cycle does (`Standing::to_write`), so its close commits
+    /// with it.
     fn answered_as_a_change(
         &self,
         shown: &CheckedEntry,
@@ -1904,9 +1917,10 @@ impl DeviceEntries {
                     at_relays::answered(db, identity, shown, another, now)
                 })
             },
-            |(_, changed)| match changed {
-                true => Came::Changed,
-                false => Came::Nothing,
+            |(outcome, changed)| match (outcome, changed) {
+                (Ok(Answered::Shown(Shown::SetAside | Shown::Closed)), _) => Came::Nothing,
+                (_, true) => Came::Changed,
+                (_, false) => Came::Nothing,
             },
         );
         outcome
@@ -1929,13 +1943,26 @@ impl DeviceEntries {
                 );
                 self.not_carried(&applied);
                 self.applied();
+                // A change in what the device keeps: it shows at every
+                // relay it reaches at once (decision 2026-10-24 (removal),
+                // rule 19).
+                self.state.own_channels.ask_whole();
                 true
             }
-            Ok(Answered::Shown(Shown::Fork)) => {
+            Ok(Answered::Shown(Shown::SetAside)) => {
+                tracing::info!(
+                    relay,
+                    "a relay holds a change made apart from the one this device follows: it is set aside, and this device goes on"
+                );
+                self.state.own_channels.ask_whole();
+                false
+            }
+            Ok(Answered::Shown(Shown::Closed)) => {
                 tracing::warn!(
                     relay,
-                    "a relay holds a change made apart from the one this device applied: it keeps both, and stops"
+                    "a relay holds a change made apart, and no change that lists this device is clear of a removed device: it is closed until the two are settled"
                 );
+                self.state.own_channels.ask_whole();
                 false
             }
             Ok(Answered::Shown(
@@ -1945,13 +1972,6 @@ impl DeviceEntries {
                     relay,
                     ?stopped,
                     "a relay holds a change by which this device stops"
-                );
-                false
-            }
-            Ok(Answered::Shown(Shown::NotClear)) => {
-                tracing::warn!(
-                    relay,
-                    "a relay holds a change that lists a device this device knows was removed: it is not applied, and what it removes is kept"
                 );
                 false
             }
@@ -2617,10 +2637,13 @@ impl DeviceEntries {
                             Ok(kept) if kept == (mark, after) => Places::Kept,
                             _ => Places::Own,
                         };
+                        let kept_before = at_relays::what_it_keeps(db);
                         match at_relays::take_page(db, &self.state.identity, &page, places, now) {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
+                                kept_changed: kept_before.is_none()
+                                    || kept_before != at_relays::what_it_keeps(db),
                                 // A page asked from a place forgotten
                                 // since is no end of the channel: the pull
                                 // goes on, from the start.
@@ -2645,6 +2668,11 @@ impl DeviceEntries {
             match taken {
                 Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
+                    // A change in what the device keeps wakes the pass
+                    // (decision 2026-10-24 (removal), rule 19).
+                    if page.kept_changed {
+                        self.state.own_channels.ask_whole();
+                    }
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;
@@ -3104,6 +3132,10 @@ struct PageSeen {
     /// Whether it was asked from a place that is no longer the one kept:
     /// every place was forgotten while it was asked for.
     stale: bool,
+    /// Whether what the device keeps of its person's changes changed by
+    /// it: a record that hands a removed key the secret it follows closes
+    /// it (decision 2026-10-24 (removal), rules 3, 8 and 19).
+    kept_changed: bool,
 }
 
 /// What the answer `done` to a push of a channel of `kind` says of what of

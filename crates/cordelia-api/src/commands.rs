@@ -41,7 +41,7 @@ use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::fingerprint;
 use cordelia_crypto::statement::Statement;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
+use cordelia_storage::person::{self as held_rows, KeptAddition, State};
 
 use crate::adding::{self, Row, WouldAdd};
 use crate::at_relays;
@@ -193,9 +193,13 @@ fn says(e: &PersonError) -> String {
             "this device follows no recovery phrase yet.\n{}",
             crate::look::WAYS_ON
         ),
+        // A head set aside, or a closed device (decision 2026-10-24
+        // (removal), rules 10 and 11).
         PersonError::Stopped(State::Fork) => "two changes were made apart, and this device has \
-                                              seen both: settle it with the phrase first \
-                                              (`cordelia settle`)."
+                                              seen both, or a device that was removed holds the \
+                                              secret of the change it follows: `cordelia \
+                                              devices` says the way on (`cordelia settle` where \
+                                              two changes were made apart)."
             .into(),
         PersonError::Stopped(State::Removed) => "this device was removed. `cordelia init \
                                                  --new-key` gives it a new key; it is then \
@@ -1116,8 +1120,12 @@ fn received(state: &AppState, now: i64) -> Option<serde_json::Value> {
 ///
 /// Refused on a device that makes no statement (§4.3): one that follows
 /// no phrase, was removed, is in no list or could not open a change. A
-/// device in a fork is handed this only to settle, and a device that is
-/// in none has nothing to settle.
+/// device that keeps a head set aside (decision 2026-10-24 (removal), rule
+/// 1), closed or not, is handed this only to settle, with the head that the
+/// settlement joins: the highest number, and of two at one number the
+/// lower hash. A device that keeps none has nothing to settle. (Rule 21,
+/// by which any change made where a head is set aside joins it, is a later
+/// slice of the build.)
 pub async fn change_prepare(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1128,13 +1136,18 @@ pub async fn change_prepare(
         let held = person::held(conn)
             .map_err(refused)?
             .ok_or_else(|| refused(PersonError::FollowsNoPhrase))?;
-        match (held.state, body.settle) {
-            (State::Applied, false) | (State::Fork, true) => Ok(held.state),
-            (State::Applied, true) => Err(ApiError::BadRequest(
+        let keeps_a_head = !held_rows::set_aside_entries(conn)?.is_empty();
+        match (held.state, keeps_a_head, body.settle) {
+            (State::Applied | State::Fork, true, true)
+            | (State::Applied | State::Fork, false, false) => Ok(held.state),
+            (State::Applied | State::Fork, false, true) => Err(ApiError::BadRequest(
                 "this device has seen no two changes made apart: there is nothing to settle."
                     .into(),
             )),
-            (state, _) => Err(refused(PersonError::Stopped(state))),
+            (State::Applied | State::Fork, true, false) => {
+                Err(refused(PersonError::Stopped(State::Fork)))
+            }
+            (state, _, _) => Err(refused(PersonError::Stopped(state))),
         }
     };
     let fork = stands(&db(&state))? == State::Fork;
@@ -1163,23 +1176,17 @@ pub async fn change_prepare(
         .map_err(refused)?
         .ok_or_else(|| refused(PersonError::FollowsNoPhrase))?;
     let statement = held.statement.to_bytes().map_err(|e| refused(e.into()))?;
-    let latest = person_entry(&conn, Kept::Latest)?
+    let latest = person::kept_followed(&conn)
+        .map_err(refused)?
         .ok_or_else(|| ApiError::Internal("no change entry is kept".into()))?;
-    let apart = person_entry(&conn, Kept::Apart)?;
-    let apart_statement = match &apart {
+    let head = head_to_settle(&conn, &state.identity, &held)?;
+    let apart_statement = match &head {
         None => None,
-        Some(entry) => {
-            let following = &held.following;
-            let read = cordelia_crypto::change_entry::open_statement(
-                entry,
-                &following.phrase_key,
-                &following.phrase_channel,
-                &following.statement_key,
-            )
-            .map_err(|e| refused(e.into()))?;
-            Some(hex::encode(read.to_bytes().map_err(|e| refused(e.into()))?))
-        }
+        Some(head) => Some(hex::encode(
+            head.statement.to_bytes().map_err(|e| refused(e.into()))?,
+        )),
     };
+    let apart = head.map(|head| head.entry);
     let kept = held_rows::additions(&conn)?;
     let additions: Vec<String> = asked_about(&kept)
         .into_iter()
@@ -1257,18 +1264,31 @@ fn standing<'a>(statement: &Statement, kept: &'a [KeptAddition]) -> Vec<&'a Kept
         .collect()
 }
 
-/// A change entry that the device keeps, checked as it is read.
-fn person_entry(
+/// The head set aside that `cordelia settle` joins with the change
+/// followed: the highest number, and of two at one number the lower hash
+/// (decision 2026-10-24 (removal), rule 8, step 7). `None` where the device
+/// keeps none.
+fn head_to_settle(
     conn: &rusqlite::Connection,
-    which: Kept,
-) -> Result<Option<CheckedEntry>, ApiError> {
-    held_rows::change_entry(conn, which)?
-        .map(|entry| {
-            entry
-                .check()
-                .map_err(|e| ApiError::Internal(format!("a change entry that is kept: {e}")))
-        })
-        .transpose()
+    identity: &cordelia_crypto::identity::NodeIdentity,
+    held: &person::Held,
+) -> Result<Option<person::Head>, ApiError> {
+    let mut heads = person::set_aside_heads(conn, identity, &held.following).map_err(refused)?;
+    let mut ranked = Vec::with_capacity(heads.len());
+    for head in heads.drain(..) {
+        let hash = head
+            .statement
+            .statement
+            .hash()
+            .map_err(|e| refused(e.into()))?;
+        ranked.push((
+            std::cmp::Reverse(head.statement.statement.number),
+            hash,
+            head,
+        ));
+    }
+    ranked.sort_by_key(|(number, hash, _)| (*number, *hash));
+    Ok(ranked.into_iter().next().map(|(_, _, head)| head))
 }
 
 #[derive(Deserialize)]

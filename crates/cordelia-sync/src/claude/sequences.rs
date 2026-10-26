@@ -552,7 +552,7 @@ impl World {
             .collect();
         let change = {
             let db = devices[0].st.db.lock().unwrap();
-            let kept = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let kept = held_rows::followed_entry(&db);
             kept.unwrap().unwrap().check().unwrap()
         };
         Self {
@@ -886,7 +886,7 @@ impl World {
         let st = &self.devices[d].st;
         let kept = {
             let db = st.db.lock().unwrap();
-            let kept = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let kept = held_rows::followed_entry(&db);
             kept.unwrap().unwrap().id()
         };
         if kept == self.change.id() {
@@ -926,7 +926,7 @@ impl World {
         let (entry, over) = {
             let db = st.db.lock().unwrap();
             let held = person::held(&db).unwrap().unwrap();
-            let latest = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let latest = held_rows::followed_entry(&db);
             let latest = latest.unwrap().unwrap().check().unwrap();
             let stay = person::who_counts(&db)
                 .unwrap()

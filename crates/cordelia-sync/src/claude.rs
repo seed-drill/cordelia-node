@@ -937,9 +937,11 @@ fn publishes_nothing(stands: Stands, moved_on: bool) -> Option<String> {
     let why = match stands {
         Stands::Applied => return None,
         Stands::NoPhrase => cordelia_api::look::no_phrase_says(moved_on).1,
+        // Closed, stored as a fork was (decision 2026-10-24 (removal),
+        // rule 10).
         Stands::Stopped(State::Fork) => {
-            "two changes were made apart: memory stays on this machine until it is settled \
-             with the phrase (`cordelia settle`)."
+            "no change that lists this device is clear of a removed device: memory stays on \
+             this machine. `cordelia devices` says the way on."
         }
         Stands::Stopped(State::Removed) => {
             "this device was removed: memory stays on this machine. `cordelia init --new-key` \
@@ -3014,7 +3016,7 @@ mod tests {
     fn removes(st: &AppState, phrase: &Phrase, gone: &[u8; 32]) -> CheckedEntry {
         let db = st.db.lock().unwrap();
         let held = person::held(&db).unwrap().unwrap();
-        let latest = held_rows::change_entry(&db, held_rows::Kept::Latest)
+        let latest = held_rows::followed_entry(&db)
             .unwrap()
             .unwrap()
             .check()

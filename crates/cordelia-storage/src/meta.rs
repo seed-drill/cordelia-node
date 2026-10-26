@@ -124,6 +124,13 @@ pub const PERSON_WORDS_TAKEN: &str = "person.words_taken";
 /// the removed keys, when the device leaves its phrase.
 pub const PERSON_REMOVED_PAST_BOUND: &str = "person.removed_past_bound";
 
+/// `"1"` where the device is to judge the change entries it kept, at its
+/// first start on the version that keeps every head (decision 2026-10-24
+/// (removal), rule 12): schema step 22 writes it on a device that follows
+/// a phrase, and the node removes it once it has judged them. A device in
+/// a fork then applies rule 8 to the entry it kept apart.
+pub const PERSON_JUDGE_KEPT: &str = "person.judge_kept";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

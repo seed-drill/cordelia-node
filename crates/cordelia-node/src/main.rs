@@ -1876,6 +1876,14 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
     indicator::Devices {
         not_applied: person["state"] == "applied" && person["cannot_go_on"].is_string(),
         removal_not_applied_secs: applied_secs.filter(|_| removal && not_by_all),
+        // A head set aside on a device that goes on (decision 2026-10-24
+        // (removal), rule 11): from the newest.
+        set_aside_secs: match person["state"] == "applied" {
+            true => list("set_aside")
+                .filter_map(|head| ago(&head["set_aside_at"]))
+                .min(),
+            false => None,
+        },
         added_not_cleared: list("notices")
             .filter(|notice| notice["kind"] == "added")
             .count(),
@@ -7155,6 +7163,7 @@ mod tests {
             indicator::Devices {
                 not_applied: false,
                 removal_not_applied_secs: Some(3_600),
+                set_aside_secs: None,
                 added_not_cleared: 2,
                 said_left: 2,
                 // Each relay that lacks the change, connected or not, as
@@ -7200,6 +7209,20 @@ mod tests {
         // nor one of which this device does not know when it applied it.
         let all_applied = edit(&|look| look["devices"][1]["applied"] = 3.into());
         assert_eq!(all_applied.removal_not_applied_secs, None);
+        // A head set aside on a device that goes on: from the newest
+        // (decision 2026-10-24 (removal), rule 11). On a closed device it
+        // is no amber: the device is red.
+        let heads = serde_json::json!([
+            { "set_aside_at": now - 500 },
+            { "set_aside_at": now - 40 },
+        ]);
+        let aside = edit(&|look| look["set_aside"] = heads.clone());
+        assert_eq!(aside.set_aside_secs, Some(40));
+        let closed = edit(&|look| {
+            look["set_aside"] = heads.clone();
+            look["state"] = "fork".into();
+        });
+        assert_eq!(closed.set_aside_secs, None);
         // A renewal: the statement lists the keys removed so far, and
         // removed none itself. So too beside a node that does not say.
         let none_removed = edit(&|look| look["removed_a_key"] = false.into());

@@ -1469,9 +1469,9 @@ const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
 /// The heads of a person's changes that a device keeps, and that a relay
 /// keeps in a slot (decision 2026-10-24 (removal), rules 1 and 14): the
 /// change a device follows and up to seven set aside. Only the phrase
-/// makes a head, and an honest person has two at most, now and then. The
-/// heads themselves are kept from a later slice of the build; this one
-/// bounds what a device knows of removals ([`MAX_KNOWN_REMOVED`]).
+/// makes a head, and an honest person has two at most, now and then. A
+/// ninth closes the device, which fails closed. It bounds what a device
+/// knows of removals too ([`MAX_KNOWN_REMOVED`]).
 pub const MAX_CHANGE_HEADS: usize = 8;
 
 /// The most keys a device keeps as removed (decision 2026-10-24

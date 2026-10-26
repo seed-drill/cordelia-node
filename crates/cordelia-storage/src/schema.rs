@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1054,6 +1054,66 @@ WHEN OLD.key = 'person.removed_past_bound'
 BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
 "#;
 
+/// Migration v22: the change entries a device keeps, and the time of each
+/// change (decision 2026-10-24 (removal), rules 1, 2 and 12).
+///
+/// - `person_change_entries` is made again. It kept the latest entry and,
+///   in a fork, the one made apart (`kept`, `latest` or `apart`); it keeps
+///   now the change the device follows (`followed` 1) and the heads it
+///   sets aside (`followed` 0), each with when it was set aside, and one
+///   change followed at most. Every row is carried: the latest as the
+///   change followed, and the one made apart as a head set aside at the
+///   time of the step. How many a device keeps (eight) is its code's to
+///   keep to.
+/// - `person_change_times`: for each change the device has applied or
+///   kept, by its statement's number and hash, the time its lineage says
+///   it was made, or none for a change made on the version before. Kept
+///   after the change goes. The step fills none: the entries are sealed,
+///   and the device notes the times of what it kept when it judges it.
+/// - `person.judge_kept` in `node_meta`, on a device that follows a
+///   phrase: at its first start on this version it notes the time of each
+///   entry it kept, and a device in a fork applies rule 8 to the one it
+///   kept apart (rule 12). Then the mark goes.
+///
+/// A relay keeps nothing in either table.
+const MIGRATION_V22: &str = r#"
+CREATE TABLE person_change_entries_22 (
+    place         INTEGER PRIMARY KEY,
+    followed      INTEGER NOT NULL CHECK(followed IN (0, 1)),
+    set_aside_at  INTEGER CHECK(set_aside_at IS NULL OR typeof(set_aside_at) = 'integer'),
+    channel       BLOB NOT NULL CHECK(length(channel) = 32),
+    slot          BLOB NOT NULL CHECK(length(slot) = 32),
+    author        BLOB NOT NULL CHECK(length(author) = 32),
+    rev           INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+    content       BLOB NOT NULL,
+    author_sig    BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig   BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    CHECK((followed = 1) = (set_aside_at IS NULL))
+);
+
+INSERT INTO person_change_entries_22
+    (followed, set_aside_at, channel, slot, author, rev, content, author_sig, channel_sig)
+SELECT kept = 'latest',
+       CASE kept WHEN 'latest' THEN NULL ELSE CAST(strftime('%s', 'now') AS INTEGER) END,
+       channel, slot, author, rev, content, author_sig, channel_sig
+FROM person_change_entries ORDER BY kept = 'apart';
+
+DROP TABLE person_change_entries;
+ALTER TABLE person_change_entries_22 RENAME TO person_change_entries;
+
+CREATE UNIQUE INDEX idx_person_change_entries_followed
+    ON person_change_entries(followed) WHERE followed = 1;
+
+CREATE TABLE person_change_times (
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    made_at  INTEGER CHECK(made_at IS NULL OR typeof(made_at) = 'integer'),
+    PRIMARY KEY (number, hash)
+);
+
+INSERT INTO node_meta (key, value) SELECT 'person.judge_kept', '1' FROM person;
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1276,6 +1336,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
         migrate_in_one(conn, MIGRATION_V21, 21)?;
     }
 
+    if current < 22 {
+        tracing::info!("applying migration v22 (the change entries a device keeps)");
+        migrate_in_one(conn, MIGRATION_V22, 22)?;
+    }
+
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
@@ -1315,6 +1380,7 @@ fn migrate_v4(conn: &Connection) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     #[test]
     fn test_init_fresh_db() {
@@ -2095,6 +2161,8 @@ mod tests {
                AND name NOT LIKE '%person_removed_keys%'
                AND name NOT LIKE '%person_holders%'
                AND name NOT LIKE '%person_clear%'
+               AND name NOT LIKE '%person_change_times%'
+               AND name NOT LIKE '%idx_person_change_entries_followed%'
                AND name NOT LIKE '%message%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
@@ -2307,7 +2375,7 @@ mod tests {
                    AND name NOT LIKE '%person_removed_keys%'
                    AND name NOT LIKE '%person_holders%'
                    AND name NOT LIKE '%person_clear%'
-               AND name NOT LIKE '%person_clear%'
+                   AND name NOT LIKE '%person_change%'
                    AND name NOT LIKE '%message%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
@@ -3295,7 +3363,10 @@ mod tests {
         for (kind, name, sql) in names {
             // What the step to version 21 adds is no row of a step before
             // it either.
-            let later = NEW_IN_V20.iter().chain(NEW_IN_V21.iter());
+            let later = NEW_IN_V20
+                .iter()
+                .chain(NEW_IN_V21.iter())
+                .chain(NEW_IN_V22.iter());
             if later
                 .clone()
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
@@ -3313,6 +3384,9 @@ mod tests {
                 let values: Vec<String> = (0..columns)
                     .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
                     .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
@@ -3556,11 +3630,12 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            // Nor what the step to version 21 adds.
+            // Nor what the steps to versions 21 and 22 make.
             if NEW_IN_V19.contains(&name.as_str())
                 || name.contains("message")
                 || NEW_IN_V21
                     .iter()
+                    .chain(NEW_IN_V22.iter())
                     .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
@@ -3576,6 +3651,9 @@ mod tests {
                 let values: Vec<String> = (0..columns)
                     .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
                     .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
@@ -4689,6 +4767,7 @@ mod tests {
         for (kind, name, sql) in names {
             if NEW_IN_V21
                 .iter()
+                .chain(NEW_IN_V22.iter())
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
@@ -4704,6 +4783,9 @@ mod tests {
                 let values: Vec<String> = (0..columns)
                     .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
                     .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
@@ -4737,7 +4819,6 @@ mod tests {
         );
 
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 21);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v21(&conn), NEW_IN_V21);
         assert_eq!(everything_but_v21(&conn), before);
@@ -4813,6 +4894,254 @@ mod tests {
         }
     }
 
+    /// What the step to version 22 makes, by name: the table of change
+    /// entries made again, its index of the change followed, and the
+    /// table of the times of changes.
+    const NEW_IN_V22: [&str; 3] = [
+        "idx_person_change_entries_followed",
+        "person_change_entries",
+        "person_change_times",
+    ];
+
+    /// What a database holds of the step to version 22, by name, with the
+    /// definition of each.
+    fn new_in_v22(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|(name, sql)| {
+                NEW_IN_V22.contains(&name.as_str())
+                    && (name != "person_change_entries"
+                        || sql.as_deref().is_some_and(|sql| sql.contains("followed")))
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 22 makes or writes.
+    fn everything_but_v22(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V22
+                .iter()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// A database at version 21, as the removal's first slice leaves one:
+    /// a device in a fork, with what [`at_v20`] holds, its person's row and
+    /// the two change entries it keeps.
+    fn at_v21() -> Connection {
+        let conn = at_v20();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        conn.execute_batch(
+            "UPDATE person SET state = 'fork';
+             INSERT INTO person_change_entries
+                 (kept, channel, slot, author, rev, content, author_sig, channel_sig)
+                 VALUES ('apart', zeroblob(32), zeroblob(32), zeroblob(32), 3, X'03',
+                         zeroblob(64), zeroblob(64)),
+                        ('latest', zeroblob(32), zeroblob(32), zeroblob(32), 2, X'02',
+                         zeroblob(64), zeroblob(64));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The step to version 22 makes the table of change entries again, and
+    /// carries each row (decision 2026-10-24 (removal), rules 1, 2 and 12):
+    /// the latest as the change followed, and the one kept apart as a head
+    /// set aside at the step's time. It adds the times of changes, empty,
+    /// and marks a device that follows a phrase to judge what it kept. It
+    /// changes nothing else; it is made in one step with its version, so a
+    /// failure between them leaves none of it, and asked for twice it is
+    /// run once. The new table takes no row that cannot be what a device
+    /// keeps.
+    #[test]
+    fn step_22_keeps_every_head_and_carries_what_was_kept() {
+        let conn = at_v21();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v22(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 21);
+        assert!(new_in_v22(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V22} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 22).is_err());
+        assert_eq!(version(&conn), 21);
+        assert!(
+            new_in_v22(&conn).is_empty(),
+            "the step goes with the version"
+        );
+
+        let began = chrono::Utc::now().timestamp();
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 22);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v22(&conn), NEW_IN_V22);
+        assert_eq!(everything_but_v22(&conn), before);
+        let rows: Vec<(i64, Option<i64>, i64, Vec<u8>)> = conn
+            .prepare(
+                "SELECT followed, set_aside_at, rev, content FROM person_change_entries
+                 ORDER BY followed DESC",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].0, rows[0].1, rows[0].2, &rows[0].3),
+            (1, None, 2, &vec![2u8])
+        );
+        assert_eq!((rows[1].0, rows[1].2, &rows[1].3), (0, 3, &vec![3u8]));
+        let at = rows[1].1.unwrap();
+        assert!(at >= began && at <= chrono::Utc::now().timestamp(), "{at}");
+        let marked = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM node_meta WHERE key = 'person.judge_kept'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(marked(&conn).as_deref(), Some("1"));
+        let times: i64 = conn
+            .query_row("SELECT COUNT(*) FROM person_change_times", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(times, 0);
+
+        // Asked for again: nothing more.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(everything_but_v22(&conn), before);
+
+        // A device that follows no phrase is not marked.
+        let none = at_v20();
+        migrate_in_one(&none, MIGRATION_V21, 21).unwrap();
+        none.execute_batch("DELETE FROM person").unwrap();
+        init_db(&none).unwrap();
+        assert_eq!(marked(&none), None);
+
+        // A row that cannot be what a device keeps is refused, and the
+        // same row with a value of its type and bound is taken.
+        let entry = |followed: &str, at: &str| {
+            format!(
+                "INSERT INTO person_change_entries
+                     (followed, set_aside_at, channel, slot, author, rev, content, author_sig,
+                      channel_sig)
+                 VALUES ({followed}, {at}, zeroblob(32), zeroblob(32), zeroblob(32), 4, X'04',
+                         zeroblob(64), zeroblob(64))"
+            )
+        };
+        conn.execute_batch("DELETE FROM person_change_entries")
+            .unwrap();
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (entry("2", "9"), entry("0", "9")),
+            (entry("0", "NULL"), entry("0", "9")),
+            (entry("1", "9"), entry("1", "NULL")),
+            (entry("0", "'nine'"), entry("0", "9")),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (0, {hash}, 9)"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (257, {hash}, 9)"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (256, {hash}, NULL)"),
+            ),
+            (
+                "INSERT INTO person_change_times (number, hash, made_at) VALUES (1, zeroblob(15), 9)".into(),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 'nine')"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+        // One change followed at most.
+        conn.execute_batch(&entry("1", "NULL")).unwrap();
+        assert!(conn.execute_batch(&entry("1", "NULL")).is_err());
+        conn.execute_batch(&entry("0", "9")).unwrap();
+        conn.execute_batch(&entry("0", "10")).unwrap();
+    }
+
+    /// The version before, whose schema is at step 21, stops on a database
+    /// that was stepped to 22, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_22() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 21);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 22, own: 21 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(refuse_a_later_version(&at_v21(), 21).is_ok());
+    }
+
     /// The version before, whose schema is at step 20, stops on a database
     /// that was stepped to 21, as every version stops on one from a later
     /// version: it is refused with both versions, and nothing of it is
@@ -4829,7 +5158,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 21, own: 20 })
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 20
+                })
             ),
             "{refused:?}"
         );
@@ -4891,7 +5223,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 13] = [
+        let from: [(u32, Connection); 14] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -4905,6 +5237,7 @@ mod tests {
             (18, at_v18()),
             (19, at_v19()),
             (20, at_v20()),
+            (21, at_v21()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -4929,6 +5262,7 @@ mod tests {
             assert_eq!(new_in_v19(&conn), NEW_IN_V19, "from version {at}");
             assert_eq!(new_in_v20(&conn), NEW_IN_V20, "from version {at}");
             assert_eq!(new_in_v21(&conn), NEW_IN_V21, "from version {at}");
+            assert_eq!(new_in_v22(&conn), NEW_IN_V22, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
         }

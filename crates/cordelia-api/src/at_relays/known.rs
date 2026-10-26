@@ -36,7 +36,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept};
+use cordelia_storage::person as held_rows;
 
 use crate::person::{PersonError, in_one};
 use crate::state::Holds;
@@ -186,11 +186,11 @@ fn write(conn: &Connection, known: &Known) -> Result<(), PersonError> {
     Ok(())
 }
 
-/// What the latest change entry that this device keeps is named by, and
-/// the number of its statement: a change entry's revision is its
+/// What the change entry of the change this device follows is named by,
+/// and the number of its statement: a change entry's revision is its
 /// statement's number.
 fn kept_entry(conn: &Connection) -> Result<Option<([u8; 32], u64)>, PersonError> {
-    let entry = held_rows::change_entry(conn, Kept::Latest)?;
+    let entry = held_rows::followed_entry(conn)?;
     Ok(entry.map(|entry| (entry.id(), entry.rev)))
 }
 

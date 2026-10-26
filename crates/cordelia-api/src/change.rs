@@ -696,7 +696,7 @@ mod tests {
         // asked on a copy of what the device holds, and then undone.
         assert_eq!(
             shown(&on.conn, &on.identity, &apart, now).unwrap(),
-            Shown::Fork
+            Shown::SetAside
         );
         let before = on.everything();
         assert!(matches!(
@@ -704,7 +704,7 @@ mod tests {
             Err(PersonError::ChangedSincePrompt)
         ));
         assert_eq!(on.everything(), before);
-        assert_eq!(on.state(), State::Fork);
+        assert_eq!(on.state(), State::Applied);
 
         // The settlement is made over both, and over no other pair.
         let read_apart = read(&s, &apart).0;
