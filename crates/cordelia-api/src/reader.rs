@@ -268,6 +268,15 @@ pub fn read_held_lists(
     })
 }
 
+/// Whether the lists that the store held from before step 20 were read
+/// ([`read_held_lists`]): then it does nothing, at any later call.
+pub fn held_lists_were_read(conn: &Connection) -> bool {
+    matches!(
+        cordelia_storage::meta::get(conn, cordelia_storage::meta::MESSAGES_LISTS_READ),
+        Ok(Some(_))
+    )
+}
+
 /// The label that this device knows `key` by (decision 2026-10-09 §3):
 /// the statement's, or the one in the record of its addition, or none.
 pub(crate) fn label_of(

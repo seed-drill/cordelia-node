@@ -4052,17 +4052,25 @@ impl Sightings {
         let Some(secret) = self.secret else { return };
 
         let now = chrono::Utc::now().timestamp();
-        for p in due {
-            let mut keyed = secret.to_vec();
-            keyed.extend_from_slice(&p.node_id.0);
-            let hash = cordelia_crypto::sha256(&keyed);
-            if usage::record_sighting(&db, &hash, p.is_relay, now).is_ok() {
+        let seen: Vec<([u8; 32], bool)> = due
+            .iter()
+            .map(|p| {
+                let mut keyed = secret.to_vec();
+                keyed.extend_from_slice(&p.node_id.0);
+                (cordelia_crypto::sha256(&keyed), p.is_relay)
+            })
+            .collect();
+        let prune_before = prune_due.then(|| now - SIGHTING_RETENTION_DAYS * 86_400);
+        // One write for every peer due, and the prune (issue #221).
+        let written = usage::record_sightings(&db, &seen, now, prune_before).is_ok();
+        drop(db);
+        if written {
+            for p in due {
                 self.noted
                     .insert(p.node_id.clone(), std::time::Instant::now());
             }
         }
         if prune_due {
-            let _ = usage::prune_sightings(&db, now - SIGHTING_RETENTION_DAYS * 86_400);
             self.noted.retain(|_, t| t.elapsed() < refresh);
             self.pruned = Some(std::time::Instant::now());
         }
