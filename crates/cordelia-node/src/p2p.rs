@@ -2885,6 +2885,12 @@ pub async fn p2p_loop(
         cordelia_core::protocol::ENTRY_CHANNEL_SWEEP_INTERVAL_SECS,
     ));
     entry_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The uses of channels that a relay keeps in memory (issue #214): a
+    // proof and a show are reads, and the uses are written once a minute.
+    let mut relay_uses_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::RELAY_USES_WRITE_INTERVAL_SECS,
+    ));
+    relay_uses_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The hourly task of messages (decision 2026-10-09 §7.1), on a
     // personal node: when it starts, and each hour after.
     let mut messages_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3469,6 +3475,16 @@ pub async fn p2p_loop(
                 }
             }
 
+            // The uses of channels it kept are written, in one
+            // transaction (issue #214). Off the select loop: it writes
+            // under the db lock.
+            _ = relay_uses_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = relay_entries.clone() {
+                    let uses_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.write_uses(&uses_state.db));
+                }
+            }
+
             // What this relay took is passed on to the relays it works
             // with that are connected (§2.4 item 6).
             _ = entry_offer_interval.tick(), if relay_entries.is_some() => {
@@ -3930,6 +3946,12 @@ pub async fn p2p_loop(
                         conn_mgr.shutdown_and_wait(),
                     ).await.is_err() {
                         tracing::warn!("closing the connections took longer than a stream timeout; not waiting for it");
+                    }
+                    // A relay writes the uses of channels it kept since
+                    // its last sweep (issue #214), once no stream asks.
+                    if let Some(entries) = relay_entries.clone() {
+                        let stop_state = state.clone();
+                        let _ = tokio::task::spawn_blocking(move || entries.write_uses(&stop_state.db)).await;
                     }
                     break;
                 }

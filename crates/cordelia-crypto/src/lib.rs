@@ -10,7 +10,8 @@
 //! ([`phrase`]), the statement of a person's devices ([`statement`]), and
 //! the entry that carries a statement to a device ([`change_entry`]). Each
 //! is pure functions, with vectors in
-//! `docs/reference/step4-test-vectors.json`. Beside them are an entry in
+//! `docs/reference/step4-test-vectors.json`, and the change entry's layout
+//! with its lineage in `docs/reference/change-entry-test-vectors.json`. Beside them are an entry in
 //! the form such a channel has, with its seal, its two signatures and its
 //! chain ([`entry`]), the one place that builds a chain ([`chain`]), and
 //! how a slot's current version is read ([`version`]); and, for a device that is added, the record of its
@@ -48,6 +49,9 @@ pub mod wire;
 
 #[cfg(test)]
 mod vectors;
+
+#[cfg(test)]
+mod change_entry_vectors;
 
 pub use aes_gcm::{item_decrypt, item_encrypt};
 pub use bech32::{bech32_decode, bech32_encode};

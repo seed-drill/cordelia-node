@@ -1037,7 +1037,8 @@ pub(crate) fn change_that_does_not_open_for(
     secret: [u8; 32],
     place: usize,
 ) -> CheckedEntry {
-    let entry = change_entry::entry_of(phrase, statement, &ForPhrase::first(secret)).unwrap();
+    let entry = change_entry::entry_of(phrase, statement, &ForPhrase::first(secret), 1_790_000_000)
+        .unwrap();
     let statement_key = phrase.statement_key().unwrap();
     let mut bound = LABEL_CHANGE_DEVICES.to_vec();
     bound.extend_from_slice(&statement.statement.number.to_be_bytes());

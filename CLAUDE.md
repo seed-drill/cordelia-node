@@ -111,8 +111,9 @@ cordelia-node/
     specs/               # Protocol and component specs + TLA+ model
     decisions/           # ADRs; 2026-10-04-a-persons-devices.md and
                          #   2026-09-30-agent-memory-sync.md are the current design
-    reference/           # Test vectors (step4-test-vectors.json: the derivations),
-                         #   network model, risk model
+    reference/           # Test vectors (step4-test-vectors.json: the derivations;
+                         #   change-entry-test-vectors.json: the change entry's
+                         #   layout with its lineage), network model, risk model
     archive/             # Pre-v1 documents, kept for history
     vision.md            # Direction after v1
   tests/                 # Integration tests
@@ -209,7 +210,9 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_DEVICE_LABEL_BYTES`, `STATEMENT_HASH_BYTES` | 64, 16 | parameter-rationale.md §12.2 |
 | `MAX_STATEMENT_BYTES` | 20,784 (derived) | parameter-rationale.md §12.2 |
 | `CHANGE_ENTRY_BYTES` | 32KB, always | parameter-rationale.md §12.3 |
-| `CHANGE_ENTRY_PHRASE_PART_BYTES`, `CHANGE_ENTRY_DEVICES_PART_BYTES` | 4KB, 28KB (derived) | parameter-rationale.md §12.3 |
+| `CHANGE_ENTRY_DEVICES_PART_BYTES`, `CHANGE_ENTRY_PHRASE_PART_BYTES`, `CHANGE_ENTRY_LINEAGE_BYTES` | 28,672 (fixed: where the version before opens it), 1KB, 3KB (derived) (decision 2026-10-24 rule 13) | parameter-rationale.md §12.3 |
+| `CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES` | 4KB (derived: the part for the phrase of the version before, opened for a change made over its entry) | parameter-rationale.md §12.3 |
+| `LINEAGE_HASH_BYTES`, `LINEAGE_MARK_BYTES`, `MAX_LINEAGE_BYTES` | 8, 8, 2,074 (derived: a lineage of a chain at its bound) | parameter-rationale.md §12.3 |
 | `SEALED_SECRET_BYTES`, `MAX_EARLIER_SECRETS` | 92, 8 | parameter-rationale.md §12.3 |
 | `MIN_ENTRY_CONTENT_BYTES` | 256 (a content is a power of two from this to `MAX_ITEM_BYTES`) | parameter-rationale.md §12.4 |
 | `MAX_ENTRY_LINKS`, `ENTRY_LINK_HASH_BYTES`, `ENTRY_LINK_SIGNER_BYTES` | 100, 16, 16 | parameter-rationale.md §12.4 |
@@ -219,7 +222,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (28 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (29 of them, all in `LABELS`; `LABEL_CHANGE_LINEAGE` among them; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -243,6 +246,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` | 16MB (derived) | parameter-rationale.md §12.7 |
 | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` | 256 | parameter-rationale.md §12.7 |
 | `ENTRY_CHANNEL_UNUSED_DAYS`, `ENTRY_CHANNEL_USED_STEP_SECS`, `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS` | 90, 3600s, 3600s (derived) | parameter-rationale.md §12.7 |
+| `RELAY_USES_WRITE_INTERVAL_SECS` | 60s (a relay writes the uses of channels it keeps in memory: a proof and a show are reads; also at the sweep and a clean stop) | parameter-rationale.md §12.7 |
 | `ENTRY_OFFER_INTERVAL_SECS`, `RELAY_ENTRY_PULL_INTERVAL_SECS` | 5s, 10s (derived) | parameter-rationale.md §12.7 |
 | `RELAY_ENTRY_PULL_PAGES`, `RELAY_CHANNEL_PAGES_PER_PASS` | 10, 10 | parameter-rationale.md §12.7 |
 | `ENTRY_REQUESTS_PER_PEER_PER_MINUTE`, `OWN_ENTRY_REQUESTS_PER_MINUTE` | 3000, 2250 (derived) | parameter-rationale.md §12.8 |

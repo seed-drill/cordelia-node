@@ -2930,7 +2930,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
                 lock.join("; ")
             }
         );
-        let nested: Vec<String> = ["rates", "room"]
+        let nested: Vec<String> = ["rates", "room", "uses"]
             .iter()
             .map(|m| {
                 let label = format!("mutex=\"{m}\"");

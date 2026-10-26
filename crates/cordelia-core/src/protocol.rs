@@ -1070,15 +1070,66 @@ pub const CHANGE_ENTRY_BYTES: usize = 32 * 1024;
 const _: () = assert!(CHANGE_ENTRY_BYTES.is_power_of_two());
 const _: () = assert!(CHANGE_ENTRY_BYTES <= MAX_ITEM_BYTES);
 
-/// How much of a change entry's content is the part for the phrase, sealed:
-/// the last 4 KB. The rest is the part for the devices.
-pub const CHANGE_ENTRY_PHRASE_PART_BYTES: usize = 4096;
-
 /// How much of a change entry's content is the part for the devices,
-/// sealed.
-/// Derived: what the part for the phrase leaves.
-pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize =
-    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
+/// sealed: the first 28 KB (decision 2026-10-04 §4.6). **Fixed, and never
+/// derived** (decision 2026-10-24 rule 13): a device of the version before
+/// (0.2.0-alpha.16) opens this part at this place and of this size, so it
+/// does not move or grow when the parts after it change.
+pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize = 28_672;
+
+/// How much of a change entry's content is the part for the phrase, sealed:
+/// 1 KB after the part for the devices (decision 2026-10-24 rule 13). At
+/// every bound it says 354 bytes, and is 382 sealed.
+pub const CHANGE_ENTRY_PHRASE_PART_BYTES: usize = 1024;
+
+/// How much of a change entry's content is the lineage, in the clear: the
+/// last 3 KB (decision 2026-10-24 rule 13). A relay reads it.
+/// Derived: what the two parts leave of CHANGE_ENTRY_BYTES.
+pub const CHANGE_ENTRY_LINEAGE_BYTES: usize =
+    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
+
+/// How much of a change entry's content was the part for the phrase in the
+/// layout of the version before (0.2.0-alpha.16), which had no lineage: the
+/// last 4 KB (decision 2026-10-04 §4.6). A change entry made there is
+/// opened for the phrase with it (decision 2026-10-24 rule 13).
+/// Derived: what the part for the devices leaves of CHANGE_ENTRY_BYTES.
+pub const CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES: usize =
+    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES;
+
+/// How much of a statement's hash names it in a lineage: its first 8
+/// bytes (decision 2026-10-24 rule 13). A relay uses them only to tell
+/// apart the statements of one phrase, and only the phrase makes one: two
+/// of 256 share 8 bytes with a chance of about 2^-49.
+pub const LINEAGE_HASH_BYTES: usize = 8;
+
+/// How much of SHA-256 of LABEL_CHANGE_LINEAGE opens a lineage, as its
+/// mark: the first 8 bytes (decision 2026-10-24 rule 13). An entry of the
+/// version before has the ciphertext of its part for the phrase there, which
+/// is the mark with a chance of 2^-64.
+pub const LINEAGE_MARK_BYTES: usize = 8;
+
+/// The most a lineage says: its mark, the time its change was made (8
+/// bytes, in seconds), the hash of its statement, a count, and the hash of
+/// each statement on a chain at its bound (decision 2026-10-24 rule 13).
+/// Derived: 2,074 bytes.
+pub const MAX_LINEAGE_BYTES: usize =
+    LINEAGE_MARK_BYTES + 8 + LINEAGE_HASH_BYTES + 2 + MAX_STATEMENT_CHAIN * LINEAGE_HASH_BYTES;
+
+// Checked at compile time (decision 2026-10-24 rule 13): the part for the
+// devices is where and as large as the version before has it; the three
+// parts are the whole content; and the lineage of a chain at its bound
+// fits its share. A lineage's hash is no longer than the statement's own.
+const _: () = assert!(CHANGE_ENTRY_DEVICES_PART_BYTES == 28 * 1024);
+const _: () = assert!(CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES == 4096);
+const _: () = assert!(
+    CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES + CHANGE_ENTRY_LINEAGE_BYTES
+        == CHANGE_ENTRY_BYTES
+);
+const _: () = assert!(CHANGE_ENTRY_LINEAGE_BYTES == 3072);
+const _: () = assert!(MAX_LINEAGE_BYTES == 2074);
+const _: () = assert!(MAX_LINEAGE_BYTES <= CHANGE_ENTRY_LINEAGE_BYTES);
+const _: () = assert!(LINEAGE_HASH_BYTES <= STATEMENT_HASH_BYTES);
+const _: () = assert!(LINEAGE_MARK_BYTES <= 32);
 
 /// The size of a secret sealed to one device's key, as the node seals to a
 /// key: an ephemeral key, a nonce, the 32 bytes and a tag.
@@ -1105,6 +1156,7 @@ const _: () = assert!(
     ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32)
         <= CHANGE_ENTRY_PHRASE_PART_BYTES
 );
+const _: () = assert!(ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32) == 382);
 
 /// The smallest an entry's content may be: 256 bytes (decision 2026-10-04
 /// §2.3). A content is a nonce, a ciphertext and a tag, and its length is
@@ -1272,6 +1324,11 @@ pub const LABEL_CHANGE_PHRASE: &[u8] = b"cordelia v2 change phrase";
 /// key. What is sealed to a device for any other use, or for another
 /// statement, does not open as that statement's secret.
 pub const LABEL_CHANGE_SECRET: &[u8] = b"cordelia v2 change secret";
+
+/// The label whose SHA-256 opens a change entry's lineage: its first
+/// LINEAGE_MARK_BYTES are the lineage's mark (decision 2026-10-24 rule
+/// 13). It begins no other label, and none begins it.
+pub const LABEL_CHANGE_LINEAGE: &[u8] = b"cordelia v2 lineage";
 
 /// The label an entry's author signs it under: the author's key signs this
 /// label and what is signed of the entry (decision 2026-10-04 §2.3).
@@ -1709,10 +1766,22 @@ pub const ENTRY_CHANNEL_UNUSED_DAYS: u32 = 90;
 pub const ENTRY_CHANNEL_USED_STEP_SECS: u64 = 60 * 60;
 
 /// How often a relay drops the channels from their secrets that nobody
-/// uses (decision 2026-10-04 §2.5), and when it starts.
+/// uses (decision 2026-10-04 §2.5), and when it starts. The uses that the
+/// relay keeps in memory are written first, in the same hold of its lock.
 /// Derived: as often as expired deletes are collected,
 /// TOMBSTONE_GC_INTERVAL_SECS. Hourly is plenty against 90 days.
 pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
+
+/// How often a relay writes the uses of channels that it keeps in memory:
+/// once a minute, in one transaction, and at its sweep and a clean stop as
+/// well (issue #214). A proof, and an entry shown that the relay holds,
+/// are reads: none writes with the relay's lock held. Each channel's time
+/// is still written at most once in ENTRY_CHANNEL_USED_STEP_SECS, so a
+/// shorter interval writes no more rows in an hour, in smaller batches. A
+/// time on disk, and what a listed relay is told of it, lags the last use
+/// by at most this and the step; a relay that stops uncleanly loses at
+/// most this much of its uses, against ENTRY_CHANNEL_UNUSED_DAYS.
+pub const RELAY_USES_WRITE_INTERVAL_SECS: u64 = 60;
 
 /// How often a device sweeps from its own store the deletes that it has
 /// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
@@ -2550,7 +2619,7 @@ const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 1) >= 16_000_000);
 const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 2) < 16_000_000);
 
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 28] = [
+pub const LABELS: [&[u8]; 29] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -2567,6 +2636,7 @@ pub const LABELS: [&[u8]; 28] = [
     LABEL_CHANGE_DEVICES,
     LABEL_CHANGE_PHRASE,
     LABEL_CHANGE_SECRET,
+    LABEL_CHANGE_LINEAGE,
     LABEL_ENTRY_AUTHOR,
     LABEL_ENTRY_CHANNEL,
     LABEL_ENTRY_CONTENT,
@@ -3182,8 +3252,12 @@ mod tests {
     #[test]
     fn test_change_entry_decision_2026_10_04_4_6() {
         assert_eq!(CHANGE_ENTRY_BYTES, 32_768);
+        // The two sealed parts, and the lineage of decision 2026-10-24
+        // rule 13.
         assert_eq!(
-            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES,
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
             CHANGE_ENTRY_BYTES
         );
         assert_eq!(SEALED_SECRET_BYTES, 92);
@@ -3193,6 +3267,37 @@ mod tests {
         assert_eq!(LABEL_CHANGE_DEVICES, b"cordelia v2 change devices");
         assert_eq!(LABEL_CHANGE_PHRASE, b"cordelia v2 change phrase");
         assert_eq!(LABEL_CHANGE_SECRET, b"cordelia v2 change secret");
+    }
+
+    /// The layout of a change entry with its lineage (decision 2026-10-24
+    /// rule 13, unit test 14): the part for the devices where the version
+    /// before has it, 1 KB for the phrase, and the lineage in the 3 KB
+    /// left, which holds a chain at its bound.
+    #[test]
+    fn test_change_entry_lineage_decision_2026_10_24_13() {
+        assert_eq!(CHANGE_ENTRY_DEVICES_PART_BYTES, 28_672);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES, 1024);
+        assert_eq!(CHANGE_ENTRY_LINEAGE_BYTES, 3072);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES, 4096);
+        assert_eq!(
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
+            CHANGE_ENTRY_BYTES
+        );
+        assert_eq!(
+            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES,
+            CHANGE_ENTRY_BYTES
+        );
+        assert_eq!(LINEAGE_HASH_BYTES, 8);
+        assert_eq!(LINEAGE_MARK_BYTES, 8);
+        // A mark, a time, the statement's hash, a count, and 256 hashes.
+        assert_eq!(MAX_LINEAGE_BYTES, 8 + 8 + 8 + 2 + 256 * 8);
+        assert_eq!(MAX_LINEAGE_BYTES, 2074);
+        // The part for the phrase at its bound: a nonce, a tag, the
+        // secret, a count, and eight earlier secrets with their numbers.
+        assert_eq!(12 + 16 + 32 + 2 + 8 * (8 + 32), 382);
+        assert_eq!(LABEL_CHANGE_LINEAGE, b"cordelia v2 lineage");
     }
 
     /// The bounds of an entry, and the room that is kept in every entry
@@ -3361,7 +3466,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 28);
+        assert_eq!(LABELS.len(), 29);
     }
 
     /// What the commands a person types go by: the place of a device's
@@ -3805,6 +3910,11 @@ mod tests {
         assert!(
             ENTRY_CHANNEL_USED_STEP_SECS * 1000 < u64::from(ENTRY_CHANNEL_UNUSED_DAYS) * 86_400
         );
+        // The uses kept in memory are written well within the step, and
+        // so within the sweep's hour.
+        assert_eq!(RELAY_USES_WRITE_INTERVAL_SECS, 60);
+        const { assert!(RELAY_USES_WRITE_INTERVAL_SECS < ENTRY_CHANNEL_USED_STEP_SECS) };
+        const { assert!(RELAY_USES_WRITE_INTERVAL_SECS < ENTRY_CHANNEL_SWEEP_INTERVAL_SECS) };
         // One entry of the largest size is within what a channel may hold.
         assert!(entry_cost(MAX_ITEM_BYTES) <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
         // And is what a pull leaves room for, in what a key may be handed
