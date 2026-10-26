@@ -272,17 +272,34 @@ pub(crate) fn taken_as_shared(
         return refused(NotTaken::NotInBandZero);
     }
 
-    // A key whose entries are being taken out: the door stores nothing
-    // more of it, with no row and no read again (§6.3, "taken out in
-    // steps").
-    if pass_rows::key_going(conn, row.id, &entry.author)? {
-        return refused(NotTaken::SharedFull);
-    }
-
     // Rule 4: the room of the keys the person does not know.
     let knows = Knows::of(conn, &held)?;
     let known = knows.knows(&entry.author);
+    // A key whose entries are being taken out (§6.3, "taken out in
+    // steps"). One the person now knows is taken out no more: its
+    // take-out ends here, and its entry is stored. Of one it does not
+    // know, the door stores nothing more, and notes the bytes as refused,
+    // so that the step that ends its take-out asks a read again: an entry
+    // newer than any it held of that slot, and than what a row kept.
     let held_there = entries::author_cost(conn, &entry.channel, &entry.slot, &entry.author)?;
+    if pass_rows::key_going(conn, row.id, &entry.author)? {
+        if known {
+            pass_rows::key_ended(conn, row.id, &entry.author)?;
+        } else {
+            let row_of = kept::key(conn, row.id, &entry.author)?;
+            let kept_rev = row_of.and_then(|of| match kind {
+                SlotOf::Message => of.kept_message_rev,
+                SlotOf::Anew => of.kept_anew_rev,
+            });
+            let newer = held_there.is_none_or(|(rev, _)| entry.rev > rev)
+                && kept_rev.is_none_or(|kept_rev| entry.rev > kept_rev);
+            if newer {
+                let cost = entry_cost(entry.content.len());
+                kept::refused(conn, row.id, &entry.author, cost, now)?;
+            }
+            return refused(NotTaken::SharedFull);
+        }
+    }
     if !known {
         let row_of = kept::key(conn, row.id, &entry.author)?;
         let kept_rev = row_of.and_then(|of| match kind {
@@ -537,6 +554,10 @@ fn keep_known(
             continue;
         }
         kept::set_known(conn, row.id, &key.key, known, now)?;
+        // A key the person comes to know is taken out no more.
+        if known {
+            pass_rows::key_ended(conn, row.id, &key.key)?;
+        }
         if known && key.bytes_refused > 0 {
             kept::ask_read_again(conn, row.id, now)?;
         }
@@ -684,10 +705,25 @@ pub fn take_out_step(conn: &Connection, now: i64) -> Result<Stepped, PersonError
             let row = kept::channel_of_row(conn, id)?;
             let going_whole = pass_rows::channel_out(conn, id)?.is_some();
             if let Some(row) = row.filter(|_| !going_whole) {
+                // A key the person came to know since its take-out was
+                // begun is taken out no more: its take-out ends here.
+                let known = match held(conn)? {
+                    Some(held) => Knows::of(conn, &held)?.knows(&key),
+                    None => false,
+                };
+                pass_rows::key_ended(conn, id, &key)?;
+                if known {
+                    return Ok(Stepped::Key);
+                }
                 let slot_key = derive::slot_key(&secret_of(&row)?)?;
                 let anew_slot = slot_id(&slot_key, &anew_name(&key)?);
+                let refused_before = kept::key(conn, id, &key)?.map_or(0, |of| of.bytes_refused);
                 kept::take_out(conn, id, &row.channel, &key, &anew_slot, as_refused, now)?;
-                pass_rows::key_ended(conn, id, &key)?;
+                // A quiet key refused something while it went: read again,
+                // so that what it wrote meanwhile is stored.
+                if !as_refused && refused_before > 0 {
+                    kept::ask_read_again(conn, id, now)?;
+                }
                 kept::keep_rows_within(conn, id, SHARED_KEYS_KEPT)?;
             } else {
                 pass_rows::key_ended(conn, id, &key)?;
@@ -2708,5 +2744,121 @@ pub(crate) mod tests {
         assert_eq!(going(conn), 0);
         assert!(kept::room(conn, id).unwrap() <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
         assert!(held_by(&s, 0, &channel, &carol.public_key()).is_empty());
+    }
+
+    /// The review's sequence (decision 2026-10-10 §6.3, "taken out in
+    /// steps"): Carol's key is quiet for 30 days and the hourly task begins
+    /// her take-out; before its step, the person labels her. Her take-out
+    /// ends with no step: her entries stay, and her row keeps no revision.
+    #[test]
+    fn a_key_labelled_while_it_goes_is_not_taken_out() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let (carol, dave) = (member(2), member(3));
+        stores(&s, 0, &message(&carol, &channel, 1, "carol's", now), now);
+        stores(&s, 0, &message(&dave, &channel, 1, "dave's", now), now);
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        let later = now + 30 * DAY;
+        assert_eq!(super::hourly(conn, &s.key(0), later).unwrap().let_go, 2);
+        assert!(pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+        let label = Label {
+            key: carol.public_key(),
+            label: Some("carol".into()),
+        };
+        let made = act(conn, &s[0].identity, Do::Label(label), later).unwrap();
+        assert!(matches!(made, Done::Made(_)));
+        assert!(!pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+        take_out_all(conn, &s.key(0), later).unwrap();
+        let of_carol = key_row(&s, 0, &channel, &carol.public_key()).unwrap();
+        assert!(of_carol.known);
+        assert_eq!(of_carol.kept_message_rev, None);
+        assert_eq!(held_by(&s, 0, &channel, &carol.public_key()).len(), 1);
+        assert!(held_by(&s, 0, &channel, &dave.public_key()).is_empty());
+        stores(&s, 0, &message(&carol, &channel, 2, "again", later), later);
+        assert_eq!(bodies(&s, 0, &channel, later), ["again"]);
+    }
+
+    /// A key the person knows when its step comes is not taken out, however
+    /// its take-out was begun; and the door stores what it writes, ending
+    /// its take-out, rather than refusing it as full (§6.3).
+    #[test]
+    fn a_key_known_when_its_step_comes_is_not_taken_out() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let carol = member(2);
+        labels(&s, 0, &carol.public_key(), Some("carol"), now);
+        stores(&s, 0, &message(&carol, &channel, 1, "one", now), now);
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+
+        // The step finds her known: it ends her take-out and takes nothing.
+        pass_rows::begin_key(conn, id, &carol.public_key(), false).unwrap();
+        assert_eq!(take_out_step(conn, now + 1).unwrap(), Stepped::Key);
+        assert!(!pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+        assert_eq!(held_by(&s, 0, &channel, &carol.public_key()).len(), 1);
+        assert_eq!(
+            key_row(&s, 0, &channel, &carol.public_key())
+                .unwrap()
+                .kept_message_rev,
+            None
+        );
+
+        // The door finds her known while she goes: it stores her entry.
+        pass_rows::begin_key(conn, id, &carol.public_key(), false).unwrap();
+        let two = message(&carol, &channel, 2, "two", now + 2);
+        assert!(matches!(
+            take(conn, &s[0].identity, &two, now + 2).unwrap(),
+            Taken::Shared {
+                stored: Outcome::Stored,
+                ..
+            }
+        ));
+        assert!(!pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+        out(&s, 0, now + 2);
+        assert_eq!(held_by(&s, 0, &channel, &carol.public_key()).len(), 2);
+        assert_eq!(bodies(&s, 0, &channel, now + 2), ["one", "two"]);
+    }
+
+    /// A quiet key that writes while its entries go: the door refuses the
+    /// entry and notes it, and the step that ends the take-out asks a read
+    /// again, which stores it (§6.3).
+    #[test]
+    fn what_a_quiet_key_writes_while_it_goes_is_read_again() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let carol = member(2);
+        stores(&s, 0, &message(&carol, &channel, 1, "one", now), now);
+        let conn = &s[0].conn;
+        let later = now + 30 * DAY;
+        assert_eq!(super::hourly(conn, &s.key(0), later).unwrap().let_go, 1);
+        assert!(read_again_due(conn, later).unwrap().is_empty());
+        let two = message(&carol, &channel, 2, "two", later);
+        assert_eq!(
+            take(conn, &s[0].identity, &two, later).unwrap(),
+            Taken::Refused(NotTaken::SharedFull)
+        );
+        // One it holds already is refused and not noted.
+        let refused = |s: &Several| {
+            key_row(s, 0, &channel, &carol.public_key())
+                .unwrap()
+                .bytes_refused
+        };
+        assert_eq!(refused(&s), MESSAGE_COST);
+        let one = message(&carol, &channel, 1, "one", now);
+        assert_eq!(
+            take(conn, &s[0].identity, &one, later).unwrap(),
+            Taken::Refused(NotTaken::SharedFull)
+        );
+        assert_eq!(refused(&s), MESSAGE_COST);
+        take_out_all(conn, &s.key(0), later).unwrap();
+        assert_eq!(read_again_due(conn, later).unwrap(), [channel.id]);
+        read_again_begun(conn, &channel.id, later).unwrap();
+        // The read again hands it again, and the store keeps it.
+        stores(&s, 0, &two, later);
+        assert_eq!(bodies(&s, 0, &channel, later), ["two"]);
     }
 }
