@@ -1426,10 +1426,16 @@ impl Leave {
     ///   derived here. No caller names a channel.
     /// - The requests are made here, each counted against the shared pass's
     ///   own counter: a proof of the channel's key, and pulls of its pages
-    ///   from the start, each on from the place the last reached, until a
-    ///   page holds nothing or leaves the place where it was, the key reads
-    ///   nothing more, or RELAY_ENTRY_PULL_PAGES pages were read. Nothing is
-    ///   pushed.
+    ///   from the start, each with `limit` and on from the place the last
+    ///   reached, until a page holds nothing or leaves the place where it
+    ///   was, the key reads nothing more, or RELAY_ENTRY_PULL_PAGES pages
+    ///   were read. Nothing is pushed.
+    /// - `counted` is given what the relay handed in each page, as it counts
+    ///   it, before the page is read, as [`Leave::shared`] gives it: so the
+    ///   caller counts it in the device's whole count and in the shared
+    ///   pass's quarter, and sizes `limit` to that quarter. The proof's place
+    ///   on the connection is the caller's to check and keep, as it is for
+    ///   a shared channel (not yet called: slice 6 calls it).
     /// - Of what comes back, each entry of that channel that `key` signed
     ///   is given to `accept`, under the database's lock: none is stored,
     ///   and no place is kept. An entry of another channel, or by another
@@ -1439,6 +1445,8 @@ impl Leave {
         state: &AppState,
         link: &Link,
         key: &[u8; 32],
+        limit: u32,
+        mut counted: impl FnMut(u64),
         reads: impl Fn(&Connection, i64) -> bool,
         accept: impl Fn(&Connection, &CheckedEntry, i64) -> Result<Option<A>, String>,
     ) -> Result<SharePairRead<A>, SharedRefused> {
@@ -1480,7 +1488,7 @@ impl Leave {
                 channel,
                 mark: place.0,
                 after: place.1,
-                limit: ENTRY_PAGE_MAX_ENTRIES,
+                limit: limit.clamp(1, ENTRY_PAGE_MAX_ENTRIES),
             });
             let page = match self.asks_shared(link, Protocol::EntryPull, &pull).await {
                 Ok(WireMessage::EntryPulled(page)) => page,
@@ -1488,6 +1496,14 @@ impl Leave {
                 Err(refused) if read.is_empty() => return Err(refused),
                 _ => break,
             };
+            // What the relay handed counts against the share, whatever is
+            // then done with it.
+            counted(
+                page.entries
+                    .iter()
+                    .map(|bytes| entry_cost(bytes.len().saturating_sub(ENTRY_WIRE_OVERHEAD_BYTES)))
+                    .sum(),
+            );
             let handed: Vec<CheckedEntry> = page
                 .entries
                 .iter()

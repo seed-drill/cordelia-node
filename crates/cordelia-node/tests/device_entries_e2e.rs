@@ -11343,30 +11343,41 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
                   entry: &CheckedEntry,
                   _: i64|
      -> Result<Option<[u8; 32]>, String> { Ok(Some(entry.id())) };
+    // Each page asked with the limit given, and what the relay handed in
+    // each given to `counted`: with a limit of one, a page for each entry,
+    // Carol's counted though the judge is not given it.
+    let handed = std::sync::Mutex::new(Vec::new());
+    let counted = |bytes: u64| handed.lock().unwrap().push(bytes);
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), |_, _| true, judged)
+        .share_pair(&bob.state, &link, &alice.key(), 1, counted, |_, _| true, judged)
         .await
         .unwrap();
     assert_eq!(
         read,
         cordelia_node::device_entries::SharePairRead::Read(vec![entry.id()])
     );
+    let cost = |entry: &CheckedEntry| entry_cost(entry.content.len());
+    let carols = theirs.clone().check().unwrap();
+    assert_eq!(
+        handed.lock().unwrap().as_slice(),
+        [cost(&entry), cost(&carols), 0]
+    );
     // Given another key, the channel is another, and holds nothing of it.
     let read = leave
-        .share_pair(&bob.state, &link, &other, |_, _| true, judged)
+        .share_pair(&bob.state, &link, &other, 100, |_| (), |_, _| true, judged)
         .await
         .unwrap();
     assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotHeld);
     // A key that reads nothing now, and sync off, ask nothing.
     let asked = bob.device_counts("relay").asked;
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), |_, _| false, judged)
+        .share_pair(&bob.state, &link, &alice.key(), 100, |_| (), |_, _| false, judged)
         .await
         .unwrap();
     assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
     bob.syncs(false);
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), |_, _| true, judged)
+        .share_pair(&bob.state, &link, &alice.key(), 100, |_| (), |_, _| true, judged)
         .await
         .unwrap();
     assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
