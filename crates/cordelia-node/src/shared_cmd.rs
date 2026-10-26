@@ -1,0 +1,445 @@
+//! The commands that make, share and take a shared channel (decision
+//! 2026-10-10 §5.1 to §5.5): `cordelia shared new`, `shared list`, `shared
+//! rename`, `shared drop`, `cordelia share`, `cordelia accept <key>
+//! --channel <name>` and `cordelia label`; and `cordelia id --words`.
+//!
+//! **Each yes is asked here, at a terminal,** and a command that asks one
+//! refuses, before anything else, where its input is not one
+//! ([`Terminal::at`]). What the yes is for is the node's text: the command
+//! asks the node with `look`, shows what it answers, and hands that text
+//! back with the yes; the node refuses where it would now do another thing.
+//!
+//! **A refusal of §5.5 is printed as the node words it,** on standard
+//! error, and the command exits 1. A yes that is not given prints
+//! [`NOT_A_YES`] on standard output, and the command exits 0.
+//!
+//! Each command that changes something refuses a node of another version
+//! (decision 2026-10-04 §10.1, rule 6); `shared list` is answered beside
+//! one, with the note.
+
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+use cordelia_crypto::bech32::decode_public_key;
+
+use crate::person_cmd::{NOT_A_YES, list, own_key, text, time_of};
+use crate::terminal::Terminal;
+use crate::{Told, api_post_told, note_another_version, refuse_another_version};
+
+/// How often the node is asked while `accept --channel` waits.
+const ASK_EVERY: Duration = Duration::from_secs(1);
+
+/// How long `cordelia accept --channel` stays and says what became of the
+/// key (§3.3, as `cordelia accept` does): the node goes on asking for the
+/// rest of the hour.
+const ACCEPT_STAYS: Duration = Duration::from_secs(60);
+
+/// How long a command waits for the node to answer.
+const ANSWERED_WITHIN: Duration = Duration::from_secs(30);
+
+/// Print `line` on standard error and exit 1: a refusal (§5.5).
+fn refuse(line: &str) -> ! {
+    eprintln!("{line}");
+    std::process::exit(1)
+}
+
+/// Ask the node `path` with `body`: what it answers, or its refusal
+/// printed as it words it, and the command ended.
+fn asked(config_path: &str, path: &str, body: &Value) -> anyhow::Result<Value> {
+    match api_post_told(config_path, path, body.clone(), Some(ANSWERED_WITHIN))? {
+        Told::Yes(answer) => Ok(answer),
+        Told::No { message, .. } => refuse(&message),
+    }
+}
+
+/// A command that asks a yes (§5.2): the node is asked what the yes is
+/// for, the person is asked it at `at`, and with a yes the node is asked to
+/// do it, with the text the yes was for. `None` where no yes was given:
+/// [`NOT_A_YES`] is printed.
+fn with_a_yes(
+    config_path: &str,
+    at: &Terminal,
+    path: &str,
+    body: Value,
+) -> anyhow::Result<Option<Value>> {
+    let mut look = body.clone();
+    look["look"] = true.into();
+    let would = asked(config_path, path, &look)?;
+    // A look that says something with no yes to ask: it is said, and
+    // nothing more is done.
+    let Some(asks) = would["asks"].as_str() else {
+        print_said(&would);
+        return Ok(None);
+    };
+    crate::person_cmd::names_this_device(&would, &own_key(config_path)?)?;
+    if !at.yes(asks)? {
+        println!("{NOT_A_YES}");
+        return Ok(None);
+    }
+    let mut body = body;
+    body["said_yes_to"] = asks.into();
+    Ok(Some(asked(config_path, path, &body)?))
+}
+
+/// Print each line the node said.
+fn print_said(answer: &Value) {
+    for line in list(answer, "said").filter_map(Value::as_str) {
+        println!("{}", crate::history_cmd::printable(line));
+    }
+}
+
+// ── cordelia id --words ──────────────────────────────────────────────
+
+/// `cordelia id --words` (§5.2): this device's key on its first line, and
+/// the six words of its fingerprint on the second, with nothing else.
+pub fn id_words(config_path: &str) -> anyhow::Result<()> {
+    let own = own_key(config_path)?;
+    println!("{}", cordelia_crypto::bech32::encode_public_key(&own)?);
+    println!("{}", cordelia_api::sharing::six_words(&own));
+    Ok(())
+}
+
+// ── cordelia shared new ──────────────────────────────────────────────
+
+/// `cordelia shared new <name> [--relay <relay>]...` (§5.1, §5.2).
+pub fn new(config_path: &str, name: &str, relays: &[String]) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "relays": relays });
+    if let Some(made) = with_a_yes(config_path, &at, "/api/v1/shared/new", body)? {
+        print_said(&made);
+    }
+    Ok(())
+}
+
+// ── cordelia share ───────────────────────────────────────────────────
+
+/// `cordelia share <name> <key> [--words <four words>]` (§3.1, §5.2).
+pub fn share(config_path: &str, name: &str, key: &str, words: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "key": key, "words": words });
+    if let Some(handed) = with_a_yes(config_path, &at, "/api/v1/shared/share", body)? {
+        print_said(&handed);
+    }
+    Ok(())
+}
+
+// ── cordelia accept <key> --channel <name> ───────────────────────────
+
+/// `cordelia accept <key> --channel <name>` (§3.2, §5.2): it shares no path
+/// with `cordelia accept <key>`, and never reads a pair channel, takes a
+/// hand-over or moves the device. The key is kept an hour with the name;
+/// the command stays a minute and says what became of it.
+pub fn accept(config_path: &str, key: &str, name: &str) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "key": key, "name": name });
+    let Some(typed) = with_a_yes(config_path, &at, "/api/v1/shared/accept", body)? else {
+        return Ok(());
+    };
+    let until = typed["until"].as_i64().unwrap_or(0);
+    let until = time_of(u64::try_from(until).unwrap_or(0));
+    println!(
+        "\nAsking your relays for what ({}) hands over, until {until}.",
+        text(&typed, "words")
+    );
+    let typed_key = decode_public_key(key.trim()).ok();
+    let typed_at = typed["typed_at"].as_i64();
+    let ends = Instant::now() + ACCEPT_STAYS;
+    loop {
+        std::thread::sleep(ASK_EVERY);
+        let listed = asked(config_path, "/api/v1/shared/list", &json!({}))?;
+        let of_the_key = list(&listed, "typed").find(|row| {
+            decode_public_key(text(row, "key")).ok() == typed_key
+                && row["typed_at"].as_i64() == typed_at
+        });
+        let Some(of_the_key) = of_the_key else {
+            anyhow::bail!(
+                "the node keeps that key no longer: type it again (cordelia accept --channel)"
+            );
+        };
+        if let Some(words) = of_the_key["taken"].as_str() {
+            let channel = list(&listed, "channels").find(|channel| text(channel, "words") == words);
+            let Some(channel) = channel else {
+                println!(
+                    "Taken: channel {words}. The channel's words are its name, and prove nothing."
+                );
+                return Ok(());
+            };
+            let relays: Vec<&str> = list(channel, "relays")
+                .map(|relay| text(relay, "shown"))
+                .collect();
+            println!(
+                "Taken: \"{}\" is channel {words}, at {}. The channel's words are its name, and \
+                 prove nothing.",
+                crate::history_cmd::printable(text(channel, "name")),
+                relays.join(" and ")
+            );
+            for line in list(channel, "wrote").filter_map(Value::as_str) {
+                println!("{}", crate::history_cmd::printable(line));
+            }
+            return Ok(());
+        }
+        if let Some(says) = of_the_key["says"].as_str() {
+            refuse(&crate::history_cmd::printable(says));
+        }
+        if Instant::now() >= ends {
+            println!(
+                "Nothing was taken yet. This device goes on asking until {until}: cordelia shared \
+                 list says what became of it."
+            );
+            return Ok(());
+        }
+    }
+}
+
+// ── cordelia label ───────────────────────────────────────────────────
+
+/// `cordelia label <key> <label>`, or `--none` (§3.4, §5.2).
+pub fn label(config_path: &str, key: &str, label: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "key": key, "label": label });
+    if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/label", body)? {
+        print_said(&done);
+    }
+    Ok(())
+}
+
+// ── cordelia shared rename, drop and list ────────────────────────────
+
+/// `cordelia shared rename <name> <new name> [--words <four words>]`
+/// (§3.4): no yes.
+pub fn rename(config_path: &str, name: &str, new: &str, words: Option<&str>) -> anyhow::Result<()> {
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "new_name": new, "words": words });
+    print_said(&asked(config_path, "/api/v1/shared/rename", &body)?);
+    Ok(())
+}
+
+/// `cordelia shared drop <name> [--words <four words>]` (§3.4, §5.2).
+pub fn drop(config_path: &str, name: &str, words: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "words": words });
+    if let Some(dropped) = with_a_yes(config_path, &at, "/api/v1/shared/drop", body)? {
+        print_said(&dropped);
+    }
+    Ok(())
+}
+
+/// `cordelia shared list [--keys]` (§5.1): the shared channels, their keys
+/// (those refused for room among them, with `--keys`) and relays; the keys
+/// typed for a channel and what became of each; the shares waiting.
+pub fn show(config_path: &str, keys: bool) -> anyhow::Result<()> {
+    note_another_version(config_path);
+    let listed = asked(config_path, "/api/v1/shared/list", &json!({ "keys": keys }))?;
+    for line in list_lines(&listed) {
+        println!("{}", crate::history_cmd::printable(&line));
+    }
+    Ok(())
+}
+
+/// The lines of `shared list`, from what the node answered.
+pub fn list_lines(listed: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let channels: Vec<&Value> = list(listed, "channels").collect();
+    match channels.len() {
+        0 => lines.push("No shared channel is held on your devices.".to_string()),
+        n => lines.push(format!(
+            "Shared channels: {n} of 16. Each lives at the relays named, known by their keys."
+        )),
+    }
+    for channel in channels {
+        let relays: Vec<&str> = list(channel, "relays")
+            .map(|relay| text(relay, "shown"))
+            .collect();
+        let mut line = format!(
+            "  \"{}\": channel {}, {} key{} wrote there, {} labelled by you; at {}",
+            text(channel, "name"),
+            text(channel, "words"),
+            channel["keys"].as_u64().unwrap_or(0),
+            if channel["keys"].as_u64() == Some(1) {
+                ""
+            } else {
+                "s"
+            },
+            channel["labelled"].as_u64().unwrap_or(0),
+            relays.join(" and "),
+        );
+        if channel["reached"] != true {
+            line.push_str("; held, not reached from this device");
+        }
+        if channel["also_a_name"] == true {
+            line.push_str("; also a name you sync");
+        }
+        lines.push(line);
+        if let Some(from) = channel["came"]["taken_from"].as_str() {
+            lines.push(format!("    taken from {from}"));
+        }
+        for key in list(channel, "table") {
+            if let Some(first) = key["first_held"].as_str() {
+                lines.push(format!(
+                    "    {}: first held on this device on {first}",
+                    text(key, "form")
+                ));
+            }
+            if let Some(first) = key["first_refused"].as_str() {
+                lines.push(format!(
+                    "    refused for room: {}, first refused on this device on {first}, {} bytes, \
+                     key {}",
+                    text(key, "form"),
+                    key["bytes_refused"].as_u64().unwrap_or(0),
+                    text(key, "key")
+                ));
+            }
+        }
+        let let_go = channel["rows_let_go"].as_u64().unwrap_or(0);
+        if let_go > 0 {
+            lines.push(format!("    no longer known on this device: {let_go} keys"));
+        }
+    }
+    for name in list(listed, "past_a_bound").filter_map(Value::as_str) {
+        lines.push(format!("  \"{name}\": past a bound, and not held"));
+    }
+    let typed: Vec<&Value> = list(listed, "typed").collect();
+    if !typed.is_empty() {
+        lines.push("Keys typed for a shared channel:".into());
+    }
+    for row in typed {
+        let until = time_of(row["until"].as_u64().unwrap_or(0));
+        let became = match (row["taken"].as_str(), row["says"].as_str()) {
+            (Some(words), _) => format!("taken: channel {words}"),
+            (None, Some(says)) => format!("nothing taken: {says}"),
+            (None, None) if row["asking"] == true => format!("asking until {until}"),
+            (None, None) => "nothing was taken within its hour".into(),
+        };
+        lines.push(format!(
+            "  {} for \"{}\": {became}",
+            text(row, "form"),
+            text(row, "name")
+        ));
+    }
+    let shares: Vec<&Value> = list(listed, "shares").collect();
+    if !shares.is_empty() {
+        lines.push("Shares this device made:".into());
+    }
+    for share in shares {
+        let until = time_of(share["until"].as_u64().unwrap_or(0));
+        let state = match (share["taken"] == true, share["waiting"] == true) {
+            (true, _) => "taken".to_string(),
+            (false, true) => format!("waiting until {until}"),
+            (false, false) => "the key took nothing".into(),
+        };
+        let name = match share["channel"].as_str() {
+            Some(name) => format!("\"{name}\""),
+            None => format!("channel {}", text(share, "words")),
+        };
+        lines.push(format!("  {name} to {}: {state}", text(share, "form")));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Cli, Commands, SharedCommand};
+    use clap::{CommandFactory, Parser};
+
+    /// `cordelia accept <key>` and `cordelia accept <key> --channel <name>`
+    /// are two commands on two paths (decision 2026-10-10 §3.2): the
+    /// parser gives each its own, and `--channel` takes a name.
+    #[test]
+    fn the_two_accepts_are_parsed_apart() {
+        let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parsed(&["cordelia", "accept", "cordelia_pk1x"]) {
+            Ok(Some(Commands::Accept { channel: None, .. })) => {}
+            _ => panic!("accept without --channel"),
+        }
+        match parsed(&["cordelia", "accept", "cordelia_pk1x", "--channel", "review"]) {
+            Ok(Some(Commands::Accept {
+                channel: Some(name),
+                ..
+            })) => assert_eq!(name, "review"),
+            _ => panic!("accept --channel"),
+        }
+        assert!(parsed(&["cordelia", "accept", "cordelia_pk1x", "--channel"]).is_err());
+        // A label, or --none, and not both.
+        assert!(parsed(&["cordelia", "label", "cordelia_pk1x"]).is_err());
+        assert!(parsed(&["cordelia", "label", "cordelia_pk1x", "bob", "--none"]).is_err());
+        assert!(parsed(&["cordelia", "label", "cordelia_pk1x", "--none"]).is_ok());
+        match parsed(&[
+            "cordelia", "shared", "new", "review", "--relay", "a:1", "--relay", "b:2",
+        ]) {
+            Ok(Some(Commands::Shared {
+                what: SharedCommand::New { relays, .. },
+            })) => assert_eq!(relays, ["a:1", "b:2"]),
+            _ => panic!("shared new"),
+        }
+        match parsed(&["cordelia", "id", "--words"]) {
+            Ok(Some(Commands::Id { words: true })) => {}
+            _ => panic!("id --words"),
+        }
+    }
+
+    /// `cordelia channels` is said for what it does now (decision
+    /// 2026-10-10 §5.1): "List subscribed channels" no more.
+    #[test]
+    fn the_help_of_channels_says_what_it_lists() {
+        let help = Cli::command()
+            .find_subcommand("channels")
+            .and_then(|command| command.get_about().map(|about| about.to_string()))
+            .unwrap();
+        assert_eq!(
+            help,
+            "List the names this device holds, or a relay's channels"
+        );
+    }
+
+    /// `shared list` says each channel by its words and relays, whether it
+    /// is reached, and what became of each key typed and each share.
+    #[test]
+    fn the_lines_of_shared_list() {
+        let listed = json!({
+            "channels": [{
+                "name": "review", "words": "a b c d", "keys": 1, "labelled": 0,
+                "reached": false, "also_a_name": true, "rows_let_go": 0,
+                "relays": [{ "shown": "relay.example.org:9474 (e f g h)" }],
+                "came": { "taken_from": "(one two three four five six) no label of yours" },
+            }],
+            "typed": [{ "form": "(x) no label of yours", "name": "design", "until": 0,
+                        "asking": false, "taken": null, "says": "Your devices hold it." }],
+            "shares": [{ "form": "(y) \"bob\"", "channel": "review", "until": 0,
+                         "waiting": true, "taken": false }],
+            "past_a_bound": [],
+        });
+        let lines = list_lines(&listed);
+        assert_eq!(
+            lines[0],
+            "Shared channels: 1 of 16. Each lives at the relays named, known by their keys."
+        );
+        assert_eq!(
+            lines[1],
+            "  \"review\": channel a b c d, 1 key wrote there, 0 labelled by you; at \
+             relay.example.org:9474 (e f g h); held, not reached from this device; also a name \
+             you sync"
+        );
+        assert!(
+            lines.contains(
+                &"  (x) no label of yours for \"design\": nothing taken: Your devices hold it."
+                    .to_string()
+            )
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("  \"review\" to (y) \"bob\": waiting until"))
+        );
+        assert_eq!(
+            list_lines(&json!({}))[0],
+            "No shared channel is held on your devices."
+        );
+    }
+}

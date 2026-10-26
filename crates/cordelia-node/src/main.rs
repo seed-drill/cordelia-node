@@ -22,6 +22,7 @@ mod p2p;
 mod person_cmd;
 mod recover_cmd;
 mod relay_entries;
+mod shared_cmd;
 mod terminal;
 
 /// What the program is, in one line: the head of `cordelia --help`, and
@@ -117,7 +118,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// List subscribed channels
+    /// List the names this device holds, or a relay's channels
     Channels,
     /// Show what this node stores and has seen (counts only)
     Stats {
@@ -130,7 +131,13 @@ enum Commands {
     /// To add this device, give the key to `cordelia add-device` on a
     /// device that has your recovery phrase.
     #[command(alias = "pubkey")]
-    Id,
+    Id {
+        /// Print, on a second line, the six words of the key's
+        /// fingerprint: what the person you share a channel with reads
+        /// back to you, by another way than the one the key came by
+        #[arg(long)]
+        words: bool,
+    },
     /// Make your recovery phrase on this device
     ///
     /// Run it once, on one device, in a terminal. It shows twelve words,
@@ -204,10 +211,55 @@ enum Commands {
     /// over. If nothing arrives within a minute, the command ends and the
     /// node goes on asking for the rest of the hour. `cordelia status`
     /// shows what happened.
+    ///
+    /// With `--channel <name>` it is another command: it takes one shared
+    /// channel that another person's device hands this one with `cordelia
+    /// share`, and files it under that name on every device of yours. It
+    /// never joins devices.
     Accept {
         /// The key of the device that added this one. `add-device` prints
-        /// it there
+        /// it there. With `--channel`, the key of the other person's
+        /// device, as `cordelia share` prints it there
         key: String,
+        /// Take a shared channel from that key, and file it under this name
+        #[arg(long, value_name = "NAME")]
+        channel: Option<String>,
+    },
+    /// Hand a shared channel to another person's device
+    ///
+    /// Run it in a terminal. Give the whole key, as `cordelia id` prints it
+    /// there. Before its yes it shows the six words of that key: have the
+    /// other person read you the words that `cordelia id --words` prints
+    /// there, by another way than the one the key came by.
+    Share {
+        /// The name you file the shared channel under
+        name: String,
+        /// The other device's key
+        key: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Give another person's device a label your devices show it by in
+    /// shared channels, or take it away with --none
+    ///
+    /// Run it in a terminal.
+    Label {
+        /// The device's key
+        key: String,
+        /// The label: 1 to 64 bytes of text
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
+        label: Option<String>,
+        /// No label for that key
+        #[arg(long)]
+        none: bool,
+    },
+    /// Channels shared between people: messages between your agents and
+    /// other people's agents, never memory
+    Shared {
+        #[command(subcommand)]
+        what: SharedCommand,
     },
     /// Remove one of your devices
     ///
@@ -520,6 +572,48 @@ enum MsgCommand {
 }
 
 #[derive(clap::Subcommand)]
+enum SharedCommand {
+    /// Make a shared channel, at one or two of your relays known by their
+    /// keys
+    ///
+    /// Run it in a terminal. With no --relay it lives at your first two
+    /// relays that have a key in your configuration.
+    New {
+        /// The name you file it under
+        name: String,
+        /// A relay of yours, as your configuration names it (host:port).
+        /// Give it once for each, at most twice
+        #[arg(long = "relay", value_name = "RELAY")]
+        relays: Vec<String>,
+    },
+    /// List the shared channels, their keys and their relays
+    List {
+        /// Also list each channel's keys, those refused for room among them
+        #[arg(long)]
+        keys: bool,
+    },
+    /// File a shared channel under another name, on every device of yours
+    Rename {
+        name: String,
+        new_name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Stop holding a shared channel, on every device of yours
+    ///
+    /// Run it in a terminal. Its other members are not told.
+    Drop {
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand)]
 enum HistoryCommand {
     /// Print one kept version
     Show {
@@ -720,10 +814,36 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Peers { json }) => cmd_peers(&cli.config, json),
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats { json }) => cmd_stats(&cli.config, json),
-        Some(Commands::Id) => cmd_pubkey(&cli.config),
+        Some(Commands::Id { words: false }) => cmd_pubkey(&cli.config),
+        Some(Commands::Id { words: true }) => shared_cmd::id_words(&cli.config),
         Some(Commands::Phrase { name }) => person_cmd::phrase(&cli.config, name),
         Some(Commands::AddDevice { key, name }) => person_cmd::add_device(&cli.config, &key, name),
-        Some(Commands::Accept { key }) => person_cmd::accept(&cli.config, &key),
+        // Two commands under one name, on two paths and two routes
+        // (decision 2026-10-10 §3.2).
+        Some(Commands::Accept { key, channel: None }) => person_cmd::accept(&cli.config, &key),
+        Some(Commands::Accept {
+            key,
+            channel: Some(name),
+        }) => shared_cmd::accept(&cli.config, &key, &name),
+        Some(Commands::Share { name, key, words }) => {
+            shared_cmd::share(&cli.config, &name, &key, words.as_deref())
+        }
+        Some(Commands::Label { key, label, none }) => {
+            let label = if none { None } else { label };
+            shared_cmd::label(&cli.config, &key, label.as_deref())
+        }
+        Some(Commands::Shared { what }) => match what {
+            SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
+            SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
+            SharedCommand::Rename {
+                name,
+                new_name,
+                words,
+            } => shared_cmd::rename(&cli.config, &name, &new_name, words.as_deref()),
+            SharedCommand::Drop { name, words } => {
+                shared_cmd::drop(&cli.config, &name, words.as_deref())
+            }
+        },
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
