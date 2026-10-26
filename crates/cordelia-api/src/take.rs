@@ -287,6 +287,14 @@ fn taken_as_its_own(
         let again = stored == Outcome::AlreadyHeld;
         taken = record_in(conn, entry, &personal, again, now)?;
     }
+    // The holders of the secret it follows grew by a record: where a
+    // removed key is among them now, rule 8 closes a device in this
+    // transaction (decision 2026-10-24 (removal), rules 3, 8 and 10). A
+    // reader that seals nothing is not closed: what it reads is what it
+    // shows.
+    if taker == Taker::Device && matches!(taken.0, Some(Record::Seen(_))) {
+        crate::person::close_if_not_clear(conn)?;
+    }
     // A record that was taken can let a key add: the one it adds, where
     // a device of the statement signed it. (A record that is not counted
     // can go where the device keeps too many, and with it what let a key

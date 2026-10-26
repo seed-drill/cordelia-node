@@ -830,9 +830,16 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
             "this device was removed: `cordelia init --new-key` first. It is then added as a \
              new device."
         ),
-        ("fork", _) => anyhow::bail!(
-            "two changes were made apart, and this device has seen both: the fork is settled \
-             first, with the phrase (`cordelia settle`)."
+        // A closed device is added again by a hand-over of a clear change
+        // that lists it (decision 2026-10-24 (removal), rule 10).
+        ("fork", _) => (
+            "several",
+            format!(
+                "This device is closed: a device that was removed holds the secret of the \
+                 change it follows. It takes, within the hour, only what {from} hands over \
+                 under the recovery phrase that it already follows, where that brings a change \
+                 that lists it and that no removed device holds. Anything else moves nothing."
+            ),
         ),
         ("not_listed" | "not_opened", _) => (
             "not_listed",
@@ -1197,17 +1204,32 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             ),
         });
     }
-    if let Some(apart) = seen["apart"].as_object() {
+    // Each head set aside, with what is said of it and its lists
+    // (decision 2026-10-24 (removal), rules 10 and 11). A node that names
+    // none of them names the one made apart, as before.
+    let heads: Vec<&Value> = list(seen, "set_aside").collect();
+    let apart: Vec<&Value> = match heads.is_empty() {
+        true => seen
+            .get("apart")
+            .filter(|apart| apart.is_object())
+            .into_iter()
+            .collect(),
+        false => heads,
+    };
+    for head in apart {
         out.push(String::new());
         out.push(format!(
             "The change made apart (change {}, made on {}):",
-            apart["number"].as_u64().unwrap_or(0),
-            shown(&apart["made_on"])
+            head["number"].as_u64().unwrap_or(0),
+            shown(&head["made_on"])
         ));
-        for device in apart["devices"].as_array().into_iter().flatten() {
+        if let Some(says) = head["says"].as_str() {
+            out.push(format!("  {}.", capitalised(says)));
+        }
+        for device in head["devices"].as_array().into_iter().flatten() {
             out.push(format!("  {}", shown(device)));
         }
-        for device in apart["removed"].as_array().into_iter().flatten() {
+        for device in head["removed"].as_array().into_iter().flatten() {
             out.push(format!("  removed: ({})", text(device, "words")));
         }
     }

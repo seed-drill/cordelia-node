@@ -92,11 +92,11 @@ use cordelia_crypto::version;
 use cordelia_storage::at_relays::{self as kept_rows};
 use cordelia_storage::entries;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept, State};
+use cordelia_storage::person::{self as held_rows, State};
 use cordelia_storage::relay::{Mark, NO_MARK};
 
 use crate::person::{
-    PersonError, Shown, applied_name, applied_word, in_one, kept_entry, latest_entry, reached_name,
+    PersonError, Shown, applied_name, applied_word, followed_entry, in_one, reached_name,
 };
 use crate::publish::Standing;
 use crate::state::Class;
@@ -153,13 +153,12 @@ pub fn stands(conn: &Connection) -> Result<Stands, PersonError> {
 /// besides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shows {
-    /// The latest change entry the device keeps: the one it shows. In a
-    /// fork that is the one it had applied (decision 2026-10-04 §4.5).
+    /// The change entry of the change the device follows: the one it
+    /// shows (decision 2026-10-24 (removal), rule 1).
     pub entry: CheckedEntry,
-    /// What the entry made apart from it is named by, where the device is
-    /// in a fork and keeps one. A relay that says it holds that one is
-    /// asked no more for it.
-    pub apart: Option<[u8; 32]>,
+    /// What each head it sets aside is named by. A relay that tells of one
+    /// of them is asked no more about it in that round.
+    pub set_aside: Vec<[u8; 32]>,
 }
 
 /// What this device shows a relay. `None` where it follows no phrase: it
@@ -169,16 +168,42 @@ pub fn to_show(conn: &Connection) -> Result<Option<Shows>, PersonError> {
         return Ok(None);
     }
     Ok(Some(Shows {
-        entry: latest_entry(conn)?,
-        apart: kept_entry(conn, Kept::Apart)?.map(|apart| apart.id()),
+        entry: followed_entry(conn)?,
+        set_aside: set_aside_ids(conn)?,
     }))
 }
 
-/// What the latest change entry that this device keeps is named by: what
-/// a leave to use a connection was given for. `None` where the device
+/// What each head this device sets aside is named by. The entries are not
+/// checked: only their names are asked.
+pub fn set_aside_ids(conn: &Connection) -> Result<Vec<[u8; 32]>, PersonError> {
+    Ok(held_rows::set_aside_entries(conn)?
+        .iter()
+        .map(|kept| kept.entry.id())
+        .collect())
+}
+
+/// What the change entry of the change this device follows is named by:
+/// what a leave to use a connection was given for. `None` where the device
 /// follows no phrase. The entry is not checked: only its name is asked.
 pub fn kept_id(conn: &Connection) -> Result<Option<[u8; 32]>, PersonError> {
-    Ok(held_rows::change_entry(conn, Kept::Latest)?.map(|entry| entry.id()))
+    Ok(held_rows::followed_entry(conn)?.map(|entry| entry.id()))
+}
+
+/// Where a device stands, the change it follows and each head it sets
+/// aside, by their names ([`what_it_keeps`]).
+pub type Keeps = (Stands, Option<[u8; 32]>, Vec<[u8; 32]>);
+
+/// What this device keeps of its person's changes, as a pass is woken by
+/// a change in it (decision 2026-10-24 (removal), rule 19): where it
+/// stands, the change it follows and each head it sets aside. `None`
+/// where any of it cannot be read: whoever compares it then takes it to
+/// have changed.
+pub fn what_it_keeps(conn: &Connection) -> Option<Keeps> {
+    Some((
+        stands(conn).ok()?,
+        kept_id(conn).ok()?,
+        set_aside_ids(conn).ok()?,
+    ))
 }
 
 /// What became of the entry that a relay answered a show with.
@@ -1531,6 +1556,8 @@ pub fn sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::several::{Kept, kept_entry};
 
     use std::collections::BTreeSet;
 
@@ -1751,7 +1778,7 @@ mod tests {
             to_show(&s[0].conn).unwrap(),
             Some(Shows {
                 entry: first.clone(),
-                apart: None,
+                set_aside: Vec::new(),
             })
         );
         assert_eq!(kept_id(&s[0].conn).unwrap(), Some(first.id()));
@@ -1768,19 +1795,25 @@ mod tests {
         let on = &s[0];
         assert_eq!(
             answered(&on.conn, &on.identity, &by_0, &by_1, s.now).unwrap(),
-            Answered::Shown(Shown::Fork)
+            Answered::Shown(Shown::SetAside)
         );
-        assert_eq!(stands(&on.conn).unwrap(), Stands::Stopped(State::Fork));
-        // It shows the one it had applied, and keeps the other.
+        // Both are clear: it goes on under the one it follows (decision
+        // 2026-10-24 (removal), rule 11).
+        assert_eq!(stands(&on.conn).unwrap(), Stands::Applied);
+        // It shows the one it follows, and sets the other aside.
         assert_eq!(
             to_show(&on.conn).unwrap(),
             Some(Shows {
                 entry: by_0.clone(),
-                apart: Some(by_1.id()),
+                set_aside: vec![by_1.id()],
             })
         );
         assert_eq!(kept_id(&on.conn).unwrap(), Some(by_0.id()));
-        // It has no channel that a pass goes through, and proves none.
+        assert!(!channels(&on.conn, &on.identity).unwrap().is_empty());
+        // Closed, it has no channel that a pass goes through, and proves
+        // none.
+        held_rows::set_state(&on.conn, State::Fork).unwrap();
+        assert_eq!(stands(&on.conn).unwrap(), Stands::Stopped(State::Fork));
         assert!(channels(&on.conn, &on.identity).unwrap().is_empty());
         assert!(listed(&on.conn, 1024).unwrap().is_empty());
 
@@ -3827,7 +3860,7 @@ mod tests {
         assert_eq!(word, carried_word(2, &[1, 2], 0, 0));
 
         // Device 1 applies the change and is given the word.
-        let change = held_rows::change_entry(&s[0].conn, Kept::Latest)
+        let change = crate::several::change_entry(&s[0].conn, Kept::Latest)
             .unwrap()
             .unwrap()
             .check()

@@ -101,7 +101,7 @@ use cordelia_crypto::statement::{SignedStatement, Statement};
 use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Following, Kept, KeptAddition, Person, State};
+use cordelia_storage::person::{self as held_rows, Following, KeptAddition, Person, State};
 
 use crate::at_relays::known::RelayId;
 use crate::carry::{self, Allows, Rule, Tally, Word};
@@ -396,7 +396,7 @@ pub fn read_generation(
         },
     )?;
     held_rows::apply_secret(&conn, statement.number, secret, now)?;
-    held_rows::keep_change_entry(&conn, Kept::Latest, &from.entry)?;
+    held_rows::keep_followed(&conn, &from.entry)?;
     // Whoever reads is in no list: it only reads.
     let reader = NodeIdentity::generate()?;
 
@@ -1550,6 +1550,8 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::several::{Kept, kept_entry};
 
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::phrase::Phrase;
@@ -3984,7 +3986,7 @@ mod tests {
             .filter(|entry| entry.open(&lab).is_ok_and(|inside| inside.name == "a.md"))
             .collect();
         assert_eq!(sent_of_lab.len(), 1);
-        let firsts_entry = person::latest_entry(&db(&first.state)).unwrap();
+        let firsts_entry = person::followed_entry(&db(&first.state)).unwrap();
 
         // The second machine: the relay holds what it held, and what the
         // first machine had sent.
@@ -4323,19 +4325,24 @@ mod tests {
             assert_ne!(made.entry.id(), theirs.id());
 
             // The new machine is answered with device 0's, and device 0
-            // with the new machine's: each is in a fork, and keeps both.
+            // with the new machine's: each is clear, so each sets the other
+            // aside and goes on (decision 2026-10-24 (removal), rules 8 and
+            // 11), and keeps both.
             let at = s.tick();
             let answered = shown(&db(new), &new.identity, &theirs, at).unwrap();
-            assert_eq!(answered, Answered::Fork);
+            assert_eq!(answered, Answered::SetAside);
             let on = &s[0];
             let answered = shown(&on.conn, &on.identity, &made.entry, at).unwrap();
-            assert_eq!(answered, Answered::Fork);
+            assert_eq!(answered, Answered::SetAside);
             let stands = || person::held(&db(new)).unwrap().unwrap();
             let kept = |which: Kept| {
-                let entry = held_rows::change_entry(&db(new), which).unwrap();
+                let entry = crate::several::change_entry(&db(new), which).unwrap();
                 entry.map(|entry| entry.check().unwrap())
             };
-            assert_eq!((stands().state, on.state()), (State::Fork, State::Fork));
+            assert_eq!(
+                (stands().state, on.state()),
+                (State::Applied, State::Applied)
+            );
             assert_eq!(
                 (
                     kept(Kept::Latest).unwrap().id(),
@@ -4448,7 +4455,7 @@ mod tests {
         let entry = make_change(
             &phrase(),
             &held.statement,
-            &person::latest_entry(&conn).unwrap(),
+            &person::followed_entry(&conn).unwrap(),
             &identity.public_key(),
             held.statement.statement.devices.clone(),
             &[],

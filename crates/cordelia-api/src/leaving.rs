@@ -45,7 +45,7 @@ use cordelia_crypto::slots::slot_id;
 use cordelia_storage::acts;
 use cordelia_storage::at_relays as kept_rows;
 use cordelia_storage::entries;
-use cordelia_storage::person::{self as held_rows, Kept, State};
+use cordelia_storage::person::{self as held_rows, State};
 
 use crate::adding::{is_alone, leave, write_over_dropped};
 use crate::at_relays::{Kind, Own};
@@ -285,8 +285,7 @@ pub fn forget(
         // any hand-over it made (§6).
         write_over_dropped(conn, identity, now)?;
         held_rows::forget_hand_overs(conn)?;
-        held_rows::drop_change_entry(conn, Kept::Latest)?;
-        held_rows::drop_change_entry(conn, Kept::Apart)?;
+        held_rows::drop_change_entries(conn)?;
         held_rows::clear_additions(conn)?;
         held_rows::forget_person(conn)?;
         acts::forget_all(conn)?;
@@ -523,6 +522,8 @@ mod tests {
     use crate::adding::Accepted;
     use crate::at_relays;
     use crate::person::{first_entry, first_statement, who_counts};
+    #[allow(unused_imports)]
+    use crate::several::{Kept, kept_entry};
     use crate::several::{OTHER_WORDS, Several};
     use crate::take::{Taken, take};
     use cordelia_crypto::phrase::Phrase;
@@ -759,11 +760,11 @@ mod tests {
         assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());
         assert_eq!(
-            held_rows::change_entry(&on.conn, Kept::Latest).unwrap(),
+            crate::several::change_entry(&on.conn, Kept::Latest).unwrap(),
             None
         );
         assert_eq!(
-            held_rows::change_entry(&on.conn, Kept::Apart).unwrap(),
+            crate::several::change_entry(&on.conn, Kept::Apart).unwrap(),
             None
         );
         assert!(held_rows::additions(&on.conn).unwrap().is_empty());
@@ -781,7 +782,8 @@ mod tests {
         assert!(!forget(&on.conn, &on.identity, false, now).unwrap());
         assert_eq!(among(&on.conn, &on.identity).unwrap(), Among::NoPhrase);
 
-        // A device in a fork keeps two change entries: it forgets both.
+        // A device that sets a head aside keeps two change entries: it
+        // forgets both.
         let mut s = Several::of_one_person(3);
         s.change(0, &[0, 1, 2], &[]);
         s.meet(&[0, 1, 2]);
@@ -789,13 +791,17 @@ mod tests {
         let apart = s.change(1, &[0, 1, 2], &[]);
         give(&mut s, 0, &apart);
         let on = &s[0];
-        assert_eq!(on.state(), State::Fork);
+        assert_eq!(on.state(), State::Applied);
         for kept in [Kept::Latest, Kept::Apart] {
-            assert!(held_rows::change_entry(&on.conn, kept).unwrap().is_some());
+            assert!(
+                crate::several::change_entry(&on.conn, kept)
+                    .unwrap()
+                    .is_some()
+            );
         }
         assert!(forget(&on.conn, &on.identity, false, s.now).unwrap());
         for kept in [Kept::Latest, Kept::Apart] {
-            assert_eq!(held_rows::change_entry(&on.conn, kept).unwrap(), None);
+            assert_eq!(crate::several::change_entry(&on.conn, kept).unwrap(), None);
         }
     }
 

@@ -142,8 +142,8 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 1. A change that is the one followed, a head kept, or behind one of them: nothing is done, as today.
 2. Otherwise the device checks it (the signature, the form, the lineage), adds its removed keys (rule 2), and drops each change set aside that it was made after.
 3. **A change that lists this device's key as removed stops the device, as removed,** whether it was made after the change followed or apart from it. (Today a change made apart is a fork, even where it removes this device.)
-4. A change made after the one followed, that counts this device and is clear: the device applies it, as today. Where its secret does not open, the device stops, as today (4.5).
-5. A change made after the one followed that neither counts this device nor removes it stops it, as in no list, as today (the record of 2026-10-04, 4.3), whether or not it is clear.
+4. A change made after the one followed, that counts this device and is clear: the device applies it, as today. It counts the device where it lists it, or where a record of the device's addition that counts comes with it (a hand-over at `cordelia accept`, 4.2 rule 3): a device dropped from a list and added again before it heard is added so. Where its secret does not open, the device stops, as today (4.5).
+5. A change made after the one followed that neither counts this device nor removes it stops it, as in no list, as today (the record of 2026-10-04, 4.3), whether or not it is clear. One that counts it only by a record and is not clear is kept as step 6 says.
 6. Anything else is kept as a head set aside. Where the change followed is still clear, nothing more is done: the device goes on (rule 11).
 7. Where the change followed is not clear, the device moves (rule 9) to the best change it keeps that is clear, counts it, and whose secret opens for it: the one with the highest number, and of two at one number, the one whose hash is lower.
 8. Where there is none, the device is closed (rule 10).

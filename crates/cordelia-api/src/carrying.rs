@@ -844,7 +844,7 @@ pub async fn look_from(
             return Err(PersonError::NameNotHeld(name.to_string()));
         }
         let removed = removed_keys(&conn, &held)?;
-        let under = person::latest_entry(&conn)?.id();
+        let under = person::followed_entry(&conn)?.id();
         (left_secrets(&conn)?, removed, under)
     };
     let mut keys: Vec<[u8; 32]> = Vec::new();
@@ -1010,7 +1010,7 @@ fn allowed_still(
     word: &Word,
 ) -> Result<(), PersonError> {
     let held = applied(conn)?;
-    let under = person::latest_entry(conn)?.id();
+    let under = person::followed_entry(conn)?.id();
     let own = state.identity.public_key();
     match word.holds(&held.following.phrase_key, &own, &under, now()) {
         true => Ok(()),
@@ -1195,7 +1195,7 @@ pub async fn look_for_phrase(
     }
     let sessions = sessions(state).await;
     let conn = db(state);
-    let entry = person::latest_entry(&conn)?;
+    let entry = person::followed_entry(&conn)?;
     let mut held_channels: Vec<String> = Vec::new();
     for secret in held_rows::secrets(&conn)? {
         let of_the_name = Zeroizing::new(derive::own_secret(&secret.secret, name)?);
@@ -1857,7 +1857,7 @@ mod tests {
             assert_eq!(found["deletes"], 1);
             assert_eq!(found["has_folder"], false);
             assert_eq!(found["read_all"], true);
-            let under = person::latest_entry(&db(&node.state)).unwrap().id();
+            let under = person::followed_entry(&db(&node.state)).unwrap().id();
             assert_eq!(found["under"], hex::encode(under));
         }
         assert_eq!(node.stored(), before);
@@ -2118,7 +2118,7 @@ mod tests {
         let (node, phrase, removed, counts) = after_a_removal();
         let before = node.stored();
         let own = node.state.identity.public_key();
-        let under = person::latest_entry(&db(&node.state)).unwrap().id();
+        let under = person::followed_entry(&db(&node.state)).unwrap().id();
         let says = from(&[removed], &[]).says().unwrap();
 
         // No word that holds: nothing is read at a relay, and nothing is

@@ -31,19 +31,50 @@ use cordelia_crypto::{item_decrypt, item_encrypt};
 use cordelia_storage::db;
 use cordelia_storage::entries;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept, State};
+use cordelia_storage::person::{self as held_rows, State};
 
 use crate::adding::{Accepted, Added, accept, add_device};
 use crate::carry::{Allows, Word};
 use crate::change::make_change;
 use crate::own_read::ReadId;
 use crate::person::{
-    Applied, Held, Shown, applied_name, applied_secret, first_statement, held, hold_name,
-    kept_entry, latest_entry, shown, who_counts,
+    Applied, Held, Shown, applied_name, applied_secret, first_statement, followed_entry, held,
+    hold_name, shown, who_counts,
 };
 use crate::publish::{PlannedAgainst, Published, Write, publish, read, value_hash};
 use crate::state::{AppState, DoorAsk, LeftAt, LeftPlace, LeftRead, OwnAsk, ProvedBy};
 use crate::take::{Taken, take};
+
+/// Which change entry a test reads of those a device keeps: the change it
+/// follows, or the first head it sets aside (decision 2026-10-24
+/// (removal), rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kept {
+    Latest,
+    Apart,
+}
+
+/// The change entry a device keeps as `which` says, as it was stored.
+pub(crate) fn change_entry(
+    conn: &Connection,
+    which: Kept,
+) -> Result<Option<Entry>, cordelia_core::CordeliaError> {
+    match which {
+        Kept::Latest => held_rows::followed_entry(conn),
+        Kept::Apart => Ok(held_rows::set_aside_entries(conn)?
+            .into_iter()
+            .next()
+            .map(|kept| kept.entry)),
+    }
+}
+
+/// [`change_entry`], checked as it is read.
+pub(crate) fn kept_entry(
+    conn: &Connection,
+    which: Kept,
+) -> Result<Option<CheckedEntry>, crate::person::PersonError> {
+    Ok(change_entry(conn, which)?.map(|entry| entry.check().unwrap()))
+}
 
 pub(crate) const WORDS: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
@@ -129,14 +160,24 @@ impl Machine {
         who_counts(&self.conn).unwrap().counts(key)
     }
 
-    /// The change entry the device keeps as the latest it has seen.
+    /// The change entry of the change the device follows.
     pub(crate) fn latest(&self) -> CheckedEntry {
-        latest_entry(&self.conn).unwrap()
+        followed_entry(&self.conn).unwrap()
     }
 
-    /// The change entry the device keeps of a statement made apart.
+    /// The first head the device sets aside, the highest number first
+    /// (decision 2026-10-24 (removal), rule 1).
     pub(crate) fn apart(&self) -> Option<CheckedEntry> {
-        kept_entry(&self.conn, Kept::Apart).unwrap()
+        self.set_aside().into_iter().next()
+    }
+
+    /// Every head the device sets aside, the highest number first.
+    pub(crate) fn set_aside(&self) -> Vec<CheckedEntry> {
+        held_rows::set_aside_entries(&self.conn)
+            .unwrap()
+            .into_iter()
+            .map(|kept| kept.entry.check().unwrap())
+            .collect()
     }
 
     /// Every entry the device's store holds, of every channel, in the
@@ -358,7 +399,7 @@ impl Several {
     pub(crate) fn pass(&mut self, from: usize, to: usize) -> Vec<Taken> {
         let now = self.tick();
         let mut given = Vec::new();
-        let kept = held_rows::change_entry(&self[from].conn, Kept::Latest).unwrap();
+        let kept = held_rows::followed_entry(&self[from].conn).unwrap();
         given.extend(kept.map(|entry| entry.check().unwrap()));
         given.extend(self[from].stored());
         let to = &self[to];
@@ -828,7 +869,7 @@ impl Node {
     /// A word of `phrase` for `allows`, given now on this node's
     /// device, under the change entry that it keeps.
     pub(crate) fn word(&self, phrase: &Phrase, allows: &Allows) -> Word {
-        let under = latest_entry(&db(&self.state)).unwrap().id();
+        let under = followed_entry(&db(&self.state)).unwrap().id();
         let own = self.state.identity.public_key();
         Word::give(phrase, &own, &under, allows.says().unwrap(), wall_clock()).unwrap()
     }
@@ -1795,13 +1836,13 @@ mod tests {
         assert_eq!(b.current.unwrap().value, text("by device 4"));
     }
 
-    /// Two changes are made apart: one on device 0, one on device 1.
-    /// Every device that sees both is in a fork, and neither publishes in
-    /// its own channels nor takes from them. The settlement, made on a
-    /// device that has seen both, ends it on each: what was written under
-    /// both branches comes together.
+    /// Two changes are made apart: one on device 0, one on device 1, each
+    /// clear. Every device that sees both sets the other aside and goes on
+    /// under the change it follows (decision 2026-10-24 (removal), rules 8
+    /// and 11). The settlement, made on a device that has seen both, joins
+    /// them on each: what was written under both branches comes together.
     #[test]
-    fn test_two_changes_made_apart_are_a_fork_and_the_settlement_ends_it_on_each() {
+    fn test_two_clear_changes_made_apart_are_set_aside_and_the_settlement_joins_them() {
         let mut s = Several::of_one_person(3);
         s.hold(&[0, 1, 2], "notes");
         let first = s[0].secret();
@@ -1814,17 +1855,17 @@ mod tests {
         s.write(0, "notes", "a.md", "written under the change of 0");
         s.write(1, "notes", "b.md", "written under the change of 1");
 
-        // Device 2 is shown one, and applies it. Shown the other, it is in
-        // a fork. So is each maker, shown the other's.
+        // Device 2 is shown one, and applies it. Shown the other, it sets
+        // it aside. So does each maker, shown the other's.
         assert!(matches!(
             s.pass(0, 2)[0],
             Taken::Shown(Shown::Applied(Applied { number: 2, .. }))
         ));
-        assert_eq!(s.pass(1, 2)[0], Taken::Shown(Shown::Fork));
-        assert_eq!(s.pass(1, 0)[0], Taken::Shown(Shown::Fork));
-        assert_eq!(s.pass(0, 1)[0], Taken::Shown(Shown::Fork));
+        assert_eq!(s.pass(1, 2)[0], Taken::Shown(Shown::SetAside));
+        assert_eq!(s.pass(1, 0)[0], Taken::Shown(Shown::SetAside));
+        assert_eq!(s.pass(0, 1)[0], Taken::Shown(Shown::SetAside));
         for n in 0..3 {
-            assert_eq!(s[n].state(), State::Fork, "{n}");
+            assert_eq!(s[n].state(), State::Applied, "{n}");
             assert_eq!(s[n].number(), 2);
         }
         // Each keeps both entries: the one it had applied, and the other.
@@ -1838,28 +1879,12 @@ mod tests {
         );
         assert_eq!(s[2].apart().unwrap().id(), by_1.id());
 
-        // In a fork a device publishes nothing, and takes nothing in its
-        // own channels.
+        // Each goes on under the change it follows: it publishes in its own
+        // channels.
         for n in 0..3 {
             let on = &s[n];
-            let write = Write {
-                name: "notes",
-                file: "c.md",
-                value: text("in a fork"),
-                planned: PlannedAgainst::NoVersion,
-                merge: None,
-            };
-            assert!(matches!(
-                publish(&on.conn, &on.identity, &write, s.now),
-                Err(PersonError::Stopped(State::Fork))
-            ));
+            assert!(crate::publish::Standing::to_write(&on.conn).is_ok(), "{n}");
         }
-        let stopped = s[2].everything();
-        let taken = s.pass(0, 2);
-        assert_eq!(taken[0], Taken::Shown(Shown::Held));
-        assert!(taken.contains(&Taken::Refused(NotTaken::Stopped(State::Fork))));
-        assert!(!taken.iter().any(|one| matches!(one, Taken::Own { .. })));
-        assert_eq!(s[2].everything(), stopped);
 
         // The settlement, with the phrase, on device 0: it has seen both.
         let now = s.tick();

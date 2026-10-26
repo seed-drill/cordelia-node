@@ -86,6 +86,17 @@
 >   was kept nowhere apart and the step has nothing to fill the holders
 >   from. Only what a device sees from the step on is kept apart.
 >
+> Step 22, per the same record (set out in §10.3):
+>
+> - **v22:** `person_change_entries` made again, to keep the change a device
+>   follows and up to seven heads set aside, each with when it was set
+>   aside; every row carried, the latest as the change followed and the one
+>   made apart as a head set aside at the step's time. `person_change_times`,
+>   empty: the time of each change a device applies or keeps. And
+>   `person.judge_kept` in `node_meta` on a device that follows a phrase: at
+>   its first start on this version it notes the time of each entry it kept,
+>   and a device in a fork judges the one it kept apart by rule 8 (rule 12).
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
@@ -1019,16 +1030,21 @@ CREATE TABLE person_secrets (
 CREATE UNIQUE INDEX idx_person_secrets_applied ON person_secrets((left_at IS NULL))
     WHERE left_at IS NULL;
 
-CREATE TABLE person_change_entries (
-    kept            TEXT PRIMARY KEY CHECK(kept IN ('latest', 'apart')),
-    channel         BLOB NOT NULL CHECK(length(channel) = 32),
-    slot            BLOB NOT NULL CHECK(length(slot) = 32),
-    author          BLOB NOT NULL CHECK(length(author) = 32),
-    rev             INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
-    content         BLOB NOT NULL,
-    author_sig      BLOB NOT NULL CHECK(length(author_sig) = 64),
-    channel_sig     BLOB NOT NULL CHECK(length(channel_sig) = 64)
+CREATE TABLE person_change_entries (               -- made again by v22
+    place         INTEGER PRIMARY KEY,
+    followed      INTEGER NOT NULL CHECK(followed IN (0, 1)),
+    set_aside_at  INTEGER CHECK(set_aside_at IS NULL OR typeof(set_aside_at) = 'integer'),
+    channel       BLOB NOT NULL CHECK(length(channel) = 32),
+    slot          BLOB NOT NULL CHECK(length(slot) = 32),
+    author        BLOB NOT NULL CHECK(length(author) = 32),
+    rev           INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+    content       BLOB NOT NULL,
+    author_sig    BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig   BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    CHECK((followed = 1) = (set_aside_at IS NULL))
 );
+CREATE UNIQUE INDEX idx_person_change_entries_followed
+    ON person_change_entries(followed) WHERE followed = 1;
 
 CREATE TABLE person_additions (
     seen     INTEGER PRIMARY KEY,
@@ -1078,6 +1094,13 @@ CREATE TABLE person_holders_past (                  -- v21
     PRIMARY KEY (number, hash)
 );
 
+CREATE TABLE person_change_times (                  -- v22
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    made_at  INTEGER CHECK(made_at IS NULL OR typeof(made_at) = 'integer'),
+    PRIMARY KEY (number, hash)
+);
+
 CREATE TABLE person_clear_mark (                    -- v21
     one   INTEGER PRIMARY KEY CHECK(one = 1),
     mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
@@ -1091,9 +1114,10 @@ CREATE TABLE person_clear_mark (                    -- v21
 
 | Table | What it holds | Decision |
 |---|---|---|
-| `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it has seen a statement made apart from the one applied); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
+| `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it is closed: it follows no clear change, decision 2026-10-24 (removal), rule 10; the name is a fork's of before); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
 | `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
-| `person_change_entries` | The latest change entry it has seen (`latest`), whole, to show to a relay; and, in a fork, the one made apart (`apart`) | §4.5, §4.6 |
+| `person_change_entries` | The change entry of the change it follows (`followed` 1), whole, to show to a relay: on a device that stopped, the one that stopped it. And up to seven heads it sets aside (`followed` 0), each with when it set it aside: eight in all (`MAX_CHANGE_HEADS`). Step 22 made it again: the latest entry was carried as the change followed, and the one made apart as a head set aside at the step's time | §4.5, §4.6; decision 2026-10-24 (removal), rule 1 |
+| `person_change_times` | For each change it applied or kept, by its statement's number and hash, the time its lineage says it was made, or none for a change made on the version before. Kept after the change goes, until the device leaves its phrase, for the cut time of rule 2 | decision 2026-10-24 (removal), rule 2 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |

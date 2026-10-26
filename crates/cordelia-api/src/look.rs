@@ -58,15 +58,15 @@ use cordelia_crypto::version;
 use cordelia_storage::acts;
 use cordelia_storage::entries;
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, Kept, KeptAddition, State};
+use cordelia_storage::person::{self as held_rows, KeptAddition, State};
 use cordelia_storage::sync_state;
 
 use crate::adding::within_its_hour;
 use crate::leaving::{Among, among, left_name};
 use crate::names;
 use crate::person::{
-    Counting, Held, NotCounted, PersonError, applied_name, applied_secret, held, in_one,
-    kept_entry, latest_entry, reached_name, read_applied_word,
+    Counting, Held, NotCounted, PersonError, applied_name, applied_secret, followed_entry, held,
+    in_one, reached_name, read_applied_word,
 };
 use crate::state::{
     AtRelays, CannotGoOn, Class, Holds, LacksFor, NoRoom, ReferenceBy, RefusedOf, Waits,
@@ -86,6 +86,12 @@ pub struct Shown {
 }
 
 impl Shown {
+    /// The key back, as it was written.
+    fn key_of(shown: &Self) -> Result<[u8; 32], PersonError> {
+        cordelia_crypto::bech32::decode_public_key(&shown.key)
+            .map_err(|e| PersonError::Held(format!("a key shown: {e}")))
+    }
+
     fn of(key: &[u8; 32], label: &str) -> Result<Self, PersonError> {
         Ok(Self {
             key: encode_public_key(key)?,
@@ -217,6 +223,24 @@ pub struct LeftOutKey {
     /// shown it nowhere else, and nothing was asked of it. `None` for a
     /// key that was shown.
     pub key: Option<String>,
+}
+
+/// A head that the device sets aside (decision 2026-10-24 (removal), rules
+/// 1 and 11): its lists, when it was set aside, and, where it is not
+/// clear, each removed key that it lists or hands its secret, with the
+/// device on which a change that removed it was made, where the device
+/// keeps one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetAsideLook {
+    #[serde(flatten)]
+    pub lists: Lists,
+    /// When it was set aside, in seconds, by this device's own clock.
+    pub set_aside_at: i64,
+    pub clear: bool,
+    /// Each removed key that it lists.
+    pub lists_removed: Vec<Shown>,
+    /// What it is said with, in `cordelia devices` and a status.
+    pub says: String,
 }
 
 /// A statement's two lists, as a device that can read it shows them.
@@ -393,9 +417,12 @@ pub struct Look {
     pub added: Vec<AddedSince>,
     pub removed: Vec<Shown>,
     pub left_out: Vec<LeftOutKey>,
-    /// The statement made apart from the one applied, where the device is
-    /// in a fork.
+    /// The first head the device sets aside, as `cordelia settle` joins
+    /// it: the highest number (decision 2026-10-24 (removal), rule 1).
     pub apart: Option<Lists>,
+    /// Each head the device sets aside, the highest number first (rules 1
+    /// and 11).
+    pub set_aside: Vec<SetAsideLook>,
     pub relays: Vec<AtRelayLook>,
     pub accepting: Vec<Accepting>,
     pub notices: Vec<Notice>,
@@ -555,6 +582,7 @@ pub fn look(
             removed: Vec::new(),
             left_out: Vec::new(),
             apart: None,
+            set_aside: Vec::new(),
             relays: relays(at_relays),
             accepting: accepting(conn, now)?,
             notices: Vec::new(),
@@ -644,7 +672,7 @@ fn of_its_person(
     let left = held_rows::secrets(conn)?;
     look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
     look.removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?.is_some();
-    look.latest = Some(hex::encode(latest_entry(conn)?.id()));
+    look.latest = Some(hex::encode(followed_entry(conn)?.id()));
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
 
@@ -733,11 +761,12 @@ fn of_its_person(
     // lists it is clear, and its way on is a new key (decision 2026-10-24
     // (removal), rules 2 and 4), not a change made here.
     let removed_as_known = counting.is_removed(&own);
+    // Each head set aside, with its lists, and what it is said with (rules
+    // 1 and 11).
+    look.set_aside = set_aside(conn, identity, held)?;
+    look.apart = look.set_aside.first().map(|head| head.lists.clone());
     let why = match held.state {
         State::Applied | State::Fork if removed_as_known => {
-            if held.state == State::Fork {
-                look.apart = apart(conn, held)?;
-            }
             look.short = Some(REMOVED_AS_KNOWN_SHORT.into());
             look.says.push(REMOVED_AS_KNOWN_WHY.into());
             look.cannot_go_on = Some(REMOVED_AS_KNOWN_WHY.into());
@@ -755,7 +784,17 @@ fn of_its_person(
                  ({why}): it sends nothing and takes nothing in a channel of its own, and tries \
                  again at each pass"
             )),
-            _ => None,
+            // A device that follows a clear change goes on with any head
+            // set aside, and says each (rule 11).
+            _ => {
+                for head in &look.set_aside {
+                    look.says.push(head.says.clone());
+                }
+                if !look.set_aside.is_empty() {
+                    look.short = Some(SET_ASIDE_SHORT.into());
+                }
+                None
+            }
         },
         State::Removed => Some(
             "this device was removed. `cordelia init --new-key` gives it a new key; it is then \
@@ -772,11 +811,20 @@ fn of_its_person(
              that has it",
             made_on(conn, held)?
         )),
+        // Closed with no head set aside: what it knows of removals grew
+        // with no change kept, and its way on in this slice of the build
+        // is a change made here (decision 2026-10-24 (removal), rule 10).
+        State::Fork if look.set_aside.is_empty() => {
+            look.short = Some(CLOSED_SHORT.into());
+            look.says.push(CLOSED_WHY.into());
+            look.cannot_go_on = Some(CLOSED_WHY.into());
+            return Ok(());
+        }
         State::Fork => {
-            look.apart = apart(conn, held)?;
-            Some(
-                "two changes were made apart: settle it with the phrase (`cordelia settle`)".into(),
-            )
+            for head in &look.set_aside {
+                look.says.push(head.says.clone());
+            }
+            Some(CLOSED_BY_HEADS_WHY.into())
         }
     };
     if let Some(why) = &why {
@@ -786,6 +834,16 @@ fn of_its_person(
     look.cannot_go_on = why;
     Ok(())
 }
+
+/// Why a device closed among heads set aside cannot go on (decision
+/// 2026-10-24 (removal), rule 10): said in red, with the lists of each
+/// head.
+pub const CLOSED_BY_HEADS_WHY: &str = "two changes were made apart, and none that lists this \
+     device is clear of a removed device: settle it with the phrase (`cordelia settle`)";
+
+/// What a status says, in a few words, of a device that follows a clear
+/// change and sets a head aside (decision 2026-10-24 (removal), rule 11).
+pub const SET_ASIDE_SHORT: &str = "a change made apart is set aside";
 
 /// Why a closed device cannot go on, in a few words (decision 2026-10-24
 /// (removal), rule 10): what `cordelia devices` says first, and what a
@@ -1515,38 +1573,95 @@ pub fn clear(
 
 /// The device on which the statement was made that stopped this one, as a
 /// person knows it: the statement is in the change entry that the device
-/// keeps as the latest it has seen.
+/// keeps as the one it follows.
 fn made_on(conn: &Connection, held: &Held) -> Result<String, PersonError> {
-    Ok(lists_in(conn, held, Kept::Latest)?
-        .map(|lists| lists.made_on.named())
-        .unwrap_or_else(|| "another device".into()))
-}
-
-/// The lists of the statement made apart from the one applied.
-fn apart(conn: &Connection, held: &Held) -> Result<Option<Lists>, PersonError> {
-    lists_in(conn, held, Kept::Apart)
-}
-
-/// The lists of the statement in a change entry that the device keeps,
-/// which every device that follows the phrase can read (§4.6).
-fn lists_in(conn: &Connection, held: &Held, which: Kept) -> Result<Option<Lists>, PersonError> {
-    let entry = match which {
-        Kept::Latest => Some(latest_entry(conn)?),
-        Kept::Apart => kept_entry(conn, Kept::Apart)?,
-    };
-    let Some(entry) = entry else {
-        return Ok(None);
-    };
     let following = &held.following;
-    let Ok(read) = change_entry::open_statement(
-        &entry,
+    let read = change_entry::open_statement(
+        &followed_entry(conn)?,
         &following.phrase_key,
         &following.phrase_channel,
         &following.statement_key,
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(lists_of(&read.statement)?))
+    );
+    Ok(match read {
+        Ok(read) => lists_of(&read.statement)?.made_on.named(),
+        Err(_) => "another device".into(),
+    })
+}
+
+/// Each head that the device sets aside, the highest number first, with
+/// its lists and what it is said with (decision 2026-10-24 (removal),
+/// rules 1 and 11). One that is not clear names the removed key it lists,
+/// and the device on which a change that removed it was made, of the
+/// changes the device keeps.
+fn set_aside(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    held: &Held,
+) -> Result<Vec<SetAsideLook>, PersonError> {
+    let heads = crate::person::set_aside_heads(conn, identity, &held.following)?;
+    let removed = held_rows::removed_keys(conn)?;
+    let labels = removed_labels(conn)?;
+    // The changes the device keeps, of which one may say who removed a key.
+    let mut kept: Vec<&Statement> = vec![&held.statement.statement];
+    kept.extend(heads.iter().map(|head| &head.statement.statement));
+    let mut out = Vec::with_capacity(heads.len());
+    for head in &heads {
+        let statement = &head.statement.statement;
+        let lists = lists_of(statement)?;
+        let clear = crate::person::is_clear(conn, statement, false)?;
+        let mut lists_removed = Vec::new();
+        for device in statement
+            .devices
+            .iter()
+            .filter(|d| removed.contains(&d.key))
+        {
+            let label = labels
+                .iter()
+                .find(|(key, _)| *key == device.key)
+                .map_or(device.label.as_str(), |(_, label)| label.as_str());
+            lists_removed.push(Shown::of(&device.key, label)?);
+        }
+        let made = format!(
+            "a change made apart on {} (change {})",
+            lists.made_on.named(),
+            lists.number
+        );
+        let says = match (clear, lists_removed.first()) {
+            (true, _) => {
+                format!("{made} is set aside: settle it with the phrase (`cordelia settle`)")
+            }
+            (false, Some(first)) => {
+                let key = Shown::key_of(first)?;
+                let by = kept
+                    .iter()
+                    .find(|other| other.removes(&key))
+                    .map(|other| lists_of(other).map(|lists| lists.made_on.named()))
+                    .transpose()?;
+                match by {
+                    Some(by) => format!(
+                        "{made} lists {}, which a change made on {by} removed: it is set aside",
+                        first.named()
+                    ),
+                    None => format!(
+                        "{made} lists {}, which a change this device has seen removed: it is \
+                         set aside",
+                        first.named()
+                    ),
+                }
+            }
+            (false, None) => {
+                format!("{made} hands its secret to a device that was removed: it is set aside")
+            }
+        };
+        out.push(SetAsideLook {
+            lists,
+            set_aside_at: head.set_aside_at,
+            clear,
+            lists_removed,
+            says,
+        });
+    }
+    Ok(out)
 }
 
 /// A statement's two lists, each device with the words of its key.
@@ -2503,8 +2618,9 @@ mod tests {
     }
 
     /// A device that cannot go on says why: it was removed, is in no
-    /// list, or is in a fork, with the lists of the statement made
-    /// apart.
+    /// list, or is closed, with the lists of each head set aside. A device
+    /// that goes on with a head set aside names it (decision 2026-10-24
+    /// (removal), rules 10 and 11).
     #[test]
     fn test_a_device_that_cannot_go_on_says_why() {
         let mut s = Several::of_one_person(3);
@@ -2530,11 +2646,18 @@ mod tests {
         assert!(!removed.may_add);
 
         give(&mut s, 0, &apart);
+        // The change made apart lists device 2, which device 0 removed: it
+        // is set aside, and device 0 goes on.
         let fork = seen(&s, 0);
-        assert_eq!(fork.state, "fork");
-        assert_eq!(
-            fork.cannot_go_on.as_deref(),
-            Some("two changes were made apart: settle it with the phrase (`cordelia settle`)")
+        assert_eq!(fork.state, "applied");
+        assert_eq!(fork.cannot_go_on, None);
+        assert_eq!(fork.short.as_deref(), Some(SET_ASIDE_SHORT));
+        let says = &fork.set_aside[0].says;
+        assert!(
+            says.contains("(change 3) lists ")
+                && says.contains("\"device 2\", which a change made on ")
+                && says.contains("\"device 0\" removed: it is set aside"),
+            "{says}"
         );
         // Both lists: its own, and the other's.
         assert_eq!(fork.change, Some(3));
@@ -2547,6 +2670,12 @@ mod tests {
         assert!(other.removed.is_empty());
         // A device that is in no fork shows no other statement.
         assert_eq!(seen(&s, 2).apart, None);
+        // Closed, it says the words of rule 10.
+        held_rows::set_state(&s[0].conn, State::Fork).unwrap();
+        let closed = seen(&s, 0);
+        assert_eq!(closed.state, "fork");
+        assert_eq!(closed.cannot_go_on.as_deref(), Some(CLOSED_BY_HEADS_WHY));
+        assert!(closed.says.contains(&closed.set_aside[0].says));
 
         // In no list: it says on which device the change was made.
         let mut s = Several::of_one_person(3);

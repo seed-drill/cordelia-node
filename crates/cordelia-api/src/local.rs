@@ -53,8 +53,9 @@ fn refused(e: PersonError) -> ApiError {
             crate::look::WAYS_ON
         )),
         PersonError::Stopped(State::Fork) => ApiError::BadRequest(
-            "two changes were made apart, and this device has seen both: it publishes nothing \
-             until that is settled with the phrase (`cordelia settle`)."
+            "no change that lists this device is clear of a device that was removed: it \
+             publishes nothing until it is shown one, or a change is made with the phrase \
+             (`cordelia devices` says the way on)."
                 .into(),
         ),
         PersonError::Stopped(_) => ApiError::BadRequest(

@@ -2617,13 +2617,15 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
     assert!(any_of_a_channel(&relay.seen()));
 }
 
-/// Two changes made apart. The device that is answered with the other
-/// keeps both, stops, and has no leave. From then on it shows the one it
-/// had applied in short, is told of the other, which it keeps, and asks
-/// no more: it does not show whole again, and the entry is not handed to
-/// it again.
+/// Two changes made apart, each clear. The device that is answered with
+/// the other sets it aside and goes on under its own (decision 2026-10-24
+/// (removal), rules 8 and 11), and has no leave at a relay that holds the
+/// other (a later slice gives leave from a head handed twice, rule 18).
+/// From then on it shows the one it follows in short, is told of the
+/// other, which it keeps, and asks no more: it does not show whole again,
+/// and the entry is not handed to it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
+async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_no_more() {
     let relay = relay_started("relay", None);
     let (mut one, mut other) = (Device::new("desktop"), Device::new("laptop"));
     one.makes_the_phrase(&phrase());
@@ -2646,14 +2648,14 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     // The other shows its own, whole, and is answered with that one.
     let before = other.counts("relay");
     other.passes().await;
-    assert_eq!(other.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(other.stands(), Stands::Applied);
     let shows = at_relays::to_show(&other.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (by_other.id(), Some(by_one.id()))
+        (shows.entry.id(), shows.set_aside),
+        (by_other.id(), vec![by_one.id()])
     );
-    assert_eq!(other.status().cannot_go_on, Some(CannotGoOn::Fork));
-    assert_eq!(other.has_leave("relay"), Err(NoLeave::Stopped(State::Fork)));
+    assert_eq!(other.status().cannot_go_on, None);
+    assert!(other.has_leave("relay").is_err());
     let forked = other.counts("relay");
     assert_eq!(forked.whole_shows, before.whole_shows + 1);
 
@@ -2670,14 +2672,17 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
         other.passes().await;
         other.sends().await;
     }
+    // A device that goes on asks for leave at its sends too: each asking
+    // is a short show, and gets none.
     let after = other.counts("relay");
     assert_eq!(after.whole_shows, forked.whole_shows);
-    assert_eq!(after.short_shows, forked.short_shows + 4);
+    let short = after.short_shows - forked.short_shows;
+    assert!((4..=8).contains(&short), "{short}");
     assert_eq!(
         (after.proofs, after.pages, after.pushes),
         (forked.proofs, forked.pages, forked.pushes)
     );
-    assert!(after.shown_bytes - forked.shown_bytes < 4 * 256);
+    assert!(after.shown_bytes - forked.shown_bytes < short * 256);
     assert_eq!(other.at("relay").holds_latest, Some(false));
     // The relay holds the one it was shown first, and nothing that the
     // other wrote under its own.
@@ -2685,7 +2690,7 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].id(), by_one.id());
     assert!(!holds_at(&relay, &other.channel("notes"), &waiting.id()));
-    assert_eq!(other.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(other.stands(), Stands::Applied);
 }
 
 /// **A statement that no relay held, shown later** (decision 2026-10-04
@@ -2698,8 +2703,12 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
 /// which holds an earlier change entry, takes the one it is shown.** The
 /// tablet, **which is behind, is answered with it there and applies
 /// it:** it is with the lost device. The laptop, **which has applied the
-/// other statement at that number, is shown it there and is in a
-/// fork;** and so is the tablet, once it is shown the laptop's.
+/// other statement at that number, is shown it there and sets it aside:**
+/// it lists the lost device, which the laptop's removes, and the laptop's
+/// is clear (decision 2026-10-24 (removal), rule 8). The tablet, once it is
+/// shown the laptop's, knows the lost device to be removed: the change it
+/// follows is not clear, and it is closed (until the move of rule 9 is
+/// built).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
     let (near, far) = (relay_started("near", None), relay_started("far", None));
@@ -2756,24 +2765,25 @@ async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_
     assert_eq!(behind.stands(), Stands::Applied);
 
     // The laptop has applied the other statement at that number. Shown
-    // the lost one's at that relay, it is in a fork, and keeps both.
+    // the lost one's at that relay, it sets it aside, keeps both, and goes
+    // on.
     remains.connects("far", &far).await;
     remains.passes().await;
-    assert_eq!(remains.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(remains.stands(), Stands::Applied);
     let shows = at_relays::to_show(&remains.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (again.id(), Some(unheard.id()))
+        (shows.entry.id(), shows.set_aside),
+        (again.id(), vec![unheard.id()])
     );
-    // And the tablet, which applied the lost one's, is in a fork once it
-    // is shown the laptop's, at the relay that holds that one.
+    // And the tablet, which applied the lost one's, is closed once it is
+    // shown the laptop's, at the relay that holds that one.
     behind.connects("near", &near).await;
     behind.passes().await;
     assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
     let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (unheard.id(), Some(again.id()))
+        (shows.entry.id(), shows.set_aside),
+        (unheard.id(), vec![again.id()])
     );
 }
 

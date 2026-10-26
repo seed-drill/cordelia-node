@@ -972,6 +972,13 @@ impl Leave {
                     },
                     |(accepted, changed)| match accepted {
                         Ok(Some(Accepted::Moved(_))) => Came::Left,
+                        // A head set aside, a close, or a refusal that
+                        // kept a removed key, commits at once: a closed
+                        // device seals nothing from that commit (decision
+                        // 2026-10-24 (removal), rules 5 and 10).
+                        Ok(Some(Accepted::SetAside | Accepted::Closed | Accepted::Refused(_))) => {
+                            Came::Nothing
+                        }
                         _ if *changed => Came::Changed,
                         _ => Came::Nothing,
                     },
