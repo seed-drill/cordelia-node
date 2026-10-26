@@ -1241,6 +1241,7 @@ impl<'a> Brought<'a> {
             held,
             &self.entry,
             &self.hand_over.statement,
+            self.hand_over.addition.is_some(),
             &mut apply,
             now,
         )?;
@@ -1661,6 +1662,25 @@ mod tests {
         assert_eq!(hand_over.statement.statement.number, 2);
         assert_eq!(hand_over.change_entry, change.clone().into_entry());
         assert!(hand_over.is_for(&listed.key()));
+    }
+
+    /// A device dropped from a list and added again by a record, before it
+    /// was shown the change that dropped it, accepts: the record counts it,
+    /// and rule 8 step 4 applies a change that counts this device
+    /// (decision 2026-10-24 (removal)).
+    #[test]
+    fn test_a_device_added_again_by_a_record_before_it_heard_accepts() {
+        let mut s = Several::of_one_person(3);
+        let dropped = s.change(0, &[0, 1], &[]);
+        let added = s.hand(0, 2);
+        assert_eq!(added.seen, Some(AdditionSeen::Counted));
+        match s.accept(2, 0, &added.hand_over) {
+            Accepted::Applied(applied) => assert_eq!(applied.number, 2),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s[2].state(), State::Applied);
+        assert_eq!(s[2].latest(), dropped);
+        assert!(s[2].counts(&s.key(2)));
     }
 
     /// A device that was itself added since the statement hands over the

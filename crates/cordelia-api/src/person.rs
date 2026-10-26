@@ -1262,7 +1262,9 @@ pub fn shown(
                 Ok(Shown::NotOpened)
             }
         };
-        decide(conn, identity, &held, entry, statement, &mut apply, now)
+        decide(
+            conn, identity, &held, entry, statement, false, &mut apply, now,
+        )
     })
 }
 
@@ -1280,7 +1282,10 @@ fn keeps_set_aside(conn: &Connection, entry: &CheckedEntry) -> Result<bool, Pers
 /// first start on this version (rule 12). `held` is what the device holds,
 /// in state applied or closed; `entry` is the change's entry, checked and
 /// opened to `statement`; `apply` applies it, where step 4 says to, and is
-/// asked nothing else. In this order:
+/// asked nothing else. `by_a_record` is whether the caller brings a record
+/// of this device's addition with the change, which `apply` checks counts
+/// (at `cordelia accept`): a statement that does not list the device then
+/// counts it all the same. In this order:
 ///
 /// 1. A change that is the one followed, a head kept, or behind one of
 ///    them: nothing is done but keeping the keys it removes, as today.
@@ -1292,9 +1297,11 @@ fn keeps_set_aside(conn: &Connection, entry: &CheckedEntry) -> Result<bool, Pers
 /// 3. A change that lists this device's key as removed stops it, as
 ///    removed, whether it was made after the change followed or apart.
 /// 4. A change made after the one followed, that counts this device and
-///    is clear, is applied ([`decide`]'s `apply`).
+///    is clear, is applied ([`decide`]'s `apply`): it lists the device, or
+///    comes with a record of its addition.
 /// 5. A change made after the one followed that neither counts this
-///    device nor removes it stops it, as in no list, clear or not.
+///    device nor removes it stops it, as in no list, clear or not. One
+///    that counts it by a record and is not clear goes on to step 6.
 /// 6. Anything else is kept as a head set aside: a ninth closes the
 ///    device, and is not kept. Where the change followed is still clear,
 ///    the device goes on (rule 11).
@@ -1302,12 +1309,14 @@ fn keeps_set_aside(conn: &Connection, entry: &CheckedEntry) -> Result<bool, Pers
 ///    change that counts it (rule 9). The move is a later slice of the
 ///    build: until it is built the device closes here. It fails closed.
 /// 8. Where there is none, the device is closed (rule 10).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide(
     conn: &Connection,
     identity: &NodeIdentity,
     held: &Held,
     entry: &CheckedEntry,
     statement: &SignedStatement,
+    by_a_record: bool,
     apply: &mut dyn FnMut(&Held) -> Result<Shown, PersonError>,
     now: i64,
 ) -> Result<Shown, PersonError> {
@@ -1365,8 +1374,14 @@ pub(crate) fn decide(
         return Ok(Shown::Removed);
     }
     // Steps 4 and 5: a change made after the one followed.
+    let counts = match judgement {
+        Judgement::Applies => true,
+        Judgement::NotListed => by_a_record,
+        _ => false,
+    };
     match judgement {
-        Judgement::Applies if is_clear(conn, shown, false)? => return apply(held),
+        _ if counts && is_clear(conn, shown, false)? => return apply(held),
+        Judgement::NotListed if by_a_record => {}
         Judgement::NotListed | Judgement::Removed => {
             stop(conn, State::NotListed, entry)?;
             return Ok(Shown::NotListed);
@@ -1516,6 +1531,7 @@ pub fn judge_kept(
                 &held,
                 &head.entry,
                 &head.statement,
+                false,
                 &mut apply,
                 now,
             )?;
@@ -8462,6 +8478,51 @@ mod tests {
         assert_eq!(judge_kept(&conn, &device(0), NOW).unwrap(), None);
         assert_eq!(state(&conn), State::Applied);
         assert!(!held_rows::to_judge_kept(&conn).unwrap());
+    }
+
+    /// Rule 8, steps 4 and 5, where the caller brings a record of this
+    /// device's addition: a change made after the one followed that does
+    /// not list the device counts it so. Clear, it is applied; not clear,
+    /// it is no change in no list, and goes on to step 6. Without the
+    /// record the same change stops the device, as in no list.
+    #[test]
+    fn test_a_change_that_counts_this_device_by_a_record_is_not_in_no_list() {
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let drops_zero = two.next(key(1), &secret(17), listed(&[1, 2]), &[]).unwrap();
+        let entry = change(&phrase, &drops_zero, secret(17));
+        let signed = sign(&drops_zero, &phrase);
+        let decided = |conn: &Connection, by_a_record: bool| {
+            let held = held(conn).unwrap().unwrap();
+            let mut apply = |_: &Held| Ok(Shown::Held);
+            in_one(conn, || {
+                decide(
+                    conn,
+                    &device(0),
+                    &held,
+                    &entry,
+                    &signed,
+                    by_a_record,
+                    &mut apply,
+                    NOW,
+                )
+            })
+            .unwrap()
+        };
+
+        // Clear: it is applied, by `apply`.
+        let conn = device_at(0, 2);
+        assert_eq!(decided(&conn, true), Shown::Held);
+        assert_eq!(state(&conn), State::Applied);
+        // Not clear: device 2, which both list, is known to be removed.
+        let conn = device_at(0, 2);
+        held_rows::keep_removed(&conn, &[key(2)], NOW).unwrap();
+        assert_eq!(decided(&conn, true), Shown::Closed);
+        assert_eq!(state(&conn), State::Fork);
+        // The control: with no record it is in no list.
+        let conn = device_at(0, 2);
+        assert_eq!(decided(&conn, false), Shown::NotListed);
+        assert_eq!(state(&conn), State::NotListed);
     }
 
     /// The hold of the node's lock on the hot paths that ask whether the
