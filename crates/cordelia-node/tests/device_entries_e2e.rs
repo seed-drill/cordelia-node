@@ -11269,6 +11269,67 @@ async fn shared_traffic_never_refuses_a_devices_own_requests() {
     );
 }
 
+/// **Shared channels push in turn** (decision 2026-10-10 §8.4): a channel
+/// that the relay refuses for room, pushed again at every pass, does not
+/// come first in each and take the quarter from the others. Sixteen anew
+/// records are pushed, and the first channel's is refused; it alone is
+/// pushed at the next pass; then each other channel writes its record
+/// again, and the pass after begins with the channel after the first, so
+/// that the five the quarter still has room for are the second to the
+/// sixth, and the first waits its turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_channel_refused_for_room_waits_its_turn_to_push() {
+    use cordelia_core::protocol::{
+        SHARED_ANEW_CONTENT_BYTES, SHARED_MAX_CHANNELS, SHARED_PUSH_BYTES_PER_MINUTE,
+    };
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let filed: Vec<([u8; 32], [u8; 32])> = (0..SHARED_MAX_CHANNELS)
+        .map(|n| device.files_shared(&format!("s{n}"), &[relay.key]))
+        .collect();
+    let channels: Vec<[u8; 32]> = filed.iter().map(|(id, _)| *id).collect();
+    for (_, secret) in &filed {
+        device.writes_anew(secret, 1);
+    }
+    let first = channels[0];
+    relay.pushes(move |entry| match entry.channel == first {
+        true => PushAnswer::Refused(EntryRefused::NoRoom),
+        false => PushAnswer::Stored,
+    });
+    let pushes = |requests: &[WireMessage]| -> Vec<usize> {
+        requests
+            .iter()
+            .filter_map(|one| match one {
+                WireMessage::EntryPush(push) => {
+                    let entry = Entry::from_wire(push.entries.first()?).ok()?;
+                    channels.iter().position(|channel| *channel == entry.channel)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let anew = entry_cost(SHARED_ANEW_CONTENT_BYTES);
+    // Twenty-two anew records fit in the quarter: sixteen, one, and five.
+    assert_eq!(SHARED_PUSH_BYTES_PER_MINUTE / anew, 22);
+
+    device.passes().await;
+    let all: Vec<usize> = (0..SHARED_MAX_CHANNELS).collect();
+    assert_eq!(pushes(&relay.requests()), all);
+    device.sends().await;
+    assert_eq!(pushes(&relay.requests()), [0]);
+    for (_, secret) in &filed[1..] {
+        device.writes_anew(secret, 2);
+    }
+    device.sends().await;
+    assert_eq!(pushes(&relay.requests()), [1, 2, 3, 4, 5]);
+    assert_eq!(device.shared_counts("relay").pushed, 22);
+}
+
 /// **The door of a share pair channel** (decision 2026-10-10 §2.3, §8.4):
 /// Alice's laptop pushes a share it wrote in its share pair channel with
 /// Bob's desktop, at a relay of their own, and pushes nothing else there;

@@ -427,6 +427,9 @@ struct OfRelay {
     /// The shared channel at which the next pass begins its pages here:
     /// where the last one stopped (§8.4, channels in turn).
     shared_next: Option<[u8; 32]>,
+    /// The shared channel at which the next pass begins its pushes here:
+    /// the one after the channel that last pushed (§8.4, channels in turn).
+    shared_push_next: Option<[u8; 32]>,
     shared: SharedCounts,
 }
 
@@ -3314,14 +3317,7 @@ impl DeviceEntries {
             .relays
             .get(link.name())
             .and_then(|of| of.shared_next);
-        let start = next
-            .and_then(|next| channels.iter().position(|channel| *channel == next))
-            .unwrap_or(0);
-        channels[start..]
-            .iter()
-            .chain(&channels[..start])
-            .copied()
-            .collect()
+        in_turn(channels, next)
     }
 
     /// The next pass at `link` begins its pages with `channel`: where this
@@ -3338,9 +3334,16 @@ impl DeviceEntries {
     /// §8.4): each push within what the device pushes to the relay
     /// (`room_to_push`, which counts it) and within the shared pass's
     /// quarter of it. A push refused for room, or past either, waits for a
-    /// later pass.
+    /// later pass. **The channels push in turn:** a pass begins with the
+    /// channel after the one that last pushed there, so that one channel
+    /// that a relay refuses for room, pushed again at every pass, does not
+    /// come first in each and take the quarter from the others.
     async fn shared_pushes(&self, link: &Link, channels: &[[u8; 32]]) {
-        for channel in channels {
+        let next = lock(&self.kept)
+            .relays
+            .get(link.name())
+            .and_then(|of| of.shared_push_next);
+        for channel in &in_turn(channels, next) {
             loop {
                 let Some(whole) = self.room_to_push(link) else {
                     return;
@@ -3370,6 +3373,8 @@ impl DeviceEntries {
                     Ok(SharedDone::Pushed { sent, refused, .. }) => {
                         let mut kept = lock(&self.kept);
                         let of = kept.relays.entry(link.name().to_string()).or_default();
+                        let at = channels.iter().position(|one| one == channel);
+                        of.shared_push_next = at.map(|at| channels[(at + 1) % channels.len()]);
                         of.shared.pushes += 1;
                         of.shared.pushed += sent as u64;
                         of.shared.refused += refused as u64;
@@ -3653,6 +3658,19 @@ fn still_of_use(part: &Part, set_up: Option<&[[u8; 32]]>, own: &[[u8; 32]]) -> b
 /// a row, and a show after the `refusals`-th in a row that got no leave:
 /// the time between two sends, doubled each time, up to
 /// OUTBOX_REFUSED_RETRY_MAX_SECS.
+/// `channels` from `next`, and round: all of them from the first where
+/// `next` is none of them.
+fn in_turn(channels: &[[u8; 32]], next: Option<[u8; 32]>) -> Vec<[u8; 32]> {
+    let start = next
+        .and_then(|next| channels.iter().position(|channel| *channel == next))
+        .unwrap_or(0);
+    channels[start..]
+        .iter()
+        .chain(&channels[..start])
+        .copied()
+        .collect()
+}
+
 fn refused_wait(refusals: u32) -> Duration {
     let secs = OUTBOX_FLUSH_INTERVAL_SECS
         .saturating_mul(1u64 << refusals.min(16))
