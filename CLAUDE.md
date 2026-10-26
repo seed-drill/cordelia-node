@@ -46,11 +46,11 @@ cordelia-node/
                          #   message (the value of a message, its ID and the ring);
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds). A shared channel
-                         #   (decision 2026-10-10, not yet used): share (the card and
+                         #   (decision 2026-10-10): share (the card and
                          #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 23). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 24). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -65,7 +65,10 @@ cordelia-node/
                          #   with its room, and the index of shared messages);
                          #   shared_pass (step 23: the places at each relay of a
                          #   shared channel, what each relay answered of a push,
-                         #   and the take-outs begun and not ended); db
+                         #   and the take-outs begun and not ended); shared_sharing
+                         #   (step 24: the keys typed for a channel and what became of
+                         #   each, the shares this device wrote and what each relay
+                         #   answered of them); db
                          #   (secure_delete, set
                          #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
@@ -78,7 +81,11 @@ cordelia-node/
                          #   take (the one door for an entry), lists (the person's lists
                          #   of shared channels, decision 2026-10-10 §3.4), shared (the
                          #   door's branch for a shared channel and its reader: the room,
-                         #   the keys shown, taking out in steps, reading again),
+                         #   the keys shown, taking out in steps, reading again; the
+                         #   judge of a share), sharing and sharing_routes (`shared
+                         #   new`, `share`, `accept --channel`, `label`, `shared
+                         #   rename`, `drop` and `list`, the empty anew record, and
+                         #   their routes under /api/v1/shared/),
                          #   shared_pass (what the shared pass reads and writes
                          #   under the lock: where a channel lives, its door's
                          #   checks, pages, places and what waits), at_relays (and
@@ -118,7 +125,8 @@ cordelia-node/
                          #   commands and their prompts), carry_cmd (`sync carry`),
                          #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
                          #   log`: the folder, the frame, the cleaning, the lines and
-                         #   log's question),
+                         #   log's question), shared_cmd (the commands that make,
+                         #   share and take a shared channel, and `id --words`),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
                          #   device_entries (a device's passes, the pass of shared
@@ -160,7 +168,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -325,7 +333,7 @@ The constants of what a relay holds across its connections (decision
 | `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
 | `SMALL_WINDOWS_PULL_ENTRIES` | 1 (derived: the entries of the largest size on the wire that a small page holds; what a relay asks a listed relay for in a page where its own end of their connection has every peer's windows, as behind a NAT) | parameter-rationale.md §13 |
 The constants of a shared channel, for messages between people (decision
-2026-10-10, proposed and not yet used by the node), each with its reason in
+2026-10-10, made, shared and taken by the node from its slice 6 on), each with its reason in
 parameter-rationale.md §12.13:
 
 | Parameter | Value | Spec Section |
