@@ -471,6 +471,9 @@ pub struct DeviceEntries {
     /// Whether the start was noted in what is known of the relays
     /// ([`known::started`]): once a node runs, at its first pass.
     started: AtomicBool,
+    /// What the passes found last of what decides whether the lists of a
+    /// person's reads and of bounds are due (issue #221).
+    lists_seen: Mutex<marks::ListsSeen>,
 }
 
 impl DeviceEntries {
@@ -509,6 +512,7 @@ impl DeviceEntries {
             reach,
             set_up: Mutex::default(),
             started: AtomicBool::new(false),
+            lists_seen: Mutex::default(),
         })
     }
 
@@ -1483,11 +1487,20 @@ impl DeviceEntries {
     /// [`cordelia_api::marks::write_person_list`]): only once the messages
     /// channel was fetched since the node started. Says whether it wrote
     /// one.
+    ///
+    /// What decides it is read without opening or checking anything, and
+    /// where it is what it was at a pass that changed nothing, nothing more
+    /// is done ([`marks::ListsSeen`], issue #221).
     fn write_person_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        match marks::write_person_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+        match marks::write_person_list_where_changed(&db, identity, self.unix(), fetched, &mut seen)
+        {
             Ok(written) => written.is_some(),
             Err(e) => {
                 tracing::debug!(error = %e, "could not write the list of what a person read here");
@@ -1502,15 +1515,23 @@ impl DeviceEntries {
     /// list 7 days and 10 minutes after it was set, or that another
     /// device's later bound overrode, goes. Only once the messages channel
     /// was fetched since the node started. Says whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
     fn write_bounds_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        let written = cordelia_api::bounds::write_bounds_list(
+        let written = cordelia_api::bounds::write_bounds_list_where_changed(
             &db,
             identity,
             self.unix(),
-            fetched.unwrap_or(false),
+            fetched,
+            &mut seen,
         );
         match written {
             Ok(written) => written.is_some(),
