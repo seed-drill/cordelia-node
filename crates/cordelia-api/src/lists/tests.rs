@@ -1157,6 +1157,46 @@ fn an_undo_of_nothing_never_pushes_out_what_is_in_force() {
     );
 }
 
+/// The filing of `shared move` is refused `held_at_bound` only where the
+/// channel moved to is itself held at the time bound with the highest
+/// count by a device that counts, never for another channel's filing so
+/// held; it is dated above every other filing that can be gone above
+/// (decision 2026-10-10 §3.4, §5.5; the review of slice 3 again, low 4).
+#[test]
+fn a_move_is_held_at_the_bound_only_by_its_own_channel() {
+    let (person, thief) = (device(1), device(2));
+    let makers = makers(&[&person, &thief], &[]);
+    let max = SHARED_ACT_TIME_MAX;
+    let x = filing(1, "x").by(&person, 10, 0);
+    let y = filing(2, "y").by(&thief, max, max);
+    let other = filing(3, "other").by(&person, 8_000, 0);
+    let of = lists(&[(&person, vec![x, other]), (&thief, vec![y])]);
+    let computed = work(&of, &makers, Bounds::OF_A_LIST);
+    let moved = Do::Move {
+        from: channel(1),
+        to: Filing {
+            came: Came::Moved(channel(1)),
+            ..filing(4, "x")
+        },
+    };
+    let made = decide(&computed, &makers, &person, &moved, 9_000).unwrap();
+    assert_eq!((made[0].time(), made[0].count()), (9_001, 0));
+    // Above the other filings that can be gone above, whatever the clock.
+    let made = decide(&computed, &makers, &person, &moved, 5).unwrap();
+    assert_eq!((made[0].time(), made[0].count()), (8_001, 0));
+    // The channel moved to, held at the bound: refused, naming its holder.
+    let held = dropped(4).by(&thief, max, max);
+    let of = lists(&[
+        (&person, vec![filing(1, "x").by(&person, 10, 0)]),
+        (&thief, vec![held]),
+    ]);
+    let computed = work(&of, &makers, Bounds::OF_A_LIST);
+    assert_eq!(
+        decide(&computed, &makers, &person, &moved, 9_000),
+        Err(Refused::HeldAtBound(thief.public_key()))
+    );
+}
+
 /// An undo over an undo is an undo of nothing below it, whatever older
 /// act of a kind in force is carried under both: it ranks in the second
 /// group past a bound, below an older item in force (decision 2026-10-10

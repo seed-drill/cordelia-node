@@ -711,18 +711,26 @@ impl Computed {
 
     /// The time and the count of the filing that `shared anew` or `shared
     /// move` makes on `key`: above the valid acts on it and above every
-    /// valid filing, so that it is the newest in the filings part.
+    /// valid filing that can be gone above, so that it is the newest in
+    /// the filings part but for a filing of another channel that a device
+    /// that counts holds at the time bound with the highest count. Only an
+    /// act on `key` itself held so refuses it (`held_at_bound`, §3.4).
     fn dated_first_of_the_filings(
         &self,
         key: &Key,
         makers: &Makers,
         now: i64,
     ) -> Result<(u64, u64), HeldAtBound> {
+        let held = |act: &AnyAct| {
+            act.time() == SHARED_ACT_TIME_MAX
+                && act.count() >= SHARED_ACT_TIME_MAX
+                && makers.counts(&act.maker())
+        };
         let filings = self
             .valid
             .iter()
             .flat_map(|(item, acts)| acts.iter().map(move |act| (item, act)))
-            .filter(|(item, act)| matches!(act, AnyAct::Filing(_)) || *item == key)
+            .filter(|(item, act)| *item == key || (matches!(act, AnyAct::Filing(_)) && !held(act)))
             .map(|(_, act)| act);
         Self::dated_above(filings, makers, now)
     }
