@@ -318,18 +318,24 @@ pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, 
         secret: Some(messages),
     };
     // Whatever else this device wrote in is a pair channel: its store
-    // holds nothing of its own but in its own channels, and where it
-    // handed a device what it needs. The messages channel is never one,
-    // with sync off as with it on.
-    let mut pairs: Vec<Own> = kept_rows::channels_written_by(conn, &identity.public_key())?
-        .into_iter()
-        .filter(|id| *id != messages.id && !own.iter().any(|channel| channel.id == *id))
-        .map(|id| Own {
+    // holds nothing of its own but in its own channels, where it handed a
+    // device what it needs, and in the shared channels, which have a pass
+    // of their own (decision 2026-10-10 §8.4). The messages channel is
+    // never one, with sync off as with it on, and nor is a shared channel.
+    let mut pairs: Vec<Own> = Vec::new();
+    for id in kept_rows::channels_written_by(conn, &identity.public_key())? {
+        if id == messages.id
+            || own.iter().any(|channel| channel.id == id)
+            || cordelia_storage::shared::channel(conn, &id)?.is_some()
+        {
+            continue;
+        }
+        pairs.push(Own {
             kind: Kind::Pair,
             id,
             secret: None,
-        })
-        .collect();
+        });
+    }
     if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_some() {
         own.push(messages);
     }

@@ -50,7 +50,7 @@ cordelia-node/
                          #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 22). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 23). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -62,7 +62,10 @@ cordelia-node/
                          #   caller's write); shared_lists (step 21: what a device keeps
                          #   beside its list of shared channels); shared (step 22: the
                          #   shared channels a device holds, the table of keys of each
-                         #   with its room, and the index of shared messages); db
+                         #   with its room, and the index of shared messages);
+                         #   shared_pass (step 23: the places at each relay of a
+                         #   shared channel, what each relay answered of a push,
+                         #   and the take-outs begun and not ended); db
                          #   (secure_delete, set
                          #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
@@ -75,7 +78,10 @@ cordelia-node/
                          #   take (the one door for an entry), lists (the person's lists
                          #   of shared channels, decision 2026-10-10 §3.4), shared (the
                          #   door's branch for a shared channel and its reader: the room,
-                         #   the keys shown, taking out, reading again), at_relays (and
+                         #   the keys shown, taking out in steps, reading again),
+                         #   shared_pass (what the shared pass reads and writes
+                         #   under the lock: where a channel lives, its door's
+                         #   checks, pages, places and what waits), at_relays (and
                          #   known: what a device knows of which relay holds which change),
                          #   local (the local
                          #   API for the names a device holds), commands (the routes behind
@@ -115,7 +121,9 @@ cordelia-node/
                          #   log's question),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, and leave; reach: whether
+                         #   device_entries (a device's passes, the pass of shared
+                         #   channels, and leave with the doors of shared channels;
+                         #   reach: whether
                          #   each relay can be reached, and its class), indicator (the
                          #   state and the level of a status)
     cordelia-test/       # Test harness: TestNode, TestMesh

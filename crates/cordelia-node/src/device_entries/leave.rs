@@ -95,9 +95,34 @@
 //!   version for a carry (`cordelia_api::carry::bring`), and by nothing
 //!   else.
 //!
+//! **And two doors are for the channels shared between people** (decision
+//! 2026-10-10 §8.4), whose streams are opened without a show and without
+//! leave, on a device that stands applied with sync on:
+//!
+//! - [`Leave::shared`] is given a channel's ID and which of three requests
+//!   (a proof, a pull with a `limit`, a push of what waits), and builds the
+//!   request itself, from the table of shared channels read under the
+//!   database's lock: it refuses a channel that is not held there or does
+//!   not live at the connection's relay. What comes back to a pull is given
+//!   to the one door ([`cordelia_api::take::take`]); a push's answers are
+//!   kept with what waits at each relay.
+//! - [`Leave::share_pair`] is given a key typed for a channel and nothing
+//!   else, as [`Leave::pair`] is given a key typed to join devices: it
+//!   derives the share pair channel itself, proves it and reads its pages
+//!   from the start, and gives each entry by the typed key to whoever
+//!   judges a share. [`Leave::share_pair_push`] pushes a share entry that
+//!   this device wrote in its share pair channel with the key it is for.
+//!
+//! **Each counts against a counter of its own** (`SHARED_REQUESTS_PER_MINUTE`
+//! for each relay over a minute), never against what the device asks for its
+//! own channels: past it the request is not sent, and that is not counted as
+//! held back by the device's pace. A request that a relay refuses for now is
+//! counted for the relay as every door counts one.
+//!
 //! A connection is a [`Link`], which keeps the connection to itself:
 //! outside this file there is no way to open a stream on one but
-//! [`Leave::show`], [`Leave::open`], [`Leave::pair`] and [`Leave::left`].
+//! [`Leave::show`], [`Leave::open`], [`Leave::pair`], [`Leave::left`],
+//! [`Leave::shared`], [`Leave::share_pair`] and [`Leave::share_pair_push`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,20 +131,22 @@ use std::time::{Duration, Instant};
 
 use cordelia_api::adding::{self, Accepted};
 use cordelia_api::at_relays::{self, Stands};
+use cordelia_api::at_relays::{Most, Pushed};
+use cordelia_api::shared_pass::{self, NotUsable};
 use cordelia_api::state::{AppState, Came};
 use cordelia_core::NodeId;
 use cordelia_core::load::DeviceCounts;
 use cordelia_core::lock::{LockWhole, TimedLock};
 use cordelia_core::protocol::{
-    BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, FRAME_LENGTH_BYTES,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
-    WAKE_WAIT_SECS,
+    BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
+    ERR_RATE_LIMIT, FRAME_LENGTH_BYTES, OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES,
+    SESSION_VALUE_BYTES, SHARED_REQUESTS_PER_MINUTE, SHOW_LEAVE_SECS, WAKE_WAIT_SECS, entry_cost,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
-    ChannelProve, EntryPull, EntryRefused, EntryShow, EntryShowShort, Protocol, ShowAnswer,
-    WireMessage,
+    ChannelProve, EntryPull, EntryPush, EntryRefused, EntryShow, EntryShowShort, Protocol,
+    PushAnswer, ShowAnswer, WireMessage,
 };
 use cordelia_network::rate_limit::RateCounter;
 use cordelia_network::{codec, transport};
@@ -381,6 +408,77 @@ pub enum PairRead {
     Read(Vec<Accepted>),
 }
 
+/// Which request the door of a shared channel's streams builds
+/// ([`Leave::shared`], decision 2026-10-10 §8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedAsk {
+    /// A proof of the channel's key.
+    Prove,
+    /// A pull of one page from the place the device keeps, of at most
+    /// `limit` entries.
+    Pull { limit: u32 },
+    /// A push of what waits for the relay, within `most`.
+    Push { most: Most },
+}
+
+/// What became of a request of a shared channel ([`Leave::shared`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedDone {
+    /// The proof was answered: whether the relay holds the channel.
+    Proved(bool),
+    /// A page was taken: how many entries it held, what the relay handed as
+    /// it counts it, whether the pull got somewhere by it, and whether it
+    /// held nothing.
+    Page {
+        entries: usize,
+        handed: u64,
+        got_somewhere: bool,
+        end: bool,
+    },
+    /// A push was answered: how many entries were sent, how many the relay
+    /// refused for room or for the address's allowance, and what they are
+    /// counted at.
+    Pushed {
+        sent: usize,
+        refused: usize,
+        cost: u64,
+    },
+    /// Nothing waits for the relay within what may be pushed: nothing was
+    /// asked.
+    NothingWaits,
+}
+
+/// Why nothing was asked through a door of a shared channel, or what came
+/// back was not taken (decision 2026-10-10 §8.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedRefused {
+    /// The door refuses the channel here: not held, not at this relay, the
+    /// device does not stand applied, or sync is off. Nothing was asked,
+    /// or nothing taken.
+    NotUsable(NotUsable),
+    /// The shared pass has asked as much of this relay as it asks in a
+    /// minute: nothing was sent.
+    AskedEnough,
+    /// The relay refused the request for now, and that was counted for it.
+    NotNow,
+    /// The relay did not answer, or not as it answers such a request; or
+    /// the device could not read its own store.
+    NotAnswered(String),
+}
+
+/// What a relay handed of the share pair channel of a key typed for a
+/// channel ([`Leave::share_pair`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharePairRead<A> {
+    /// The key reads nothing now: nothing was asked of the relay.
+    NotNow,
+    /// The relay does not hold the channel, as it answered the proof.
+    NotHeld,
+    /// What the judge made of each entry that the relay handed and that the
+    /// typed key signed, in the relay's order.
+    Read(Vec<A>),
+}
+
 /// What a relay handed of a channel of a generation that the device has
 /// left, or never followed ([`Leave::left`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +580,10 @@ struct Inner {
     /// The requests that each relay refused for now, by its node key,
     /// each by when ([`Leave::refused_for_now`]).
     refused_for_now: HashMap<[u8; 32], VecDeque<Instant>>,
+    /// What the shared pass asked of each relay in the last minute, by the
+    /// relay's name: its own counter, apart from `asked` (decision
+    /// 2026-10-10 §8.4).
+    shared_asked: HashMap<String, RateCounter>,
 }
 
 impl Inner {
@@ -493,6 +595,19 @@ impl Inner {
             .entry(relay.to_string())
             .or_insert_with(|| {
                 RateCounter::new(Duration::from_secs(60), OWN_ENTRY_REQUESTS_PER_MINUTE)
+            })
+            .check_and_record()
+    }
+
+    /// Whether one request more of a shared channel or a share pair
+    /// channel may be asked of the relay called `relay` in this minute
+    /// (decision 2026-10-10 §8.4): its own counter, at
+    /// SHARED_REQUESTS_PER_MINUTE. Where it may, it is counted.
+    fn may_ask_shared(&mut self, relay: &str) -> bool {
+        self.shared_asked
+            .entry(relay.to_string())
+            .or_insert_with(|| {
+                RateCounter::new(Duration::from_secs(60), SHARED_REQUESTS_PER_MINUTE)
             })
             .check_and_record()
     }
@@ -599,6 +714,9 @@ impl Leave {
         // What was asked of a relay is kept across a reconnect, for as
         // long as the device is set up with the relay.
         inner.asked.retain(|relay, _| set_up_with.contains(relay));
+        inner
+            .shared_asked
+            .retain(|relay, _| set_up_with.contains(relay));
         // The lid was closed, and is open: the connections still look
         // open, and a leave still looks young, by a clock that stood
         // still. Every relay is asked first, as when the node starts.
@@ -1107,6 +1225,379 @@ impl Leave {
         })
     }
 
+    /// The door of a shared channel's streams (decision 2026-10-10 §8.4):
+    /// on `link`, ask of the shared channel `channel` what `ask` says, and
+    /// take what comes back. No show is made and no leave asked.
+    ///
+    /// It does that and nothing else (see the module's documentation):
+    ///
+    /// - Under the database's lock, it reads the channel from the table of
+    ///   shared channels, and refuses one that is not held there, or whose
+    ///   card does not name the connection's relay by its key; and it
+    ///   refuses where the device does not stand applied under the latest
+    ///   statement it has seen, or sync is off. It builds the request
+    ///   itself: the proof, from the channel's secret; the pull, from the
+    ///   place it keeps there, with `limit`; the push, of what waits there
+    ///   within `most`.
+    /// - It counts the request against the shared pass's own counter, and
+    ///   never against what the device asks for its own channels. Past it,
+    ///   nothing is sent ([`SharedRefused::AskedEnough`]).
+    /// - What comes back is checked with no database held, and then taken
+    ///   under the lock, where the channel is asked for again: a page's
+    ///   entries through the one door, and the place past them; a push's
+    ///   answers with what waits at that relay.
+    ///
+    /// `counted` is given what the request costs of a byte share: what the
+    /// relay handed in a page, as it counts it, before the page is taken;
+    /// what the entries pushed are counted at, before they are sent.
+    pub async fn shared(
+        &self,
+        state: &AppState,
+        link: &Link,
+        channel: &[u8; 32],
+        ask: SharedAsk,
+        counted: impl FnOnce(u64),
+    ) -> Result<SharedDone, SharedRefused> {
+        let relay = link.relay().0;
+        let identity = &state.identity;
+        let own = identity.public_key();
+        let store =
+            |e: cordelia_api::person::PersonError| SharedRefused::NotAnswered(e.to_string());
+        let (usable, request, batch, asked_from) = {
+            let conn = lock(&state.db);
+            let usable = shared_pass::usable(&conn, channel, &relay)
+                .map_err(store)?
+                .map_err(SharedRefused::NotUsable)?;
+            match ask {
+                SharedAsk::Prove => {
+                    let proof = link
+                        .session()
+                        .and_then(|session| usable.proof(&session, &own))
+                        .ok_or_else(|| SharedRefused::NotAnswered("no proof".into()))?;
+                    let request = WireMessage::ChannelProve(ChannelProve {
+                        channel: *channel,
+                        proof,
+                    });
+                    (usable, request, Vec::new(), (NO_MARK, 0))
+                }
+                SharedAsk::Pull { limit } => {
+                    let place = shared_pass::place(&conn, &usable, &relay).map_err(store)?;
+                    let request = WireMessage::EntryPull(EntryPull {
+                        channel: *channel,
+                        mark: place.0,
+                        after: place.1,
+                        limit: limit.clamp(1, ENTRY_PAGE_MAX_ENTRIES),
+                    });
+                    (usable, request, Vec::new(), place)
+                }
+                SharedAsk::Push { most } => {
+                    let batch = shared_pass::to_send(&conn, identity, &usable, &relay, most)
+                        .map_err(store)?;
+                    if batch.is_empty() {
+                        return Ok(SharedDone::NothingWaits);
+                    }
+                    let request = WireMessage::EntryPush(EntryPush {
+                        entries: batch.iter().map(|entry| entry.to_wire().into()).collect(),
+                    });
+                    (usable, request, batch, (NO_MARK, 0))
+                }
+            }
+        };
+        let protocol = match &request {
+            WireMessage::ChannelProve(_) => Protocol::ChannelProve,
+            WireMessage::EntryPull(_) => Protocol::EntryPull,
+            _ => Protocol::EntryPush,
+        };
+        // The shared pass's own counter: what it does not ask is not held
+        // back by the device's pace, and is not counted as such.
+        if !lock(&self.inner).may_ask_shared(link.name()) {
+            return Err(SharedRefused::AskedEnough);
+        }
+        let cost: u64 = batch
+            .iter()
+            .map(|entry| entry_cost(entry.content.len()))
+            .sum();
+        let mut counted = Some(counted);
+        if !batch.is_empty()
+            && let Some(counted) = counted.take()
+        {
+            counted(cost);
+        }
+        let answer = self.asks_shared(link, protocol, &request).await?;
+        match (ask, answer) {
+            (SharedAsk::Prove, WireMessage::ChannelProved(proved)) => {
+                if !proved.proved {
+                    let conn = lock(&state.db);
+                    shared_pass::not_held_at(&conn, &usable, &relay).map_err(store)?;
+                }
+                Ok(SharedDone::Proved(proved.proved))
+            }
+            (SharedAsk::Pull { .. }, WireMessage::EntryPulled(page)) => {
+                if page.entries.len() > ENTRY_PAGE_MAX_ENTRIES as usize {
+                    return Err(SharedRefused::NotAnswered(
+                        "a page holds more than a page may".into(),
+                    ));
+                }
+                // What the relay handed counts against the share, whatever
+                // is then done with it.
+                let handed: u64 = page
+                    .entries
+                    .iter()
+                    .map(|bytes| entry_cost(bytes.len().saturating_sub(ENTRY_WIRE_OVERHEAD_BYTES)))
+                    .sum();
+                if let Some(counted) = counted.take() {
+                    counted(handed);
+                }
+                let entries: Option<Vec<CheckedEntry>> = page
+                    .entries
+                    .iter()
+                    .map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+                    .collect();
+                let Some(entries) = entries else {
+                    return Err(SharedRefused::NotAnswered(
+                        "a page holds an entry that does not check".into(),
+                    ));
+                };
+                let now = self.clock.unix_from(state.sync_control.now());
+                let conn = lock(&state.db);
+                // Asked again: the channel may have been dropped, or the
+                // device may stand elsewhere, while the page was asked for.
+                let usable = shared_pass::usable(&conn, channel, &relay)
+                    .map_err(store)?
+                    .map_err(SharedRefused::NotUsable)?;
+                let taken = shared_pass::take_page(
+                    &conn,
+                    identity,
+                    &usable,
+                    &relay,
+                    asked_from,
+                    (&entries, page.mark, page.next),
+                    now,
+                )
+                .map_err(store)?;
+                let Some(taken) = taken else {
+                    return Err(SharedRefused::NotAnswered(
+                        "a page holds an entry of another channel".into(),
+                    ));
+                };
+                Ok(SharedDone::Page {
+                    entries: entries.len(),
+                    handed,
+                    got_somewhere: taken.got_somewhere,
+                    end: entries.is_empty(),
+                })
+            }
+            (SharedAsk::Push { .. }, WireMessage::EntryPushed(pushed)) => {
+                if pushed.answers.len() != batch.len() {
+                    return Err(SharedRefused::NotAnswered(
+                        "a push was not answered for each entry".into(),
+                    ));
+                }
+                let answers: Vec<Pushed> = pushed.answers.iter().map(pushed_as).collect();
+                let conn = lock(&state.db);
+                let refused =
+                    shared_pass::pushed(&conn, &usable, &relay, &batch, &answers).map_err(store)?;
+                Ok(SharedDone::Pushed {
+                    sent: batch.len(),
+                    refused,
+                    cost,
+                })
+            }
+            _ => Err(SharedRefused::NotAnswered(
+                "a request was not answered as one".into(),
+            )),
+        }
+    }
+
+    /// The door of the share pair channel of a key typed for a channel
+    /// (decision 2026-10-10 §2.3, §3.2, §8.4): read, on `link`, the share
+    /// pair channel of this device and `key`, and give what the device of
+    /// that key wrote there to `accept`, which judges a share, and to
+    /// nothing else. No show is made and no leave asked.
+    ///
+    /// It does that and nothing else, as [`Leave::pair`] does for a key
+    /// typed to join devices:
+    ///
+    /// - Under the database's lock, `reads` says whether the key reads now
+    ///   (typed for a channel within its hour, and taken with no share): a
+    ///   key that does not reads nothing, and the relay is asked nothing.
+    ///   So does a device that does not stand applied with sync on.
+    /// - The channel is the share pair channel of `key` and this device,
+    ///   derived here. No caller names a channel.
+    /// - The requests are made here, each counted against the shared pass's
+    ///   own counter: a proof of the channel's key, and pulls of its pages
+    ///   from the start, each with `limit` and on from the place the last
+    ///   reached, until a page holds nothing or leaves the place where it
+    ///   was, the key reads nothing more, or RELAY_ENTRY_PULL_PAGES pages
+    ///   were read. Nothing is pushed.
+    /// - `counted` is given what the relay handed in each page, as it counts
+    ///   it, before the page is read, as [`Leave::shared`] gives it: so the
+    ///   caller counts it in the device's whole count and in the shared
+    ///   pass's quarter, and sizes `limit` to that quarter. The proof's place
+    ///   on the connection is the caller's to check and keep, as it is for
+    ///   a shared channel (not yet called: slice 6 calls it).
+    /// - Of what comes back, each entry of that channel that `key` signed
+    ///   is given to `accept`, under the database's lock: none is stored,
+    ///   and no place is kept. An entry of another channel, or by another
+    ///   key, is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn share_pair<A>(
+        &self,
+        state: &AppState,
+        link: &Link,
+        key: &[u8; 32],
+        limit: u32,
+        mut counted: impl FnMut(u64),
+        reads: impl Fn(&Connection, i64) -> bool,
+        accept: impl Fn(&Connection, &CheckedEntry, i64) -> Result<Option<A>, String>,
+    ) -> Result<SharePairRead<A>, SharedRefused> {
+        let (db, identity) = (&state.db, &state.identity);
+        let unix = || self.clock.unix_from(state.sync_control.now());
+        let still = |conn: &Connection, now: i64| {
+            matches!(shared_pass::may_open(conn), Ok(Ok(()))) && reads(conn, now)
+        };
+        if !still(&lock(db), unix()) {
+            return Ok(SharePairRead::NotNow);
+        }
+        let not = |why: &str| SharedRefused::NotAnswered(why.to_string());
+        let (channel, secret) =
+            shared_pass::share_pair(identity, key).ok_or_else(|| not("no share pair channel"))?;
+        let session = link.session().ok_or_else(|| not("no session"))?;
+        let proof =
+            proof::make(&secret, &session, &identity.public_key()).map_err(|_| not("no proof"))?;
+        let prove = WireMessage::ChannelProve(ChannelProve { channel, proof });
+        if !lock(&self.inner).may_ask_shared(link.name()) {
+            return Err(SharedRefused::AskedEnough);
+        }
+        let proved = match self
+            .asks_shared(link, Protocol::ChannelProve, &prove)
+            .await?
+        {
+            WireMessage::ChannelProved(proved) => proved.proved,
+            _ => return Err(not("a proof was not answered as one")),
+        };
+        if !proved {
+            return Ok(SharePairRead::NotHeld);
+        }
+        let mut read = Vec::new();
+        let mut place = (NO_MARK, 0);
+        for _ in 0..RELAY_ENTRY_PULL_PAGES {
+            if !lock(&self.inner).may_ask_shared(link.name()) {
+                break;
+            }
+            let pull = WireMessage::EntryPull(EntryPull {
+                channel,
+                mark: place.0,
+                after: place.1,
+                limit: limit.clamp(1, ENTRY_PAGE_MAX_ENTRIES),
+            });
+            let page = match self.asks_shared(link, Protocol::EntryPull, &pull).await {
+                Ok(WireMessage::EntryPulled(page)) => page,
+                Ok(_) if read.is_empty() => return Err(not("a pull was not answered with a page")),
+                Err(refused) if read.is_empty() => return Err(refused),
+                _ => break,
+            };
+            // What the relay handed counts against the share, whatever is
+            // then done with it.
+            counted(
+                page.entries
+                    .iter()
+                    .map(|bytes| entry_cost(bytes.len().saturating_sub(ENTRY_WIRE_OVERHEAD_BYTES)))
+                    .sum(),
+            );
+            let handed: Vec<CheckedEntry> = page
+                .entries
+                .iter()
+                .take(ENTRY_PAGE_MAX_ENTRIES as usize)
+                .filter_map(|bytes| Entry::from_wire(bytes).ok()?.check().ok())
+                .filter(|entry| entry.channel == channel && entry.author == *key)
+                .collect();
+            for entry in &handed {
+                let now = unix();
+                let conn = lock(db);
+                if !still(&conn, now) {
+                    return Ok(SharePairRead::Read(read));
+                }
+                match accept(&conn, entry, now) {
+                    Ok(Some(judged)) => read.push(judged),
+                    Ok(None) => return Ok(SharePairRead::Read(read)),
+                    Err(e) => return Err(not(&format!("could not judge a share: {e}"))),
+                }
+            }
+            let reached = (page.mark, page.next);
+            if page.entries.is_empty() || reached == place || !still(&lock(db), unix()) {
+                break;
+            }
+            place = reached;
+        }
+        Ok(SharePairRead::Read(read))
+    }
+
+    /// Push, on `link`, `entry`: a share that this device wrote in its share
+    /// pair channel with `key`, and that its store holds (decision
+    /// 2026-10-10 §3.1, §8.4). Any other entry is refused, and nothing is
+    /// asked. Counted against the shared pass's own counter. Returns what
+    /// the relay answered of it.
+    pub async fn share_pair_push(
+        &self,
+        state: &AppState,
+        link: &Link,
+        key: &[u8; 32],
+        entry: &CheckedEntry,
+    ) -> Result<Pushed, SharedRefused> {
+        let not = |why: &str| SharedRefused::NotAnswered(why.to_string());
+        {
+            let conn = lock(&state.db);
+            if let Ok(Err(not_usable)) = shared_pass::may_open(&conn) {
+                return Err(SharedRefused::NotUsable(not_usable));
+            }
+            let own = shared_pass::is_own_share(&conn, &state.identity, key, entry);
+            if !own.map_err(|e| not(&e.to_string()))? {
+                return Err(SharedRefused::NotUsable(NotUsable::NotHeld));
+            }
+        }
+        if !lock(&self.inner).may_ask_shared(link.name()) {
+            return Err(SharedRefused::AskedEnough);
+        }
+        let push = WireMessage::EntryPush(EntryPush {
+            entries: vec![entry.to_wire().into()],
+        });
+        match self.asks_shared(link, Protocol::EntryPush, &push).await? {
+            WireMessage::EntryPushed(pushed) if pushed.answers.len() == 1 => {
+                Ok(pushed_as(&pushed.answers[0]))
+            }
+            _ => Err(not("a push was not answered for its entry")),
+        }
+    }
+
+    /// Ask `request` of the relay at `link` on a stream of `protocol`, for
+    /// a shared channel or a share pair channel, once its counter has let
+    /// it through: a request that the relay refused for now is said so, and
+    /// counted for the relay ([`Self::refused`]), as every door counts one.
+    async fn asks_shared(
+        &self,
+        link: &Link,
+        protocol: Protocol,
+        request: &WireMessage,
+    ) -> Result<WireMessage, SharedRefused> {
+        let (send, recv) = open_stream(&link.conn)
+            .await
+            .map_err(SharedRefused::NotAnswered)?;
+        let answer = exchange(
+            send,
+            recv,
+            protocol,
+            request,
+            self.counts_as_sent(link, protocol, request),
+        )
+        .await;
+        answer.map_err(|e| match self.refused(link, &e) {
+            Refused::NotNow => SharedRefused::NotNow,
+            Refused::NotAnswered(why) => SharedRefused::NotAnswered(why),
+            other => SharedRefused::NotAnswered(format!("{other:?}")),
+        })
+    }
+
     /// Ask `request` of the relay at `link` on a stream of `protocol`,
     /// for the pair channel of a typed key, or for a channel of a
     /// generation that was left, where the device has not asked as much
@@ -1229,6 +1720,18 @@ impl Leave {
             Ok(Some(kept)) if kept == *under => Ok(()),
             _ => Err(Refused::KeptAnother),
         }
+    }
+}
+
+/// What a relay's answer for one entry of a push means for sending it.
+fn pushed_as(answer: &PushAnswer) -> Pushed {
+    match answer {
+        PushAnswer::Stored | PushAnswer::Held => Pushed::Holds,
+        PushAnswer::Older => Pushed::HoldsLater,
+        PushAnswer::Another => Pushed::HoldsAnother,
+        PushAnswer::Refused(EntryRefused::NotSigned) => Pushed::DoesNotCheck,
+        PushAnswer::Refused(EntryRefused::NoRoom) => Pushed::NoRoom,
+        PushAnswer::Refused(EntryRefused::OverLimit) => Pushed::OverAllowance,
     }
 }
 
@@ -1508,6 +2011,30 @@ mod tests {
         assert!(!inner.may_ask("one"));
         assert!(!inner.may_ask("one"));
         assert!(inner.may_ask("other"));
+    }
+
+    /// The shared pass's requests are counted against a counter of their
+    /// own, at SHARED_REQUESTS_PER_MINUTE for each relay, and never against
+    /// what the device asks for its own channels; nor do the device's own
+    /// count against the shared pass's (decision 2026-10-10 §8.4).
+    #[test]
+    fn a_shared_request_is_counted_apart_from_the_devices_own() {
+        assert_eq!(SHARED_REQUESTS_PER_MINUTE, 600);
+        let mut inner = Inner::default();
+        for n in 0..SHARED_REQUESTS_PER_MINUTE {
+            assert!(inner.may_ask_shared("one"), "{n}");
+        }
+        assert!(!inner.may_ask_shared("one"));
+        assert!(inner.may_ask_shared("other"));
+        for n in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+            assert!(inner.may_ask("one"), "{n}");
+        }
+        assert!(!inner.may_ask("one"));
+        let mut inner = Inner::default();
+        for _ in 0..OWN_ENTRY_REQUESTS_PER_MINUTE {
+            inner.may_ask("one");
+        }
+        assert!(inner.may_ask_shared("one"));
     }
 
     /// A node that reaches no relay is waking. Once it reaches one, it is

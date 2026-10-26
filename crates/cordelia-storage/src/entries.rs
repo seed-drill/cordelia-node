@@ -495,6 +495,30 @@ pub fn author_entry(
     .map_err(storage)
 }
 
+/// Every entry that the store holds from `author` in a channel, as it is
+/// stored, in the order the store took them: whoever is handed one checks
+/// it.
+pub fn author_entries(
+    conn: &Connection,
+    channel: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Vec<StoredEntry>, CordeliaError> {
+    let rows = conn
+        .prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM entries
+             WHERE channel_id = ?1 AND author = ?2 ORDER BY seq"
+        ))
+        .map_err(storage)?
+        .query_map(
+            params![channel.as_slice(), author.as_slice()],
+            stored_entry_from_row,
+        )
+        .map_err(storage)?
+        .collect::<Result<_, _>>()
+        .map_err(storage)?;
+    Ok(rows)
+}
+
 /// The revision of the entry that the store holds from one author in one
 /// slot of a channel, and what that entry is counted at
 /// ([`cordelia_core::protocol::entry_cost`]): what an entry that replaces

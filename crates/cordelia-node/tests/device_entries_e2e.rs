@@ -10763,3 +10763,791 @@ async fn a_relay_counts_who_it_turns_away_and_each_churn_where_warm_churn_closes
     assert_eq!((peers("hot") + peers("warm"), peers("cold")), (5, 0));
     assert_eq!(value_of(&said, "cordelia_connections_closed_total"), 0);
 }
+
+// ── The pass of shared channels (decision 2026-10-10 §8.4) ───────────
+
+impl Device {
+    /// The device's configuration knows the relay it calls `name` by the
+    /// key that answers there: a card's relay is one of its own only so
+    /// (decision 2026-10-10 §8.2).
+    fn knows_key_of(&mut self, name: &str) {
+        let key = self.link(name).relay().0;
+        self.relay_mut(name).key = Some(key);
+    }
+
+    /// The device files a shared channel as `name`, made here, at the
+    /// relays `relays` by their keys, as a person's act does: it holds it.
+    /// Returns its ID and its secret.
+    fn files_shared(&self, name: &str, relays: &[[u8; 32]]) -> ([u8; 32], [u8; 32]) {
+        use cordelia_api::lists::{Do, Done, act};
+        use cordelia_crypto::acts::{Came, Filing};
+        use cordelia_crypto::share::{Card, Relays};
+        let card = Card::make(Relays::new(relays).unwrap()).unwrap();
+        let (channel, secret) = (card.channel_id().unwrap(), card.secret().unwrap());
+        let filing = Filing {
+            channel,
+            card,
+            name: name.into(),
+            came: Came::Made,
+        };
+        let done = act(
+            &self.db(),
+            &self.state.identity,
+            Do::File(filing),
+            self.now(),
+        )
+        .unwrap();
+        assert!(matches!(done, Done::Made(_)), "{done:?}");
+        (channel, secret)
+    }
+
+    /// The device writes its empty anew record in the shared channel whose
+    /// secret is `secret`, at `rev`, through the one door: what it writes
+    /// when it comes to hold a channel (decision 2026-10-10 §7).
+    fn writes_anew(&self, secret: &[u8; 32], rev: u64) -> CheckedEntry {
+        use cordelia_crypto::shared::{Anew, anew_name};
+        let me = NodeIdentity::from_seed(*self.state.identity.seed()).unwrap();
+        let value = Value::Other(Anew::Empty.to_value().unwrap());
+        let entry = sealed(&me, secret, rev, &anew_name(&self.key()).unwrap(), value);
+        let entry = entry.check().unwrap();
+        let taken = take(&self.db(), &self.state.identity, &entry, self.now()).unwrap();
+        assert!(
+            matches!(taken, cordelia_api::take::Taken::Shared { .. }),
+            "{taken:?}"
+        );
+        entry
+    }
+
+    /// What the shared pass asked of the relay it calls `name`.
+    fn shared_counts(&self, name: &str) -> cordelia_node::device_entries::SharedCounts {
+        self.engine.shared_counts(name)
+    }
+
+    /// What the device's counters hold of the relay it calls `name`
+    /// (decision 2026-10-22 §1.2).
+    fn device_counts(&self, name: &str) -> cordelia_core::load::DeviceRead {
+        self.state.load.device.of(&self.link(name).relay().0)
+    }
+}
+
+/// Message `number` of `author` in the shared channel whose secret is
+/// `secret`, on the wire: an entry of 2,048 bytes in its slot (decision
+/// 2026-10-10 §2.3).
+fn shared_message(author: &NodeIdentity, secret: &[u8; 32], number: u64) -> Vec<u8> {
+    use cordelia_crypto::shared::SharedMessage;
+    let said = SharedMessage {
+        asks: false,
+        sent: 1_800_000_000,
+        nonce: [number as u8; 16],
+        thread: [0; 16],
+        answers: [0; 16],
+        link: None,
+        body: format!("message {number}"),
+    };
+    let value = Value::Other(said.to_value().unwrap());
+    let name = message::message_name(&author.public_key(), number).unwrap();
+    let rev = message::message_rev(number).unwrap();
+    sealed(author, secret, rev, &name, value).to_wire()
+}
+
+/// An entry of the largest size, by `author`, in the channel whose secret
+/// is `secret`: one that a member can push at a relay, and that a device's
+/// door refuses as no shared entry, after the relay has handed it.
+fn largest_in(author: &NodeIdentity, secret: &[u8; 32], n: u64) -> Vec<u8> {
+    use cordelia_core::protocol::{MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES};
+    let name = format!("{n}");
+    let text = "x".repeat(MAX_ENTRY_NAME_AND_VALUE_BYTES - name.len());
+    let entry = sealed(author, secret, n + 1, &name, Value::Text(text));
+    assert_eq!(entry.content.len(), MAX_ITEM_BYTES);
+    entry.to_wire()
+}
+
+/// What a stand-in hands of each channel, by its ID: a page from the place
+/// asked, of at most the `limit` asked and SMALL_PAGE_BYTES of entries and
+/// at least one, as a relay pages a device; for a channel `endless` names,
+/// entries without end.
+/// Entries without end, by their place.
+type Endless = Box<dyn Fn(u64) -> Vec<u8> + Send>;
+
+#[derive(Default)]
+struct SharedHolding {
+    held: HashMap<[u8; 32], Vec<Vec<u8>>>,
+    endless: HashMap<[u8; 32], Endless>,
+}
+
+impl SharedHolding {
+    fn page(&self, pull: &EntryPull) -> EntryPulled {
+        let after = if pull.mark == [5; 8] { pull.after } else { 0 };
+        let entry = |n: u64| -> Option<Vec<u8>> {
+            if let Some(endless) = self.endless.get(&pull.channel) {
+                return Some(endless(n));
+            }
+            self.held.get(&pull.channel)?.get(n as usize).cloned()
+        };
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0;
+        let mut n = after;
+        while entries.len() < pull.limit as usize {
+            let Some(one) = entry(n) else { break };
+            if !entries.is_empty() && bytes + one.len() > SMALL_PAGE_BYTES {
+                break;
+            }
+            bytes += one.len();
+            entries.push(one);
+            n += 1;
+        }
+        EntryPulled {
+            next: after + entries.len() as u64,
+            entries: entries.into_iter().map(Into::into).collect(),
+            mark: [5; 8],
+        }
+    }
+}
+
+/// The pulls among `requests` of the channels `of`, in order, each by the
+/// channel's place in `of`.
+fn shared_pulls(requests: &[WireMessage], of: &[[u8; 32]]) -> Vec<usize> {
+    requests
+        .iter()
+        .filter_map(|one| match one {
+            WireMessage::EntryPull(pull) => of.iter().position(|c| *c == pull.channel),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every request among `requests` that names one of the channels `of`.
+fn naming(requests: &[WireMessage], of: &[[u8; 32]]) -> usize {
+    requests
+        .iter()
+        .filter(|one| {
+            let named = match one {
+                WireMessage::ChannelProve(prove) => vec![prove.channel],
+                WireMessage::EntryPull(pull) => vec![pull.channel],
+                WireMessage::EntryPush(push) => push
+                    .entries
+                    .iter()
+                    .map(|e| Entry::from_wire(e).unwrap().channel)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            named.iter().any(|channel| of.contains(channel))
+        })
+        .count()
+}
+
+/// **A shared channel lives only at its relays that are the device's own,
+/// by key** (decision 2026-10-10 §8.2, §8.4; property 14). The device is
+/// set up with three relays: it knows the first two by their keys, and the
+/// third by its address alone. A channel whose card names the first is
+/// proved, pulled and pushed there, after the device's own channels, and
+/// the second is asked nothing of it; a channel whose card names the third
+/// is asked of no relay, since the configuration does not know that relay
+/// by its key. With sync off, no stream of a shared channel is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_channel_is_asked_only_at_its_relays_that_are_the_devices_own() {
+    let (one, two, three) = (
+        StandIn::started().await,
+        StandIn::started().await,
+        StandIn::started().await,
+    );
+    for relay in [&one, &two, &three] {
+        relay.holds_what_is_proved(true);
+    }
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.connects_to("one", one.port, one.key).await;
+    device.connects_to("two", two.port, two.key).await;
+    device.connects_to("three", three.port, three.key).await;
+    device.knows_key_of("one");
+    device.knows_key_of("two");
+    let (here, here_secret) = device.files_shared("review", &[one.key]);
+    let (third, third_secret) = device.files_shared("third", &[three.key]);
+    let mine = device.writes_anew(&here_secret, 1);
+    device.writes_anew(&third_secret, 1);
+
+    device.passes().await;
+    let at_one = one.requests();
+    let of = |requests: &[WireMessage], kind: Seen| {
+        requests
+            .iter()
+            .filter(|one| match (one, kind) {
+                (WireMessage::ChannelProve(p), Seen::Prove) => p.channel == here,
+                (WireMessage::EntryPull(p), Seen::Pull) => p.channel == here,
+                (WireMessage::EntryPush(p), Seen::Push) => p
+                    .entries
+                    .iter()
+                    .any(|e| Entry::from_wire(e).unwrap().id() == mine.id()),
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(of(&at_one, Seen::Prove), 1);
+    assert_eq!(of(&at_one, Seen::Pull), 1);
+    assert_eq!(of(&at_one, Seen::Push), 1);
+    // After the device's own channels there: its first proof is of one of
+    // its own.
+    let first_shared = at_one
+        .iter()
+        .position(|r| naming(std::slice::from_ref(r), &[here]) > 0);
+    let first_own = at_one
+        .iter()
+        .position(|r| matches!(r, WireMessage::ChannelProve(p) if p.channel != here));
+    assert!(first_own < first_shared, "{first_own:?} {first_shared:?}");
+    assert_eq!(naming(&two.requests(), &[here, third]), 0);
+    assert_eq!(naming(&three.requests(), &[here, third]), 0);
+    let counts = device.shared_counts("one");
+    assert_eq!((counts.proofs, counts.pages, counts.pushes), (1, 1, 1));
+
+    // The pass that sends pushes only what waits: it was taken.
+    device.sends().await;
+    assert_eq!(naming(&one.requests(), &[here]), 0);
+    // A later record waits, and goes at the pass that sends.
+    let later = device.writes_anew(&here_secret, 2);
+    device.sends().await;
+    let pushed = one.requests();
+    assert_eq!(naming(&pushed, &[here]), 1);
+    assert!(matches!(&pushed[..], [WireMessage::EntryPush(p)]
+        if Entry::from_wire(&p.entries[0]).unwrap().id() == later.id()));
+
+    // Sync off: nothing of a shared channel, anywhere.
+    let waiting = device.writes_anew(&here_secret, 3);
+    device.syncs(false);
+    assert!(
+        device.db().query_row(
+            "SELECT COUNT(*) FROM entries WHERE channel_id = ?1 AND rev = 3",
+            [&waiting.channel[..]],
+            |row| row.get::<_, i64>(0),
+        ) == Ok(1)
+    );
+    device.passes().await;
+    device.sends().await;
+    for relay in [&one, &two, &three] {
+        assert_eq!(naming(&relay.requests(), &[here, third]), 0);
+    }
+}
+
+/// **The shared pass counts what it asks of a relay against a counter of
+/// its own** (decision 2026-10-10 §8.4): at most SHARED_REQUESTS_PER_MINUTE
+/// in a minute, and never against what the device asks for its own
+/// channels. With sixteen shared channels proved on each new connection,
+/// pass after pass within a minute, the shared pass stops at its counter;
+/// what it did not ask is not counted as held back by the device's pace;
+/// and the device's own channels are asked for at every pass all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shared_pass_asks_a_relay_within_its_own_counter() {
+    use cordelia_core::protocol::{SHARED_MAX_CHANNELS, SHARED_REQUESTS_PER_MINUTE};
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.holds("notes");
+    let notes = device.channel("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let channels: Vec<[u8; 32]> = (0..SHARED_MAX_CHANNELS)
+        .map(|n| device.files_shared(&format!("s{n}"), &[relay.key]).0)
+        .collect();
+    let began = std::time::Instant::now();
+    let (mut shared, mut own_pulls) = (0, 0);
+    // Each pass on a new connection: every channel is proved again.
+    for _ in 0..25 {
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.knows_key_of("relay");
+        device.passes().await;
+        let requests = relay.requests();
+        shared += naming(&requests, &channels);
+        let of_notes =
+            |r: &&WireMessage| matches!(r, WireMessage::EntryPull(p) if p.channel == notes);
+        let pulls_of_notes = requests.iter().filter(of_notes).count();
+        assert!(
+            pulls_of_notes >= 1,
+            "the device's own channel is pulled at every pass"
+        );
+        own_pulls += pulls_of_notes;
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(60),
+        "within one minute"
+    );
+    assert_eq!(shared, SHARED_REQUESTS_PER_MINUTE as usize);
+    assert!(device.shared_counts("relay").asked_enough > 0);
+    assert_eq!(own_pulls, 25);
+    let counts = device.device_counts("relay");
+    assert_eq!(
+        counts.held_back, 0,
+        "nothing the shared pass did not ask is held back"
+    );
+}
+
+/// **Shared traffic never refuses a device's own requests or bytes**
+/// (decision 2026-10-10 §8.4, §13 item 24). Sixteen shared channels live at
+/// a relay: one is read from its start, where a member's entries of 64 KiB
+/// wait without end, and fifteen hold three pages of messages each; an
+/// anew record of the device's waits in each, and the relay refuses every
+/// shared push for room, so that each is pushed again.
+///
+/// - Between two pages of any shared channel, each other is asked for at
+///   most one page.
+/// - What the relay hands the shared pass in the minute is within its
+///   quarter of the 2 MiB, and what the shared pass pushes within its
+///   quarter of the 1.5 MiB; a push refused is pushed again at a later
+///   pass, within that quarter.
+/// - In the same minute, the device's own channel then takes the bytes it
+///   asks for up to three quarters of the 2 MiB, less the room a relay
+///   keeps for a show's answer; its own push goes; and none of its own
+///   requests is held back by its pace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_traffic_never_refuses_a_devices_own_requests() {
+    use cordelia_core::protocol::{
+        MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE, PUSH_BYTES_PER_PEER_PER_MINUTE,
+        SHARED_ANEW_CONTENT_BYTES, SHARED_BYTES_PER_MINUTE, SHARED_MAX_CHANNELS,
+        SHARED_PUSH_BYTES_PER_MINUTE,
+    };
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.holds("notes");
+    let notes = device.channel("notes");
+    let notes_secret = device.name_secret("notes");
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let filed: Vec<([u8; 32], [u8; 32])> = (0..SHARED_MAX_CHANNELS)
+        .map(|n| device.files_shared(&format!("s{n}"), &[relay.key]))
+        .collect();
+    let channels: Vec<[u8; 32]> = filed.iter().map(|(id, _)| *id).collect();
+    for (_, secret) in &filed {
+        device.writes_anew(secret, 1);
+    }
+    let member = NodeIdentity::generate().unwrap();
+    let mut holding = SharedHolding::default();
+    let (first, first_secret) = filed[0];
+    let member_seed = *member.seed();
+    holding.endless.insert(
+        first,
+        Box::new(move |n| {
+            let member = NodeIdentity::from_seed(member_seed).unwrap();
+            largest_in(&member, &first_secret, n)
+        }),
+    );
+    for (channel, secret) in &filed[1..] {
+        let three = (1..=3)
+            .map(|n| shared_message(&member, secret, n))
+            .collect();
+        holding.held.insert(*channel, three);
+    }
+    let holding = Arc::new(Mutex::new(holding));
+    let serves = holding.clone();
+    relay.pulls(move |pull| serves.lock().unwrap().page(pull));
+    let shared_ids = channels.clone();
+    relay.pushes(move |entry| match shared_ids.contains(&entry.channel) {
+        true => PushAnswer::Refused(EntryRefused::NoRoom),
+        false => PushAnswer::Stored,
+    });
+    let began = std::time::Instant::now();
+
+    // The whole pass: the device's own channel holds nothing yet.
+    device.passes().await;
+    let requests = relay.requests();
+    let pulls = shared_pulls(&requests, &channels);
+    assert!(pulls.iter().filter(|c| **c == 0).count() >= 2, "{pulls:?}");
+    // In turn: each channel is asked for a page before any is asked for a
+    // second.
+    let first: std::collections::HashSet<usize> =
+        pulls[..SHARED_MAX_CHANNELS].iter().copied().collect();
+    assert_eq!(first.len(), SHARED_MAX_CHANNELS, "{pulls:?}");
+    // Between two pages of one channel, each other at most one.
+    for (at, channel) in pulls.iter().enumerate() {
+        let Some(next) = pulls[at + 1..].iter().position(|c| c == channel) else {
+            continue;
+        };
+        let between = &pulls[at + 1..at + 1 + next];
+        for other in 0..SHARED_MAX_CHANNELS {
+            let asked = between.iter().filter(|c| **c == other).count();
+            assert!(
+                asked <= 1,
+                "{other} asked {asked} times between two of {channel}: {pulls:?}"
+            );
+        }
+    }
+    // Each page is asked with a limit of no more entries of the largest
+    // size than the share has room for: seven at first, and fewer as it
+    // is spent.
+    let limits: Vec<u32> = requests
+        .iter()
+        .filter_map(|one| match one {
+            WireMessage::EntryPull(pull) if channels.contains(&pull.channel) => Some(pull.limit),
+            _ => None,
+        })
+        .collect();
+    let largest = entry_cost(MAX_ITEM_BYTES);
+    assert_eq!(limits[0] as u64, SHARED_BYTES_PER_MINUTE / largest);
+    assert_eq!(limits[0], 7);
+    assert!(limits.windows(2).all(|two| two[1] <= two[0]), "{limits:?}");
+    assert_eq!(*limits.last().unwrap(), 1, "{limits:?}");
+    let handed = device.shared_counts("relay").handed;
+    assert!(handed <= SHARED_BYTES_PER_MINUTE, "{handed}");
+    // What the shared pass took is in the device's whole count too.
+    let (taken, _) = device.engine.in_the_last_minute("relay");
+    assert!(taken >= handed, "{taken} < {handed}");
+    assert!(
+        handed + entry_cost(MAX_ITEM_BYTES) > SHARED_BYTES_PER_MINUTE,
+        "the share was used"
+    );
+    let anew = entry_cost(SHARED_ANEW_CONTENT_BYTES);
+    let counts = device.shared_counts("relay");
+    assert_eq!(counts.pushed, SHARED_MAX_CHANNELS as u64);
+    assert_eq!(counts.refused, SHARED_MAX_CHANNELS as u64);
+
+    // The passes that send push again what was refused, within the quarter.
+    device.sends().await;
+    device.sends().await;
+    let counts = device.shared_counts("relay");
+    let pushed = counts.pushed * anew;
+    assert!(counts.pushed > SHARED_MAX_CHANNELS as u64, "pushed again");
+    assert!(pushed <= SHARED_PUSH_BYTES_PER_MINUTE, "{pushed}");
+    assert!(
+        pushed + anew > SHARED_PUSH_BYTES_PER_MINUTE,
+        "the share was used"
+    );
+    // What the shared pass pushed is in the device's whole count too.
+    let (_, paced) = device.engine.in_the_last_minute("relay");
+    assert!(paced >= pushed, "{paced} < {pushed}");
+
+    // The device's own channel now holds entries of the largest size, and
+    // the device writes a file of its own.
+    let me = NodeIdentity::from_seed(*device.state.identity.seed()).unwrap();
+    holding
+        .lock()
+        .unwrap()
+        .endless
+        .insert(notes, Box::new(move |n| largest_in(&me, &notes_secret, n)));
+    let written = device.writes("notes", "a.md", "mine");
+    let before = device.counts("relay").pulled;
+    // Pass after pass, as the node passes, until the device takes no more
+    // in this minute: a pass reads so many pages of a channel.
+    let mut requests = Vec::new();
+    loop {
+        let pulled = device.counts("relay").pulled;
+        device.passes().await;
+        requests.extend(relay.requests());
+        if device.counts("relay").pulled == pulled {
+            break;
+        }
+    }
+    let own_pulled = device.counts("relay").pulled - before;
+    let own_bytes = own_pulled * entry_cost(MAX_ITEM_BYTES);
+    let three_quarters = PUSH_BYTES_PER_PEER_PER_MINUTE * 3 / 4 - SHOW_ANSWER_ROOM_BYTES;
+    assert!(
+        own_bytes >= three_quarters,
+        "{own_bytes} < {three_quarters}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(r, WireMessage::EntryPush(p)
+            if p.entries.iter().any(|e| Entry::from_wire(e).unwrap().id() == written.id()))),
+        "its own push went"
+    );
+    const {
+        assert!(
+            OUTBOX_BYTES_PER_MINUTE - SHARED_PUSH_BYTES_PER_MINUTE
+                >= OUTBOX_BYTES_PER_MINUTE * 3 / 4
+        )
+    };
+    assert_eq!(device.device_counts("relay").held_back, 0);
+    // The relay never handed more than it may in a minute.
+    let (taken, _) = device.engine.in_the_last_minute("relay");
+    assert!(taken <= PUSH_BYTES_PER_PEER_PER_MINUTE, "{taken}");
+    assert!(
+        began.elapsed() < Duration::from_secs(60),
+        "within one minute"
+    );
+}
+
+/// **Shared channels push in turn** (decision 2026-10-10 §8.4): a channel
+/// that the relay refuses for room, pushed again at every pass, does not
+/// come first in each and take the quarter from the others. Sixteen anew
+/// records are pushed, and the first channel's is refused; it alone is
+/// pushed at the next pass; then each other channel writes its record
+/// again, and the pass after begins with the channel after the first, so
+/// that the five the quarter still has room for are the second to the
+/// sixth, and the first waits its turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_channel_refused_for_room_waits_its_turn_to_push() {
+    use cordelia_core::protocol::{
+        SHARED_ANEW_CONTENT_BYTES, SHARED_MAX_CHANNELS, SHARED_PUSH_BYTES_PER_MINUTE,
+    };
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let filed: Vec<([u8; 32], [u8; 32])> = (0..SHARED_MAX_CHANNELS)
+        .map(|n| device.files_shared(&format!("s{n}"), &[relay.key]))
+        .collect();
+    let channels: Vec<[u8; 32]> = filed.iter().map(|(id, _)| *id).collect();
+    for (_, secret) in &filed {
+        device.writes_anew(secret, 1);
+    }
+    let first = channels[0];
+    relay.pushes(move |entry| match entry.channel == first {
+        true => PushAnswer::Refused(EntryRefused::NoRoom),
+        false => PushAnswer::Stored,
+    });
+    let pushes = |requests: &[WireMessage]| -> Vec<usize> {
+        requests
+            .iter()
+            .filter_map(|one| match one {
+                WireMessage::EntryPush(push) => {
+                    let entry = Entry::from_wire(push.entries.first()?).ok()?;
+                    channels
+                        .iter()
+                        .position(|channel| *channel == entry.channel)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let anew = entry_cost(SHARED_ANEW_CONTENT_BYTES);
+    // Twenty-two anew records fit in the quarter: sixteen, one, and five.
+    assert_eq!(SHARED_PUSH_BYTES_PER_MINUTE / anew, 22);
+
+    device.passes().await;
+    let all: Vec<usize> = (0..SHARED_MAX_CHANNELS).collect();
+    assert_eq!(pushes(&relay.requests()), all);
+    device.sends().await;
+    assert_eq!(pushes(&relay.requests()), [0]);
+    for (_, secret) in &filed[1..] {
+        device.writes_anew(secret, 2);
+    }
+    device.sends().await;
+    assert_eq!(pushes(&relay.requests()), [1, 2, 3, 4, 5]);
+    assert_eq!(device.shared_counts("relay").pushed, 22);
+}
+
+/// **The door of a share pair channel** (decision 2026-10-10 §2.3, §8.4):
+/// Alice's laptop pushes a share it wrote in its share pair channel with
+/// Bob's desktop, at a relay of their own, and pushes nothing else there;
+/// Bob's desktop, given Alice's key, derives the channel itself, proves it,
+/// and hands each entry that Alice's key signed there to the judge, and
+/// nothing else. A key that reads nothing now asks the relay nothing, and
+/// neither does a device with sync off. Each request counts against the
+/// shared pass's counter, not the device's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_the_judge() {
+    use cordelia_api::shared_pass;
+    use cordelia_crypto::share::{Card, Relays, Share, share_name};
+    let relay = relay_started("relay", None);
+    let mut alice = Device::new("laptop");
+    alice.makes_the_phrase(&phrase());
+    alice.syncs(true);
+    let mut bob = Device::new("desktop");
+    bob.makes_the_phrase(&Phrase::parse(OTHER_WORDS).unwrap());
+    bob.syncs(true);
+    alice.connects("relay", &relay).await;
+    bob.connects("relay", &relay).await;
+    let relay_key = key_of(&relay);
+
+    // Alice's share, in the share pair channel of her key and Bob's.
+    let (pair, secret) = shared_pass::share_pair(&alice.state.identity, &bob.key()).unwrap();
+    let card = Card::make(Relays::new(&[relay_key]).unwrap()).unwrap();
+    let id = card.channel_id().unwrap();
+    let share = Share {
+        made: alice.now() as u64,
+        for_key: bob.key(),
+        card,
+    };
+    let me = NodeIdentity::from_seed(*alice.state.identity.seed()).unwrap();
+    let entry = sealed(
+        &me,
+        &secret,
+        alice.now() as u64,
+        &share_name(&id),
+        Value::Other(share.to_value()),
+    )
+    .check()
+    .unwrap();
+    entries::store(&alice.db(), &entry, alice.now()).unwrap();
+    let link = alice.link("relay");
+    let leave = alice.engine.leave();
+    let pushed = leave
+        .share_pair_push(&alice.state, &link, &bob.key(), &entry)
+        .await
+        .unwrap();
+    assert_eq!(pushed, cordelia_api::at_relays::Pushed::Holds);
+    assert!(holds_at(&relay, &pair, &entry.id()));
+    // Not for another key, and nothing it did not write.
+    let other = NodeIdentity::generate().unwrap().public_key();
+    assert!(
+        leave
+            .share_pair_push(&alice.state, &link, &other, &entry)
+            .await
+            .is_err()
+    );
+
+    // Another key's entry in that channel, which the relay holds.
+    let carol = NodeIdentity::generate().unwrap();
+    let theirs = sealed(&carol, &secret, 1, "share/x", Value::Other(vec![1; 16]));
+    // (Pushed by hand through the one way in, whose leave a show gives.)
+    alice.passes().await;
+    let answers = pushed_by_hand(&alice, "relay", &[&theirs]).await;
+    assert_eq!(answers, [PushAnswer::Stored]);
+    // Bob reads it through the door, given Alice's key.
+    let link = bob.link("relay");
+    let leave = bob.engine.leave();
+    let judged = |_: &rusqlite::Connection,
+                  entry: &CheckedEntry,
+                  _: i64|
+     -> Result<Option<[u8; 32]>, String> { Ok(Some(entry.id())) };
+    // Each page asked with the limit given, and what the relay handed in
+    // each given to `counted`: with a limit of one, a page for each entry,
+    // Carol's counted though the judge is not given it.
+    let handed = std::sync::Mutex::new(Vec::new());
+    let counted = |bytes: u64| handed.lock().unwrap().push(bytes);
+    let read = leave
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            1,
+            counted,
+            |_, _| true,
+            judged,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read,
+        cordelia_node::device_entries::SharePairRead::Read(vec![entry.id()])
+    );
+    let cost = |entry: &CheckedEntry| entry_cost(entry.content.len());
+    let carols = theirs.clone().check().unwrap();
+    assert_eq!(
+        handed.lock().unwrap().as_slice(),
+        [cost(&entry), cost(&carols), 0]
+    );
+    // Given another key, the channel is another, and holds nothing of it.
+    let read = leave
+        .share_pair(&bob.state, &link, &other, 100, |_| (), |_, _| true, judged)
+        .await
+        .unwrap();
+    assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotHeld);
+    // A key that reads nothing now, and sync off, ask nothing.
+    let asked = bob.device_counts("relay").asked;
+    let read = leave
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            100,
+            |_| (),
+            |_, _| false,
+            judged,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
+    bob.syncs(false);
+    let read = leave
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            100,
+            |_| (),
+            |_, _| true,
+            judged,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
+    assert_eq!(bob.device_counts("relay").asked, asked);
+    // Counted by stream in the device's counters, and never held back.
+    assert_eq!(bob.device_counts("relay").held_back, 0);
+}
+
+/// **A shared request that a relay refuses for now is counted for the relay
+/// as every door counts one** (decision 2026-10-10 §8.4): so it holds back
+/// the device's own reads at that relay as any refusal does. And the shared
+/// pass stops at that relay until the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_request_refused_for_now_counts_as_every_refusal_does() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let channels: Vec<[u8; 32]> = (0..3)
+        .map(|n| device.files_shared(&format!("s{n}"), &[relay.key]).0)
+        .collect();
+    let shared = channels.clone();
+    // The second channel's first pull is refused for now.
+    let refused = Arc::new(AtomicBool::new(false));
+    relay.hook(move |request| match request {
+        WireMessage::EntryPull(pull)
+            if pull.channel == shared[1] && !refused.swap(true, Ordering::SeqCst) =>
+        {
+            Some(Say::NotNow)
+        }
+        _ => None,
+    });
+    assert_eq!(device.engine.refused_for_now(&relay.key), 0);
+    device.passes().await;
+    let requests = relay.requests();
+    // The first channel's pull, the second's refused, and the shared pass
+    // asked nothing more there.
+    assert_eq!(shared_pulls(&requests, &channels), [0, 1]);
+    assert_eq!(device.engine.refused_for_now(&relay.key), 1);
+    assert_eq!(device.device_counts("relay").refused_for_now, 1);
+    assert_eq!(device.device_counts("relay").held_back, 0);
+    // The next pass begins where this one stopped: with the channel refused.
+    relay.hook(|_| None);
+    device.passes().await;
+    let next = shared_pulls(&relay.requests(), &channels);
+    assert_eq!(next.first(), Some(&1), "{next:?}");
+    assert_eq!(next.len(), channels.len());
+}
+
+/// **Shared channels are proved after every channel of the device's own**
+/// (decision 2026-10-10 §8.4): a shared channel's proof does not take a
+/// place among a connection's proofs that a channel of the device's own
+/// needs and has not had. Where the relay did not answer the device's own
+/// proofs in a turn, and the connection has room for those alone, the
+/// shared channel is not proved there; with a place left beside them, it
+/// is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_proof_takes_no_place_a_channel_of_the_devices_own_needs() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    for (most, proved) in [(2, false), (3, true)] {
+        // Its own channels: the personal channel and the messages channel.
+        let mut device = Device::proving_at_most("laptop", most);
+        device.makes_the_phrase(&phrase());
+        device.syncs(true);
+        device.connects_to("relay", relay.port, relay.key).await;
+        device.knows_key_of("relay");
+        let (shared, _) = device.files_shared("review", &[relay.key]);
+        let own = [device.personal(), device.messages()];
+        relay.hook(move |request| match request {
+            WireMessage::ChannelProve(prove) if own.contains(&prove.channel) => Some(Say::NotNow),
+            _ => None,
+        });
+        relay.requests();
+        device.passes().await;
+        let asked = relay
+            .requests()
+            .iter()
+            .any(|one| matches!(one, WireMessage::ChannelProve(p) if p.channel == shared));
+        assert_eq!(asked, proved, "with room for {most}");
+        assert_eq!(device.shared_counts("relay").proofs, u64::from(proved));
+    }
+}
