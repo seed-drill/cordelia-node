@@ -1128,6 +1128,31 @@ fn an_undo_of_nothing_never_pushes_out_what_is_in_force() {
     );
 }
 
+/// An undo over an undo is an undo of nothing below it, whatever older
+/// act of a kind in force is carried under both: it ranks in the second
+/// group past a bound, below an older item in force (decision 2026-10-10
+/// §3.4, "Past a bound, in one pass").
+#[test]
+fn an_undo_over_an_undo_is_an_undo_of_nothing() {
+    let (person, desktop, phone, old) = (device(1), device(2), device(3), device(4));
+    let makers = makers(&[&person, &desktop, &phone], &[&old]);
+    // A removed key's acts are taken from any list: its subscribe and its
+    // unsubscribe, each a copy, under the person's newer unsubscribe.
+    let undo = sub(50, false, &person, 30);
+    let older = sub(51, true, &person, 1);
+    let of = lists(&[
+        (&person, vec![undo.clone(), older.clone()]),
+        (&desktop, vec![sub(50, false, &old, 20)]),
+        (&phone, vec![sub(50, true, &old, 10)]),
+    ]);
+    for order in orders(&of) {
+        let computed = work(&order, &makers, Bounds::of(16, 64, 1, 64));
+        assert_eq!(newest_of(&computed, &undo), Some(undo.written()));
+        assert!(in_force_of(&computed, &older));
+        assert_eq!(past(&computed), BTreeSet::from([undo.written()]));
+    }
+}
+
 /// A filing, a subscribe or a label takes a new place, and is refused
 /// where its part is full, unless the newest valid act on its item is of
 /// a kind in force or an undo kept for something written in that part
