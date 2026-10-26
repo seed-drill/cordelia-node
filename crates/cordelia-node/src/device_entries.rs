@@ -639,7 +639,17 @@ impl DeviceEntries {
         let whole = kind == Pass::Whole;
         let number = whole.then(|| self.state.own_channels.whole_pass_begins());
         if whole {
-            self.shared_before_turns();
+            // Off the runtime's threads: a take-out of many keys is many
+            // steps, each a short hold of the lock, and the turns wait for
+            // them all. Its takes of the lock are of the pass.
+            let engine = Arc::clone(self);
+            let before = tokio::task::spawn_blocking(move || {
+                let _pass = taking(TakeKind::Pass);
+                engine.shared_before_turns();
+            });
+            if let Err(e) = before.await {
+                tracing::warn!(error = %e, "the shared channels' work before a pass failed");
+            }
         }
         let links: Vec<&Link> = relays
             .iter()
