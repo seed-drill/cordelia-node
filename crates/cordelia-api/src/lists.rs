@@ -88,13 +88,15 @@ pub enum Cut {
     /// are built (decision 2026-10-10 §20, item 7).
     StatementAlone,
     /// The cut times of the removal record, rule 2: for each generation
-    /// (the number of a statement this device applied) that a change
-    /// removing the key was made after, the cut time, or `None` where no
-    /// change on its chain has a time. An act taken in a generation that
-    /// is not listed was taken in a generation made apart from the
-    /// removal, and counts for nothing; one taken in a listed generation
-    /// counts for nothing at or after its cut time, or at any time where
-    /// there is none.
+    /// (the number of a statement this device applied) on the chain of a
+    /// change removing the key, the cut time, or `None` where no change on
+    /// its chain has a time. **The filler lists every generation of that
+    /// chain,** the one the change was made after and each earlier one this
+    /// device applied, each with the cut time: an act taken in a
+    /// generation that is not listed is taken as taken in a generation
+    /// made apart from the removal, and counts for nothing; one taken in a
+    /// listed generation counts for nothing at or after its cut time, or
+    /// at any time where there is none.
     Times(Vec<(u64, Option<i64>)>),
 }
 

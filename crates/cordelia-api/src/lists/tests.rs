@@ -622,7 +622,8 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
         Removed(Cut::Times(vec![(3, Some(cut_at))])),
     );
     // Taken before the cut in generation 3, after it there, and in
-    // generation 2, which the removal was not made after.
+    // generation 2, which the filler does not list: one made apart from
+    // the removal, since it lists every generation of the removal's chain.
     let mut takings = Takings::now(Taken {
         generation: 3,
         taken_at: cut_at + 5,
@@ -667,6 +668,16 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
     );
     let computed = compute(&of, &none, &takings, Bounds::OF_A_LIST);
     assert!(computed.written.is_empty());
+    // Listed as an earlier generation of the removal's chain, generation
+    // 2 counts before its cut time.
+    let chain = Makers::new(
+        Counting::of_devices(&[laptop.public_key(), desktop.public_key()]),
+        Removed(Cut::Times(vec![(2, Some(cut_at)), (3, Some(cut_at))])),
+    );
+    let computed = compute(&of, &chain, &takings, Bounds::OF_A_LIST);
+    assert!(in_force_of(&computed, &apart));
+    assert!(in_force_of(&computed, &before));
+    assert!(!in_force_of(&computed, &after));
     // Today: by the statement alone, every act taken counts.
     let today = makers_by_statement(&laptop, &tablet);
     let computed = compute(&of, &today, &takings, Bounds::OF_A_LIST);
