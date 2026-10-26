@@ -75,7 +75,7 @@ pub struct Facts {
     pub projects_waiting: usize,
     /// Where the device stands under a recovery phrase, as the node says
     /// it: `no_phrase`, `applied`, or why it has stopped (`fork`,
-    /// `removed`, `not_listed`, `not_opened`). Empty where the node did
+    /// `removed`, `not_listed`, `not_opened`, `closed`). Empty where the node did
     /// not say.
     pub stands: String,
     /// Folders the last cycle synced or is waiting to sync.
@@ -385,6 +385,8 @@ fn stopped_says(stands: &str) -> Option<&'static str> {
         "removed" => "memory not syncing: this device was removed",
         "not_listed" => "memory not syncing: not in the last change",
         "not_opened" => "memory not syncing: a change could not be opened",
+        // Decision 2026-10-24 (removal), rule 10.
+        "closed" => "memory not syncing: a removed device holds this change's secret",
         _ => return None,
     })
 }
@@ -2734,6 +2736,7 @@ mod tests {
             ("removed", "this device was removed"),
             ("not_listed", "not in the last change"),
             ("not_opened", "a change could not be opened"),
+            ("closed", "a removed device holds this change's secret"),
         ] {
             assert_eq!(
                 stands(stopped),

@@ -114,16 +114,35 @@ pub enum Stands {
     /// It follows a phrase, and has stopped or is in a fork: it neither
     /// sends in its own channels nor takes from them (§4.3, §4.5).
     Stopped(State),
+    /// It has applied a statement, and the change it follows is not clear:
+    /// a key it knows to be removed holds its secret (decision 2026-10-24
+    /// (removal), rules 3, 4 and 10). It seals nothing, sends nothing and
+    /// takes nothing in a channel of its own, and shows each relay its
+    /// change entry, as a device in a fork does. It is worked out from what
+    /// the device knows, and is stored nowhere.
+    Closed,
     /// It has applied a statement, and is a device under it.
     Applied,
 }
 
-/// Where this device stands. It is read from the one row, and nothing is
-/// checked: whoever goes on to read a channel checks what it reads.
+/// Where this device stands. It is read from the one row, and, where the
+/// device has applied a statement, from what it knows of removals
+/// (decision 2026-10-24 (removal), rule 3): so a device is closed from
+/// the commit that keeps a removed key or a record that hands one the
+/// secret, and not from a later pass (rule 5). Whether the change is clear
+/// is worked out once for each write that can change it, and read after
+/// that from one row ([`crate::person::follows_a_clear_change`]). The
+/// statement is not checked again here: whoever goes on to read a channel
+/// checks what it reads.
 pub fn stands(conn: &Connection) -> Result<Stands, PersonError> {
     Ok(match held_rows::person(conn)? {
         None => Stands::NoPhrase,
-        Some(person) if person.state == State::Applied => Stands::Applied,
+        Some(person) if person.state == State::Applied => {
+            match crate::person::follows_a_clear_change(conn)? {
+                true => Stands::Applied,
+                false => Stands::Closed,
+            }
+        }
         Some(person) => Stands::Stopped(person.state),
     })
 }
@@ -290,8 +309,10 @@ impl Own {
 /// where the node's settings hold no Claude Code directory, nothing of it
 /// is proved, pulled or pushed.
 ///
-/// None for a device that follows no phrase, has stopped, or is in a
-/// fork: it neither sends in a channel of its own nor takes from one.
+/// None for a device that follows no phrase, has stopped, is in a fork,
+/// or is closed: it neither sends in a channel of its own nor takes from
+/// one, and sends nothing it wrote in a pair channel (decision 2026-10-24
+/// (removal), rule 5).
 pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, PersonError> {
     if stands(conn)? != Stands::Applied {
         return Ok(Vec::new());

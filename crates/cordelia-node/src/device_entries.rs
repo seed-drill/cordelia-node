@@ -1137,9 +1137,12 @@ impl DeviceEntries {
                 return;
             }
         };
-        // A device in a fork shows its own entry; one that has stopped
-        // otherwise shows none.
-        let shows = matches!(stands, Stands::Applied | Stands::Stopped(State::Fork));
+        // A device in a fork, or closed, shows its own entry; one that has
+        // stopped otherwise shows none.
+        let shows = matches!(
+            stands,
+            Stands::Applied | Stands::Closed | Stands::Stopped(State::Fork)
+        );
         let each: Vec<_> = relays
             .iter()
             .map(|relay| {
@@ -1942,6 +1945,13 @@ impl DeviceEntries {
                     relay,
                     ?stopped,
                     "a relay holds a change by which this device stops"
+                );
+                false
+            }
+            Ok(Answered::Shown(Shown::NotClear)) => {
+                tracing::warn!(
+                    relay,
+                    "a relay holds a change that lists a device this device knows was removed: it is not applied, and what it removes is kept"
                 );
                 false
             }
@@ -3063,6 +3073,7 @@ impl DeviceEntries {
             Stands::Stopped(State::NotListed) => Some(CannotGoOn::NotListed),
             Stands::Stopped(State::Fork) => Some(CannotGoOn::Fork),
             Stands::Stopped(State::NotOpened) => Some(CannotGoOn::NotOpened),
+            Stands::Closed => Some(CannotGoOn::Closed),
             Stands::Stopped(State::Applied) | Stands::Applied => {
                 kept.not_applied
                     .as_ref()

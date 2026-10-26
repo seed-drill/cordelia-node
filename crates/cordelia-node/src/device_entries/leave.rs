@@ -312,6 +312,9 @@ pub enum NoLeave {
     NoPhrase,
     /// The device has stopped, or is in a fork.
     Stopped(State),
+    /// The device is closed: the change it follows is not clear
+    /// (decision 2026-10-24 (removal), rules 5 and 10).
+    Closed,
     /// The device was answered with a change that it could not apply.
     NotApplied,
     /// No answer on this connection gives leave now: none was had, or the
@@ -682,12 +685,7 @@ impl Leave {
         if inner.not_applied {
             return Err(NoLeave::NotApplied);
         }
-        match at_relays::stands(conn) {
-            Ok(Stands::Applied) => {}
-            Ok(Stands::NoPhrase) => return Err(NoLeave::NoPhrase),
-            Ok(Stands::Stopped(state)) => return Err(NoLeave::Stopped(state)),
-            Err(_) => return Err(NoLeave::NotGiven),
-        }
+        stands_applied(conn)?;
         let Some(given) = inner.given.get(&link.id()) else {
             return Err(NoLeave::NotGiven);
         };
@@ -1223,12 +1221,31 @@ impl Leave {
     }
 
     /// Whether the device still keeps the change entry named `under` as
-    /// the latest: the one that a request was built under.
+    /// the latest, the one that a request was built under, and still
+    /// stands where it may use a connection: what [`Self::has`] asks of
+    /// where it stands, and not the entry's ID alone. So a request built
+    /// before the commit that closed the device is not written once its
+    /// stream is open (decision 2026-10-24 (removal), rule 5).
     fn keeps(&self, conn: &Connection, under: &[u8; 32]) -> Result<(), Refused> {
+        stands_applied(conn).map_err(Refused::NoLeave)?;
         match at_relays::kept_id(conn) {
             Ok(Some(kept)) if kept == *under => Ok(()),
             _ => Err(Refused::KeptAnother),
         }
+    }
+}
+
+/// Whether the device stands where it may use a connection for a channel
+/// of its own: it has applied a statement, has not stopped, and the change
+/// it follows is clear (decision 2026-10-24 (removal), rules 5 and 10).
+/// Where its database cannot be read, it is taken not to.
+fn stands_applied(conn: &Connection) -> Result<(), NoLeave> {
+    match at_relays::stands(conn) {
+        Ok(Stands::Applied) => Ok(()),
+        Ok(Stands::NoPhrase) => Err(NoLeave::NoPhrase),
+        Ok(Stands::Stopped(state)) => Err(NoLeave::Stopped(state)),
+        Ok(Stands::Closed) => Err(NoLeave::Closed),
+        Err(_) => Err(NoLeave::NotGiven),
     }
 }
 
@@ -1320,6 +1337,36 @@ fn refusals_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check once a stream is open asks where the device stands, as
+    /// `has` asks it, and not only which change entry it keeps (decision
+    /// 2026-10-24 (removal), rule 5): from the commit that closes the
+    /// device, a request built before it is not written, though the device
+    /// keeps the same entry.
+    #[test]
+    fn a_request_built_before_the_device_closed_is_not_written() {
+        let conn = cordelia_storage::db::open_in_memory().unwrap();
+        let identity = cordelia_crypto::identity::NodeIdentity::from_seed([0x44; 32]).unwrap();
+        let phrase = cordelia_crypto::phrase::Phrase::parse(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        cordelia_api::person::first_statement(&conn, &identity, &phrase, "laptop", 1).unwrap();
+        let under = at_relays::kept_id(&conn).unwrap().unwrap();
+        let leave = Leave::new(Clock::system());
+        assert_eq!(stands_applied(&conn), Ok(()));
+        assert_eq!(leave.keeps(&conn, &under), Ok(()));
+
+        // Its own key is kept as removed, set so by hand: the change it
+        // follows is not clear, and the entry it keeps is the same.
+        cordelia_storage::person::keep_removed(&conn, &[identity.public_key()], 2).unwrap();
+        assert_eq!(at_relays::kept_id(&conn).unwrap(), Some(under));
+        assert_eq!(stands_applied(&conn), Err(NoLeave::Closed));
+        assert_eq!(
+            leave.keeps(&conn, &under),
+            Err(Refused::NoLeave(NoLeave::Closed))
+        );
+    }
 
     /// What a relay refused for now before the window is forgotten as it
     /// refuses again: a relay that refuses request after request, and is

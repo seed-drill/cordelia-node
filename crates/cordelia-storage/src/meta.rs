@@ -118,6 +118,12 @@ pub const PERSON_NOT_SHOWN: &str = "person.not_shown";
 /// gone by, and the list goes when the device leaves its phrase.
 pub const PERSON_WORDS_TAKEN: &str = "person.words_taken";
 
+/// `"1"` where a change this device saw would have had it keep more keys
+/// as removed than `MAX_KNOWN_REMOVED` (decision 2026-10-24 (removal),
+/// rule 2): the device is then closed, which fails closed. It goes, with
+/// the removed keys, when the device leaves its phrase.
+pub const PERSON_REMOVED_PAST_BOUND: &str = "person.removed_past_bound";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

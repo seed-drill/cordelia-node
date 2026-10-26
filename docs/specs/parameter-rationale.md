@@ -1780,6 +1780,49 @@ record that counts is never dropped for room.
 **Why 256:** chosen with the other bounds of 256 here; no measurement
 behind it yet.
 
+#### MAX_CHANGE_HEADS = 8
+
+**Rationale:** The heads of a person's changes that a device keeps (the
+change it follows and up to seven set aside), and that a relay keeps in a
+slot (decision 2026-10-24 (removal), rules 1 and 14). Only the phrase makes
+a head, and an honest person has two at most, now and then: eight is room
+for a phrase used on several devices that had not met, and a ninth closes
+the device, which fails closed.
+
+**Why 8:** chosen as room to spare over two; no measurement behind it yet.
+
+#### MAX_KNOWN_REMOVED = 2,048
+
+**Derivation:** `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`: the removed
+keys of every head a device keeps, each at its bound.
+
+**Rationale:** A device keeps every key that any change it has seen and
+checked lists as removed, on any branch, and never takes one out (decision
+2026-10-24 (removal), rule 2). It seals only under a secret that none of
+them holds, and takes nothing that one of them signs. Each statement
+already lists every key removed on its own chain, so the keys of the heads
+are all there are. Past the bound the device is closed: it seals and sends
+nothing, which fails closed.
+
+#### MAX_KNOWN_HOLDERS = 2,048
+
+**Rationale:** The keys that a device keeps as holding the secret of one
+change because a record of an addition under that change adds them
+(decision 2026-10-24 (removal), rule 3). They are kept apart from the
+records: the bound of `MAX_NOT_COUNTED_RECORDS` drops a record, and never
+its key from here, since a key whose record went still holds the secret
+it was handed. A change whose holders include a removed key is not clear,
+and nothing is sealed under it. Past the bound the change is not clear,
+which fails closed.
+
+**What it costs:** only a key that counts under a change writes a record
+that a device keeps, but any such key can sign records for 2,049 keys and
+close every device that follows that change, a stolen device among them
+before its removal is known. The way on is a change made with the phrase.
+
+**Why 2,048:** as `MAX_KNOWN_REMOVED`, and eight times the records a
+device keeps as not counted; no measurement behind it yet.
+
 #### KEPT_OUT_PER_ADDER = 3
 
 **Derivation:** the lesser of

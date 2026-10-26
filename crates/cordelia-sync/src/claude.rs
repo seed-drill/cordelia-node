@@ -777,7 +777,11 @@ impl ClaudeAdapter {
             let folder = memory.display().to_string();
             let result = match stands {
                 // Nothing syncs: the folder is listed, and left as it is.
-                Stands::NoPhrase | Stands::Stopped(_) => Ok(FolderReport::default()),
+                // A closed device keeps new content in its folders, and
+                // publishes nothing (decision 2026-10-24 (removal), rule 10).
+                Stands::NoPhrase | Stands::Stopped(_) | Stands::Closed => {
+                    Ok(FolderReport::default())
+                }
                 Stands::Applied => match name_channel(state, &folder, &target.name, generation) {
                     Ok(Channel::Ready(channel)) => {
                         syncing.push((folder, channel.clone()));
@@ -948,6 +952,10 @@ fn publishes_nothing(stands: Stands, moved_on: bool) -> Option<String> {
         Stands::Stopped(_) => {
             "a change could not be opened on this device: memory stays on this machine until \
              it is added again from a device that has the change."
+        }
+        Stands::Closed => {
+            "a device that was removed holds the secret of the change this device follows: \
+             memory stays on this machine. `cordelia devices` says the way on."
         }
     };
     Some(why.to_string())

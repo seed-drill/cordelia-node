@@ -1466,6 +1466,32 @@ pub const KEPT_OUT_PER_ADDER: usize = {
 // that the 64 kept out, in both bounds.
 const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
 
+/// The heads of a person's changes that a device keeps, and that a relay
+/// keeps in a slot (decision 2026-10-24 (removal), rules 1 and 14): the
+/// change a device follows and up to seven set aside. Only the phrase
+/// makes a head, and an honest person has two at most, now and then. The
+/// heads themselves are kept from a later slice of the build; this one
+/// bounds what a device knows of removals ([`MAX_KNOWN_REMOVED`]).
+pub const MAX_CHANGE_HEADS: usize = 8;
+
+/// The most keys a device keeps as removed (decision 2026-10-24
+/// (removal), rule 2): every key that a change it has seen and checked
+/// lists as removed, on any branch. They only grow. Past the bound the
+/// device is closed: it seals nothing and sends nothing, which fails
+/// closed.
+/// Derived: MAX_STATEMENT_REMOVED x MAX_CHANGE_HEADS, the removed keys of
+/// every head a device keeps, each at its bound.
+pub const MAX_KNOWN_REMOVED: usize = MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS;
+
+/// The most keys a device keeps as holding the secret of one change
+/// because a record of an addition under it adds them (decision
+/// 2026-10-24 (removal), rule 3), apart from the records themselves and
+/// their bound of MAX_NOT_COUNTED_RECORDS. Past it the change is not
+/// clear, which fails closed. Only a key that counts under the change
+/// writes a record that a device keeps, but any key that counts can push
+/// past it, a stolen device among them before its removal is known.
+pub const MAX_KNOWN_HOLDERS: usize = 2048;
+
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
 /// forgotten. It is for a carry that a person asks for.
@@ -3368,6 +3394,20 @@ mod tests {
         assert_eq!(MAX_NOT_COUNTED_RECORDS, 256);
         assert_eq!(MAX_COUNTED_DEVICES, 64);
         assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
+    }
+
+    /// What a device keeps of removals (decision 2026-10-24 (removal),
+    /// rules 2 and 3, section 11): eight heads, the removed keys of every
+    /// head at its bound, and 2,048 keys that records add under one change.
+    #[test]
+    fn test_what_a_device_keeps_of_removals_decision_2026_10_24_removal_11() {
+        assert_eq!(MAX_CHANGE_HEADS, 8);
+        assert_eq!(MAX_KNOWN_REMOVED, 2_048);
+        assert_eq!(MAX_KNOWN_REMOVED, MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS);
+        assert_eq!(MAX_KNOWN_HOLDERS, 2_048);
+        // The holders of one change are never fewer than the records it
+        // keeps of them, so the bound of records drops no holder first.
+        const { assert!(MAX_KNOWN_HOLDERS > MAX_NOT_COUNTED_RECORDS + MAX_COUNTED_DEVICES) };
     }
 
     /// Each adder that may add keeps its first three keys that the 64
