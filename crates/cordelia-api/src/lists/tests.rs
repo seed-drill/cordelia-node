@@ -589,6 +589,8 @@ fn an_act_whose_signature_fails_or_whose_maker_was_never_a_device_is_not_taken()
         named.passed_over.iter().collect::<Vec<_>>(),
         [&stranger.public_key()]
     );
+    // Nothing is kept of when this device took a stranger's act.
+    assert!(named.taken.is_empty());
 }
 
 // ── The cut of the removal record ────────────────────────────────────────
