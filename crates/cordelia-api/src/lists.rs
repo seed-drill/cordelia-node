@@ -583,13 +583,24 @@ impl Computed {
             .any(|act| act.key() == *key && !act.undoes())
     }
 
-    /// Whether a valid act of a kind in force is carried on `key`: a
-    /// filing, a subscribe or a label of an item that has none is a new
-    /// item, which a full part refuses (§3.4).
-    fn has_one_in_force(&self, key: &Key) -> bool {
-        self.valid
-            .get(key)
-            .is_some_and(|acts| acts.iter().any(|act| !act.undoes()))
+    /// Whether a filing, a subscribe or a label on `key`, in `part`, takes
+    /// no new place there (§3.4): the newest valid act on the item is of a
+    /// kind in force, written (the new act takes its place) or past a
+    /// bound (an act on an item past a bound is never refused for room);
+    /// or it is an undo kept for something that the device writes in that
+    /// same part, whose place the new act takes. Any other is a new item,
+    /// which a full part refuses: a drop is in another part than the
+    /// filings, so a filing of a dropped channel takes a new place among
+    /// the 16, whatever older filing is carried below the drop.
+    fn holds_a_place(&self, key: &Key, part: usize) -> bool {
+        let Some(acts) = self.valid.get(key) else {
+            return false;
+        };
+        let newest = &acts[0];
+        !newest.undoes()
+            || (newest.part() == part
+                && kept_for_something(acts)
+                && self.written.iter().any(|act| act.key() == *key))
     }
 
     /// The items in force and the undoes kept for something that the
@@ -939,9 +950,9 @@ fn decide(
     };
     // A filing, a subscribe or a label of a new item is refused where its
     // part holds its bound of items in force and undoes kept for
-    // something; an act on an item that has one takes its place.
+    // something; an act on an item that holds a place takes that place.
     let room = |key: &Key, part: usize, bound: usize, as_part: Part| {
-        if computed.has_one_in_force(key) {
+        if computed.holds_a_place(key, part) {
             return Ok(());
         }
         let (placed, devices) = computed.placed(part);

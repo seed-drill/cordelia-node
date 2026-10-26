@@ -1128,6 +1128,102 @@ fn an_undo_of_nothing_never_pushes_out_what_is_in_force() {
     );
 }
 
+/// A filing, a subscribe or a label takes a new place, and is refused
+/// where its part is full, unless the newest valid act on its item is of
+/// a kind in force or an undo kept for something written in that part
+/// (decision 2026-10-10 §3.4, "What a new act is refused for"): so none
+/// pushes out an item in force. A filing of a channel whose drop is kept
+/// for something takes a new place, since the drop is kept among the
+/// drops; so does a subscribe over an undo of nothing, and one over an
+/// undo kept for something that a bound left out.
+#[test]
+fn an_act_on_an_item_that_holds_no_place_is_refused_for_room() {
+    // A filing of a dropped channel, at the real bounds: the desktop's
+    // filing of it is still carried, below the laptop's drop.
+    let s = person(2, 2);
+    let now = s.now + 10;
+    on(&s, 1, Do::File(filing(50, "x")), now + 1);
+    fetch_from(&s, &[1], 0, now + 2);
+    on(&s, 0, Do::Drop(channel(50)), now + 3);
+    for seed in 0..16 {
+        on(&s, 0, Do::File(filing(seed, &format!("c{seed}"))), now + 4);
+    }
+    assert_eq!(
+        refused(&s, 0, Do::File(filing(50, "x")), now + 5),
+        Refused::Full {
+            part: Part::Channel,
+            devices: Vec::new()
+        }
+    );
+    let names = filed(&s, 0);
+    assert_eq!(names.len(), 16);
+    assert!(names.iter().all(|name| name.starts_with('c')), "{names:?}");
+    // Once a place is free it is filed, and pushes out nothing.
+    on(&s, 0, Do::Drop(channel(0)), now + 6);
+    on(&s, 0, Do::File(filing(50, "x")), now + 7);
+    let names = filed(&s, 0);
+    assert_eq!(names.len(), 16);
+    assert!(names.contains(&"x".to_string()) && !names.contains(&"c0".to_string()));
+
+    // A subscribe over an undo of nothing, at the real bound of 32.
+    let (person, desktop, phone, old) = (device(1), device(2), device(3), device(4));
+    let makers = makers(&[&person, &desktop, &phone], &[&old]);
+    let full: Vec<AnyAct> = (0..32)
+        .map(|n| sub(100 + n, true, &person, 100 + u64::from(n)))
+        .collect();
+    let mut person_list = full.clone();
+    person_list.push(sub(50, false, &person, 30));
+    let of = lists(&[
+        (&person, person_list),
+        (&desktop, vec![sub(50, false, &old, 20)]),
+        (&phone, vec![sub(50, true, &old, 10)]),
+    ]);
+    let again = Do::Subscribe(subscription(50, "a", true));
+    let computed = work(&of, &makers, Bounds::OF_A_LIST);
+    assert_eq!(
+        decide(&computed, &makers, &person, &again, 9_000),
+        Err(Refused::Full {
+            part: Part::Subscription,
+            devices: Vec::new()
+        })
+    );
+    // An undo kept for something, past the bound: the person's 32 newer
+    // subscriptions rank above it, so it holds no place.
+    let mut person_list = full.clone();
+    person_list.push(sub(50, false, &person, 20));
+    let of = lists(&[
+        (&person, person_list),
+        (&phone, vec![sub(50, true, &old, 10)]),
+    ]);
+    let computed = work(&of, &makers, Bounds::OF_A_LIST);
+    assert!(
+        computed
+            .past_bound
+            .iter()
+            .any(|act| act.key() == again_key())
+    );
+    assert_eq!(
+        decide(&computed, &makers, &person, &again, 9_000),
+        Err(Refused::Full {
+            part: Part::Subscription,
+            devices: Vec::new()
+        })
+    );
+    // Written, that undo's place is the subscribe's: it is made.
+    let mut person_list: Vec<AnyAct> = full[1..].to_vec();
+    person_list.push(sub(50, false, &person, 20));
+    let of = lists(&[
+        (&person, person_list),
+        (&phone, vec![sub(50, true, &old, 10)]),
+    ]);
+    let computed = work(&of, &makers, Bounds::OF_A_LIST);
+    assert!(decide(&computed, &makers, &person, &again, 9_000).is_ok());
+
+    fn again_key() -> Key {
+        (Part::Subscription, subscription(50, "a", true).item())
+    }
+}
+
 /// With three lists over a bound of filings and drops, the drop a device
 /// makes is written first among the drops kept for something, and its
 /// channel is not in force in that computation or the next (decision
