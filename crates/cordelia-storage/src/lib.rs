@@ -23,6 +23,7 @@ pub mod search;
 pub mod shared;
 pub mod shared_lists;
 pub mod shared_pass;
+pub mod shared_sharing;
 pub mod sync_state;
 pub mod usage;
 

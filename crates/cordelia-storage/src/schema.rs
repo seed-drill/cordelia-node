@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1210,6 +1210,62 @@ CREATE TABLE shared_take_out_keys (
 );
 "#;
 
+/// Migration v24: what a device keeps of making, sharing and taking a
+/// shared channel (decision 2026-10-10 §3.1, §3.2, §14). Each column takes
+/// only its type and its bound.
+///
+/// - `shared_typed_keys`: each key a person typed at `cordelia accept
+///   --channel`, with the name it is to be filed under, when it was typed,
+///   when a share was taken under it and of which channel, and what became
+///   of it (a word, and what the line of that word names): counted apart
+///   from the keys typed to join devices.
+/// - `shared_shares`: each share this device wrote, by the key it is for
+///   and the channel it hands: its share pair channel, the card's relays
+///   (in their one form: 33 or 65 bytes), its revision, the time it says,
+///   and whether a delete was written over it.
+/// - `shared_share_sent`: what each relay answered a push of a share, or of
+///   the delete over it, at which revision.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V24: &str = r#"
+CREATE TABLE shared_typed_keys (
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    name      TEXT NOT NULL CHECK(typeof(name) = 'text'
+                                  AND length(CAST(name AS BLOB)) >= 1
+                                  AND length(CAST(name AS BLOB)) <= 200),
+    typed_at  INTEGER NOT NULL CHECK(typeof(typed_at) = 'integer'),
+    taken_at  INTEGER CHECK(taken_at IS NULL OR typeof(taken_at) = 'integer'),
+    channel   BLOB CHECK(channel IS NULL OR (typeof(channel) = 'blob' AND length(channel) = 32)),
+    became    TEXT CHECK(became IS NULL
+                         OR (typeof(became) = 'text' AND length(CAST(became AS BLOB)) <= 64)),
+    detail    TEXT CHECK(detail IS NULL
+                         OR (typeof(detail) = 'text' AND length(CAST(detail AS BLOB)) <= 1024)),
+    CHECK((taken_at IS NULL) = (channel IS NULL))
+);
+
+CREATE TABLE shared_shares (
+    key      BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    channel  BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    pair     BLOB NOT NULL CHECK(typeof(pair) = 'blob' AND length(pair) = 32),
+    relays   BLOB NOT NULL CHECK(typeof(relays) = 'blob' AND length(relays) IN (33, 65)),
+    rev      INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                    AND rev >= 0 AND rev <= 9007199254740991),
+    made     INTEGER NOT NULL CHECK(typeof(made) = 'integer'),
+    gone     INTEGER NOT NULL DEFAULT 0 CHECK(gone IN (0, 1)),
+    PRIMARY KEY (key, channel)
+);
+
+CREATE TABLE shared_share_sent (
+    key      BLOB NOT NULL,
+    channel  BLOB NOT NULL,
+    relay    BLOB NOT NULL CHECK(typeof(relay) = 'blob' AND length(relay) = 32),
+    rev      INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                    AND rev >= 0 AND rev <= 9007199254740991),
+    FOREIGN KEY (key, channel) REFERENCES shared_shares(key, channel) ON DELETE CASCADE,
+    PRIMARY KEY (key, channel, relay)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1442,6 +1498,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 23 {
         tracing::info!("applying migration v23 (what the shared pass keeps)");
         migrate_in_one(conn, MIGRATION_V23, 23)?;
+    }
+
+    if current < 24 {
+        tracing::info!("applying migration v24 (making, sharing and taking a shared channel)");
+        migrate_in_one(conn, MIGRATION_V24, 24)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -4828,7 +4889,7 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 23, own: 20 })
+                Err(StorageError::LaterVersion { found: 24, own: 20 })
             ),
             "{refused:?}"
         );
@@ -4883,6 +4944,7 @@ mod tests {
              WHERE (name LIKE 'shared%' OR name LIKE 'idx_shared%')
                AND name NOT LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
                AND name NOT LIKE 'shared_relay_%' AND name NOT LIKE 'shared_take_out_%'
+               AND name NOT LIKE 'shared_typed_%' AND name NOT LIKE 'shared_share%'
              ORDER BY name",
         )
         .unwrap()
@@ -4904,6 +4966,7 @@ mod tests {
         everything_but(conn, |name| {
             NEW_IN_V22.contains(&name)
                 || NEW_IN_V23.contains(&name)
+                || NEW_IN_V24.contains(&name)
                 || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
         })
     }
@@ -4936,7 +4999,10 @@ mod tests {
     fn everything_but_v23(conn: &Connection) -> Vec<String> {
         everything_but(conn, |name| {
             NEW_IN_V23.contains(&name)
+                || NEW_IN_V24.contains(&name)
                 || name.starts_with("sqlite_autoindex_shared_relay_")
+                || name.starts_with("sqlite_autoindex_shared_typed_")
+                || name.starts_with("sqlite_autoindex_shared_share")
                 || name.starts_with("sqlite_autoindex_shared_take_out_")
         })
     }
@@ -4976,9 +5042,8 @@ mod tests {
             new_in_v23(&conn).is_empty(),
             "the tables go with the version"
         );
-        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
         assert_eq!(version(&conn), 23);
-        assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v23(&conn), NEW_IN_V23);
         assert_eq!(everything_but_v23(&conn), before);
 
@@ -5040,6 +5105,127 @@ mod tests {
             "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), 0, 1)",
             "INSERT INTO shared_take_out_channels VALUES (1, 1)",
             "INSERT INTO shared_take_out_keys VALUES (1, zeroblob(32), 0)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 24 adds: three tables.
+    const NEW_IN_V24: [&str; 3] = ["shared_share_sent", "shared_shares", "shared_typed_keys"];
+
+    /// What a database holds of the step to version 24, by name.
+    fn new_in_v24(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE 'shared_typed_%' OR name LIKE 'shared_share%')
+               AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// The step to version 24 (decision 2026-10-10 §3.1, §3.2, §14): from a
+    /// database at step 23 that holds rows of the steps before it, it adds
+    /// the tables of the keys typed for channels and of the shares this
+    /// device wrote, empty, and changes no older row or definition; a
+    /// failure leaves none of it, and the step asked for twice is run once.
+    /// Each column takes only its type and its bound.
+    #[test]
+    fn step_24_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v20();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);
+             INSERT INTO shared_take_out_channels (channel, how) VALUES (1, 3);",
+        )
+        .unwrap();
+        let but = |conn: &Connection| {
+            everything_but(conn, |name| {
+                NEW_IN_V24.contains(&name)
+                    || name.starts_with("sqlite_autoindex_shared_typed_")
+                    || name.starts_with("sqlite_autoindex_shared_share")
+            })
+        };
+        let before = but(&conn);
+        assert!(new_in_v24(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V24} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 24).is_err());
+        assert_eq!(version(&conn), 23);
+        assert!(
+            new_in_v24(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 24);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v24(&conn), NEW_IN_V24);
+        assert_eq!(but(&conn), before);
+
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V24
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 3]);
+        conn.execute_batch(
+            "INSERT INTO shared_typed_keys (key, name, typed_at) VALUES (zeroblob(32), 'r', 9);
+             INSERT INTO shared_shares (key, channel, pair, relays, rev, made)
+                 VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9);
+             INSERT INTO shared_share_sent (key, channel, relay, rev)
+                 VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9);",
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [1; 3]);
+        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(but(&conn), before);
+
+        conn.execute_batch(
+            "DELETE FROM shared_share_sent; DELETE FROM shared_shares;
+             DELETE FROM shared_typed_keys;",
+        )
+        .unwrap();
+        let refused = [
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(31), 'r', 9, NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), '', 9, NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 'nine', NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, NULL, zeroblob(32), NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(31), NULL, NULL)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(34), 9, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), -1, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9007199254740992, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9, 2)",
+            "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
+        ];
+        for refused in refused {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(32), 'taken', NULL)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(65), 9, 9, 1)",
+            "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
         ] {
             assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
         }
