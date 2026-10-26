@@ -153,7 +153,7 @@ impl Knows {
         let mut labels: Vec<_> = crate::lists::holds(conn)?
             .labels
             .into_iter()
-            .filter(|(act, maker)| maker.in_force() && act.item.label.is_some())
+            .filter(|(act, _)| act.item.label.is_some())
             .map(|(act, _)| act)
             .collect();
         labels.sort_by_key(|act| (act.time, act.count, act.maker));
@@ -376,12 +376,12 @@ pub fn index(
 /// counts may have changed: at an act, at a whole fetch, where the door
 /// applied a statement or a key came to count, and in the hourly task. A
 /// device that follows no phrase keeps nothing.
-pub fn keep(conn: &Connection, now: i64) -> Result<(), PersonError> {
+pub fn keep(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonError> {
     in_one(conn, || {
         let Some(held) = held(conn)? else {
             return Ok(());
         };
-        follow_the_lists(conn, now)?;
+        follow_the_lists(conn, own, now)?;
         let knows = Knows::of(conn, &held)?;
         let seen = kept::labelled(conn)?;
         let newly_labelled = knows.labels.iter().any(|key| !seen.contains(key));
@@ -407,20 +407,16 @@ pub fn keep(conn: &Connection, now: i64) -> Result<(), PersonError> {
 /// Hold each channel filed in force; take every entry of a channel
 /// dropped or moved from out of the store, with every row of a drop and
 /// every row but the index of a move; forget a channel the lists hold no
-/// act on, its drop freed (decision 2026-10-10 §3.4, §6.3). Of the
-/// channels moved from, the index stays for the 16 moved from last.
-fn follow_the_lists(conn: &Connection, now: i64) -> Result<(), PersonError> {
-    let holds = crate::lists::holds(conn)?;
-    let filed: Vec<_> = holds
-        .filings
-        .iter()
-        .filter(|(_, maker)| maker.in_force())
-        .map(|(act, _)| &act.item)
-        .collect();
+/// valid act on (decision 2026-10-10 §3.4, §6.3). What is in force, and
+/// what a bound leaves out, is worked out from the lists the device reads
+/// (`lists::holds_worked_out`). Of the channels moved from, the index
+/// stays for the 16 moved from last.
+fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonError> {
+    let holds = crate::lists::holds_worked_out(conn, own, now)?;
+    let filed: Vec<_> = holds.filings.iter().map(|(act, _)| &act.item).collect();
     let dropped: Vec<[u8; 32]> = holds
         .drops
         .iter()
-        .filter(|(_, maker)| maker.in_force())
         .map(|(act, _)| act.item.channel)
         .collect();
     let mut anywhere: Vec<[u8; 32]> = holds
@@ -591,8 +587,8 @@ pub struct Hourly {
 /// again; then what has expired, or is not live, goes from the index; and
 /// where a key was let go, the table is kept again, so that what waits of
 /// a key now shown in its place is opened.
-pub fn hourly(conn: &Connection, now: i64) -> Result<Hourly, PersonError> {
-    keep(conn, now)?;
+pub fn hourly(conn: &Connection, own: &[u8; 32], now: i64) -> Result<Hourly, PersonError> {
+    keep(conn, own, now)?;
     in_one(conn, || {
         let mut done = Hourly::default();
         for row in kept::channels(conn)? {
@@ -626,7 +622,7 @@ pub fn hourly(conn: &Connection, now: i64) -> Result<Hourly, PersonError> {
         // A key let go takes no place among the 64 shown: what waits of a
         // key that comes to be shown in its place is opened.
         if done.let_go > 0 {
-            keep(conn, now)?;
+            keep(conn, own, now)?;
         }
         Ok(done)
     })
@@ -1102,7 +1098,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         let list = cordelia_crypto::acts::SharedList {
-            fetched: u64::try_from(now).unwrap(),
             labels: vec![act_by_laptop],
             ..Default::default()
         };
@@ -1270,7 +1265,7 @@ pub(crate) mod tests {
         // channel is read again.
         let later = now + 30 * DAY;
         assert!(read_again_due(&s[0].conn, later).unwrap().is_empty());
-        assert_eq!(hourly(&s[0].conn, later).unwrap().let_go, 963);
+        assert_eq!(hourly(&s[0].conn, &s.key(0), later).unwrap().let_go, 963);
         assert_eq!(held_of_others(&s, 0, &channel, &known), 0);
         assert_eq!(read_again_due(&s[0].conn, later).unwrap(), [channel.id]);
         read_again_begun(&s[0].conn, &channel.id, later).unwrap();
@@ -1479,7 +1474,12 @@ pub(crate) mod tests {
         let again = anew(&member(1_500), &channel, 2);
         stores(&s, 0, &again, now + 20 * DAY);
 
-        assert_eq!(hourly(&s[0].conn, now + 30 * DAY - 1).unwrap().let_go, 0);
+        assert_eq!(
+            hourly(&s[0].conn, &s.key(0), now + 30 * DAY - 1)
+                .unwrap()
+                .let_go,
+            0
+        );
         assert!(
             read_again_due(&s[0].conn, now + 30 * DAY)
                 .unwrap()
@@ -1493,7 +1493,12 @@ pub(crate) mod tests {
                 .any(|(waiting, _)| waiting == key)
         };
         assert!(waits(&member(1_500).public_key()));
-        assert_eq!(hourly(&s[0].conn, now + 30 * DAY).unwrap().let_go, 962);
+        assert_eq!(
+            hourly(&s[0].conn, &s.key(0), now + 30 * DAY)
+                .unwrap()
+                .let_go,
+            962
+        );
         // The key that wrote again is now shown, and what waited of it was
         // opened.
         assert!(!waits(&member(1_500).public_key()));
@@ -1626,8 +1631,8 @@ pub(crate) mod tests {
     /// drop the device holds no entry and no row of that channel; at a move
     /// it holds no entry of the old channel, and shows its index rows until
     /// they expire, for the 16 channels moved from last. Neither's entries
-    /// are taken any more. Ninety days on, the device frees the drop and
-    /// forgets the seed.
+    /// are taken any more, ninety days on or a year on: a drop is never let
+    /// go for its age.
     #[test]
     fn a_drop_or_a_move_takes_its_entries() {
         let s = bob(1);
@@ -1708,12 +1713,16 @@ pub(crate) mod tests {
         assert_eq!(indexed(&s, 0, &moved), 0);
         assert_eq!(indexed(&s, 0, &Shared::of(3)), 1);
 
-        // Ninety days on the drops are freed, and their seeds forgotten.
-        let later = now + 91 * DAY;
-        crate::lists::fetched_whole(&s[0].conn, &s[0].identity, later).unwrap();
-        assert!(kept::channel(&s[0].conn, &dropped.id).unwrap().is_none());
-        assert!(kept::channel(&s[0].conn, &moved.id).unwrap().is_none());
-        assert_eq!(row(&s, 0, &from).state, State::Held);
+        // Ninety days on, and a year on, the drops are still written: an
+        // undo is let go only past a bound, never for its age (§3.4), so
+        // the rows of a channel dropped stay while the device writes its
+        // drop, and nothing of it is taken.
+        for later in [now + 91 * DAY, now + 365 * DAY] {
+            crate::lists::fetched_whole(&s[0].conn, &s[0].identity, later).unwrap();
+            assert_eq!(row(&s, 0, &dropped).state, State::Dropped);
+            assert!(s[0].stored_in(&dropped.secret).is_empty());
+            assert_eq!(row(&s, 0, &from).state, State::Held);
+        }
     }
 
     /// A reader shows 64 keys, and 64 places an hour for the keys the
@@ -2012,14 +2021,15 @@ pub(crate) mod tests {
         assert_eq!(counted().overwritten, before + 1);
     }
 
-    /// What a maker in no list filed or labelled is not in force on this
+    /// What a maker in no list filed or labelled is passed over on this
     /// device (decision 2026-10-10 §3.4): the phone files a channel and
     /// labels Alice's key, and the desktop takes both from its list; once a
-    /// settlement leaves the phone in no list, the desktop holds the
-    /// channel by no act in force and takes nothing of it, and Alice's key
-    /// is no longer one Bob knows.
+    /// settlement leaves the phone in no list, its acts are passed over as
+    /// if no list carried them: a channel that no list carries a valid act
+    /// on keeps no entry and no row, and Alice's key is no longer one Bob
+    /// knows.
     #[test]
-    fn what_a_maker_in_no_list_filed_or_labelled_is_not_in_force_here() {
+    fn what_a_maker_in_no_list_filed_or_labelled_is_passed_over_here() {
         let mut s = bob(3);
         let (desktop, phone, laptop) = (0, 1, 2);
         let now = s.now + 10;
@@ -2046,7 +2056,14 @@ pub(crate) mod tests {
             given(&s, desktop, &change, now + 1),
             Taken::Shown(crate::person::Shown::Applied(_))
         ));
-        assert_eq!(row(&s, desktop, &channel).state, State::NotInForce);
+        // The phone's acts are passed over: no list carries a valid act on
+        // the channel, and the desktop keeps no entry and no row of it.
+        assert!(
+            kept::channel(&s[desktop].conn, &channel.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(s[desktop].stored_in(&channel.secret).is_empty());
         let held_by_desktop = held(&s[desktop].conn).unwrap().unwrap();
         assert!(
             !Knows::of(&s[desktop].conn, &held_by_desktop)
@@ -2058,8 +2075,6 @@ pub(crate) mod tests {
             given(&s, desktop, &entry, now + 1),
             Taken::Refused(NotTaken::AnotherChannel)
         );
-        // What it held of the channel stays.
-        assert_eq!(held_by(&s, desktop, &channel, &alice.public_key()).len(), 1);
     }
 
     /// A key with bytes refused that comes to count is read again (decision
@@ -2134,12 +2149,16 @@ pub(crate) mod tests {
             Taken::Refused(NotTaken::SharedFull)
         );
         let start = now + 30 * DAY;
-        assert_eq!(hourly(&s[0].conn, start).unwrap().let_go, 1);
+        assert_eq!(hourly(&s[0].conn, &s.key(0), start).unwrap().let_go, 1);
         assert_eq!(read_again_due(&s[0].conn, start).unwrap(), [channel.id]);
         read_again_begun(&s[0].conn, &channel.id, start).unwrap();
         for hour in 1..24 {
             let t = start + hour * HOUR;
-            assert_eq!(hourly(&s[0].conn, t).unwrap().let_go, 1, "{hour}");
+            assert_eq!(
+                hourly(&s[0].conn, &s.key(0), t).unwrap().let_go,
+                1,
+                "{hour}"
+            );
             assert!(read_again_due(&s[0].conn, t).unwrap().is_empty(), "{hour}");
             if hour == 2 {
                 labels(&s, 0, &member(77).public_key(), Some("a label"), t);
@@ -2234,7 +2253,12 @@ pub(crate) mod tests {
                  BEGIN INSERT INTO overwritten VALUES (CAST(old.body AS BLOB)); END;",
             )
             .unwrap();
-        assert_eq!(hourly(&s[0].conn, now + 30 * DAY - 1).unwrap().gone, 0);
+        assert_eq!(
+            hourly(&s[0].conn, &s.key(0), now + 30 * DAY - 1)
+                .unwrap()
+                .gone,
+            0
+        );
         // The node's hourly task runs the shared channels' part.
         crate::reader::hourly(&s[0].conn, &s[0].identity, now + 30 * DAY, false).unwrap();
         assert_eq!(indexed(&s, 0, &channel), 0);

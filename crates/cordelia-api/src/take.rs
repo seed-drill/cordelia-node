@@ -215,8 +215,12 @@ pub fn take(
                     ..
                 })
         );
-        if knows_anew {
-            crate::shared::keep(conn, now)?;
+        // The person's lists are worked out again, and the device's own
+        // written where it changed (§3.4, "What a device writes"), in a
+        // write of its own: an error there is logged, and takes back
+        // nothing of what was taken, a statement applied among it.
+        if knows_anew && let Err(e) = crate::lists::follow(conn, identity, now) {
+            tracing::warn!(error = %e, "could not work out the person's lists again");
         }
         Ok(taken)
     })?;
@@ -281,6 +285,15 @@ fn taken_as_its_own(
     if is_personal && stored != Outcome::OlderThanHeld {
         let again = stored == Outcome::AlreadyHeld;
         taken = record_in(conn, entry, &personal, again, now)?;
+    }
+    // A device's list stored: this device keeps when it first held each
+    // act the list brings (decision 2026-10-10 property 9). An error there
+    // is logged, and takes back nothing of the entry.
+    if is_personal && stored == Outcome::Stored {
+        let own = identity.public_key();
+        if let Err(e) = crate::lists::took(conn, &own, entry, &personal, now) {
+            tracing::warn!(error = %e, "could not keep when this device took the acts of a list");
+        }
     }
     // A record that was taken can let a key add: the one it adds, where
     // a device of the statement signed it. (A record that is not counted

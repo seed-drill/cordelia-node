@@ -327,8 +327,7 @@ parameter-rationale.md §12.13:
 | `SHARED_SEED_BYTES`, `SHARED_MAX_RELAYS` | 32, 2 (a card is the seed and one or two relays by key: 97 bytes at most) | parameter-rationale.md §12.13 |
 | `SHARED_MAX_CHANNELS`, `SHARED_MAX_DROPPED`, `SHARED_MAX_SUBSCRIPTIONS`, `SHARED_MAX_LABELS` | 16, 64, 32, 64 | parameter-rationale.md §12.13 |
 | `SHARED_LABEL_MAX_BYTES` | 64 (derived: `MAX_DEVICE_LABEL_BYTES`) | parameter-rationale.md §12.13 |
-| `SHARED_LIST_MAX_VALUE_BYTES` | 41,341 (derived: a device's list at every bound, which seals at 65,536) | parameter-rationale.md §12.13 |
-| `SHARED_WORDS_WRITTEN_AGAIN_DAYS` | 30 (derived: a third of `KEYED_TOMBSTONE_RETENTION_DAYS`) | parameter-rationale.md §12.13 |
+| `SHARED_LIST_MAX_VALUE_BYTES` | 41,333 (derived: a device's list at every bound, which seals at 65,536) | parameter-rationale.md §12.13 |
 | `SHARED_ACT_TIME_MAX` | 2^40 (the latest time and the highest count an act may say) | parameter-rationale.md §12.13 |
 | `SHARED_MAX_KEYS`, `SHARED_KEYS_KEPT` | 64, 1,024 | parameter-rationale.md §12.13 |
 | `SHARED_TAKE_OUT_STEP_ENTRIES` | 65 (derived: one key's entries, taken out of a device's store under one hold of its lock) | parameter-rationale.md §12.13 |
