@@ -11155,6 +11155,11 @@ async fn shared_traffic_never_refuses_a_devices_own_requests() {
     let requests = relay.requests();
     let pulls = shared_pulls(&requests, &channels);
     assert!(pulls.iter().filter(|c| **c == 0).count() >= 2, "{pulls:?}");
+    // In turn: each channel is asked for a page before any is asked for a
+    // second.
+    let first: std::collections::HashSet<usize> =
+        pulls[..SHARED_MAX_CHANNELS].iter().copied().collect();
+    assert_eq!(first.len(), SHARED_MAX_CHANNELS, "{pulls:?}");
     // Between two pages of one channel, each other at most one.
     for (at, channel) in pulls.iter().enumerate() {
         let Some(next) = pulls[at + 1..].iter().position(|c| c == channel) else {
@@ -11435,7 +11440,7 @@ async fn a_shared_proof_takes_no_place_a_channel_of_the_devices_own_needs() {
         let (shared, _) = device.files_shared("review", &[relay.key]);
         let own = [device.personal(), device.messages()];
         relay.hook(move |request| match request {
-            WireMessage::ChannelProve(prove) if own.contains(&prove.channel) => Some(Say::Reset),
+            WireMessage::ChannelProve(prove) if own.contains(&prove.channel) => Some(Say::NotNow),
             _ => None,
         });
         relay.requests();

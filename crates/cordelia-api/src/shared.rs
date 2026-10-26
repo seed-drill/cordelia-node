@@ -2616,7 +2616,8 @@ pub(crate) mod tests {
             assert_eq!(gone, 100);
             // The door stores nothing more of a key going, and the reader
             // shows nothing of it.
-            let going = &keys[keys.len() - 1];
+            // The first key still going: the next in the order shown.
+            let going = &keys[100];
             assert!(pass_rows::key_going(&conn, id, &going.public_key()).unwrap());
             let next = message(going, &channel, 2, "after the stop", later);
             assert_eq!(
@@ -2666,5 +2667,46 @@ pub(crate) mod tests {
         assert!(bodies(&s, 0, &channel, now + 3).is_empty());
         stores(&s, 0, &late, now + 3);
         assert_eq!(bodies(&s, 0, &channel, now + 3), ["two"]);
+    }
+
+    /// What the take-outs begun will take out of the room is counted as gone
+    /// already (decision 2026-10-10 §6.3): a keeping before their steps
+    /// begins no more than the room needs. Carol's key stops being known in
+    /// a full room, which is then past its bound: her entries are begun,
+    /// and keeping again before the step begins nothing more.
+    #[test]
+    fn a_take_out_begun_is_counted_as_gone_from_the_room() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let carol = member(2);
+        labels(&s, 0, &carol.public_key(), Some("carol"), now);
+        stores(&s, 0, &message(&carol, &channel, 1, "carol's", now), now);
+        fill_to(&s, 0, &channel, FULL, now);
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        let unlabel = Label {
+            key: carol.public_key(),
+            label: None,
+        };
+        let made = act(conn, &s[0].identity, Do::Label(unlabel), now + 1).unwrap();
+        assert!(matches!(made, Done::Made(_)));
+        let going = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM shared_take_out_keys WHERE channel = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(going(conn), 1);
+        assert!(pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+        keep(conn, &s.key(0), now + 2).unwrap();
+        keep(conn, &s.key(0), now + 3).unwrap();
+        assert_eq!(going(conn), 1);
+        take_out_all(conn, &s.key(0), now + 4).unwrap();
+        assert_eq!(going(conn), 0);
+        assert!(kept::room(conn, id).unwrap() <= MAX_ENTRY_CHANNEL_BYTES_AT_RELAY);
+        assert!(held_by(&s, 0, &channel, &carol.public_key()).is_empty());
     }
 }
