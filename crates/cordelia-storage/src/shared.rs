@@ -230,6 +230,17 @@ pub fn channel(conn: &Connection, channel: &[u8; 32]) -> Result<Option<Channel>,
     .map_err(storage)
 }
 
+/// The row `id` of the table, where it has one.
+pub fn channel_of_row(conn: &Connection, id: i64) -> Result<Option<Channel>, CordeliaError> {
+    conn.query_row(
+        &format!("SELECT {CHANNEL_COLUMNS} FROM shared_channels WHERE id = ?1"),
+        [id],
+        channel_from_row,
+    )
+    .optional()
+    .map_err(storage)
+}
+
 /// Every row of the table, in the order they were made.
 pub fn channels(conn: &Connection) -> Result<Vec<Channel>, CordeliaError> {
     let rows = conn
@@ -322,6 +333,7 @@ pub fn drop_index(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
 /// it goes (§3.4: when its drop is freed).
 pub fn forget(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
     drop_rows(conn, id, false)?;
+    crate::shared_pass::forget(conn, id)?;
     conn.execute("DELETE FROM shared_channels WHERE id = ?1", [id])
         .map_err(storage)?;
     Ok(())
@@ -431,6 +443,7 @@ pub fn keys_held_in_order(
         .prepare(
             "SELECT key FROM shared_keys
              WHERE channel = ?1 AND held_order IS NOT NULL AND bytes_stored > 0
+               AND key NOT IN (SELECT key FROM shared_take_out_keys WHERE channel = ?1)
              ORDER BY held_order LIMIT ?2",
         )
         .map_err(storage)?
@@ -655,6 +668,89 @@ pub fn take_out(
         add_to_room(conn, id, -to_sql(bytes))?;
     }
     Ok(bytes)
+}
+
+/// Whether any key of the channel of row `id` has bytes refused for room.
+pub fn any_refused(conn: &Connection, id: i64) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM shared_keys WHERE channel = ?1 AND bytes_refused > 0)",
+        [id],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// What one step of a take-out of every entry of a channel did (decision
+/// 2026-10-10 §6.3, "taken out in steps").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelStep {
+    /// It took out entries of this key, at most `most`, and what waited to
+    /// be opened of it, and, where the index goes too, its index rows.
+    Key([u8; 32]),
+    /// The store held no entry of the channel: it took out the index rows
+    /// of this signer.
+    Signer([u8; 32]),
+    /// Nothing of the channel's entries, and where the index goes, of its
+    /// index, is left.
+    Done,
+}
+
+/// One step of a take-out of every entry of the channel `channel` (of row
+/// `id`): one key's entries, at most `most` of them, with what waits to be
+/// opened of it and, where `index_too`, its index rows, each overwritten
+/// first. Once no entry is left, one signer's index rows a step, where
+/// `index_too`. In the caller's write.
+pub fn take_out_channel_step(
+    conn: &Connection,
+    id: i64,
+    channel: &[u8; 32],
+    index_too: bool,
+    most: usize,
+) -> Result<ChannelStep, CordeliaError> {
+    let author: Option<[u8; 32]> = conn
+        .query_row(
+            "SELECT author FROM entries WHERE channel_id = ?1 LIMIT 1",
+            [&channel[..]],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(author) = author {
+        conn.execute(
+            "DELETE FROM entries WHERE rowid IN (
+                 SELECT rowid FROM entries WHERE channel_id = ?1 AND author = ?2 LIMIT ?3)",
+            params![&channel[..], &author[..], to_sql(most as u64)],
+        )
+        .map_err(storage)?;
+        conn.execute(
+            "DELETE FROM shared_unopened WHERE channel = ?1 AND key = ?2",
+            params![id, &author[..]],
+        )
+        .map_err(storage)?;
+        if index_too {
+            for message in index_ids(conn, id, Some(&author))? {
+                drop_row(conn, id, &message)?;
+            }
+        }
+        return Ok(ChannelStep::Key(author));
+    }
+    if index_too {
+        let signer: Option<[u8; 32]> = conn
+            .query_row(
+                "SELECT signer FROM shared_index WHERE channel = ?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some(signer) = signer {
+            for message in index_ids(conn, id, Some(&signer))? {
+                drop_row(conn, id, &message)?;
+            }
+            return Ok(ChannelStep::Signer(signer));
+        }
+    }
+    Ok(ChannelStep::Done)
 }
 
 /// The channel of row `id` keeps the rows of at most `kept` keys that
