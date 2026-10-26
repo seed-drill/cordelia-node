@@ -158,6 +158,31 @@ pub enum PersonError {
     MadeOnAnotherDevice,
 
     #[error(
+        "the change does not list as removed every key that this device knows to be removed: \
+         nothing was made. A change lists each of them (`cordelia devices` names them)."
+    )]
+    LeavesOutARemovedKey,
+
+    #[error(
+        "the change lists as a device a key that this device knows to be removed: nothing was \
+         made. A removed key is not added again; `cordelia init --new-key` on that device gives \
+         it a new one."
+    )]
+    ListsARemovedKey,
+
+    #[error(
+        "the change does not join every change that this device keeps set aside: nothing was \
+         made. A change made here joins each of them, with the recovery phrase."
+    )]
+    JoinsNotEveryHead,
+
+    #[error(
+        "a recovery lists the removals of every change it read, and the changes it read do not \
+         hold the one it recovers from: nothing was made"
+    )]
+    NotAllRead,
+
+    #[error(
         "sync is on here, and this device is alone under a recovery phrase: `cordelia sync off` \
          first, so that sending its folders to another set of devices takes two acts."
     )]
@@ -1690,11 +1715,18 @@ pub fn first_statement(
 /// **What the prompt showed is checked again inside that transaction.**
 /// `over` is what the change entry was named by of the change that the
 /// device followed when the command was handed what it showed, and
-/// `apart` that of the head set aside that the change settles, where it
-/// settles two. Where the device follows another change now, no longer
-/// keeps that head, or keeps a head where none was shown, a statement
-/// arrived between the prompt and the phrase. Nothing is made, and the
-/// command asks again ([`PersonError::ChangedSincePrompt`]).
+/// `heads` what each head set aside was named by then: the change joins
+/// them all. Where the device follows another change now, or keeps
+/// another set of heads, a statement arrived between the prompt and the
+/// phrase. Nothing is made, and the command asks again
+/// ([`PersonError::ChangedSincePrompt`]).
+///
+/// **A change of its own is refused** where it does not list as removed
+/// every key that this device knows to be removed, or lists one of them as
+/// a device (decision 2026-10-24 (removal), rule 20), and where it does
+/// not have every head set aside on its chain (rule 21): a change made
+/// where a head is set aside joins it. Where this device's own key is
+/// among the removed, no change that lists it is clear, and it is told so.
 ///
 /// A record of an addition that arrived meanwhile changes neither entry,
 /// and never does that: its key is in neither of the statement's lists,
@@ -1708,23 +1740,17 @@ pub fn apply_made(
     identity: &NodeIdentity,
     entry: &CheckedEntry,
     over: &[u8; 32],
-    apart: Option<&[u8; 32]>,
+    heads: &[[u8; 32]],
     now: i64,
 ) -> Result<Applied, PersonError> {
     in_one(conn, || {
         let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
-        let heads: Vec<[u8; 32]> = set_aside_heads(conn, identity, &held.following)?
-            .iter()
-            .map(|head| head.entry.id())
-            .collect();
-        // A change that settles is made over a head set aside, which the
-        // device still keeps; any other only where it keeps none (decision
-        // 2026-10-24 (removal), rule 21 joins them in a later slice).
-        let heads_as_shown = match apart {
-            Some(apart) => heads.contains(apart),
-            None => heads.is_empty(),
-        };
-        let as_shown = followed_entry(conn)?.id() == *over && heads_as_shown;
+        let set_aside = set_aside_heads(conn, identity, &held.following)?;
+        let mut kept: Vec<[u8; 32]> = set_aside.iter().map(|head| head.entry.id()).collect();
+        kept.sort_unstable();
+        let mut shown_heads = heads.to_vec();
+        shown_heads.sort_unstable();
+        let as_shown = followed_entry(conn)?.id() == *over && kept == shown_heads;
         if !as_shown || !matches!(held.state, State::Applied | State::Fork) {
             return Err(PersonError::ChangedSincePrompt);
         }
@@ -1743,8 +1769,28 @@ pub fn apply_made(
         // file, which is the key this node runs under (§16): a statement
         // that says it was made on another device was not made by a
         // command of this one.
-        if opened.statement.statement.maker != identity.public_key() {
+        let made = &opened.statement.statement;
+        let own = identity.public_key();
+        if made.maker != own {
             return Err(PersonError::MadeOnAnotherDevice);
+        }
+        // Rule 21: it joins every head set aside.
+        for head in &set_aside {
+            if !made.has_on_chain(&head.statement.statement.link()?) {
+                return Err(PersonError::JoinsNotEveryHead);
+            }
+        }
+        // Rule 20: every key this device knows to be removed is listed as
+        // removed, and none as a device.
+        let known = held_rows::removed_keys(conn)?;
+        if known.contains(&own) {
+            return Err(PersonError::RemovedAsKnown);
+        }
+        if known.iter().any(|key| made.lists(key)) {
+            return Err(PersonError::ListsARemovedKey);
+        }
+        if !known.iter().all(|key| made.removes(key)) {
+            return Err(PersonError::LeavesOutARemovedKey);
         }
         apply(conn, identity, &opened.statement, &secret, entry, now)
     })
@@ -5248,7 +5294,8 @@ mod tests {
         // The settlement lists device 0.
         let (conn, _) = with_a_head();
         let settled =
-            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0, 1]), &[]).unwrap();
+            Statement::settle(&[&three, &apart], key(0), &secret(20), listed(&[0, 1]), &[])
+                .unwrap();
         let entry = change(&phrase, &settled, secret(20));
         assert_eq!(
             shown(&conn, &device(0), &entry, NOW + 5).unwrap(),
@@ -5291,7 +5338,7 @@ mod tests {
         // Step 5: a settlement that does not list it.
         let (conn, _) = with_a_head();
         let without =
-            Statement::settle(&three, &apart, key(1), &secret(21), listed(&[1]), &[]).unwrap();
+            Statement::settle(&[&three, &apart], key(1), &secret(21), listed(&[1]), &[]).unwrap();
         let entry = change(&phrase, &without, secret(21));
         assert_eq!(
             shown(&conn, &device(0), &entry, NOW).unwrap(),
@@ -5313,7 +5360,8 @@ mod tests {
         let [_, _, three, _] = statements(&phrase);
         let [apart, ..] = made_apart(&phrase);
         let settled =
-            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0, 1]), &[]).unwrap();
+            Statement::settle(&[&three, &apart], key(0), &secret(20), listed(&[0, 1]), &[])
+                .unwrap();
         let ways: [(&str, Vec<u8>); 3] = [
             (
                 "sealed to another key",
@@ -5396,7 +5444,7 @@ mod tests {
 
         // The settlement removes both, and lists device 0 alone.
         let settled =
-            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0]), &[]).unwrap();
+            Statement::settle(&[&three, &apart], key(0), &secret(20), listed(&[0]), &[]).unwrap();
         assert_eq!(settled.removed.len(), 2);
         let lacking = |key: [u8; 32]| {
             let mut lacking = settled.clone();
@@ -5509,7 +5557,8 @@ mod tests {
         assert_eq!(kept(&conn, Kept::Apart), Some(other.id()));
         // It still takes the statement that settles the two.
         let settled =
-            Statement::settle(&three, &apart, key(0), &secret(20), listed(&[0, 1]), &[]).unwrap();
+            Statement::settle(&[&three, &apart], key(0), &secret(20), listed(&[0, 1]), &[])
+                .unwrap();
         let entry = change(&phrase, &settled, secret(20));
         assert!(matches!(
             shown(&conn, &device(0), &entry, NOW).unwrap(),
@@ -8187,8 +8236,7 @@ mod tests {
         // Closed, it takes a change made after the one it follows, that
         // lists it and is clear, and stands applied again (rule 10).
         let settles = Statement::settle(
-            &lists_two,
-            &removes_two,
+            &[&lists_two, &removes_two],
             key(0),
             &secret(15),
             listed(&[0, 1]),

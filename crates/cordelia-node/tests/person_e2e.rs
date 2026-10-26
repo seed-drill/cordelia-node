@@ -855,7 +855,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
             409,
         ),
         (json!({ "entry": entry, "over": over }), 400),
-        (json!({ "entry": kept, "over": over, "apart": over }), 409),
+        (json!({ "entry": kept, "over": over, "heads": [over] }), 409),
     ] {
         let (status, said) = asks(&laptop, "/api/v1/change/make", body.clone());
         assert_eq!(status, refused_as, "{body}: {said}");
@@ -1943,9 +1943,10 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
 /// relay comes to hold one, and the device that made the other sees both.
 /// Both are clear, so it sets the other aside and goes on (decision
 /// 2026-10-24 (removal), rules 8 and 11): it says so, with both lists, and
-/// is amber; it makes no change but the settlement. `cordelia settle`,
-/// there, shows both statements, asks of the other device whether it
-/// stays, and makes the settlement with the phrase. Both devices apply it.
+/// is amber. Any change made there joins the two (rule 21): `cordelia
+/// renew`, there, shows both statements, asks of the other device whether
+/// it stays, and makes the settlement with the phrase, as `cordelia
+/// settle` does. Both devices apply it.
 #[test]
 fn two_changes_made_apart_are_settled_with_the_phrase() {
     let mut relay = relay_started();
@@ -2010,21 +2011,23 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         listed.contains("The change made apart (change 3, made on"),
         "{listed}"
     );
-    // A change made there is the settlement: `cordelia renew` is refused,
-    // and so is the route that a change other than a settlement asks.
-    let said = forked.at_terminal(&["renew"]).refused();
-    assert!(said.contains("two changes were made apart"), "{said}");
-    let (status, _) = asks(forked, "/api/v1/change/prepare", json!({}));
-    assert_eq!(status, 400);
+    // A change made there is the settlement (rule 21): the route hands
+    // the head set aside to a renewal as to `cordelia settle`.
+    let handed = forked.post("/api/v1/change/prepare", json!({}));
+    assert_eq!(
+        handed["heads"].as_array().map(Vec::len),
+        Some(1),
+        "{handed}"
+    );
 
-    // The settlement.
-    let mut at = forked.at_terminal(&["settle"]);
-    at.says("Two changes were made apart. Each is shown from its signed bytes.");
-    at.says("Change 3 (this device had applied):");
-    at.says("Change 3 (made apart):");
-    at.says("It undoes no removal");
+    // The settlement, made by `cordelia renew`.
+    let mut at = forked.at_terminal(&["renew"]);
+    at.says("2 changes were made apart. Each is shown from its signed bytes.");
+    at.says("Change 3 (this device follows):");
+    at.says("Change 3 (set aside):");
+    at.says("undoes no removal");
     at.says(&format!(
-        "({}) {:?}, a device of both changes:",
+        "({}) {:?}, a device of every change shown:",
         words_of(&key_of(other)),
         other.name
     ));

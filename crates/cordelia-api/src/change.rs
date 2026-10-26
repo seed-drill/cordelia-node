@@ -45,8 +45,11 @@ pub struct Prepared {
     /// The statement the change is made after: the one the device has
     /// applied.
     applied: SignedStatement,
-    /// The statement made apart from it, where the change settles two.
-    apart: Option<SignedStatement>,
+    /// The heads set aside that the change joins with it, where it is a
+    /// settlement (decision 2026-10-24 (removal), rule 21), in the order
+    /// they were given: their entries are given to [`Prepared::sign`] in
+    /// that order.
+    joined: Vec<SignedStatement>,
     /// The statement that will be signed, in its canonical form.
     bytes: Vec<u8>,
     /// The new secret. It is overwritten when this is dropped.
@@ -73,39 +76,40 @@ impl Prepared {
     /// Sign the statement with the phrase, seal the part of its change
     /// entry that is for the phrase, and sign the entry (decision
     /// 2026-10-04 §5). `held` is the change entry of the statement the
-    /// device has applied, and `apart` the entry of the statement made
-    /// apart from it, where the change settles two: the phrase opens the
-    /// secrets before from them.
+    /// device has applied, and `joined` the entries of the heads set aside
+    /// that the change joins, in the order they were prepared: the phrase
+    /// opens the secrets before from them. **The part for the phrase holds
+    /// the secret of every branch joined, as many as fit, the newest
+    /// first** (decision 2026-10-24 (removal), rule 21;
+    /// [`ForPhrase::following`]).
     ///
     /// What is signed is the statement in [`Prepared::bytes`], read again
     /// from those bytes.
     ///
     /// Refused: a statement or an entry that is not this phrase's; an
-    /// entry that is not its statement's, the one made apart among them;
-    /// and an entry given for a statement made apart where there is
-    /// none, or none where there is one.
+    /// entry that is not its statement's, a head's among them; and more or
+    /// fewer entries of heads than heads prepared.
     pub fn sign(
         self,
         phrase: &Phrase,
         held: &CheckedEntry,
-        apart: Option<&CheckedEntry>,
+        joined: &[&CheckedEntry],
     ) -> Result<CheckedEntry, PersonError> {
         let one = applied_with(phrase, &self.applied, held)?;
-        let number = self.applied.statement.number;
-        let mut for_phrase = match (&self.apart, apart) {
-            (None, None) => ForPhrase::following(*self.secret, &[(number, &one)]),
-            (Some(shown), Some(entry)) => {
-                let (other_statement, other) = opened(phrase, entry)?;
-                if other_statement != *shown {
-                    return Err(PersonError::NotTheStatementsEntry);
-                }
-                ForPhrase::following(
-                    *self.secret,
-                    &[(number, &one), (other_statement.statement.number, &other)],
-                )
+        if joined.len() != self.joined.len() {
+            return Err(PersonError::NotTheStatementsEntry);
+        }
+        let mut opened_heads = Vec::with_capacity(joined.len());
+        for (shown, entry) in self.joined.iter().zip(joined) {
+            let (statement, for_phrase) = opened(phrase, entry)?;
+            if statement != *shown {
+                return Err(PersonError::NotTheStatementsEntry);
             }
-            _ => return Err(PersonError::NotTheStatementsEntry),
-        };
+            opened_heads.push((statement.statement.number, for_phrase));
+        }
+        let mut before = vec![(self.applied.statement.number, &one)];
+        before.extend(opened_heads.iter().map(|(number, said)| (*number, said)));
+        let mut for_phrase = ForPhrase::following(*self.secret, &before);
         let entry = entry_of(phrase, Statement::from_bytes(&self.bytes)?, &for_phrase);
         // The secrets that the phrase opened, and the new one, are
         // overwritten here: they are in the entry, sealed.
@@ -139,36 +143,33 @@ pub fn prepare_change(
     let next = applied.statement.next(*maker, &secret, stay, removed)?;
     Ok(Prepared {
         applied: applied.clone(),
-        apart: None,
+        joined: Vec::new(),
         bytes: next.to_bytes()?,
         secret,
     })
 }
 
-/// Prepare the statement that settles `applied` and `apart`, two that
-/// were made apart (decision 2026-10-04 §4.5), with no phrase: a new
-/// secret, and the settlement in the bytes that will be signed. `maker`,
-/// `stay` and `removed` are as [`make_settlement`] takes them, and what
-/// it refuses of them is refused here.
+/// Prepare the statement that joins `applied` with `joined`, the heads
+/// set aside (decision 2026-10-04 §4.5; decision 2026-10-24 (removal),
+/// rule 21: every head a device keeps, two or more in all), with no
+/// phrase: a new secret, and the settlement in the bytes that will be
+/// signed. `maker`, `stay` and `removed` are as [`make_settlement`] takes
+/// them, and what it refuses of them is refused here.
 pub fn prepare_settlement(
     applied: &SignedStatement,
-    apart: &SignedStatement,
+    joined: &[SignedStatement],
     maker: &[u8; 32],
     stay: Vec<Device>,
     removed: &[[u8; 32]],
 ) -> Result<Prepared, PersonError> {
     let secret = Zeroizing::new(statement::new_secret()?);
-    let settled = Statement::settle(
-        &applied.statement,
-        &apart.statement,
-        *maker,
-        &secret,
-        stay,
-        removed,
-    )?;
+    let heads: Vec<&Statement> = std::iter::once(&applied.statement)
+        .chain(joined.iter().map(|head| &head.statement))
+        .collect();
+    let settled = Statement::settle(&heads, *maker, &secret, stay, removed)?;
     Ok(Prepared {
         applied: applied.clone(),
-        apart: Some(apart.clone()),
+        joined: joined.to_vec(),
         bytes: settled.to_bytes()?,
         secret,
     })
@@ -185,32 +186,43 @@ pub fn prepare_settlement(
 ///
 /// Where `apart` is given, a statement that is not on the chain of
 /// `from` was found beside it: the statement that is made settles the
-/// two (§4.5), and lists as removed every key that either removed.
+/// two (§4.5). **It lists as removed every key that any change the
+/// recovery read removes** (decision 2026-10-24 (removal), rule 22):
+/// `read` is every change it read, `from` and `apart` among them, and
+/// those on the chain of neither or behind. It lists one device, so its
+/// secret is clear by construction.
 ///
-/// Refused: whatever a statement refuses, a maker that `from` or `apart`
-/// lists as removed among it.
+/// Refused: whatever a statement refuses, a maker that a change read lists
+/// as removed among it; and `read` without `from`, or without `apart`:
+/// what a recovery read holds the change it recovers from.
 pub fn prepare_recovery(
     from: &SignedStatement,
     apart: Option<&SignedStatement>,
+    read: &[&Statement],
     maker: Device,
     removed: &[[u8; 32]],
 ) -> Result<Prepared, PersonError> {
+    let among = |statement: &SignedStatement| read.contains(&&statement.statement);
+    if !among(from) || apart.is_some_and(|apart| !among(apart)) {
+        return Err(PersonError::NotAllRead);
+    }
     let secret = Zeroizing::new(statement::new_secret()?);
     let key = maker.key;
+    let mut removes = crate::recover::removed_by_any(read);
+    removes.extend_from_slice(removed);
     let made = match apart {
-        None => from.statement.next(key, &secret, vec![maker], removed)?,
+        None => from.statement.next(key, &secret, vec![maker], &removes)?,
         Some(apart) => Statement::settle(
-            &from.statement,
-            &apart.statement,
+            &[&from.statement, &apart.statement],
             key,
             &secret,
             vec![maker],
-            removed,
+            &removes,
         )?,
     };
     Ok(Prepared {
         applied: from.clone(),
-        apart: apart.cloned(),
+        joined: apart.into_iter().cloned().collect(),
         bytes: made.to_bytes()?,
         secret,
     })
@@ -249,44 +261,44 @@ pub fn make_change(
     removed: &[[u8; 32]],
 ) -> Result<CheckedEntry, PersonError> {
     applied_with(phrase, applied, held)?;
-    prepare_change(applied, maker, stay, removed)?.sign(phrase, held, None)
+    prepare_change(applied, maker, stay, removed)?.sign(phrase, held, &[])
 }
 
-/// Make the statement that settles two that were made apart (decision
-/// 2026-10-04 §4.5).
+/// Make the statement that joins changes made apart (decision 2026-10-04
+/// §4.5; decision 2026-10-24 (removal), rule 21).
 ///
 /// `applied` is the statement the device has applied and `held` its
-/// change entry. `apart` is the change entry the device keeps of the
-/// statement that was made apart from it. `maker`, `stay` and `removed`
-/// are as [`make_change`] takes them: the devices are chosen from those
-/// of both statements, and a device of either that is neither kept nor
-/// removed is in no list.
+/// change entry. `joined` are the change entries the device keeps of the
+/// heads it sets aside. `maker`, `stay` and `removed` are as
+/// [`make_change`] takes them: the devices are chosen from those of every
+/// head, and a device of any that is neither kept nor removed is in no
+/// list.
 ///
-/// The settlement is numbered above both, its chain holds both and their
-/// chains, and it lists as removed every key that either does: it undoes
-/// nothing. The part for the phrase holds the secrets of both branches,
-/// each opened from its entry with the phrase.
+/// The settlement is numbered above each, its chain holds each and their
+/// chains, and it lists as removed every key that any does: it undoes
+/// nothing. The part for the phrase holds the secret of every branch, each
+/// opened from its entry with the phrase, as many as fit, the newest
+/// first.
 ///
 /// Refused: what [`make_change`] refuses of the statement and the
 /// entries; a maker that would not be among the devices, as a statement
-/// refuses it; two statements that were not made apart; and an entry kept
-/// apart whose statement the phrase's statement key does not read whole.
+/// refuses it; no head given, or one given twice; and an entry of a head
+/// whose statement the phrase's statement key does not read whole.
 pub fn make_settlement(
     phrase: &Phrase,
     applied: &SignedStatement,
     held: &CheckedEntry,
-    apart: &CheckedEntry,
+    joined: &[&CheckedEntry],
     maker: &[u8; 32],
     stay: Vec<Device>,
     removed: &[[u8; 32]],
 ) -> Result<CheckedEntry, PersonError> {
     applied_with(phrase, applied, held)?;
-    let (other_statement, _) = opened(phrase, apart)?;
-    prepare_settlement(applied, &other_statement, maker, stay, removed)?.sign(
-        phrase,
-        held,
-        Some(apart),
-    )
+    let mut statements = Vec::with_capacity(joined.len());
+    for entry in joined {
+        statements.push(opened(phrase, entry)?.0);
+    }
+    prepare_settlement(applied, &statements, maker, stay, removed)?.sign(phrase, held, joined)
 }
 
 /// The part for the phrase of `held`, where `held` is the change entry of
@@ -382,7 +394,7 @@ mod tests {
     use cordelia_crypto::change_entry::{ChangeEntryError, DeviceSecret, Earlier};
     use cordelia_crypto::identity::NodeIdentity;
     use cordelia_crypto::statement::{Judgement, judge};
-    use cordelia_storage::person::State;
+    use cordelia_storage::person::{self as held_rows, State};
 
     /// What a command with the phrase reads in a change entry.
     fn read(s: &Several, entry: &CheckedEntry) -> (SignedStatement, ForPhrase) {
@@ -534,7 +546,7 @@ mod tests {
         assert!(printed.contains(&hex::encode(prepared.bytes())));
 
         let bytes = prepared.bytes().to_vec();
-        let entry = prepared.sign(&s.phrase, &on.latest(), None).unwrap();
+        let entry = prepared.sign(&s.phrase, &on.latest(), &[]).unwrap();
         let (signed, for_phrase) = read(&s, &entry);
         assert_eq!(signed.statement.to_bytes().unwrap(), bytes);
         signed.verify().unwrap();
@@ -548,15 +560,15 @@ mod tests {
         // where there is none.
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         assert!(matches!(
-            prepare().sign(&other, &on.latest(), None),
+            prepare().sign(&other, &on.latest(), &[]),
             Err(PersonError::Statement(StatementError::AnotherPhrase))
         ));
         assert!(matches!(
-            prepare().sign(&s.phrase, &entry, None),
+            prepare().sign(&s.phrase, &entry, &[]),
             Err(PersonError::NotTheStatementsEntry)
         ));
         assert!(matches!(
-            prepare().sign(&s.phrase, &on.latest(), Some(&entry)),
+            prepare().sign(&s.phrase, &on.latest(), &[&entry]),
             Err(PersonError::NotTheStatementsEntry)
         ));
         // What is refused of a change is refused before any phrase.
@@ -582,7 +594,14 @@ mod tests {
         let applied = on.held().statement;
         let apart = read(&s, &by_1).0;
         let prepare = || {
-            prepare_settlement(&applied, &apart, &on.key(), s.listed(&[0, 1]), &[s.key(2)]).unwrap()
+            prepare_settlement(
+                &applied,
+                std::slice::from_ref(&apart),
+                &on.key(),
+                s.listed(&[0, 1]),
+                &[s.key(2)],
+            )
+            .unwrap()
         };
         let prepared = prepare();
         let shown = Statement::from_bytes(prepared.bytes()).unwrap();
@@ -593,7 +612,7 @@ mod tests {
             assert!(shown.has_on_chain(&statement.link().unwrap()));
         }
         let bytes = prepared.bytes().to_vec();
-        let entry = prepared.sign(&s.phrase, &by_0, Some(&by_1)).unwrap();
+        let entry = prepared.sign(&s.phrase, &by_0, &[&by_1]).unwrap();
         let (signed, for_phrase) = read(&s, &entry);
         assert_eq!(signed.statement.to_bytes().unwrap(), bytes);
         let numbers: Vec<u64> = for_phrase.earlier.iter().map(|e| e.number).collect();
@@ -602,16 +621,22 @@ mod tests {
         // The entry of another statement than the one shown as made
         // apart, and no entry for it at all.
         assert!(matches!(
-            prepare().sign(&s.phrase, &by_0, Some(&later)),
+            prepare().sign(&s.phrase, &by_0, &[&later]),
             Err(PersonError::NotTheStatementsEntry)
         ));
         assert!(matches!(
-            prepare().sign(&s.phrase, &by_0, None),
+            prepare().sign(&s.phrase, &by_0, &[]),
             Err(PersonError::NotTheStatementsEntry)
         ));
         // Two that were not made apart are not settled.
         assert!(matches!(
-            prepare_settlement(&applied, &applied, &on.key(), s.listed(&[0, 1]), &[]),
+            prepare_settlement(
+                &applied,
+                std::slice::from_ref(&applied),
+                &on.key(),
+                s.listed(&[0, 1]),
+                &[]
+            ),
             Err(PersonError::Statement(StatementError::NotApart))
         ));
     }
@@ -630,13 +655,13 @@ mod tests {
         // The statement says that it was made on device 1.
         let entry = prepare_change(&applied, &s.key(1), s.listed(&[0, 1]), &[s.key(2)])
             .unwrap()
-            .sign(&s.phrase, &held, None)
+            .sign(&s.phrase, &held, &[])
             .unwrap();
         let now = s.tick();
         let on = &s[0];
         let before = on.everything();
         assert!(matches!(
-            apply_made(&on.conn, &on.identity, &entry, &over, None, now),
+            apply_made(&on.conn, &on.identity, &entry, &over, &[], now),
             Err(PersonError::MadeOnAnotherDevice)
         ));
         assert_eq!(on.everything(), before);
@@ -644,7 +669,7 @@ mod tests {
         // The control: through the node of the device that it says it
         // was made on, it is made.
         let on = &s[1];
-        let made = apply_made(&on.conn, &on.identity, &entry, &over, None, now).unwrap();
+        let made = apply_made(&on.conn, &on.identity, &entry, &over, &[], now).unwrap();
         assert_eq!(made.number, 3);
     }
 
@@ -668,10 +693,10 @@ mod tests {
             shown(&on.conn, &on.identity, &arrived, now).unwrap(),
             Shown::Applied(_)
         ));
-        let entry = prepared.sign(&s.phrase, &held, None).unwrap();
+        let entry = prepared.sign(&s.phrase, &held, &[]).unwrap();
         let before = on.everything();
         assert!(matches!(
-            apply_made(&on.conn, &on.identity, &entry, &over, None, now),
+            apply_made(&on.conn, &on.identity, &entry, &over, &[], now),
             Err(PersonError::ChangedSincePrompt)
         ));
         assert_eq!(on.everything(), before);
@@ -688,7 +713,7 @@ mod tests {
         let over = held.id();
         let entry = prepare_change(&applied, &s.key(0), s.listed(&[0, 1]), &[s.key(2)])
             .unwrap()
-            .sign(&s.phrase, &held, None)
+            .sign(&s.phrase, &held, &[])
             .unwrap();
         let now = s.tick();
         let on = &s[0];
@@ -700,7 +725,7 @@ mod tests {
         );
         let before = on.everything();
         assert!(matches!(
-            apply_made(&on.conn, &on.identity, &entry, &over, None, now),
+            apply_made(&on.conn, &on.identity, &entry, &over, &[], now),
             Err(PersonError::ChangedSincePrompt)
         ));
         assert_eq!(on.everything(), before);
@@ -709,16 +734,23 @@ mod tests {
         // The settlement is made over both, and over no other pair.
         let read_apart = read(&s, &apart).0;
         let settle = || {
-            prepare_settlement(&applied, &read_apart, &s.key(0), s.listed(&[0, 1, 2]), &[])
-                .unwrap()
-                .sign(&s.phrase, &held, Some(&apart))
-                .unwrap()
+            prepare_settlement(
+                &applied,
+                std::slice::from_ref(&read_apart),
+                &s.key(0),
+                s.listed(&[0, 1, 2]),
+                &[],
+            )
+            .unwrap()
+            .sign(&s.phrase, &held, &[&apart])
+            .unwrap()
         };
         let settlement = settle();
         for (shown_over, shown_apart) in [
-            (over, None),
-            (over, Some([9u8; 32])),
-            (apart.id(), Some(apart.id())),
+            (over, vec![]),
+            (over, vec![[9u8; 32]]),
+            (over, vec![apart.id(), apart.id()]),
+            (apart.id(), vec![apart.id()]),
         ] {
             assert!(matches!(
                 apply_made(
@@ -726,7 +758,7 @@ mod tests {
                     &on.identity,
                     &settlement,
                     &shown_over,
-                    shown_apart.as_ref(),
+                    &shown_apart,
                     now
                 ),
                 Err(PersonError::ChangedSincePrompt)
@@ -738,7 +770,7 @@ mod tests {
             &on.identity,
             &settlement,
             &over,
-            Some(&apart.id()),
+            &[apart.id()],
             now,
         )
         .unwrap();
@@ -752,7 +784,7 @@ mod tests {
                 &on.identity,
                 &settle(),
                 &on.latest().id(),
-                Some(&apart.id()),
+                &[apart.id()],
                 now
             ),
             Err(PersonError::ChangedSincePrompt)
@@ -773,7 +805,7 @@ mod tests {
                 &on.identity,
                 &removal,
                 &on.latest().id(),
-                None,
+                &[],
                 now
             ),
             Err(PersonError::ChangedSincePrompt)
@@ -805,8 +837,8 @@ mod tests {
         assert!(on.counts(&late.key()));
         assert_eq!(on.latest().id(), over);
 
-        let entry = prepared.sign(&s.phrase, &held, None).unwrap();
-        let made = apply_made(&on.conn, &on.identity, &entry, &over, None, now + 1).unwrap();
+        let entry = prepared.sign(&s.phrase, &held, &[]).unwrap();
+        let made = apply_made(&on.conn, &on.identity, &entry, &over, &[], now + 1).unwrap();
         assert_eq!(made.number, 3);
         let statement = on.held().statement.statement;
         assert!(!statement.lists(&late.key()) && !statement.removes(&late.key()));
@@ -853,7 +885,7 @@ mod tests {
                 &s.phrase,
                 &on.held().statement,
                 &on.latest(),
-                &apart,
+                &[&apart],
                 &s.key(maker),
                 s.listed(stay),
                 &[],
@@ -982,7 +1014,7 @@ mod tests {
                 &s.phrase,
                 &on.held().statement,
                 &on.latest(),
-                apart,
+                &[apart],
                 &on.key(),
                 s.listed(stay),
                 removed,
@@ -1038,6 +1070,206 @@ mod tests {
             settle(&by_1, &[0, 1, 2], &[]),
             Err(PersonError::Statement(StatementError::InBothLists))
         ));
+    }
+
+    // ── Changes made from here (decision 2026-10-24 (removal), rules
+    // 20 and 21) ──────────────────────────────────────────────────────
+
+    /// A change made with the phrase over `held`, the entry of `applied`,
+    /// on device `maker`, with the devices in `stay` and the keys in
+    /// `removed`: a renewal or a removal.
+    fn renewal(
+        s: &Several,
+        maker: usize,
+        (applied, held): (&SignedStatement, &CheckedEntry),
+        stay: &[usize],
+        removed: &[[u8; 32]],
+    ) -> CheckedEntry {
+        prepare_change(applied, &s.key(maker), s.listed(stay), removed)
+            .unwrap()
+            .sign(&s.phrase, held, &[])
+            .unwrap()
+    }
+
+    /// Rule 20: the node refuses a change of its own that does not list
+    /// as removed every key the device knows to be removed, or lists one
+    /// of them as a device, whatever kind of change it is, with nothing
+    /// changed. The keys are set by hand, as a change seen on another
+    /// branch keeps them.
+    #[test]
+    fn test_the_node_refuses_a_change_of_its_own_that_leaves_out_a_removed_key_or_lists_one() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let stranger = Machine::new(9).key();
+        let now = s.tick();
+        let on = &s[0];
+        held_rows::keep_removed(&on.conn, &[stranger], now).unwrap();
+        let (applied, held) = (on.held().statement, on.latest());
+        let over = held.id();
+        let made =
+            |entry: &CheckedEntry| apply_made(&on.conn, &on.identity, entry, &over, &[], now);
+        let before = on.everything();
+        // A renewal, and a removal of another key, that leave it out.
+        for (stay, removed) in [(&[0, 1, 2][..], vec![]), (&[0, 1], vec![s.key(2)])] {
+            let entry = renewal(&s, 0, (&applied, &held), stay, &removed);
+            assert!(
+                matches!(made(&entry), Err(PersonError::LeavesOutARemovedKey)),
+                "{removed:?}"
+            );
+            assert_eq!(on.everything(), before);
+        }
+        // Device 2 is known to be removed too: a change that keeps it as a
+        // device is refused, and so is one that leaves it in no list.
+        held_rows::keep_removed(&on.conn, &[s.key(2)], now).unwrap();
+        let before = on.everything();
+        let keeps = renewal(&s, 0, (&applied, &held), &[0, 1, 2], &[stranger]);
+        assert!(matches!(made(&keeps), Err(PersonError::ListsARemovedKey)));
+        assert_eq!(on.everything(), before);
+        // The control: each is listed as removed, and none as a device.
+        let entry = renewal(&s, 0, (&applied, &held), &[0, 1], &[stranger, s.key(2)]);
+        assert_eq!(made(&entry).unwrap().number, 3);
+        let statement = on.held().statement.statement;
+        assert!(statement.removes(&stranger) && statement.removes(&s.key(2)));
+        assert!(!statement.lists(&s.key(2)));
+
+        // A device that knows its own key to be removed makes no change:
+        // it is told so.
+        let (applied, held) = (on.held().statement, on.latest());
+        held_rows::keep_removed(&on.conn, &[s.key(0)], now).unwrap();
+        let before = on.everything();
+        let entry = renewal(&s, 0, (&applied, &held), &[0, 1], &[]);
+        assert!(matches!(
+            apply_made(&on.conn, &on.identity, &entry, &held.id(), &[], now),
+            Err(PersonError::RemovedAsKnown)
+        ));
+        assert_eq!(on.everything(), before);
+    }
+
+    /// Rule 21: a change made on a device that keeps heads set aside joins
+    /// every one. A renewal that joins none, and a settlement of two heads
+    /// where three are kept, are refused, with nothing changed; and a
+    /// change shown over fewer heads than are kept was made over something
+    /// else. The settlement of all three has each on its chain, holds the
+    /// secret of each in its part for the phrase, is applied, and leaves no
+    /// head set aside.
+    #[test]
+    fn test_a_change_made_where_heads_are_set_aside_joins_every_one() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let by_0 = s.change(0, &[0, 1, 2], &[]);
+        let by_1 = s.change(1, &[0, 1, 2], &[]);
+        let by_2 = s.change(2, &[0, 1, 2], &[]);
+        let now = s.tick();
+        let on = &s[0];
+        for apart in [&by_1, &by_2] {
+            assert_eq!(
+                shown(&on.conn, &on.identity, apart, now).unwrap(),
+                Shown::SetAside
+            );
+        }
+        assert_eq!(on.latest().id(), by_0.id());
+        let heads = [by_1.id(), by_2.id()];
+        let (applied, held) = (on.held().statement, on.latest());
+        let over = held.id();
+        let (one, two) = (read(&s, &by_1).0, read(&s, &by_2).0);
+        let before = on.everything();
+
+        let renewed = renewal(&s, 0, (&applied, &held), &[0, 1, 2], &[]);
+        let of_two = prepare_settlement(
+            &applied,
+            std::slice::from_ref(&one),
+            &s.key(0),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap()
+        .sign(&s.phrase, &held, &[&by_1])
+        .unwrap();
+        for entry in [&renewed, &of_two] {
+            assert!(matches!(
+                apply_made(&on.conn, &on.identity, entry, &over, &heads, now),
+                Err(PersonError::JoinsNotEveryHead)
+            ));
+            assert_eq!(on.everything(), before);
+        }
+        for shown_heads in [&[][..], &[by_1.id()], &[by_1.id(), by_2.id(), by_0.id()]] {
+            assert!(matches!(
+                apply_made(&on.conn, &on.identity, &of_two, &over, shown_heads, now),
+                Err(PersonError::ChangedSincePrompt)
+            ));
+        }
+        assert_eq!(on.everything(), before);
+
+        // The settlement of all three, the heads in either order.
+        let settlement = prepare_settlement(
+            &applied,
+            &[two.clone(), one.clone()],
+            &s.key(0),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap()
+        .sign(&s.phrase, &held, &[&by_2, &by_1])
+        .unwrap();
+        let (signed, for_phrase) = read(&s, &settlement);
+        assert_eq!(signed.statement.number, 4);
+        for head in [&applied, &one, &two] {
+            assert!(
+                signed
+                    .statement
+                    .has_on_chain(&head.statement.link().unwrap())
+            );
+        }
+        let secrets: Vec<[u8; 32]> = for_phrase.earlier.iter().map(|e| e.secret).collect();
+        for entry in [&by_0, &by_1, &by_2] {
+            assert!(secrets.contains(&read(&s, entry).1.secret));
+        }
+        // The three heads, then changes 2 and 1, which each copies forward.
+        let numbers: Vec<u64> = for_phrase.earlier.iter().map(|e| e.number).collect();
+        assert_eq!(numbers, [3, 3, 3, 2, 1]);
+        let made = apply_made(&on.conn, &on.identity, &settlement, &over, &heads, now).unwrap();
+        assert_eq!((made.number, made.left), (4, Some(3)));
+        assert_eq!(on.state(), State::Applied);
+        assert!(held_rows::set_aside_entries(&on.conn).unwrap().is_empty());
+    }
+
+    /// A settlement of three heads holds the secrets of each in its part
+    /// for the phrase, as many as fit: where the branches are long, the
+    /// secret of each head is held before the secrets that each copies
+    /// forward.
+    #[test]
+    fn test_a_settlement_of_three_heads_holds_the_secret_of_each_as_many_as_fit() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        let by_0 = s.change(0, &[0, 1, 2], &[]);
+        let by_2 = s.change(2, &[0, 1, 2], &[]);
+        // Device 1 renews eight times on its own: its branch is long.
+        let mut by_1 = s.change(1, &[0, 1, 2], &[]);
+        for _ in 0..8 {
+            by_1 = s.change(1, &[0, 1, 2], &[]);
+        }
+        assert_eq!(by_1.rev, 11);
+        let on = &s[0];
+        let settlement = make_settlement(
+            &s.phrase,
+            &on.held().statement,
+            &on.latest(),
+            &[&by_1, &by_2],
+            &on.key(),
+            s.listed(&[0, 1, 2]),
+            &[],
+        )
+        .unwrap();
+        let (signed, for_phrase) = read(&s, &settlement);
+        assert_eq!(signed.statement.number, 12);
+        let secrets: Vec<[u8; 32]> = for_phrase.earlier.iter().map(|e| e.secret).collect();
+        assert_eq!(secrets.len(), cordelia_core::protocol::MAX_EARLIER_SECRETS);
+        for entry in [&by_0, &by_1, &by_2] {
+            assert!(secrets.contains(&read(&s, entry).1.secret));
+        }
     }
 
     // ── The lineage, and entries of the version before (decision
@@ -1112,7 +1344,7 @@ mod tests {
             &s.phrase,
             &on.held().statement,
             &on.latest(),
-            &by_1,
+            &[&by_1],
             &on.key(),
             s.listed(&[0, 1, 2]),
             &[],
@@ -1180,7 +1412,7 @@ mod tests {
             &s.phrase,
             &on.held().statement,
             &as_the_version_before_made_it(&s, &on.latest()),
-            &as_the_version_before_made_it(&s, &by_1),
+            &[&as_the_version_before_made_it(&s, &by_1)],
             &on.key(),
             s.listed(&[0, 1, 2]),
             &[],

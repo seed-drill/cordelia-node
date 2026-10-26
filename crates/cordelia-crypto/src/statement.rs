@@ -114,7 +114,7 @@ pub enum StatementError {
     #[error("the statement is under another phrase")]
     AnotherPhrase,
 
-    #[error("the two statements were not made apart")]
+    #[error("a settlement joins two changes or more, each given once")]
     NotApart,
 
     #[error(
@@ -295,49 +295,67 @@ impl Statement {
         Ok(statement)
     }
 
-    /// The statement that settles two that were made apart (decision
-    /// 2026-10-04 §4.5).
+    /// The statement that joins `heads`, changes made apart (decision
+    /// 2026-10-04 §4.5): two, or as many as a device keeps (decision
+    /// 2026-10-24 (removal), rule 21: the change it follows and every head
+    /// it sets aside).
     ///
-    /// It is numbered above both. Its chain holds both and their chains,
-    /// so that a device on either branch can apply it. Its removed keys
-    /// are every key that either removed, and those in `removed`: a
-    /// settlement undoes nothing.
+    /// It is numbered above each. Its chain holds each and its chain, so
+    /// that a device on any branch can apply it. Its removed keys are every
+    /// key that any of them removed, and those in `removed`: a settlement
+    /// undoes nothing.
     ///
-    /// Two statements of which one is the other, or is on the other's
-    /// chain, were not made apart, and are not settled: the later one is
-    /// simply the later one. And a settlement has a secret of its own: one
-    /// that either of the two commits to is refused, as [`Statement::next`]
-    /// refuses the secret of the statement before.
+    /// One head alone, or a head given twice, settles nothing, and is
+    /// refused. A head may be on another's chain: a device sets aside a
+    /// change made after the one it follows where that change is not clear
+    /// (rule 8, step 6), and a change made there joins it all the same, so
+    /// that the device is not left with no change it can make. And a
+    /// settlement has a secret of its own: one that any head commits to is
+    /// refused, as [`Statement::next`] refuses the secret of the statement
+    /// before.
     pub fn settle(
-        one: &Self,
-        other: &Self,
+        heads: &[&Self],
         maker: [u8; 32],
         secret: &[u8; 32],
         devices: Vec<Device>,
         removed: &[[u8; 32]],
     ) -> Result<Self, StatementError> {
-        if one.phrase_key != other.phrase_key {
+        let Some(first) = heads.first() else {
+            return Err(StatementError::NotApart);
+        };
+        if heads.iter().any(|head| head.phrase_key != first.phrase_key) {
             return Err(StatementError::AnotherPhrase);
         }
-        let (a, b) = (one.link()?, other.link()?);
-        if a == b || one.has_on_chain(&b) || other.has_on_chain(&a) {
+        let links = heads
+            .iter()
+            .map(|head| head.link())
+            .collect::<Result<Vec<Link>, _>>()?;
+        let mut distinct = links.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < 2 || distinct.len() != links.len() {
             return Err(StatementError::NotApart);
         }
-        if one.commits_to(secret) || other.commits_to(secret) {
+        if heads.iter().any(|head| head.commits_to(secret)) {
             return Err(StatementError::SameSecret);
         }
-        let mut chain: Vec<Link> = one.chain.iter().chain(&other.chain).copied().collect();
-        chain.extend([a, b]);
+        let mut chain: Vec<Link> = heads
+            .iter()
+            .flat_map(|head| head.chain.iter().copied())
+            .chain(links)
+            .collect();
         chain.sort_unstable();
         chain.dedup();
+        let mut lists: Vec<&[[u8; 32]]> = heads.iter().map(|head| &head.removed[..]).collect();
+        lists.push(removed);
         let statement = Self {
-            number: one.number.max(other.number) + 1,
+            number: heads.iter().map(|head| head.number).max().unwrap_or(0) + 1,
             maker,
             chain,
             commitment: commitment(secret),
             devices,
-            removed: all_of(&[&one.removed, &other.removed, removed]),
-            phrase_key: one.phrase_key,
+            removed: all_of(&lists),
+            phrase_key: first.phrase_key,
         };
         statement.validate()?;
         Ok(statement)
@@ -2043,7 +2061,7 @@ mod tests {
         } = apart(&phrase);
 
         let settled =
-            Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
+            Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
         assert_eq!(settled.number, 5);
         let mut chain = vec![
             one.link().unwrap(),
@@ -2062,14 +2080,15 @@ mod tests {
         // Either way round it is the same statement, and it is numbered
         // above the higher of the two.
         assert_eq!(
-            Statement::settle(&b4, &a3, key(1), &secret(9), devices(&[1, 5]), &[]).unwrap(),
+            Statement::settle(&[&b4, &a3], key(1), &secret(9), devices(&[1, 5]), &[]).unwrap(),
             settled
         );
-        let later = Statement::settle(&b5, &a3, key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
+        let later =
+            Statement::settle(&[&b5, &a3], key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
         assert_eq!(later.number, 6);
         assert_eq!(later.chain.len(), 6);
         // Two at one number.
-        let level = Statement::settle(&a3, &b3, key(1), &secret(9), devices(&[1]), &[]).unwrap();
+        let level = Statement::settle(&[&a3, &b3], key(1), &secret(9), devices(&[1]), &[]).unwrap();
         assert_eq!(level.number, 4);
         assert_eq!(level.chain.len(), 4);
     }
@@ -2084,11 +2103,11 @@ mod tests {
         both.sort_unstable();
 
         let settled =
-            Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
+            Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
         assert_eq!(settled.removed, both);
         // And those the person says at the prompt are removed.
         let more =
-            Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1]), &[key(5)]).unwrap();
+            Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1]), &[key(5)]).unwrap();
         let mut all = vec![key(0), key(2), key(5)];
         all.sort_unstable();
         assert_eq!(more.removed, all);
@@ -2097,21 +2116,24 @@ mod tests {
         // branch it is asked on.
         for back in [0, 2] {
             assert_eq!(
-                Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1, back]), &[]),
+                Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1, back]), &[]),
                 Err(StatementError::InBothLists),
                 "{back}"
             );
         }
         assert_eq!(
-            Statement::settle(&a3, &b4, key(0), &secret(9), devices(&[0, 1]), &[]),
+            Statement::settle(&[&a3, &b4], key(0), &secret(9), devices(&[0, 1]), &[]),
             Err(StatementError::InBothLists)
         );
     }
 
-    /// Only two statements that were made apart are settled. Where one is
-    /// the other, or is on the other's chain, there is nothing to settle.
+    /// A settlement joins two changes or more. One alone, or one given
+    /// twice, settles nothing. A head on another's chain is joined all the
+    /// same (decision 2026-10-24 (removal), rule 21): the settlement is
+    /// made after each, and is what [`Statement::next`] would make after
+    /// the later, with every removal of each.
     #[test]
-    fn two_statements_that_were_not_made_apart_are_not_settled() {
+    fn a_settlement_joins_two_changes_or_more_each_given_once() {
         let phrase = phrase();
         let Apart {
             one,
@@ -2121,28 +2143,97 @@ mod tests {
             b4,
             ..
         } = apart(&phrase);
-        for (first, second) in [
-            (&a3, &a3),
-            (&two, &a3),
-            (&a3, &two),
-            (&one, &b4),
-            (&b4, &b3),
-            (&b3, &b4),
-        ] {
+        let refused: [&[&Statement]; 4] = [&[], &[&a3], &[&a3, &a3], &[&a3, &b4, &a3]];
+        for heads in refused {
             assert_eq!(
-                Statement::settle(first, second, key(1), &secret(9), devices(&[1]), &[]),
-                Err(StatementError::NotApart)
+                Statement::settle(heads, key(1), &secret(9), devices(&[1]), &[]),
+                Err(StatementError::NotApart),
+                "{}",
+                heads.len()
             );
         }
         // The control.
-        assert!(Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1]), &[]).is_ok());
+        assert!(Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1]), &[]).is_ok());
+        // One on the other's chain: made after both, numbered above the
+        // later, and its chain is the later's and the later.
+        for (first, second) in [(&two, &a3), (&a3, &two), (&one, &b4), (&b4, &b3)] {
+            let joined =
+                Statement::settle(&[first, second], key(1), &secret(9), devices(&[1]), &[])
+                    .unwrap();
+            let later = if first.number > second.number {
+                first
+            } else {
+                second
+            };
+            assert_eq!(joined.number, later.number + 1);
+            let mut chain = later.chain.clone();
+            chain.push(later.link().unwrap());
+            assert_eq!(joined.chain, chain);
+            assert_eq!(joined.removed, later.removed);
+        }
 
-        // Nor are two statements under two phrases.
+        // Nor are statements under two phrases joined.
         let other = Phrase::parse(OTHER_WORDS).unwrap();
         let theirs = first(&other);
         assert_eq!(
-            Statement::settle(&a3, &theirs, key(1), &secret(9), devices(&[1]), &[]),
+            Statement::settle(&[&a3, &theirs], key(1), &secret(9), devices(&[1]), &[]),
             Err(StatementError::AnotherPhrase)
+        );
+        assert_eq!(
+            Statement::settle(&[&a3, &b4, &theirs], key(1), &secret(9), devices(&[1]), &[]),
+            Err(StatementError::AnotherPhrase)
+        );
+    }
+
+    /// A settlement of three heads (decision 2026-10-24 (removal), rule
+    /// 21): numbered above each, its chain holds each and their chains,
+    /// and it removes every key that any removed. Given in any order, it
+    /// is one statement.
+    #[test]
+    fn a_settlement_of_three_heads_holds_each_and_every_removal() {
+        let phrase = phrase();
+        let Apart { two, a3, b4, .. } = apart(&phrase);
+        // A third branch from statement 2, made on device 5's side: it
+        // removes device 1.
+        let c3 = two
+            .next(key(2), &secret(0xc3), devices(&[0, 2]), &[key(1)])
+            .unwrap();
+        let settled =
+            Statement::settle(&[&a3, &b4, &c3], key(5), &secret(9), devices(&[5]), &[]).unwrap();
+        assert_eq!(settled.number, 5);
+        for head in [&a3, &b4, &c3] {
+            assert!(settled.has_on_chain(&head.link().unwrap()));
+            for link in &head.chain {
+                assert!(settled.has_on_chain(link));
+            }
+            assert!(settled.keeps_the_removals_of(head));
+        }
+        assert_eq!(settled.chain.len(), 6);
+        let mut every = vec![key(0), key(1), key(2)];
+        every.sort_unstable();
+        assert_eq!(settled.removed, every);
+        for order in [[&c3, &a3, &b4], [&b4, &c3, &a3]] {
+            assert_eq!(
+                Statement::settle(&order, key(5), &secret(9), devices(&[5]), &[]).unwrap(),
+                settled
+            );
+        }
+        // Of two of them it is another statement, which lacks the third's
+        // removal: the mutation that a settlement of two would be where
+        // three are kept.
+        let of_two =
+            Statement::settle(&[&a3, &b4], key(5), &secret(9), devices(&[5]), &[]).unwrap();
+        assert!(!of_two.removes(&key(1)));
+        assert!(!of_two.has_on_chain(&c3.link().unwrap()));
+        // A secret that any of the three commits to is not its own.
+        assert_eq!(
+            Statement::settle(&[&a3, &b4, &c3], key(5), &secret(0xc3), devices(&[5]), &[]),
+            Err(StatementError::SameSecret)
+        );
+        // A key that any of them removed is not kept.
+        assert_eq!(
+            Statement::settle(&[&a3, &b4, &c3], key(5), &secret(9), devices(&[5, 1]), &[]),
+            Err(StatementError::InBothLists)
         );
     }
 
@@ -2167,13 +2258,13 @@ mod tests {
         let b = branch(&one, 128, 0x80);
         assert_eq!((a.number, b.number), (129, 129));
         assert_eq!(
-            Statement::settle(&a, &b, key(0), &secret(9), devices(&[0]), &[]),
+            Statement::settle(&[&a, &b], key(0), &secret(9), devices(&[0]), &[]),
             Err(StatementError::ChainTooLong(257))
         );
         // One statement fewer on one side, and it is made.
         let shorter = branch(&one, 127, 0x80);
         let settled =
-            Statement::settle(&a, &shorter, key(0), &secret(9), devices(&[0]), &[]).unwrap();
+            Statement::settle(&[&a, &shorter], key(0), &secret(9), devices(&[0]), &[]).unwrap();
         assert_eq!(settled.chain.len(), 256);
         assert_eq!(settled.number, 130);
     }
@@ -2445,12 +2536,11 @@ mod tests {
                 Err(StatementError::UndoesARemoval)
             );
         }
-        // It is no fork: the two were not made apart, and nothing settles
-        // them.
-        assert_eq!(
-            Statement::settle(&a3, &undone, key(0), &secret(5), devices(&[0, 1]), &[]),
-            Err(StatementError::NotApart)
-        );
+        // It is no fork: the two were not made apart. A change that joins
+        // them keeps the removal that it lacks.
+        let joined =
+            Statement::settle(&[&a3, &undone], key(0), &secret(5), devices(&[0, 1]), &[]).unwrap();
+        assert!(joined.removes(&key(2)) && joined.removes(&key(9)));
 
         // One made after it, with the removal again, is judged for what
         // it is: it applies.
@@ -2483,7 +2573,7 @@ mod tests {
         );
         for of_either in [secret(0xa3), secret(0xb3)] {
             assert_eq!(
-                Statement::settle(&a3, &b3, key(1), &of_either, devices(&[1]), &[]),
+                Statement::settle(&[&a3, &b3], key(1), &of_either, devices(&[1]), &[]),
                 Err(StatementError::SameSecret)
             );
         }
@@ -2492,7 +2582,7 @@ mod tests {
             .next(key(0), &secret(4), devices(&[0, 1]), &[key(9)])
             .unwrap();
         assert_eq!(judged(&phrase, &next, &a3, 1), Ok(Judgement::Applies));
-        assert!(Statement::settle(&a3, &b3, key(1), &secret(4), devices(&[1]), &[]).is_ok());
+        assert!(Statement::settle(&[&a3, &b3], key(1), &secret(4), devices(&[1]), &[]).is_ok());
 
         // Where one is read: the same statement, committing to the secret
         // of the one applied. It is refused for a device it lists, one it
@@ -2614,7 +2704,7 @@ mod tests {
             b5,
         } = apart(&phrase);
         let settled =
-            Statement::settle(&a3, &b4, key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
+            Statement::settle(&[&a3, &b4], key(1), &secret(9), devices(&[1, 5]), &[]).unwrap();
         for applied in [&a3, &b4, &b3, &two, &one] {
             assert_eq!(
                 judged(&phrase, &settled, applied, 1),

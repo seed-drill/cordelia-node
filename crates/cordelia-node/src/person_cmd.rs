@@ -1569,7 +1569,9 @@ enum Which {
     Remove([u8; 32]),
     /// `cordelia renew`: a change that removes nothing.
     Renew,
-    /// `cordelia settle`: the statement that settles two made apart.
+    /// `cordelia settle`: the statement that joins changes made apart.
+    /// Any change made where a head is set aside joins it too (decision
+    /// 2026-10-24 (removal), rule 21).
     Settle,
 }
 
@@ -1606,8 +1608,8 @@ pub fn renew(config_path: &str) -> anyhow::Result<()> {
     made_at_a_terminal(config_path, || Ok(Which::Renew))
 }
 
-/// `cordelia settle`: settle two changes that were made apart, on a
-/// device that has seen both (decision 2026-10-04 §4.5).
+/// `cordelia settle`: join the changes made apart that this device keeps
+/// (decision 2026-10-04 §4.5; decision 2026-10-24 (removal), rule 21).
 pub fn settle(config_path: &str) -> anyhow::Result<()> {
     made_at_a_terminal(config_path, || Ok(Which::Settle))
 }
@@ -1622,9 +1624,14 @@ struct Handed {
     held: CheckedEntry,
     /// What that entry is named by, in hex: worked out from the entry.
     over: String,
-    /// The statement made apart, its entry, and what the entry is named
-    /// by, worked out from it, where the device is in a fork.
-    apart: Option<(SignedStatement, CheckedEntry, String)>,
+    /// Each head set aside, as the node handed it (decision 2026-10-24
+    /// (removal), rule 21): its statement, its entry, and what the entry
+    /// is named by, worked out from it. A change made here joins them all.
+    heads: Vec<(SignedStatement, CheckedEntry, String)>,
+    /// Every key that the device knows to be removed, on any branch, as
+    /// the node handed them (rule 20): the change lists each as removed,
+    /// and none as a device.
+    removed: Vec<[u8; 32]>,
     /// The record of each device added since that counts, of a key that
     /// the statement lists in neither list: what the node says a person
     /// is asked about.
@@ -1657,17 +1664,37 @@ impl Handed {
         names_this_device(handed, own)?;
         let applied = SignedStatement::from_bytes(&hex::decode(text(handed, "statement"))?)?;
         applied.verify()?;
-        let apart = match handed["apart_statement"].as_str() {
-            None => None,
-            Some(statement) => {
-                let statement = SignedStatement::from_bytes(&hex::decode(statement)?)?;
-                statement.verify()?;
-                let entry = entry_of(text(handed, "apart_entry"))?;
-                // What it is named by is worked out here, from the entry.
-                let named = hex::encode(entry.id());
-                Some((statement, entry, named))
+        let mut heads = Vec::new();
+        for head in list(handed, "heads") {
+            let statement = SignedStatement::from_bytes(&hex::decode(text(head, "statement"))?)?;
+            statement.verify()?;
+            if statement.statement.phrase_key != applied.statement.phrase_key {
+                anyhow::bail!(
+                    "the node handed a change set aside under another phrase than the one this \
+                     device follows. Nothing was done."
+                );
             }
-        };
+            let entry = entry_of(text(head, "entry"))?;
+            // What it is named by is worked out here, from the entry.
+            let named = hex::encode(entry.id());
+            heads.push((statement, entry, named));
+        }
+        let mut removed: Vec<[u8; 32]> = Vec::new();
+        for key in list(handed, "removed") {
+            let key = decode_public_key(key.as_str().unwrap_or_default()).map_err(|e| {
+                anyhow::anyhow!("the node handed a removed key that is no key: {e}")
+            })?;
+            if key == *own {
+                anyhow::bail!(
+                    "this device was removed: a change of the recovery phrase that it has seen \
+                     removes it. `cordelia init --new-key` gives it a new key; it is then added \
+                     as a new device."
+                );
+            }
+            removed.push(key);
+        }
+        removed.sort_unstable();
+        removed.dedup();
         // Each record, read from its signed bytes: its adder signed it,
         // and it names the statement that the device has applied.
         let under = applied.statement.link()?;
@@ -1757,7 +1784,8 @@ impl Handed {
             applied,
             held,
             over,
-            apart,
+            heads,
+            removed,
             added,
             left,
             names,
@@ -1808,8 +1836,14 @@ impl Handed {
             .sum()
     }
 
-    /// The label that this device knows `key` by: the statement's, the
-    /// other statement's, or that of the record that added it.
+    /// Whether the device knows `key` to be removed, on any branch: the
+    /// node handed it as removed (decision 2026-10-24 (removal), rule 20).
+    fn knows_removed(&self, key: &[u8; 32]) -> bool {
+        self.removed.binary_search(key).is_ok()
+    }
+
+    /// The label that this device knows `key` by: the statement's, a
+    /// head's, or that of the record that added it.
     fn label(&self, key: &[u8; 32]) -> String {
         let listed = |statement: &Statement| {
             statement
@@ -1819,7 +1853,11 @@ impl Handed {
                 .map(|device| device.label.clone())
         };
         listed(&self.applied.statement)
-            .or_else(|| listed(&self.apart.as_ref()?.0.statement))
+            .or_else(|| {
+                self.heads
+                    .iter()
+                    .find_map(|(head, _, _)| listed(&head.statement))
+            })
             .or_else(|| {
                 let record = self.added.iter().find(|r| r.addition.device.key == *key)?;
                 Some(record.addition.device.label.clone())
@@ -1926,7 +1964,8 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
     // listed and nobody has cleared it.
     for device in &handed.applied.statement.devices {
         let key = device.key;
-        if key == own || Some(key) == goes || !handed.left.contains(&key) {
+        let skip = key == own || Some(key) == goes || handed.knows_removed(&key);
+        if skip || !handed.left.contains(&key) {
             continue;
         }
         asked.push(Question {
@@ -1940,7 +1979,7 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
     for record in first.into_iter().chain(after) {
         let added = &record.addition;
         let key = added.device.key;
-        if key == own || Some(key) == goes {
+        if key == own || Some(key) == goes || handed.knows_removed(&key) {
             continue;
         }
         let says = format!(
@@ -1966,7 +2005,9 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
 }
 
 /// The devices of the last change that stay with nothing asked: each but
-/// the one that goes, and but those that a person is asked about.
+/// the one that goes, but those that a person is asked about, and but
+/// each that the device knows to be removed on another branch (decision
+/// 2026-10-24 (removal), rule 20), which the change lists as removed.
 fn stays_unasked(handed: &Handed, goes: Option<[u8; 32]>, asked: &[Question]) -> Vec<Device> {
     let is_asked = |key: &[u8; 32]| asked.iter().any(|question| question.device.key == *key);
     handed
@@ -1975,6 +2016,7 @@ fn stays_unasked(handed: &Handed, goes: Option<[u8; 32]>, asked: &[Question]) ->
         .devices
         .iter()
         .filter(|device| Some(device.key) != goes && !is_asked(&device.key))
+        .filter(|device| !handed.knows_removed(&device.key))
         .cloned()
         .collect()
 }
@@ -2042,7 +2084,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
             json!({
                 "entry": hex::encode(entry.to_wire()),
                 "over": handed.over,
-                "apart": handed.apart.as_ref().map(|(_, _, id)| id.clone()),
+                "heads": handed.heads.iter().map(|(_, _, id)| id.clone()).collect::<Vec<_>>(),
             }),
             Some(Duration::from_secs(60)),
         );
@@ -2102,77 +2144,19 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
 
 /// Show what the node handed, ask of each device what a person has to
 /// say of it, and prepare the statement, with no phrase.
+///
+/// **Every key that the device knows to be removed is listed as removed,
+/// and none as a device** (decision 2026-10-24 (removal), rule 20): those
+/// the node handed are shown, and are neither asked about nor kept. **A
+/// change made where a head is set aside joins every head** (rule 21):
+/// `remove-device` and `renew` there make a settlement, as `settle` does.
 fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Prepared> {
     let own = handed.this_device;
     let applied = &handed.applied.statement;
     let mut stay: Vec<Device> = Vec::new();
     let mut removed: Vec<[u8; 32]> = Vec::new();
 
-    if let Which::Settle = which {
-        let Some((apart, _, _)) = &handed.apart else {
-            anyhow::bail!("this device has seen no two changes made apart: nothing to settle.");
-        };
-        let apart = &apart.statement;
-        println!("\nTwo changes were made apart. Each is shown from its signed bytes.");
-        for (says, statement) in [("this device had applied", applied), ("made apart", apart)] {
-            println!("\nChange {} ({says}):", statement.number);
-            for line in lists_shown(statement, handed)? {
-                println!("{line}");
-            }
-        }
-        println!(
-            "\nThe settlement is a change numbered above both. It undoes no removal: every \
-             key that either removed stays removed. Of each other device of either, say \
-             whether it stays, is removed, or is neither: one that is neither is in no list, \
-             and is added again by hand. A device added under the other change since it was \
-             made is not known here, and is in no list."
-        );
-        let gone = |key: &[u8; 32]| applied.removes(key) || apart.removes(key);
-        let mut each: Vec<&Device> = Vec::new();
-        for device in applied.devices.iter().chain(&apart.devices) {
-            if !gone(&device.key) && !each.iter().any(|seen| seen.key == device.key) {
-                each.push(device);
-            }
-        }
-        for device in each {
-            if device.key == own {
-                stay.push(device.clone());
-                continue;
-            }
-            let in_both = applied.lists(&device.key) && apart.lists(&device.key);
-            let says = format!(
-                "\n{}, a device of {}{}:",
-                named(&device.label, &device.key),
-                match (in_both, applied.lists(&device.key)) {
-                    (true, _) => "both changes",
-                    (false, true) => "the change this device had applied",
-                    (false, false) => "the change made apart",
-                },
-                match handed.left.contains(&device.key) {
-                    true => format!(". {SAID_IT_LEFT}"),
-                    false => String::new(),
-                }
-            );
-            match asks_of(at, &says, true)? {
-                Answer::Stays => stay.push(device.clone()),
-                Answer::Removed => removed.push(device.key),
-                Answer::Neither => {}
-            }
-        }
-        if !stay.iter().any(|device| device.key == own) {
-            stay.insert(0, own_listing(at, handed, true)?);
-        }
-        let (apart, _, _) = handed.apart.as_ref().expect("checked above");
-        return Ok(prepare_settlement(
-            &handed.applied,
-            apart,
-            &own,
-            stay,
-            &removed,
-        )?);
-    }
-
-    // A removal, or a renewal.
+    // A removal names the key that goes, whatever else the change joins.
     let goes = match which {
         Which::Remove(key) => Some(*key),
         _ => None,
@@ -2184,11 +2168,15 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
                  its devices: remove this device from another that stays."
             );
         }
-        if applied.removes(&goes) {
+        if applied.removes(&goes) || handed.knows_removed(&goes) {
             anyhow::bail!("that key was removed already, by an earlier change.");
         }
-        let known =
-            applied.lists(&goes) || handed.added.iter().any(|r| r.addition.device.key == goes);
+        let known = applied.lists(&goes)
+            || handed
+                .heads
+                .iter()
+                .any(|(head, _, _)| head.statement.lists(&goes))
+            || handed.added.iter().any(|r| r.addition.device.key == goes);
         match known {
             true => {
                 println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
@@ -2202,27 +2190,132 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         }
         removed.push(goes);
     }
-    let asked = questions(handed, goes);
-    stay.extend(stays_unasked(handed, goes, &asked));
-    if !applied.lists(&own) {
-        // This device was added since: the device that makes a statement
-        // is always among its devices, whoever added it.
-        stay.push(own_listing(at, handed, false)?);
-    }
-    if !asked.is_empty() {
+    // The keys removed on another branch, which this change lists too.
+    let elsewhere: Vec<&[u8; 32]> = handed
+        .removed
+        .iter()
+        .filter(|key| !applied.removes(key))
+        .collect();
+    if !elsewhere.is_empty() {
         println!(
-            "\nOf each of these, say whether it stays or is removed. No answer is suggested \
-             for any of them: each is typed."
+            "\nThis device knows {} to be removed by a change made apart from the one it \
+             follows. The change lists {} as removed too, and no device that was removed is \
+             in it:",
+            counted(elsewhere.len(), "key"),
+            if elsewhere.len() == 1 { "it" } else { "each" }
         );
+        for key in &elsewhere {
+            println!("  {}", named(&handed.label(key), key));
+        }
     }
-    for question in asked {
-        match asks_of(at, &question.says, false)? {
-            Answer::Stays => stay.push(question.device),
-            Answer::Removed => removed.push(question.device.key),
+    removed.extend(handed.removed.iter().copied());
+
+    if handed.heads.is_empty() {
+        if let Which::Settle = which {
+            anyhow::bail!("this device has seen no two changes made apart: nothing to settle.");
+        }
+        // A removal, or a renewal.
+        let asked = questions(handed, goes);
+        stay.extend(stays_unasked(handed, goes, &asked));
+        if !applied.lists(&own) {
+            // This device was added since: the device that makes a
+            // statement is always among its devices, whoever added it.
+            stay.push(own_listing(at, handed, false)?);
+        }
+        if !asked.is_empty() {
+            println!(
+                "\nOf each of these, say whether it stays or is removed. No answer is suggested \
+                 for any of them: each is typed."
+            );
+        }
+        for question in asked {
+            match asks_of(at, &question.says, false)? {
+                Answer::Stays => stay.push(question.device),
+                Answer::Removed => removed.push(question.device.key),
+                Answer::Neither => {}
+            }
+        }
+        return Ok(prepare_change(&handed.applied, &own, stay, &removed)?);
+    }
+
+    // A settlement: the change followed and every head set aside.
+    let heads: Vec<&Statement> = std::iter::once(applied)
+        .chain(handed.heads.iter().map(|(head, _, _)| &head.statement))
+        .collect();
+    println!(
+        "\n{} changes were made apart. Each is shown from its signed bytes.",
+        heads.len()
+    );
+    for (n, statement) in heads.iter().enumerate() {
+        let says = match n {
+            0 => "this device follows",
+            _ => "set aside",
+        };
+        println!("\nChange {} ({says}):", statement.number);
+        for line in lists_shown(statement, handed)? {
+            println!("{line}");
+        }
+    }
+    println!(
+        "\nThis change joins them: it is numbered above each, and undoes no removal: every key \
+         that any removed stays removed. Of each other device of any, say whether it stays, is \
+         removed, or is neither: one that is neither is in no list, and is added again by hand. \
+         A device added under a change set aside since it was made is not known here, and is in \
+         no list."
+    );
+    let gone = |key: &[u8; 32]| {
+        Some(*key) == goes
+            || handed.knows_removed(key)
+            || heads.iter().any(|statement| statement.removes(key))
+    };
+    let mut each: Vec<&Device> = Vec::new();
+    for device in heads.iter().flat_map(|statement| statement.devices.iter()) {
+        if !gone(&device.key) && !each.iter().any(|seen| seen.key == device.key) {
+            each.push(device);
+        }
+    }
+    for device in each {
+        if device.key == own {
+            stay.push(device.clone());
+            continue;
+        }
+        let listing = heads
+            .iter()
+            .filter(|statement| statement.lists(&device.key));
+        let of = match (listing.count(), applied.lists(&device.key)) {
+            (n, _) if n == heads.len() => "every change shown",
+            (_, true) => "the change this device follows",
+            (_, false) => "a change set aside",
+        };
+        let says = format!(
+            "\n{}, a device of {of}{}:",
+            named(&device.label, &device.key),
+            match handed.left.contains(&device.key) {
+                true => format!(". {SAID_IT_LEFT}"),
+                false => String::new(),
+            }
+        );
+        match asks_of(at, &says, true)? {
+            Answer::Stays => stay.push(device.clone()),
+            Answer::Removed => removed.push(device.key),
             Answer::Neither => {}
         }
     }
-    Ok(prepare_change(&handed.applied, &own, stay, &removed)?)
+    if !stay.iter().any(|device| device.key == own) {
+        stay.insert(0, own_listing(at, handed, true)?);
+    }
+    let joined: Vec<SignedStatement> = handed
+        .heads
+        .iter()
+        .map(|(head, _, _)| head.clone())
+        .collect();
+    Ok(prepare_settlement(
+        &handed.applied,
+        &joined,
+        &own,
+        stay,
+        &removed,
+    )?)
 }
 
 /// What `cordelia remove-device` says of a key that is in no list of the
@@ -2306,14 +2399,20 @@ fn own_listing(at: &impl Answers, handed: &Handed, settles: bool) -> anyhow::Res
 
 /// The number of the change that this command makes (decision 2026-10-04
 /// §4.5): one above the change applied for a renewal or a removal, and
-/// one above the higher of the two for a settlement (`settles`). It is the
-/// number that "The change that the recovery phrase will sign" shows
-/// next (decision 2026-10-24, rule 1).
+/// one above the highest of the heads for a settlement (`settles`), which
+/// any change made where a head is set aside is (decision 2026-10-24
+/// (removal), rule 21). It is the number that "The change that the
+/// recovery phrase will sign" shows next (decision 2026-10-24, rule 1).
 fn next_change(handed: &Handed, settles: bool) -> u64 {
     let applied = handed.applied.statement.number;
-    match (&handed.apart, settles) {
-        (Some((apart, _, _)), true) => applied.max(apart.statement.number) + 1,
-        _ => applied + 1,
+    let highest = handed
+        .heads
+        .iter()
+        .map(|(head, _, _)| head.statement.number)
+        .fold(applied, u64::max);
+    match settles && !handed.heads.is_empty() {
+        true => highest + 1,
+        false => applied + 1,
     }
 }
 
@@ -2338,13 +2437,21 @@ fn own_addition(handed: &Handed, settles: bool) -> anyhow::Result<(String, Devic
     let applied = &handed.applied.statement;
     let this = named(&added.device.label, &own);
     let new = next_change(handed, settles);
-    let (signed_before, makes) = match (&handed.apart, settles) {
-        (Some((apart, _, _)), true) => (
+    let (signed_before, makes) = match (handed.heads.as_slice(), settles) {
+        ([(apart, _, _)], true) => (
             format!(
                 "Neither change {} nor change {} lists this machine: both were made without it.",
                 applied.number, apart.statement.number
             ),
             format!("This command makes change {new}, which settles the two."),
+        ),
+        ([_, ..], true) => (
+            format!(
+                "None of the {} changes made apart lists this machine: each was made without \
+                 it.",
+                handed.heads.len() + 1
+            ),
+            format!("This command makes change {new}, which joins them."),
         ),
         _ => (
             format!(
@@ -2456,8 +2563,8 @@ pub(crate) fn typed_phrase(at: &Terminal) -> anyhow::Result<Phrase> {
 /// that is one, and not the one that this device follows, makes nothing.
 fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<CheckedEntry> {
     let phrase = typed_phrase(at)?;
-    let apart = handed.apart.as_ref().map(|(_, entry, _)| entry);
-    match prepared.sign(&phrase, &handed.held, apart) {
+    let joined: Vec<&CheckedEntry> = handed.heads.iter().map(|(_, entry, _)| entry).collect();
+    match prepared.sign(&phrase, &handed.held, &joined) {
         Ok(entry) => Ok(entry),
         Err(PersonError::Statement(StatementError::AnotherPhrase)) => anyhow::bail!(
             "that is a recovery phrase, and it is not the one that this device follows: \
@@ -3113,6 +3220,8 @@ mod tests {
 
     const WORDS: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const OTHER_PHRASE: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
     /// A device under a phrase, at its second statement, which lists it
     /// and one other device and removes one key: the statement, its
@@ -3147,7 +3256,7 @@ mod tests {
             stay.push(Device::new(listed, "phone").unwrap());
             let entry = prepare_change(&one, &own.public_key(), stay, &[removed])
                 .unwrap()
-                .sign(&phrase, &first.entry, None)
+                .sign(&phrase, &first.entry, &[])
                 .unwrap();
             Self {
                 listed,
@@ -3179,7 +3288,7 @@ mod tests {
                 let stay = statement.statement.devices.clone();
                 entry = prepare_change(&statement, &own, stay, &[])
                     .unwrap()
-                    .sign(&phrase, &entry, None)
+                    .sign(&phrase, &entry, &[])
                     .unwrap();
             }
             (read(&entry), entry)
@@ -3256,7 +3365,7 @@ mod tests {
             f.read(&says_another).unwrap().over,
             hex::encode(f.entry.id())
         );
-        assert!(handed.apart.is_none());
+        assert!(handed.heads.is_empty() && handed.removed.is_empty());
         assert_eq!(handed.added, [desktop.clone(), tablet]);
         // The labels that the device knows a key by.
         assert_eq!(handed.label(&f.own.public_key()), "laptop");
@@ -3272,19 +3381,52 @@ mod tests {
         let mut forged = desktop.clone();
         forged.signature[0] ^= 1;
         assert!(f.read(&f.handed(&f.statement, &[forged])).is_err());
-        // The statement made apart, where there is one, likewise.
+        // Each head set aside, where there is one, likewise: what it is
+        // named by is worked out from its entry, whatever the node says.
         let mut with_apart = f.handed(&f.statement, &[]);
-        with_apart["apart_statement"] = with_apart["statement"].clone();
-        with_apart["apart_entry"] = with_apart["entry"].clone();
-        with_apart["apart"] = hex::encode([7u8; 32]).into();
+        with_apart["heads"] = json!([{
+            "statement": with_apart["statement"].clone(),
+            "entry": with_apart["entry"].clone(),
+            "id": hex::encode([7u8; 32]),
+        }]);
         let handed = f.read(&with_apart).unwrap();
-        let (statement, _, named) = handed.apart.unwrap();
-        assert_eq!(statement, f.statement);
-        assert_eq!(named, hex::encode(f.entry.id()));
+        let (statement, _, named) = &handed.heads[0];
+        assert_eq!(*statement, f.statement);
+        assert_eq!(*named, hex::encode(f.entry.id()));
         let mut forged = f.statement.clone();
         forged.signature[0] ^= 1;
-        with_apart["apart_statement"] = hex::encode(forged.to_bytes().unwrap()).into();
+        with_apart["heads"][0]["statement"] = hex::encode(forged.to_bytes().unwrap()).into();
         assert!(f.read(&with_apart).is_err());
+        // A head under another phrase is refused.
+        let other = Phrase::parse(OTHER_PHRASE).unwrap();
+        let theirs = first_entry(&other, &f.own.public_key(), "laptop")
+            .unwrap()
+            .entry;
+        let theirs_read = open_statement(
+            &theirs,
+            &other.public_key().unwrap(),
+            &theirs.channel,
+            &other.statement_key().unwrap(),
+        )
+        .unwrap();
+        with_apart["heads"][0]["statement"] = hex::encode(theirs_read.to_bytes().unwrap()).into();
+        with_apart["heads"][0]["entry"] = hex::encode(theirs.to_wire()).into();
+        assert!(f.read(&with_apart).is_err());
+        // The removed keys the node hands are read in order, each once;
+        // one that is no key, and this device's own, are refused.
+        let mut with_removed = f.handed(&f.statement, &[]);
+        with_removed["removed"] = json!([
+            encode_public_key(&key(8)).unwrap(),
+            encode_public_key(&key(7)).unwrap(),
+            encode_public_key(&key(8)).unwrap(),
+        ]);
+        let mut both = vec![key(7), key(8)];
+        both.sort_unstable();
+        assert_eq!(f.read(&with_removed).unwrap().removed, both);
+        with_removed["removed"] = json!(["no key"]);
+        assert!(f.read(&with_removed).is_err());
+        with_removed["removed"] = json!([encode_public_key(&f.own.public_key()).unwrap()]);
+        assert!(f.read(&with_removed).is_err());
         // And what is no entry at all.
         let mut no_entry = f.handed(&f.statement, &[]);
         no_entry["entry"] = "00".into();
@@ -3561,8 +3703,10 @@ mod tests {
         );
         // In a fork, a settlement: the two changes, and the one above both.
         let (apart, apart_entry) = f.apart(2);
-        handed["apart_statement"] = hex::encode(apart.to_bytes().unwrap()).into();
-        handed["apart_entry"] = hex::encode(apart_entry.to_wire()).into();
+        handed["heads"] = json!([{
+            "statement": hex::encode(apart.to_bytes().unwrap()),
+            "entry": hex::encode(apart_entry.to_wire()),
+        }]);
         let read = Handed::of(&handed, &five).unwrap();
         let (says, _) = own_addition(&read, true).unwrap();
         assert_eq!(
@@ -3614,8 +3758,10 @@ mod tests {
         let mut handed = f.handed(&f.statement, &[f.adds(five, "desktop")]);
         handed["this_device"] = encode_public_key(&five).unwrap().into();
         let (apart, apart_entry) = f.apart(2);
-        handed["apart_statement"] = hex::encode(apart.to_bytes().unwrap()).into();
-        handed["apart_entry"] = hex::encode(apart_entry.to_wire()).into();
+        handed["heads"] = json!([{
+            "statement": hex::encode(apart.to_bytes().unwrap()),
+            "entry": hex::encode(apart_entry.to_wire()),
+        }]);
         let read = Handed::of(&handed, &five).unwrap();
         // The laptop, of both changes, and the phone stay; then this
         // machine is listed.
@@ -3650,6 +3796,115 @@ mod tests {
         }
     }
 
+    /// **Every key that the device knows to be removed is listed as
+    /// removed, and none as a device** (decision 2026-10-24 (removal),
+    /// rule 20): a renewal and a removal list each key that the node
+    /// handed, a device of the last change among them is neither kept nor
+    /// asked about, and a key that is removed already is not removed again.
+    #[test]
+    fn a_change_lists_every_key_the_node_hands_as_removed() {
+        let f = Fixture::new();
+        let own = f.own.public_key();
+        let stranger = NodeIdentity::from_seed([9; 32]).unwrap().public_key();
+        let mut handed = f.handed(&f.statement, &[]);
+        // The phone, a device of the last change, was removed on another
+        // branch; so was a key that this device never knew.
+        handed["removed"] = json!([
+            encode_public_key(&f.listed).unwrap(),
+            encode_public_key(&stranger).unwrap(),
+        ]);
+        let read = f.read(&handed).unwrap();
+        // Nothing is asked: the phone is not asked about.
+        let typed = Typed::of(&[]);
+        let prepared = asked(&typed, &read, &Which::Renew).unwrap();
+        assert!(typed.asked.borrow().is_empty());
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert_eq!(
+            signs.devices.iter().map(|d| d.key).collect::<Vec<_>>(),
+            [own]
+        );
+        for key in [f.listed, stranger, f.removed] {
+            assert!(signs.removes(&key));
+        }
+        // A removal of another key lists them too.
+        let other = NodeIdentity::from_seed([8; 32]).unwrap().public_key();
+        let typed = Typed::of(&["refuse"]);
+        let prepared = asked(&typed, &read, &Which::Remove(other)).unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        for key in [f.listed, stranger, f.removed, other] {
+            assert!(signs.removes(&key));
+        }
+        assert!(!signs.lists(&f.listed));
+        // A key the node handed as removed is not removed again.
+        for goes in [stranger, f.listed] {
+            let refused = asked(&Typed::of(&[]), &read, &Which::Remove(goes));
+            assert_eq!(
+                refused.err().unwrap().to_string(),
+                "that key was removed already, by an earlier change."
+            );
+        }
+    }
+
+    /// **A change made where a head is set aside joins every head**
+    /// (decision 2026-10-24 (removal), rule 21): `remove-device` and
+    /// `renew` there make a settlement, as `settle` does, numbered above
+    /// each head, with each on its chain; a removal there removes its key.
+    /// With two heads set aside, the settlement joins all three changes.
+    #[test]
+    fn a_change_made_where_a_head_is_set_aside_joins_every_head() {
+        let f = Fixture::new();
+        let mut handed = f.handed(&f.statement, &[]);
+        let (apart, apart_entry) = f.apart(2);
+        handed["heads"] = json!([{
+            "statement": hex::encode(apart.to_bytes().unwrap()),
+            "entry": hex::encode(apart_entry.to_wire()),
+        }]);
+        let read = f.read(&handed).unwrap();
+        let joins = |signs: &Statement, heads: &[&SignedStatement]| {
+            for head in heads {
+                assert!(signs.has_on_chain(&head.statement.link().unwrap()));
+                assert!(signs.number > head.statement.number);
+            }
+        };
+        // A removal of the phone: nothing is asked of it, and of the
+        // laptop, this device, nothing either.
+        let typed = Typed::of(&[]);
+        let prepared = asked(&typed, &read, &Which::Remove(f.listed)).unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert_eq!(signs.number, 4);
+        joins(&signs, &[&f.statement, &apart]);
+        assert!(signs.removes(&f.listed));
+        // A renewal asks of the phone, as `cordelia settle` asks.
+        let typed = Typed::of(&["stays"]);
+        let prepared = asked(&typed, &read, &Which::Renew).unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        joins(&signs, &[&f.statement, &apart]);
+        assert!(signs.lists(&f.listed));
+        assert!(typed.asked.borrow()[0].contains("a device of the change this device follows"));
+
+        // Two heads set aside: the settlement joins all three.
+        let (third, third_entry) = f.apart(3);
+        handed["heads"] = json!([
+            {
+                "statement": hex::encode(third.to_bytes().unwrap()),
+                "entry": hex::encode(third_entry.to_wire()),
+            },
+            {
+                "statement": hex::encode(apart.to_bytes().unwrap()),
+                "entry": hex::encode(apart_entry.to_wire()),
+            },
+        ]);
+        let read = f.read(&handed).unwrap();
+        for which in [Which::Renew, Which::Settle] {
+            let typed = Typed::of(&["stays"]);
+            let prepared = asked(&typed, &read, &which).unwrap();
+            let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+            assert_eq!(signs.number, 5);
+            assert_eq!(next_change(&read, true), 5);
+            joins(&signs, &[&f.statement, &apart, &third]);
+        }
+    }
+
     /// **The change that the question names is the one that is signed**
     /// (decision 2026-10-24, rule 1): the number it says is the number of
     /// the statement that is prepared, for a renewal, a removal and a
@@ -3670,8 +3925,10 @@ mod tests {
         assert_eq!(next_change(&read, false), signs(removal));
         // Made apart: the other change is numbered above this one.
         let (apart, apart_entry) = f.apart(2);
-        handed["apart_statement"] = hex::encode(apart.to_bytes().unwrap()).into();
-        handed["apart_entry"] = hex::encode(apart_entry.to_wire()).into();
+        handed["heads"] = json!([{
+            "statement": hex::encode(apart.to_bytes().unwrap()),
+            "entry": hex::encode(apart_entry.to_wire()),
+        }]);
         let read = f.read(&handed).unwrap();
         let mut both = stay.clone();
         both.extend(
@@ -3682,7 +3939,9 @@ mod tests {
                 .filter(|device| !stay.iter().any(|listed| listed.key == device.key))
                 .cloned(),
         );
-        let settlement = prepare_settlement(&f.statement, &apart, &own, both, &[]).unwrap();
+        let settlement =
+            prepare_settlement(&f.statement, std::slice::from_ref(&apart), &own, both, &[])
+                .unwrap();
         assert_eq!(next_change(&read, true), signs(settlement));
         assert_eq!(next_change(&read, true), 4);
     }

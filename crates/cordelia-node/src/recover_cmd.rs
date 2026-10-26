@@ -1611,6 +1611,12 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             Some(Candidate { entry, statement })
         })
         .collect();
+    // Every change read: the recovery lists as removed every key that any
+    // of them removes (decision 2026-10-24 (removal), rule 22).
+    let read: Vec<Statement> = candidates
+        .iter()
+        .map(|candidate| candidate.statement.statement.clone())
+        .collect();
     let Some(found) = recover::found(candidates) else {
         anyhow::bail!("{}", none_found_says(&not_read));
     };
@@ -1687,16 +1693,16 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     );
     // Before anything is asked: whether the answers could all be kept,
     // and how many keys a record was read for that have no row.
-    let apart_statement = apart.as_ref().map(|other| &other.statement.statement);
-    let room = recover::room(&statement, apart_statement, rows, &own);
+    let others: Vec<&Statement> = read.iter().collect();
+    let read_removed = recover::removed_by_any(&others);
+    let room = recover::room(&statement, &others, rows, &own);
     for says in said_first(&room, &generation, statement.number) {
         println!("{says}");
     }
     // Whether a change has removed a key already: the one recovered
-    // from, or the one made apart from it.
-    let removed_already = |key: &[u8; 32]| {
-        statement.removes(key) || apart_statement.is_some_and(|other| other.removes(key))
-    };
+    // from, or any other that was read (rule 22).
+    let removed_already =
+        |key: &[u8; 32]| statement.removes(key) || read_removed.binary_search(key).is_ok();
     let mut answers: Vec<Answer> = Vec::new();
     for at_row in 0..rows.len() {
         let removed = &removed_already;
@@ -1750,6 +1756,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let prepared = prepare_recovery(
         &from.statement,
         apart.as_ref().map(|other| &other.statement),
+        &others,
         maker,
         &gone,
     )?;
@@ -1783,7 +1790,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         .sign(
             &phrase,
             &from.entry,
-            apart.as_ref().map(|other| &other.entry),
+            &apart.iter().map(|other| &other.entry).collect::<Vec<_>>(),
         )
         .map_err(not_this_phrases)?;
     let allows = Allows::Look {

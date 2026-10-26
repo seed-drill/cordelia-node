@@ -943,7 +943,7 @@ impl World {
         };
         let now = self.now;
         let applied = st
-            .as_a_change(|db| person::apply_made(db, &st.identity, &entry, &over, None, now))
+            .as_a_change(|db| person::apply_made(db, &st.identity, &entry, &over, &[], now))
             .unwrap();
         let all = applied.no_version.is_empty() && applied.not_carried.is_empty();
         assert!(all, "device {by}: {applied:?}");
