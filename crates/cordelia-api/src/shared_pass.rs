@@ -502,8 +502,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Another holding: the place and the answers start again there.
-        take_page(
+        // Another holding: the place and the answers start again there,
+        // and the page got somewhere, though its place is lower.
+        let anew_holding = take_page(
             conn,
             &s[0].identity,
             &here,
@@ -512,7 +513,9 @@ mod tests {
             (&[], [6; 8], 0),
             now,
         )
+        .unwrap()
         .unwrap();
+        assert!(anew_holding.got_somewhere);
         assert_eq!(place(conn, &here, &AT).unwrap(), ([6; 8], 0));
         assert_eq!(
             to_send(conn, &s[0].identity, &here, &AT, most).unwrap(),
@@ -610,7 +613,12 @@ mod tests {
         // Another key's entry is never the device's to push.
         let theirs = anew(&member(3), &channel, 1);
         crate::take::take(conn, identity, &theirs, now).unwrap();
-        assert_eq!(waits(&AT), [later]);
+        assert_eq!(waits(&AT), [later.clone()]);
+        // An answer at a lower revision does not undo one at a higher.
+        let held = std::slice::from_ref(&later);
+        pushed(conn, &here, &AT, held, &[Pushed::Holds]).unwrap();
+        rows::answered(conn, here.id, &AT, &own.slot, own.rev, Answer::Holds).unwrap();
+        assert!(waits(&AT).is_empty());
     }
 
     /// A read again from the start begins at most once a day for each
