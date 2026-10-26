@@ -2820,6 +2820,40 @@ pub(crate) mod tests {
         out(&s, 0, now + 2);
         assert_eq!(held_by(&s, 0, &channel, &carol.public_key()).len(), 2);
         assert_eq!(bodies(&s, 0, &channel, now + 2), ["one", "two"]);
+        // Quiet for 30 days, she is known: the hourly task lets her go not.
+        let later = now + 2 + 30 * DAY;
+        assert_eq!(super::hourly(conn, &s.key(0), later).unwrap().let_go, 0);
+        assert!(!pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+    }
+
+    /// A step of a channel's take-out takes out at most
+    /// `SHARED_TAKE_OUT_STEP_ENTRIES` of one key's entries (§6.3): the door
+    /// stores no more than that of a key, and the bound holds of a store
+    /// that holds more all the same.
+    #[test]
+    fn a_step_takes_out_at_most_its_bound_of_one_keys_entries() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let carol = member(2);
+        let more = SHARED_TAKE_OUT_STEP_ENTRIES as u64 + 5;
+        for n in 0..more {
+            let name = format!("other/{n}");
+            let entry = entry_by(
+                &carol,
+                &channel.secret,
+                2,
+                &name,
+                Value::Other(vec![1]),
+                &[],
+            );
+            entries::store(&s[0].conn, &entry, now).unwrap();
+        }
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        pass_rows::begin_channel(conn, id, ChannelOut::Dropped).unwrap();
+        assert_eq!(take_out_step(conn, now).unwrap(), Stepped::OfAChannel);
+        assert_eq!(held_by(&s, 0, &channel, &carol.public_key()).len(), 5);
     }
 
     /// A quiet key that writes while its entries go: the door refuses the
