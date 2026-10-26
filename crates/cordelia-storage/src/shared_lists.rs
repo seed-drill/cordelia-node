@@ -9,7 +9,8 @@
 //!   among the lists it reads, where its own entry in the store is at no
 //!   higher revision;
 //! - **when it took each act** ([`Taken`]), by the act's signature, with
-//!   the generation it was taken in. No rule of order reads it: it is what
+//!   the generation it was taken in, and the latest generation whose lists
+//!   carried it ([`TakenRow`]). No rule of order reads it: it is what
 //!   the removal record's cut asks of an act of a removed key (decision
 //!   2026-10-24, rule 6).
 //!
@@ -68,18 +69,32 @@ pub struct Taken {
     pub taken_at: i64,
 }
 
+/// What is kept of an act this device took: when it took it, and the
+/// latest generation whose lists, as it read them, carried it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakenRow {
+    pub taken: Taken,
+    pub carried_in: u64,
+}
+
 /// Every act this device has taken, by its signature.
-pub fn taken(conn: &Connection) -> Result<Vec<([u8; 64], Taken)>, CordeliaError> {
+pub fn taken(conn: &Connection) -> Result<Vec<([u8; 64], TakenRow)>, CordeliaError> {
     let mut stmt = conn
-        .prepare("SELECT signature, generation, taken_at FROM shared_list_taken ORDER BY signature")
+        .prepare(
+            "SELECT signature, generation, taken_at, carried_in FROM shared_list_taken
+             ORDER BY signature",
+        )
         .map_err(storage)?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, [u8; 64]>(0)?,
-                Taken {
-                    generation: row.get::<_, i64>(1)?.max(0) as u64,
-                    taken_at: row.get(2)?,
+                TakenRow {
+                    taken: Taken {
+                        generation: row.get::<_, i64>(1)?.max(0) as u64,
+                        taken_at: row.get(2)?,
+                    },
+                    carried_in: row.get::<_, i64>(3)?.max(0) as u64,
                 },
             ))
         })
@@ -88,19 +103,25 @@ pub fn taken(conn: &Connection) -> Result<Vec<([u8; 64], Taken)>, CordeliaError>
 }
 
 /// Keep `taken` in the place of every row: an act that is not among them
-/// is one the lists no longer carry.
-pub fn keep_taken(conn: &Connection, taken: &[([u8; 64], Taken)]) -> Result<(), CordeliaError> {
+/// is one the device no longer keeps.
+pub fn keep_taken(conn: &Connection, taken: &[([u8; 64], TakenRow)]) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM shared_list_taken", [])
         .map_err(storage)?;
     let mut insert = conn
         .prepare(
-            "INSERT INTO shared_list_taken (signature, generation, taken_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO shared_list_taken (signature, generation, taken_at, carried_in)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .map_err(storage)?;
-    for (signature, taken) in taken {
-        let generation = i64::try_from(taken.generation).unwrap_or(i64::MAX);
+    let number = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    for (signature, row) in taken {
         insert
-            .execute(params![signature.as_slice(), generation, taken.taken_at])
+            .execute(params![
+                signature.as_slice(),
+                number(row.taken.generation),
+                row.taken.taken_at,
+                number(row.carried_in)
+            ])
             .map_err(storage)?;
     }
     Ok(())
@@ -156,16 +177,22 @@ mod tests {
         let rows = [
             (
                 [3; 64],
-                Taken {
-                    generation: 2,
-                    taken_at: 30,
+                TakenRow {
+                    taken: Taken {
+                        generation: 2,
+                        taken_at: 30,
+                    },
+                    carried_in: 3,
                 },
             ),
             (
                 [1; 64],
-                Taken {
-                    generation: 1,
-                    taken_at: 10,
+                TakenRow {
+                    taken: Taken {
+                        generation: 1,
+                        taken_at: 10,
+                    },
+                    carried_in: 1,
                 },
             ),
         ];

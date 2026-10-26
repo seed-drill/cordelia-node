@@ -679,6 +679,35 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
     }));
 }
 
+/// What is kept of when each act was taken: every act the lists read
+/// carry, as carried in the generation applied, a new one taken now; and
+/// each act the latest generation before carried, until the lists of this
+/// one carry it. An act this generation carried and no longer does goes,
+/// and so does one of an older generation (decision 2026-10-10 property
+/// 9; the review of slice 3 again, medium 2).
+#[test]
+fn what_is_kept_of_a_taking_outlives_one_generation() {
+    let t = |generation, taken_at| Taken {
+        generation,
+        taken_at,
+    };
+    let mut takings = Takings::now(t(5, 500));
+    for (signature, carried_in) in [([1; 64], 5), ([2; 64], 4), ([3; 64], 3), ([4; 64], 4)] {
+        takings.known.insert(signature, t(1, 10));
+        takings.carried_in.insert(signature, carried_in);
+    }
+    let carried = BTreeSet::from([[4; 64], [9; 64]]);
+    let row = |taken, carried_in| TakenRow { taken, carried_in };
+    assert_eq!(
+        takings.rows(&carried),
+        [
+            ([2; 64], row(t(1, 10), 4)),
+            ([4; 64], row(t(1, 10), 5)),
+            ([9; 64], row(t(5, 500), 5)),
+        ]
+    );
+}
+
 fn makers_by_statement(counting: &NodeIdentity, removed: &NodeIdentity) -> Makers {
     makers(&[counting], &[removed])
 }
@@ -2695,6 +2724,52 @@ fn a_statement_applied_writes_the_list_again() {
     let (after, list) = written_entry(&s, 1).unwrap();
     assert!(after > before);
     assert_eq!(list, kept(&s, 1));
+}
+
+/// When this device took an act, by its signature.
+fn taken_of(s: &Several, n: usize, act: &AnyAct) -> Option<Taken> {
+    kept_rows::taken(&s[n].conn)
+        .unwrap()
+        .into_iter()
+        .find_map(|(signature, taken)| (signature == act.signature()).then_some(taken.taken))
+}
+
+/// An act's time of taking is when the door first stored a list that
+/// brings it, though the device worked nothing out then; and it keeps
+/// that time when its maker is removed later, so that the removal's cut
+/// reads it, and not the time the lists were worked out again (decision
+/// 2026-10-10 property 9, §20 item 7; the review of slice 3 again,
+/// medium 2).
+#[test]
+fn an_act_is_taken_when_the_door_first_stores_a_list_that_brings_it() {
+    let mut s = person(3, 3);
+    let now = s.now + 10;
+    // The tablet's act, copied by the laptop, whose store the desktop is
+    // given: the desktop stores the lists and works nothing out.
+    let made = on(&s, 2, Do::Label(label(7, Some("tablet's"))), now + 1);
+    fetch_from(&s, &[2], 0, now + 2);
+    give(&s, 0, 1, now + 3);
+    let first = Taken {
+        generation: s[1].number(),
+        taken_at: now + 3,
+    };
+    assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
+    // Given again later, it keeps its time.
+    give(&s, 0, 1, now + 4);
+    assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
+    // The tablet removed: the desktop applies the statement at its door
+    // and works its lists out again; the act, from the laptop's copy,
+    // keeps the time it was first held.
+    s.now = now + 10;
+    s.change(0, &[0, 1], &[2]);
+    give(&s, 0, 1, s.now + 1);
+    assert!(s[1].number() > first.generation);
+    assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
+    // Worked out in the new generation, the act stays, named as the
+    // removed tablet's, and keeps its time.
+    fetch(&s, 1, s.now + 2);
+    assert_eq!(labelled(&s, 1, 7), Some(Some("tablet's".into())));
+    assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
 }
 
 /// A whole fetch whose database cannot be read says so.

@@ -965,9 +965,11 @@ CREATE TABLE message_bounds (
 ///   revision.
 /// - `shared_list_taken`: for each act the lists it reads carry, by its
 ///   signature, the generation it was taken in and when this device first
-///   took it, by its clock. No rule of order reads it: it is what the
-///   removal record's cut asks of an act of a removed key (decision
-///   2026-10-24, rule 6; decision 2026-10-10 property 9).
+///   took it, by its clock; and the latest generation whose lists carried
+///   it, so that a row outlives the change from one generation to the
+///   next, before the lists of the new one arrive. No rule of order reads
+///   it: it is what the removal record's cut asks of an act of a removed
+///   key (decision 2026-10-24, rule 6; decision 2026-10-10 property 9).
 ///
 /// Each column takes only its type and its bound. A relay keeps nothing in
 /// either.
@@ -984,7 +986,9 @@ CREATE TABLE shared_list_taken (
     signature   BLOB PRIMARY KEY CHECK(typeof(signature) = 'blob' AND length(signature) = 64),
     generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer'
                                        AND generation >= 0 AND generation <= 256),
-    taken_at    INTEGER NOT NULL CHECK(typeof(taken_at) = 'integer')
+    taken_at    INTEGER NOT NULL CHECK(typeof(taken_at) = 'integer'),
+    carried_in  INTEGER NOT NULL CHECK(typeof(carried_in) = 'integer'
+                                       AND carried_in >= 0 AND carried_in <= 256)
 );
 "#;
 
@@ -4945,8 +4949,8 @@ mod tests {
         // What the device keeps, at the bounds of each column.
         conn.execute_batch(
             "INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(41333), 9007199254740991);
-             INSERT INTO shared_list_taken (signature, generation, taken_at)
-                 VALUES (zeroblob(64), 256, 9), (X'01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0, -9);",
+             INSERT INTO shared_list_taken (signature, generation, taken_at, carried_in)
+                 VALUES (zeroblob(64), 256, 9, 256), (X'01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0, -9, 0);",
         )
         .unwrap();
         let kept = counted(&conn);
@@ -4965,7 +4969,7 @@ mod tests {
             |values: &str| format!("INSERT INTO shared_lists (one, list, rev) VALUES ({values})");
         let taken = |values: &str| {
             format!(
-                "INSERT INTO shared_list_taken (signature, generation, taken_at) VALUES ({values})"
+                "INSERT INTO shared_list_taken (signature, generation, taken_at, carried_in) VALUES ({values})"
             )
         };
         let another = format!("X'02{}'", "00".repeat(63));
@@ -4980,14 +4984,18 @@ mod tests {
             lists("1, zeroblob(5), 9007199254740992"),
             lists("1, zeroblob(5), 1.5"),
             lists("1, zeroblob(5), NULL"),
-            taken("zeroblob(64), 0, 9"),
-            taken("zeroblob(63), 0, 9"),
-            taken("zeroblob(65), 0, 9"),
-            taken(&format!("{another}, 257, 9")),
-            taken(&format!("{another}, -1, 9")),
-            taken(&format!("{another}, 0, 'nine'")),
-            taken(&format!("{another}, 0, NULL")),
-            taken(&format!("{another}, 'one', 9")),
+            taken("zeroblob(64), 0, 9, 0"),
+            taken("zeroblob(63), 0, 9, 0"),
+            taken("zeroblob(65), 0, 9, 0"),
+            taken(&format!("{another}, 257, 9, 0")),
+            taken(&format!("{another}, -1, 9, 0")),
+            taken(&format!("{another}, 0, 'nine', 0")),
+            taken(&format!("{another}, 0, NULL, 0")),
+            taken(&format!("{another}, 'one', 9, 0")),
+            taken(&format!("{another}, 0, 9, 257")),
+            taken(&format!("{another}, 0, 9, -1")),
+            taken(&format!("{another}, 0, 9, 'one'")),
+            taken(&format!("{another}, 0, 9, NULL")),
         ];
         for refused in refused {
             assert!(conn.execute(&refused, []).is_err(), "{refused}");
@@ -4996,7 +5004,7 @@ mod tests {
         // within its bound.
         for taken in [
             lists("1, zeroblob(5), 0"),
-            taken(&format!("{another}, 1, 9")),
+            taken(&format!("{another}, 1, 9, 1")),
         ] {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }

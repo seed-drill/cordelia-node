@@ -32,6 +32,8 @@
 //! - **At a whole fetch, at a statement applied and where a key came to
 //!   count** ([`fetched_whole`], [`follow`]) a device works out its list
 //!   again and writes it where it differs from the list it last wrote.
+//! - **Where the door stores a device's list** ([`took`]) the device keeps
+//!   when it took each act that list brings, and works nothing out.
 //! - **A recovery** reads the lists of the devices it shows as any device
 //!   reads ([`recovered`]).
 //!
@@ -46,8 +48,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{
-    SHARED_ACT_TIME_MAX, SHARED_MAX_CHANNELS, SHARED_MAX_DROPPED, SHARED_MAX_LABELS,
-    SHARED_MAX_SUBSCRIPTIONS,
+    PERSONAL_SHARED_PREFIX, SHARED_ACT_TIME_MAX, SHARED_MAX_CHANNELS, SHARED_MAX_DROPPED,
+    SHARED_MAX_LABELS, SHARED_MAX_SUBSCRIPTIONS,
 };
 use cordelia_core::revision::{band, next_under};
 use cordelia_crypto::acts::{
@@ -58,7 +60,7 @@ use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries;
-use cordelia_storage::shared_lists::{self as kept_rows, Kept, Taken};
+use cordelia_storage::shared_lists::{self as kept_rows, Kept, Taken, TakenRow};
 
 use crate::names::is_a_name;
 use crate::person::{Counting, PersonError, in_one};
@@ -206,9 +208,11 @@ impl Checked {
 
 /// When this device took each act, by its signature, and what an act it
 /// has not taken yet is taken as: the generation it applies, at its clock.
+/// Beside each, the latest generation whose lists carried it.
 #[derive(Debug, Clone, Default)]
 pub struct Takings {
     known: HashMap<[u8; 64], Taken>,
+    carried_in: HashMap<[u8; 64], u64>,
     now: Option<Taken>,
 }
 
@@ -216,16 +220,18 @@ impl Takings {
     /// Each act taken as it is first read, `now`.
     pub fn now(now: Taken) -> Self {
         Self {
-            known: HashMap::new(),
             now: Some(now),
+            ..Self::default()
         }
     }
 
     fn load(conn: &Connection, now: Taken) -> Result<Self, PersonError> {
-        Ok(Self {
-            known: kept_rows::taken(conn)?.into_iter().collect(),
-            now: Some(now),
-        })
+        let mut takings = Self::now(now);
+        for (signature, row) in kept_rows::taken(conn)? {
+            takings.known.insert(signature, row.taken);
+            takings.carried_in.insert(signature, row.carried_in);
+        }
+        Ok(takings)
     }
 
     /// Record that `signature` was taken at `taken`, where it was not.
@@ -233,31 +239,58 @@ impl Takings {
         self.known.entry(signature).or_insert(taken);
     }
 
+    fn now_or_zero(&self) -> Taken {
+        self.now.unwrap_or(Taken {
+            generation: 0,
+            taken_at: 0,
+        })
+    }
+
     fn of(&self, act: &AnyAct) -> Taken {
         self.known
             .get(&act.signature())
             .copied()
-            .unwrap_or(self.now.unwrap_or(Taken {
-                generation: 0,
-                taken_at: 0,
-            }))
+            .unwrap_or(self.now_or_zero())
     }
 
-    /// What is kept: every act of `taken`, with when it was taken.
-    fn rows(&self, taken: &BTreeSet<[u8; 64]>) -> Vec<([u8; 64], Taken)> {
-        let now = self.now.unwrap_or(Taken {
-            generation: 0,
-            taken_at: 0,
+    /// What is kept: every act of `carried`, which the lists read carry,
+    /// with when it was taken, as carried in the generation applied; and
+    /// each act that the latest generation before it carried, until the
+    /// lists of this one carry it. So the rows outlive the change from one
+    /// generation to the next, before the lists of the new one arrive; an
+    /// act that the lists of this generation carried and no longer carry
+    /// goes, and the rows are at most what two generations carry.
+    fn rows(&self, carried: &BTreeSet<[u8; 64]>) -> Vec<([u8; 64], TakenRow)> {
+        let now = self.now_or_zero();
+        let before = self
+            .carried_in
+            .values()
+            .copied()
+            .filter(|generation| *generation < now.generation)
+            .max();
+        let carried_now = carried.iter().map(|signature| {
+            let taken = self.known.get(signature).copied().unwrap_or(now);
+            let row = TakenRow {
+                taken,
+                carried_in: now.generation,
+            };
+            (*signature, row)
         });
-        taken
-            .iter()
-            .map(|signature| {
-                (
-                    *signature,
-                    self.known.get(signature).copied().unwrap_or(now),
-                )
-            })
-            .collect()
+        let carried_before = self.known.iter().filter_map(|(signature, taken)| {
+            let carried_in = self.carried_in.get(signature).copied();
+            (!carried.contains(signature) && carried_in.is_some() && carried_in == before).then(
+                || {
+                    let row = TakenRow {
+                        taken: *taken,
+                        carried_in: carried_in.unwrap_or_default(),
+                    };
+                    (*signature, row)
+                },
+            )
+        });
+        let mut rows: Vec<([u8; 64], TakenRow)> = carried_now.chain(carried_before).collect();
+        rows.sort_by_key(|(signature, _)| *signature);
+        rows
     }
 }
 
@@ -462,9 +495,25 @@ pub struct Computed {
     /// Each key whose acts the lists carry, signed, and passed over: a key
     /// that is no valid maker, or a removed key's act taken after its cut.
     pub passed_over: BTreeSet<[u8; 32]>,
-    /// The signatures of the acts this device takes from the lists: valid
-    /// or cut. What is kept of when each was taken.
+    /// The signatures of the acts of valid makers that the lists carry
+    /// ([`carried`]): what is kept of when each was taken.
     taken: BTreeSet<[u8; 64]>,
+}
+
+/// The signatures of every act of a valid maker that `lists` carry, a
+/// copy among them and whether or not its signature holds: what a device
+/// keeps of when it took each (decision 2026-10-10 property 9). The door
+/// keeps the same where it stores a list ([`took`]), so an act's time of
+/// taking is when this device first held it, and the cut on a maker
+/// removed later reads that time, not the time it was worked out again.
+/// No rule of order reads it.
+fn carried(lists: &[([u8; 32], SharedList)], makers: &Makers) -> BTreeSet<[u8; 64]> {
+    lists
+        .iter()
+        .flat_map(|(_, list)| acts_of(list))
+        .filter(|act| makers.maker(&act.maker()).is_some())
+        .map(|act| act.signature())
+        .collect()
 }
 
 /// What `lists`, each with the key of its writer, come to (decision
@@ -479,7 +528,10 @@ pub fn compute(
 ) -> Computed {
     let checked = Checked::default();
     let writers: BTreeSet<[u8; 32]> = lists.iter().map(|(writer, _)| *writer).collect();
-    let mut computed = Computed::default();
+    let mut computed = Computed {
+        taken: carried(lists, makers),
+        ..Computed::default()
+    };
     let mut valid: BTreeMap<Vec<u8>, AnyAct> = BTreeMap::new();
 
     // 1. The valid acts, each once, with the lists that carry it.
@@ -500,7 +552,6 @@ pub fn compute(
             if !checked.holds(&act) {
                 continue;
             }
-            computed.taken.insert(act.signature());
             if of == Maker::Removed && makers.cut(&maker, takings.of(&act)) {
                 computed.passed_over.insert(maker);
                 continue;
@@ -1085,6 +1136,38 @@ pub fn fetched_whole(
     now: i64,
 ) -> Result<bool, PersonError> {
     follow(conn, identity, now)
+}
+
+/// What the door does where it stored `entry`, an entry of the personal
+/// channel whose secret is `personal`, at `now` (decision 2026-10-10
+/// property 9, §20 item 7): where it is a device's list, each act of a
+/// valid maker that the lists read carry and that this device had not
+/// taken is taken now, in the generation it applies; each it had taken
+/// keeps its time. It works nothing out and writes no list: an act's time
+/// of taking is when this device first held it, whether or not it worked
+/// its lists out then. A device that does not stand applied keeps nothing.
+pub fn took(
+    conn: &Connection,
+    own: &[u8; 32],
+    entry: &CheckedEntry,
+    personal: &[u8; 32],
+    now: i64,
+) -> Result<(), PersonError> {
+    let is_a_list = entry
+        .open(personal)
+        .is_ok_and(|inside| inside.name.starts_with(PERSONAL_SHARED_PREFIX));
+    if !is_a_list {
+        return Ok(());
+    }
+    in_one(conn, || {
+        let Ok(standing) = Standing::of(conn) else {
+            return Ok(());
+        };
+        let reading = Reading::of(conn, standing, own, now)?;
+        let carried = carried(&reading.lists, &reading.makers);
+        kept_rows::keep_taken(conn, &reading.takings.rows(&carried))?;
+        Ok(())
+    })
 }
 
 /// What a device holds of the person's lists, each act with what its
