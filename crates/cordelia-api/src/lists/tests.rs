@@ -2772,6 +2772,29 @@ fn an_act_is_taken_when_the_door_first_stores_a_list_that_brings_it() {
     assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
 }
 
+/// An error in the person's lists takes back nothing at the door: a list
+/// kept that no longer reads does not stop a statement from being
+/// applied (the review of slice 3 again, low 5).
+#[test]
+fn an_error_in_the_lists_takes_back_no_statement() {
+    let mut s = person(2, 2);
+    kept_rows::keep(
+        &s[1].conn,
+        &kept_rows::Kept {
+            list: vec![9; 5],
+            rev: 1,
+        },
+    )
+    .unwrap();
+    assert!(holds(&s[1].conn).is_err());
+    let before = s[1].number();
+    s.now += 10;
+    s.change(0, &[0, 1], &[]);
+    give(&s, 0, 1, s.now + 1);
+    assert!(s[1].number() > before);
+    assert_eq!(s[1].number(), s[0].number());
+}
+
 /// A whole fetch whose database cannot be read says so.
 #[test]
 fn a_whole_fetch_that_cannot_read_the_database_says_so() {

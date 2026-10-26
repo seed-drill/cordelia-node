@@ -216,9 +216,11 @@ pub fn take(
                 })
         );
         // The person's lists are worked out again, and the device's own
-        // written where it changed (§3.4, "What a device writes").
-        if knows_anew {
-            crate::lists::follow(conn, identity, now)?;
+        // written where it changed (§3.4, "What a device writes"), in a
+        // write of its own: an error there is logged, and takes back
+        // nothing of what was taken, a statement applied among it.
+        if knows_anew && let Err(e) = crate::lists::follow(conn, identity, now) {
+            tracing::warn!(error = %e, "could not work out the person's lists again");
         }
         Ok(taken)
     })?;
