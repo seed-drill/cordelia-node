@@ -1512,8 +1512,10 @@ pub fn judge_kept(
                 note_time(conn, &followed, &read.statement)?;
             }
         }
+        // A device that is not in a fork is judged by what it follows: one
+        // applied under a change that is not clear is closed (rule 10).
         if held.state != State::Fork {
-            return Ok(None);
+            return Ok(close_if_not_clear(conn)?.then_some(Shown::Closed));
         }
         let mut judged = None;
         for head in set_aside_heads(conn, identity, &following)? {
@@ -1525,7 +1527,7 @@ pub fn judge_kept(
             // A change made apart is not applied here: nothing comes of
             // step 4 for it.
             let mut apply = |_: &Held| Ok(Shown::Closed);
-            let shown = decide(
+            let mut shown = decide(
                 conn,
                 identity,
                 &held,
@@ -1535,8 +1537,12 @@ pub fn judge_kept(
                 &mut apply,
                 now,
             )?;
+            // It was set applied to be judged: whatever rule 8 did, it
+            // stays applied only under a change that is clear.
             if shown == Shown::Closed {
                 close(conn)?;
+            } else if close_if_not_clear(conn)? {
+                shown = Shown::Closed;
             }
             judged = Some(shown);
             let stays = held_rows::person(conn)?.map(|person| person.state);
@@ -8523,6 +8529,50 @@ mod tests {
         let conn = device_at(0, 2);
         assert_eq!(decided(&conn, false), Shown::NotListed);
         assert_eq!(state(&conn), State::NotListed);
+    }
+
+    /// Rule 12 with rule 10: whatever rule 8 makes of what a device kept at
+    /// its first start, it is left applied only under a change that is
+    /// clear. A device in a fork whose entry kept apart is behind the change
+    /// it follows, which lists a key it knows to be removed, stays closed;
+    /// and a device in no fork, applied under such a change, is closed.
+    #[test]
+    fn test_at_its_first_start_a_device_is_left_applied_only_under_a_clear_change() {
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let mark = |conn: &Connection| {
+            cordelia_storage::meta::set(conn, cordelia_storage::meta::PERSON_JUDGE_KEPT, "1")
+                .unwrap();
+        };
+
+        // In a fork: it follows a change after statement 2 that lists
+        // device 2, keeps device 2 as removed, and kept statement 2 apart.
+        let lists_two = two
+            .next(key(0), &secret(13), listed(&[0, 1, 2]), &[])
+            .unwrap();
+        let conn = db::open_in_memory().unwrap();
+        follow(&conn, 0, &phrase, &lists_two, secret(13));
+        held_rows::set_aside(&conn, &change(&phrase, &two, secret(2)), NOW).unwrap();
+        held_rows::keep_removed(&conn, &[key(2)], NOW).unwrap();
+        held_rows::set_state(&conn, State::Fork).unwrap();
+        mark(&conn);
+        assert_eq!(
+            judge_kept(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Closed)
+        );
+        assert_eq!(state(&conn), State::Fork);
+
+        // In no fork: applied under statement 2, with device 2 kept as
+        // removed.
+        let conn = device_at(0, 2);
+        held_rows::keep_removed(&conn, &[key(2)], NOW).unwrap();
+        mark(&conn);
+        assert_eq!(
+            judge_kept(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Closed)
+        );
+        assert_eq!(state(&conn), State::Fork);
+        assert!(!held_rows::to_judge_kept(&conn).unwrap());
     }
 
     /// The hold of the node's lock on the hot paths that ask whether the
