@@ -613,7 +613,7 @@ mod tests {
         // Another key's entry is never the device's to push.
         let theirs = anew(&member(3), &channel, 1);
         crate::take::take(conn, identity, &theirs, now).unwrap();
-        assert_eq!(waits(&AT), [later.clone()]);
+        assert_eq!(waits(&AT), std::slice::from_ref(&later));
         // An answer at a lower revision does not undo one at a higher.
         let held = std::slice::from_ref(&later);
         pushed(conn, &here, &AT, held, &[Pushed::Holds]).unwrap();
