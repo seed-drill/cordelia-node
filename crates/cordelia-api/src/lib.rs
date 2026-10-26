@@ -67,6 +67,7 @@ pub mod sender;
 #[cfg(test)]
 mod several;
 pub mod shared;
+pub mod shared_pass;
 pub mod state;
 pub mod swept;
 pub mod sync;
