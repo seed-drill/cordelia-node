@@ -11307,7 +11307,9 @@ async fn a_shared_channel_refused_for_room_waits_its_turn_to_push() {
             .filter_map(|one| match one {
                 WireMessage::EntryPush(push) => {
                     let entry = Entry::from_wire(push.entries.first()?).ok()?;
-                    channels.iter().position(|channel| *channel == entry.channel)
+                    channels
+                        .iter()
+                        .position(|channel| *channel == entry.channel)
                 }
                 _ => None,
             })
@@ -11410,7 +11412,15 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
     let handed = std::sync::Mutex::new(Vec::new());
     let counted = |bytes: u64| handed.lock().unwrap().push(bytes);
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), 1, counted, |_, _| true, judged)
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            1,
+            counted,
+            |_, _| true,
+            judged,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -11432,13 +11442,29 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
     // A key that reads nothing now, and sync off, ask nothing.
     let asked = bob.device_counts("relay").asked;
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), 100, |_| (), |_, _| false, judged)
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            100,
+            |_| (),
+            |_, _| false,
+            judged,
+        )
         .await
         .unwrap();
     assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
     bob.syncs(false);
     let read = leave
-        .share_pair(&bob.state, &link, &alice.key(), 100, |_| (), |_, _| true, judged)
+        .share_pair(
+            &bob.state,
+            &link,
+            &alice.key(),
+            100,
+            |_| (),
+            |_, _| true,
+            judged,
+        )
         .await
         .unwrap();
     assert_eq!(read, cordelia_node::device_entries::SharePairRead::NotNow);
