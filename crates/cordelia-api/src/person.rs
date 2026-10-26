@@ -1270,7 +1270,7 @@ pub fn first_entry(
     let statement =
         Statement::first(device, &secret, phrase.public_key()?)?.sign(&phrase.signing_key()?)?;
     let mut for_phrase = ForPhrase::first(*secret);
-    let entry = change_entry::entry_of(phrase, &statement, &for_phrase);
+    let entry = change_entry::entry_of(phrase, &statement, &for_phrase, crate::change::made_now());
     // The new secret is in the entry, sealed: what is left of it here is
     // overwritten.
     for_phrase.secret.zeroize();
@@ -2072,10 +2072,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use cordelia_core::protocol::{
-        CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_NAME,
-        ITEM_SEAL_OVERHEAD_BYTES, KEPT_OUT_PER_ADDER, LABEL_CHANGE_DEVICES, LABEL_CHANGE_SECRET,
-        LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT, LABEL_STATEMENT,
-        MIN_ENTRY_CONTENT_BYTES, REV_BAND_HALF, REV_COUNT_BITS,
+        CHANGE_ENTRY_BYTES, CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_LINEAGE_BYTES,
+        CHANGE_ENTRY_NAME, ITEM_SEAL_OVERHEAD_BYTES, KEPT_OUT_PER_ADDER, LABEL_CHANGE_DEVICES,
+        LABEL_CHANGE_SECRET, LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, LABEL_ENTRY_CONTENT,
+        LABEL_STATEMENT, MIN_ENTRY_CONTENT_BYTES, REV_BAND_HALF, REV_COUNT_BITS,
     };
     use cordelia_crypto::addition::Addition;
     use cordelia_crypto::aes_gcm::item_encrypt;
@@ -2170,10 +2170,15 @@ mod tests {
     /// The change entry of `statement`, which commits to `secret`, as the
     /// phrase makes it. Made twice, it is two entries of one statement.
     fn change(phrase: &Phrase, statement: &Statement, secret: [u8; 32]) -> CheckedEntry {
-        change_entry::entry_of(phrase, &sign(statement, phrase), &ForPhrase::first(secret))
-            .unwrap()
-            .check()
-            .unwrap()
+        change_entry::entry_of(
+            phrase,
+            &sign(statement, phrase),
+            &ForPhrase::first(secret),
+            NOW as u64,
+        )
+        .unwrap()
+        .check()
+        .unwrap()
     }
 
     /// What a device follows that follows `phrase`.
@@ -5109,6 +5114,63 @@ mod tests {
         // The control: the entry they were made from is applied.
         assert!(matches!(
             shown(&conn, &device(1), &good, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
+    }
+
+    /// A device refuses an entry whose lineage does not match its
+    /// statement (decision 2026-10-24 rule 13): nothing changes, and the
+    /// device is in no fork. An entry with no lineage, as the version
+    /// before makes one, is judged by its statement alone.
+    #[test]
+    fn test_an_entry_whose_lineage_is_not_its_statements_is_refused() {
+        use cordelia_crypto::change_entry::Lineage;
+        let conn = device_at(1, 2);
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let good = change(&phrase, &three, secret(3));
+        let region = CHANGE_ENTRY_BYTES - CHANGE_ENTRY_LINEAGE_BYTES;
+        let with = |lineage: &Lineage| {
+            let mut content = good.content.clone();
+            content[region..].copy_from_slice(&lineage.to_bytes().unwrap());
+            change_with(&phrase, 3, content)
+        };
+        let mut chain_changed = Lineage::of(&three, NOW as u64).unwrap();
+        chain_changed.chain[1][0] ^= 1;
+        let refused = [
+            (
+                "another statement's",
+                with(&Lineage::of(&two, NOW as u64).unwrap()),
+            ),
+            ("with its chain changed", with(&chain_changed)),
+        ];
+        let before = everything(&conn);
+        for (what, entry) in refused {
+            assert_eq!(
+                shown(&conn, &device(1), &entry, NOW).unwrap(),
+                Shown::Refused(Refused::NotAChangeEntry(
+                    ChangeEntryError::LineageNotItsStatement
+                )),
+                "{what}"
+            );
+            assert_eq!(everything(&conn), before, "{what}");
+        }
+        assert_eq!(state(&conn), State::Applied);
+
+        // With no lineage, the entry is applied by its statement.
+        let mut content = good.content.clone();
+        content[region..].fill(0);
+        let made_before = change_with(&phrase, 3, content);
+        assert!(matches!(
+            shown(&conn, &device(1), &made_before, NOW).unwrap(),
+            Shown::Applied(_)
+        ));
+
+        // The control: the entry as it was made is applied on another
+        // device.
+        let other = device_at(0, 2);
+        assert!(matches!(
+            shown(&other, &device(0), &good, NOW).unwrap(),
             Shown::Applied(_)
         ));
     }

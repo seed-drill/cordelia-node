@@ -1909,7 +1909,9 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
         phrase_key: applied.phrase_key,
     };
     let signed = undoes.sign(&phrase().signing_key().unwrap()).unwrap();
-    let entry = change_entry::entry_of(&phrase(), &signed, &ForPhrase::first(secret)).unwrap();
+    let entry =
+        change_entry::entry_of(&phrase(), &signed, &ForPhrase::first(secret), 1_790_000_000)
+            .unwrap();
 
     device.connects_to("relay", relay.port, relay.key).await;
     let other = Say::Answer(ShowAnswer::Other {

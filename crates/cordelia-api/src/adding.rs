@@ -3887,7 +3887,9 @@ mod tests {
     /// `secret`, with its change entry as the phrase makes it.
     fn handing(s: &Several, statement: Statement, secret: [u8; 32]) -> HandOver {
         let signed = statement.sign(&s.phrase.signing_key().unwrap()).unwrap();
-        let entry = change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret)).unwrap();
+        let entry =
+            change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret), s.now as u64)
+                .unwrap();
         HandOver {
             made_at: s.now as u64,
             statement: signed,
