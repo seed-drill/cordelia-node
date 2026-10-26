@@ -474,6 +474,9 @@ pub struct DeviceEntries {
     /// What the passes found last of what decides whether the lists of a
     /// person's reads and of bounds are due (issue #221).
     lists_seen: Mutex<marks::ListsSeen>,
+    /// Whether the lists that the store held from before step 20 are known
+    /// to have been read: once they are, a pass asks no more.
+    held_lists_read: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -513,6 +516,7 @@ impl DeviceEntries {
             set_up: Mutex::default(),
             started: AtomicBool::new(false),
             lists_seen: Mutex::default(),
+            held_lists_read: AtomicBool::new(false),
         })
     }
 
@@ -1546,12 +1550,20 @@ impl DeviceEntries {
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
     /// which the device stands applied, where the start did not.
+    /// Once they are known to be read, a pass does nothing here, and takes
+    /// no lock (issue #221).
     fn read_held_lists(&self) {
+        if self.held_lists_read.load(Ordering::Relaxed) {
+            return;
+        }
         let db = lock(&self.state.db);
         match cordelia_api::reader::read_held_lists(&db, &self.state.identity, self.unix()) {
             Ok(true) => tracing::info!("read the lists of messages held from before this version"),
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
+        }
+        if cordelia_api::reader::held_lists_were_read(&db) {
+            self.held_lists_read.store(true, Ordering::Relaxed);
         }
     }
 
@@ -3506,5 +3518,32 @@ mod tests {
             pushed_as(&PushAnswer::Refused(EntryRefused::OverLimit)),
             Pushed::OverAllowance
         );
+    }
+
+    /// Once the lists that the store held from before step 20 are known to
+    /// have been read, a pass asks no more, and takes no lock for them
+    /// (issue #221). Before, each pass asks.
+    #[test]
+    fn a_pass_takes_no_lock_for_the_held_lists_once_they_were_read() {
+        let state = a_node();
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let takes = || state.db.times().hold(TakeKind::Other).count;
+        let before = takes();
+        device.read_held_lists();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 2);
+        cordelia_storage::meta::set(
+            &lock(&state.db),
+            cordelia_storage::meta::MESSAGES_LISTS_READ,
+            "1",
+        )
+        .unwrap();
+        let before = takes();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 1);
+        for _ in 0..10 {
+            device.read_held_lists();
+        }
+        assert_eq!(takes(), before + 1);
     }
 }
