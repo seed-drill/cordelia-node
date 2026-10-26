@@ -1435,7 +1435,7 @@ impl Leave {
     ///   caller counts it in the device's whole count and in the shared
     ///   pass's quarter, and sizes `limit` to that quarter. The proof's place
     ///   on the connection is the caller's to check and keep, as it is for
-    ///   a shared channel (not yet called: slice 6 calls it).
+    ///   a shared channel (`DeviceEntries::asks_for_shares`).
     /// - Of what comes back, each entry of that channel that `key` signed
     ///   is given to `accept`, under the database's lock: none is stored,
     ///   and no place is kept. An entry of another channel, or by another
