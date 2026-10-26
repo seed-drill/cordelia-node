@@ -1903,7 +1903,8 @@ impl DeviceEntries {
     /// the keys it removes commits at once, and is not undone to wait for
     /// the cycle. A closed device seals nothing from that commit, whatever
     /// a running cycle does (`Standing::to_write`), so its close commits
-    /// with it.
+    /// with it. A refusal that closed the device is a close: it commits at
+    /// once, and wakes the pass (rule 19), wherever it was answered.
     fn answered_as_a_change(
         &self,
         shown: &CheckedEntry,
@@ -1911,18 +1912,28 @@ impl DeviceEntries {
         now: i64,
     ) -> Result<Answered, PersonError> {
         let identity = &self.state.identity;
-        let (outcome, _) = self.state.as_a_change_where(
+        let (outcome, changed) = self.state.as_a_change_where(
             |db| {
                 at_relays::telling_a_change(db, |db| {
                     at_relays::answered(db, identity, shown, another, now)
                 })
             },
             |(outcome, changed)| match (outcome, changed) {
-                (Ok(Answered::Shown(Shown::SetAside | Shown::Closed)), _) => Came::Nothing,
+                (Ok(Answered::Shown(Shown::SetAside | Shown::Closed | Shown::Refused(_))), _) => {
+                    Came::Nothing
+                }
                 (_, true) => Came::Changed,
                 (_, false) => Came::Nothing,
             },
         );
+        // A refusal changes where the device stands only where the keys it
+        // kept closed it.
+        if changed && matches!(outcome, Ok(Answered::Shown(Shown::Refused(_)))) {
+            tracing::warn!(
+                "a change was refused, and the keys it removes leave the change this device follows not clear: it is closed until the two are settled"
+            );
+            self.state.own_channels.ask_whole();
+        }
         outcome
     }
 
@@ -3273,6 +3284,114 @@ mod tests {
             held: Default::default(),
             history: Default::default(),
         })
+    }
+
+    /// A change that the phrase signed, which undoes a removal of the
+    /// change this device follows and removes a key that the change lists,
+    /// is refused, and its removed key is kept: the change followed is not
+    /// clear, and the device is closed (decision 2026-10-24 (removal),
+    /// rules 2, 8 and 10). The close is no change of settings that waits
+    /// for a cycle, and it wakes the pass at once (rule 19).
+    #[tokio::test]
+    async fn a_refusal_that_closes_the_device_commits_at_once_and_wakes_the_pass() {
+        use cordelia_crypto::change_entry::{ForPhrase, entry_of};
+        use cordelia_crypto::phrase::Phrase;
+        use cordelia_crypto::statement::Device;
+
+        let state = a_node();
+        let phrase = Phrase::parse(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let own = state.identity.public_key();
+        let key = |seed: u8| {
+            cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32])
+                .unwrap()
+                .public_key()
+        };
+        let (k, x) = (key(0x4b), key(0x58));
+        let entry = |statement: &cordelia_crypto::statement::Statement, secret: [u8; 32]| {
+            let signed = statement
+                .clone()
+                .sign(&phrase.signing_key().unwrap())
+                .unwrap();
+            let entry = entry_of(&phrase, &signed, &ForPhrase::first(secret), 1_800_000_000)
+                .unwrap()
+                .check()
+                .unwrap();
+            (signed, entry)
+        };
+        // It follows change 2, which lists K and removes X.
+        let (followed, refused) = {
+            let db = lock(&state.db);
+            cordelia_api::person::first_statement(
+                &db,
+                &state.identity,
+                &phrase,
+                "d",
+                1_800_000_000,
+            )
+            .unwrap();
+            let one = cordelia_api::person::held(&db)
+                .unwrap()
+                .unwrap()
+                .statement
+                .statement;
+            let two = one
+                .next(
+                    own,
+                    &[2; 32],
+                    vec![Device::new(own, "d").unwrap(), Device::new(k, "k").unwrap()],
+                    &[x],
+                )
+                .unwrap();
+            let (signed, followed) = entry(&two, [2; 32]);
+            cordelia_api::person::apply(
+                &db,
+                &state.identity,
+                &signed,
+                &[2; 32],
+                &followed,
+                1_800_000_001,
+            )
+            .unwrap();
+            // Change 3 removes K, and drops the removal of X.
+            let mut three = two
+                .next(own, &[3; 32], vec![Device::new(own, "d").unwrap()], &[k])
+                .unwrap();
+            three.removed.retain(|key| *key != x);
+            three.validate().unwrap();
+            (followed, entry(&three, [3; 32]).1)
+        };
+
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let generation = state.sync_control.generation();
+        let outcome = device.answered_as_a_change(&followed, &refused, 1_800_000_002);
+        assert!(
+            matches!(outcome, Ok(Answered::Shown(Shown::Refused(_)))),
+            "{outcome:?}"
+        );
+        let held = cordelia_api::person::held(&lock(&state.db))
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state, State::Fork);
+        // Committed with no change of settings counted.
+        assert_eq!(state.sync_control.generation(), generation);
+        // And the pass was asked for.
+        let asked =
+            tokio::time::timeout(Duration::from_millis(50), state.own_channels.wait_asked()).await;
+        assert!(asked.is_ok(), "the pass was not woken");
+
+        // The same refusal again closes nothing more, and wakes nothing.
+        device
+            .answered_as_a_change(&followed, &refused, 1_800_000_003)
+            .unwrap();
+        let asked =
+            tokio::time::timeout(Duration::from_millis(50), state.own_channels.wait_asked()).await;
+        assert!(
+            asked.is_err(),
+            "a refusal that changed nothing woke the pass"
+        );
     }
 
     /// The hourly task of messages runs on a node whatever the device's
