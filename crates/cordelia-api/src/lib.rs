@@ -68,6 +68,8 @@ pub mod sender;
 mod several;
 pub mod shared;
 pub mod shared_pass;
+pub mod sharing;
+pub mod sharing_routes;
 pub mod state;
 pub mod swept;
 pub mod sync;
@@ -159,6 +161,18 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/send", web::post().to(messages::send))
             .route("/log", web::post().to(messages::log))
             .route("/allow", web::post().to(messages::allow)),
+    );
+    // Making, sharing and taking a shared channel (decision 2026-10-10
+    // §5.6): a personal node's, each behind the node's token.
+    cfg.service(
+        web::scope("/api/v1/shared")
+            .route("/new", web::post().to(sharing_routes::new))
+            .route("/share", web::post().to(sharing_routes::share))
+            .route("/accept", web::post().to(sharing_routes::accept))
+            .route("/label", web::post().to(sharing_routes::label))
+            .route("/rename", web::post().to(sharing_routes::rename))
+            .route("/drop", web::post().to(sharing_routes::drop))
+            .route("/list", web::post().to(sharing_routes::list)),
     );
     shared_routes(cfg);
 }

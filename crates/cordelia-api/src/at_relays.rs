@@ -321,12 +321,20 @@ pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, 
     // holds nothing of its own but in its own channels, where it handed a
     // device what it needs, and in the shared channels, which have a pass
     // of their own (decision 2026-10-10 §8.4). The messages channel is
-    // never one, with sync off as with it on, and nor is a shared channel.
+    // never one, with sync off as with it on, and nor is a shared channel
+    // or a share pair channel.
+    // A share pair channel is no pair channel either: its shares go only
+    // to their cards' relays, through a door of their own (§3.1, §8.4).
+    let share_pairs: Vec<[u8; 32]> = cordelia_storage::shared_sharing::shares(conn)?
+        .into_iter()
+        .map(|share| share.pair)
+        .collect();
     let mut pairs: Vec<Own> = Vec::new();
     for id in kept_rows::channels_written_by(conn, &identity.public_key())? {
         if id == messages.id
             || own.iter().any(|channel| channel.id == id)
             || cordelia_storage::shared::channel(conn, &id)?.is_some()
+            || share_pairs.contains(&id)
         {
             continue;
         }
