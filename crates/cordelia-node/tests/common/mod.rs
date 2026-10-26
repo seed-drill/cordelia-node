@@ -2020,6 +2020,10 @@ pub struct Script {
     /// A channel it has no room for, whatever `has_room` says: an entry
     /// of it that is shown or pushed is refused for room.
     pub no_room_in: Option<[u8; 32]>,
+    /// The channels it holds entries of, each with those entries as they
+    /// travel, in its order: a proof of one is answered yes, and a pull of
+    /// one is handed what follows its place.
+    pub serves: std::collections::HashMap<[u8; 32], Vec<Vec<u8>>>,
 }
 
 /// A stand-in for a relay. It completes the handshake as a relay does,
@@ -2069,6 +2073,7 @@ pub fn stand_in_relay() -> StandIn {
             says_nothing_of: 0,
             holds: BTreeSet::new(),
             no_room_in: None,
+            serves: Default::default(),
         })),
         connections: Arc::default(),
     };
@@ -2169,14 +2174,33 @@ impl StandIn {
                     };
                     Some(WireMessage::EntryShown(EntryShown { answer }))
                 }
-                Some(WireMessage::ChannelProve(_)) => {
-                    Some(WireMessage::ChannelProved(ChannelProved { proved: false }))
+                Some(WireMessage::ChannelProve(prove)) => {
+                    let proved = script.serves.contains_key(&prove.channel);
+                    Some(WireMessage::ChannelProved(ChannelProved { proved }))
                 }
-                Some(WireMessage::EntryPull(pull)) => Some(WireMessage::EntryPulled(EntryPulled {
-                    entries: Vec::new(),
-                    next: pull.after,
-                    mark: pull.mark,
-                })),
+                Some(WireMessage::EntryPull(pull)) => match script.serves.get(&pull.channel) {
+                    // What follows the place asked from, under a mark of
+                    // its own, at most as many as asked for.
+                    Some(served) => {
+                        let from = usize::try_from(pull.after).unwrap_or(usize::MAX);
+                        let handed: Vec<serde_bytes::ByteBuf> = served
+                            .iter()
+                            .skip(from)
+                            .take(pull.limit.max(1) as usize)
+                            .map(|bytes| serde_bytes::ByteBuf::from(bytes.clone()))
+                            .collect();
+                        Some(WireMessage::EntryPulled(EntryPulled {
+                            next: (from.min(served.len()) + handed.len()) as u64,
+                            entries: handed,
+                            mark: [1; 8],
+                        }))
+                    }
+                    None => Some(WireMessage::EntryPulled(EntryPulled {
+                        entries: Vec::new(),
+                        next: pull.after,
+                        mark: pull.mark,
+                    })),
+                },
                 Some(WireMessage::EntryPush(push)) if script.says_nothing_of > 0 => {
                     script.says_nothing_of -= 1;
                     let answers = vec![PushAnswer::Stored; push.entries.len().saturating_sub(1)];
@@ -2208,6 +2232,13 @@ impl StandIn {
     /// From now on it has room, or has none, as `has_room` says.
     pub fn has_room(&self, has_room: bool) {
         self.script.lock().unwrap().has_room = has_room;
+    }
+
+    /// From now on it holds `entries` of the channel `channel`, and only
+    /// those: it proves it, and hands them to a pull, in this order.
+    pub fn serves(&self, channel: [u8; 32], entries: &[Entry]) {
+        let wire = entries.iter().map(|entry| entry.to_wire()).collect();
+        self.script.lock().unwrap().serves.insert(channel, wire);
     }
 
     /// From now on it has no room for the channel `channel`, and room for
