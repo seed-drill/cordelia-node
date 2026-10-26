@@ -2260,8 +2260,9 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         "\nThis change joins them: it is numbered above each, and undoes no removal: every key \
          that any removed stays removed. Of each other device of any, say whether it stays, is \
          removed, or is neither: one that is neither is in no list, and is added again by hand. \
-         A device added under a change set aside since it was made is not known here, and is in \
-         no list."
+         Each device added since under the change this device follows is asked about too. A \
+         device added under a change set aside since it was made is not known here, and is in no \
+         list."
     );
     let gone = |key: &[u8; 32]| {
         Some(*key) == goes
@@ -2298,6 +2299,21 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         match asks_of(at, &says, true)? {
             Answer::Stays => stay.push(device.clone()),
             Answer::Removed => removed.push(device.key),
+            Answer::Neither => {}
+        }
+    }
+    // Each device added since under the change followed, by a record that
+    // counts, is asked about as at a renewal, with the third answer: no
+    // change shown lists it, and a change made here would otherwise leave
+    // it in no list.
+    for question in questions(handed, goes) {
+        let key = question.device.key;
+        if gone(&key) || heads.iter().any(|statement| statement.lists(&key)) {
+            continue;
+        }
+        match asks_of(at, &question.says, true)? {
+            Answer::Stays => stay.push(question.device),
+            Answer::Removed => removed.push(key),
             Answer::Neither => {}
         }
     }
@@ -3881,6 +3897,25 @@ mod tests {
         joins(&signs, &[&f.statement, &apart]);
         assert!(signs.lists(&f.listed));
         assert!(typed.asked.borrow()[0].contains("a device of the change this device follows"));
+        // A device added since under the change followed is asked about
+        // too, with the third answer: it is not left out unasked.
+        let desktop = NodeIdentity::from_seed([5; 32]).unwrap().public_key();
+        let mut with_added = f.handed(&f.statement, &[f.adds(desktop, "desktop")]);
+        with_added["heads"] = handed["heads"].clone();
+        let read_added = f.read(&with_added).unwrap();
+        for (answer, kept) in [("stays", true), ("neither", false)] {
+            let typed = Typed::of(&["stays", answer]);
+            let prepared = asked(&typed, &read_added, &Which::Renew).unwrap();
+            let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+            joins(&signs, &[&f.statement, &apart]);
+            assert_eq!(signs.lists(&desktop), kept, "{answer}");
+            let asked = typed.asked.borrow();
+            assert!(
+                asked[1].contains("added since the last change"),
+                "{}",
+                asked[1]
+            );
+        }
 
         // Two heads set aside: the settlement joins all three.
         let (third, third_entry) = f.apart(3);
