@@ -1440,6 +1440,7 @@ impl Leave {
     ///   is given to `accept`, under the database's lock: none is stored,
     ///   and no place is kept. An entry of another channel, or by another
     ///   key, is dropped.
+    #[allow(clippy::too_many_arguments)]
     pub async fn share_pair<A>(
         &self,
         state: &AppState,
