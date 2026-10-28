@@ -142,9 +142,17 @@ fn accept_takes_only_the_typed_keys_share_for_this_device_within_the_hour_at_its
     );
     // Rule 4: another name, a value that is no share, a delete.
     let named = share_by(&alice, &bob_key, &good_card, now, Some("hand-over"));
+    // The channel's ID right, but not spelled as a share's name is: in
+    // capitals.
+    let upper = format!(
+        "{}{}",
+        cordelia_core::protocol::SHARE_PREFIX,
+        hex::encode_upper(good_card.channel_id().unwrap())
+    );
+    let spelled = share_by(&alice, &bob_key, &good_card, now, Some(&upper));
     let no_share = entry_by(&alice, &secret, 1, &name, Value::Other(vec![1; 407]), &[]);
     let delete = entry_by(&alice, &secret, 2, &name, Value::Delete, &[]);
-    for entry in [&named, &no_share, &delete] {
+    for entry in [&named, &spelled, &no_share, &delete] {
         assert_eq!(
             judge(&s, 0, &typing, entry, now),
             Some(Judged::Not(NotAShare::NotAShare))
