@@ -4084,7 +4084,8 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
     at.says("The change is made (change 2).");
 
     // The wait: the same process, and another image of the program in
-    // it, which was given the change's number and nothing else.
+    // it, which was given the change's number and its entry, and nothing
+    // else.
     let began = std::time::Instant::now();
     let waits = loop {
         let line = command_line(pid);
@@ -4093,8 +4094,11 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    let entry = waits
+        .split_once(" change-made 2 --entry ")
+        .map_or("", |(_, entry)| entry);
     assert!(
-        waits.ends_with(" change-made 2"),
+        entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit()),
         "{waits:?} after {signs:?}"
     );
     assert!(!waits.contains("renew"), "{waits}");
