@@ -985,8 +985,10 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     wait_for("the relay holds the change", &[&relay, &a], 30, || {
         let seen = person_of(&a);
         let relays = seen["relays"].as_array()?;
-        (seen["change"] == 2 && relays.iter().all(|relay| relay["holds_latest"] == true))
-            .then_some(())
+        (seen["change"] == 2
+            && !relays.is_empty()
+            && relays.iter().all(|relay| relay["holds_latest"] == true))
+        .then_some(())
     });
     let seen = person_of(&a);
     assert_eq!(seen["names"]["to_go"], json!(["lab"]), "{seen}");
