@@ -2637,7 +2637,15 @@ pub(crate) mod tests {
     /// still going, or gone with its revisions kept; the door stores
     /// nothing more of a key going, and the reader shows nothing of it; and
     /// the next start ends the take-out.
+    ///
+    /// Not under coverage (CI's coverage job builds with `--cfg
+    /// coverage`): its counters are in the holds it bounds, and they ran
+    /// over 100 ms there on 28 October; CI's test job runs it whole.
     #[test]
+    #[cfg_attr(
+        coverage,
+        ignore = "under coverage, its counters are in the holds it bounds"
+    )]
     fn a_take_out_holds_the_lock_one_key_at_a_time() {
         use cordelia_core::load::Kind;
         use cordelia_core::lock::{LockWhole, TimedLock, taking};
