@@ -1394,9 +1394,11 @@ impl Leave {
                     ));
                 }
                 let answers: Vec<Pushed> = pushed.answers.iter().map(pushed_as).collect();
+                let now = self.clock.unix_from(state.sync_control.now());
                 let conn = lock(&state.db);
                 let refused =
-                    shared_pass::pushed(&conn, &usable, &relay, &batch, &answers).map_err(store)?;
+                    shared_pass::pushed(&conn, identity, &usable, &relay, &batch, &answers, now)
+                        .map_err(store)?;
                 Ok(SharedDone::Pushed {
                     sent: batch.len(),
                     refused,
