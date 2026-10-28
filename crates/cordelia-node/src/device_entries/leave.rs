@@ -16,15 +16,22 @@
 //!   RELAY_ROLE_HEADS, and hands one head that the device keeps twice in a
 //!   round, gives leave** ([`Leave::grant`]): a relay of the version
 //!   before does that, and holds that head alone.
-//! - **A device in a fork has no leave anywhere, nor has one that has
-//!   stopped,** nor one that follows no phrase: it has nothing to show.
+//! - **A closed device has no leave anywhere, nor has one that has
+//!   stopped,** nor one that follows no phrase: it has nothing to show. A
+//!   closed device sends the delete it wrote over a hand-over, through a
+//!   door of its own, and nothing else ([`Leave::withdraw`]).
 //! - **Leave ends at once, at every relay, when the entry that the device
 //!   keeps changes.** It is given for the entry that was shown, and what
 //!   the device keeps is read from its database each time leave is asked.
 //! - **A device that wakes asks every relay first.** When the node starts,
 //!   or reaches a relay after having reached none, there is no leave
-//!   anywhere until each relay it is set up with has answered a show, or
-//!   WAKE_WAIT_SECS have gone by.
+//!   anywhere until each relay it is set up with has answered a show and
+//!   its answer is judged ([`Leave::heard`], decision 2026-10-24 (removal),
+//!   rule 5), or WAKE_WAIT_SECS have gone by.
+//! - **A push open at the commit after which the device may use the
+//!   connection no more, and not yet answered, is reset** (rule 5): the
+//!   commit that closes it, or has it apply a change. The node's database
+//!   counts its commits ([`Leave::watch_commits`]).
 //! - **A device that was answered with a change and could not apply it**
 //!   has no leave anywhere until it has: whatever becomes of the
 //!   connection that the change came on.
@@ -550,6 +557,12 @@ impl Inner {
 pub struct Leave {
     clock: Clock,
     inner: Mutex<Inner>,
+    /// How many transactions the node's database has committed, as its
+    /// commit hook counts them ([`Self::watch_commits`]): a push that is
+    /// open watches it, and is reset at the commit after which the device
+    /// may use the connection no more (decision 2026-10-24 (removal), rule
+    /// 5).
+    commits: tokio::sync::watch::Sender<u64>,
     /// What the device asked of each relay, held back and was refused for
     /// now: counted, and read by nothing here (decision 2026-10-22 §1.2,
     /// §7.3).
@@ -563,8 +576,25 @@ impl Leave {
         Self {
             clock,
             inner: Mutex::default(),
+            commits: tokio::sync::watch::Sender::new(0),
             counts: Arc::default(),
         }
+    }
+
+    /// Count each transaction that `conn` commits, so that a push open at
+    /// the commit that closes the device, or has it apply a change, is
+    /// reset (decision 2026-10-24 (removal), rule 5): `conn` is the node's
+    /// database, which every such commit is made on. The count moves as
+    /// the commit is made, under the database's lock: whoever then reads
+    /// where the device stands waits for that lock, and reads what was
+    /// committed. A connection has one commit hook: the node's one leave
+    /// watches its database.
+    pub fn watch_commits(&self, conn: &Connection) {
+        let commits = self.commits.clone();
+        conn.commit_hook(Some(move || {
+            commits.send_modify(|count| *count = count.wrapping_add(1));
+            false
+        }));
     }
 
     /// The same leave, counting what the device asks in `counts`: the
@@ -738,6 +768,9 @@ impl Leave {
     /// gives leave on the connection from now, for that entry. Any other
     /// answer to it ends what leave there was. The show of a head set
     /// aside does neither. A stream that is not answered changes nothing.
+    ///
+    /// **The relay is not heard here** while the device wakes: it is heard
+    /// once its answer is judged ([`Self::heard`]).
     pub async fn show(
         &self,
         link: &Link,
@@ -766,9 +799,6 @@ impl Leave {
             WireMessage::EntryShown(shown) => shown.answer,
             _ => return Err("a show was not answered as one".into()),
         };
-        if let Some(woke) = &mut lock(&self.inner).woke {
-            woke.heard.insert(link.name.clone());
-        }
         if followed {
             match gives_leave(&answer) {
                 true => self.grant(link, entry),
@@ -795,6 +825,17 @@ impl Leave {
                 entry: entry.id(),
             },
         );
+    }
+
+    /// The relay called `name` answered a show, and its answer has been
+    /// judged: while the node wakes, it is heard from then (decision
+    /// 2026-10-24 (removal), rule 5). So a device that wakes goes on at no
+    /// relay while the answer of another, which may hold a removal, waits
+    /// to be judged.
+    pub fn heard(&self, name: &str) {
+        if let Some(woke) = &mut lock(&self.inner).woke {
+            woke.heard.insert(name.to_string());
+        }
     }
 
     /// Open a stream for a channel of the device's own on `link`, ask
@@ -863,6 +904,10 @@ impl Leave {
         let (mut send, mut recv) = open_stream(&link.conn)
             .await
             .map_err(Refused::NotAnswered)?;
+        // The commits are watched from before the check below: one made
+        // after it is seen.
+        let mut commits = self.commits.subscribe();
+        commits.mark_unchanged();
         // The stream is open, which may have taken the relay a while:
         // the request is written only where the device still keeps the
         // entry that it was built under.
@@ -874,14 +919,32 @@ impl Leave {
         }
         // A request that the relay refused for now is said so, and
         // counted for the relay; any other failure is said as it was.
-        let answer = exchange(
-            send,
-            recv,
-            protocol,
-            request,
-            self.counts_as_sent(link, protocol, request),
-        )
-        .await
+        let sent = self.counts_as_sent(link, protocol, request);
+        let answer = match protocol {
+            // **A push open at the commit after which the device may use
+            // the connection no more, and not yet answered, is reset**
+            // (decision 2026-10-24 (removal), rule 5): the commit that
+            // closes it, or has it apply a change. Only what the relay
+            // already had whole can be stored.
+            Protocol::EntryPush => {
+                let exchanged = {
+                    let exchange = exchange(&mut send, &mut recv, protocol, request, sent);
+                    tokio::select! {
+                        answer = exchange => Ok(answer),
+                        refused = self.may_no_longer(db, under, &mut commits) => Err(refused),
+                    }
+                };
+                match exchanged {
+                    Ok(answer) => answer,
+                    Err(refused) => {
+                        let _ = send.reset(0u32.into());
+                        let _ = recv.stop(0u32.into());
+                        return Err(refused);
+                    }
+                }
+            }
+            _ => exchange(&mut send, &mut recv, protocol, request, sent).await,
+        }
         .map_err(|e| self.refused(link, &e))?;
         let answer = read(answer);
         let conn = lock(db);
@@ -1168,6 +1231,104 @@ impl Leave {
         })
     }
 
+    /// Wait for the commit after which a request built under the change
+    /// entry named `under` may use a connection no more ([`Self::keeps`]),
+    /// as `commits` counts them: what it is refused with then. It never
+    /// ends where no such commit is made.
+    async fn may_no_longer(
+        &self,
+        db: &TimedLock<Connection>,
+        under: &[u8; 32],
+        commits: &mut tokio::sync::watch::Receiver<u64>,
+    ) -> Refused {
+        loop {
+            if commits.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+            if let Err(refused) = self.keeps(&lock(db), under) {
+                return refused;
+            }
+        }
+    }
+
+    /// The one door of a closed device (decision 2026-10-24 (removal),
+    /// rules 4, 5 and 10): push on `link` the delete that it wrote over a
+    /// hand-over that a relay was sent, which withdraws the hand-over
+    /// there. A closed device has no leave anywhere, and sends nothing
+    /// else: no entry under the secret it follows, and no hand-over that
+    /// carries it.
+    ///
+    /// It does that and nothing else:
+    ///
+    /// - Under the database's lock, the device stands closed (closed, or
+    ///   stored so, as `fork`), and every entry of `request`, a push, is a
+    ///   delete that this device signed, in a pair channel in which it
+    ///   wrote over a hand-over ([`at_relays::withdrawals`]). Anything
+    ///   else is refused, and nothing is sent.
+    /// - It counts against what the device asks of a relay in a minute.
+    /// - `opened` is called under that lock as the stream is about to be
+    ///   opened, `read` with the answer, and `take` with what `read` made,
+    ///   under the lock again, where the device stands closed still: what
+    ///   a delete hands on is nothing, and a device that goes on sends
+    ///   what waits through the one way in.
+    pub async fn withdraw<R, T>(
+        &self,
+        state: &AppState,
+        link: &Link,
+        request: &WireMessage,
+        opened: impl FnOnce(&Connection),
+        read: impl FnOnce(WireMessage) -> R,
+        take: impl FnOnce(&Connection, R) -> T,
+    ) -> Result<T, Refused> {
+        let (db, identity) = (&state.db, &state.identity);
+        let WireMessage::EntryPush(push) = request else {
+            return Err(Refused::NotARequest);
+        };
+        let closed = |conn: &Connection| -> Result<(), Refused> {
+            match at_relays::stands(conn) {
+                Ok(Stands::Closed | Stands::Stopped(State::Fork)) => Ok(()),
+                Ok(Stands::Applied) => Err(Refused::NoLeave(NoLeave::NotGiven)),
+                Ok(Stands::NoPhrase) => Err(Refused::NoLeave(NoLeave::NoPhrase)),
+                Ok(Stands::Stopped(state)) => Err(Refused::NoLeave(NoLeave::Stopped(state))),
+                Err(_) => Err(Refused::NoLeave(NoLeave::NotGiven)),
+            }
+        };
+        {
+            let conn = lock(db);
+            closed(&conn)?;
+            let pairs = at_relays::withdrawals(&conn, identity)
+                .map_err(|_| Refused::NoLeave(NoLeave::NotGiven))?;
+            let own = identity.public_key();
+            let each_a_withdrawal = !push.entries.is_empty()
+                && push.entries.iter().all(|bytes| {
+                    Entry::from_wire(bytes).is_ok_and(|entry| {
+                        entry.delete
+                            && entry.author == own
+                            && pairs.iter().any(|pair| pair.id == entry.channel)
+                    })
+                });
+            if !each_a_withdrawal {
+                return Err(Refused::NotARequest);
+            }
+            if !self.may_ask_of(link) {
+                return Err(Refused::AskedEnough);
+            }
+            opened(&conn);
+        }
+        let protocol = Protocol::EntryPush;
+        let (mut send, mut recv) = open_stream(&link.conn)
+            .await
+            .map_err(Refused::NotAnswered)?;
+        let sent = self.counts_as_sent(link, protocol, request);
+        let answer = exchange(&mut send, &mut recv, protocol, request, sent)
+            .await
+            .map_err(|e| self.refused(link, &e))?;
+        let answer = read(answer);
+        let conn = lock(db);
+        closed(&conn)?;
+        Ok(take(&conn, answer))
+    }
+
     /// Ask `request` of the relay at `link` on a stream of `protocol`,
     /// for the pair channel of a typed key, or for a channel of a
     /// generation that was left, where the device has not asked as much
@@ -1183,12 +1344,12 @@ impl Leave {
         if !self.may_ask_of(link) {
             return Err(Refused::AskedEnough);
         }
-        let (send, recv) = open_stream(&link.conn)
+        let (mut send, mut recv) = open_stream(&link.conn)
             .await
             .map_err(Refused::NotAnswered)?;
         let answer = exchange(
-            send,
-            recv,
+            &mut send,
+            &mut recv,
             protocol,
             request,
             self.counts_as_sent(link, protocol, request),
@@ -1222,9 +1383,9 @@ impl Leave {
         protocol: Protocol,
         request: &WireMessage,
     ) -> Result<WireMessage, String> {
-        let (send, recv) = open_stream(&link.conn).await?;
+        let (mut send, mut recv) = open_stream(&link.conn).await?;
         let sent = self.counts_as_sent(link, protocol, request);
-        exchange(send, recv, protocol, request, sent)
+        exchange(&mut send, &mut recv, protocol, request, sent)
             .await
             .map_err(|e| {
                 if refused_for_now(&e) {
@@ -1343,13 +1504,13 @@ async fn open_stream(
 /// request is written, with the bytes of its frame (decision 2026-10-22
 /// §1.2). The bytes on the wire are the same.
 async fn exchange(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
     protocol: Protocol,
     request: &WireMessage,
     sent: impl FnOnce(usize),
 ) -> Result<WireMessage, codec::CodecError> {
-    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let mut stream = tokio::io::join(&mut *recv, &mut *send);
     let answer = async {
         let frame = codec::encode_message(request)?;
         codec::write_protocol_byte(&mut stream, protocol).await?;

@@ -26,8 +26,9 @@
 //!   and then each head it sets aside, every one at a relay that names the
 //!   role `heads` and none numbered above the change it follows at one that
 //!   does not (decision 2026-10-24 (removal), rule 18); each the first time
-//!   on a connection whole, and from then on in short. And then, at each
-//!   relay where it
+//!   on a connection whole, and from then on in short. A closed device
+//!   then pushes the delete it wrote over each hand-over that a relay was
+//!   sent, and nothing else (rules 5 and 10). And then, at each relay where it
 //!   has leave, for each channel of its own: it **proves** the channel's
 //!   key, once on a connection and again after a day; **pulls** the
 //!   channel from the place it keeps, each page through the one door;
@@ -249,6 +250,10 @@ struct At<'a> {
     /// now ([`DeviceEntries::asks_after_refusals`]): a read's are, and a
     /// pass's are not.
     gated: bool,
+    /// Whether the device is closed, and pushes through the one door of a
+    /// closed device the deletes it wrote over hand-overs, and nothing else
+    /// ([`Leave::withdraw`], decision 2026-10-24 (removal), rule 10).
+    closed: bool,
 }
 
 /// The relays of `relays` by their keys, where every one is connected
@@ -400,6 +405,10 @@ struct Round {
     /// Whether a show was made: an attempt at the relay (decision
     /// 2026-10-19 §1).
     shown: bool,
+    /// Whether a show was answered: once the round has judged what it was
+    /// answered, the relay is heard while the device wakes (decision
+    /// 2026-10-24 (removal), rule 5).
+    answered: bool,
     /// What the latest show that counts said: "show it whole" to a short
     /// show, and a short show not answered, are followed by a whole one,
     /// whose answer is what counts.
@@ -508,9 +517,14 @@ impl DeviceEntries {
         reach: Arc<Reach>,
     ) -> Arc<Self> {
         let counts = state.load.device.clone();
+        let leave = Leave::new(clock.clone()).counting(counts);
+        // A push open at the commit after which the device may use the
+        // connection no more is reset (decision 2026-10-24 (removal), rule
+        // 5): the commits of the node's database are counted.
+        leave.watch_commits(&lock(&state.db));
         Arc::new(Self {
             state,
-            leave: Leave::new(clock.clone()).counting(counts),
+            leave,
             clock,
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
@@ -1351,6 +1365,16 @@ impl DeviceEntries {
             None if whole => Some(self.show_at(link, false).await),
             None => None,
         };
+        // A closed device sends the delete it wrote over a hand-over that
+        // the relay was sent, and nothing else (decision 2026-10-24
+        // (removal), rules 5 and 10).
+        let closed = matches!(
+            at_relays::stands(&lock(&self.state.db)),
+            Ok(Stands::Closed | Stands::Stopped(State::Fork))
+        );
+        if closed {
+            self.withdraw_at(link).await;
+        }
         // (A device that has stopped, or is in a fork, has no channel
         // that a pass goes through. And one that wakes while this turn
         // runs has no leave from then on, anywhere: the one way in
@@ -1361,7 +1385,38 @@ impl DeviceEntries {
         self.relay_pass(link, kind).await
     }
 
- ─────────────────────────────────────────────────
+    /// A closed device's turn at `link`: it pushes the delete it wrote
+    /// over each hand-over that the relay was sent, through the one door
+    /// of a closed device ([`Leave::withdraw`]), and nothing else
+    /// (decision 2026-10-24 (removal), rules 4, 5 and 10).
+    async fn withdraw_at(&self, link: &Link) {
+        let read = {
+            let db = lock(&self.state.db);
+            at_relays::withdrawals(&db, &self.state.identity)
+                .and_then(|pairs| Ok((pairs, at_relays::kept_id(&db)?)))
+        };
+        let (pairs, under) = match read {
+            Ok((pairs, Some(under))) => (pairs, under),
+            Ok((_, None)) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read what a closed device withdraws");
+                return;
+            }
+        };
+        let at = At {
+            link,
+            under,
+            gated: false,
+            closed: true,
+        };
+        for pair in &pairs {
+            if matches!(self.push(&at, pair, Which::Since).await, Step::Stop) {
+                return;
+            }
+        }
+    }
+
+    // ── Old deletes ─────────────────────────────────────────────────
 
     /// Drop from the device's own store each delete that it has held for
     /// 90 days and that may go (decision 2026-10-04 §2.3, §7.3, §16;
@@ -1595,6 +1650,20 @@ impl DeviceEntries {
             Ok(dropped) => tracing::info!(dropped, "hand-overs left the store: two hours old"),
             Err(e) => tracing::debug!(error = %e, "could not drop the old hand-overs"),
         }
+        // A closed device drops every hand-over it made: each carries the
+        // secret it follows, which is not clear (decision 2026-10-24
+        // (removal), rule 5). The delete over each that a relay was sent is
+        // written below, and is all that a closed device sends.
+        match adding::drop_hand_overs_not_clear(&db) {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(
+                dropped,
+                "hand-overs left the store: they carry a secret that a removed device holds"
+            ),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not drop the hand-overs of a closed device")
+            }
+        }
         match write_over_dropped(&db, &self.state.identity, now) {
             Ok(0) => {}
             Ok(written) => {
@@ -1733,6 +1802,10 @@ impl DeviceEntries {
         let gave_leave = self.show_round(link, &mut round, gated).await;
         if round.shown {
             self.round_ended(link, &round);
+        }
+        // Its answers are judged: the relay is heard (rule 5).
+        if round.answered {
+            self.leave.heard(link.name());
         }
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
@@ -1886,6 +1959,7 @@ impl DeviceEntries {
                     return leave;
                 }
             };
+            round.answered = true;
             if is_followed {
                 round.whole_answered |= !short;
             }
@@ -2409,6 +2483,7 @@ impl DeviceEntries {
             link,
             under,
             gated: false,
+            closed: false,
         };
         let whole = kind == Pass::Whole;
         // A connection that is to be made again for the device's memory
@@ -2564,6 +2639,12 @@ impl DeviceEntries {
             gated: at.gated,
         };
         let link = at.link;
+        if at.closed {
+            return self
+                .leave
+                .withdraw(&self.state, link, request, &opened, &read, &take)
+                .await;
+        }
         let open = || self.leave.open(db, link, asked, &opened, &read, &take);
         match open().await {
             Err(Refused::NoLeave(NoLeave::NotGiven)) => {

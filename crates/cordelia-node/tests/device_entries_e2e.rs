@@ -5022,6 +5022,12 @@ async fn a_move_at_accept_waits_for_the_cycle_with_the_device_closed() {
         assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
         let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
         assert!(removed.contains(&tablet.key()));
+        // From that commit, before the cycle's turn, there is no leave
+        // (rule 5).
+        assert_eq!(
+            laptop.has_leave("relay"),
+            Err(NoLeave::Stopped(State::Fork))
+        );
         drop(turn);
         let read = reading.join().unwrap();
         let Ok(PairRead::Read(read)) = read else {
@@ -10915,7 +10921,7 @@ async fn a_relay_counts_who_it_turns_away_and_each_churn_where_warm_churn_closes
     assert_eq!(value_of(&said, "cordelia_connections_closed_total"), 0);
 }
 
-// ── Every head (decision 2026-10-24 (removal), rule 18) ─────────────
+// ── Every head (decision 2026-10-24 (removal), rule 18, and rule 5) ──
 
 /// A laptop that follows its own change 2 and sets aside two changes made
 /// apart from it, each clear: a tablet's change 2, and a desktop's change
@@ -11291,4 +11297,178 @@ async fn a_device_that_keeps_eight_heads_ends_its_round_at_a_relay_that_keeps_ei
     let mut all: Vec<[u8; 32]> = changes.iter().map(|change| change.id()).collect();
     all.sort();
     assert_eq!(held, all);
+}
+
+/// At a wake, a relay is heard once its answer is judged, and not when it
+/// arrives (decision 2026-10-24 (removal), rule 5): while relay A's answer,
+/// a change for the device to apply, waits for the sync cycle's turn, the
+/// pass that sends starts at no relay, relay B included, which has
+/// answered "held".
+///
+/// Taken out: the relay heard as its answer arrives (relay B is pushed what
+/// waits under the change the device leaves: the assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_a_wake_a_relay_is_heard_once_its_answer_is_judged() {
+    let (a, b) = (StandIn::started().await, StandIn::started().await);
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.holds("notes");
+    laptop.writes("notes", "a.md", "waits to be sent");
+    let change = desktop.changes(&phrase(), &[&laptop, &desktop], &[]);
+    // Relay A holds the change: it answers a whole show with it.
+    a.says(
+        Say::Answer(ShowAnswer::Whole),
+        Say::Answer(ShowAnswer::Another(change.to_wire())),
+    );
+    laptop.connects_to("a", a.port, a.key).await;
+    laptop.connects_to("b", b.port, b.key).await;
+    assert!(laptop.engine.leave().is_waking());
+
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        // Both relays have answered the wake's shows.
+        let waited = std::time::Instant::now();
+        let mut shown = (false, false);
+        while shown != (true, true) {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no shows");
+            std::thread::sleep(Duration::from_millis(20));
+            shown.0 |= !shows_in(&a.requests()).is_empty();
+            shown.1 |= !shows_in(&b.requests()).is_empty();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        // Relay A's answer waits for the cycle's turn: the pass that sends
+        // starts nowhere.
+        assert!(laptop.engine.leave().is_waking());
+        let sends = scope
+            .spawn(|| {
+                handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), laptop.sends()).await
+                })
+            })
+            .join()
+            .unwrap();
+        assert!(sends.is_ok(), "the pass that sends waited");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !b.seen().contains(&Seen::Push),
+            "relay B was sent what waits while relay A's answer was judged"
+        );
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.latest().id(), change.id());
+    assert!(!laptop.engine.leave().is_waking());
+}
+
+/// A push open at the commit after which the device may use the connection
+/// no more, and not yet answered, is reset (decision 2026-10-24 (removal),
+/// rule 5): from the commit that closes the device the stream is let go at
+/// once, and it does not wait out the relay's answer. Before it, the
+/// device had leave there; from it, it has none.
+///
+/// Taken out: the reset (the push waits for the relay until the stream's
+/// timeout: the assertion of time fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_open_at_the_commit_that_closes_the_device_is_reset() {
+    let relay = StandIn::started().await;
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.holds("notes");
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    relay.requests();
+
+    // The relay takes the next push and answers nothing.
+    relay.hook(|request| matches!(request, WireMessage::EntryPush(_)).then_some(Say::Nothing));
+    laptop.writes("notes", "a.md", "on its way at the commit");
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| {
+            let began = std::time::Instant::now();
+            handle.block_on(laptop.sends());
+            began.elapsed()
+        });
+        let waited = std::time::Instant::now();
+        while !relay.seen().contains(&Seen::Push) {
+            assert!(waited.elapsed() < Duration::from_secs(10), "no push");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The commit that closes the device: its own key kept as removed,
+        // set so by hand. The change it follows is not clear from here.
+        let closed_at = std::time::Instant::now();
+        cordelia_storage::person::keep_removed(&laptop.db(), &[laptop.key()], 2).unwrap();
+        assert_eq!(laptop.stands(), Stands::Closed);
+        assert_eq!(laptop.has_leave("relay"), Err(NoLeave::Closed));
+        sending.join().unwrap();
+        let after = closed_at.elapsed();
+        assert!(
+            after < Duration::from_secs(3),
+            "the push waited {after:?} after the commit"
+        );
+    });
+}
+
+/// A closed device sends the delete that it wrote over a hand-over that a
+/// relay was sent, and nothing else (decision 2026-10-24 (removal), rules
+/// 4, 5 and 10): the hand-over carries the secret it follows, which is not
+/// clear, and is dropped from its store; the delete withdraws it at the
+/// relay. What it wrote in a channel of its own waits.
+///
+/// Taken out: the delete sent (the relay is sent nothing: the first
+/// fails); the hand-over dropped on a closed device (no delete is written:
+/// the same).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_device_sends_the_delete_over_a_hand_over_and_nothing_else() {
+    let relay = StandIn::started().await;
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.holds("notes");
+    let now = laptop.now();
+    let added = add_device(
+        &laptop.db(),
+        &laptop.state.identity,
+        &desktop.key(),
+        "desktop",
+        now,
+    );
+    let pair = added.unwrap().hand_over.channel;
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    // The hand-over reached the relay.
+    let pushed = |requests: &[WireMessage]| -> Vec<Entry> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|bytes| Entry::from_wire(&bytes).unwrap())
+            .collect()
+    };
+    let first = pushed(&relay.requests());
+    assert!(
+        first
+            .iter()
+            .any(|entry| entry.channel == pair && !entry.delete)
+    );
+
+    // What it writes in a channel of its own waits. The device is then
+    // closed: a key it knows to be removed holds the secret it follows,
+    // set so by hand.
+    laptop.writes("notes", "a.md", "waits while closed");
+    cordelia_storage::person::keep_removed(&laptop.db(), &[desktop.key()], 2).unwrap();
+    assert_eq!(laptop.stands(), Stands::Closed);
+    laptop.passes().await;
+    laptop.sends().await;
+    laptop.passes().await;
+    let sent = pushed(&relay.requests());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].delete && sent[0].channel == pair && sent[0].author == laptop.key());
+    assert_eq!(laptop.has_leave("relay"), Err(NoLeave::Closed));
 }
