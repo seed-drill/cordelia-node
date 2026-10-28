@@ -105,6 +105,13 @@ pub fn taken(conn: &Connection) -> Result<Vec<([u8; 64], TakenRow)>, CordeliaErr
 /// Keep `taken` in the place of every row: an act that is not among them
 /// is one the device no longer keeps.
 pub fn keep_taken(conn: &Connection, taken: &[([u8; 64], TakenRow)]) -> Result<(), CordeliaError> {
+    // Where the rows are these already, nothing is written: a device
+    // works its lists out at every whole pass.
+    let mut wanted = taken.to_vec();
+    wanted.sort_by(|a, b| a.0.cmp(&b.0));
+    if self::taken(conn)? == wanted {
+        return Ok(());
+    }
     conn.execute("DELETE FROM shared_list_taken", [])
         .map_err(storage)?;
     let mut insert = conn
