@@ -2891,6 +2891,13 @@ pub async fn p2p_loop(
         cordelia_core::protocol::RELAY_USES_WRITE_INTERVAL_SECS,
     ));
     relay_uses_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The checkpoint of a relay's store (issue #224), in a take of the
+    // lock of its own: its connection has SQLite's automatic checkpoint
+    // off. When it starts, and every second after.
+    let mut relay_checkpoint_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::RELAY_CHECKPOINT_INTERVAL_SECS,
+    ));
+    relay_checkpoint_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The hourly task of messages (decision 2026-10-09 §7.1), on a
     // personal node: when it starts, and each hour after.
     let mut messages_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3485,6 +3492,15 @@ pub async fn p2p_loop(
                 }
             }
 
+            // The store's log is written back and truncated (issue #224).
+            // Off the select loop: it writes under the db lock.
+            _ = relay_checkpoint_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = relay_entries.clone() {
+                    let checkpoint_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.checkpoint(&checkpoint_state.db));
+                }
+            }
+
             // What this relay took is passed on to the relays it works
             // with that are connected (§2.4 item 6).
             _ = entry_offer_interval.tick(), if relay_entries.is_some() => {
@@ -3948,10 +3964,17 @@ pub async fn p2p_loop(
                         tracing::warn!("closing the connections took longer than a stream timeout; not waiting for it");
                     }
                     // A relay writes the uses of channels it kept since
-                    // its last sweep (issue #214), once no stream asks.
+                    // its last sweep (issue #214), once no stream asks,
+                    // and then checkpoints its store (issue #224).
                     if let Some(entries) = relay_entries.clone() {
                         let stop_state = state.clone();
-                        let _ = tokio::task::spawn_blocking(move || entries.write_uses(&stop_state.db)).await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            entries.write_uses(&stop_state.db);
+                            if entries.checkpoint_at_stop(&stop_state.db) {
+                                tracing::info!("the store's log was written back and truncated");
+                            }
+                        })
+                        .await;
                     }
                     break;
                 }

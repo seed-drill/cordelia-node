@@ -678,6 +678,45 @@ impl RelayEntries {
         self.uses_written(&db);
     }
 
+    /// Write the store's write-ahead log back, in a take of the lock of
+    /// its own, of kind Checkpoint (issue #224): every
+    /// RELAY_CHECKPOINT_INTERVAL_SECS, from when the relay starts. A
+    /// relay's connection has SQLite's automatic checkpoint off, so that
+    /// no push or show pays for one. The checkpoint is passive: where a
+    /// reader in another process holds a part of the log, the rest is
+    /// written back at once, and the next checkpoint writes back what is
+    /// left. Says whether the log was written back whole.
+    pub fn checkpoint(&self, db: &TimedLock<Connection>) -> bool {
+        self.checkpoint_with(db, cordelia_storage::db::checkpoint_passive)
+    }
+
+    /// At a clean stop, once no stream asks: the log is written back whole
+    /// and its file truncated, waiting for a reader up to the connection's
+    /// busy timeout, as kind Checkpoint (issue #224).
+    pub fn checkpoint_at_stop(&self, db: &TimedLock<Connection>) -> bool {
+        self.checkpoint_with(db, cordelia_storage::db::checkpoint_truncating)
+    }
+
+    fn checkpoint_with(
+        &self,
+        db: &TimedLock<Connection>,
+        checkpoint: fn(&Connection) -> Result<bool, cordelia_storage::StorageError>,
+    ) -> bool {
+        let _checkpoint = taking(Kind::Checkpoint);
+        let Ok(db) = db.lock() else { return false };
+        match checkpoint(&db) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!("a reader holds a part of the log: the next checkpoint writes it");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not checkpoint the store's log");
+                false
+            }
+        }
+    }
+
     /// [`Self::write_uses`], with the database's lock held: whether every
     /// use kept was written. What could not be written is kept, for the
     /// next time.
@@ -3403,6 +3442,290 @@ mod tests {
         read(&format!(
             "both rounds, the second with every time kept new ({took:?} in all)"
         ));
+    }
+
+    // ── The checkpoint (issue #224) ──────────────────────────────────
+
+    /// A relay with room for everything, whose store is a file in `dir`,
+    /// opened as a relay's node opens it: with SQLite's automatic
+    /// checkpoint off where `off`.
+    fn relay_on_disk(dir: &std::path::Path, off: bool) -> (Relay, std::path::PathBuf) {
+        let path = dir.join("relay.db");
+        let conn = cordelia_storage::db::open(&path).unwrap();
+        if off {
+            cordelia_storage::db::automatic_checkpoint_off(&conn).unwrap();
+        }
+        let mut at = relay();
+        at.db = TimedLock::new(conn);
+        (at, path)
+    }
+
+    /// The bytes of the store's write-ahead log.
+    fn wal_bytes(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path.with_extension("db-wal")).map_or(0, |file| file.len())
+    }
+
+    /// The kinds of take of the lock that held it at least once.
+    fn kinds_held(db: &TimedLock<Connection>) -> Vec<Kind> {
+        Kind::ALL
+            .into_iter()
+            .filter(|kind| db.times().hold(*kind).count > 0)
+            .collect()
+    }
+
+    /// The peer numbered `n` pushes one entry of its own channel, `n`,
+    /// in slot `slot`, at `rev`: stored.
+    fn pushes_one(at: &Relay, n: u8, slot: u64, rev: u64) {
+        let entry = made(n.into(), n, rev, &format!("note-{slot}.md"), "a small text");
+        assert_eq!(
+            pushed(at.push(n, vec![entry.to_wire()])),
+            [PushAnswer::Stored]
+        );
+    }
+
+    /// No push checkpoints the log (issue #224): on a relay's store, a
+    /// thousand pushes from ten devices grow its log past twice the 1,000
+    /// pages at which SQLite's automatic checkpoint would have run inside
+    /// one of them, and it never shrinks; every take of the lock is of a
+    /// push.
+    #[test]
+    fn a_push_never_runs_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        let page: u64 = Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let mut log = wal_bytes(&path);
+        for i in 0..100u64 {
+            for n in 1..=10u8 {
+                pushes_one(&at, n, i, 5 + i);
+                let now = wal_bytes(&path);
+                assert!(now >= log, "a push shrank the log: {log} to {now}");
+                log = now;
+            }
+        }
+        assert!(log / page > 2_000, "the log is {} pages", log / page);
+        assert_eq!(kinds_held(&at.db), [Kind::Push]);
+    }
+
+    /// The relay's checkpoint takes the lock as a checkpoint, and as no
+    /// other kind, and shrinks the log that pushes grew (issue #224): once
+    /// it has written the log back, the next push starts the log again and
+    /// cuts its file to RELAY_LOG_KEPT_BYTES. Without it the log goes on
+    /// growing. The checkpoint at a stop truncates it.
+    #[test]
+    fn the_checkpoint_takes_the_lock_as_a_checkpoint_and_shrinks_the_log() {
+        use cordelia_core::protocol::RELAY_LOG_KEPT_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        let mut rev = 5;
+        // Some 1,300 pushes grow it past; a push that checkpointed would
+        // keep it from ever growing so far.
+        while wal_bytes(&path) <= RELAY_LOG_KEPT_BYTES as u64 {
+            assert!(rev < 500, "the log stays at {} bytes", wal_bytes(&path));
+            for n in 1..=10u8 {
+                pushes_one(&at, n, rev, rev);
+            }
+            rev += 1;
+        }
+        let grown = wal_bytes(&path);
+        pushes_one(&at, 1, rev, rev);
+        assert!(wal_bytes(&path) > grown, "no checkpoint: the log grows");
+        assert!(at.entries.checkpoint(&at.db));
+        assert_eq!(at.db.times().hold(Kind::Checkpoint).count, 1);
+        pushes_one(&at, 2, rev, rev);
+        assert!(
+            wal_bytes(&path) <= RELAY_LOG_KEPT_BYTES as u64,
+            "the log is {} bytes",
+            wal_bytes(&path)
+        );
+        assert_eq!(kinds_held(&at.db), [Kind::Push, Kind::Checkpoint]);
+        assert!(at.entries.checkpoint_at_stop(&at.db));
+        assert_eq!(wal_bytes(&path), 0);
+        assert_eq!(at.db.times().hold(Kind::Checkpoint).count, 2);
+        // What was pushed is held after it.
+        assert!(at.held(10).is_some());
+    }
+
+    /// A checkpoint that a reader in another process holds back answers
+    /// false at once, and the next, once the reader is gone, writes the
+    /// log back whole (issue #224).
+    #[test]
+    fn a_checkpoint_that_a_reader_holds_back_is_made_again_at_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        pushes_one(&at, 1, 1, 5);
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM node_meta", [], |row| row.get(0))
+            .unwrap();
+        pushes_one(&at, 2, 1, 5);
+        let started = Instant::now();
+        assert!(!at.entries.checkpoint(&at.db));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert!(at.entries.checkpoint(&at.db));
+    }
+
+    /// A push's hold of the lock with SQLite's automatic checkpoint on, as
+    /// before issue #224, and off with the relay's checkpoint on its timer,
+    /// RELAY_CHECKPOINT_INTERVAL_SECS, from the node's own counters: many
+    /// devices push to a relay whose store is a file on disk, from four
+    /// threads. `CORDELIA_BENCH_DIR` names where the store goes (a
+    /// temporary directory otherwise); `CORDELIA_BENCH_DEVICES` and
+    /// `CORDELIA_BENCH_ROUNDS` how many devices push, and how many entries
+    /// each (100 and 200); `CORDELIA_BENCH_CHECKPOINT_MS` the timer's
+    /// interval. Printed, not asserted: run with
+    /// `--ignored --nocapture`. A disk whose sync is slow is had by running
+    /// the test binary under `strace -f --seccomp-bpf -o /dev/null -e
+    /// trace=fsync,fdatasync -e inject=fsync,fdatasync:delay_exit=10000`,
+    /// which makes each sync take 10 ms more.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn bench_a_pushs_hold_with_and_without_the_automatic_checkpoint() {
+        use cordelia_core::protocol::RELAY_CHECKPOINT_INTERVAL_SECS;
+        let number = |name: &str, or: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(or)
+        };
+        let devices = number("CORDELIA_BENCH_DEVICES", 100).min(199) as u8;
+        let rounds = number("CORDELIA_BENCH_ROUNDS", 200);
+        let base = std::env::var("CORDELIA_BENCH_DIR").ok();
+        let every_ms = number(
+            "CORDELIA_BENCH_CHECKPOINT_MS",
+            RELAY_CHECKPOINT_INTERVAL_SECS * 1000,
+        );
+        let upper = |hold: &cordelia_core::load::HistogramRead, q: f64| -> u64 {
+            let target = (q * hold.count as f64).ceil() as u64;
+            let mut seen = 0;
+            for (i, n) in hold.buckets.iter().enumerate() {
+                seen += n;
+                if seen >= target {
+                    return 1u64 << i;
+                }
+            }
+            u64::MAX
+        };
+        for off in [false, true] {
+            let dir = match &base {
+                Some(base) => tempfile::tempdir_in(base).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let (at, path) = relay_on_disk(dir.path(), off);
+            // Each push's own time, around the call, for exact quantiles
+            // beside the counters' buckets.
+            let took = Mutex::new(Vec::new());
+            let most_log = std::sync::atomic::AtomicU64::new(0);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let started = Instant::now();
+            std::thread::scope(|s| {
+                if off {
+                    s.spawn(|| {
+                        let every = Duration::from_millis(every_ms);
+                        let mut next = Instant::now();
+                        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                            if Instant::now() >= next {
+                                most_log.fetch_max(
+                                    wal_bytes(&path),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                at.entries.checkpoint(&at.db);
+                                next += every;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    });
+                }
+                let pushers: Vec<_> = (0..4u8)
+                    .map(|t| {
+                        let (at, took) = (&at, &took);
+                        s.spawn(move || {
+                            for i in 0..rounds {
+                                for n in (1..=devices).filter(|n| n % 4 == t) {
+                                    let one = Instant::now();
+                                    pushes_one(at, n, i % 8, 5 + i);
+                                    lock(took).push(one.elapsed());
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for pusher in pushers {
+                    pusher.join().unwrap();
+                }
+                most_log.fetch_max(wal_bytes(&path), std::sync::atomic::Ordering::Relaxed);
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let elapsed = started.elapsed();
+            let mut took = took.into_inner().unwrap();
+            took.sort();
+            let at_q =
+                |q: f64| took[((q * took.len() as f64).ceil() as usize).clamp(1, took.len()) - 1];
+            let times = at.db.times();
+            println!(
+                "automatic checkpoint {}: {} pushes in {elapsed:?}, the log at most {} KiB",
+                if off {
+                    format!("off, the relay's every {every_ms} ms")
+                } else {
+                    "on".into()
+                },
+                took.len(),
+                most_log.into_inner() / 1024,
+            );
+            for kind in [Kind::Push, Kind::Checkpoint] {
+                let hold = times.hold(kind);
+                let wait = times.wait(kind);
+                println!(
+                    "  {}: {} holds, mean {:.0} us, p50 <= {} us, p99 <= {} us, max {} us, over 5/50/100/250 ms {:?}; wait p99 <= {} us, max {} us",
+                    kind.name(),
+                    hold.count,
+                    hold.sum_nanos as f64 / hold.count.max(1) as f64 / 1000.0,
+                    upper(&hold, 0.50),
+                    upper(&hold, 0.99),
+                    hold.max_micros,
+                    hold.over,
+                    upper(&wait, 0.99),
+                    wait.max_micros,
+                );
+                // The holds over 8 ms, by bucket: up to 16, 32, 64 and
+                // 128 ms, and over.
+                println!(
+                    "    holds over 8 ms, in buckets to 16/32/64/128 ms and over: {:?}",
+                    [
+                        hold.buckets[14],
+                        hold.buckets[15],
+                        hold.buckets[16],
+                        hold.buckets[17],
+                        hold.buckets[18..].iter().sum::<u64>(),
+                    ]
+                );
+            }
+            println!(
+                "  a push's call, timed around it: p50 {:?}, p99 {:?}, p99.9 {:?}, max {:?}",
+                at_q(0.50),
+                at_q(0.99),
+                at_q(0.999),
+                took[took.len() - 1]
+            );
+            if off {
+                // With nothing written since the last.
+                at.entries.checkpoint(&at.db);
+                let before = at.db.times().hold(Kind::Checkpoint);
+                for _ in 0..1_000 {
+                    at.entries.checkpoint(&at.db);
+                }
+                let after = at.db.times().hold(Kind::Checkpoint);
+                println!(
+                    "  a checkpoint with nothing written: mean {:.1} us over 1,000",
+                    (after.sum_nanos - before.sum_nanos) as f64 / 1_000.0 / 1000.0
+                );
+            }
+        }
     }
 
     /// A listed relay whose clock runs ahead says a channel was used later
