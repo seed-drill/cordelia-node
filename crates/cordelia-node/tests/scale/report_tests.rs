@@ -739,3 +739,125 @@ fn the_model_counts_a_device_only_where_its_relay_holds_its_connection() {
     let (less, _) = model(true);
     assert_eq!(all - less, 6.0 * 6.0 * 3.0);
 }
+
+// ── Bars 6 and 7: what a process rose from ──
+
+/// A sample of a process's RSS at `t`, with ten connections open.
+fn rss_at(run: &Run, node: usize, t: f64, mib: f64) {
+    run.samples.lock().unwrap().nodes.push(Sample {
+        t,
+        node,
+        proc: Some(crate::machine::ProcRead {
+            rss_kib: (mib * 1024.0) as u64,
+            ..Default::default()
+        }),
+        metrics: Some(HashMap::from([(
+            "cordelia_connections_open".to_string(),
+            10.0,
+        )])),
+        ..Sample::default()
+    });
+}
+
+/// Every five minutes from 600 s to 11,400 s: the window.
+fn every_five_minutes() -> impl Iterator<Item = f64> {
+    (2..=38).map(|n| n as f64 * 300.0)
+}
+
+/// A relay's first sample is taken as it starts, at a few MiB. Bar 7's 2%
+/// an hour is of the RSS it rose from: a relay of 60 MiB that rises 1 MiB
+/// an hour does not grow, and one that rises 2 MiB an hour does.
+#[test]
+fn bar_7_takes_its_two_percent_of_the_rss_it_rose_from() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 600.0, 11_400.0);
+    for node in [0, 1] {
+        rss_at(&run, node, 0.0, 2.0);
+    }
+    for t in every_five_minutes() {
+        rss_at(&run, 0, t, 60.0 + (t - 600.0) / 3600.0);
+        rss_at(&run, 1, t, 60.0 + 2.0 * (t - 600.0) / 3600.0);
+    }
+    let read = read_of(&run);
+    let bar = bar_7(&read);
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    let said: Vec<&str> = bar.figure.split("; ").collect();
+    assert_eq!(
+        said,
+        [
+            "relay 1: the most RSS 63.0 MiB, 0 samples over the bar, no persistent growth \
+             (rises of 1.00 and 1.00 MiB an hour, from 60.0 and 61.5 MiB)",
+            "relay 2: the most RSS 66.0 MiB, 0 samples over the bar, growing in both halves \
+             (rises of 2.00 and 2.00 MiB an hour, from 60.0 and 63.0 MiB)",
+        ]
+    );
+}
+
+/// After a start, a stretch rises from what the process held before it,
+/// where that is higher: a relay or a device that fills again to it does
+/// not grow in that half, and one that comes back above it and rises does.
+#[test]
+fn filling_again_to_what_a_process_held_before_a_start_is_no_growth() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    for node in [0, 1, 2] {
+        becomes(&run, node, 4400.0, Is::Stopped);
+        becomes(&run, node, 4500.0, Is::Running);
+    }
+    window(&run, 600.0, 11_400.0);
+    for t in every_five_minutes() {
+        let (before, after) = (t - 600.0, t - 4500.0);
+        match t < 4400.0 {
+            true => {
+                rss_at(&run, 0, t, 60.0 + 1.5 * before / 3600.0);
+                rss_at(&run, 1, t, 60.0 + 2.0 * before / 3600.0);
+                rss_at(&run, 2, t, 20.0 + 3.0 * before / 3600.0);
+            }
+            false => {
+                rss_at(&run, 0, t, 30.0 + 4.0 * after / 3600.0);
+                rss_at(&run, 1, t, 63.0 + 2.0 * after / 3600.0);
+                rss_at(&run, 2, t, 10.0 + 4.0 * after / 3600.0);
+            }
+        }
+    }
+    let read = read_of(&run);
+    let bar = bar_7(&read);
+    let said: Vec<&str> = bar.figure.split("; ").collect();
+    assert_eq!(
+        said,
+        [
+            "relay 1: the most RSS 61.5 MiB, 0 samples over the bar, no persistent growth \
+             (rises of 1.50 and -15.89 MiB an hour, from 60.0 and 61.5 MiB)",
+            "relay 2: the most RSS 66.8 MiB, 0 samples over the bar, growing in both halves \
+             (rises of 2.00 and 2.00 MiB an hour, from 60.0 and 63.8 MiB)",
+        ]
+    );
+    let (devices, _) = bar_6(&read);
+    assert_eq!(devices.verdict, Verdict::Pass, "{}", devices.figure);
+    assert_eq!(
+        devices.figure,
+        "the most RSS of a device 23.0 MiB; 0 of 1 devices tested grow in both halves"
+    );
+}
+
+/// Where a half's longest stretch is under a quarter of it, bar 7 says the
+/// growth was not tested, not that there was none.
+#[test]
+fn bar_7_says_where_growth_was_not_tested() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 600.0, 11_400.0);
+    for t in every_five_minutes().filter(|t| *t < 6000.0) {
+        rss_at(&run, 0, t, 60.0);
+    }
+    let read = read_of(&run);
+    let bar = bar_7(&read);
+    for said in bar.figure.split("; ") {
+        assert!(
+            said.ends_with("growth not tested (a half's longest stretch is under a quarter of it)"),
+            "{}",
+            bar.figure
+        );
+    }
+}

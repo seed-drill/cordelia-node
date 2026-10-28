@@ -1474,15 +1474,33 @@ fn bar_5(read: &Read) -> Line {
 }
 
 /// What a series rose by in each half of the window, in MiB an hour, over
-/// its longest stretch in that half with no start; `None` where that
-/// stretch is under a quarter of the half.
-fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<(f64, f64)> {
+/// its longest stretch in that half with no start, and the RSS in MiB it
+/// rose from: the RSS at that stretch's start, or what it held before the
+/// start that began it where that is higher, so that filling again to it
+/// is no growth. `None` where that stretch is under a quarter of the half.
+fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<[(f64, f64); 2]> {
     let mid = (read.start + read.end) / 2.0;
     let half = (mid - read.start).max(1.0);
-    let rise_in = |a: f64, b: f64| -> Option<f64> {
-        let mut best: Option<(f64, f64, f64)> = None;
+    let rss = |s: &Sample| s.proc.map_or(0.0, |p| p.rss_kib as f64);
+    let starts = read.lives.starts(node);
+    let held_before_start = |t: f64| -> f64 {
+        let Some(start) = starts
+            .iter()
+            .copied()
+            .filter(|s| *s <= t)
+            .max_by(f64::total_cmp)
+        else {
+            return 0.0;
+        };
+        series
+            .iter()
+            .filter(|s| s.t < start && s.proc.is_some())
+            .max_by(|x, y| x.t.total_cmp(&y.t))
+            .map_or(0.0, |s| rss(s))
+    };
+    let rise_in = |a: f64, b: f64| -> Option<(f64, f64)> {
+        let mut best: Option<(&Sample, &Sample, f64)> = None;
         let mut first: Option<&Sample> = None;
-        let rss = |s: &Sample| s.proc.map_or(0.0, |p| p.rss_kib as f64);
         // Outside the parts treated apart: a relay that starts again warms
         // up there.
         for s in series
@@ -1499,13 +1517,14 @@ fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<(f64, f64)> {
             let f = *first.get_or_insert(s);
             let long = s.t - f.t;
             if best.is_none_or(|(_, _, b)| long > b) {
-                best = Some((rss(f), rss(s), long));
+                best = Some((f, s, long));
             }
         }
-        let (from, to, long) = best?;
-        (long >= half / 4.0).then(|| (to - from) / 1024.0 / (long / 3600.0))
+        let (f, s, long) = best?;
+        let from = rss(f).max(held_before_start(f.t));
+        (long >= half / 4.0).then(|| ((rss(s) - from) / 1024.0 / (long / 3600.0), from / 1024.0))
     };
-    Some((rise_in(read.start, mid)?, rise_in(mid, read.end)?))
+    Some([rise_in(read.start, mid)?, rise_in(mid, read.end)?])
 }
 
 fn bar_6(read: &Read) -> (Line, Vec<f64>) {
@@ -1522,7 +1541,7 @@ fn bar_6(read: &Read) -> (Line, Vec<f64>) {
                 worst = worst.max(p.rss_kib as f64 / 1024.0);
             }
         }
-        if let Some((a, b)) = halves(&series, read, i) {
+        if let Some([(a, _), (b, _)]) = halves(&series, read, i) {
             tested += 1;
             rises.push(a.max(b));
             if a > threshold && b > threshold {
@@ -1546,8 +1565,9 @@ fn bar_6(read: &Read) -> (Line, Vec<f64>) {
             ),
             &format!(
                 "RSS at most 64 MiB at every sample, and no more than 1% of devices growing by \
-                 over {threshold:.1} MiB an hour in both halves (one device growing in two runs \
-                 of three is read across the stage's summaries)"
+                 over {threshold:.1} MiB an hour in both halves (filling again to what it held \
+                 before a start is no growth; one device growing in two runs of three is read \
+                 across the stage's summaries)"
             ),
             holds,
         ),
@@ -1580,21 +1600,26 @@ fn bar_7(read: &Read) -> Line {
                 over += 1;
             }
         }
-        let grows = halves(&series, read, i).is_some_and(|(a, b)| {
-            let base = series
-                .first()
-                .and_then(|s| s.proc)
-                .map_or(20.0, |p| p.rss_kib as f64 / 1024.0);
-            a > 0.02 * base && b > 0.02 * base
-        });
+        // The 2% an hour is of the RSS it rose from in each half: its first
+        // sample is taken as it starts, at a few MiB, and a start again in
+        // the window lowers its median.
+        let rises = halves(&series, read, i);
+        let grows = rises.is_some_and(|h| h.iter().all(|&(rise, from)| rise > 0.02 * from));
         holds &= over == 0 && !grows;
         said.push(format!(
             "relay {}: the most RSS {worst:.1} MiB, {over} samples over the bar, {}",
             r + 1,
-            if grows {
-                "growing in both halves"
-            } else {
-                "no persistent growth"
+            match rises {
+                None => "growth not tested (a half's longest stretch is under a quarter of it)"
+                    .to_string(),
+                Some([(a, fa), (b, fb)]) => format!(
+                    "{} (rises of {a:.2} and {b:.2} MiB an hour, from {fa:.1} and {fb:.1} MiB)",
+                    if grows {
+                        "growing in both halves"
+                    } else {
+                        "no persistent growth"
+                    }
+                ),
             }
         ));
     }
@@ -1602,7 +1627,8 @@ fn bar_7(read: &Read) -> Line {
         "A relay's memory in ordinary use",
         said.join("; "),
         "RSS at most 64 MiB and 384 KiB for each open connection, and no growth of 2% of its \
-         RSS an hour in both halves",
+         RSS an hour in both halves (from the RSS each half rose from: where a start began the \
+         stretch, what it held before, if higher)",
         holds,
     )
 }
