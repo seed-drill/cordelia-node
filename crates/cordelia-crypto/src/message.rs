@@ -77,7 +77,7 @@ use cordelia_core::protocol::{
     AGENT_MESSAGE_PAIR_BOUNDS_PREFIX, AGENT_MESSAGE_PERSON_PREFIX, AGENT_MESSAGE_PREFIX,
     AGENT_MESSAGE_READ_MARK_BYTES, AGENT_MESSAGE_READ_MARKS_MAX, AGENT_MESSAGE_READ_PREFIX,
     AGENT_MESSAGE_RING, AGENT_MESSAGE_VALUE_BYTES, LABEL_AGENT_MESSAGE_ID,
-    LABEL_AGENT_MESSAGE_READ,
+    LABEL_AGENT_MESSAGE_READ, LABEL_SHARED_SENT, SHARED_READ_PREFIX,
 };
 
 use crate::CryptoError;
@@ -631,6 +631,9 @@ pub enum Taken {
     /// The signer's list of the bounds a person set on it (decision
     /// 2026-10-25, rule 2).
     Bounds(PairBounds),
+    /// The signer's list of the shared messages its agents read and sent
+    /// (decision 2026-10-10 §6.1): form 2, apart from its `read/` list.
+    SharedList(ReadMarks),
 }
 
 /// Where an entry stands in its signer's slots, by its name and revision.
@@ -643,6 +646,9 @@ pub enum Place {
     PersonList,
     /// The list of bounds (decision 2026-10-25, rule 2).
     Bounds,
+    /// The list of shared marks, in `sread/<signer>` (decision 2026-10-10
+    /// §6.1).
+    SharedList,
 }
 
 /// Where the entry named `name`, signed by `signer`, at revision `rev`,
@@ -668,6 +674,9 @@ pub fn place_of(name: &str, signer: &[u8; 32], rev: u64) -> Option<Place> {
     }
     if name == hold_name(signer).ok()? {
         return Some(Place::Bounds);
+    }
+    if name == sread_name(signer).ok()? {
+        return Some(Place::SharedList);
     }
     let number = number_of(rev);
     if !is_a_number(number) || name != message_name(signer, number).ok()? {
@@ -703,6 +712,7 @@ pub fn take(
         Place::List => Ok(Taken::List(ReadMarks::from_value(value)?)),
         Place::PersonList => Ok(Taken::PersonList(PersonReads::from_value(value)?)),
         Place::Bounds => Ok(Taken::Bounds(PairBounds::from_value(value, is_a_name)?)),
+        Place::SharedList => Ok(Taken::SharedList(ReadMarks::from_value(value)?)),
     }
 }
 
@@ -752,6 +762,56 @@ pub fn hold_name(signer: &[u8; 32]) -> Result<String, CryptoError> {
         "{AGENT_MESSAGE_PAIR_BOUNDS_PREFIX}{}",
         encode_public_key(signer)?
     ))
+}
+
+/// The name of a device's list of the shared messages its agents read and
+/// sent: `sread/` and the device's key as it is written (decision
+/// 2026-10-10 §6.1). It is a slot of the person's messages channel, apart
+/// from `read/`, so that neither list pushes the other's marks out.
+pub fn sread_name(signer: &[u8; 32]) -> Result<String, CryptoError> {
+    Ok(format!(
+        "{SHARED_READ_PREFIX}{}",
+        encode_public_key(signer)?
+    ))
+}
+
+/// The mark that the shared message `id` of the shared channel `channel`
+/// was read by the agent of `name` (decision 2026-10-10 §6.1): the first
+/// 16 bytes of SHA-256 of the messages record's label, the channel's ID,
+/// the message's ID and the name. It binds the channel, since one ID can be
+/// in two channels; the two IDs are of fixed length, so it is never a mark
+/// of the `read/` list, nor a mark of a message sent.
+pub fn shared_read_mark(
+    channel: &[u8; 32],
+    id: &[u8; AGENT_MESSAGE_ID_BYTES],
+    name: &str,
+) -> [u8; AGENT_MESSAGE_READ_MARK_BYTES] {
+    shared_mark(LABEL_AGENT_MESSAGE_READ, channel, id, name)
+}
+
+/// The mark that the shared message `id` of the shared channel `channel`
+/// was sent by the agent of `name` (decision 2026-10-10 §6.1), under
+/// `cordelia v2 message sent`.
+pub fn shared_sent_mark(
+    channel: &[u8; 32],
+    id: &[u8; AGENT_MESSAGE_ID_BYTES],
+    name: &str,
+) -> [u8; AGENT_MESSAGE_READ_MARK_BYTES] {
+    shared_mark(LABEL_SHARED_SENT, channel, id, name)
+}
+
+fn shared_mark(
+    label: &[u8],
+    channel: &[u8; 32],
+    id: &[u8; AGENT_MESSAGE_ID_BYTES],
+    name: &str,
+) -> [u8; AGENT_MESSAGE_READ_MARK_BYTES] {
+    let mut hashed = Vec::with_capacity(label.len() + 32 + id.len() + name.len());
+    hashed.extend_from_slice(label);
+    hashed.extend_from_slice(channel);
+    hashed.extend_from_slice(id);
+    hashed.extend_from_slice(name.as_bytes());
+    first(&crate::sha256(&hashed))
 }
 
 /// The revision of message `number`: twice it (decision 2026-10-09 §2.3).
@@ -2106,5 +2166,57 @@ mod tests {
             PairBounds { bounds: five }.to_value(names),
             Err(NotAMessage::Field)
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_marks_tests {
+    use super::*;
+
+    /// A device's list of shared marks is in a slot of its own, `sread/`,
+    /// which the reader places apart from `read/`, `person/` and `hold/`
+    /// (decision 2026-10-10 §6.1).
+    #[test]
+    fn the_sread_list_has_a_slot_of_its_own() {
+        let signer = [7; 32];
+        let name = sread_name(&signer).unwrap();
+        assert!(name.starts_with("sread/cordelia_pk1"));
+        assert_eq!(name.len(), 76);
+        assert_eq!(place_of(&name, &signer, 9), Some(Place::SharedList));
+        assert_eq!(
+            place_of(&read_name(&signer).unwrap(), &signer, 9),
+            Some(Place::List)
+        );
+        // Named for another key, it is in none of this signer's slots.
+        assert_eq!(place_of(&sread_name(&[8; 32]).unwrap(), &signer, 9), None);
+        let list = ReadMarks {
+            marks: vec![[1; 16]],
+        }
+        .to_value()
+        .unwrap();
+        assert_eq!(
+            take(&name, &signer, 3, &Value::Other(list), |_| true),
+            Ok(Taken::SharedList(ReadMarks {
+                marks: vec![[1; 16]]
+            }))
+        );
+    }
+
+    /// A shared mark binds the channel, the ID and the name, and a mark of
+    /// a read is never a mark of a send nor a mark of the `read/` list
+    /// (decision 2026-10-10 §6.1, §4.2).
+    #[test]
+    fn a_shared_mark_binds_its_channel() {
+        let (one, two, id) = ([1; 32], [2; 32], [3; 16]);
+        let read = shared_read_mark(&one, &id, "github.com/owner/repo");
+        assert_ne!(read, shared_read_mark(&two, &id, "github.com/owner/repo"));
+        assert_ne!(
+            read,
+            shared_read_mark(&one, &[4; 16], "github.com/owner/repo")
+        );
+        assert_ne!(read, shared_read_mark(&one, &id, "notes"));
+        assert_ne!(read, shared_sent_mark(&one, &id, "github.com/owner/repo"));
+        assert_ne!(read, read_mark(&id, "github.com/owner/repo"));
+        assert_eq!(read, shared_read_mark(&one, &id, "github.com/owner/repo"));
     }
 }
