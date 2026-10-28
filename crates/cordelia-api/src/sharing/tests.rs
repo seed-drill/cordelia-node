@@ -603,11 +603,11 @@ fn add_device_counts_the_keys_of_each_channel() {
     let s = bob(1);
     let now = s.now + 10;
     let conn = &s[0].conn;
-    assert!(held_with_keys(conn).unwrap().is_empty());
+    assert!(held_with_keys(conn, &s.key(0)).unwrap().is_empty());
     let channel = crate::shared::tests::holds(&s, 0, 7, "review", now);
     crate::shared::tests::holds(&s, 0, 8, "design", now);
     let sorted = || {
-        let mut held = held_with_keys(conn).unwrap();
+        let mut held = held_with_keys(conn, &s.key(0)).unwrap();
         held.sort();
         held
     };
@@ -623,6 +623,20 @@ fn add_device_counts_the_keys_of_each_channel() {
         sorted(),
         [("design".to_string(), 0), ("review".to_string(), 3)]
     );
+    // This device's own empty anew record is not counted, as `shared list`
+    // does not count it.
+    let plan = new_plan(conn, &relays(), "made", &[]).unwrap();
+    make_new(conn, &s[0].identity, &plan.what, now).unwrap();
+    let made = sorted().into_iter().find(|(name, _)| name == "made");
+    assert_eq!(made, Some(("made".to_string(), 0)));
+    let listed = list(conn, &s[0].identity, &relays(), false, now).unwrap();
+    let in_list = listed["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|channel| channel["name"] == "made")
+        .map(|channel| channel["keys"].clone());
+    assert_eq!(in_list, Some(json!(0)));
 }
 
 /// The list says each channel by its words and its relays by the

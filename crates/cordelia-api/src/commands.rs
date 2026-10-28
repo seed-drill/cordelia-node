@@ -664,7 +664,8 @@ pub async fn add_look(
         // The shared channels the new device is handed, with the keys of
         // each (decision 2026-10-10 §5.2): adding a device trusts it with
         // everything of the person's.
-        let shared = crate::sharing::held_with_keys(&conn).map_err(refused)?;
+        let shared =
+            crate::sharing::held_with_keys(&conn, &state.identity.public_key()).map_err(refused)?;
         (would, shared)
     };
     let shared: Vec<serde_json::Value> = shared

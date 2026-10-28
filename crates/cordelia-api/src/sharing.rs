@@ -1503,14 +1503,18 @@ pub fn write_empty_anew_records(
 // ── What `add-device` names ──────────────────────────────────────────
 
 /// Each shared channel the person holds, with how many keys wrote there as
-/// this device holds it (§5.2, `add-device`).
-pub fn held_with_keys(conn: &Connection) -> Result<Vec<(String, usize)>, PersonError> {
+/// this device holds it (§5.2, `add-device`): this device, whose key is
+/// `own`, not among them, as `shared list` counts them.
+pub fn held_with_keys(
+    conn: &Connection,
+    own: &[u8; 32],
+) -> Result<Vec<(String, usize)>, PersonError> {
     let mut held = Vec::new();
     for filing in filed(conn)? {
         let keys = match kept::channel(conn, &filing.channel)? {
             Some(row) => kept::keys(conn, row.id)?
                 .iter()
-                .filter(|key| key.first_held.is_some())
+                .filter(|key| key.first_held.is_some() && key.key != *own)
                 .count(),
             None => 0,
         };
