@@ -805,9 +805,6 @@ pub fn share_plan(
     };
     let key = key_typed(typed)?;
     another_persons(conn, &held, &own, &key, "share")?;
-    if share_pair(identity, &key).is_none() {
-        key_typed("")?;
-    }
     if !any_own(own_relays, &filing.card) {
         return refused(
             "not_reached",
