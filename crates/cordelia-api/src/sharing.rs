@@ -1630,11 +1630,12 @@ pub fn list(
     for row in rows::shares(conn)? {
         let filing = filings.iter().find(|filing| filing.channel == row.channel);
         // A share is taken where its key came to write in the channel since
-        // it was made: the taker writes its empty anew record there.
+        // it was made: the taker writes its empty anew record there. Both
+        // times are this device's clock's.
         let taken = match kept::channel(conn, &row.channel)? {
             Some(channel) => kept::key(conn, channel.id, &row.key)?
                 .and_then(|key| key.first_held)
-                .is_some_and(|first| first >= row.made - PAIR_KEY_TYPED_SECS),
+                .is_some_and(|first| first >= row.made),
             None => false,
         };
         shares.push(json!({

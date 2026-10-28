@@ -888,3 +888,48 @@ fn a_filing_and_a_label_past_a_bound_are_still_acted_on() {
     let none = none.unwrap_or_else(|line| panic!("{line}"));
     make_label(conn, identity, &none.what, now + 2).unwrap();
 }
+
+/// `shared list` calls a share taken only where its key came to write in
+/// the channel since the share was made, by this device's clock (decision
+/// 2026-10-10 §19, item 41): a key that wrote there within the hour before
+/// it does not make it taken.
+#[test]
+fn a_share_is_taken_only_by_what_its_key_wrote_since() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let plan = new_plan(conn, &relays(), "review", &[]).unwrap();
+    make_new(conn, identity, &plan.what, now).unwrap();
+    let channel = plan_channel(conn, "review");
+    let alice = member(1);
+    let shared = crate::shared::tests::Shared {
+        secret: channel.card.secret().unwrap(),
+        id: channel.channel,
+    };
+    let before = crate::shared::tests::message(&alice, &shared, 1, "hello", now);
+    crate::take::take(conn, identity, &before, now).unwrap();
+    let typed_key = encode_public_key(&alice.public_key()).unwrap();
+    let to = share_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        &typed_key,
+        None,
+        now + 60,
+    )
+    .unwrap();
+    make_share(conn, identity, &relays(), &to.what, now + 60).unwrap();
+    let listed = list(conn, identity, &relays(), false, now + 61).unwrap();
+    assert_eq!(listed["shares"][0]["taken"], false, "{listed}");
+}
+
+/// The filing in force named `name`.
+fn plan_channel(conn: &Connection, name: &str) -> Filing {
+    filed(conn)
+        .unwrap()
+        .into_iter()
+        .find(|filing| filing.name == name)
+        .unwrap()
+}
