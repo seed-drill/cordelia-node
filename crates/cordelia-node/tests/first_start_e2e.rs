@@ -2146,7 +2146,7 @@ fn a_device_in_a_fork_judges_what_it_kept_at_its_first_start() {
         forked.log_tail()
     );
     let db = database_of(forked);
-    assert_eq!(schema_version(&db), 22);
+    assert_eq!(schema_version(&db), 23);
     let marked: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM node_meta WHERE key = 'person.judge_kept'",
