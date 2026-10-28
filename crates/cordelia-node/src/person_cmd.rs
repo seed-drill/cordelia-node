@@ -3861,6 +3861,24 @@ mod tests {
         }
     }
 
+    /// **A device added since that the node knows to be removed is not
+    /// asked about,** and the change lists it as removed and not as a
+    /// device (decision 2026-10-24 (removal), rule 20): a key removed on
+    /// another branch after this device's record of it counted.
+    #[test]
+    fn a_device_added_since_that_the_node_knows_removed_is_not_asked_about() {
+        let f = Fixture::new();
+        let desktop = NodeIdentity::from_seed([5; 32]).unwrap().public_key();
+        let mut handed = f.handed(&f.statement, &[f.adds(desktop, "desktop")]);
+        handed["removed"] = json!([encode_public_key(&desktop).unwrap()]);
+        let read = f.read(&handed).unwrap();
+        let typed = Typed::of(&[]);
+        let prepared = asked(&typed, &read, &Which::Renew).unwrap();
+        assert!(typed.asked.borrow().is_empty(), "{:?}", typed.asked);
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert!(signs.removes(&desktop) && !signs.lists(&desktop));
+    }
+
     /// **A change made where a head is set aside joins every head**
     /// (decision 2026-10-24 (removal), rule 21): `remove-device` and
     /// `renew` there make a settlement, as `settle` does, numbered above
