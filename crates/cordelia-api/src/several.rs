@@ -1893,7 +1893,7 @@ mod tests {
             &s.phrase,
             &on.held().statement,
             &on.latest(),
-            &on.apart().unwrap(),
+            &[&on.apart().unwrap()],
             &on.key(),
             s.listed(&[0, 1, 2]),
             &[],

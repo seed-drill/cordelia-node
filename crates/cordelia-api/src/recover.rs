@@ -192,6 +192,61 @@ pub fn found(mut candidates: Vec<Candidate>) -> Option<Found> {
     Some(Found { from, apart })
 }
 
+/// Every key that any change a recovery read removes, each once, in
+/// order (decision 2026-10-24 (removal), rule 22): the one it recovers
+/// from, one made apart that it settles, one on the chain of neither, and
+/// one behind. The recovery lists each as removed, and lists one device,
+/// so its secret is clear by construction.
+pub fn removed_by_any(read: &[&Statement]) -> Vec<[u8; 32]> {
+    let removed: BTreeSet<[u8; 32]> = read
+        .iter()
+        .flat_map(|statement| statement.removed.iter().copied())
+        .collect();
+    removed.into_iter().collect()
+}
+
+/// Every change that a recovery read (decision 2026-10-24 (removal),
+/// rule 22), taken whole from what the phrase opened, before
+/// [`found`] picks one to recover from. The command asks, counts its
+/// room and prepares its statement from this one list, so that no change
+/// it read is left out of any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read(Vec<Statement>);
+
+impl Read {
+    /// The statement of each change that the phrase opened.
+    pub fn of(candidates: &[Candidate]) -> Self {
+        Self(
+            candidates
+                .iter()
+                .map(|candidate| candidate.statement.statement.clone())
+                .collect(),
+        )
+    }
+
+    /// Each change read.
+    pub fn all(&self) -> Vec<&Statement> {
+        self.0.iter().collect()
+    }
+
+    /// Every key that any of them removes ([`removed_by_any`]).
+    pub fn removed(&self) -> Vec<[u8; 32]> {
+        removed_by_any(&self.all())
+    }
+
+    /// The recovery's statement ([`crate::change::prepare_recovery`]),
+    /// which lists as removed every key that any change read removes.
+    pub fn prepare(
+        &self,
+        from: &SignedStatement,
+        apart: Option<&SignedStatement>,
+        maker: cordelia_crypto::statement::Device,
+        removed: &[[u8; 32]],
+    ) -> Result<crate::change::Prepared, PersonError> {
+        crate::change::prepare_recovery(from, apart, &self.all(), maker, removed)
+    }
+}
+
 /// One of the three things that a person says of a device at a recovery
 /// (decision 2026-10-04 §9, step 3), or that nothing was asked of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -817,7 +872,8 @@ pub fn gone(rows: &[Row], answers: &[Answer]) -> Vec<[u8; 32]> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Room {
     /// How many keys are removed already: by the statement recovered
-    /// from, and by one made apart from it, which the recovery settles.
+    /// from, and by every other change the recovery read (decision
+    /// 2026-10-24 (removal), rule 22), which it lists as removed too.
     pub removed: usize,
     /// How many rows are asked about, at most: each device that counts,
     /// but the machine itself, and each key that fails only for the
@@ -838,12 +894,17 @@ impl Room {
 
 /// What room the statement of a recovery has for the keys that the
 /// person may say are gone ([`Room`]), worked out before anything is
-/// asked. `from` is the statement recovered from, `apart` one that was
-/// made apart from it, `rows` the rows that are shown, and `own` the key
-/// of the machine that recovers.
-pub fn room(from: &Statement, apart: Option<&Statement>, rows: &[Row], own: &[u8; 32]) -> Room {
+/// asked. `from` is the statement recovered from, `others` every other
+/// change the recovery read, whose removals it lists too (decision
+/// 2026-10-24 (removal), rule 22), `rows` the rows that are shown, and
+/// `own` the key of the machine that recovers.
+pub fn room(from: &Statement, others: &[&Statement], rows: &[Row], own: &[u8; 32]) -> Room {
     let mut removed: BTreeSet<[u8; 32]> = from.removed.iter().copied().collect();
-    removed.extend(apart.iter().flat_map(|apart| apart.removed.iter().copied()));
+    removed.extend(
+        others
+            .iter()
+            .flat_map(|other| other.removed.iter().copied()),
+    );
     let asked = rows
         .iter()
         .filter(|row| row.counts || !row.no_room.is_empty())
@@ -1733,6 +1794,96 @@ mod tests {
         assert_eq!(three.second().unwrap().1, 1);
     }
 
+    /// **A recovery lists as removed every key that any change it read
+    /// removes** (decision 2026-10-24 (removal), rule 22): three changes
+    /// made apart from change 2, each removing another device. The
+    /// recovery settles the first two, and the third is on the chain of
+    /// neither: its removal is listed all the same. It lists one device.
+    #[test]
+    fn test_a_recovery_lists_as_removed_every_key_that_any_change_it_read_removes() {
+        use cordelia_crypto::statement::{Device, Statement};
+        let mut s = Several::of_one_person(5);
+        s.change(0, &[0, 1, 2, 3, 4], &[]);
+        let (applied, held) = (s[0].held().statement, s[0].latest());
+        let apart_of = |removes: usize, stay: &[usize]| {
+            let removed = [s.key(removes)];
+            make_change(
+                &s.phrase,
+                &applied,
+                &held,
+                &s.key(0),
+                s.listed(stay),
+                &removed,
+            )
+            .unwrap()
+        };
+        let made = [
+            apart_of(2, &[0, 1, 3, 4]),
+            apart_of(3, &[0, 1, 2, 4]),
+            apart_of(4, &[0, 1, 2, 3]),
+        ];
+        let candidates: Vec<Candidate> = made.iter().map(candidate).collect();
+        let read: Vec<Statement> = candidates
+            .iter()
+            .map(|c| c.statement.statement.clone())
+            .collect();
+        let read: Vec<&Statement> = read.iter().collect();
+        let mut every = vec![s.key(2), s.key(3), s.key(4)];
+        every.sort_unstable();
+        assert_eq!(removed_by_any(&read), every);
+
+        // What the command reads from: every change the phrase opened,
+        // the third branch's included (the review's low of slice 4).
+        let changes = Read::of(&candidates);
+        assert_eq!(changes.all(), read);
+        assert_eq!(changes.removed(), every);
+
+        let found = found(candidates).unwrap();
+        let (second, on_neither) = found.second().unwrap();
+        assert_eq!(on_neither, 1);
+        let maker = || Device::new(Machine::new(9).key(), "new machine").unwrap();
+        let prepared = changes
+            .prepare(&found.from.statement, Some(&second.statement), maker(), &[])
+            .unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert_eq!(signs.removed, every);
+        assert_eq!(signs.devices, [maker()]);
+        // Its room counts each of the three removals once.
+        assert_eq!(
+            room(&found.from.statement.statement, &read, &[], &[9; 32]).removed,
+            3
+        );
+        // The control: of the two it settles alone, the third's removal
+        // would be missing.
+        let two = [&found.from.statement.statement, &second.statement.statement];
+        let of_two = prepare_recovery(
+            &found.from.statement,
+            Some(&second.statement),
+            &two,
+            maker(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            Statement::from_bytes(of_two.bytes()).unwrap().removed.len(),
+            2
+        );
+        // What was read holds the change recovered from, and the one it
+        // settles.
+        for read in [&[][..], &two[1..], &two[..1]] {
+            assert!(matches!(
+                prepare_recovery(
+                    &found.from.statement,
+                    Some(&second.statement),
+                    read,
+                    maker(),
+                    &[]
+                ),
+                Err(PersonError::NotAllRead)
+            ));
+        }
+    }
+
     /// **A name that only a key lists which does not count is named
     /// among the names that the look leaves** (decision 2026-10-04 §9).
     /// Such a key's word is in what the relays hand, and nothing that it
@@ -2284,10 +2435,16 @@ mod tests {
         let names = names_in_order(&read, answers, &[], RECOVERY_MAX_NAMES);
         let removed = gone(&read.rows, answers);
         let maker = Device::new(own, "new machine").unwrap();
-        let entry = prepare_recovery(&from.statement, None, maker, &removed)
-            .unwrap()
-            .sign(&phrase, &from.entry, None)
-            .unwrap();
+        let entry = prepare_recovery(
+            &from.statement,
+            None,
+            &[&from.statement.statement],
+            maker,
+            &removed,
+        )
+        .unwrap()
+        .sign(&phrase, &from.entry, &[])
+        .unwrap();
         let allows = Allows::Look {
             names: names.carried.clone(),
             takes: takes(&read.rows, answers).iter().map(hex::encode).collect(),
@@ -2823,7 +2980,7 @@ mod tests {
         // The room for removed keys is worked out with both, before
         // anything is asked.
         assert_eq!(
-            room(&statement, None, &read.rows, &[9; 32]).asked,
+            room(&statement, &[], &read.rows, &[9; 32]).asked,
             counted + 2
         );
 
@@ -3090,7 +3247,7 @@ mod tests {
         assert_eq!(of_the_third.added_by, Some((ky, AT)));
         assert!(!of_the_third.counts && of_the_third.no_room.is_empty());
         assert_eq!(
-            room(&statement, None, &read.rows, &[9; 32]).asked,
+            room(&statement, &[], &read.rows, &[9; 32]).asked,
             counted + 1
         );
 
@@ -3835,7 +3992,7 @@ mod tests {
         let read = read_generation(&from, &statement_key, &s[0].secret(), &handed, s.now).unwrap();
         let mut statement = from.statement.statement.clone();
         let own = [9u8; 32];
-        let all = room(&statement, None, &read.rows, &own);
+        let all = room(&statement, &[], &read.rows, &own);
         assert_eq!(
             all,
             Room {
@@ -3847,26 +4004,26 @@ mod tests {
         assert!(all.for_every_answer());
         // The machine itself is not asked about, and nor is a record
         // that does not count.
-        assert_eq!(room(&statement, None, &read.rows, &s.key(0)).asked, 5);
+        assert_eq!(room(&statement, &[], &read.rows, &s.key(0)).asked, 5);
         let mut rows = read.rows.clone();
         rows[5].counts = false;
-        assert_eq!(room(&statement, None, &rows, &own).asked, 5);
+        assert_eq!(room(&statement, &[], &rows, &own).asked, 5);
 
         // 251 keys are removed already: five of the six can go.
         statement.removed = (0..251u16)
             .map(|n| identity_of(2_000 + n).public_key())
             .collect();
-        let tight = room(&statement, None, &read.rows, &own);
+        let tight = room(&statement, &[], &read.rows, &own);
         assert_eq!((tight.removed, tight.asked, tight.can_go), (251, 6, 5));
         assert!(!tight.for_every_answer());
         statement.removed.pop();
-        assert!(room(&statement, None, &read.rows, &own).for_every_answer());
+        assert!(room(&statement, &[], &read.rows, &own).for_every_answer());
         // A statement made apart removed two keys more, one of them a
         // key that the other removed too: each is counted once. One is a
         // device that is shown here: it is removed whatever is said.
         let mut apart = from.statement.statement.clone();
         apart.removed = vec![statement.removed[0], [7; 32], s.key(5)];
-        let both = room(&statement, Some(&apart), &read.rows, &own);
+        let both = room(&statement, &[&apart], &read.rows, &own);
         assert_eq!((both.removed, both.asked, both.can_go), (252, 5, 4));
         assert!(!both.for_every_answer());
     }
@@ -4364,7 +4521,7 @@ mod tests {
                     &phrase(),
                     &stands().statement,
                     &kept(Kept::Latest).unwrap(),
-                    &kept(Kept::Apart).unwrap(),
+                    &[&kept(Kept::Apart).unwrap()],
                     &own,
                     stay,
                     &[],
@@ -4373,7 +4530,7 @@ mod tests {
                     &phrase(),
                     &on.held().statement,
                     &on.latest(),
-                    &on.apart().unwrap(),
+                    &[&on.apart().unwrap()],
                     &on.key(),
                     stay,
                     &[],

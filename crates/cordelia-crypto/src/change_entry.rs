@@ -397,23 +397,38 @@ impl ForPhrase {
     /// `before` it, each given with its statement's number (decision
     /// 2026-10-04 §9).
     ///
-    /// One entry before for a statement made after one, and two for a
-    /// settlement, which passes on the secrets of both branches. They are
-    /// kept the newest first, each once, and only as many as eight. So a
-    /// maker that never held a generation's secret passes it on all the
-    /// same: it is read from the entry, with the phrase.
+    /// One entry before for a statement made after one, and one for each
+    /// branch for a settlement, which passes on the secret of every branch
+    /// it joins (decision 2026-10-24 (removal), rule 21). They are kept the
+    /// newest first, each once, and only as many as eight: **the secret of
+    /// each entry `before` comes first,** as many as fit, and then those
+    /// each copied forward, so that a long branch does not push out the
+    /// secret of a short one. So a maker that never held a generation's
+    /// secret passes it on all the same: it is read from the entry, with
+    /// the phrase.
     pub fn following(secret: [u8; 32], before: &[(u64, &ForPhrase)]) -> Self {
-        let mut earlier = Vec::new();
-        for (number, entry) in before {
-            earlier.push(Earlier {
+        let newest_first = |list: &mut Vec<Earlier>| {
+            list.sort_unstable_by(|a, b| by_age(b, a));
+            list.dedup();
+        };
+        let mut earlier: Vec<Earlier> = before
+            .iter()
+            .map(|(number, entry)| Earlier {
                 number: *number,
                 secret: entry.secret,
-            });
-            earlier.extend(entry.earlier.iter().cloned());
-        }
-        earlier.sort_unstable_by(|a, b| by_age(b, a));
-        earlier.dedup();
+            })
+            .collect();
+        newest_first(&mut earlier);
         earlier.truncate(MAX_EARLIER_SECRETS);
+        let mut copied: Vec<Earlier> = before
+            .iter()
+            .flat_map(|(_, entry)| entry.earlier.iter().cloned())
+            .filter(|one| !earlier.contains(one))
+            .collect();
+        newest_first(&mut copied);
+        copied.truncate(MAX_EARLIER_SECRETS - earlier.len());
+        earlier.append(&mut copied);
+        newest_first(&mut earlier);
         Self { secret, earlier }
     }
 
@@ -2705,6 +2720,54 @@ mod tests {
         assert_eq!(settled.validate(10), Ok(()));
     }
 
+    /// A settlement holds the secret of each branch it joins before any
+    /// secret copied forward (decision 2026-10-24 (removal), rule 21): a
+    /// long branch does not push out the secret of a short one, and three
+    /// heads are each held.
+    #[test]
+    fn a_settlement_holds_the_secret_of_each_branch_before_those_copied_forward() {
+        let two = for_phrase_of(2);
+        let a3 = ForPhrase::following(secret(0xa3), &[(2, &two)]);
+        let c3 = ForPhrase::following(secret(0xc3), &[(2, &two)]);
+        let mut b = ForPhrase::following(secret(0x43), &[(2, &two)]);
+        for n in 4..=11u8 {
+            b = ForPhrase::following(secret(0x40 + n), &[(u64::from(n) - 1, &b)]);
+        }
+        let numbers = |said: &ForPhrase| -> Vec<(u64, [u8; 32])> {
+            said.earlier
+                .iter()
+                .map(|earlier| (earlier.number, earlier.secret))
+                .collect()
+        };
+        // The long branch's eight newest would be 10 down to 3: change 3
+        // of the short branch is held all the same, and the oldest copied
+        // forward makes room for it.
+        let settled = ForPhrase::following(secret(12), &[(3, &a3), (11, &b)]);
+        assert_eq!(
+            numbers(&settled),
+            [
+                (11, secret(0x4b)),
+                (10, secret(0x4a)),
+                (9, secret(0x49)),
+                (8, secret(0x48)),
+                (7, secret(0x47)),
+                (6, secret(0x46)),
+                (5, secret(0x45)),
+                (3, secret(0xa3)),
+            ]
+        );
+        assert_eq!(settled.validate(12), Ok(()));
+
+        // Three heads: each is held, the newest first.
+        let settled = ForPhrase::following(secret(12), &[(3, &a3), (11, &b), (3, &c3)]);
+        let held = numbers(&settled);
+        assert_eq!(held.len(), MAX_EARLIER_SECRETS);
+        for head in [(11, secret(0x4b)), (3, secret(0xa3)), (3, secret(0xc3))] {
+            assert!(held.contains(&head), "{}", head.0);
+        }
+        assert_eq!(settled.validate(12), Ok(()));
+    }
+
     /// What the part for the phrase may say: at most eight earlier
     /// secrets, the newest first, each of a statement before this one and
     /// none twice. Anything else is refused where an entry is made and
@@ -3049,7 +3112,7 @@ mod tests {
             .unwrap();
         let ours = two.next(key(0), &secret(3), devices(&[0, 1]), &[]).unwrap();
         let settled =
-            Statement::settle(&ours, &apart, key(0), &secret(4), devices(&[0, 1]), &[]).unwrap();
+            Statement::settle(&[&ours, &apart], key(0), &secret(4), devices(&[0, 1]), &[]).unwrap();
         let read = Lineage::of(&settled, MADE_AT).unwrap();
         assert_eq!(read.chain.len(), settled.chain.len());
         assert_eq!(read.chain.len(), 4);

@@ -33,8 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use cordelia_core::protocol::{
-    CHANGE_FETCH_MAX_SECS, CHANGE_FETCH_PASSES, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS,
-    RECEIVED_LAST_WEEK_SECS,
+    CHANGE_FETCH_MAX_SECS, CHANGE_FETCH_PASSES, MAX_STATEMENT_REMOVED, PAIR_KEY_TYPED_SECS,
+    RECEIVED_LAST_DAY_SECS, RECEIVED_LAST_WEEK_SECS,
 };
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -198,8 +198,9 @@ fn says(e: &PersonError) -> String {
         PersonError::Stopped(State::Fork) => "two changes were made apart, and this device has \
                                               seen both, or a device that was removed holds the \
                                               secret of the change it follows: `cordelia \
-                                              devices` says the way on (`cordelia settle` where \
-                                              two changes were made apart)."
+                                              devices` says the way on (a change made with the \
+                                              recovery phrase, `cordelia renew`, joins two \
+                                              changes made apart)."
             .into(),
         PersonError::Stopped(State::Removed) => "this device was removed. `cordelia init \
                                                  --new-key` gives it a new key; it is then \
@@ -929,7 +930,9 @@ pub async fn forget(
 
 #[derive(Deserialize)]
 pub struct PrepareRequest {
-    /// Whether the change settles two that were made apart.
+    /// Whether the command is `cordelia settle`: refused where the device
+    /// keeps no head set aside. (Any change made where one is kept joins
+    /// it, decision 2026-10-24 (removal), rule 21.)
     #[serde(default)]
     pub settle: bool,
 }
@@ -1101,8 +1104,11 @@ fn received(state: &AppState, now: i64) -> Option<serde_json::Value> {
 /// anything (decision 2026-10-04 §5, §7.1): the statement that the device
 /// has applied, as its signed bytes; the change entry it keeps; the
 /// record of each device added since that counts, as its signed bytes
-/// ([`asked_about`]); and, in a fork, the statement made apart and its
-/// entry. The command reads what it shows from those bytes.
+/// ([`asked_about`]); each head set aside, its statement and its entry
+/// ([`heads_to_join`]); and every key that the device knows to be removed
+/// (decision 2026-10-24 (removal), rule 20), which the change lists as
+/// removed and none of which it lists as a device. The command reads what
+/// it shows from those bytes.
 ///
 /// Before that the device shows its change entry to each relay and
 /// fetches, for two minutes at most, and then runs a sync cycle, within
@@ -1119,13 +1125,14 @@ fn received(state: &AppState, now: i64) -> Option<serde_json::Value> {
 /// the last week ([`received`]).
 ///
 /// Refused on a device that makes no statement (§4.3): one that follows
-/// no phrase, was removed, is in no list or could not open a change. A
-/// device that keeps a head set aside (decision 2026-10-24 (removal), rule
-/// 1), closed or not, is handed this only to settle, with the head that the
-/// settlement joins: the highest number, and of two at one number the
-/// lower hash. A device that keeps none has nothing to settle. (Rule 21,
-/// by which any change made where a head is set aside joins it, is a later
-/// slice of the build.)
+/// no phrase, was removed, is in no list or could not open a change, and
+/// one whose own key it knows to be removed (decision 2026-10-24
+/// (removal), rule 20: no change that lists it is clear). **A change made
+/// on a device that keeps a head set aside joins every head** (rule 21),
+/// closed or not, whichever of `cordelia remove-device`, `cordelia renew`
+/// and `cordelia settle` makes it: the command makes a settlement there.
+/// `cordelia settle` on a device that keeps none has nothing to settle,
+/// and is refused.
 pub async fn change_prepare(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1137,16 +1144,28 @@ pub async fn change_prepare(
             .map_err(refused)?
             .ok_or_else(|| refused(PersonError::FollowsNoPhrase))?;
         let keeps_a_head = !held_rows::set_aside_entries(conn)?.is_empty();
+        let own = state.identity.public_key();
+        let removed = held_rows::removed_keys(conn)?;
+        // A change lists every key known to be removed (rule 20), and a
+        // statement lists at most 256: past that no change can be made
+        // here, and the device says so before anything is asked.
+        let too_many =
+            removed.len() > MAX_STATEMENT_REMOVED || held_rows::removed_past_bound(conn)?;
         match (held.state, keeps_a_head, body.settle) {
-            (State::Applied | State::Fork, true, true)
-            | (State::Applied | State::Fork, false, false) => Ok(held.state),
+            (State::Applied | State::Fork, _, _) if removed.contains(&own) => {
+                Err(refused(PersonError::RemovedAsKnown))
+            }
+            (State::Applied | State::Fork, _, _) if too_many => Err(ApiError::BadRequest(format!(
+                "this device knows {} keys to be removed, and a change lists every one of them: \
+                 a change lists at most {MAX_STATEMENT_REMOVED}. No change can be made on this \
+                 device. Nothing was done.",
+                removed.len()
+            ))),
             (State::Applied | State::Fork, false, true) => Err(ApiError::BadRequest(
                 "this device has seen no two changes made apart: there is nothing to settle."
                     .into(),
             )),
-            (State::Applied | State::Fork, true, false) => {
-                Err(refused(PersonError::Stopped(State::Fork)))
-            }
+            (State::Applied | State::Fork, _, _) => Ok(held.state),
             (state, _, _) => Err(refused(PersonError::Stopped(state))),
         }
     };
@@ -1179,14 +1198,18 @@ pub async fn change_prepare(
     let latest = person::kept_followed(&conn)
         .map_err(refused)?
         .ok_or_else(|| ApiError::Internal("no change entry is kept".into()))?;
-    let head = head_to_settle(&conn, &state.identity, &held)?;
-    let apart_statement = match &head {
-        None => None,
-        Some(head) => Some(hex::encode(
-            head.statement.to_bytes().map_err(|e| refused(e.into()))?,
-        )),
-    };
-    let apart = head.map(|head| head.entry);
+    let mut heads: Vec<serde_json::Value> = Vec::new();
+    for head in heads_to_join(&conn, &state.identity, &held)? {
+        heads.push(json!({
+            "id": hex::encode(head.entry.id()),
+            "entry": hex_of(head.entry),
+            "statement": hex::encode(head.statement.to_bytes().map_err(|e| refused(e.into()))?),
+        }));
+    }
+    let removed: Vec<String> = held_rows::removed_keys(&conn)?
+        .iter()
+        .map(written)
+        .collect::<Result<_, _>>()?;
     let kept = held_rows::additions(&conn)?;
     let additions: Vec<String> = asked_about(&kept)
         .into_iter()
@@ -1203,9 +1226,10 @@ pub async fn change_prepare(
         "statement": hex::encode(statement),
         "over": hex::encode(latest.id()),
         "entry": hex_of(latest),
-        "apart": apart.as_ref().map(|entry| hex::encode(entry.id())),
-        "apart_entry": apart.map(hex_of),
-        "apart_statement": apart_statement,
+        // Each head set aside, which the change joins (rule 21), and every
+        // key known to be removed, which it lists (rule 20).
+        "heads": heads,
+        "removed": removed,
         "additions": additions,
         "standing": standing,
         // Each device that has said that it left: a person is asked
@@ -1264,15 +1288,15 @@ fn standing<'a>(statement: &Statement, kept: &'a [KeptAddition]) -> Vec<&'a Kept
         .collect()
 }
 
-/// The head set aside that `cordelia settle` joins with the change
-/// followed: the highest number, and of two at one number the lower hash
-/// (decision 2026-10-24 (removal), rule 8, step 7). `None` where the device
-/// keeps none.
-fn head_to_settle(
+/// The heads set aside that a change made on this device joins with the
+/// change followed (decision 2026-10-24 (removal), rule 21): every one, the
+/// highest number first, and of two at one number the lower hash first
+/// (as rule 8, step 7, ranks them). None where the device keeps none.
+fn heads_to_join(
     conn: &rusqlite::Connection,
     identity: &cordelia_crypto::identity::NodeIdentity,
     held: &person::Held,
-) -> Result<Option<person::Head>, ApiError> {
+) -> Result<Vec<person::Head>, ApiError> {
     let mut heads = person::set_aside_heads(conn, identity, &held.following).map_err(refused)?;
     let mut ranked = Vec::with_capacity(heads.len());
     for head in heads.drain(..) {
@@ -1288,7 +1312,7 @@ fn head_to_settle(
         ));
     }
     ranked.sort_by_key(|(number, hash, _)| (*number, *hash));
-    Ok(ranked.into_iter().next().map(|(_, _, head)| head))
+    Ok(ranked.into_iter().map(|(_, _, head)| head).collect())
 }
 
 #[derive(Deserialize)]
@@ -1299,10 +1323,11 @@ pub struct MakeRequest {
     /// What the change entry was named by that the device kept as the
     /// latest when the command was handed what it showed.
     pub over: String,
-    /// What the entry of the statement made apart was named by, where
-    /// the change settles two.
+    /// What each head set aside was named by when the command was handed
+    /// what it showed: the change joins them all (decision 2026-10-24
+    /// (removal), rule 21). None where the device kept none.
     #[serde(default)]
-    pub apart: Option<String>,
+    pub heads: Vec<String>,
 }
 
 /// The node's half of a change that a command made with the phrase
@@ -1319,18 +1344,16 @@ pub async fn change_make(
     asked(&req, &state)?;
     let entry = entry_of("entry", &body.entry)?;
     let over = id_of("over", &body.over)?;
-    let apart = body
-        .apart
-        .as_deref()
-        .map(|apart| id_of("apart", apart))
-        .transpose()?;
+    let heads = body
+        .heads
+        .iter()
+        .map(|head| id_of("heads", head))
+        .collect::<Result<Vec<_>, _>>()?;
     // The node stops its sync cycle, and makes the change in one
     // transaction (§7.2): it counts as a change of settings, and waits
     // for a cycle that is running to stop.
     let applied = state
-        .as_a_change(|conn| {
-            person::apply_made(conn, &state.identity, &entry, &over, apart.as_ref(), now())
-        })
+        .as_a_change(|conn| person::apply_made(conn, &state.identity, &entry, &over, &heads, now()))
         .map_err(refused)?;
     for (name, file) in &applied.not_carried {
         tracing::warn!(
@@ -2316,5 +2339,129 @@ exit 0"#,
         // the fetch.
         assert!(not_fetched(Waited::EndedEarly, Waited::Done, true).is_empty());
         assert_eq!(not_fetched(Waited::NotEnded, Waited::Done, true).len(), 1);
+    }
+
+    /// What the prepare route answers, as a command reads it.
+    async fn prepared(
+        state: &web::Data<AppState>,
+        settle: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer t"))
+            .to_http_request();
+        let answered =
+            change_prepare(req, state.clone(), web::Json(PrepareRequest { settle })).await?;
+        let body = actix_web::body::to_bytes(answered.into_body())
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A command that makes a change is handed every key that the device
+    /// knows to be removed, and every head it sets aside, the highest
+    /// number first (decision 2026-10-24 (removal), rules 20 and 21): a
+    /// change made there lists the one and joins the other, whichever
+    /// command makes it. `cordelia settle` with no head kept has nothing
+    /// to settle, and a device that knows its own key to be removed is
+    /// told so before anything is asked.
+    #[actix_web::test]
+    async fn test_a_change_is_handed_every_removed_key_and_every_head_set_aside() {
+        let mut s = Several::of_one_person(3);
+        s.change(0, &[0, 1, 2], &[]);
+        s.meet(&[0, 1, 2]);
+        s.change(0, &[0, 1, 2], &[]);
+        // Device 1 makes two changes: its second, numbered 4, is the head,
+        // and its first is behind it.
+        s.change(1, &[0, 1, 2], &[]);
+        let by_1 = s.change(1, &[0, 1, 2], &[]);
+        let by_2 = s.change(2, &[0, 1, 2], &[]);
+        let now = s.tick();
+        let stranger = Machine::new(9).key();
+        {
+            let on = &s[0];
+            for apart in [&by_2, &by_1] {
+                let seen = person::shown(&on.conn, &on.identity, apart, now).unwrap();
+                assert_eq!(seen, person::Shown::SetAside);
+            }
+            held_rows::keep_removed(&on.conn, &[stranger], now).unwrap();
+        }
+        let state = web::Data::new(state_of(s.machines.remove(0)));
+        for settle in [false, true] {
+            let handed = prepared(&state, settle).await.unwrap();
+            let ids: Vec<&str> = handed["heads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|head| head["id"].as_str().unwrap())
+                .collect();
+            // The highest number first.
+            assert_eq!(
+                ids,
+                [hex::encode(by_1.id()), hex::encode(by_2.id())],
+                "{settle}"
+            );
+            for head in handed["heads"].as_array().unwrap() {
+                let statement = cordelia_crypto::statement::SignedStatement::from_bytes(
+                    &hex::decode(head["statement"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+                let entry =
+                    Entry::from_wire(&hex::decode(head["entry"].as_str().unwrap()).unwrap())
+                        .unwrap()
+                        .check()
+                        .unwrap();
+                assert_eq!(hex::encode(entry.id()), head["id"].as_str().unwrap());
+                assert_eq!(statement.statement.number, entry.rev);
+            }
+            assert_eq!(handed["removed"], json!([written(&stranger).unwrap()]));
+        }
+
+        // A device that keeps no head has nothing to settle; it is handed
+        // the removed keys all the same.
+        let mut s = Several::of_one_person(2);
+        s.change(0, &[0, 1], &[]);
+        let now = s.tick();
+        held_rows::keep_removed(&s[0].conn, &[stranger], now).unwrap();
+        let state = web::Data::new(state_of(s.machines.remove(0)));
+        let handed = prepared(&state, false).await.unwrap();
+        assert_eq!(handed["heads"], json!([]));
+        assert_eq!(handed["removed"], json!([written(&stranger).unwrap()]));
+        match prepared(&state, true).await {
+            Err(ApiError::BadRequest(said)) => {
+                assert!(said.contains("nothing to settle"), "{said}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // 257 keys known to be removed: a change would list each, and a
+        // statement lists at most 256. It is refused, and says why.
+        let many: Vec<[u8; 32]> = (0..=MAX_STATEMENT_REMOVED)
+            .map(|n| {
+                let mut key = [0xa5; 32];
+                key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                key
+            })
+            .collect();
+        held_rows::keep_removed(&db(&state), &many[1..MAX_STATEMENT_REMOVED], now).unwrap();
+        assert_eq!(held_rows::removed_keys(&db(&state)).unwrap().len(), 256);
+        assert!(prepared(&state, false).await.is_ok(), "256 fit");
+        held_rows::keep_removed(&db(&state), &many[..1], now).unwrap();
+        for settle in [false, true] {
+            match prepared(&state, settle).await {
+                Err(ApiError::BadRequest(said)) => {
+                    assert!(said.contains("knows 257 keys to be removed"), "{said}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // Its own key known to be removed: no change is prepared.
+        held_rows::keep_removed(&db(&state), &[state.identity.public_key()], now).unwrap();
+        for settle in [false, true] {
+            match prepared(&state, settle).await {
+                Err(ApiError::BadRequest(said)) => {
+                    assert!(said.contains("this device was removed"), "{said}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }

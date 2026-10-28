@@ -3031,7 +3031,7 @@ mod tests {
         let own = st.identity.public_key();
         let entry =
             change::make_change(phrase, &held.statement, &latest, &own, stay, &[*gone]).unwrap();
-        person::apply_made(&db, &st.identity, &entry, &latest.id(), None, now()).unwrap();
+        person::apply_made(&db, &st.identity, &entry, &latest.id(), &[], now()).unwrap();
         entry
     }
 
