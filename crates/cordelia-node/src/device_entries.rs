@@ -1025,6 +1025,19 @@ impl DeviceEntries {
             self.say(relays, stands);
             return true;
         }
+        // A device closed by what it knows of removals growing, at the
+        // door or at `cordelia accept`, moves where a change it keeps is
+        // clear and counts it (decision 2026-10-24 (removal), rules 8 and
+        // 9): only the move waited for the cycle's turn (rule 5).
+        let stands = match stands {
+            Stands::Closed | Stands::Stopped(State::Fork) => match self.moves(self.unix()) {
+                Some(Ok(Shown::Moved(_))) => {
+                    at_relays::stands(&lock(&self.state.db)).unwrap_or(stands)
+                }
+                _ => stands,
+            },
+            _ => stands,
+        };
         let names: Vec<String> = relays.iter().map(|relay| relay.name.clone()).collect();
         // A machine that slept moves every relay's reference: the five
         // minutes before a relay is out of reach start again (decision
@@ -1654,6 +1667,7 @@ impl DeviceEntries {
             // with it what a change entry has it do: nothing waits now.
             Ok(done) => {
                 tracing::info!(?done, "a change that could not be applied was dealt with");
+                // A move was said where it was made.
                 if let Answered::Shown(Shown::Applied(applied)) = &done {
                     self.not_carried(applied);
                 }
@@ -1905,6 +1919,12 @@ impl DeviceEntries {
     /// a running cycle does (`Standing::to_write`), so its close commits
     /// with it. A refusal that closed the device is a close: it commits at
     /// once, and wakes the pass (rule 19), wherever it was answered.
+    ///
+    /// **A move waits for the cycle's turn, and nothing else does** (rules
+    /// 5 and 9): the move is held back where the entry is judged, so that
+    /// the device is closed in the transaction that commits at once; it
+    /// then moves as a change of settings ([`Self::moves`]), and the
+    /// outcome is the move.
     fn answered_as_a_change(
         &self,
         shown: &CheckedEntry,
@@ -1914,8 +1934,10 @@ impl DeviceEntries {
         let identity = &self.state.identity;
         let (outcome, changed) = self.state.as_a_change_where(
             |db| {
-                at_relays::telling_a_change(db, |db| {
-                    at_relays::answered(db, identity, shown, another, now)
+                cordelia_api::person::with_moves_held_back(|| {
+                    at_relays::telling_a_change(db, |db| {
+                        at_relays::answered(db, identity, shown, another, now)
+                    })
                 })
             },
             |(outcome, changed)| match (outcome, changed) {
@@ -1934,7 +1956,55 @@ impl DeviceEntries {
             );
             self.state.own_channels.ask_whole();
         }
+        // Closed where the move was held back, or by a refusal: it moves
+        // now, where a change it keeps is clear and counts it.
+        let closed = matches!(
+            outcome,
+            Ok(Answered::Shown(Shown::Closed | Shown::Refused(_)))
+        );
+        if closed && let Some(Ok(Shown::Moved(applied))) = self.moves(now) {
+            return Ok(Answered::Shown(Shown::Moved(applied)));
+        }
         outcome
+    }
+
+    /// Move the device, where the change it follows is not clear and a
+    /// change it keeps as a head set aside is clear and counts it (decision
+    /// 2026-10-24 (removal), rules 8 and 9), as a change of settings: it
+    /// waits for the sync cycle's turn. `None` where there is no move to
+    /// make, as the database says before it asks for the change; the move
+    /// itself asks again, in its own transaction.
+    fn moves(&self, now: i64) -> Option<Result<Shown, PersonError>> {
+        let identity = &self.state.identity;
+        let due = cordelia_api::person::would_move(&lock(&self.state.db), identity);
+        match due {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => return Some(Err(e)),
+        }
+        let moved = self
+            .state
+            .as_a_change(|db| cordelia_api::person::move_to_a_clear_change(db, identity, now));
+        match moved {
+            Ok(Some(Shown::Moved(applied))) => {
+                tracing::warn!(
+                    statement = applied.number,
+                    carried = applied.carried,
+                    "the change this device followed lists a device that was removed: it moved, with no phrase, to a clear change that lists it"
+                );
+                self.not_carried(&applied);
+                self.applied();
+                // A change in what the device keeps: it shows at every
+                // relay it reaches at once (rule 19).
+                self.state.own_channels.ask_whole();
+                Some(Ok(Shown::Moved(applied)))
+            }
+            Ok(shown) => shown.map(Ok),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not move to a clear change");
+                Some(Err(e))
+            }
+        }
     }
 
     /// The device was answered on `link` with `another`, where it showed
@@ -1945,6 +2015,9 @@ impl DeviceEntries {
         let outcome = self.answered_as_a_change(shown, another, now);
         let relay = link.name();
         match outcome {
+            // Moved where it was answered: what the move says is said
+            // where it was made ([`Self::moves`]).
+            Ok(Answered::Shown(Shown::Moved(_))) => true,
             Ok(Answered::Shown(Shown::Applied(applied))) => {
                 tracing::info!(
                     relay,
