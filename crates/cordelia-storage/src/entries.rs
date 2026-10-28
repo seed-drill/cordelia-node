@@ -11,6 +11,13 @@
 //! one. Nothing here compares one author's entries with another's, so no
 //! author can hide or displace what another stored.
 //!
+//! **A relay keeps every head besides** (decision 2026-10-24 (removal),
+//! rule 14): an entry with a lineage is kept in a row of its own, whose
+//! `head` is the entry's ID, beside the others of that author in that slot.
+//! Which heads a relay keeps is the relay's rule (`crate::relay`), and
+//! [`store_head`] and [`remove_author_row`] are its. The store's rule here
+//! is for the row whose `head` is empty: every row a device keeps.
+//!
 //! The rule is in the statement that writes: a row is replaced only by a
 //! higher revision, whoever else is writing to the database. What became
 //! of an entry is read from what that statement did.
@@ -109,7 +116,7 @@ fn stored(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, 
                      (SELECT value + 1 FROM counters WHERE name = 'entry_seq'), ?9,
                      (SELECT COALESCE(MAX(channel_place), 0) + 1 FROM entries
                       WHERE channel_id = ?1))
-             ON CONFLICT(channel_id, slot, author) DO UPDATE SET
+             ON CONFLICT(channel_id, slot, author, head) DO UPDATE SET
                  rev = excluded.rev, is_delete = excluded.is_delete,
                  content = excluded.content, author_sig = excluded.author_sig,
                  channel_sig = excluded.channel_sig, seq = excluded.seq,
@@ -144,7 +151,8 @@ fn stored(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<Outcome, 
     // since: the statement took the database for writing.
     let held: i64 = conn
         .query_row(
-            "SELECT rev FROM entries WHERE channel_id = ?1 AND slot = ?2 AND author = ?3",
+            "SELECT rev FROM entries
+             WHERE channel_id = ?1 AND slot = ?2 AND author = ?3 AND head = x''",
             params![
                 entry.channel.as_slice(),
                 entry.slot.as_slice(),
@@ -475,8 +483,9 @@ pub fn channel_cost(conn: &Connection, channel: &[u8; 32]) -> Result<u64, Cordel
 }
 
 /// The entry that the store holds from one author in one slot of a
-/// channel, as it is stored: whoever is handed it checks it. `None` where
-/// it holds none from that author there.
+/// channel by the store's rule, as it is stored: whoever is handed it
+/// checks it. `None` where it holds none from that author there. A head
+/// that a relay keeps beside it ([`author_rows`]) is not this one.
 pub fn author_entry(
     conn: &Connection,
     channel: &[u8; 32],
@@ -486,7 +495,7 @@ pub fn author_entry(
     conn.query_row(
         &format!(
             "SELECT {ENTRY_COLUMNS} FROM entries
-             WHERE channel_id = ?1 AND slot = ?2 AND author = ?3"
+             WHERE channel_id = ?1 AND slot = ?2 AND author = ?3 AND head = x''"
         ),
         params![channel.as_slice(), slot.as_slice(), author.as_slice()],
         stored_entry_from_row,
@@ -496,9 +505,10 @@ pub fn author_entry(
 }
 
 /// The revision of the entry that the store holds from one author in one
-/// slot of a channel, and what that entry is counted at
-/// ([`cordelia_core::protocol::entry_cost`]): what an entry that replaces
-/// it gives back. `None` where it holds none from that author there.
+/// slot of a channel by the store's rule, and what that entry is counted
+/// at ([`cordelia_core::protocol::entry_cost`]): what an entry that
+/// replaces it gives back. `None` where it holds none from that author
+/// there.
 pub fn author_cost(
     conn: &Connection,
     channel: &[u8; 32],
@@ -507,7 +517,7 @@ pub fn author_cost(
 ) -> Result<Option<(u64, u64)>, CordeliaError> {
     conn.query_row(
         "SELECT rev, length(content) FROM entries
-         WHERE channel_id = ?1 AND slot = ?2 AND author = ?3",
+         WHERE channel_id = ?1 AND slot = ?2 AND author = ?3 AND head = x''",
         params![channel.as_slice(), slot.as_slice(), author.as_slice()],
         |row| {
             let rev = row.get::<_, i64>(0)?.max(0) as u64;
@@ -516,6 +526,136 @@ pub fn author_cost(
         },
     )
     .optional()
+    .map_err(storage)
+}
+
+/// A row that the store holds from one author in one slot of a channel:
+/// the entry, and the row's `head`, which is empty for the row kept by the
+/// store's rule and the entry's ID for a head that a relay keeps beside it
+/// (decision 2026-10-24 (removal), rule 14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorRow {
+    pub stored: StoredEntry,
+    pub head: Vec<u8>,
+}
+
+/// Every row that the store holds from one author in one slot of a
+/// channel, as it is stored, in the order they were stored. Whoever reads
+/// one checks it.
+pub fn author_rows(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Vec<AuthorRow>, CordeliaError> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {ENTRY_COLUMNS}, head FROM entries
+             WHERE channel_id = ?1 AND slot = ?2 AND author = ?3
+             ORDER BY seq ASC"
+        ))
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![channel.as_slice(), slot.as_slice(), author.as_slice()],
+            |row| {
+                Ok(AuthorRow {
+                    stored: stored_entry_from_row(row)?,
+                    head: row.get(11)?,
+                })
+            },
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Store `entry` as a head that a relay keeps beside the other rows of its
+/// author in its slot (decision 2026-10-24 (removal), rule 14), in a row
+/// whose `head` is the entry's ID. `now` is this node's time, in seconds.
+/// It takes the next place in this node's order and in its channel's own,
+/// as [`store`] does. Which heads are kept is the caller's to say: this
+/// stores, and replaces nothing. Refused where that very entry is held.
+pub fn store_head(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<(), CordeliaError> {
+    conn.execute_batch("SAVEPOINT store_head")
+        .map_err(storage)?;
+    let stored = conn
+        .execute(
+            "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                  author_sig, channel_sig, seq, stored_at, channel_place, head)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                     (SELECT value + 1 FROM counters WHERE name = 'entry_seq'), ?9,
+                     (SELECT COALESCE(MAX(channel_place), 0) + 1 FROM entries
+                      WHERE channel_id = ?1), ?10)",
+            params![
+                entry.channel.as_slice(),
+                entry.slot.as_slice(),
+                entry.author.as_slice(),
+                rev_to_sql(entry.rev),
+                entry.delete,
+                entry.content,
+                entry.author_signature.as_slice(),
+                entry.channel_signature.as_slice(),
+                now,
+                entry.id().as_slice(),
+            ],
+        )
+        .and_then(|_| {
+            conn.execute(
+                "UPDATE counters SET value = value + 1 WHERE name = 'entry_seq'",
+                [],
+            )
+        })
+        .map_err(storage);
+    let end = match stored {
+        Ok(_) => "RELEASE store_head",
+        Err(_) => "ROLLBACK TO store_head; RELEASE store_head",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    stored.map(|_| ())
+}
+
+/// Remove the row of one author in one slot of a channel whose `head` is
+/// `head`: empty for the row kept by the store's rule, an entry's ID for a
+/// head. Returns whether there was one.
+pub fn remove_author_row(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+    head: &[u8],
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "DELETE FROM entries WHERE channel_id = ?1 AND slot = ?2 AND author = ?3 AND head = ?4",
+        params![channel.as_slice(), slot.as_slice(), author.as_slice(), head],
+    )
+    .map(|removed| removed > 0)
+    .map_err(storage)
+}
+
+/// Give the row of one author in one slot of a channel whose `head` is
+/// `from` the `head` `to`, and nothing else of it: its places stay. A
+/// relay does this to a row kept by the store's rule whose entry carries a
+/// lineage, which it keeps as a head from then (decision 2026-10-24
+/// (removal), rule 14). Returns whether there was one.
+pub fn rekey_author_row(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+    (from, to): (&[u8], &[u8]),
+) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "UPDATE entries SET head = ?5
+         WHERE channel_id = ?1 AND slot = ?2 AND author = ?3 AND head = ?4",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            author.as_slice(),
+            from,
+            to
+        ],
+    )
+    .map(|changed| changed > 0)
     .map_err(storage)
 }
 

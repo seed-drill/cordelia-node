@@ -2619,11 +2619,11 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
 
 /// Two changes made apart, each clear. The device that is answered with
 /// the other sets it aside and goes on under its own (decision 2026-10-24
-/// (removal), rules 8 and 11), and has no leave at a relay that holds the
-/// other (a later slice gives leave from a head handed twice, rule 18).
-/// From then on it shows the one it follows in short, is told of the
-/// other, which it keeps, and asks no more: it does not show whole again,
-/// and the entry is not handed to it again.
+/// (removal), rules 8 and 11). The relay keeps both heads (rule 14), and
+/// hands the other whole once on the connection before it says that it
+/// holds the one shown (rule 16): from then the device shows the one it
+/// follows in short, is told that the relay holds it, and has leave. It
+/// does not show whole again, and the other is not handed to it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_no_more() {
     let relay = relay_started("relay", None);
@@ -2664,32 +2664,29 @@ async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_n
     other.passes().await;
     assert_eq!(other.counts("relay"), forked);
     other.clock.run_ahead(Duration::from_secs(4));
-    // From then on, pass after pass: one short show each, answered with
-    // word of the entry that it keeps. Nothing whole, and no stream of a
-    // channel. (A show in short that gets no leave costs little, and
-    // starts no wait.)
+    // From then on, pass after pass, in short: the relay keeps both, has
+    // handed the other whole once, and says that it holds the one shown.
+    // Nothing more whole, either way, and the device has leave.
     for _ in 0..4 {
         other.passes().await;
         other.sends().await;
     }
-    // A device that goes on asks for leave at its sends too: each asking
-    // is a short show, and gets none.
     let after = other.counts("relay");
     assert_eq!(after.whole_shows, forked.whole_shows);
-    let short = after.short_shows - forked.short_shows;
-    assert!((4..=8).contains(&short), "{short}");
-    assert_eq!(
-        (after.proofs, after.pages, after.pushes),
-        (forked.proofs, forked.pages, forked.pushes)
-    );
-    assert!(after.shown_bytes - forked.shown_bytes < short * 256);
-    assert_eq!(other.at("relay").holds_latest, Some(false));
-    // The relay holds the one it was shown first, and nothing that the
-    // other wrote under its own.
-    let held = held_at(&relay, &by_one.channel);
-    assert_eq!(held.len(), 1);
-    assert_eq!(held[0].id(), by_one.id());
-    assert!(!holds_at(&relay, &other.channel("notes"), &waiting.id()));
+    assert!(after.short_shows > forked.short_shows);
+    assert_eq!(other.has_leave("relay"), Ok(()));
+    assert_eq!(other.at("relay").holds_latest, Some(true));
+    // The relay keeps both heads, and what the other wrote under its own
+    // change, which is clear, reaches it.
+    let mut held: Vec<[u8; 32]> = held_at(&relay, &by_one.channel)
+        .iter()
+        .map(|entry| entry.id())
+        .collect();
+    held.sort();
+    let mut both = vec![by_one.id(), by_other.id()];
+    both.sort();
+    assert_eq!(held, both);
+    assert!(holds_at(&relay, &other.channel("notes"), &waiting.id()));
     assert_eq!(other.stands(), Stands::Applied);
 }
 
@@ -4122,7 +4119,9 @@ async fn a_relays_refusal_for_room_is_said_as_what_it_is() {
         .iter()
         .map(|held| cost(&held.entry))
         .sum();
-    let relay = relay_started("relay", Some(cost(&device.latest()) + applied));
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let relay = relay_started("relay", Some(2 * cost(&device.latest()) + applied));
     device.says_it_syncs("lab");
     device.connects("relay", &relay).await;
     // What `cordelia devices` says of the relay.
@@ -4203,7 +4202,9 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
         .iter()
         .map(|held| cost(&held.entry))
         .sum();
-    let room = cost(&device.latest()) + personal + cost(&fits);
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let room = 2 * cost(&device.latest()) + personal + cost(&fits);
     let relay = relay_started("relay", Some(room));
     device.connects("relay", &relay).await;
 
@@ -4276,7 +4277,9 @@ async fn a_delete_behind_an_entry_that_found_no_room_reaches_the_relay_and_the_e
         .map(|held| cost(&held.entry))
         .sum();
     let slack = 512;
-    let room = cost(&device.latest()) + personal + cost(&large) + slack;
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let room = 2 * cost(&device.latest()) + personal + cost(&large) + slack;
     let relay = relay_started("relay", Some(room));
     device.connects("relay", &relay).await;
 

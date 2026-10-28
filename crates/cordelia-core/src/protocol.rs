@@ -1474,6 +1474,19 @@ const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
 /// knows of removals too ([`MAX_KNOWN_REMOVED`]).
 pub const MAX_CHANGE_HEADS: usize = 8;
 
+/// The heads that a relay keeps room for in a slot whose entry carries a
+/// lineage, where it has the room (decision 2026-10-24 (removal), rule
+/// 15): from when it takes the first such entry there, it counts the slot
+/// at this many of that entry's size. So a second head made apart from the
+/// first, a removal among them, always has room, and a removed device that
+/// fills the relay with the old channels it holds cannot keep a removal
+/// out. The relay makes no room for it: where it has none, the share is
+/// not counted, and a second head is refused for room as any new entry is.
+pub const CHANGE_HEADS_ROOM: usize = 2;
+
+// Checked at compile time: the room kept is for heads that a relay keeps.
+const _: () = assert!(CHANGE_HEADS_ROOM >= 2 && CHANGE_HEADS_ROOM <= MAX_CHANGE_HEADS);
+
 /// The most keys a device keeps as removed (decision 2026-10-24
 /// (removal), rule 2): every key that a change it has seen and checked
 /// lists as removed, on any branch. They only grow. Past the bound the
@@ -3405,6 +3418,7 @@ mod tests {
         assert_eq!(MAX_KNOWN_REMOVED, 2_048);
         assert_eq!(MAX_KNOWN_REMOVED, MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS);
         assert_eq!(MAX_KNOWN_HOLDERS, 2_048);
+        assert_eq!(CHANGE_HEADS_ROOM, 2);
         // The holders of one change are never fewer than the records it
         // keeps of them, so the bound of records drops no holder first.
         const { assert!(MAX_KNOWN_HOLDERS > MAX_NOT_COUNTED_RECORDS + MAX_COUNTED_DEVICES) };

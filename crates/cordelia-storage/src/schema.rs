@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1116,6 +1116,63 @@ CREATE TABLE person_change_times (
 INSERT INTO node_meta (key, value) SELECT 'person.judge_kept', '1' FROM person;
 "#;
 
+/// Migration v23: a relay keeps every head (decision 2026-10-24
+/// (removal), rules 14 and 15).
+///
+/// - `entries` is made again, with a column `head`, which is part of its
+///   key in place of one row for each author in a slot. It is empty
+///   (`x''`) for a row kept by the store's rule, the newest revision of
+///   that author there, which is every row a device keeps and every row
+///   there is at the step; and the entry's ID for a row that a relay keeps
+///   as a head by its lineage, beside the others of that author in that
+///   slot. So a device keeps one row for each author in a slot, as before,
+///   and a relay up to `MAX_CHANGE_HEADS` heads more. Every row is carried
+///   as it was, with its places, and so are the two indexes of its orders.
+/// - `relay_head_rooms`: each slot of an author in which a relay counts
+///   room for `CHANGE_HEADS_ROOM` heads, from when it took the first entry
+///   with a lineage there, where it had the room. Empty at the step: a
+///   relay counts it from the next entry with a lineage it takes there.
+const MIGRATION_V23: &str = r#"
+DROP INDEX idx_entries_channel_seq;
+DROP INDEX idx_entries_channel_place;
+ALTER TABLE entries RENAME TO entries_22;
+
+CREATE TABLE entries (
+    channel_id     BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot           BLOB NOT NULL CHECK(length(slot) = 32),
+    author         BLOB NOT NULL CHECK(length(author) = 32),
+    rev            INTEGER NOT NULL CHECK(rev >= 1),
+    is_delete      INTEGER NOT NULL CHECK(is_delete IN (0, 1)),
+    content        BLOB NOT NULL,
+    author_sig     BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig    BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    seq            INTEGER NOT NULL,
+    stored_at      INTEGER NOT NULL,
+    channel_place  INTEGER NOT NULL DEFAULT 0,
+    head           BLOB NOT NULL DEFAULT x''
+                   CHECK(typeof(head) = 'blob' AND length(head) IN (0, 32)),
+    PRIMARY KEY (channel_id, slot, author, head)
+);
+
+INSERT INTO entries (channel_id, slot, author, rev, is_delete, content, author_sig,
+                     channel_sig, seq, stored_at, channel_place)
+SELECT channel_id, slot, author, rev, is_delete, content, author_sig, channel_sig, seq,
+       stored_at, channel_place
+FROM entries_22;
+
+DROP TABLE entries_22;
+
+CREATE UNIQUE INDEX idx_entries_channel_seq ON entries(channel_id, seq);
+CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_place);
+
+CREATE TABLE relay_head_rooms (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    author      BLOB NOT NULL CHECK(length(author) = 32),
+    PRIMARY KEY (channel_id, slot, author)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1341,6 +1398,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 22 {
         tracing::info!("applying migration v22 (the change entries a device keeps)");
         migrate_in_one(conn, MIGRATION_V22, 22)?;
+    }
+
+    if current < 23 {
+        tracing::info!("applying migration v23 (a relay keeps every head)");
+        migrate_in_one(conn, MIGRATION_V23, 23)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1935,6 +1997,7 @@ mod tests {
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
+                   AND name NOT LIKE '%relay_head_rooms%'
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
@@ -2136,6 +2199,32 @@ mod tests {
             held.extend(rows);
         }
         held
+    }
+
+    /// What a snapshot of a database holds, as it would be at version 22:
+    /// the step to version 23 makes the table of entries again with a
+    /// column more at its end, `head`, and adds a table of its own
+    /// (decision 2026-10-24 (removal), rules 14 and 15). Its rows are
+    /// compared without that column, its definition is read by itself
+    /// ([`definition_of`]), and what the step adds is left out, as each
+    /// step leaves out what later steps add. The step to version 23 has a
+    /// test of its own.
+    fn as_of_v22(held: Vec<String>) -> Vec<String> {
+        held.into_iter()
+            .filter(|row| !row.contains("relay_head_rooms"))
+            .map(|row| match row.strip_prefix("entries: ") {
+                Some(sql) if sql.starts_with("CREATE TABLE") => {
+                    "entries: (its definition, read by itself)".to_string()
+                }
+                Some(values)
+                    if values.ends_with(", Blob([])") && values.matches("Blob(").count() > 5 =>
+                {
+                    let cut = values.len() - ", Blob([])".len();
+                    format!("entries: {}", &values[..cut])
+                }
+                _ => row,
+            })
+            .collect()
     }
 
     /// How a table or an index is defined.
@@ -2395,7 +2484,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// What a database holds of the step to version 13, by name.
@@ -2506,6 +2595,9 @@ mod tests {
         // The step by itself, and then a start, which has no more to do
         // for it.
         migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
+        // What the step makes of the table of entries; a later step makes
+        // it again (step 23).
+        let entries_at_13 = definition_of(&conn, "entries");
         assert_eq!(version(&conn), 13);
         assert_eq!(held_before_v13(&conn), before);
         init_db(&conn).unwrap();
@@ -2532,7 +2624,7 @@ mod tests {
         );
         // The table of entries has that one column more, and is as it
         // was otherwise.
-        let entries_after = definition_of(&conn, "entries");
+        let entries_after = entries_at_13;
         assert!(!entries_before.contains("channel_place"));
         assert_eq!(
             entries_after.replace(", channel_place INTEGER NOT NULL DEFAULT 0", ""),
@@ -2617,7 +2709,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The two tables of what a device keeps of each relay are made in
@@ -2768,7 +2860,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The three tables of what a person typed, cleared and is to be told
@@ -2921,7 +3013,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The table of what a relay refused for room is made in one step
@@ -3392,7 +3484,7 @@ mod tests {
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// The step to version 20 adds the tables of a person's hold, empty,
@@ -3659,7 +3751,7 @@ mod tests {
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// The step to version 19 adds the tables of messages, empty, and
@@ -4791,7 +4883,7 @@ mod tests {
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// The step to version 21 adds what a device knows of removals,
@@ -4964,7 +5056,7 @@ mod tests {
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// A database at version 21, as the removal's first slice leaves one:
@@ -5017,7 +5109,6 @@ mod tests {
 
         let began = chrono::Utc::now().timestamp();
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 22);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v22(&conn), NEW_IN_V22);
         assert_eq!(everything_but_v22(&conn), before);
@@ -5120,6 +5211,137 @@ mod tests {
         conn.execute_batch(&entry("0", "10")).unwrap();
     }
 
+    /// The rows of the table of entries, with every column it had at
+    /// version 22, in the order they were stored; and the definitions of
+    /// its two indexes.
+    fn entries_as_at_v22(conn: &Connection) -> Vec<String> {
+        let mut held: Vec<String> = conn
+            .prepare(
+                "SELECT hex(channel_id) || hex(slot) || hex(author) || rev || is_delete
+                     || hex(content) || hex(author_sig) || hex(channel_sig) || seq
+                     || stored_at || channel_place
+                 FROM entries ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        held.push(definition_of(conn, "idx_entries_channel_seq"));
+        held.push(definition_of(conn, "idx_entries_channel_place"));
+        held
+    }
+
+    /// The step to version 23 makes the table of entries again, with a
+    /// column `head` in its key (decision 2026-10-24 (removal), rule 14),
+    /// and adds the table of the room a relay keeps for heads (rule 15),
+    /// empty. Every row is carried as it was, with its places and an empty
+    /// `head`, and so are the two indexes of its orders; nothing else
+    /// changes. It is made in one step with its version, so a failure
+    /// between them leaves none of it, and asked for twice it is run once.
+    /// After it, an author has one row in a slot by the store's rule, and a
+    /// row more for each head, named by an ID.
+    #[test]
+    fn step_23_keeps_a_row_for_each_head_and_carries_every_entry() {
+        let conn = at_v21();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has_rooms = |conn: &Connection| {
+            conn.prepare("SELECT COUNT(*) FROM relay_head_rooms")
+                .is_ok()
+        };
+        let before = everything_but_v22(&conn);
+        let entries_before = entries_as_at_v22(&conn);
+        let definition_before = definition_of(&conn, "entries");
+        assert!(entries_before.len() > 2, "{entries_before:?}");
+        assert!(!definition_before.contains("head"));
+
+        let failing = format!("{MIGRATION_V23} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 23).is_err());
+        assert_eq!(version(&conn), 22);
+        assert!(!has_rooms(&conn), "the step goes with the version");
+        assert_eq!(definition_of(&conn, "entries"), definition_before);
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 23);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(everything_but_v22(&conn), before);
+        assert_eq!(entries_as_at_v22(&conn), entries_before);
+        let definition = definition_of(&conn, "entries");
+        assert!(definition.contains("PRIMARY KEY (channel_id, slot, author, head)"));
+        let (empty, rooms): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries WHERE head = x''),
+                        (SELECT COUNT(*) FROM relay_head_rooms)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((empty as usize, rooms), (entries_before.len() - 2, 0));
+        // The autoindex of the key is the table's own, by its name.
+        let autoindex: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('sqlite_autoindex_entries_1', 'sqlite_autoindex_entries_22_1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(autoindex, 1);
+
+        // Asked for again: nothing more.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        assert_eq!(entries_as_at_v22(&conn), entries_before);
+
+        // One row by the store's rule for an author in a slot, and a row
+        // more for each head, named by 32 bytes; nothing else.
+        let row = |head: &str, seq: i64, place: i64| {
+            format!(
+                "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                      author_sig, channel_sig, seq, stored_at, channel_place,
+                                      head)
+                 VALUES (X'{c}', X'{c}', X'{c}', 3, 0, X'03', zeroblob(64), zeroblob(64),
+                         {seq}, 9, {place}, {head})",
+                c = "AB".repeat(32)
+            )
+        };
+        conn.execute_batch(&row("x''", 9001, 1)).unwrap();
+        assert!(conn.execute_batch(&row("x''", 9002, 2)).is_err());
+        conn.execute_batch(&row("zeroblob(32)", 9003, 3)).unwrap();
+        conn.execute_batch(&row(&format!("X'{}'", "01".repeat(32)), 9004, 4))
+            .unwrap();
+        assert!(conn.execute_batch(&row("zeroblob(32)", 9005, 5)).is_err());
+        assert!(conn.execute_batch(&row("zeroblob(31)", 9006, 6)).is_err());
+        assert!(conn.execute_batch(&row("'text'", 9007, 7)).is_err());
+    }
+
+    /// The version before, whose schema is at step 22, stops on a database
+    /// that was stepped to 23, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_23() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 22);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion { found: 23, own: 22 })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
     /// The version before, whose schema is at step 21, stops on a database
     /// that was stepped to 22, as every version stops on one from a later
     /// version: it is refused with both versions, and nothing of it is
@@ -5135,7 +5357,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 22, own: 21 })
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 21
+                })
             ),
             "{refused:?}"
         );
