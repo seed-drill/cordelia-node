@@ -350,6 +350,9 @@ pub fn pushed(
                 }
             };
             rows::answered(conn, usable.id, relay, &entry.slot, entry.rev, answer)?;
+            // A message of the device's own: sent again, or taken by every
+            // relay of its card (decision 2026-10-10 §6.1).
+            crate::shared_sender::answered(conn, usable.id, entry, answer)?;
         }
         Ok(refused)
     })

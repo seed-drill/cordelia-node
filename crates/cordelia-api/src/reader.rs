@@ -67,6 +67,9 @@ pub enum Read {
     /// The signer's list of the bounds a person set on it (decision
     /// 2026-10-25, rule 2).
     Bounds,
+    /// The signer's list of the shared messages its agents read and sent
+    /// (decision 2026-10-10 §6.1).
+    SharedList,
     /// An entry at a number that is not live: never opened, and counted
     /// as overwritten where it is a message.
     Overwritten,
@@ -113,9 +116,11 @@ pub fn taken(
 
     let is_person_list = entry.slot == slot_id(&slot_key, &message::person_name(&signer)?);
     let is_bounds = entry.slot == slot_id(&slot_key, &message::hold_name(&signer)?);
+    // The list of shared marks (decision 2026-10-10 §6.1) is a list too.
     let is_list = is_person_list
         || is_bounds
-        || entry.slot == slot_id(&slot_key, &message::read_name(&signer)?);
+        || entry.slot == slot_id(&slot_key, &message::read_name(&signer)?)
+        || entry.slot == slot_id(&slot_key, &message::sread_name(&signer)?);
     let number = message::number_of(entry.rev);
     let in_its_slot = !is_list
         && message::message_rev(number).is_some()
@@ -194,6 +199,13 @@ pub fn taken(
             crate::bounds::list_taken(conn, own, &signer, &list, now)?;
             Ok(Read::Bounds)
         }
+        // A list of shared marks is its device's latest, or the device's
+        // own from its later life (decision 2026-10-10 §6.1): kept apart
+        // from the `read/` list.
+        Ok(InTheRing::SharedList(list)) => {
+            crate::shared_messages::list_taken(conn, own, &signer, &list.marks, now)?;
+            Ok(Read::SharedList)
+        }
         Err(why) => {
             if bounds_of_form_4 {
                 crate::bounds::no_list(conn, own, &signer)?;
@@ -264,6 +276,59 @@ pub fn read_held_lists(
         conn.execute("UPDATE message_signers SET not_messages = 0", [])
             .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
         meta::set(conn, meta::MESSAGES_LISTS_READ, &now.to_string())?;
+        Ok(true)
+    })
+}
+
+/// Read once, after the schema's step 25, the `sread/` lists that the store
+/// held from before it (decision 2026-10-10 §14, "lists stored before the
+/// upgrade"), as [`read_held_lists`] reads the lists of step 20: where the
+/// device stands applied, the entry its store holds in `sread/<key>` of
+/// each key that counts is read through the reader, as though the store had
+/// just kept it, with the time the store kept it as its first holding; each
+/// signer's count of entries that were not messages is set to 0; and the
+/// key of `node_meta` that says it was done is written: all three in one
+/// transaction, at `now`. Where the device does not stand applied, nothing
+/// is done, and it is done at a later call once it does. Returns whether it
+/// was done now.
+pub fn read_held_shared_lists(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<bool, PersonError> {
+    use cordelia_storage::entries;
+    use cordelia_storage::meta;
+    let not_yet = |conn: &Connection| -> Result<bool, PersonError> {
+        Ok(meta::get(conn, meta::MESSAGES_SREAD_LISTS_READ)?.is_none()
+            && crate::at_relays::stands(conn)? == crate::at_relays::Stands::Applied)
+    };
+    if !not_yet(conn)? {
+        return Ok(false);
+    }
+    in_one(conn, || {
+        if !not_yet(conn)? {
+            return Ok(false);
+        }
+        let Some(person) = crate::person::held(conn)? else {
+            return Ok(false);
+        };
+        let statement = &person.statement.statement;
+        let secret = crate::person::applied_secret(conn, statement)?;
+        let messages = derive::messages_secret(&secret)?;
+        let channel = derive::channel_id(&messages)?;
+        let slot_key = derive::slot_key(&messages)?;
+        let own = identity.public_key();
+        for key in crate::person::who_counts(conn)?.keys() {
+            let slot = slot_id(&slot_key, &message::sread_name(&key)?);
+            let Some(stored) = entries::author_entry(conn, &channel, &slot, &key)? else {
+                continue;
+            };
+            let entry = stored.entry.check()?;
+            taken(conn, &own, &secret, statement, &entry, stored.stored_at)?;
+        }
+        conn.execute("UPDATE message_signers SET not_messages = 0", [])
+            .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
+        meta::set(conn, meta::MESSAGES_SREAD_LISTS_READ, &now.to_string())?;
         Ok(true)
     })
 }
@@ -343,6 +408,9 @@ pub fn hourly(
     };
     if let Err(e) = in_one(conn, || crate::marks::hourly(conn, now)) {
         tracing::warn!(error = %e, "could not keep this device's marks");
+    }
+    if let Err(e) = in_one(conn, || crate::shared_messages::hourly(conn, now)) {
+        tracing::warn!(error = %e, "could not keep this device's shared marks");
     }
     // The shared channels' part (decision 2026-10-10 §6.3), in writes of
     // its own: an error there takes back nothing of the rest.

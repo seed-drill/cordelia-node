@@ -231,6 +231,7 @@ fn secret_of(row: &Channel) -> Result<[u8; 32], PersonError> {
 /// its table of shared channels (rule 1), and nothing was done with it.
 pub(crate) fn taken_as_shared(
     conn: &Connection,
+    own: &[u8; 32],
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Option<Taken>, PersonError> {
@@ -326,6 +327,9 @@ pub(crate) fn taken_as_shared(
     if stored != Outcome::Stored {
         return Ok(Some(Taken::Shared { stored, read: None }));
     }
+    // The device's own entry from its later life over a message that not
+    // every relay took: that message is sent again (§6.1).
+    crate::shared_sender::taken_over(conn, own, row.id, &slot_key, entry)?;
     let replaced = held_there.map_or(0, |(_, cost)| cost);
     let more = i64::try_from(entry_cost(entry.content.len())).unwrap_or(i64::MAX)
         - i64::try_from(replaced).unwrap_or(i64::MAX);
@@ -437,6 +441,9 @@ pub fn keep(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonErr
             keep_known(conn, &knows, &row, now)?;
             open_shown(conn, &knows, &row, now)?;
         }
+        // Each subscription starts when this device first takes it
+        // (decision 2026-10-10 §4.1).
+        crate::shared_messages::keep_starts(conn, now)?;
         Ok(())
     })
 }
@@ -2687,6 +2694,7 @@ pub(crate) mod tests {
         assert!(
             crate::shared::taken_as_shared(
                 &s[0].conn,
+                &s.key(0),
                 &message(&member(1), &channel, 9, "late", now),
                 now
             )
@@ -2812,7 +2820,11 @@ pub(crate) mod tests {
         assert!(matches!(made, Done::Made(_)));
         assert_eq!(row(&s, 0, &channel).state, State::Dropped);
         let late = message(&member(1), &channel, 2, "two", now + 2);
-        assert!(taken_as_shared(conn, &late, now + 2).unwrap().is_none());
+        assert!(
+            taken_as_shared(conn, &s.key(0), &late, now + 2)
+                .unwrap()
+                .is_none()
+        );
         take_out_all(conn, &s.key(0), now + 3).unwrap();
         assert_eq!(row(&s, 0, &channel).state, State::Held);
         assert!(s[0].stored_in(&channel.secret).is_empty());

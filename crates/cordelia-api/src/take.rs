@@ -203,7 +203,7 @@ pub fn take(
             Some(taken) => Some(taken),
             // Of no channel of the person's own: perhaps of a shared
             // channel, in the same transaction (decision 2026-10-10 §2.3).
-            None => crate::shared::taken_as_shared(conn, entry, now)?,
+            None => crate::shared::taken_as_shared(conn, &identity.public_key(), entry, now)?,
         };
         // Who the person knows may have changed: a statement applied, or a
         // key that came to count. The shared channels follow it (§6.3).

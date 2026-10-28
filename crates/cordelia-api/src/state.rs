@@ -771,6 +771,23 @@ impl OwnChannels {
         from_each || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
     }
 
+    /// Whether the shared channel whose ID is `channel` was fetched since the
+    /// node started, at `now` (decision 2026-10-10 §6.1, `not_fetched`):
+    /// pulled to its end from each of the `reached` relays of its card that
+    /// are, by key, the device's own, or from one, and the wait for the
+    /// others has gone by since. A device writes nothing in a shared channel
+    /// before then. No where it reaches none of them.
+    pub fn shared_fetch_done(&self, channel: &[u8; 32], reached: usize, now: Instant) -> bool {
+        if reached == 0 {
+            return false;
+        }
+        let fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(of) = fetched.get(channel) else {
+            return false;
+        };
+        of.from.len() >= reached || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
+    }
+
     /// The node says whether the messages channel has no place among the
     /// proofs of one connection (decision 2026-10-09 §2.1): it would be
     /// proved past what a relay remembers for one, and is not proved.

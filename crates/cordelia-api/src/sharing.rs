@@ -124,7 +124,7 @@ fn all_own(relays: &[OwnRelay], card: &Card) -> bool {
 
 /// Whether any relay of `card` is, by key, one of `relays`: the channel is
 /// reached from this device (§8.3).
-fn any_own(relays: &[OwnRelay], card: &Card) -> bool {
+pub(crate) fn any_own(relays: &[OwnRelay], card: &Card) -> bool {
     card.relays()
         .keys()
         .iter()
@@ -170,7 +170,7 @@ impl From<cordelia_crypto::CryptoError> for Failed {
 /// What a step gives, or why nothing was done.
 pub type Out<T> = Result<T, Failed>;
 
-fn refused<T>(word: &'static str, line: String) -> Out<T> {
+pub(crate) fn refused<T>(word: &'static str, line: String) -> Out<T> {
     Err(Failed::Refused(Refusal { word, line }))
 }
 
@@ -204,7 +204,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
 /// The device stands applied under the latest statement it has seen, with
 /// sync on (§5.5, the second row): the messages record's lines, said of a
 /// shared channel. What it holds of its person, where it does.
-fn standing(conn: &Connection) -> Out<Held> {
+pub(crate) fn standing(conn: &Connection) -> Out<Held> {
     match may_open(conn)? {
         Ok(()) => {}
         Err(NotUsable::SyncOff) => {
@@ -253,7 +253,10 @@ fn key_typed(typed: &str) -> Out<[u8; 32]> {
 
 /// The label the person gave `key` in shared channels, where it has one
 /// in force (§3.4).
-fn label_given(conn: &Connection, key: &[u8; 32]) -> Result<Option<String>, PersonError> {
+pub(crate) fn label_given(
+    conn: &Connection,
+    key: &[u8; 32],
+) -> Result<Option<String>, PersonError> {
     Ok(lists::holds(conn)?
         .labels
         .into_iter()
@@ -283,7 +286,7 @@ fn label_to_undo(
 }
 
 /// A label as it is shown: cleaned, and quoted.
-fn quoted(label: &str) -> String {
+pub(crate) fn quoted(label: &str) -> String {
     format!("{:?}", crate::messages::cleaned(label))
 }
 
@@ -405,7 +408,7 @@ pub fn channel_words(channel: &[u8; 32]) -> String {
 /// With `past`, this device's key and the time, a filing that a bound
 /// leaves out is found too: a rename and a drop act on it (§3.4), and
 /// `share` does not, since its channel is not held.
-fn find(
+pub(crate) fn find(
     conn: &Connection,
     name: &str,
     words: Option<&str>,
@@ -544,7 +547,13 @@ fn act_refused(conn: &Connection, held: &Held, own: &[u8; 32], why: Refused) -> 
 }
 
 /// Do `what` in the person's list, or refuse as §5.5 says.
-fn act(conn: &Connection, identity: &NodeIdentity, held: &Held, what: Do, now: i64) -> Out<()> {
+pub(crate) fn act(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    held: &Held,
+    what: Do,
+    now: i64,
+) -> Out<()> {
     match lists::act(conn, identity, what, now)? {
         Done::Made(_) => Ok(()),
         Done::Refused(why) => act_refused(conn, held, &identity.public_key(), why),
@@ -1654,11 +1663,21 @@ pub fn list(
         .into_iter()
         .map(|filing| filing.name)
         .collect();
+    // Each subscription in force, by its agent and the channel's name, for
+    // `cordelia sync status` (§5.1).
+    let subscriptions: Vec<serde_json::Value> = crate::shared_messages::in_force(conn)?
+        .into_iter()
+        .filter_map(|(channel, agent)| {
+            let filing = filings.iter().find(|filing| filing.channel == channel)?;
+            Some(json!({ "agent": agent, "channel": filing.name }))
+        })
+        .collect();
     Ok(json!({
         "channels": channels,
         "typed": typed,
         "shares": shares,
         "past_a_bound": past,
+        "subscriptions": subscriptions,
     }))
 }
 

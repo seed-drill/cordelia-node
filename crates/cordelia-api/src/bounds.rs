@@ -630,7 +630,7 @@ mod tests {
     use cordelia_crypto::slots::slot_id;
     use cordelia_storage::entries;
 
-    use crate::sender::{At, NotSent, Request, no_reply, send};
+    use crate::sender::{Address, At, NotSent, Request, no_reply, send};
     use crate::several::Several;
     use crate::take::take;
 
@@ -747,10 +747,12 @@ mod tests {
             no_place: false,
             mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+            shared_fetched: false,
+            shared_reached: false,
         };
         let request = Request {
             from: from.into(),
-            to: To::Name(to.into()),
+            address: Address::Own(To::Name(to.into())),
             asks: false,
             link: None,
             body: format!("from {from} at {now}"),
