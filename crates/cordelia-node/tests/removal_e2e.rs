@@ -684,11 +684,11 @@ fn lists_together(f: &mut Fault) {
 ///
 /// It asserts (a), (b), (e) and (f) of test 1: the laptop, which reaches
 /// relay A alone, follows the desktop's change; the tablet reads that it
-/// was removed; and nothing that the laptop signs from then is in a
+/// was removed; and nothing that the laptop signs after (a) is in a
 /// channel but the desktop's change 3's, at either relay. What either
-/// relay held of the laptop's own change 3 before the two were listed
-/// together, the other may take from it: (e) and (f) are of what neither
-/// held then.
+/// relay held of the laptop's own change 3 by then, the other may take
+/// from it: (e) and (f) are of what neither held at (a), and a push
+/// already on its way at (a) has its ten seconds first (rule 5).
 ///
 /// Taken out: rule 14 (relay A does not keep the desktop's change beside
 /// the laptop's: (a) times out). Rule 17 taken out alone is not caught
@@ -701,16 +701,22 @@ fn relays_that_work_together_spread_a_removal_made_apart() {
     let mut f = the_fault(1);
     let own_secret = f.own_secrets[0];
     let laptop_key = key_bytes(&f.laptop);
-    let held_before: HashSet<Vec<u8>> = signed_at(&f.relay_a, &laptop_key)
-        .into_iter()
-        .chain(signed_at(&f.relay_b, &laptop_key))
-        .map(|(signature, _, _)| signature)
-        .collect();
     lists_together(&mut f);
 
     // (a), and relay A holds the desktop's change, which it was passed.
     let moved_to = follows_the_removal(&f, 180);
     assert!(holds_change(&f.relay_a, &f.removal));
+    // Until it read the removal the laptop could send under its own change
+    // 3 (section 8's window), and a push already on its way has its ten
+    // seconds (rule 5; its reset is slice 7's). What either relay holds of
+    // the laptop's then, the other may take from it: (e) and (f) are of
+    // what neither held then.
+    std::thread::sleep(Duration::from_secs(12));
+    let held_before: HashSet<Vec<u8>> = signed_at(&f.relay_a, &laptop_key)
+        .into_iter()
+        .chain(signed_at(&f.relay_b, &laptop_key))
+        .map(|(signature, _, _)| signature)
+        .collect();
     let marks = (
         last_stored_by(&f.relay_a, &laptop_key),
         last_stored_by(&f.relay_b, &laptop_key),
