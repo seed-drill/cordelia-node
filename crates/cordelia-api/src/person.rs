@@ -1717,9 +1717,20 @@ fn moved_says(
             }
         }
     }
+    // A holder whose record the bound dropped, or that a device stepped to
+    // this version kept apart: named by what the device called it, if
+    // anything (rule 3).
+    if listed.is_none() && held_by.is_none() {
+        let link = leaving.link()?;
+        held_by = held_rows::holders(conn, link.number, &link.hash)?
+            .into_iter()
+            .find(|key| removed.contains(key))
+            .map(|key| (key, label_of(&key, ""), false));
+    }
     let Some((key, label, is_listed)) = listed.or(held_by) else {
         return Ok(format!(
-            "a change made apart on {} is clear of every removed device, and this change is              not: this device follows that change now",
+            "a change made apart on {} is clear of every removed device, and this change is \
+             not: this device follows that change now",
             lists_of(to)?.made_on.named()
         ));
     };
@@ -8892,6 +8903,9 @@ mod tests {
     /// their bound. R, made apart, lists 0, 1 and 3 and removes 5: the
     /// device moves to it. S, made apart, lists 1 and removes 3, so R is
     /// not clear: A is no change to move to, and the device is closed.
+    /// What a command that waits after A says names the removed key that A
+    /// hands its secret to, by a record or as a holder alone, and says in
+    /// one sentence where it names none.
     #[test]
     fn test_no_move_goes_back_to_a_change_that_was_not_clear() {
         let phrase = phrase();
@@ -8904,7 +8918,12 @@ mod tests {
             .next(key(1), &secret(15), listed(&[1]), &[key(3)])
             .unwrap();
         let a_hash = a.hash().unwrap();
-        for case in ["record", "record kept alone", "past the bound"] {
+        for case in [
+            "record",
+            "record kept alone",
+            "holder alone",
+            "past the bound",
+        ] {
             let conn = db::open_in_memory().unwrap();
             let a_entry = follow(&conn, 0, &phrase, &a, secret(13));
             match case {
@@ -8924,6 +8943,11 @@ mod tests {
                         NOW,
                     )
                     .unwrap();
+                }
+                "holder alone" => {
+                    // Its record dropped by the bound of 256: the key is
+                    // kept as a holder alone.
+                    held_rows::keep_holder(&conn, 3, &a_hash, &key(5)).unwrap();
                 }
                 _ => {
                     for n in 0..=MAX_KNOWN_HOLDERS as u32 {
@@ -8946,6 +8970,28 @@ mod tests {
                 !is_clear(&conn, &a, false).unwrap(),
                 "{case}: the change left reads as clear"
             );
+            // What a command that waits after A says: the removed key that
+            // A hands its secret to, by a record or as a holder alone.
+            let says = &moves_made(&conn).unwrap()[0].says;
+            assert!(!says.contains("  "), "{case}: {says}");
+            if case == "past the bound" {
+                assert!(
+                    says.ends_with(
+                        "is clear of every removed device, and this change is not: this \
+                         device follows that change now"
+                    ),
+                    "{case}: {says}"
+                );
+            } else {
+                assert!(
+                    says.contains(" removed ")
+                        && says.ends_with(
+                            ", to which this change hands its secret: this device follows \
+                             that change now"
+                        ),
+                    "{case}: {says}"
+                );
+            }
 
             let to_s = change(&phrase, &s, secret(15));
             assert_eq!(
