@@ -252,3 +252,239 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
     );
     assert!(last_stored_by(&relay, &laptop_key) > closed_at);
 }
+
+// ── Slice 5: a move (rule 9) ─────────────────────────────────────────
+
+/// The secret of the change that `node` follows, as its database holds it.
+fn applied_secret_of(node: &Node) -> [u8; 32] {
+    store_of(node)
+        .query_row(
+            "SELECT secret FROM person_secrets WHERE left_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Every secret that `node`'s database holds of its person: the one it
+/// follows, and those it left and keeps.
+fn secrets_of(node: &Node) -> Vec<[u8; 32]> {
+    let db = store_of(node);
+    let mut stmt = db.prepare("SELECT secret FROM person_secrets").unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The channels of the generation of `secret` that a device of this test
+/// writes in: the personal channel, the messages channel, and the channel
+/// of the name `lab`.
+fn channels_of(secret: &[u8; 32]) -> Vec<[u8; 32]> {
+    [
+        derive::personal_secret(secret).unwrap(),
+        derive::messages_secret(secret).unwrap(),
+        derive::own_secret(secret, "lab").unwrap(),
+    ]
+    .iter()
+    .map(|channel| derive::channel_id(channel).unwrap())
+    .collect()
+}
+
+/// The channel of each entry in `relay`'s store that the key `author`
+/// signed, stored after the place `after`.
+fn channels_stored_by(relay: &Node, author: &[u8; 32], after: i64) -> Vec<[u8; 32]> {
+    let db = store_of(relay);
+    let mut stmt = db
+        .prepare("SELECT channel_id FROM entries WHERE author = ?1 AND seq > ?2")
+        .unwrap();
+    stmt.query_map(rusqlite::params![author.as_slice(), after], |row| {
+        row.get(0)
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// Set `node` up with the relay at `to` in place of the one at `from`, and
+/// start it again.
+fn moves_relay(node: &mut Node, from: &Node, to: &Node) {
+    node.stop();
+    let config = std::fs::read_to_string(node.config()).unwrap();
+    let (was, is) = (
+        format!("127.0.0.1:{}", from.p2p),
+        format!("127.0.0.1:{}", to.p2p),
+    );
+    assert!(config.contains(&was), "{config}");
+    std::fs::write(node.config(), config.replace(&was, &is)).unwrap();
+    node.start();
+    wait_for("the device reaches its relay", &[node, to], 60, || {
+        has_hot_peer(node)
+    });
+}
+
+/// Test 1 of decision 2026-10-24 (removal), section 7, but its point (b),
+/// which needs relays that keep every head (slice 6): the fault, kept for
+/// good. The laptop and the tablet use relay A; the desktop uses relay B;
+/// the relays are not listed together; all three are on change 2. The
+/// desktop removes the tablet (its change 3). The laptop renews (its own
+/// change 3, made apart, which lists the tablet). The tablet applies the laptop's change. The laptop
+/// is then set up with relay B too, and started again.
+///
+/// It asserts:
+///
+/// - (a) the laptop follows the desktop's change 3, by its ID, with its
+///   own set aside, and no phrase was typed (rules 8 and 9);
+/// - (c) the desktop's state is applied at every look through the test,
+///   and it never says that two changes were made apart (rule 11);
+/// - (d) a file that the laptop edits after (a) reaches the desktop;
+/// - (e) every entry that the laptop pushed to either relay after (a) is
+///   in a channel of the desktop's change 3, and none is in a channel of
+///   any secret that the tablet's database holds;
+/// - (f) no entry that the laptop signed reaches either relay in a channel
+///   of its own change 3 after (a): at relay B, none ever.
+///
+/// Taken out: rule 9 (the laptop is closed: (a) and (d) fail); rule 4 or
+/// 5 (it goes on under its own change: (e) and (f) fail); rule 11 (the
+/// desktop stops: (c) fails).
+#[test]
+fn a_removal_made_apart_from_a_renewal_takes_effect_without_settle() {
+    let relay_a = relay_started();
+    let relay_b = relay_started();
+    let mut laptop = device_started("laptop", &relay_a);
+    let mut desktop = device_started("desktop", &relay_a);
+    let tablet = device_started("tablet", &relay_a);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    adds(&laptop, &tablet, "tablet");
+    let (l_notes, l_mem) = notes_of(&laptop);
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(l_mem.join("first.md"), "what both hold\n").unwrap();
+    syncs_lab(&laptop, &l_notes);
+    syncs_lab(&desktop, &d_notes);
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet];
+    wait_for("the desktop has the laptop's file", &all, 120, || {
+        (read(&d_mem.join("first.md"))?.as_str() == "what both hold\n").then_some(())
+    });
+    // All three on change 2, which lists each.
+    let mut at = renews(&laptop, &["stays", "stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    has_applied(&desktop, 2, &all);
+    has_applied(&tablet, 2, &all);
+
+    // The desktop uses relay B alone from here.
+    moves_relay(&mut desktop, &relay_a, &relay_b);
+    let desktop_applied = |desktop: &Node| {
+        let seen = person_of(desktop);
+        assert_eq!(seen["state"], "applied", "(c): {seen}");
+        assert_eq!(
+            seen["set_aside"].as_array().map(Vec::len),
+            Some(0),
+            "(c): {seen}"
+        );
+        let status = desktop.cli(&["status"]);
+        assert!(!status.contains("made apart"), "(c): {status}");
+    };
+    desktop_applied(&desktop);
+
+    // The desktop removes the tablet: its change 3, through relay B.
+    let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
+    desktop_applied(&desktop);
+
+    // The laptop, which reaches relay A alone, renews: its own change 3,
+    // made apart, which lists the tablet. The tablet applies it.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let own_change = person_of(&laptop)["latest"].as_str().unwrap().to_string();
+    assert_ne!(own_change, removal);
+    let own_secret = applied_secret_of(&laptop);
+    has_applied(
+        &tablet,
+        3,
+        &[&relay_a, &relay_b, &laptop, &desktop, &tablet],
+    );
+    assert_eq!(
+        person_of(&tablet)["latest"].as_str(),
+        Some(own_change.as_str())
+    );
+    desktop_applied(&desktop);
+
+    // The laptop is set up with relay B too, and started again.
+    laptop.stop();
+    laptop.add_relay(&format!("127.0.0.1:{}", relay_b.p2p), None);
+    laptop.start();
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+
+    // (a) It follows the desktop's change, by its ID, with its own set
+    // aside: no phrase was typed.
+    wait_for("the laptop follows the desktop's change", &all, 180, || {
+        let seen = person_of(&laptop);
+        (seen["latest"].as_str() == Some(removal.as_str())).then_some(())
+    });
+    let laptop_key = key_bytes(&laptop);
+    let marks = (
+        last_stored_by(&relay_a, &laptop_key),
+        last_stored_by(&relay_b, &laptop_key),
+    );
+    let seen = person_of(&laptop);
+    assert_eq!(seen["state"], "applied", "{seen}");
+    assert_eq!(seen["change"].as_u64(), Some(3), "{seen}");
+    let set_aside = seen["set_aside"].as_array().cloned().unwrap_or_default();
+    assert_eq!(set_aside.len(), 1, "{seen}");
+    assert_eq!(set_aside[0]["clear"], false, "{seen}");
+    let moved_to = applied_secret_of(&laptop);
+    assert_eq!(moved_to, applied_secret_of(&desktop));
+    desktop_applied(&desktop);
+
+    // (d) A file that the laptop edits now reaches the desktop.
+    std::fs::write(l_mem.join("after.md"), "written after the move\n").unwrap();
+    wait_for(
+        "the desktop has the file written after the move",
+        &all,
+        180,
+        || (read(&d_mem.join("after.md"))?.as_str() == "written after the move\n").then_some(()),
+    );
+    desktop_applied(&desktop);
+    // A few passes more, for whatever the laptop has still to send.
+    std::thread::sleep(Duration::from_secs(15));
+
+    // (e) Every entry it pushed after (a) is in a channel of the desktop's
+    // change 3, and none in a channel of the tablet's secrets.
+    let desktop_channels = channels_of(&moved_to);
+    let tablet_channels: Vec<[u8; 32]> = secrets_of(&tablet).iter().flat_map(channels_of).collect();
+    let own_channels = channels_of(&own_secret);
+    let pushed_a = channels_stored_by(&relay_a, &laptop_key, marks.0);
+    let pushed_b = channels_stored_by(&relay_b, &laptop_key, marks.1);
+    assert!(!pushed_b.is_empty(), "the laptop pushed nothing to relay B");
+    for channel in pushed_a.iter().chain(&pushed_b) {
+        assert!(
+            desktop_channels.contains(channel),
+            "(e): {}",
+            hex::encode(channel)
+        );
+        assert!(
+            !tablet_channels.contains(channel),
+            "(e): {}",
+            hex::encode(channel)
+        );
+    }
+    // (f) None in a channel of its own change 3 after (a), at either
+    // relay; at relay B, none ever.
+    for channel in pushed_a
+        .iter()
+        .chain(&channels_stored_by(&relay_b, &laptop_key, 0))
+    {
+        assert!(
+            !own_channels.contains(channel),
+            "(f): {}",
+            hex::encode(channel)
+        );
+    }
+    desktop_applied(&desktop);
+}
