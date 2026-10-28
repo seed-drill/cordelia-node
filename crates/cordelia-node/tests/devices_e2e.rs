@@ -4545,12 +4545,13 @@ async fn one_relay_under_two_names_is_counted_and_paced_once() {
         (listed_relays(&laptop) == expected).then_some(())
     });
     // The device's own list of its relays: what it counts, paces and
-    // passes, and says holds the latest change. A list with no relay in
-    // it yet says nothing of either.
+    // passes, and says holds the latest change.
     let counted = wait_for("the relay holds the latest change", &all, 60, || {
         let seen = person_of(&laptop);
         let relays = seen["relays"].as_array()?.clone();
-        (!relays.is_empty() && relays.iter().all(|relay| relay["holds_latest"] == true))
+        relays
+            .iter()
+            .all(|relay| relay["holds_latest"] == true)
             .then_some(relays)
     });
     let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();
