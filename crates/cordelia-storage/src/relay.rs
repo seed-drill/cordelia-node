@@ -911,9 +911,11 @@ fn taken(
             entries::rekey_author_row(conn, channel, slot, author, (&[], &kept.id))?;
         }
     }
-    for &at in &replaced {
-        entries::remove_author_row(conn, channel, slot, author, &kept[at].row)?;
-    }
+    // Stored first, and what it replaces removed after: an entry takes the
+    // place above the highest its channel has, the rows it replaces among
+    // them, so that no place is given twice in a holding (decision
+    // 2026-10-04 §2.4 item 3). An entry with no lineage replaces the row
+    // kept by the store's rule in the store's own write.
     match &lineage {
         Some(_) => entries::store_head(conn, entry, now)?,
         None => {
@@ -923,6 +925,12 @@ fn taken(
                 ));
             }
         }
+    }
+    for &at in &replaced {
+        if lineage.is_none() && kept[at].row.is_empty() {
+            continue;
+        }
+        entries::remove_author_row(conn, channel, slot, author, &kept[at].row)?;
     }
     if counts_room {
         conn.execute(
@@ -6158,6 +6166,43 @@ mod tests {
         assert_eq!(pushed(&conn, &mut room, &desktop), Taken::Stored);
         assert_eq!(pushed(&conn, &mut room, &laptop), Taken::OlderThanHeld);
         assert_eq!(heads(&conn, 1, 1), [desktop.id(), four.id()]);
+    }
+
+    /// An entry that replaces another, by the store's rule or as a head
+    /// made after it, takes a place above every place given before in the
+    /// holding (decision 2026-10-04 §2.4 item 3): a reader that has reached
+    /// the place of the entry replaced is handed the one that replaces it.
+    #[test]
+    fn an_entry_that_replaces_another_takes_a_place_above_it() {
+        let (conn, mut room) = relay();
+        let highest =
+            |conn: &Connection, c: u16| entries::highest_place(conn, &channel(c)).unwrap();
+        let after = |conn: &Connection, c: u16, place: i64| -> Vec<[u8; 32]> {
+            entries::channel_entries_after_place(conn, &channel(c), place, 100)
+                .unwrap()
+                .iter()
+                .map(|held| held.entry.id())
+                .collect()
+        };
+        // By the store's rule: the one row of its author in its slot.
+        assert_eq!(pushed(&conn, &mut room, &small(1, 1, 5)), Taken::Stored);
+        let reached = highest(&conn, 1);
+        let newer = small(1, 1, 6);
+        assert_eq!(pushed(&conn, &mut room, &newer), Taken::Stored);
+        assert_eq!(after(&conn, 1, reached), [newer.id()]);
+        // As a head made after the one kept, and over one of the version
+        // before.
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(2, 1, 1)),
+            Taken::Stored
+        );
+        let [_, two, laptop, _, _] = the_fault(2);
+        for head in [&two, &laptop] {
+            let reached = highest(&conn, 2);
+            assert_eq!(pushed(&conn, &mut room, head), Taken::Stored);
+            assert_eq!(after(&conn, 2, reached), [head.id()]);
+        }
+        counted(&conn);
     }
 
     /// Rule 14: at most eight heads in a slot, the highest numbers first;
