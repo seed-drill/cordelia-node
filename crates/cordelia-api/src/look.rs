@@ -92,7 +92,7 @@ impl Shown {
             .map_err(|e| PersonError::Held(format!("a key shown: {e}")))
     }
 
-    fn of(key: &[u8; 32], label: &str) -> Result<Self, PersonError> {
+    pub(crate) fn of(key: &[u8; 32], label: &str) -> Result<Self, PersonError> {
         Ok(Self {
             key: encode_public_key(key)?,
             label: label.to_string(),
@@ -406,6 +406,12 @@ pub struct Look {
     /// lost the node's answer, learns by it whether the node made it
     /// (§16).
     pub latest: Option<String>,
+    /// The moves this device made (decision 2026-10-24 (removal), rule
+    /// 9), the latest last: each the change entry it left, as `latest`
+    /// names one, and what a command that waits after that change says. A
+    /// command that made a change learns by it that the device moved from
+    /// it, whatever its number.
+    pub moved: Vec<crate::person::MovedFrom>,
     /// The first words of the fingerprint of the key of the phrase that
     /// the device follows: what a person tells one phrase from another
     /// by.
@@ -575,6 +581,7 @@ pub fn look(
             applied_at: None,
             removed_a_key: false,
             latest: None,
+            moved: Vec::new(),
             phrase_words: None,
             statements_left: None,
             devices: Vec::new(),
@@ -673,6 +680,7 @@ fn of_its_person(
     look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
     look.removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?.is_some();
     look.latest = Some(hex::encode(followed_entry(conn)?.id()));
+    look.moved = crate::person::moves_made(conn)?;
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
     look.statements_left = statements_left(statement.number);
 

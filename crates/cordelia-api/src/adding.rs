@@ -1247,7 +1247,8 @@ impl<'a> Brought<'a> {
         )?;
         Ok(match shown {
             Shown::Held | Shown::Behind => Accepted::Refused(NotAccepted::BringsNoChange),
-            Shown::Applied(applied) => Accepted::Applied(applied),
+            // A move is an apply (decision 2026-10-24 (removal), rule 9).
+            Shown::Applied(applied) | Shown::Moved(applied) => Accepted::Applied(applied),
             Shown::SetAside => Accepted::SetAside,
             Shown::Closed => Accepted::Closed,
             Shown::Refused(Refused::NotAChangeEntry(ChangeEntryError::Statement(e))) => {
@@ -1366,6 +1367,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
+    meta::remove(conn, meta::PERSON_MOVED_FROM)?;
     // What it knew of which relay holds which change was of entries of
     // the phrase it leaves (decision 2026-10-19 §1).
     crate::at_relays::known::forget(conn)?;

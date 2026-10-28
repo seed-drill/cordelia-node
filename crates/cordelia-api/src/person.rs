@@ -38,8 +38,9 @@
 //! - it was made after the one followed and does not list this device:
 //!   the device stops;
 //! - anything else is kept as a head set aside: the device goes on where
-//!   the change it follows is clear, and is closed where it is not
-//!   (stored as `fork`, rule 10), until the move of rule 9 is built;
+//!   the change it follows is clear; where it is not, it moves, with no
+//!   phrase, to the best clear change it keeps that counts it (rule 9),
+//!   and is closed where there is none (stored as `fork`, rule 10);
 //! - it is not the phrase's, or not well formed: it is refused, and
 //!   nothing changes.
 //!
@@ -89,7 +90,7 @@ use cordelia_core::protocol::{
     PERSONAL_APPLIED_PREFIX, PERSONAL_APPLIED_SENT, PERSONAL_REACHED_PREFIX,
     RECOVERY_MAX_LEFT_SECRETS,
 };
-use cordelia_core::revision::lifted;
+use cordelia_core::revision::{band, lifted};
 use cordelia_crypto::CryptoError;
 use cordelia_crypto::addition::{AdditionError, SignedAddition};
 use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
@@ -1123,10 +1124,16 @@ pub enum Shown {
     /// It is kept as a head set aside, and the change followed is still
     /// clear: the device goes on (rules 1, 8 step 6, and 11).
     SetAside,
+    /// The change followed is not clear, and the device moved, with no
+    /// phrase, to the best clear change it keeps that counts it (rules 8,
+    /// step 7, and 9): it applied that change, and keeps the one it left as
+    /// a head set aside.
+    Moved(Applied),
     /// The device is closed (rule 10): the change it follows is not clear,
-    /// and none it keeps that is clear is moved to in this version of the
-    /// build; or the change was a ninth head. Where it could be kept, it is
-    /// kept as a head set aside.
+    /// and no change it keeps that is clear counts it; or the change was a
+    /// ninth head. Where it could be kept, it is kept as a head set aside.
+    /// Where moves are held back ([`with_moves_held_back`]) it is closed
+    /// too, and moved by [`move_to_a_clear_change`] after.
     Closed,
     /// It was refused, and nothing changed but the keys it removes, where
     /// the phrase signed it.
@@ -1330,9 +1337,10 @@ fn keeps_set_aside(conn: &Connection, entry: &CheckedEntry) -> Result<bool, Pers
 /// 6. Anything else is kept as a head set aside: a ninth closes the
 ///    device, and is not kept. Where the change followed is still clear,
 ///    the device goes on (rule 11).
-/// 7. Where it is not clear, the device would move to the best clear
-///    change that counts it (rule 9). The move is a later slice of the
-///    build: until it is built the device closes here. It fails closed.
+/// 7. Where it is not clear, the device moves (rule 9) to the best change
+///    it keeps that is clear, counts it, and whose secret opens for it
+///    ([`move_or_close`]). The change shown counts it by the record that
+///    comes with it, where one does: a move to it is `apply`'s.
 /// 8. Where there is none, the device is closed (rule 10).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decide(
@@ -1359,7 +1367,11 @@ pub(crate) fn decide(
             // signed it (rule 2): a change that drops a removal and makes
             // another says that the other key is removed.
             know_removed_if_signed(conn, identity, statement, now)?;
-            close_if_not_clear(conn)?;
+            // What it knows of removals grew: rule 8 moves or closes a
+            // device whose change is no longer clear.
+            if !follows_a_clear_change(conn)? {
+                move_or_close(conn, identity, None, now)?;
+            }
             return Ok(Shown::Refused(Refused::NotAChangeEntry(e.into())));
         }
     };
@@ -1420,12 +1432,349 @@ pub(crate) fn decide(
         return Ok(Shown::Closed);
     }
     held_rows::set_aside(conn, entry, now)?;
-    if held.state == State::Applied && follows_a_clear_change(conn)? {
-        return Ok(Shown::SetAside);
+    if follows_a_clear_change(conn)? {
+        // A closed device whose change is clear was closed by a ninth
+        // head, and stays so: it does not move where its change is clear.
+        if held.state == State::Applied {
+            return Ok(Shown::SetAside);
+        }
+        close(conn)?;
+        return Ok(Shown::Closed);
     }
-    // Steps 7 and 8.
-    close(conn)?;
-    Ok(Shown::Closed)
+    // Steps 7 and 8. The change shown is among the heads now; where it
+    // counts this device by the record that comes with it alone, and is
+    // clear, it is a change to move to as well, by `apply`.
+    let by_its_record = by_a_record && !shown.lists(&own) && is_clear(conn, shown, false)?;
+    let handed = by_its_record.then_some(Handed {
+        entry,
+        statement,
+        apply,
+    });
+    move_or_close(conn, identity, handed, now)
+}
+
+/// A change handed with a record of this device's addition, which counts
+/// it by that record alone: rule 8, step 7, may move to it, by `apply`.
+struct Handed<'a> {
+    entry: &'a CheckedEntry,
+    statement: &'a SignedStatement,
+    apply: &'a mut dyn FnMut(&Held) -> Result<Shown, PersonError>,
+}
+
+thread_local! {
+    /// Whether this thread holds moves back ([`with_moves_held_back`]).
+    static MOVES_HELD_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Do `work` with every move held back (decision 2026-10-24 (removal),
+/// rule 5): where rule 8 would move the device, it closes it instead, and
+/// the caller moves it after ([`move_to_a_clear_change`]). It is for the
+/// node's pass, where a change that is no change of settings commits at
+/// once, and one that is waits for the sync cycle's turn
+/// (`AppState::as_a_change_where`): the transaction that keeps a head and
+/// its removed keys commits at once, closed, and only the move waits for
+/// the cycle. A move done in that transaction would have it undone and
+/// done again after the wait, with the device standing on a change that is
+/// not clear, and not closed, meanwhile.
+pub fn with_moves_held_back<T>(work: impl FnOnce() -> T) -> T {
+    struct Restored(bool);
+    impl Drop for Restored {
+        fn drop(&mut self) {
+            MOVES_HELD_BACK.set(self.0);
+        }
+    }
+    let _restored = Restored(MOVES_HELD_BACK.replace(true));
+    work()
+}
+
+/// The order of the changes a device may move to (rule 8, step 7): the
+/// highest number, and of two at one number the lower hash.
+fn rank(statement: &Statement) -> Result<(u64, std::cmp::Reverse<Vec<u8>>), PersonError> {
+    let link = statement.link()?;
+    Ok((link.number, std::cmp::Reverse(link.hash.to_vec())))
+}
+
+/// Rule 8, steps 7 and 8, of decision 2026-10-24 (removal), on a device
+/// whose change is not clear, inside the caller's transaction: it moves to
+/// the best change it keeps as a head set aside that is clear, lists it,
+/// and whose secret opens for it (rule 9), or to `handed`, where that ranks
+/// above it; and is closed where there is none (rule 10). Where moves are
+/// held back ([`with_moves_held_back`]) it is closed, and moved after.
+fn move_or_close(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    handed: Option<Handed<'_>>,
+    now: i64,
+) -> Result<Shown, PersonError> {
+    let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
+    if MOVES_HELD_BACK.get() {
+        close(conn)?;
+        return Ok(Shown::Closed);
+    }
+    let heads = set_aside_heads(conn, identity, &held.following)?;
+    let best = best_to_move_to(conn, identity, &heads)?;
+    if let Some(handed) = handed {
+        let handed_rank = rank(&handed.statement.statement)?;
+        let above = match &best {
+            Some((head, _)) => handed_rank > rank(&head.statement.statement)?,
+            None => true,
+        };
+        if above {
+            let left = followed_entry(conn)?;
+            let says = moved_says(conn, &held, &heads, &handed.statement.statement)?;
+            for head in &heads {
+                if head.entry.id() == handed.entry.id() {
+                    held_rows::drop_set_aside(conn, head.place)?;
+                }
+            }
+            return match (handed.apply)(&held)? {
+                Shown::Applied(applied) => {
+                    moved(conn, &left, &held, &handed.statement.statement, &says, now)?;
+                    Ok(Shown::Moved(applied))
+                }
+                other => Ok(other),
+            };
+        }
+    }
+    match best {
+        Some((head, secret)) => move_to(conn, identity, &held, &heads, &head, &secret, now),
+        None => {
+            close(conn)?;
+            Ok(Shown::Closed)
+        }
+    }
+}
+
+/// A head set aside that a device may move to, with its secret.
+type Target = (Head, Zeroizing<[u8; 32]>);
+
+/// Of the heads set aside, the best to move to (rule 8, step 7): one that
+/// is clear, lists this device, and whose secret opens for it, with that
+/// secret; the highest number, and of two at one number the lower hash.
+/// One that does not open for it is passed over: it is not where the
+/// device goes.
+fn best_to_move_to(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    heads: &[Head],
+) -> Result<Option<Target>, PersonError> {
+    let own = identity.public_key();
+    let Some(held) = held(conn)? else {
+        return Ok(None);
+    };
+    let following = &held.following;
+    let mut best: Option<Target> = None;
+    for head in heads {
+        let statement = &head.statement.statement;
+        if !statement.lists(&own) || !is_clear(conn, statement, false)? {
+            continue;
+        }
+        let opened = change_entry::open_for_device(
+            &head.entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        );
+        let Ok(opened) = opened else {
+            continue;
+        };
+        let DeviceSecret::Opened(secret) = opened.secret else {
+            continue;
+        };
+        let secret = Zeroizing::new(secret);
+        if !opens(&head.statement, &secret) {
+            continue;
+        }
+        let better = match &best {
+            Some((kept, _)) => rank(statement)? > rank(&kept.statement.statement)?,
+            None => true,
+        };
+        if better {
+            best = Some((head.clone(), secret));
+        }
+    }
+    Ok(best)
+}
+
+/// Rule 9 of decision 2026-10-24 (removal): the device moves to `head`,
+/// whose secret is `secret`, with no phrase. It is an apply, in the
+/// caller's transaction ([`apply_judged`]), but for two rules of 4.2 that
+/// are not asked of it: that the number is above the one followed, and
+/// that the change was made after it. No removal is undone: what the device
+/// knows to be removed only grows, and [`come_to`] refuses a change that
+/// lists one. It carries what it holds, by the renumbering of a move
+/// ([`carried_rev`]), and keeps the change it left as a head set aside.
+fn move_to(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    held: &Held,
+    heads: &[Head],
+    head: &Head,
+    secret: &[u8; 32],
+    now: i64,
+) -> Result<Shown, PersonError> {
+    let left = followed_entry(conn)?;
+    let to = &head.statement.statement;
+    let says = moved_says(conn, held, heads, to)?;
+    held_rows::drop_set_aside(conn, head.place)?;
+    let change = Change {
+        following: &held.following,
+        statement: &head.statement,
+        secret,
+        entry: &head.entry,
+    };
+    let applied = apply_judged(conn, identity, Some(held), &change, now)?;
+    moved(conn, &left, held, to, &says, now)?;
+    Ok(Shown::Moved(applied))
+}
+
+/// After a move from the change `held` follows, whose entry is `left`, to
+/// `to`: the change left is kept as a head set aside, where `to` was not
+/// made after it (rule 9), and the move is noted, with what a command that
+/// waits after the change left says of it.
+fn moved(
+    conn: &Connection,
+    left: &CheckedEntry,
+    held: &Held,
+    to: &Statement,
+    says: &str,
+    now: i64,
+) -> Result<(), PersonError> {
+    if !to.has_on_chain(&held.statement.statement.link()?) {
+        held_rows::set_aside(conn, left, now)?;
+    }
+    let mut kept: Vec<MovedFrom> = meta::get(conn, meta::PERSON_MOVED_FROM)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default();
+    kept.push(MovedFrom {
+        from: hex::encode(left.id()),
+        says: says.to_string(),
+    });
+    let over = kept.len().saturating_sub(MAX_CHANGE_HEADS);
+    kept.drain(..over);
+    let written = serde_json::to_string(&kept)
+        .map_err(|e| PersonError::Held(format!("the moves noted: {e}")))?;
+    meta::set(conn, meta::PERSON_MOVED_FROM, &written)?;
+    Ok(())
+}
+
+/// A move that this device made (decision 2026-10-24 (removal), rule 9):
+/// the change entry of the change it left, as the look names an entry, and
+/// what a command that waits after that change says of it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MovedFrom {
+    pub from: String,
+    pub says: String,
+}
+
+/// The moves this device made, the latest last, up to `MAX_CHANGE_HEADS`
+/// of them: none where it made none since it came to its phrase.
+pub fn moves_made(conn: &Connection) -> Result<Vec<MovedFrom>, PersonError> {
+    Ok(meta::get(conn, meta::PERSON_MOVED_FROM)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default())
+}
+
+/// What a command that waits after the change `held` follows says where the
+/// device moves from it to `to` (rule 9): "a change made apart on <label>
+/// removed <label>, which this change lists: this device follows that
+/// change now". The key is one that the change left lists, or hands its
+/// secret to by a record, and that the device knows to be removed; the
+/// device named first is the one on which a change it keeps that removes
+/// that key was made: `to`, where it does.
+fn moved_says(
+    conn: &Connection,
+    held: &Held,
+    heads: &[Head],
+    to: &Statement,
+) -> Result<String, PersonError> {
+    use crate::look::{Shown as Named, lists_of};
+    let leaving = &held.statement.statement;
+    let removed = held_rows::removed_keys(conn)?;
+    let labels = crate::look::removed_labels(conn)?;
+    let label_of = |key: &[u8; 32], or: &str| {
+        labels
+            .iter()
+            .find(|(known, _)| known == key)
+            .map_or(or.to_string(), |(_, label)| label.clone())
+    };
+    let listed = leaving
+        .devices
+        .iter()
+        .find(|device| removed.contains(&device.key))
+        .map(|device| (device.key, label_of(&device.key, &device.label), true));
+    let mut held_by = None;
+    if listed.is_none() {
+        for record in held_rows::additions(conn)? {
+            if removed.contains(&record.key) {
+                let label = SignedAddition::from_bytes(&record.record)?
+                    .addition
+                    .device
+                    .label;
+                held_by = Some((record.key, label_of(&record.key, &label), false));
+                break;
+            }
+        }
+    }
+    let Some((key, label, is_listed)) = listed.or(held_by) else {
+        return Ok(format!(
+            "a change made apart on {} is clear of every removed device, and this change is              not: this device follows that change now",
+            lists_of(to)?.made_on.named()
+        ));
+    };
+    let by = std::iter::once(to)
+        .chain(heads.iter().map(|head| &head.statement.statement))
+        .find(|change| change.removes(&key))
+        .unwrap_or(to);
+    let removed = Named::of(&key, &label)?.named();
+    let how = match is_listed {
+        true => "which this change lists",
+        false => "to which this change hands its secret",
+    };
+    Ok(format!(
+        "a change made apart on {} removed {removed}, {how}: this device follows that change now",
+        lists_of(by)?.made_on.named()
+    ))
+}
+
+/// Move this device to the best clear change it keeps that counts it, where
+/// the change it follows is not clear (decision 2026-10-24 (removal), rules
+/// 8 and 9), in a transaction of its own: what the node runs, as a change of
+/// settings, after a close that held the move back ([`with_moves_held_back`]),
+/// and at each pass, for a device closed by what it knows of removals
+/// growing at the door or at `cordelia accept`. `None` where it follows no
+/// phrase, has stopped, or follows a clear change; `Shown::Closed` where
+/// no clear change counts it.
+pub fn move_to_a_clear_change(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+) -> Result<Option<Shown>, PersonError> {
+    in_one(conn, || {
+        let Some(held) = held(conn)? else {
+            return Ok(None);
+        };
+        if !matches!(held.state, State::Applied | State::Fork) || follows_a_clear_change(conn)? {
+            return Ok(None);
+        }
+        move_or_close(conn, identity, None, now).map(Some)
+    })
+}
+
+/// Whether [`move_to_a_clear_change`] would move this device: it follows a
+/// change that is not clear, applied or closed, and keeps a head set aside
+/// that it would move to. Read alone, so that the node asks for a change of
+/// settings only where there is a move to make.
+pub fn would_move(conn: &Connection, identity: &NodeIdentity) -> Result<bool, PersonError> {
+    let Some(held) = held(conn)? else {
+        return Ok(false);
+    };
+    if !matches!(held.state, State::Applied | State::Fork) || follows_a_clear_change(conn)? {
+        return Ok(false);
+    }
+    let heads = set_aside_heads(conn, identity, &held.following)?;
+    Ok(best_to_move_to(conn, identity, &heads)?.is_some())
 }
 
 /// What the statement `shown` is to this device beside the change it
@@ -1493,9 +1842,11 @@ fn close(conn: &Connection) -> Result<(), PersonError> {
 /// Close this device where it stands applied under a change that is not
 /// clear (decision 2026-10-24 (removal), rules 8 and 10): what it knows of
 /// removals grew with no change kept, by a record that adds a removed key
-/// under the change it follows (rule 3), or by the keys of a change that
-/// was refused. The move of rule 9 is not built yet, so it closes. Says
-/// whether it closed.
+/// under the change it follows (rule 3), at the door, or by the keys of a
+/// change refused at `cordelia accept`. Both commit at once, closed; the
+/// move of rule 9 waits for the sync cycle's turn (rule 5), and the node
+/// makes it at its next pass ([`move_to_a_clear_change`]). Says whether it
+/// closed.
 pub(crate) fn close_if_not_clear(conn: &Connection) -> Result<bool, PersonError> {
     let applied = held_rows::person(conn)?.is_some_and(|person| person.state == State::Applied);
     if !applied || follows_a_clear_change(conn)? {
@@ -1538,9 +1889,13 @@ pub fn judge_kept(
             }
         }
         // A device that is not in a fork is judged by what it follows: one
-        // applied under a change that is not clear is closed (rule 10).
+        // applied under a change that is not clear moves, or is closed
+        // (rules 9 and 10).
         if held.state != State::Fork {
-            return Ok(close_if_not_clear(conn)?.then_some(Shown::Closed));
+            if held.state == State::Applied && !follows_a_clear_change(conn)? {
+                return move_or_close(conn, identity, None, now).map(Some);
+            }
+            return Ok(None);
         }
         let mut judged = None;
         for head in set_aside_heads(conn, identity, &following)? {
@@ -1563,11 +1918,13 @@ pub fn judge_kept(
                 now,
             )?;
             // It was set applied to be judged: whatever rule 8 did, it
-            // stays applied only under a change that is clear.
+            // stays applied only under a change that is clear, and moves
+            // where another that it keeps is (rule 9).
+            let applied = held_rows::person(conn)?.map(|person| person.state);
             if shown == Shown::Closed {
                 close(conn)?;
-            } else if close_if_not_clear(conn)? {
-                shown = Shown::Closed;
+            } else if applied == Some(State::Applied) && !follows_a_clear_change(conn)? {
+                shown = move_or_close(conn, identity, None, now)?;
             }
             judged = Some(shown);
             let stays = held_rows::person(conn)?.map(|person| person.state);
@@ -2139,6 +2496,7 @@ fn come_to(
         let carry = Carry {
             identity,
             statement: from.number,
+            to: to.number,
             now,
         };
         // What the personal channel that is left lists, as this device
@@ -2283,6 +2641,12 @@ fn come_to(
 /// taken for one that was deleted there. Returns the files whose record
 /// was dropped, each once, in order.
 ///
+/// **A move to the same number or a lower one** (decision 2026-10-24
+/// (removal), rule 9): a record whose revision, or whose slot's current
+/// version, is in a band above the change moved to is dropped too, and its
+/// file meets the new channel as a new file does. Nothing is carried in
+/// that slot ([`carried_rev`]).
+///
 /// It is called before the carry, which drops what the store holds of the
 /// channel that is left.
 fn move_records(
@@ -2299,17 +2663,21 @@ fn move_records(
     let channel = derive::channel_id(from)?;
     let slot_key = derive::slot_key(from)?;
     let mut dropped: Vec<String> = Vec::new();
-    for (folder, file) in sync_state::files(conn, &old)? {
+    for (folder, file, rev) in sync_state::files_at(conn, &old)? {
         let held = entries::slot_entries(conn, &channel, &slot_id(&slot_key, &file))?;
         let read = version::current(&held, from, carry.statement, |key| counting.counts(key))?;
-        if read.current.is_none() {
+        let carried = read
+            .current
+            .is_some_and(|current| carry.renumbered(current.rev).is_some());
+        if !carried || carry.renumbered(rev).is_none() {
             sync_state::forget_file(conn, &folder, &old, &file)?;
             dropped.push(file);
         }
     }
     dropped.sort();
     dropped.dedup();
-    sync_state::move_channel(conn, &old, &new, lifted)?;
+    // Each record left has a revision that the renumbering carries.
+    sync_state::move_channel(conn, &old, &new, |rev| carry.renumbered(rev).unwrap_or(rev))?;
     Ok(dropped)
 }
 
@@ -2415,10 +2783,18 @@ struct Carry<'a> {
     identity: &'a NodeIdentity,
     /// The number of the statement the device is leaving.
     statement: u64,
+    /// The number of the statement it comes to: above `statement`, or, at
+    /// a move, the same or below it.
+    to: u64,
     now: i64,
 }
 
 impl Carry<'_> {
+    /// `rev` as this carry carries it ([`carried_rev`]).
+    fn renumbered(&self, rev: u64) -> Option<u64> {
+        carried_rev(rev, self.statement, self.to)
+    }
+
     /// Carry one channel: each slot's current version, as the device's
     /// own store has it under the statement it is leaving, is sealed
     /// again as this device's own entry in the channel whose secret is
@@ -2435,7 +2811,10 @@ impl Carry<'_> {
     /// revision.
     ///
     /// An entry that lost a tie is not current, and is not carried. Nor
-    /// is one that is no version.
+    /// is one that is no version, nor, at a move to the same number or a
+    /// lower one, a version in a band above it ([`carried_rev`]): its
+    /// record was dropped ([`move_records`]), and it is no slot that held
+    /// no version.
     fn channel(
         &self,
         conn: &Connection,
@@ -2458,7 +2837,10 @@ impl Carry<'_> {
             if !carries(&version) {
                 continue;
             }
-            let entry = carried_entry(self.identity, to, &version)?;
+            let Some(rev) = self.renumbered(version.rev) else {
+                continue;
+            };
+            let entry = carried_entry_at(self.identity, to, &version, rev)?;
             if entries::store(conn, &entry, self.now)? != Outcome::Stored {
                 return Err(PersonError::Held(
                     "the store holds an entry of this device's in a generation it has not come to"
@@ -2491,6 +2873,36 @@ pub(crate) fn carried_entry(
     to: &[u8; 32],
     version: &Version,
 ) -> Result<CheckedEntry, PersonError> {
+    carried_entry_at(identity, to, version, lifted(version.rev))
+}
+
+/// The revision `rev` of a version under statement `from` takes where it is
+/// carried to statement `to` (decision 2026-10-04 §2.3; decision 2026-10-24
+/// (removal), rule 9). Crossing to a higher number it is lifted
+/// ([`lifted`]). The renumbering runs forward only: at a move to the same
+/// number or a lower one it stays where it is, and is carried only where
+/// its band is not above `to`. `None` where it is not carried as a version.
+///
+/// A version that is current under `from` is in `from`'s band, or in the
+/// bottom half of a lower one, so one whose band is not above `to` is a
+/// revision that may be an entry's under `to`.
+pub(crate) fn carried_rev(rev: u64, from: u64, to: u64) -> Option<u64> {
+    if to > from {
+        Some(lifted(rev))
+    } else if band(rev) <= to {
+        Some(rev)
+    } else {
+        None
+    }
+}
+
+/// [`carried_entry`], at the revision `rev`.
+fn carried_entry_at(
+    identity: &NodeIdentity,
+    to: &[u8; 32],
+    version: &Version,
+    rev: u64,
+) -> Result<CheckedEntry, PersonError> {
     let own = identity.public_key();
     // A version's entries are in order of their signers' keys.
     let from = version
@@ -2506,7 +2918,7 @@ pub(crate) fn carried_entry(
         value: version.value.clone(),
         chain: Some(chain),
     };
-    Ok(Entry::seal(to, identity, lifted(version.rev), &inside)?.check()?)
+    Ok(Entry::seal(to, identity, rev, &inside)?.check()?)
 }
 
 /// Whether an entry of this device's own in the personal channel is
@@ -7911,10 +8323,10 @@ mod tests {
         follow(&conn, 0, &phrase, &same_number, secret(13));
         assert!(removed(&conn).is_empty());
         let removal = change(&phrase, &three, secret(3));
-        assert_eq!(
-            shown(&conn, &device(0), &removal, NOW).unwrap(),
+        assert!(matches!(
+            with_moves_held_back(|| shown(&conn, &device(0), &removal, NOW)).unwrap(),
             Shown::Closed
-        );
+        ));
         assert_eq!(removed(&conn), vec![key(2)]);
         assert!(!clear(&conn));
         assert_eq!(state(&conn), State::Fork);
@@ -8199,17 +8611,268 @@ mod tests {
             .collect()
     }
 
-    /// Rule 8, steps 7 and 8, in this slice: a device whose change is not
-    /// clear is closed, stored as `fork`, where a clear change that counts
-    /// it is set aside (it fails closed until the move of rule 9 is built),
-    /// and where none is clear. It keeps the head, and the keys it removes,
-    /// which only grow.
+    /// Rule 8, step 7, with rule 9: a device whose change is not clear
+    /// moves, with no phrase, to the clear change made apart that lists it,
+    /// at a higher number, at the same number, and at a lower one. It
+    /// applies that change, keeps the one it left as a head set aside, and
+    /// carries what it holds: at a lower number a version, and a folder's
+    /// record, in a band above the change moved to is not carried, and its
+    /// file meets the new channel as a new file does. The move is noted for
+    /// a command that waits after the change left.
     #[test]
-    fn test_a_device_whose_change_is_not_clear_is_closed_until_the_move_is_built() {
+    fn test_a_device_whose_change_is_not_clear_moves_to_the_clear_one_that_lists_it() {
+        use cordelia_storage::sync_state::Agreed;
         let phrase = phrase();
         let [_, two, ..] = statements(&phrase);
-        // The fault: device 0 follows a renewal that lists device 2, and is
-        // shown a change made apart that removes device 2 and lists it.
+        // The fault: the change followed lists device 2, and one made apart
+        // removes device 2 and lists device 0.
+        let lists_two = two
+            .next(key(0), &secret(13), listed(&[0, 1, 2]), &[])
+            .unwrap();
+        let removes_two = two
+            .next(key(1), &secret(14), listed(&[1, 0]), &[key(2)])
+            .unwrap();
+        let higher = removes_two
+            .next(key(1), &secret(15), listed(&[1, 0]), &[key(2)])
+            .unwrap();
+        let lower_left = lists_two
+            .next(key(0), &secret(16), listed(&[0, 1, 2]), &[])
+            .unwrap();
+        let folder = "/home/ana/memory";
+        for (case, left, left_secret, to, to_secret) in [
+            ("higher", &lists_two, 13, &higher, 15),
+            ("same", &lists_two, 13, &removes_two, 14),
+            ("lower", &lower_left, 16, &removes_two, 14),
+        ] {
+            let conn = db::open_in_memory().unwrap();
+            let left_entry = follow(&conn, 0, &phrase, left, secret(left_secret));
+            hold_name(&conn, "team", NOW).unwrap();
+            let team = own(left_secret, "team");
+            let written = |secret: &[u8; 32]| encode_channel_id(&id_of(secret)).unwrap();
+            // A version in band 0, and one in the band of the change left:
+            // a device jumped there.
+            let high = at(left.number, 1);
+            for (file, rev) in [("a.md", 5), ("high.md", high)] {
+                put(&conn, &team, 1, rev, file, text(file), &[]);
+                let agreed = Agreed {
+                    hash: None,
+                    rev,
+                    signer: Some(key(1)),
+                    chain: None,
+                };
+                sync_state::save(&conn, folder, &written(&team), file, &agreed).unwrap();
+            }
+            assert!(clear(&conn));
+
+            let entry = change(&phrase, to, secret(to_secret));
+            let Shown::Moved(applied) = shown(&conn, &device(0), &entry, NOW).unwrap() else {
+                panic!("{case}: no move");
+            };
+            assert_eq!(
+                (applied.number, applied.left),
+                (to.number, Some(left.number)),
+                "{case}"
+            );
+            // It follows the change moved to, with no phrase, and keeps the
+            // one it left as a head set aside.
+            assert_eq!(state(&conn), State::Applied, "{case}");
+            assert!(clear(&conn), "{case}");
+            assert_eq!(kept(&conn, Kept::Latest), Some(entry.id()), "{case}");
+            assert_eq!(kept(&conn, Kept::Apart), Some(left_entry.id()), "{case}");
+            assert_eq!(
+                secrets(&conn)[0],
+                (to.number, secret(to_secret), None),
+                "{case}"
+            );
+            // What it held is carried, and the generation left is gone.
+            let new = own(to_secret, "team");
+            let carried = read(&conn, &new, to.number, "a.md", &[0, 1]).current;
+            assert_eq!(
+                carried.map(|version| (version.value, version.rev)),
+                Some((text("a.md"), 5)),
+                "{case}"
+            );
+            assert!(!channels(&conn).contains(&id_of(&team)), "{case}");
+            let records = sync_state::load(&conn, folder, &written(&new)).unwrap();
+            let high_carried = read(&conn, &new, to.number, "high.md", &[0, 1]).current;
+            if case == "lower" {
+                // In a band above the change moved to: not carried, and its
+                // record dropped.
+                assert!(high_carried.is_none());
+                assert!(!records.contains_key("high.md"));
+                assert_eq!(
+                    applied.not_carried,
+                    vec![("team".to_string(), "high.md".to_string())]
+                );
+            } else {
+                let rev = high_carried.unwrap().rev;
+                assert_eq!(rev, high, "{case}");
+                assert_eq!(records["high.md"].rev, rev, "{case}");
+                assert!(applied.not_carried.is_empty(), "{case}");
+            }
+            assert_eq!(records["a.md"].rev, 5, "{case}");
+            // The move is noted, with what a command that waits says.
+            let moves = moves_made(&conn).unwrap();
+            assert_eq!(moves.len(), 1, "{case}");
+            assert_eq!(moves[0].from, hex::encode(left_entry.id()), "{case}");
+            assert!(
+                moves[0].says.starts_with("a change made apart on ")
+                    && moves[0].says.contains("\"device 1\" removed ")
+                    && moves[0].says.ends_with(
+                        "\"device 2\", which this change lists: this device follows that \
+                         change now"
+                    ),
+                "{case}: {}",
+                moves[0].says
+            );
+        }
+    }
+
+    /// Rule 8, step 8, and rule 10: with no clear change that counts it, a
+    /// device is closed, stored as `fork`, and keeps the head and the keys
+    /// it removes, which only grow. Closed, it moves to a clear change made
+    /// apart that lists it, once it is shown one (rule 10).
+    #[test]
+    fn test_with_no_clear_change_a_device_is_closed_until_one_counts_it() {
+        let phrase = phrase();
+        let [_, two, ..] = statements(&phrase);
+        // Each side removes a different device: neither change is clear.
+        let removes_one = two
+            .next(key(0), &secret(16), listed(&[0, 2]), &[key(1)])
+            .unwrap();
+        let removes_two = two
+            .next(key(1), &secret(14), listed(&[1, 0]), &[key(2)])
+            .unwrap();
+        let conn = db::open_in_memory().unwrap();
+        let keeps = follow(&conn, 0, &phrase, &removes_one, secret(16));
+        let other = change(&phrase, &removes_two, secret(14));
+        assert_eq!(
+            shown(&conn, &device(0), &other, NOW).unwrap(),
+            Shown::Closed
+        );
+        assert_eq!(state(&conn), State::Fork);
+        assert_eq!(kept(&conn, Kept::Latest), Some(keeps.id()));
+        assert_eq!(kept(&conn, Kept::Apart), Some(other.id()));
+        let mut both = vec![key(1), key(2)];
+        both.sort_unstable();
+        assert_eq!(removed(&conn), both);
+        assert_eq!(
+            crate::at_relays::stands(&conn).unwrap(),
+            crate::at_relays::Stands::Stopped(State::Fork)
+        );
+        assert!(!would_move(&conn, &device(0)).unwrap());
+        assert_eq!(
+            move_to_a_clear_change(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Closed)
+        );
+
+        // A third, made apart from both, removes both and lists device 0:
+        // it is clear, and the closed device moves to it.
+        let removes_both = two
+            .next(key(0), &secret(17), listed(&[0]), &[key(1), key(2)])
+            .unwrap();
+        let third = change(&phrase, &removes_both, secret(17));
+        assert!(matches!(
+            shown(&conn, &device(0), &third, NOW).unwrap(),
+            Shown::Moved(Applied { number: 3, .. })
+        ));
+        assert_eq!(state(&conn), State::Applied);
+        assert_eq!(kept(&conn, Kept::Latest), Some(third.id()));
+        let mut set_aside: Vec<[u8; 32]> = held_rows::set_aside_entries(&conn)
+            .unwrap()
+            .iter()
+            .map(|head| head.entry.id())
+            .collect();
+        set_aside.sort_unstable();
+        let mut heads = vec![keeps.id(), other.id()];
+        heads.sort_unstable();
+        assert_eq!(set_aside, heads);
+        assert_eq!(removed(&conn), both);
+    }
+
+    /// Rule 8, step 7: of the clear changes that list it, a device moves
+    /// to the one with the highest number, and of two at one number to the
+    /// one whose hash is lower. One whose secret does not open for it is
+    /// passed over, and so is one that does not list it.
+    #[test]
+    fn test_of_two_clear_changes_a_device_moves_to_the_higher_then_the_lower_hash() {
+        let phrase = phrase();
+        let [_, two, ..] = statements(&phrase);
+        let lists_two = two
+            .next(key(0), &secret(13), listed(&[0, 1, 2]), &[])
+            .unwrap();
+        let removing = |secret_of: u8| {
+            two.next(key(1), &secret(secret_of), listed(&[1, 0]), &[key(2)])
+                .unwrap()
+        };
+        let (first, second) = (removing(14), removing(15));
+        let later = first
+            .next(key(1), &secret(18), listed(&[1, 0]), &[key(2)])
+            .unwrap();
+        let without_zero = two
+            .next(key(1), &secret(19), listed(&[1]), &[key(2)])
+            .unwrap();
+        let lower = usize::from(first.link().unwrap().hash > second.link().unwrap().hash);
+        // The heads as a device keeps them, with device 2 known to be
+        // removed: the change it follows is not clear.
+        let device_with = |heads: &[CheckedEntry]| {
+            let conn = db::open_in_memory().unwrap();
+            follow(&conn, 0, &phrase, &lists_two, secret(13));
+            for head in heads {
+                held_rows::set_aside(&conn, head, NOW).unwrap();
+            }
+            held_rows::keep_removed(&conn, &[key(2)], NOW).unwrap();
+            assert!(!clear(&conn));
+            conn
+        };
+        let moved_to = |conn: &Connection| {
+            assert!(would_move(conn, &device(0)).unwrap());
+            let moved = move_to_a_clear_change(conn, &device(0), NOW).unwrap();
+            assert!(matches!(moved, Some(Shown::Moved(_))), "{moved:?}");
+            kept(conn, Kept::Latest)
+        };
+
+        // The highest number.
+        let heads = [
+            change(&phrase, &first, secret(14)),
+            change(&phrase, &later, secret(18)),
+            change(&phrase, &second, secret(15)),
+            change(&phrase, &without_zero, secret(19)),
+        ];
+        assert_eq!(moved_to(&device_with(&heads)), Some(heads[1].id()));
+        // Of two at one number, the lower hash, in either order kept.
+        let at_three = [
+            change(&phrase, &first, secret(14)),
+            change(&phrase, &second, secret(15)),
+        ];
+        let lower_entry = at_three[lower].clone();
+        for heads in [at_three.clone(), [at_three[1].clone(), at_three[0].clone()]] {
+            let conn = device_with(&heads);
+            assert_eq!(moved_to(&conn), Some(lower_entry.id()));
+        }
+        // The highest whose secret does not open is passed over.
+        let wrong = sealed(&[sealed_for(4, 1, &secret(99)), sealed_for(4, 0, &secret(99))]);
+        let not_opening = change_sealing(&phrase, &later, &wrong);
+        let conn = device_with(&[not_opening, at_three[0].clone()]);
+        assert_eq!(moved_to(&conn), Some(at_three[0].id()));
+        // One that does not list it is no change to move to: it is closed.
+        let conn = device_with(&[change(&phrase, &without_zero, secret(19))]);
+        assert!(!would_move(&conn, &device(0)).unwrap());
+        assert_eq!(
+            move_to_a_clear_change(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Closed)
+        );
+        assert_eq!(state(&conn), State::Fork);
+    }
+
+    /// Rule 5 with rule 9: where moves are held back, rule 8 closes the
+    /// device in the transaction that keeps the head and its removed keys,
+    /// and the move is made after, in a transaction of its own: what the
+    /// node does so that only the move waits for the sync cycle's turn.
+    #[test]
+    fn test_a_move_held_back_is_a_close_and_then_a_move() {
+        let phrase = phrase();
+        let [_, two, ..] = statements(&phrase);
         let lists_two = two
             .next(key(0), &secret(13), listed(&[0, 1, 2]), &[])
             .unwrap();
@@ -8217,62 +8880,48 @@ mod tests {
             .next(key(1), &secret(14), listed(&[1, 0]), &[key(2)])
             .unwrap();
         let conn = db::open_in_memory().unwrap();
-        let keeps = follow(&conn, 0, &phrase, &lists_two, secret(13));
-        assert!(clear(&conn));
+        let left = follow(&conn, 0, &phrase, &lists_two, secret(13));
         let removal = change(&phrase, &removes_two, secret(14));
         assert_eq!(
-            shown(&conn, &device(0), &removal, NOW).unwrap(),
+            with_moves_held_back(|| shown(&conn, &device(0), &removal, NOW)).unwrap(),
             Shown::Closed
         );
         assert_eq!(state(&conn), State::Fork);
-        assert_eq!(kept(&conn, Kept::Latest), Some(keeps.id()));
-        assert_eq!(kept(&conn, Kept::Apart), Some(removal.id()));
+        assert_eq!(kept(&conn, Kept::Latest), Some(left.id()));
         assert_eq!(removed(&conn), vec![key(2)]);
-        assert_eq!(applied_number(&conn), 3);
-        assert_eq!(
-            crate::at_relays::stands(&conn).unwrap(),
-            crate::at_relays::Stands::Stopped(State::Fork)
-        );
-        // Closed, it takes a change made after the one it follows, that
-        // lists it and is clear, and stands applied again (rule 10).
-        let settles = Statement::settle(
-            &[&lists_two, &removes_two],
-            key(0),
-            &secret(15),
-            listed(&[0, 1]),
-            &[],
-        )
-        .unwrap();
-        let settlement = change(&phrase, &settles, secret(15));
+        // Held back on this thread only for the work given.
+        assert!(!MOVES_HELD_BACK.get());
+        assert!(would_move(&conn, &device(0)).unwrap());
         assert!(matches!(
-            shown(&conn, &device(0), &settlement, NOW).unwrap(),
-            Shown::Applied(Applied { number: 4, .. })
+            move_to_a_clear_change(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Moved(Applied { number: 3, .. }))
         ));
         assert_eq!(state(&conn), State::Applied);
-        assert_eq!(kept(&conn, Kept::Apart), None);
-        // The keys it removes stay removed after the head goes.
-        assert_eq!(removed(&conn), vec![key(2)]);
-
-        // Each side removes a different device: neither change is clear.
-        let removes_one = two
-            .next(key(0), &secret(16), listed(&[0, 2]), &[key(1)])
-            .unwrap();
-        let conn = db::open_in_memory().unwrap();
-        follow(&conn, 0, &phrase, &removes_one, secret(16));
+        assert_eq!(kept(&conn, Kept::Latest), Some(removal.id()));
+        assert_eq!(kept(&conn, Kept::Apart), Some(left.id()));
+        // Clear now: nothing more to do.
+        assert!(!would_move(&conn, &device(0)).unwrap());
         assert_eq!(
-            shown(
-                &conn,
-                &device(0),
-                &change(&phrase, &removes_two, secret(14)),
-                NOW
-            )
-            .unwrap(),
-            Shown::Closed
+            move_to_a_clear_change(&conn, &device(0), NOW).unwrap(),
+            None
         );
-        assert_eq!(state(&conn), State::Fork);
-        let mut both = vec![key(1), key(2)];
-        both.sort_unstable();
-        assert_eq!(removed(&conn), both);
+    }
+
+    /// The renumbering of a carry (decision 2026-10-04 §2.3; decision
+    /// 2026-10-24 (removal), rule 9): forward, a revision is lifted; at a
+    /// move to the same number or a lower one it stays where it is, and is
+    /// not carried where its band is above the change moved to.
+    #[test]
+    fn test_a_revision_is_renumbered_forward_only() {
+        let top = at(3, HALF + 7);
+        assert_eq!(carried_rev(top, 3, 4), Some(lifted(top)));
+        assert_eq!(carried_rev(5, 3, 7), Some(5));
+        assert_eq!(carried_rev(top, 3, 3), Some(top));
+        assert_eq!(carried_rev(at(3, 1), 4, 3), Some(at(3, 1)));
+        assert_eq!(carried_rev(at(4, 1), 4, 3), None);
+        assert_eq!(carried_rev(at(4, HALF + 1), 4, 3), None);
+        assert_eq!(carried_rev(at(2, 9), 5, 2), Some(at(2, 9)));
+        assert_eq!(carried_rev(0, 5, 2), Some(0));
     }
 
     /// Rule 1: a device keeps the change it follows and up to seven heads
@@ -8460,8 +9109,9 @@ mod tests {
 
     /// Rule 12: at its first start on this version a device in a fork
     /// judges the entry it kept apart, which step 22 set aside, by rule 8:
-    /// it goes on where the change it follows is clear, stays closed where
-    /// it is not, and stops where the other removes it. It notes the time
+    /// it goes on where the change it follows is clear, moves where it is
+    /// not and the other is clear and lists it, stays closed where neither
+    /// is, and stops where the other removes it. It notes the time
     /// of what it keeps, and judges once.
     #[test]
     fn test_at_its_first_start_a_device_in_a_fork_judges_what_it_kept() {
@@ -8501,18 +9151,31 @@ mod tests {
         assert!(!held_rows::to_judge_kept(&conn).unwrap());
         assert_eq!(judge_kept(&conn, &device(0), NOW).unwrap(), None);
 
-        // The other removes device 2, which the change it follows lists:
-        // it stays closed.
+        // The other removes device 2, which the change it follows lists,
+        // and lists it: it moves there, with no phrase (rule 9), and keeps
+        // the change it left as a head set aside.
         let lists_two = two
             .next(key(0), &secret(13), listed(&[0, 1, 2]), &[])
             .unwrap();
         let conn = in_a_fork(&lists_two, 13, &three, 3);
+        assert!(matches!(
+            judge_kept(&conn, &device(0), NOW).unwrap(),
+            Some(Shown::Moved(Applied { number: 3, .. }))
+        ));
+        assert_eq!(state(&conn), State::Applied);
+        assert_eq!(held(&conn).unwrap().unwrap().statement.statement, three);
+        assert_eq!(removed(&conn), vec![key(2)]);
+        assert_eq!(held_rows::set_aside_entries(&conn).unwrap().len(), 1);
+        // Where it does not list it, it stays closed.
+        let without_zero = two
+            .next(key(1), &secret(15), listed(&[1]), &[key(2)])
+            .unwrap();
+        let conn = in_a_fork(&lists_two, 13, &without_zero, 15);
         assert_eq!(
             judge_kept(&conn, &device(0), NOW).unwrap(),
             Some(Shown::Closed)
         );
         assert_eq!(state(&conn), State::Fork);
-        assert_eq!(removed(&conn), vec![key(2)]);
         assert_eq!(held_rows::set_aside_entries(&conn).unwrap().len(), 1);
 
         // The other removes device 0: it stops, as removed.
