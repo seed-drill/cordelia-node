@@ -241,7 +241,8 @@ pub async fn label(
     let identity = &state.identity;
     {
         let conn = db(&state);
-        match sharing::label_plan(&conn, identity, &body.key, body.label.as_deref()) {
+        let now = state.sync_control.now();
+        match sharing::label_plan(&conn, identity, &body.key, body.label.as_deref(), now) {
             Ok(Err(line)) => return Ok(HttpResponse::Ok().json(json!({ "said": [line] }))),
             Ok(Ok(_)) => {}
             Err(failed) => return answer_of(failed),
@@ -251,7 +252,13 @@ pub async fn label(
         &state,
         body.look,
         body.said_yes_to.as_deref(),
-        |conn, _, _| match sharing::label_plan(conn, identity, &body.key, body.label.as_deref()) {
+        |conn, _, now| match sharing::label_plan(
+            conn,
+            identity,
+            &body.key,
+            body.label.as_deref(),
+            now,
+        ) {
             Ok(Ok(plan)) => Ok(plan),
             Ok(Err(line)) => Err(Failed::Refused(sharing::Refusal { word: "", line })),
             Err(failed) => Err(failed),
@@ -325,7 +332,7 @@ pub async fn drop(
         &state,
         body.look,
         body.said_yes_to.as_deref(),
-        |conn, _, _| sharing::drop_plan(conn, &body.name, body.words.as_deref()),
+        |conn, _, now| sharing::drop_plan(conn, identity, &body.name, body.words.as_deref(), now),
         |conn, _, channel, now| {
             let said = sharing::make_drop(conn, identity, channel, &body.name, now)?;
             Ok(json!({ "said": [said] }))

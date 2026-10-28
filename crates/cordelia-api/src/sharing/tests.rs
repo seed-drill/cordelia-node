@@ -465,26 +465,41 @@ fn a_label_is_given_and_taken_away_as_the_table_says() {
     };
     let own = encode_public_key(&s.key(0)).unwrap();
     assert_eq!(
-        word(label_plan(conn, identity, &own, Some("me"))),
+        word(label_plan(conn, identity, &own, Some("me"), now)),
         "own_device"
     );
-    assert_eq!(word(label_plan(conn, identity, "nope", Some("me"))), "");
     assert_eq!(
-        word(label_plan(conn, identity, &carol, Some(&"x".repeat(65)))),
+        word(label_plan(conn, identity, "nope", Some("me"), now)),
+        ""
+    );
+    assert_eq!(
+        word(label_plan(
+            conn,
+            identity,
+            &carol,
+            Some(&"x".repeat(65)),
+            now
+        )),
         "bad_label"
     );
     assert_eq!(
-        word(label_plan(conn, identity, &carol, Some("\u{200b}\u{7}"))),
+        word(label_plan(
+            conn,
+            identity,
+            &carol,
+            Some("\u{200b}\u{7}"),
+            now
+        )),
         "bad_label"
     );
     assert_eq!(
-        word(label_plan(conn, identity, &carol, None)),
+        word(label_plan(conn, identity, &carol, None, now)),
         format!(
             "({}) has no label of yours.",
             six_words(&member(2).public_key())
         )
     );
-    let plan = label_plan(conn, identity, &carol, Some("carol"))
+    let plan = label_plan(conn, identity, &carol, Some("carol"), now)
         .unwrap()
         .unwrap();
     assert!(
@@ -503,7 +518,9 @@ fn a_label_is_given_and_taken_away_as_the_table_says() {
             .as_deref(),
         Some("carol")
     );
-    let none = label_plan(conn, identity, &carol, None).unwrap().unwrap();
+    let none = label_plan(conn, identity, &carol, None, now)
+        .unwrap()
+        .unwrap();
     make_label(conn, identity, &none.what, now + 1).unwrap();
     assert_eq!(label_given(conn, &member(2).public_key()).unwrap(), None);
 }
@@ -563,13 +580,13 @@ fn a_channel_is_renamed_dropped_and_told_apart_by_its_words() {
         )),
         "name_taken"
     );
-    let plan = drop_plan(conn, "other", None).unwrap();
+    let plan = drop_plan(conn, &s[0].identity, "other", None, now + 2).unwrap();
     assert!(plan.asks.contains("\"other\""));
     make_drop(conn, &s[0].identity, &plan.what, "other", now + 2).unwrap();
     let names: Vec<String> = filed(conn).unwrap().into_iter().map(|f| f.name).collect();
     assert_eq!(names, ["review"]);
     assert_eq!(
-        drop_plan(conn, "other", None)
+        drop_plan(conn, &s[0].identity, "other", None, now + 2)
             .err()
             .map(|failed| match failed {
                 Failed::Refused(refusal) => refusal.word,
@@ -780,7 +797,7 @@ fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     assert_eq!(word(shared.err().unwrap()), "removed_key");
     let accepted = accept_plan(conn, identity, &relays(), &removed, "taken", now);
     assert_eq!(word(accepted.err().unwrap()), "removed_key");
-    let labelled = label_plan(conn, identity, &removed, Some("old"));
+    let labelled = label_plan(conn, identity, &removed, Some("old"), now);
     assert_eq!(word(labelled.err().unwrap()), "removed_key");
 }
 
@@ -817,4 +834,57 @@ fn a_device_that_leaves_keeps_no_share_and_no_typed_key() {
     );
     assert!(rows::shares(conn).unwrap().is_empty());
     assert!(rows::typed_keys(conn).unwrap().is_empty());
+}
+
+/// A filing and a label past a bound are still acted on (decision
+/// 2026-10-10 §3.4: "an item in force past a bound can be undone", and a
+/// rename of a filing past it is never refused): `shared drop`, `shared
+/// rename` and `label --none` find them, as `shared list` names them.
+#[test]
+fn a_filing_and_a_label_past_a_bound_are_still_acted_on() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    // Device 1 files 16 and labels 64; device 0 then files 16 and labels
+    // 64 that are newer, which push device 1's past the bounds on device
+    // 0. Device 1's own list still carries them.
+    for (n, at) in [(1, now), (0, now + 100)] {
+        let conn = &s[n].conn;
+        for i in 0..SHARED_MAX_CHANNELS {
+            let plan = new_plan(conn, &relays(), &format!("d{n}-{i}"), &[]).unwrap();
+            make_new(conn, &s[n].identity, &plan.what, at).unwrap();
+        }
+        for i in 0..64u32 {
+            let key = member(1000 * (n as u32 + 1) + i).public_key();
+            crate::shared::tests::labels(&s, n, &key, Some("someone"), at);
+        }
+    }
+    s.meet(&[0, 1]);
+    let now = s.now + 200;
+    lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let listed = list(conn, identity, &relays(), false, now).unwrap();
+    assert!(
+        listed["past_a_bound"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("d1-0")),
+        "{}",
+        listed["past_a_bound"]
+    );
+    assert!(
+        filed(conn)
+            .unwrap()
+            .iter()
+            .all(|f| f.name.starts_with("d0-"))
+    );
+
+    let plan = drop_plan(conn, identity, "d1-0", None, now).unwrap();
+    make_drop(conn, identity, &plan.what, "d1-0", now).unwrap();
+    let said = rename(conn, identity, "d1-1", "renamed", None, now + 1).unwrap();
+    assert!(said.starts_with("Renamed \"d1-1\""), "{said}");
+    let key = encode_public_key(&member(2000).public_key()).unwrap();
+    let none = label_plan(conn, identity, &key, None, now + 2).unwrap();
+    let none = none.unwrap_or_else(|line| panic!("{line}"));
+    make_label(conn, identity, &none.what, now + 2).unwrap();
 }

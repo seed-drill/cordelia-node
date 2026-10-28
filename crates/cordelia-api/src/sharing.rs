@@ -261,6 +261,27 @@ fn label_given(conn: &Connection, key: &[u8; 32]) -> Result<Option<String>, Pers
         .and_then(|(act, _)| act.item.label))
 }
 
+/// The label the person gave `key`, in force or past a bound: what
+/// `label --none` may take away (§3.4, "an item in force past a bound can
+/// be undone").
+fn label_to_undo(
+    conn: &Connection,
+    own: &[u8; 32],
+    key: &[u8; 32],
+    now: i64,
+) -> Result<Option<String>, PersonError> {
+    if let Some(label) = label_given(conn, key)? {
+        return Ok(Some(label));
+    }
+    Ok(lists::holds_worked_out(conn, own, now)?
+        .left_out
+        .into_iter()
+        .find_map(|(act, _)| match act {
+            lists::AnyAct::Label(act) if act.item.key == *key => act.item.label,
+            _ => None,
+        }))
+}
+
 /// A label as it is shown: cleaned, and quoted.
 fn quoted(label: &str) -> String {
     format!("{:?}", crate::messages::cleaned(label))
@@ -357,6 +378,23 @@ pub fn filed(conn: &Connection) -> Result<Vec<Filing>, PersonError> {
         .collect())
 }
 
+/// The filings that a bound leaves out, worked out at `now` (§3.4): not
+/// in force, and still acted on by a rename or a drop.
+fn filed_past_a_bound(
+    conn: &Connection,
+    own: &[u8; 32],
+    now: i64,
+) -> Result<Vec<Filing>, PersonError> {
+    Ok(lists::holds_worked_out(conn, own, now)?
+        .left_out
+        .into_iter()
+        .filter_map(|(act, _)| match act {
+            lists::AnyAct::Filing(filing) => Some(filing.item),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The channel's words: the first four of its ID's fingerprint (§3.2).
 pub fn channel_words(channel: &[u8; 32]) -> String {
     fingerprint::shown(channel)
@@ -364,8 +402,24 @@ pub fn channel_words(channel: &[u8; 32]) -> String {
 
 /// The shared channel filed as `name`, and given by its words where
 /// `words` names them (§3.4, "two filings in force under one name").
-fn find(conn: &Connection, name: &str, words: Option<&str>) -> Out<Filing> {
-    let of_name: Vec<Filing> = filed(conn)?
+/// With `past`, this device's key and the time, a filing that a bound
+/// leaves out is found too: a rename and a drop act on it (§3.4), and
+/// `share` does not, since its channel is not held.
+fn find(
+    conn: &Connection,
+    name: &str,
+    words: Option<&str>,
+    past: Option<(&[u8; 32], i64)>,
+) -> Out<Filing> {
+    let mut all = filed(conn)?;
+    if let Some((own, now)) = past {
+        for filing in filed_past_a_bound(conn, own, now)? {
+            if !all.iter().any(|one| one.channel == filing.channel) {
+                all.push(filing);
+            }
+        }
+    }
+    let of_name: Vec<Filing> = all
         .into_iter()
         .filter(|filing| filing.name == name)
         .collect();
@@ -730,7 +784,7 @@ pub fn share_plan(
 ) -> Out<Plan<ShareTo>> {
     let held = standing(conn)?;
     let own = identity.public_key();
-    let filing = match find(conn, name, words) {
+    let filing = match find(conn, name, words, None) {
         Err(Failed::Refused(refusal)) if refusal.word == "no_such_channel" && words.is_none() => {
             let own_name = crate::names::listed(conn)?
                 .iter()
@@ -1275,6 +1329,7 @@ pub fn label_plan(
     identity: &NodeIdentity,
     typed: &str,
     label: Option<&str>,
+    now: i64,
 ) -> Out<Result<Plan<Labelling>, String>> {
     let held = standing(conn)?;
     let own = identity.public_key();
@@ -1282,7 +1337,7 @@ pub fn label_plan(
     another_persons(conn, &held, &own, &key, "label")?;
     let six = six_words(&key);
     let Some(label) = label else {
-        if label_given(conn, &key)?.is_none() {
+        if label_to_undo(conn, &own, &key, now)?.is_none() {
             return Ok(Err(format!("({six}) has no label of yours.")));
         }
         let asks = format!(
@@ -1349,7 +1404,7 @@ pub fn rename(
     now: i64,
 ) -> Out<String> {
     let held = standing(conn)?;
-    let filing = find(conn, name, words)?;
+    let filing = find(conn, name, words, Some((&identity.public_key(), now)))?;
     name_free(conn, new)?;
     let renamed = Filing {
         name: new.into(),
@@ -1364,9 +1419,15 @@ pub fn rename(
 
 /// `cordelia shared drop <name> [--words]` (§3.4, §5.2): what it would drop,
 /// and its yes.
-pub fn drop_plan(conn: &Connection, name: &str, words: Option<&str>) -> Out<Plan<[u8; 32]>> {
+pub fn drop_plan(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    words: Option<&str>,
+    now: i64,
+) -> Out<Plan<[u8; 32]>> {
     standing(conn)?;
-    let filing = find(conn, name, words)?;
+    let filing = find(conn, name, words, Some((&identity.public_key(), now)))?;
     let asks = format!(
         "This stops every device of yours holding the shared channel \"{name}\". Its other \
          members are not told, and still hold it. What it held is taken off your devices."
@@ -1587,13 +1648,9 @@ pub fn list(
             "taken": taken,
         }));
     }
-    let past: Vec<String> = lists::holds_worked_out(conn, &own, now)?
-        .left_out
-        .iter()
-        .filter_map(|(act, _)| match act {
-            lists::AnyAct::Filing(filing) => Some(filing.item.name.clone()),
-            _ => None,
-        })
+    let past: Vec<String> = filed_past_a_bound(conn, &own, now)?
+        .into_iter()
+        .map(|filing| filing.name)
         .collect();
     Ok(json!({
         "channels": channels,
