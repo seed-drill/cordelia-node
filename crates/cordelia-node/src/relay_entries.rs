@@ -1005,20 +1005,29 @@ impl RelayEntries {
             // is over is told "not now", and that is no breach: whoever
             // shows an earlier entry again and again is handed one entry
             // beyond its bytes for the minute, and no more.
+            let mut not_now = false;
             if !who.listed
                 && let Shown::Another { cost, .. } = &found
             {
                 let mut rates = db.nested(Nested::Rates, rates);
                 if rates.fetch_room(who.peer, who.address) == 0 {
-                    return Answer::NotNow;
+                    not_now = true;
+                } else {
+                    rates.answered(who.peer, who.address, *cost);
                 }
-                rates.answered(who.peer, who.address, *cost);
             }
-            showing
+            (showing, not_now)
         };
-        // What was stored is passed on, whatever the answer hands.
+        let (showing, not_now) = showing;
+        // What was stored is passed on, whatever the answer hands, and
+        // also where the asker is told "not now": it is stored all the
+        // same, and a later show of it is answered "held", which passes
+        // nothing on (decision 2026-10-24 (removal), rule 17).
         if showing.stored {
             self.took(std::iter::once(&entry), who.listed.then_some(who.peer));
+        }
+        if not_now {
+            return Answer::NotNow;
         }
         // An entry handed whole is not handed again on this connection
         // (decision 2026-10-24 (removal), rule 16).
@@ -7001,5 +7010,37 @@ mod tests {
                 .is_empty()
         );
         assert!(lock(&*at.entries.heads).heads.is_empty());
+    }
+
+    /// Rule 17, where the asker is over its allowance (the review of slice
+    /// 6, its medium): the relay keeps the laptop's change 3, and a device
+    /// whose address has been handed all it may be in the minute shows the
+    /// desktop's removal. The removal is stored, and the device is told
+    /// "not now", since the answer would hand it the laptop's change. The
+    /// removal waits for the relay it works with all the same: a later show
+    /// of it is answered "held", which passes nothing on.
+    #[test]
+    fn a_head_stored_by_a_show_answered_not_now_waits_to_be_offered() {
+        let at = relay_of(u64::MAX, &[9]);
+        let (laptop, desktop) = made_apart(1);
+        pushed(at.push(1, vec![laptop.to_wire()]));
+        let first = at.entries.to_pass_on(&at.db, &[peer(9)]);
+        for message in &first[0].1 {
+            RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+        }
+        RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        assert!(at.entries.to_pass_on(&at.db, &[peer(9)]).is_empty());
+
+        // The device's address has been handed all it may be.
+        lock(&at.rates).fetched(&peer(2), address(2), MINUTE);
+        assert_eq!(at.fetch_room(2), 0);
+        assert!(matches!(at.show(2, desktop.to_wire()), Answer::NotNow));
+        // It was stored, and waits for relay 9.
+        let offered: Vec<[u8; 32]> = waiting_for(&at.entries.to_pass_on(&at.db, &[peer(9)]), 9)
+            .iter()
+            .flatten()
+            .map(|passed| Entry::from_wire(&passed.entry).unwrap().id())
+            .collect();
+        assert_eq!(offered, [desktop.id()]);
     }
 }
