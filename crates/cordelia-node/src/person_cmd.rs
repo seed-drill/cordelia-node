@@ -2124,7 +2124,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                      another device, even if this command is stopped now: two changes made \
                      apart have to be settled with the phrase."
                 );
-                return stays_in_a_new_process(config_path, number);
+                return stays_in_a_new_process(config_path, number, &entry.id());
             }
             // A statement arrived between the prompt and the phrase:
             // nothing was made, and it asks again.
@@ -2609,7 +2609,7 @@ pub const NOT_AT_EVERY_RELAY_STATUS: i32 = 3;
 /// What this process has said is written out first. Where the program
 /// cannot be run again (it was replaced where it lay, say), nothing waits
 /// in this process: the command says where to look, and ends.
-fn stays_in_a_new_process(config_path: &str, number: u64) -> anyhow::Result<()> {
+fn stays_in_a_new_process(config_path: &str, number: u64, made: &[u8; 32]) -> anyhow::Result<()> {
     use std::io::Write;
     // The change is made: a failure from here on gives the status of a
     // change not known to be at every relay, and never 1 (decision
@@ -2627,6 +2627,8 @@ fn stays_in_a_new_process(config_path: &str, number: u64) -> anyhow::Result<()> 
                 .arg(config_path)
                 .arg(STAYS_COMMAND)
                 .arg(number.to_string())
+                .arg("--entry")
+                .arg(hex::encode(made))
                 .exec(),
             Err(e) => e,
         }
@@ -2661,6 +2663,9 @@ enum Waited {
     /// The device has since applied another change: whether that one is
     /// at every relay is the business of the command that made it.
     Another,
+    /// The device moved from this change, with no phrase, to a change made
+    /// apart that is clear (decision 2026-10-24 (removal), rule 9).
+    Moved,
     /// The device no longer stands in its phrase
     /// ([`wait::no_longer_stands`]).
     NoLongerStands,
@@ -2668,22 +2673,26 @@ enum Waited {
 
 /// The exit status of the wait after a change, as it ended (decision
 /// 2026-10-19 §4, rule 8): 0 only at ends 1 and 2; 3 at end 3, where the
-/// device has since applied another change or no longer stands in its
-/// phrase, and on any error during the wait.
+/// device has since applied another change, moved from this one (decision
+/// 2026-10-24 (removal), rule 9) or no longer stands in its phrase, and on
+/// any error during the wait.
 fn status_of(waited: &anyhow::Result<Waited>) -> i32 {
     match waited {
         Ok(Waited::Ended(end)) => end.status(),
-        Ok(Waited::Another | Waited::NoLongerStands) | Err(_) => NOT_AT_EVERY_RELAY_STATUS,
+        Ok(Waited::Another | Waited::Moved | Waited::NoLongerStands) | Err(_) => {
+            NOT_AT_EVERY_RELAY_STATUS
+        }
     }
 }
 
-/// `cordelia change-made <number>`: what `remove-device`, `renew` and
-/// `settle` go on to once the change numbered so is made ([`stays`]). It
-/// asks nothing, and holds no phrase. Gives the command's exit status
-/// ([`status_of`]): an error during the wait is said on standard error
-/// first, with that the change is made.
-pub fn change_made(config_path: &str, number: u64) -> i32 {
-    let waited = stays(config_path, number);
+/// `cordelia change-made <number> --entry <id>`: what `remove-device`,
+/// `renew` and `settle` go on to once the change numbered so, whose change
+/// entry `made` names in hex, is made ([`stays`]). It asks nothing, and
+/// holds no phrase. Gives the command's exit status ([`status_of`]): an
+/// error during the wait is said on standard error first, with that the
+/// change is made.
+pub fn change_made(config_path: &str, number: u64, made: Option<&str>) -> i32 {
+    let waited = stays(config_path, number, made);
     if let Err(e) = &waited {
         eprintln!("{}", wait::could_not_go_on(number, e));
     }
@@ -2875,8 +2884,10 @@ fn still_to_send_to(sent: &Value) -> Vec<String> {
 /// It ends at the first of the three ends that holds (decision 2026-10-19
 /// §4, rule 8: [`wait::end_of`]), by each relay's class and the node's
 /// `word_to_come` as its look gives them, and says what that end says.
-fn stays(config_path: &str, number: u64) -> anyhow::Result<Waited> {
-    waits_after(number, &TheNode(config_path), |line| println!("{line}"))
+fn stays(config_path: &str, number: u64, made: Option<&str>) -> anyhow::Result<Waited> {
+    waits_after(number, made, &TheNode(config_path), |line| {
+        println!("{line}")
+    })
 }
 
 /// What the wait after a change asks of the node, and the clock it goes
@@ -2927,8 +2938,16 @@ impl AfterAChange for TheNode<'_> {
 /// once a minute where none comes ([`wait::Told`], decision 2026-10-24,
 /// rule 3); then the line that each end begins with, and what that end
 /// says.
+///
+/// **A device that moves from the change ends the wait with status 3**
+/// (decision 2026-10-24 (removal), rule 9), and says why: a change made
+/// apart removed a device that this change lists, and the device follows
+/// that change now. `made` names the change's entry, in hex, so that a
+/// move at the same number is known as one; a look that keeps another
+/// entry than it after the device stopped is another change.
 fn waits_after(
     number: u64,
+    made: Option<&str>,
     node: &impl AfterAChange,
     mut say: impl FnMut(String),
 ) -> anyhow::Result<Waited> {
@@ -2946,6 +2965,11 @@ fn waits_after(
         }
         let seen = node.look()?;
         let at = node.now();
+        if let Some(says) = made.and_then(|made| wait::moved_from(&seen, made)) {
+            say(wait::Told::ended(at));
+            say(says);
+            return Ok(Waited::Moved);
+        }
         if seen["change"].as_u64() != Some(number) {
             say(wait::Told::ended(at));
             say("This device has since applied another change: `cordelia devices` says.".into());
@@ -2955,6 +2979,11 @@ fn waits_after(
             say(wait::Told::ended(at));
             say(line);
             return Ok(Waited::NoLongerStands);
+        }
+        if made.is_some_and(|made| seen["latest"].as_str() != Some(made)) {
+            say(wait::Told::ended(at));
+            say("This device has since applied another change: `cordelia devices` says.".into());
+            return Ok(Waited::Another);
         }
         let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
         let lines = after_a_change(&seen, number, &own, at);
@@ -4183,7 +4212,7 @@ mod tests {
         };
         assert!(matches!(
             read.command,
-            Some(crate::Commands::ChangeMade { number: 3 })
+            Some(crate::Commands::ChangeMade { number: 3, .. })
         ));
         // It is not among the commands that the help lists.
         use clap::CommandFactory;
@@ -4529,7 +4558,7 @@ mod tests {
         /// What the wait says of these looks, and how it ends.
         fn said(&self) -> (anyhow::Result<Waited>, Vec<String>) {
             let mut said = Vec::new();
-            let waited = waits_after(3, self, |line| said.push(line));
+            let waited = waits_after(3, None, self, |line| said.push(line));
             (waited, said)
         }
     }
@@ -4764,6 +4793,7 @@ mod tests {
                     "This device has since applied another change: `cordelia devices` says.".into(),
                 ],
                 Waited::NoLongerStands => vec![wait::no_longer_stands(&seen).unwrap()],
+                Waited::Moved => unreachable!("no change was named, so none was moved from"),
             };
             assert_eq!(said[ended + 1..], end_says, "{said:?}");
             assert!(
@@ -4771,6 +4801,56 @@ mod tests {
                 "{said:?}"
             );
         }
+    }
+
+    /// **A device that moves from the change ends the wait with status 3**
+    /// (decision 2026-10-24 (removal), rule 9), and says why, in the words
+    /// the node noted at the move: at another number and at the same one,
+    /// where the look names the change entry that the command made as one
+    /// the device moved from. A look that keeps another entry than the one
+    /// made, with no move from it, is another change; and a move from
+    /// another entry is not this change's.
+    #[test]
+    fn a_device_that_moves_from_the_change_ends_the_wait_with_status_3() {
+        use wait::OwnWord;
+        use wait::tests::{KEPT, Scenario::Ok as Reached};
+        let made = hex::encode(KEPT);
+        let says = "a change made apart on (w) \"desktop\" removed (x) \"tablet\", which this \
+                    change lists: this device follows that change now";
+        let waited_on = |seen: Value| {
+            let node = Looks::from(AT_10_53, vec![(AT_10_53 + 5, seen)]);
+            let mut said = Vec::new();
+            let waited = waits_after(3, Some(&made), &node, |line| said.push(line));
+            (waited, said)
+        };
+        let moved = |number: u64| {
+            let mut seen = after(&[Reached], OwnWord::Sent);
+            seen["change"] = json!(number);
+            seen["latest"] = json!(hex::encode([9u8; 32]));
+            seen["moved"] = json!([{ "from": made, "says": says }]);
+            seen
+        };
+        for number in [2, 3, 4] {
+            let (waited, said) = waited_on(moved(number));
+            let waited = waited.unwrap();
+            assert_eq!(waited, Waited::Moved, "{said:?}");
+            assert_eq!(status_of(&Ok(waited)), 3);
+            assert_eq!(said.last().map(String::as_str), Some(says), "{said:?}");
+            assert!(
+                said.iter()
+                    .any(|line| line == "  10:53:05  The wait has ended."),
+                "{said:?}"
+            );
+        }
+        // Another entry kept at the same number, with no move from this
+        // one: another change.
+        let mut another = moved(3);
+        another["moved"] = json!([{ "from": hex::encode([7u8; 32]), "says": says }]);
+        let (waited, said) = waited_on(another);
+        assert_eq!(waited.unwrap(), Waited::Another, "{said:?}");
+        // The entry made, still kept: the wait ends as it would.
+        let (waited, said) = waited_on(after(&[Reached, Reached], OwnWord::Sent));
+        assert_eq!(waited.unwrap(), Waited::Ended(wait::End::Done), "{said:?}");
     }
 
     /// **The count of a relay that the wait waits out** (decision
@@ -4853,6 +4933,7 @@ mod tests {
         assert_eq!(status_of(&Ok(Waited::Ended(End::Warned))), 0);
         assert_eq!(status_of(&Ok(Waited::Ended(End::NotDone))), 3);
         assert_eq!(status_of(&Ok(Waited::Another)), 3);
+        assert_eq!(status_of(&Ok(Waited::Moved)), 3);
         assert_eq!(status_of(&Ok(Waited::NoLongerStands)), 3);
         assert_eq!(status_of(&Err(anyhow::anyhow!("the node stopped"))), 3);
         let (said, status) = wait_not_started(&"no such file");

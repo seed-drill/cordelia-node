@@ -962,7 +962,9 @@ CREATE TABLE message_bounds (
 ///   each key that a record of an addition under it adds, counted or not.
 ///   They are kept apart from the records (`person_additions`), whose
 ///   bound of 256 drops a record and never its key from here. At most
-///   2,048 a change.
+///   2,048 a change. A change's rows stay for as long as the device keeps
+///   it, followed or as a head set aside, with its row past the bound
+///   below: at a move the change left keeps them, with its records' keys.
 /// - `person_holders_past`: each change that a record would have given a
 ///   2,049th holder. Such a change is not clear.
 ///

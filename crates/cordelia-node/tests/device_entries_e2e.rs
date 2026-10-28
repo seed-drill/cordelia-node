@@ -2707,8 +2707,9 @@ async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_n
 /// it lists the lost device, which the laptop's removes, and the laptop's
 /// is clear (decision 2026-10-24 (removal), rule 8). The tablet, once it is
 /// shown the laptop's, knows the lost device to be removed: the change it
-/// follows is not clear, and it is closed (until the move of rule 9 is
-/// built).
+/// follows is not clear, and it moves, with no phrase, to the laptop's,
+/// which is clear and lists it, and sets the lost one's aside (rule 9;
+/// section 4, case 7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
     let (near, far) = (relay_started("near", None), relay_started("far", None));
@@ -2775,15 +2776,15 @@ async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_
         (shows.entry.id(), shows.set_aside),
         (again.id(), vec![unheard.id()])
     );
-    // And the tablet, which applied the lost one's, is closed once it is
-    // shown the laptop's, at the relay that holds that one.
+    // And the tablet, which applied the lost one's, moves to the
+    // laptop's once it is shown it, at the relay that holds that one.
     behind.connects("near", &near).await;
     behind.passes().await;
-    assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(behind.stands(), Stands::Applied);
     let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
     assert_eq!(
         (shows.entry.id(), shows.set_aside),
-        (unheard.id(), vec![again.id()])
+        (again.id(), vec![unheard.id()])
     );
 }
 
@@ -4941,6 +4942,120 @@ async fn a_hand_over_is_a_change_of_settings_only_where_it_is_taken() {
     assert_eq!(new.latest().id(), adder.latest().id());
     assert_eq!(new.state.sync_control.generation(), counted + 2);
     assert!(!new.state.own_channels.first_fetch_done(&channel, noted));
+}
+
+/// A move at `cordelia accept` waits for the sync cycle's turn, and the
+/// device is closed while it waits (decision 2026-10-24 (removal), rules 5
+/// and 9). The laptop follows its own change, which lists the tablet. The
+/// desktop, apart from it, removes the tablet and adds the laptop again by
+/// a hand-over. Accepted, the hand-over's change is clear and counts the
+/// laptop by its record: the laptop moves to it. The removed key and the
+/// close commit first, so that while a cycle holds its turn the laptop
+/// stands closed, and seals nothing under the change it leaves; once the
+/// turn ends it has moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_at_accept_waits_for_the_cycle_with_the_device_closed() {
+    let relay = relay_started("relay", None);
+    let (mut desktop, mut laptop, tablet) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    desktop.makes_the_phrase(&phrase());
+    desktop.adds(&laptop);
+    desktop.adds(&tablet);
+    // Apart: the laptop's change lists the tablet; the desktop's removes
+    // it, and lists the desktop alone. The desktop adds the laptop again.
+    laptop.changes(&phrase(), &[&laptop, &desktop, &tablet], &[]);
+    let removal = desktop.changes(&phrase(), &[&desktop], &[&tablet]);
+    let now = desktop.now();
+    add_device(
+        &desktop.db(),
+        &desktop.state.identity,
+        &laptop.key(),
+        "laptop",
+        now,
+    )
+    .unwrap();
+    desktop.connects("relay", &relay).await;
+    desktop.passes().await;
+
+    laptop.connects("relay", &relay).await;
+    let typed = types(&laptop, &desktop);
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let counted = laptop.state.sync_control.generation();
+    // A cycle holds its turn while the hand-over is read.
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| handle.block_on(asks_for_hand_over(&laptop, "relay", &typed)));
+        // The move asks for its change of settings, and waits for the turn.
+        let waited = std::time::Instant::now();
+        while laptop.state.sync_control.generation() == counted {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no move asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
+        assert!(removed.contains(&tablet.key()));
+        drop(turn);
+        let read = reading.join().unwrap();
+        let Ok(PairRead::Read(read)) = read else {
+            panic!("{read:?}");
+        };
+        assert!(
+            matches!(read.as_slice(), [Accepted::Applied(_)]),
+            "{read:?}"
+        );
+    });
+    assert_eq!(laptop.stands(), Stands::Applied);
+    assert_eq!(laptop.latest().id(), removal.id());
+}
+
+/// A move in the pass waits for the sync cycle's turn, and the device is
+/// closed while it waits (decision 2026-10-24 (removal), rules 5 and 9):
+/// the pass holds the move back, so the head and its removed keys commit
+/// at once with the device closed, and only the move waits. The laptop
+/// follows its own change, which lists the tablet; the relay holds the
+/// desktop's, made apart, which removes the tablet and lists the laptop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_in_the_pass_waits_for_the_cycle_with_the_device_closed() {
+    let relay = relay_started("relay", None);
+    let (mut desktop, mut laptop, tablet) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    desktop.makes_the_phrase(&phrase());
+    desktop.adds(&laptop);
+    desktop.adds(&tablet);
+    laptop.changes(&phrase(), &[&laptop, &desktop, &tablet], &[]);
+    let removal = desktop.changes(&phrase(), &[&desktop, &laptop], &[&tablet]);
+    desktop.connects("relay", &relay).await;
+    desktop.passes().await;
+    assert!(holds_at(&relay, &removal.channel, &removal.id()));
+
+    laptop.connects("relay", &relay).await;
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let counted = laptop.state.sync_control.generation();
+    // A cycle holds its turn while the laptop passes.
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        let waited = std::time::Instant::now();
+        while laptop.state.sync_control.generation() == counted {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no move asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
+        assert!(removed.contains(&tablet.key()));
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.stands(), Stands::Applied);
+    assert_eq!(laptop.latest().id(), removal.id());
 }
 
 /// The door for a typed key can do nothing else. It asks the relay

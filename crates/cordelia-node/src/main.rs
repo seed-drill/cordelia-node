@@ -322,6 +322,10 @@ enum Commands {
     ChangeMade {
         /// The change's number
         number: u64,
+        /// Its change entry, in hex: a device that moves from it ends the
+        /// wait with status 3 (decision 2026-10-24 (removal), rule 9)
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// List your devices and what each relay has
     ///
@@ -729,9 +733,9 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         // Its own exit status: 3 where the change is made and not known
         // to be at every relay (decision 2026-10-19 §4, rule 8).
-        Some(Commands::ChangeMade { number }) => {
-            std::process::exit(person_cmd::change_made(&cli.config, number))
-        }
+        Some(Commands::ChangeMade { number, entry }) => std::process::exit(
+            person_cmd::change_made(&cli.config, number, entry.as_deref()),
+        ),
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
         Some(Commands::RecoverMade {
             number,

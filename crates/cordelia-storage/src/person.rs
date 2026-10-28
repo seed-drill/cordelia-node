@@ -842,23 +842,46 @@ pub fn holders_past_bound(
     .map_err(storage)
 }
 
-/// Keep the holders of no change but the one whose statement is numbered
-/// `number` and hashes to `hash`: the change the device comes to follow.
-/// Returns how many rows went.
+/// Keep the holders, and the mark past their bound, of no change but
+/// those in `kept`, each by its statement's number and hash: the change
+/// the device comes to follow and every change it keeps as a head set
+/// aside (decision 2026-10-24 (removal), rule 3). A head is judged by them
+/// for as long as it is kept, so what made it not clear stays. Returns how
+/// many rows went.
 pub fn forget_holders_but(
     conn: &Connection,
-    number: u64,
-    hash: &[u8; 16],
+    kept: &[(u64, [u8; 16])],
 ) -> Result<usize, CordeliaError> {
-    let number = i64::try_from(number).unwrap_or(i64::MAX);
+    let kept: Vec<(i64, [u8; 16])> = kept
+        .iter()
+        .map(|(number, hash)| (i64::try_from(*number).unwrap_or(i64::MAX), *hash))
+        .collect();
     let mut gone = 0;
     for table in ["person_holders", "person_holders_past"] {
-        gone += conn
-            .execute(
-                &format!("DELETE FROM {table} WHERE NOT (number = ?1 AND hash = ?2)"),
-                params![number, hash.as_slice()],
-            )
+        let mut stmt = conn
+            .prepare(&format!("SELECT DISTINCT number, hash FROM {table}"))
             .map_err(storage)?;
+        let held = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        for (number, hash) in held {
+            if kept
+                .iter()
+                .any(|(n, h)| *n == number && h.as_slice() == hash.as_slice())
+            {
+                continue;
+            }
+            gone += conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE number = ?1 AND hash = ?2"),
+                    params![number, hash],
+                )
+                .map_err(storage)?;
+        }
     }
     Ok(gone)
 }
@@ -1342,10 +1365,15 @@ mod tests {
         assert!(holders_past_bound(&conn, 3, &three).unwrap());
         assert!(!holders_past_bound(&conn, 3, &four).unwrap());
 
-        forget_holders_but(&conn, 4, &four).unwrap();
+        // A change still kept keeps its holders and its mark past the
+        // bound; one that is not loses both.
+        forget_holders_but(&conn, &[(4, four), (3, three)]).unwrap();
+        assert_eq!(holders(&conn, 3, &three).unwrap().len(), MAX_KNOWN_HOLDERS);
+        assert!(holders_past_bound(&conn, 3, &three).unwrap());
+        assert!(holders(&conn, 3, &four).unwrap().is_empty());
+        forget_holders_but(&conn, &[(4, four)]).unwrap();
         assert!(holders(&conn, 3, &three).unwrap().is_empty());
         assert!(!holders_past_bound(&conn, 3, &three).unwrap());
-        assert!(holders(&conn, 3, &four).unwrap().is_empty());
         assert_eq!(holders(&conn, 4, &four).unwrap(), vec![[5; 32]]);
         forget_removals(&conn).unwrap();
         assert!(holders(&conn, 4, &four).unwrap().is_empty());

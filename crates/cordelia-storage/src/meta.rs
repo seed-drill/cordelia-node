@@ -131,6 +131,12 @@ pub const PERSON_REMOVED_PAST_BOUND: &str = "person.removed_past_bound";
 /// a fork then applies rule 8 to the entry it kept apart.
 pub const PERSON_JUDGE_KEPT: &str = "person.judge_kept";
 
+/// JSON array of the moves this device made (decision 2026-10-24
+/// (removal), rule 9), the latest last, up to `MAX_CHANGE_HEADS`: each the
+/// change entry it left, in hex, and what a command that waits after that
+/// change says of the move. It goes when the device leaves its phrase.
+pub const PERSON_MOVED_FROM: &str = "person.moved_from";
+
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version
 /// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).

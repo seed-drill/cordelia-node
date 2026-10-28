@@ -883,7 +883,11 @@ impl Leave {
     /// ([`AppState::as_a_change_where`], decision 2026-10-04 §4.2):
     /// where one is taken, it waits for a sync cycle that is running to
     /// stop, and counts as a change of settings. One that is refused
-    /// counts as none.
+    /// counts as none. **What it says of removals commits first**
+    /// ([`adding::know_what_is_handed`]): the keys its change removes, and
+    /// the close where the change followed is then not clear, so that a
+    /// move that waits for the cycle waits with the device closed
+    /// (decision 2026-10-24 (removal), rule 5).
     pub async fn pair(
         &self,
         state: &AppState,
@@ -956,6 +960,15 @@ impl Leave {
                 .collect();
             for entry in &handed {
                 let now = unix();
+                // What the hand-over says of removals commits first, with
+                // the close it brings: a move waits for the cycle's turn
+                // below, and the device sends nothing meanwhile under a
+                // change it knows not to be clear (decision 2026-10-24
+                // (removal), rule 5).
+                let known = adding::know_what_is_handed(&lock(db), identity, typed, entry, now);
+                if let Err(e) = known {
+                    return Err(not(&format!("could not judge a hand-over: {e}")));
+                }
                 // It is a change of settings only where the hand-over was
                 // taken: a statement was applied, or the device's state
                 // changed. A device that is moved has left the phrase it
