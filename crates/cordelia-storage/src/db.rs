@@ -66,6 +66,34 @@ pub fn automatic_checkpoint_off(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// The pages this connection has written to its write-ahead log since the
+/// count was last cleared, clearing it where `clear` (issue #224): SQLite's
+/// own count of the pages a connection writes, which in write-ahead mode
+/// are the log's frames (SQLITE_DBSTATUS_CACHE_WRITE). A relay's timer
+/// reads it to checkpoint only once the log holds
+/// RELAY_CHECKPOINT_LOG_PAGES, and clears it when a checkpoint writes the
+/// log back whole: the next commit starts the log again.
+pub fn log_pages_written(conn: &Connection, clear: bool) -> Result<u64, StorageError> {
+    use rusqlite::ffi;
+    let (mut now, mut most) = (0, 0);
+    // SAFETY: the handle is this connection's, open for as long as `conn`
+    // is borrowed; sqlite3_db_status writes the two integers it is given
+    // and nothing else.
+    let rc = unsafe {
+        ffi::sqlite3_db_status(
+            conn.handle(),
+            ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+            &mut now,
+            &mut most,
+            i32::from(clear),
+        )
+    };
+    if rc != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None).into());
+    }
+    Ok(u64::try_from(now).unwrap_or(0))
+}
+
 /// Write the write-ahead log back into the database file, as much of it
 /// as no reader holds, without waiting for a reader (issue #224): SQLite's
 /// passive checkpoint, which calls no busy handler. Returns whether the
@@ -173,7 +201,8 @@ mod tests {
     /// the 1,000 pages at which SQLite would have checkpointed inside a
     /// commit; with it on, as a store is opened, it does not. A passive
     /// checkpoint then writes it back whole, and the next commit starts the
-    /// log again and cuts its file to RELAY_LOG_KEPT_BYTES.
+    /// log again over its file, which is shorter than RELAY_LOG_KEPT_BYTES
+    /// and so kept.
     #[test]
     fn with_the_automatic_checkpoint_off_no_commit_checkpoints() {
         use cordelia_core::protocol::RELAY_LOG_KEPT_BYTES;
@@ -220,7 +249,84 @@ mod tests {
             "a passive checkpoint cuts nothing"
         );
         insert(&conn, 1_500, "w");
+        assert!(before < RELAY_LOG_KEPT_BYTES as u64);
+        assert_eq!(wal_bytes(&path), before, "the log starts again in place");
+    }
+
+    /// Writes `bytes` of log in one transaction, in rows of a page each,
+    /// with keys from `from`.
+    fn log_of(conn: &Connection, from: usize, bytes: u64) {
+        let page: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let value = "v".repeat(page as usize);
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..bytes / page {
+            conn.execute(
+                "INSERT INTO node_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("k{}", from as u64 + i), value],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    /// A log as long as a second's at a thousand pushes a second (27 MiB,
+    /// issue #224), written back whole, keeps its file when the next commit
+    /// starts it again: the next second's commits write over it and do not
+    /// grow it. A log longer than RELAY_LOG_KEPT_BYTES, as one a reader
+    /// held for long, is cut back to it.
+    #[test]
+    fn a_seconds_log_keeps_its_file_and_a_longer_one_is_cut() {
+        use cordelia_core::protocol::RELAY_LOG_KEPT_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let conn = open(&path).unwrap();
+        automatic_checkpoint_off(&conn).unwrap();
+        let one = |key: &str| {
+            conn.execute("INSERT INTO node_meta (key, value) VALUES (?1, 'w')", [key])
+                .unwrap();
+        };
+        log_of(&conn, 0, 27 << 20);
+        let second = wal_bytes(&path);
+        assert!(second > 27 << 20);
+        assert!(checkpoint_passive(&conn).unwrap());
+        one("after the second");
+        assert_eq!(wal_bytes(&path), second, "the log's file was cut");
+
+        log_of(&conn, 1 << 20, RELAY_LOG_KEPT_BYTES as u64 + (8 << 20));
+        assert!(wal_bytes(&path) > RELAY_LOG_KEPT_BYTES as u64);
+        assert!(checkpoint_passive(&conn).unwrap());
+        one("after the long one");
         assert!(wal_bytes(&path) <= RELAY_LOG_KEPT_BYTES as u64);
+    }
+
+    /// The pages written to the log are counted from the connection's
+    /// start, as the log's frames are: a commit of a row a page long adds
+    /// at least a page, a read adds none, and a clear starts the count
+    /// again (issue #224).
+    #[test]
+    fn the_pages_written_to_the_log_are_counted_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let conn = open(&path).unwrap();
+        automatic_checkpoint_off(&conn).unwrap();
+        assert!(checkpoint_truncating(&conn).unwrap());
+        log_pages_written(&conn, true).unwrap();
+        assert_eq!(log_pages_written(&conn, false).unwrap(), 0);
+        log_of(&conn, 0, 400 * 4096);
+        let page: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let frames = (wal_bytes(&path) - 32) / (page + 24);
+        let written = log_pages_written(&conn, false).unwrap();
+        assert!(written >= 400, "{written}");
+        assert_eq!(written, frames, "the count is the log's frames");
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM node_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(log_pages_written(&conn, true).unwrap(), written);
+        assert_eq!(log_pages_written(&conn, false).unwrap(), 0);
     }
 
     /// A passive checkpoint answers at once where a reader holds the log,
