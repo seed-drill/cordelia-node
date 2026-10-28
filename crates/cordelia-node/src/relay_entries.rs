@@ -3689,6 +3689,12 @@ mod tests {
             {
                 std::thread::yield_now();
             }
+            // A slow start is said as one, not taken for a tick that queued;
+            // the lock is let go first, or the waiting tick would never end.
+            if !at.entries.checkpointing.load(Ordering::Acquire) {
+                drop(held);
+                panic!("the waiting tick did not start within a second");
+            }
             // The other ticks from a thread of their own, so that a tick
             // that queued on the lock fails the test rather than hang it.
             let (said, answers) = std::sync::mpsc::channel();

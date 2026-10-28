@@ -870,6 +870,12 @@ fn open_the_nodes_database(
         Ok(conn) => {
             if relay_entries::kept_by(role) {
                 cordelia_storage::db::automatic_checkpoint_off(&conn)?;
+                // What a stop that was not clean left in the log is written
+                // back now: the timer counts only the pages this connection
+                // writes, and would leave it until as many are written again.
+                if let Err(e) = cordelia_storage::db::checkpoint_passive(&conn) {
+                    tracing::warn!(error = %e, "could not write the log back at the start");
+                }
             }
             Ok((conn, None))
         }
@@ -9386,6 +9392,37 @@ mod tests {
             let command = open_database(&db_path, &as_a(role)).unwrap();
             assert_eq!(every(&command), (1000, -1), "{role}");
         }
+    }
+
+    /// A relay that starts over a log a stop that was not clean left writes
+    /// it back at once (issue #224): its timer counts only the pages its
+    /// own connection writes, and would leave the log until as many were
+    /// written again.
+    #[test]
+    fn a_relay_writes_back_at_its_start_a_log_left_from_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relay.db");
+        let mut config = Config::default();
+        config.network.role = "relay".into();
+        let (before, _) = open_the_nodes_database(&db_path, &config).unwrap();
+        before
+            .execute_batch(
+                "CREATE TABLE left (n INTEGER, v BLOB);
+                 WITH RECURSIVE k(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM k WHERE n < 500)
+                 INSERT INTO left SELECT n, zeroblob(4096) FROM k;",
+            )
+            .unwrap();
+        // As a process that is killed: the connection is never closed, so
+        // nothing writes its log back.
+        std::mem::forget(before);
+        let file = || std::fs::metadata(&db_path).unwrap().len();
+        let left = file();
+        let (_started, _) = open_the_nodes_database(&db_path, &config).unwrap();
+        assert!(
+            file() >= left + 500 * 4096,
+            "the log was not written back: {left} then {} bytes",
+            file()
+        );
     }
 
     /// The node sets `secure_delete` on a personal node's store before
