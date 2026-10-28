@@ -492,6 +492,10 @@ pub struct DeviceEntries {
     /// Whether the start was noted in what is known of the relays
     /// ([`known::started`]): once a node runs, at its first pass.
     started: AtomicBool,
+    /// Whether the leave counts the commits of the node's database
+    /// ([`Leave::watch_commits`]): from the first pass, which is the first
+    /// that can push.
+    watching: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -517,14 +521,10 @@ impl DeviceEntries {
         reach: Arc<Reach>,
     ) -> Arc<Self> {
         let counts = state.load.device.clone();
-        let leave = Leave::new(clock.clone()).counting(counts);
-        // A push open at the commit after which the device may use the
-        // connection no more is reset (decision 2026-10-24 (removal), rule
-        // 5): the commits of the node's database are counted.
-        leave.watch_commits(&lock(&state.db));
         Arc::new(Self {
             state,
-            leave,
+            leave: Leave::new(clock.clone()).counting(counts),
+            watching: AtomicBool::new(false),
             clock,
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
@@ -585,6 +585,13 @@ impl DeviceEntries {
     async fn passing(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
         if self.state.held.why().is_some() {
             return;
+        }
+        // A push open at the commit after which the device may use the
+        // connection no more is reset (decision 2026-10-24 (removal), rule
+        // 5): from the first pass, which is the first that can push, the
+        // commits of the node's database are counted.
+        if !self.watching.swap(true, Ordering::SeqCst) {
+            self.leave.watch_commits(&lock(&self.state.db));
         }
         let whole = kind == Pass::Whole;
         let number = whole.then(|| self.state.own_channels.whole_pass_begins());

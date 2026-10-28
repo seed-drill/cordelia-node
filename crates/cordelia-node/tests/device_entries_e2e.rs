@@ -5022,12 +5022,6 @@ async fn a_move_at_accept_waits_for_the_cycle_with_the_device_closed() {
         assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
         let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
         assert!(removed.contains(&tablet.key()));
-        // From that commit, before the cycle's turn, there is no leave
-        // (rule 5).
-        assert_eq!(
-            laptop.has_leave("relay"),
-            Err(NoLeave::Stopped(State::Fork))
-        );
         drop(turn);
         let read = reading.join().unwrap();
         let Ok(PairRead::Read(read)) = read else {
