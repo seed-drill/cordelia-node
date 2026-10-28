@@ -29,6 +29,21 @@
 //! the newest revision for each author in each slot ([`take`], §2.4 items
 //! 1 and 2). It needs no list of members and no state of the channel.
 //!
+//! **Every head, where entries carry a lineage** (decision 2026-10-24
+//! (removal), rule 14). An entry whose content is a change entry's size
+//! and ends with a lineage in its form ([`cordelia_crypto::change_entry`])
+//! is kept by the lineages, for its author in its slot: each that no other
+//! kept was made after, up to MAX_CHANGE_HEADS, the highest numbers first.
+//! One that a kept head was made after, or that is that head's statement
+//! again, is not stored, whoever shows or passes it: so whoever shows
+//! every change of a branch again pushes no head out. One made after some
+//! that are kept replaces them; one made apart from all is kept beside
+//! them. An entry with no lineage is kept as today, while no entry of its
+//! author in the slot has a higher revision, and no head is dropped for
+//! it. A relay cannot tell a change entry from any entry that ends so, so
+//! a stranger's are kept the same way, within the caps of its channel and
+//! of the relay, and its allowances.
+//!
 //! ## Its room
 //!
 //! Room is counted by what entries are counted at
@@ -43,6 +58,15 @@
 //!   makes it drop anything that it holds.
 //! - A newer revision of an entry it holds, that is no larger, is never
 //!   refused for room.
+//! - **Room for a second head** (decision 2026-10-24 (removal), rule 15).
+//!   From when the relay takes the first entry with a lineage in an
+//!   author's slot, it counts the slot at CHANGE_HEADS_ROOM heads, where
+//!   it has the room: in a slot that is new, the room for both is asked as
+//!   for any new entry; where the entry replaces one of the version
+//!   before, it is taken as a replacement that is no larger, and the
+//!   second share is counted only where there is room. Once counted, a
+//!   second head always has room. A third, and those after it, take room
+//!   as any new entry. The relay drops nothing to make room for a head.
 //! - A relay that holds more than its cap drops the channels it has held
 //!   for the shortest time, until it is under ([`make_room`]). That is for
 //!   a relay whose cap came down, and for its operator: whoever runs the
@@ -66,6 +90,16 @@
 //!   entry; that it held none from that author in that slot, or an earlier
 //!   one, and took this one; or the other entry it holds from that author
 //!   in that slot, at that revision or a later one.
+//! - **Every head before "held"** (decision 2026-10-24 (removal), rule 16;
+//!   [`show_handing`], [`show_short_handing`]). Shown an entry, whole or in
+//!   short, the relay first takes it by the rules above, and then hands,
+//!   one in each answer, each other entry it keeps of that author in that
+//!   slot that the connection has neither been handed whole nor shown
+//!   whole, the lowest number first, and of two at one number the lower
+//!   ID: whole to a whole show, by its revision and ID to a short one. Only
+//!   once none is left does it say that it holds the entry, took it, or
+//!   refused it. What the connection was shown and handed whole is the
+//!   caller's to say: an answer by revision and ID hands nothing.
 //! - **Shown an entry in short** ([`show_short`], §2.4 item 5): its
 //!   channel, its slot, its author, its revision and its ID, and nothing
 //!   else of it. The relay holds that entry; or it holds none, or an
@@ -155,12 +189,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS, ENTRY_CHANNEL_USED_STEP_SECS,
-    ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    KEYED_TOMBSTONE_RETENTION_DAYS, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
-    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES,
-    entry_cost,
+    CHANGE_ENTRY_BYTES, CHANGE_HEADS_ROOM, CHANNEL_MARK_BYTES, ENTRY_CHANNEL_UNUSED_DAYS,
+    ENTRY_CHANNEL_USED_STEP_SECS, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES,
+    ENTRY_WIRE_OVERHEAD_BYTES, KEYED_TOMBSTONE_RETENTION_DAYS, MAX_CHANGE_HEADS,
+    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR,
+    RELAY_CHANNELS_PAGE_MAX, SESSION_VALUE_BYTES, entry_cost,
 };
+use cordelia_crypto::change_entry::{self, Lineage};
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError};
 use cordelia_crypto::proof;
 use cordelia_crypto::wire::WireError;
@@ -603,6 +638,199 @@ fn taken_as_one(
     })
 }
 
+/// An entry that the relay keeps of one author in one slot (decision
+/// 2026-10-24 (removal), rule 14): a row of the store, read whole.
+struct Kept {
+    /// The row's `head`: empty for the row kept by the store's rule, the
+    /// entry's ID for a head kept beside it.
+    row: Vec<u8>,
+    /// The entry, as it is stored: whoever is handed it checks it.
+    entry: Entry,
+    id: [u8; 32],
+    /// Its lineage, where its content is a change entry's and ends with
+    /// one. A row kept by the store's rule may carry one, where it was
+    /// stored before this relay kept heads: it is a head all the same.
+    lineage: Option<Lineage>,
+    /// What it is counted at.
+    cost: u64,
+}
+
+/// The lineage that a relay reads of an entry's content (decision
+/// 2026-10-24 (removal), rule 13): `None` for content that is not a change
+/// entry's size, that does not end with a lineage, or whose lineage is not
+/// in its form. Such an entry is kept by the store's rule.
+fn lineage_of(content: &[u8]) -> Option<Lineage> {
+    change_entry::lineage(content).ok().flatten()
+}
+
+/// What the relay keeps of `author` in `slot` of `channel`.
+fn kept_of(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<Vec<Kept>, CordeliaError> {
+    Ok(entries::author_rows(conn, channel, slot, author)?
+        .into_iter()
+        .map(|row| {
+            let entry = row.stored.entry;
+            Kept {
+                row: row.head,
+                id: entry.id(),
+                lineage: lineage_of(&entry.content),
+                cost: entry_cost(entry.content.len()),
+                entry,
+            }
+        })
+        .collect())
+}
+
+/// What the relay's rules make of an entry (decision 2026-10-04 §2.4
+/// item 2; decision 2026-10-24 (removal), rule 14), from what it keeps of
+/// the entry's author in its slot.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// It keeps that very entry.
+    AlreadyHeld,
+    /// It is not stored: an entry kept is at its revision and ahead of it,
+    /// or the same statement again.
+    HeldAnother,
+    /// It is not stored: an entry kept is ahead of it.
+    Older,
+    /// It is stored, and the entries kept at these places go: those it was
+    /// made after, the one of the version before that it is newer than, and
+    /// the lowest heads past MAX_CHANGE_HEADS.
+    Store { replaced: Vec<usize> },
+}
+
+/// Decide what becomes of `entry`, whose lineage is `lineage`, where the
+/// relay keeps `kept` of its author in its slot.
+///
+/// - **An entry with a lineage** is not stored where a head kept was made
+///   after it, or is the same statement, by the lineages: so a change shown
+///   again pushes no head out. Otherwise it is kept, and replaces each head
+///   that it was made after, and the entry of the version before where
+///   that is of a lower revision. Of the heads that are then kept, at most
+///   MAX_CHANGE_HEADS stay, the highest numbers first, and of two at one
+///   number the lower ID.
+/// - **An entry with no lineage** is kept as today: where no entry kept of
+///   its author in the slot, a head among them, has its revision or a
+///   higher one. It replaces the one kept by the store's rule, and no head:
+///   a change made on this version is never dropped for one made on the
+///   version before.
+fn decide(kept: &[Kept], entry: &CheckedEntry, lineage: Option<&Lineage>) -> Decision {
+    let id = entry.id();
+    if kept.iter().any(|kept| kept.id == id) {
+        return Decision::AlreadyHeld;
+    }
+    let not_stored = |ahead: &[&Kept]| match ahead.iter().any(|kept| kept.entry.rev == entry.rev) {
+        true => Decision::HeldAnother,
+        false => Decision::Older,
+    };
+    let Some(lineage) = lineage else {
+        let ahead: Vec<&Kept> = kept
+            .iter()
+            .filter(|kept| kept.entry.rev >= entry.rev)
+            .collect();
+        if !ahead.is_empty() {
+            return not_stored(&ahead);
+        }
+        let replaced = (0..kept.len())
+            .filter(|&at| kept[at].lineage.is_none())
+            .collect();
+        return Decision::Store { replaced };
+    };
+    // Behind a head, or that head's statement again.
+    let ahead: Vec<&Kept> = kept
+        .iter()
+        .filter(|kept| {
+            kept.lineage.as_ref().is_some_and(|head| {
+                head.statement == lineage.statement || head.chain.contains(&lineage.statement)
+            })
+        })
+        .collect();
+    if !ahead.is_empty() {
+        return not_stored(&ahead);
+    }
+    let mut replaced: Vec<usize> = (0..kept.len())
+        .filter(|&at| match &kept[at].lineage {
+            Some(head) => lineage.chain.contains(&head.statement),
+            None => kept[at].entry.rev < entry.rev,
+        })
+        .collect();
+    // The heads that are left with it, the highest numbers first: at most
+    // MAX_CHANGE_HEADS of them stay.
+    let mut heads: Vec<(u64, [u8; 32], Option<usize>)> = (0..kept.len())
+        .filter(|at| kept[*at].lineage.is_some() && !replaced.contains(at))
+        .map(|at| (kept[at].entry.rev, kept[at].id, Some(at)))
+        .chain(std::iter::once((entry.rev, id, None)))
+        .collect();
+    if heads.len() > MAX_CHANGE_HEADS {
+        heads.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, _, at) in heads.split_off(MAX_CHANGE_HEADS) {
+            match at {
+                Some(at) => replaced.push(at),
+                None => return Decision::Older,
+            }
+        }
+    }
+    Decision::Store { replaced }
+}
+
+/// What one head is counted at: an entry with a lineage is always of a
+/// change entry's size.
+fn head_cost() -> u64 {
+    entry_cost(CHANGE_ENTRY_BYTES)
+}
+
+/// The room a slot is counted at beyond its entries, for heads that it
+/// does not hold yet (decision 2026-10-24 (removal), rule 15): where its
+/// room for CHANGE_HEADS_ROOM heads is counted and it holds at least one,
+/// one head's cost for each that it lacks of them.
+fn kept_room(counted: bool, heads: usize) -> u64 {
+    match counted && heads >= 1 {
+        true => head_cost() * CHANGE_HEADS_ROOM.saturating_sub(heads) as u64,
+        false => 0,
+    }
+}
+
+/// Whether the relay counts room for CHANGE_HEADS_ROOM heads in the slot
+/// of `author` in `slot` of `channel`.
+fn room_counted(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    author: &[u8; 32],
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT 1 FROM relay_head_rooms WHERE channel_id = ?1 AND slot = ?2 AND author = ?3",
+        params![channel.as_slice(), slot.as_slice(), author.as_slice()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(storage)
+}
+
+/// What a channel is counted at: its entries ([`entries::channel_cost`]),
+/// and the room kept in each of its slots for heads that it does not hold
+/// yet ([`kept_room`]).
+fn held_cost(conn: &Connection, channel: &[u8; 32]) -> Result<u64, CordeliaError> {
+    let lacking: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(MAX(0, ?2 - heads)), 0) FROM (
+                 SELECT (SELECT COUNT(*) FROM entries AS held
+                         WHERE held.channel_id = room.channel_id AND held.slot = room.slot
+                           AND held.author = room.author AND length(held.head) = 32) AS heads
+                 FROM relay_head_rooms AS room WHERE room.channel_id = ?1)
+             WHERE heads >= 1",
+            params![channel.as_slice(), CHANGE_HEADS_ROOM as i64],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    Ok(entries::channel_cost(conn, channel)? + head_cost() * lacking.max(0) as u64)
+}
+
 /// [`take`], inside what the caller began.
 fn taken(
     conn: &Connection,
@@ -611,41 +839,50 @@ fn taken(
     asker: &Asker,
     now: i64,
 ) -> Result<Taken, CordeliaError> {
-    // What the entry would replace, as it is counted. An entry at the
-    // revision of the one held from its author in its slot, or below it,
-    // replaces nothing: the store says which it is, and no room is asked
-    // about.
-    let replaced = match entries::author_cost(conn, &entry.channel, &entry.slot, &entry.author)? {
-        Some((rev, _)) if rev >= entry.rev => {
-            return match entries::store(conn, entry, now)? {
-                // Held at that revision: that very entry, or another
-                // that its author signed at it. The two are told apart
-                // by what an entry is named by.
-                Outcome::AlreadyHeld => {
-                    let held =
-                        entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)?;
-                    match held.is_some_and(|held| held.entry.id() == entry.id()) {
-                        true => Ok(Taken::AlreadyHeld),
-                        false => Ok(Taken::HeldAnother),
-                    }
-                }
-                Outcome::OlderThanHeld => Ok(Taken::OlderThanHeld),
-                Outcome::Stored => Err(CordeliaError::Storage(
-                    "an entry no newer than the one held was stored".into(),
-                )),
-            };
-        }
-        Some((_, replaced)) => replaced,
-        None => 0,
+    let (channel, slot, author) = (&entry.channel, &entry.slot, &entry.author);
+    let kept = kept_of(conn, channel, slot, author)?;
+    let lineage = lineage_of(&entry.content);
+    // An entry that the rules do not store is answered by them, whatever
+    // room there is.
+    let replaced = match decide(&kept, entry, lineage.as_ref()) {
+        Decision::AlreadyHeld => return Ok(Taken::AlreadyHeld),
+        Decision::HeldAnother => return Ok(Taken::HeldAnother),
+        Decision::Older => return Ok(Taken::OlderThanHeld),
+        Decision::Store { replaced } => replaced,
     };
+    let replaced_cost: u64 = replaced.iter().map(|&at| kept[at].cost).sum();
+    let heads_before = kept.iter().filter(|kept| kept.lineage.is_some()).count();
+    let heads_after = heads_before
+        - replaced
+            .iter()
+            .filter(|&&at| kept[at].lineage.is_some())
+            .count()
+        + usize::from(lineage.is_some());
 
     // What the channel would hold with this entry, less what it replaces,
     // and how much more that is than it holds. A write that makes it hold
     // no more is always taken: a newer revision, of an entry the relay
-    // holds, that is no larger.
-    let held = held_channel(conn, &entry.channel)?;
+    // holds, that is no larger, and a second head where its room is
+    // counted (rule 15).
+    let held = held_channel(conn, channel)?;
     let holds = held.map_or(0, |held| held.bytes);
-    let after = holds.saturating_sub(replaced) + entry_cost(entry.content.len());
+    let counted = room_counted(conn, channel, slot, author)?;
+    let entries_after = holds
+        .saturating_sub(replaced_cost)
+        .saturating_sub(kept_room(counted, heads_before))
+        + entry_cost(entry.content.len());
+    // The room for CHANGE_HEADS_ROOM heads, from the first entry with a
+    // lineage in the slot (rule 15). In a slot that is new it is asked as
+    // any new entry's room is. Where the entry replaces what is there, it
+    // is counted only where the relay has the room: it makes none.
+    let counts_room = lineage.is_some() && !counted && {
+        let with = entries_after + kept_room(true, heads_after);
+        let more = with.saturating_sub(holds);
+        kept.is_empty()
+            || (used_bytes(conn)?.saturating_add(more) <= room.max_bytes
+                && with <= room.max_channel_bytes)
+    };
+    let after = entries_after + kept_room(counted || counts_room, heads_after);
     let more = after.saturating_sub(holds);
 
     // A write that would take the relay past its cap is refused here,
@@ -667,16 +904,38 @@ fn taken(
         return Ok(Taken::Refused(Refused::ChannelFull));
     }
 
-    if entries::store(conn, entry, now)? != Outcome::Stored {
-        return Err(CordeliaError::Storage(
-            "an entry newer than the one held was not stored".into(),
-        ));
+    // A row of the version before's rule whose entry carries a lineage is
+    // a head: it is kept as one from now, where it stays.
+    for (at, kept) in kept.iter().enumerate() {
+        if kept.row.is_empty() && kept.lineage.is_some() && !replaced.contains(&at) {
+            entries::rekey_author_row(conn, channel, slot, author, (&[], &kept.id))?;
+        }
+    }
+    for &at in &replaced {
+        entries::remove_author_row(conn, channel, slot, author, &kept[at].row)?;
+    }
+    match &lineage {
+        Some(_) => entries::store_head(conn, entry, now)?,
+        None => {
+            if entries::store(conn, entry, now)? != Outcome::Stored {
+                return Err(CordeliaError::Storage(
+                    "an entry newer than the one held was not stored".into(),
+                ));
+            }
+        }
+    }
+    if counts_room {
+        conn.execute(
+            "INSERT INTO relay_head_rooms (channel_id, slot, author) VALUES (?1, ?2, ?3)",
+            params![channel.as_slice(), slot.as_slice(), author.as_slice()],
+        )
+        .map_err(storage)?;
     }
     match held {
         Some(_) => {
             conn.execute(
                 "UPDATE relay_channels SET bytes = ?2 WHERE channel_id = ?1",
-                params![entry.channel.as_slice(), to_sql(after)],
+                params![channel.as_slice(), to_sql(after)],
             )
             .map_err(storage)?;
         }
@@ -700,14 +959,14 @@ fn taken(
                 } if *last > 0 => now.min(*last),
                 _ => now,
             };
-            let bytes = entries::channel_cost(conn, &entry.channel)?;
+            let bytes = held_cost(conn, channel)?;
             // This holding's own mark: another than any it had before.
             let mark = new_mark()?;
             conn.execute(
                 "INSERT INTO relay_channels (channel_id, mark, held_since, used_at, bytes)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    entry.channel.as_slice(),
+                    channel.as_slice(),
                     mark.as_slice(),
                     since,
                     used,
@@ -801,6 +1060,11 @@ fn drop_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, Cordelia
     let entries = entries::remove_channel(conn, channel)?;
     conn.execute(
         "DELETE FROM relay_channels WHERE channel_id = ?1",
+        params![channel.as_slice()],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM relay_head_rooms WHERE channel_id = ?1",
         params![channel.as_slice()],
     )
     .map_err(storage)?;
@@ -1000,12 +1264,54 @@ fn said_by(
 
 // ── What it answers ──────────────────────────────────────────────────
 
+/// What a relay answers to an entry that it is shown ([`show_handing`]),
+/// with what became of the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Showing {
+    /// The answer.
+    pub answer: Shown,
+    /// Whether the entry shown was stored: it is passed on as anything
+    /// stored is, whatever the answer hands.
+    pub stored: bool,
+    /// Whether the relay holds the entry shown once it is answered: its
+    /// channel was used.
+    pub holds: bool,
+}
+
 /// Answer an entry that the relay is shown (decision 2026-10-04 §2.4 item
-/// 5), from the store. `entry` has passed the check: both signatures were
-/// looked at before anything here is (§16).
+/// 5), from the store, to a connection that has been shown and handed whole
+/// no entry of that author in that slot: [`show_handing`], with nothing
+/// known.
+pub fn show(
+    conn: &Connection,
+    room: &mut Room,
+    entry: &CheckedEntry,
+    asker: &Asker,
+    now: i64,
+) -> Result<Shown, RelayError> {
+    show_handing(conn, room, entry, asker, now, &[]).map(|showing| showing.answer)
+}
+
+/// Answer an entry that the relay is shown (decision 2026-10-04 §2.4 item
+/// 5; decision 2026-10-24 (removal), rule 16), from the store. `entry` has
+/// passed the check: both signatures were looked at before anything here
+/// is (§16). `known` is the IDs of the entries of its author in its slot
+/// that the connection has been shown whole or handed whole.
+///
+/// **It takes first, and then hands.** The entry is taken by the relay's
+/// rules ([`take`]): a head that it was made after is then gone, and is not
+/// handed. Then each other entry that the relay keeps of its author in its
+/// slot that is not `known` is handed, one in each answer, whole
+/// ([`Shown::Another`]), the lowest number first, and of two at one number
+/// the lower ID. Only once none is left does the relay answer that it holds
+/// the entry, took it, or refused it. An entry that it does not hold and
+/// did not take, one behind what it keeps, is answered as today, with the
+/// first it keeps at that revision or a later one, known or not.
 ///
 /// What comes back with [`Shown::Another`] counts against the asker's
-/// limits as anything fetched does: its cost is given with it.
+/// limits as anything fetched does: its cost is given with it. Whoever
+/// calls this remembers it as handed whole to the connection only where it
+/// was handed.
 ///
 /// Refused, with nothing changed, on a database in which a device follows
 /// a phrase.
@@ -1015,94 +1321,157 @@ fn said_by(
 /// holds it. Whether the relay would take the entry is read first, and
 /// decides how the database is taken: for writing where it would, and
 /// otherwise for reading alone, with nothing written. Where it holds that
-/// very entry ([`Shown::Held`]), the channel was used: the caller keeps
-/// the use in its [`Uses`], and it is written with the others.
-pub fn show(
+/// very entry ([`Showing::holds`]), and did not take it now, the channel
+/// was used: the caller keeps the use in its [`Uses`], and it is written
+/// with the others.
+pub fn show_handing(
     conn: &Connection,
     room: &mut Room,
     entry: &CheckedEntry,
     asker: &Asker,
     now: i64,
-) -> Result<Shown, RelayError> {
+    known: &[[u8; 32]],
+) -> Result<Showing, RelayError> {
     no_device_writes(conn)?;
     let to_write = would_take(conn, entry)?;
     let (own, before) = (conn.is_autocommit(), room.not_yet.len());
     let done = in_one_begun(conn, to_write, || {
         no_device_writes(conn)?;
-        Ok(shown(conn, room, entry, asker, now)?)
+        Ok(shown(conn, room, entry, asker, now, known)?)
     });
     room.ended(own, before, done.is_ok());
     done
 }
 
-/// Whether the relay would take `entry` where it is shown: it holds none
-/// from that author in that slot, or an earlier one.
+/// Whether the relay would store `entry` where it is shown, by its rules
+/// ([`decide`]).
 fn would_take(conn: &Connection, entry: &CheckedEntry) -> Result<bool, CordeliaError> {
-    let held = entries::author_cost(conn, &entry.channel, &entry.slot, &entry.author)?;
-    Ok(held.is_none_or(|(rev, _)| rev < entry.rev))
+    let kept = kept_of(conn, &entry.channel, &entry.slot, &entry.author)?;
+    let lineage = lineage_of(&entry.content);
+    Ok(matches!(
+        decide(&kept, entry, lineage.as_ref()),
+        Decision::Store { .. }
+    ))
 }
 
-/// [`show`], inside what the caller began.
+/// Whether `kept` is behind an entry at `rev` whose lineage is `lineage`:
+/// by the lineages where both carry one, and by revision otherwise. An
+/// entry is not handed one that it is ahead of (decision 2026-10-24
+/// (removal), rule 16): a device of the version before would judge it
+/// behind its own, and wait on it.
+fn is_behind(kept: &Kept, rev: u64, lineage: Option<&Lineage>) -> bool {
+    match (lineage, &kept.lineage) {
+        (Some(lineage), Some(head)) => lineage.chain.contains(&head.statement),
+        _ => kept.entry.rev < rev,
+    }
+}
+
+/// The entries kept of `kept` that a connection which knows `known` is
+/// handed before the relay says it holds the entry shown, named `id`, at
+/// `rev`, whose lineage is `lineage`, in the order they are handed: the
+/// lowest number first, and of two at one number the lower ID (decision
+/// 2026-10-24 (removal), rule 16). None that the entry shown is ahead of.
+fn to_hand<'a>(
+    kept: &'a [Kept],
+    (id, rev, lineage): (&[u8; 32], u64, Option<&Lineage>),
+    known: &[[u8; 32]],
+) -> Vec<&'a Kept> {
+    let mut others: Vec<&Kept> = kept
+        .iter()
+        .filter(|kept| {
+            kept.id != *id && !known.contains(&kept.id) && !is_behind(kept, rev, lineage)
+        })
+        .collect();
+    others.sort_by(|a, b| a.entry.rev.cmp(&b.entry.rev).then(a.id.cmp(&b.id)));
+    others
+}
+
+/// The entry that an entry at `rev` which the relay does not hold is
+/// answered with where nothing is left to hand: the first it keeps at that
+/// revision or a later one, the lowest number first, as today.
+fn ahead_of(kept: &[Kept], rev: u64) -> Option<&Kept> {
+    kept.iter()
+        .filter(|kept| kept.entry.rev >= rev)
+        .min_by(|a, b| a.entry.rev.cmp(&b.entry.rev).then(a.id.cmp(&b.id)))
+}
+
+/// [`Shown::Another`], of an entry kept.
+fn another(kept: &Kept) -> Result<Shown, CordeliaError> {
+    let other = kept.entry.clone().check().map_err(|e| {
+        CordeliaError::Storage(format!("a stored entry does not pass the check: {e}"))
+    })?;
+    Ok(Shown::Another {
+        entry: Box::new(other),
+        cost: kept.cost,
+    })
+}
+
+/// [`show_handing`], inside what the caller began.
 fn shown(
     conn: &Connection,
     room: &mut Room,
     entry: &CheckedEntry,
     asker: &Asker,
     now: i64,
-) -> Result<Shown, CordeliaError> {
+    known: &[[u8; 32]],
+) -> Result<Showing, CordeliaError> {
     said_by(conn, asker, &entry.channel, now)?;
-    match entries::author_entry(conn, &entry.channel, &entry.slot, &entry.author)? {
-        Some(held) if held.entry.rev >= entry.rev => {
-            if held.entry.id() == entry.id() {
-                return Ok(Shown::Held);
-            }
-            let cost = entry_cost(held.entry.content.len());
-            let other = held.entry.check().map_err(|e| {
-                CordeliaError::Storage(format!("a stored entry does not pass the check: {e}"))
-            })?;
-            Ok(Shown::Another {
-                entry: Box::new(other),
-                cost,
-            })
-        }
-        _ => match taken(conn, room, entry, asker, now)? {
+    let place = (&entry.channel, &entry.slot, &entry.author);
+    let kept = kept_of(conn, place.0, place.1, place.2)?;
+    let lineage = lineage_of(&entry.content);
+    // It takes first.
+    let (stored, refused) = match decide(&kept, entry, lineage.as_ref()) {
+        Decision::Store { .. } => match taken(conn, room, entry, asker, now)? {
             Taken::Stored => {
                 used(conn, &entry.channel, now)?;
-                Ok(Shown::Taken)
+                (true, None)
             }
-            Taken::Refused(why) => Ok(Shown::Refused(why)),
-            Taken::AlreadyHeld | Taken::HeldAnother | Taken::OlderThanHeld => Err(
-                CordeliaError::Storage("an entry newer than the one held was not stored".into()),
-            ),
+            Taken::Refused(why) => (false, Some(why)),
+            Taken::AlreadyHeld | Taken::HeldAnother | Taken::OlderThanHeld => {
+                return Err(CordeliaError::Storage(
+                    "an entry that the relay would take was not stored".into(),
+                ));
+            }
         },
-    }
+        _ => (false, None),
+    };
+    let kept = match stored {
+        true => kept_of(conn, place.0, place.1, place.2)?,
+        false => kept,
+    };
+    let id = entry.id();
+    let holds = kept.iter().any(|kept| kept.id == id);
+    // Then it hands each that the connection does not know.
+    let shown = (&id, entry.rev, lineage.as_ref());
+    let answer = if let Some(next) = to_hand(&kept, shown, known).first() {
+        another(next)?
+    } else if holds {
+        match stored {
+            true => Shown::Taken,
+            false => Shown::Held,
+        }
+    } else if let Some(why) = refused {
+        Shown::Refused(why)
+    } else {
+        match ahead_of(&kept, entry.rev) {
+            Some(ahead) => another(ahead)?,
+            None => {
+                return Err(CordeliaError::Storage(
+                    "an entry that the relay did not take is ahead of nothing it keeps".into(),
+                ));
+            }
+        }
+    };
+    Ok(Showing {
+        answer,
+        stored,
+        holds,
+    })
 }
 
-/// Answer an entry that the relay is shown in short (decision 2026-10-04
-/// §2.4 item 5): the entry of `author` in `slot` of `channel`, at `rev`,
-/// whose ID is `id` ([`Entry::id`]). `now` is the relay's time, in
-/// seconds.
-///
-/// The relay holds that very entry, which is use of the channel as with
-/// the whole one. Or it holds none from that author in that slot, or an
-/// earlier one: there is nothing here for it to take, and the entry is to
-/// be shown whole. Or it holds another, at that revision or a later one,
-/// and says that one's revision and ID, and no more: whoever is told of
-/// one that it does not keep shows its own whole, and is answered with the
-/// entry then.
-///
-/// **Whoever calls this says who may ask.** A short form is looked up only
-/// for a connection that last showed that very entry whole in that slot,
-/// with both signatures: anyone else could ask what a relay holds from an
-/// ID alone. For any other the caller answers [`ShownShort::Whole`] from
-/// what it remembers of the connection, and does not call this at all.
-///
-/// It is answered by reading, and nothing is written. Where the relay
-/// holds that very entry ([`ShownShort::Held`]), the channel was used: the
-/// caller keeps the use in its [`Uses`], and it is written with the
-/// others.
-///
-/// Refused on a database in which a device follows a phrase.
+/// Answer an entry that the relay is shown in short, to a connection that
+/// has been shown and handed whole no entry of that author in that slot
+/// but this one: [`show_short_handing`], with nothing else known.
 pub fn show_short(
     conn: &Connection,
     channel: &[u8; 32],
@@ -1111,34 +1480,98 @@ pub fn show_short(
     rev: u64,
     id: &[u8; 32],
 ) -> Result<ShownShort, RelayError> {
+    show_short_handing(conn, (channel, slot, author), rev, id, &[]).map(|(answer, _)| answer)
+}
+
+/// Answer an entry that the relay is shown in short (decision 2026-10-04
+/// §2.4 item 5; decision 2026-10-24 (removal), rule 16): the entry of the
+/// author in the slot of the channel that `place` names, at `rev`, whose ID
+/// is `id` ([`Entry::id`]). `known` is the IDs of the entries of that
+/// author in that slot that the connection has been shown whole or handed
+/// whole. Returns the answer, and whether the relay holds that very entry.
+///
+/// Each other entry the relay keeps there that is not `known` is told
+/// first, one in each answer, by its revision and ID and no more
+/// ([`ShownShort::Other`]), the lowest number first: whoever is told of
+/// one shows its own whole, and is handed the entry then. **That hands
+/// nothing:** the entry is handed only whole. Once none is left: the relay
+/// holds that very entry, which is use of the channel as with the whole
+/// one. Or it holds none from that author in that slot, or only earlier
+/// ones: there is nothing here for it to take, and the entry is to be
+/// shown whole. Or it holds another, at that revision or a later one, and
+/// says that one's revision and ID.
+///
+/// **Whoever calls this says who may ask.** A short form is looked up only
+/// for a connection that showed that very entry whole in that slot, or was
+/// handed it whole there, with both signatures: anyone else could ask what
+/// a relay holds from an ID alone. For any other the caller answers
+/// [`ShownShort::Whole`] from what it remembers of the connection, and
+/// does not call this at all.
+///
+/// It is answered by reading, and nothing is written. Where the relay
+/// holds that very entry, the channel was used: the caller keeps the use
+/// in its [`Uses`], and it is written with the others.
+///
+/// Refused on a database in which a device follows a phrase.
+pub fn show_short_handing(
+    conn: &Connection,
+    place: (&[u8; 32], &[u8; 32], &[u8; 32]),
+    rev: u64,
+    id: &[u8; 32],
+    known: &[[u8; 32]],
+) -> Result<(ShownShort, bool), RelayError> {
     in_one_reading(conn, || {
         no_device_writes(conn)?;
-        Ok(shown_short(conn, (channel, slot, author), rev, id)?)
+        Ok(shown_short(conn, place, rev, id, known)?)
     })
 }
 
-/// [`show_short`], inside what the caller began. `place` is the channel,
-/// the slot and the author.
+/// [`show_short_handing`], inside what the caller began.
 fn shown_short(
     conn: &Connection,
     place: (&[u8; 32], &[u8; 32], &[u8; 32]),
     rev: u64,
     id: &[u8; 32],
-) -> Result<ShownShort, CordeliaError> {
+    known: &[[u8; 32]],
+) -> Result<(ShownShort, bool), CordeliaError> {
     let (channel, slot, author) = place;
-    match entries::author_entry(conn, channel, slot, author)? {
-        Some(held) if held.entry.rev >= rev => {
-            let held_id = held.entry.id();
-            if held_id == *id {
-                return Ok(ShownShort::Held);
-            }
-            Ok(ShownShort::Other {
-                rev: held.entry.rev,
-                id: held_id,
-            })
+    let kept = kept_of(conn, channel, slot, author)?;
+    let holds = kept.iter().any(|kept| kept.id == *id);
+    let other = |kept: &Kept| ShownShort::Other {
+        rev: kept.entry.rev,
+        id: kept.id,
+    };
+    // Its lineage, where the relay keeps it: otherwise it is told apart from
+    // what is kept by its revision alone.
+    let lineage = kept
+        .iter()
+        .find(|kept| kept.id == *id)
+        .and_then(|kept| kept.lineage.as_ref());
+    let answer = if let Some(next) = to_hand(&kept, (id, rev, lineage), known).first() {
+        other(next)
+    } else if holds {
+        ShownShort::Held
+    } else {
+        match ahead_of(&kept, rev) {
+            Some(ahead) => other(ahead),
+            None => ShownShort::Whole,
         }
-        _ => Ok(ShownShort::Whole),
-    }
+    };
+    Ok((answer, holds))
+}
+
+/// The entry with the ID `id` that the relay keeps of the author in the
+/// slot of the channel that `place` names, as it is stored: whoever is
+/// handed it checks it. `None` where it keeps none.
+pub fn kept_entry(
+    conn: &Connection,
+    place: (&[u8; 32], &[u8; 32], &[u8; 32]),
+    id: &[u8; 32],
+) -> Result<Option<Entry>, CordeliaError> {
+    Ok(kept_of(conn, place.0, place.1, place.2)?
+        .into_iter()
+        .find(|kept| kept.id == *id)
+        .map(|kept| kept.entry))
 }
 
 /// Check the proof that the other end of the connection whose TLS session
@@ -1476,9 +1909,15 @@ fn swept_deletes(conn: &Connection, now: i64) -> Result<SweptDeletes, CordeliaEr
             lighter.push((channel, entries::highest_place(conn, &channel)?));
         }
         swept.entries += entries::remove_slot(conn, &channel, &slot)?;
+        // The room kept for heads in the slot goes with it.
+        conn.execute(
+            "DELETE FROM relay_head_rooms WHERE channel_id = ?1 AND slot = ?2",
+            params![channel.as_slice(), slot.as_slice()],
+        )
+        .map_err(storage)?;
     }
     for (channel, highest) in lighter {
-        let bytes = entries::channel_cost(conn, &channel)?;
+        let bytes = held_cost(conn, &channel)?;
         if bytes == 0 {
             drop_channel(conn, &channel)?;
             swept.channels.push(channel);
@@ -1810,7 +2249,9 @@ mod tests {
             .unwrap();
         let mut sum = 0;
         for (channel, bytes) in &rows {
-            let cost = entries::channel_cost(conn, channel).unwrap();
+            // Its entries, and the room kept in its slots for heads.
+            let cost = held_cost(conn, channel).unwrap();
+            assert!(cost >= entries::channel_cost(conn, channel).unwrap());
             assert_eq!(*bytes as u64, cost);
             assert!(cost > 0, "a channel is held with no entry");
             sum += cost;
@@ -5537,5 +5978,517 @@ mod tests {
         assert_eq!(held(&conn), [4, 5]);
         assert_eq!(counted(&conn), 2 * SMALL);
         assert_eq!(ids(&conn, 4).len(), 1);
+    }
+
+    // ── Every head (decision 2026-10-24 (removal), rules 14 to 16) ───
+
+    /// What one head is counted at: a change entry's content, and what an
+    /// entry takes beyond it.
+    const HEAD: u64 = CHANGE_ENTRY_BYTES as u64 + 1024;
+
+    /// The slot of the change entries in the tests below.
+    const CHANGES: [u8; 32] = [0x33; 32];
+
+    /// An entry of channel `c` by device `d` at `rev`, whose content is
+    /// `content`, signed by the device and by the channel's key.
+    fn raw(c: u16, d: u8, rev: u64, content: Vec<u8>) -> CheckedEntry {
+        let key = derive::signing_key(&secret(c)).unwrap();
+        let mut entry = Entry {
+            channel: channel(c),
+            slot: CHANGES,
+            author: device(d).public_key(),
+            rev,
+            delete: false,
+            content,
+            author_signature: [0; 64],
+            channel_signature: [0; 64],
+        };
+        let form = entry.signed_bytes();
+        entry.author_signature = device(d).sign(&[LABEL_ENTRY_AUTHOR, form.as_slice()].concat());
+        entry.channel_signature = key.sign(&[LABEL_ENTRY_CHANNEL, form.as_slice()].concat());
+        entry.check().unwrap()
+    }
+
+    /// A change entry of channel `c` by device `d`, numbered `rev`, whose
+    /// statement is named `name` and whose chain is the statements named
+    /// `chain`: what a relay reads of it is its lineage alone.
+    fn change(c: u16, d: u8, rev: u64, name: u8, chain: &[u8]) -> CheckedEntry {
+        let lineage = Lineage {
+            made_at: NOW as u64,
+            statement: [name; 8],
+            chain: chain.iter().map(|link| [*link; 8]).collect(),
+        };
+        let mut content = vec![0u8; CHANGE_ENTRY_BYTES - lineage.to_bytes().unwrap().len()];
+        content.extend(lineage.to_bytes().unwrap());
+        let entry = raw(c, d, rev, content);
+        assert!(lineage_of(&entry.content).is_some());
+        entry
+    }
+
+    /// A change entry of the version before: of a change entry's size, and
+    /// with no lineage.
+    fn change_before(c: u16, d: u8, rev: u64) -> CheckedEntry {
+        let entry = raw(c, d, rev, vec![0x42; CHANGE_ENTRY_BYTES]);
+        assert!(lineage_of(&entry.content).is_none());
+        entry
+    }
+
+    /// The IDs of the entries the relay keeps of device `d` in the slot of
+    /// changes of channel `c`, the lowest number first.
+    fn heads(conn: &Connection, c: u16, d: u8) -> Vec<[u8; 32]> {
+        let mut kept = kept_of(conn, &channel(c), &CHANGES, &device(d).public_key()).unwrap();
+        kept.sort_by(|a, b| a.entry.rev.cmp(&b.entry.rev).then(a.id.cmp(&b.id)));
+        kept.iter().map(|kept| kept.id).collect()
+    }
+
+    /// Take `entry` as a device's push is taken.
+    fn pushed(conn: &Connection, room: &mut Room, entry: &CheckedEntry) -> Taken {
+        take(conn, room, entry, &from(1), NOW).unwrap()
+    }
+
+    /// Show `entry` whole on a connection that has been shown and handed
+    /// whole `known`, as the relay's streams do: the entry shown is known
+    /// on the connection from then, and so is an entry handed whole.
+    fn shown_on(
+        conn: &Connection,
+        room: &mut Room,
+        entry: &CheckedEntry,
+        known: &mut Vec<[u8; 32]>,
+    ) -> Showing {
+        if !known.contains(&entry.id()) {
+            known.push(entry.id());
+        }
+        let showing = show_handing(conn, room, entry, &from(1), NOW, known).unwrap();
+        if let Shown::Another { entry, .. } = &showing.answer {
+            known.push(entry.id());
+        }
+        showing
+    }
+
+    /// The ID of the entry an answer hands whole, if it hands one.
+    fn handed(showing: &Showing) -> Option<[u8; 32]> {
+        match &showing.answer {
+            Shown::Another { entry, .. } => Some(entry.id()),
+            _ => None,
+        }
+    }
+
+    /// Show `entry` in short on a connection that knows `known`.
+    fn short_on(conn: &Connection, entry: &CheckedEntry, known: &[[u8; 32]]) -> ShownShort {
+        let place = (&entry.channel, &entry.slot, &entry.author);
+        show_short_handing(conn, place, entry.rev, &entry.id(), known)
+            .unwrap()
+            .0
+    }
+
+    /// The fault of the record's section 0, by the lineages: change 2 after
+    /// change 1; the laptop's change 3 and the desktop's, each after 2 and
+    /// made apart; the laptop's change 4 after its change 3.
+    fn the_fault(c: u16) -> [CheckedEntry; 5] {
+        [
+            change(c, 1, 1, 0x01, &[]),
+            change(c, 1, 2, 0x02, &[0x01]),
+            change(c, 1, 3, 0x13, &[0x01, 0x02]),
+            change(c, 1, 3, 0x23, &[0x01, 0x02]),
+            change(c, 1, 4, 0x14, &[0x01, 0x02, 0x13]),
+        ]
+    }
+
+    /// Rule 14: a relay keeps every head by the lineages. An entry made
+    /// apart from what it keeps is kept beside it; one made after some
+    /// replaces them; one that a head was made after, or that head's
+    /// statement again, is not stored, from a device or from a relay it
+    /// works with. So every change of a branch shown again pushes no head
+    /// out.
+    #[test]
+    fn a_relay_keeps_every_head_by_the_lineages() {
+        let (conn, mut room) = relay();
+        let [one, two, laptop, desktop, four] = the_fault(1);
+        assert_eq!(pushed(&conn, &mut room, &one), Taken::Stored);
+        assert_eq!(pushed(&conn, &mut room, &two), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [two.id()], "one made after replaces");
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        // The desktop's change 3, made apart from the laptop's: kept
+        // beside it, at the same number.
+        assert_eq!(
+            take(&conn, &mut room, &desktop, &LISTED, NOW).unwrap(),
+            Taken::Stored
+        );
+        let mut both = [laptop.id(), desktop.id()];
+        both.sort();
+        assert_eq!(heads(&conn, 1, 1), both);
+        assert_eq!(counted(&conn), 2 * HEAD);
+        // The laptop's change 4 replaces its change 3, and not the
+        // desktop's, which is a number below it.
+        assert_eq!(pushed(&conn, &mut room, &four), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [desktop.id(), four.id()]);
+        assert_eq!(counted(&conn), 2 * HEAD);
+
+        // Every change of the laptop's branch shown and pushed again, and
+        // by a relay it works with: none is stored, and no head goes.
+        for _ in 0..3 {
+            for again in [&one, &two, &laptop, &four] {
+                assert_ne!(pushed(&conn, &mut room, again), Taken::Stored);
+                assert_ne!(
+                    take(&conn, &mut room, again, &LISTED, NOW).unwrap(),
+                    Taken::Stored
+                );
+                let mut known = Vec::new();
+                let showing = shown_on(&conn, &mut room, again, &mut known);
+                assert!(!showing.stored);
+            }
+            assert_eq!(heads(&conn, 1, 1), [desktop.id(), four.id()]);
+        }
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::OlderThanHeld);
+        assert_eq!(pushed(&conn, &mut room, &four), Taken::AlreadyHeld);
+        // The same statement in another entry is the same change.
+        let again = change(1, 1, 3, 0x23, &[0x01, 0x02, 0x99]);
+        assert_eq!(pushed(&conn, &mut room, &again), Taken::HeldAnother);
+
+        // A settlement of the two replaces both.
+        let five = change(1, 1, 5, 0x05, &[0x01, 0x02, 0x13, 0x14, 0x23]);
+        assert_eq!(pushed(&conn, &mut room, &five), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [five.id()]);
+        assert_eq!(counted(&conn), 2 * HEAD, "room for a second is kept");
+        // What a relay that keeps one entry by number alone would have
+        // done is not done: a head is never pushed out by a number.
+        let (conn, mut room) = relay();
+        let [_, _, laptop, desktop, four] = the_fault(1);
+        assert_eq!(pushed(&conn, &mut room, &four), Taken::Stored);
+        assert_eq!(pushed(&conn, &mut room, &desktop), Taken::Stored);
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::OlderThanHeld);
+        assert_eq!(heads(&conn, 1, 1), [desktop.id(), four.id()]);
+    }
+
+    /// Rule 14: at most eight heads in a slot, the highest numbers first;
+    /// one that would be a ninth below them all is not stored. The bound is
+    /// of one author's slot: another author's entries are their own.
+    #[test]
+    fn a_relay_keeps_at_most_eight_heads_the_highest_numbers_first() {
+        let (conn, mut room) = relay();
+        let apart: Vec<CheckedEntry> = (0..MAX_CHANGE_HEADS as u8 + 1)
+            .map(|n| change(1, 1, 3 + u64::from(n), 0x40 + n, &[0x01, 0x02]))
+            .collect();
+        for head in &apart[1..] {
+            assert_eq!(pushed(&conn, &mut room, head), Taken::Stored);
+        }
+        assert_eq!(heads(&conn, 1, 1).len(), MAX_CHANGE_HEADS);
+        // A ninth below them all: not stored.
+        assert_eq!(pushed(&conn, &mut room, &apart[0]), Taken::OlderThanHeld);
+        // A ninth above the lowest: the lowest goes.
+        let higher = change(1, 1, 20, 0x60, &[0x01, 0x02]);
+        assert_eq!(pushed(&conn, &mut room, &higher), Taken::Stored);
+        let kept = heads(&conn, 1, 1);
+        assert_eq!(kept.len(), MAX_CHANGE_HEADS);
+        assert!(!kept.contains(&apart[1].id()));
+        assert!(kept.contains(&higher.id()));
+        // Another author's slot is its own.
+        assert_eq!(
+            pushed(&conn, &mut room, &change(1, 2, 3, 0x40, &[0x01])),
+            Taken::Stored
+        );
+        assert_eq!(heads(&conn, 1, 2).len(), 1);
+        counted(&conn);
+    }
+
+    /// Rule 14: an entry with no lineage is kept as today, while no entry
+    /// of its author in the slot has a higher revision, and no head is
+    /// dropped for it. An entry with a lineage replaces one of the version
+    /// before that has a lower revision. A head that a relay stored before
+    /// it kept heads, by the store's rule, is a head.
+    #[test]
+    fn an_entry_with_no_lineage_is_kept_as_today_and_drops_no_head() {
+        let (conn, mut room) = relay();
+        // A change of the version before, and then the person's first
+        // change made on this version, which replaces it.
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(1, 1, 2)),
+            Taken::Stored
+        );
+        let three = change(1, 1, 3, 0x03, &[0x01, 0x02]);
+        assert_eq!(pushed(&conn, &mut room, &three), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [three.id()]);
+        // One of the version before: below the head, or at its number, it
+        // is not stored.
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(1, 1, 2)),
+            Taken::OlderThanHeld
+        );
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(1, 1, 3)),
+            Taken::HeldAnother
+        );
+        // Above it, it is kept as today, and the head stays beside it.
+        let five = change_before(1, 1, 5);
+        assert_eq!(pushed(&conn, &mut room, &five), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [three.id(), five.id()]);
+        // Another of the version before, higher still, replaces the one of
+        // the version before, and not the head.
+        let six = change_before(1, 1, 6);
+        assert_eq!(pushed(&conn, &mut room, &six), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [three.id(), six.id()]);
+        counted(&conn);
+
+        // Entries that are no change entries are kept as today.
+        let text = made(2, 1, 5, "notes.md", "a text");
+        assert_eq!(pushed(&conn, &mut room, &text), Taken::Stored);
+        assert_eq!(
+            pushed(&conn, &mut room, &made(2, 1, 4, "notes.md", "older")),
+            Taken::OlderThanHeld
+        );
+
+        // A head stored by the store's rule, before this relay kept heads,
+        // is a head: one made apart from it is kept beside it, and one of
+        // the version before above it drops neither.
+        let (conn, mut room) = relay();
+        let [_, _, laptop, desktop, _] = the_fault(3);
+        assert_eq!(
+            entries::store(&conn, &laptop, NOW).unwrap(),
+            Outcome::Stored
+        );
+        conn.execute(
+            "INSERT INTO relay_channels (channel_id, mark, held_since, used_at, bytes)
+             VALUES (?1, X'0102030405060708', ?2, ?2, ?3)",
+            params![channel(3).as_slice(), NOW, HEAD as i64],
+        )
+        .unwrap();
+        assert_eq!(pushed(&conn, &mut room, &desktop), Taken::Stored);
+        let mut both = [laptop.id(), desktop.id()];
+        both.sort();
+        assert_eq!(heads(&conn, 3, 1), both);
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(3, 1, 7)),
+            Taken::Stored
+        );
+        assert_eq!(heads(&conn, 3, 1).len(), 3);
+        counted(&conn);
+    }
+
+    /// Rule 16: shown an entry, a relay takes it first, and then hands
+    /// whole, one in each answer, each head it keeps in that slot that the
+    /// connection has neither been shown whole nor handed whole, the lowest
+    /// number first, and of two at one number the lower ID; "held" comes
+    /// only after. A head that the entry shown was made after is gone, and
+    /// is not handed. Each is handed once on a connection; a new one is
+    /// handed each again.
+    #[test]
+    fn a_relay_hands_every_head_whole_once_before_it_says_held() {
+        let (conn, mut room) = relay();
+        let [_, two, laptop, desktop, four] = the_fault(1);
+        let other = change(1, 1, 3, 0x33, &[0x01, 0x02]);
+        for head in [&two, &four, &desktop, &other] {
+            assert_eq!(pushed(&conn, &mut room, head), Taken::Stored);
+        }
+        // Three heads: the desktop's 3, another 3, and the laptop's 4.
+        assert_eq!(heads(&conn, 1, 1).len(), 3);
+        let mut threes = [desktop.id(), other.id()];
+        threes.sort();
+
+        // A device on change 2: behind all three. It is handed each, the
+        // lower number first and then the lower ID, and then, behind them
+        // all, it is answered as today, with the first it is behind.
+        let mut known = Vec::new();
+        let order: Vec<Option<[u8; 32]>> = (0..4)
+            .map(|_| handed(&shown_on(&conn, &mut room, &two, &mut known)))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                Some(threes[0]),
+                Some(threes[1]),
+                Some(four.id()),
+                Some(threes[0])
+            ]
+        );
+
+        // The laptop's change 3, shown: behind its change 4, so not
+        // stored, and it is not handed what it is ahead of... nor anything
+        // it was made before: its 4 is handed, and the two made apart.
+        let mut known = Vec::new();
+        let first = shown_on(&conn, &mut room, &laptop, &mut known);
+        assert!(!first.stored && !first.holds);
+        assert_eq!(handed(&first), Some(threes[0]));
+
+        // The desktop's change, shown: held, and the others are handed
+        // first, each once.
+        let mut known = Vec::new();
+        let answers: Vec<Shown> = (0..4)
+            .map(|_| shown_on(&conn, &mut room, &desktop, &mut known).answer)
+            .collect();
+        assert!(matches!(&answers[0], Shown::Another { entry, .. } if entry.id() == other.id()));
+        assert!(matches!(&answers[1], Shown::Another { entry, .. } if entry.id() == four.id()));
+        assert_eq!(answers[2], Shown::Held);
+        assert_eq!(answers[3], Shown::Held);
+
+        // It takes first, and then hands: a settlement of the desktop's
+        // change and the other 3 replaces both, and only the laptop's 4,
+        // made apart from it, is handed before "taken".
+        let settles = change(1, 1, 4, 0x34, &[0x01, 0x02, 0x23, 0x33]);
+        let mut known = Vec::new();
+        let first = shown_on(&conn, &mut room, &settles, &mut known);
+        assert!(first.stored && first.holds);
+        assert_eq!(handed(&first), Some(four.id()));
+        let then = shown_on(&conn, &mut room, &settles, &mut known);
+        assert_eq!(then.answer, Shown::Held);
+        assert_eq!(heads(&conn, 1, 1).len(), 2);
+
+        // A slot with one entry, as every slot of entries that are not
+        // change entries is: answered as today.
+        let text = made(2, 1, 5, "notes.md", "a text");
+        let mut known = Vec::new();
+        assert!(shown_on(&conn, &mut room, &text, &mut known).stored);
+        assert_eq!(
+            shown_on(&conn, &mut room, &text, &mut known).answer,
+            Shown::Held
+        );
+        let older = made(2, 1, 4, "notes.md", "older");
+        for _ in 0..2 {
+            assert_eq!(
+                handed(&shown_on(&conn, &mut room, &older, &mut known)),
+                Some(text.id())
+            );
+        }
+    }
+
+    /// Rule 16, the short show: a head that the connection does not know is
+    /// told by its revision and ID, and that hands nothing: the whole show
+    /// after it is handed the head whole. Only then does the short show say
+    /// "held".
+    #[test]
+    fn a_short_show_told_of_another_is_handed_nothing_and_the_whole_show_after_it_is() {
+        let (conn, mut room) = relay();
+        let [_, _, laptop, desktop, _] = the_fault(1);
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        assert_eq!(pushed(&conn, &mut room, &desktop), Taken::Stored);
+        // The tablet follows the laptop's change, and has shown it whole on
+        // its connection before.
+        let mut known = vec![laptop.id()];
+        for _ in 0..3 {
+            assert_eq!(
+                short_on(&conn, &laptop, &known),
+                ShownShort::Other {
+                    rev: 3,
+                    id: desktop.id()
+                },
+                "an Other hands nothing: it is told again"
+            );
+        }
+        let whole = shown_on(&conn, &mut room, &laptop, &mut known);
+        assert_eq!(handed(&whole), Some(desktop.id()));
+        assert_eq!(short_on(&conn, &laptop, &known), ShownShort::Held);
+        // An entry not kept, below what is kept and made before it: as
+        // today, with the first it is behind.
+        let two = change(1, 1, 2, 0x02, &[0x01]);
+        assert!(matches!(
+            short_on(&conn, &two, &known),
+            ShownShort::Other { rev: 3, .. }
+        ));
+        // One that is above everything kept is to be shown whole.
+        let four = change(1, 1, 4, 0x14, &[0x01, 0x02, 0x13]);
+        assert_eq!(short_on(&conn, &four, &known), ShownShort::Whole);
+    }
+
+    /// Rule 15: from the first entry with a lineage in a new slot, a relay
+    /// asks room for two heads and counts it; a second head then always
+    /// has room, at a relay at its cap; a third takes room as any new entry
+    /// does, and at a full relay is refused for room (the limit, shown).
+    #[test]
+    fn a_second_head_is_kept_at_a_relay_at_its_cap_where_its_room_was_counted() {
+        // Room for two heads, and no more.
+        let (conn, mut room) = relay_of(2 * HEAD);
+        let [_, _, laptop, desktop, _] = the_fault(1);
+        let third = change(1, 1, 3, 0x33, &[0x01, 0x02]);
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        assert_eq!(counted(&conn), 2 * HEAD, "the room for both is counted");
+        // At its cap, a new channel finds no room...
+        assert_eq!(
+            pushed(&conn, &mut room, &small(9, 1, 5)),
+            Taken::Refused(Refused::NoRoom)
+        );
+        // ...and the second head does.
+        assert_eq!(
+            take(&conn, &mut room, &desktop, &LISTED, NOW).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(counted(&conn), 2 * HEAD);
+        // A third is refused for room.
+        assert_eq!(
+            pushed(&conn, &mut room, &third),
+            Taken::Refused(Refused::NoRoom)
+        );
+        // And where one entry replaces both, the room for a second stays.
+        let settles = change(1, 1, 4, 0x04, &[0x01, 0x02, 0x13, 0x23]);
+        assert_eq!(pushed(&conn, &mut room, &settles), Taken::Stored);
+        assert_eq!(counted(&conn), 2 * HEAD);
+        assert_eq!(
+            pushed(&conn, &mut room, &third),
+            Taken::Stored,
+            "apart from the settlement"
+        );
+
+        // In a slot that is new, the room for both is asked: a relay with
+        // room for one head refuses the first.
+        let (conn, mut room) = relay_of(HEAD);
+        assert_eq!(
+            pushed(&conn, &mut room, &laptop),
+            Taken::Refused(Refused::NoRoom)
+        );
+        assert_eq!(counted(&conn), 0);
+
+        // The room kept goes with the channel, and with its slot at a sweep
+        // of old deletes.
+        let (conn, mut room) = relay();
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        let rooms = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM relay_head_rooms", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(rooms(&conn), 1);
+        assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
+        assert_eq!((rooms(&conn), counted(&conn)), (0, 0));
+    }
+
+    /// Rule 15 at a full relay, during the change-over: the person's first
+    /// change made on this version replaces the one of the version before,
+    /// as any replacement that is no larger, counts nothing more and drops
+    /// no channel; a second head there is refused for room.
+    #[test]
+    fn a_first_head_at_a_full_relay_replaces_the_old_and_a_second_is_refused_for_room() {
+        let (conn, mut room) = relay_of(HEAD + SMALL);
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(1, 1, 2)),
+            Taken::Stored
+        );
+        assert_eq!(pushed(&conn, &mut room, &small(2, 1, 5)), Taken::Stored);
+        assert_eq!(counted(&conn), HEAD + SMALL);
+        let [_, _, laptop, desktop, _] = the_fault(1);
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        assert_eq!(heads(&conn, 1, 1), [laptop.id()]);
+        assert_eq!(counted(&conn), HEAD + SMALL, "nothing more is counted");
+        assert_eq!(held(&conn), [1, 2], "no channel is dropped");
+        assert!(!room_counted(&conn, &channel(1), &CHANGES, &device(1).public_key()).unwrap());
+        assert_eq!(
+            take(&conn, &mut room, &desktop, &LISTED, NOW).unwrap(),
+            Taken::Refused(Refused::NoRoom)
+        );
+        assert_eq!(heads(&conn, 1, 1), [laptop.id()]);
+
+        // Where the relay has the room, the second share is counted at the
+        // replacement, and the second head then has room.
+        let (conn, mut room) = relay_of(2 * HEAD + SMALL);
+        assert_eq!(
+            pushed(&conn, &mut room, &change_before(1, 1, 2)),
+            Taken::Stored
+        );
+        assert_eq!(pushed(&conn, &mut room, &laptop), Taken::Stored);
+        assert_eq!(counted(&conn), 2 * HEAD);
+        assert_eq!(pushed(&conn, &mut room, &small(2, 1, 5)), Taken::Stored);
+        assert_eq!(
+            take(&conn, &mut room, &desktop, &LISTED, NOW).unwrap(),
+            Taken::Stored
+        );
+        assert_eq!(counted(&conn), 2 * HEAD + SMALL);
     }
 }
