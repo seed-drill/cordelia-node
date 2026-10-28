@@ -2037,7 +2037,10 @@ fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() 
 /// one that keeps every head left a device in a fork (decision
 /// 2026-10-24 (removal), schema step 21): its state `fork`, the change
 /// entry it follows kept as `latest` and the head it sets aside as
-/// `apart`, no time of any change, and schema version 21.
+/// `apart`, no time of any change, and schema version 21. What step 23
+/// adds goes too: the table of the room a relay keeps for heads. (Step 23
+/// makes the table of entries again from the columns it had at step 22,
+/// so the one column more it finds there changes nothing.)
 fn as_a_fork_of_the_version_before(node: &Node) {
     let conn = Connection::open(node.data_dir().join("cordelia.db")).unwrap();
     conn.execute_batch(
@@ -2059,6 +2062,7 @@ fn as_a_fork_of_the_version_before(node: &Node) {
          DROP TABLE person_change_entries;
          ALTER TABLE person_change_entries_21 RENAME TO person_change_entries;
          DROP TABLE person_change_times;
+         DROP TABLE relay_head_rooms;
          DELETE FROM node_meta WHERE key = 'person.judge_kept';
          UPDATE person SET state = 'fork';
          COMMIT;",
