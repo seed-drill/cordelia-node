@@ -1700,6 +1700,43 @@ pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
 /// most this much of its uses, against ENTRY_CHANNEL_UNUSED_DAYS.
 pub const RELAY_USES_WRITE_INTERVAL_SECS: u64 = 60;
 
+/// How often a relay looks at its store's write-ahead log, in a take of
+/// its lock of its own, of kind Checkpoint (issue #224): every second,
+/// from when it starts. Where the relay has written
+/// RELAY_CHECKPOINT_LOG_PAGES to the log since its last whole checkpoint,
+/// it checkpoints then; otherwise it lets go at once. At a clean stop the
+/// log is written back and truncated. A relay's connection has SQLite's
+/// automatic checkpoint off, which would otherwise run inside whichever
+/// commit crossed those pages, and hold that push for two syncs more. The
+/// checkpoint is passive: it waits for no reader. Chosen from a
+/// measurement (parameter-rationale.md §12.7): a second keeps the log
+/// short between two checkpoints at the most a relay can take in, and a
+/// look that finds the log short costs a take of the lock and some µs.
+pub const RELAY_CHECKPOINT_INTERVAL_SECS: u64 = 1;
+
+/// The pages a relay writes to its store's log before its timer
+/// checkpoints it (issue #224): SQLite's own threshold for its automatic
+/// checkpoint, kept, so that at the scale test's rates (a write every few
+/// seconds) a relay checkpoints as often as SQLite did, and a push pays
+/// for no more syncs than it did; only the checkpoint's own two are moved
+/// out of the push, into a take of their own. A checkpoint each second
+/// whatever was written would cost about four syncs a push at those rates
+/// (parameter-rationale.md §12.7).
+pub const RELAY_CHECKPOINT_LOG_PAGES: u64 = 1000;
+
+/// The bytes of its write-ahead log's file that a relay's store keeps once
+/// a checkpoint has written the log back whole, and the next commit starts
+/// it again (issue #224; SQLite's `journal_size_limit`): a longer file is
+/// cut to this. Chosen above the longest log a second can make: at a
+/// thousand pushes a second, more than a relay's limits let it take for
+/// long, the log reached 27 MiB between two checkpoints; 64 MiB is that
+/// with room, rounded up to a power of two. Below it the log is written
+/// over in place; a file cut below a second's log must grow again under
+/// the next second's commits, which cost every push (parameter-rationale.md
+/// §12.7). Above it, as after a reader held the log for long, the file is
+/// cut back.
+pub const RELAY_LOG_KEPT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// How often a device sweeps from its own store the deletes that it has
 /// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
 /// 2026-10-04 §16). A channel that a sweep took a delete of is read
