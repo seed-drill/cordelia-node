@@ -203,6 +203,25 @@ pub fn files(conn: &Connection, channel_id: &str) -> Result<Vec<(String, String)
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// [`files`], each with the revision its folder agreed.
+pub fn files_at(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<(String, String, u64)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT folder, key, rev FROM sync_files WHERE channel_id = ?1 ORDER BY folder, key",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel_id], |row| {
+            let rev: i64 = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, rev.max(0) as u64))
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Forget what `folder` agreed with `channel_id` for `key`, and nothing
 /// else. Returns whether there was a record.
 pub fn forget_file(
