@@ -2572,11 +2572,31 @@ fn come_to(
     }
     note_time(conn, change.entry, statement)?;
     // Records are not carried: the statement's own list is what stands.
+    // The key each adds still holds the secret of the change left, and is
+    // kept as its holder first: a device stepped to this version kept some
+    // as records alone (decision 2026-10-24 (removal), rule 3).
+    let mut kept = vec![statement.link()?];
+    if let Some(before) = before {
+        let left = before.statement.statement.link()?;
+        for record in held_rows::additions(conn)? {
+            held_rows::keep_holder(conn, left.number, &left.hash, &record.key)?;
+        }
+        // The change left stays a head where this one was not made after
+        // it (rule 9, [`moved`]).
+        if !statement.has_on_chain(&left) {
+            kept.push(left);
+        }
+        for head in set_aside_heads(conn, identity, &before.following)? {
+            kept.push(head.statement.statement.link()?);
+        }
+    }
     held_rows::clear_additions(conn)?;
-    // Nor are the holders of the change it leaves: it seals under that
-    // secret no more (decision 2026-10-24 (removal), rule 3).
-    let link = statement.link()?;
-    held_rows::forget_holders_but(conn, link.number, &link.hash)?;
+    // The holders of a change that is not kept go: the device seals under
+    // its secret no more. Those of a change still kept as a head stay, with
+    // its mark past their bound, so that what made it not clear stays and
+    // no move goes back to it (rules 3 and 9).
+    let kept: Vec<(u64, [u8; 16])> = kept.iter().map(|link| (link.number, link.hash)).collect();
+    held_rows::forget_holders_but(conn, &kept)?;
     // What other devices said a person read is kept only of the keys this
     // statement counts, so that a key added again later counts only what
     // it lists from then; and a statement ends every bound a person set,
@@ -8863,6 +8883,85 @@ mod tests {
             Some(Shown::Closed)
         );
         assert_eq!(state(&conn), State::Fork);
+    }
+
+    /// Rules 3 and 9: a change that a device moved from keeps what made it
+    /// not clear for as long as it is kept as a head, so no move goes back
+    /// to it. Device 0 follows A, which lists 0 and 1 and is not clear: a
+    /// record under it handed its secret to key 5, or its holders passed
+    /// their bound. R, made apart, lists 0, 1 and 3 and removes 5: the
+    /// device moves to it. S, made apart, lists 1 and removes 3, so R is
+    /// not clear: A is no change to move to, and the device is closed.
+    #[test]
+    fn test_no_move_goes_back_to_a_change_that_was_not_clear() {
+        let phrase = phrase();
+        let [_, two, ..] = statements(&phrase);
+        let a = two.next(key(0), &secret(13), listed(&[0, 1]), &[]).unwrap();
+        let r = two
+            .next(key(1), &secret(14), listed(&[0, 1, 3]), &[key(5)])
+            .unwrap();
+        let s = two
+            .next(key(1), &secret(15), listed(&[1]), &[key(3)])
+            .unwrap();
+        let a_hash = a.hash().unwrap();
+        for case in ["record", "record kept alone", "past the bound"] {
+            let conn = db::open_in_memory().unwrap();
+            let a_entry = follow(&conn, 0, &phrase, &a, secret(13));
+            match case {
+                "record" => {
+                    see_addition(&conn, &added(&a, 1, 5), NOW).unwrap();
+                }
+                "record kept alone" => {
+                    // As a device stepped to this version kept it: as a
+                    // record, and not as a holder.
+                    let record = added(&a, 1, 5);
+                    held_rows::keep_addition(
+                        &conn,
+                        &record.to_bytes().unwrap(),
+                        &key(5),
+                        &key(1),
+                        true,
+                        NOW,
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    for n in 0..=MAX_KNOWN_HOLDERS as u32 {
+                        let mut holder = [0xdd; 32];
+                        holder[..4].copy_from_slice(&n.to_be_bytes());
+                        held_rows::keep_holder(&conn, 3, &a_hash, &holder).unwrap();
+                    }
+                }
+            }
+            let to_r = change(&phrase, &r, secret(14));
+            assert!(
+                matches!(
+                    shown(&conn, &device(0), &to_r, NOW).unwrap(),
+                    Shown::Moved(_)
+                ),
+                "{case}"
+            );
+            assert_eq!(kept(&conn, Kept::Apart), Some(a_entry.id()), "{case}");
+            assert!(
+                !is_clear(&conn, &a, false).unwrap(),
+                "{case}: the change left reads as clear"
+            );
+
+            let to_s = change(&phrase, &s, secret(15));
+            assert_eq!(
+                shown(&conn, &device(0), &to_s, NOW).unwrap(),
+                Shown::Closed,
+                "{case}"
+            );
+            assert_eq!(state(&conn), State::Fork, "{case}");
+            assert_eq!(kept(&conn, Kept::Latest), Some(to_r.id()), "{case}");
+            assert!(!would_move(&conn, &device(0)).unwrap(), "{case}");
+            assert_eq!(
+                move_to_a_clear_change(&conn, &device(0), NOW).unwrap(),
+                Some(Shown::Closed),
+                "{case}"
+            );
+        }
     }
 
     /// Rule 5 with rule 9: where moves are held back, rule 8 closes the
