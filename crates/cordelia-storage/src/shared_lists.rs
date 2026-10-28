@@ -108,7 +108,7 @@ pub fn keep_taken(conn: &Connection, taken: &[([u8; 64], TakenRow)]) -> Result<(
     // Where the rows are these already, nothing is written: a device
     // works its lists out at every whole pass.
     let mut wanted = taken.to_vec();
-    wanted.sort_by(|a, b| a.0.cmp(&b.0));
+    wanted.sort_by_key(|a| a.0);
     if self::taken(conn)? == wanted {
         return Ok(());
     }
