@@ -5012,6 +5012,52 @@ async fn a_move_at_accept_waits_for_the_cycle_with_the_device_closed() {
     assert_eq!(laptop.latest().id(), removal.id());
 }
 
+/// A move in the pass waits for the sync cycle's turn, and the device is
+/// closed while it waits (decision 2026-10-24 (removal), rules 5 and 9):
+/// the pass holds the move back, so the head and its removed keys commit
+/// at once with the device closed, and only the move waits. The laptop
+/// follows its own change, which lists the tablet; the relay holds the
+/// desktop's, made apart, which removes the tablet and lists the laptop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_in_the_pass_waits_for_the_cycle_with_the_device_closed() {
+    let relay = relay_started("relay", None);
+    let (mut desktop, mut laptop, tablet) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    desktop.makes_the_phrase(&phrase());
+    desktop.adds(&laptop);
+    desktop.adds(&tablet);
+    laptop.changes(&phrase(), &[&laptop, &desktop, &tablet], &[]);
+    let removal = desktop.changes(&phrase(), &[&desktop, &laptop], &[&tablet]);
+    desktop.connects("relay", &relay).await;
+    desktop.passes().await;
+    assert!(holds_at(&relay, &removal.channel, &removal.id()));
+
+    laptop.connects("relay", &relay).await;
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let counted = laptop.state.sync_control.generation();
+    // A cycle holds its turn while the laptop passes.
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        let waited = std::time::Instant::now();
+        while laptop.state.sync_control.generation() == counted {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no move asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
+        assert!(removed.contains(&tablet.key()));
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.stands(), Stands::Applied);
+    assert_eq!(laptop.latest().id(), removal.id());
+}
+
 /// The door for a typed key can do nothing else. It asks the relay
 /// nothing for a key that the device does not keep as typed, or whose
 /// hour has gone. For one it keeps, it proves the pair channel of that
