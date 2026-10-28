@@ -75,7 +75,7 @@ use zeroize::Zeroizing;
 
 use cordelia_api::carry::{self, Allows, Word};
 use cordelia_api::carrying::CONNECTION_CHANGED;
-use cordelia_api::change::{prepare_recovery, read_with};
+use cordelia_api::change::read_with;
 use cordelia_api::look::{CarriedWordLook, held_named, joined, lists_of};
 use cordelia_api::person::PersonError;
 use cordelia_api::recover::{self, Answer, Candidate, Generation, Judged, Row};
@@ -160,6 +160,12 @@ fn not_asked_says(row: &Row, removed: bool) -> String {
         ),
     }
 }
+
+/// What is said of a device of the change recovered from that another
+/// change the recovery read removed (decision 2026-10-24 (removal), rule
+/// 22).
+const REMOVED_APART: &str = "  Another change that was read, made apart from this one, removed \
+    it: nothing is asked of it, nothing that it wrote is brought back, and it stays removed.";
 
 /// What is said of a record that does not count and whose key no change
 /// has removed.
@@ -1471,8 +1477,10 @@ enum AtARow {
 /// someone else's hands is not shown, nor its label. `number` is the
 /// number of the change recovered from, `own` this machine's key, `room`
 /// what the change has room for, and `removed_already` whether a change
-/// has removed a key already: the one recovered from, or the one made
-/// apart from it.
+/// has removed a key already: the one recovered from, or any other that
+/// the recovery read (decision 2026-10-24 (removal), rule 22). **A device
+/// that counts and that another change removed is not asked about:** it
+/// is removed whatever is said, and the look takes nothing from it.
 fn at_a_row(
     rows: &[Row],
     answers: &[Answer],
@@ -1486,6 +1494,14 @@ fn at_a_row(
     if rows[at].key == *own {
         let says = format!("{says}\n  It is this machine: it is the one device of the change.");
         return AtARow::Said(says, Answer::Have);
+    }
+    // A device of the change recovered from that another change read
+    // removed: the recovery lists it as removed whatever is said (rule
+    // 22), so nothing is asked of it, and the look takes nothing from it
+    // (decision 2026-10-24 (removal), property 5).
+    if rows[at].counts && removed_already(&rows[at].key) {
+        let says = format!("{says}\n{REMOVED_APART}");
+        return AtARow::Said(says, Answer::NotAsked);
     }
     // A record that does not count is shown as that, and nothing is
     // asked of it: unless only the bound of 64 kept its key out, a key
@@ -1613,10 +1629,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         .collect();
     // Every change read: the recovery lists as removed every key that any
     // of them removes (decision 2026-10-24 (removal), rule 22).
-    let read: Vec<Statement> = candidates
-        .iter()
-        .map(|candidate| candidate.statement.statement.clone())
-        .collect();
+    let changes_read = recover::Read::of(&candidates);
     let Some(found) = recover::found(candidates) else {
         anyhow::bail!("{}", none_found_says(&not_read));
     };
@@ -1693,9 +1706,8 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     );
     // Before anything is asked: whether the answers could all be kept,
     // and how many keys a record was read for that have no row.
-    let others: Vec<&Statement> = read.iter().collect();
-    let read_removed = recover::removed_by_any(&others);
-    let room = recover::room(&statement, &others, rows, &own);
+    let read_removed = changes_read.removed();
+    let room = recover::room(&statement, &changes_read.all(), rows, &own);
     for says in said_first(&room, &generation, statement.number) {
         println!("{says}");
     }
@@ -1753,10 +1765,9 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     let gone = recover::gone(rows, &answers);
 
     // 4. The statement, shown from the bytes that the phrase will sign.
-    let prepared = prepare_recovery(
+    let prepared = changes_read.prepare(
         &from.statement,
         apart.as_ref().map(|other| &other.statement),
-        &others,
         maker,
         &gone,
     )?;
@@ -3278,6 +3289,52 @@ mod tests {
         // This machine is answered as one that the person has.
         let own = at_a_row(&rows, &[], 0, 3, &[1; 32], &room, &|_| false);
         assert!(matches!(own, AtARow::Said(_, Answer::Have)), "{own:?}");
+    }
+
+    /// **A device of the change recovered from that another change the
+    /// recovery read removed is not asked about, and the look takes
+    /// nothing from it** (decision 2026-10-24 (removal), rule 22 and
+    /// property 5). The review's sequence: change 2 lists the desktop; a
+    /// third branch, made apart from change 2, removes it; the recovery
+    /// recovers from change 2 and reads that branch. Were the desktop
+    /// asked, `have` would bring back what it wrote after its removal,
+    /// and the recovery's statement would remove it all the same.
+    #[test]
+    fn test_a_device_that_another_change_read_removed_is_not_asked_and_nothing_is_taken() {
+        let rows = rows();
+        let room = recover::Room {
+            removed: 1,
+            asked: 2,
+            can_go: 255,
+        };
+        let desktop = [2; 32];
+        let removed_apart = |key: &[u8; 32]| *key == desktop;
+        let mut answers: Vec<Answer> = Vec::new();
+        for at in 0..rows.len() {
+            match at_a_row(&rows, &answers, at, 2, &[9; 32], &room, &removed_apart) {
+                AtARow::Said(says, answer) => {
+                    if at == 1 {
+                        assert!(says.ends_with(REMOVED_APART), "{says}");
+                        assert_eq!(answer, Answer::NotAsked);
+                    }
+                    answers.push(answer);
+                }
+                AtARow::Asks(_) => {
+                    assert_ne!(at, 1, "the desktop is asked about");
+                    // The person says `have` of every device asked.
+                    answers.push(Answer::Have);
+                }
+            }
+        }
+        let takes = recover::takes(&rows, &answers);
+        assert!(!takes.contains(&desktop), "{takes:?}");
+        assert!(takes.contains(&[1; 32]) && takes.contains(&[3; 32]));
+        assert!(!recover::gone(&rows, &answers).contains(&desktop));
+        // The control: where no other change removed it, it is asked.
+        assert!(matches!(
+            at_a_row(&rows, &answers[..1], 1, 2, &[9; 32], &room, &|_| false),
+            AtARow::Asks(_)
+        ));
     }
 
     /// **A row that does not count, has one adder, and was not kept out

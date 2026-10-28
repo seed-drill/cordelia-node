@@ -240,7 +240,7 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 - The part for the phrase of a settlement holds the secrets of every branch it joins, as many as fit (`MAX_EARLIER_SECRETS`), the newest first.
 - **Where:** `change_prepare` (which refuses `settle` today on a device in no fork, `commands.rs` 1131), and `Statement::settle` (`statement.rs` 311), which comes to take more than two heads.
 
-**Rule 22. A recovery lists one device,** as today. So its secret is clear by construction. It lists as removed every key that any change it read removes (the record of 2026-10-04, section 9, step 2, already settles two found apart).
+**Rule 22. A recovery lists one device,** as today. So its secret is clear by construction. It lists as removed every key that any change it read removes (the record of 2026-10-04, section 9, step 2, already settles two found apart). **It asks nothing of a device of the change it recovers from that another change it read removes:** that key is removed whatever is said, so the prompt says so in place of a question, and the look takes nothing that it wrote (property 5). The command asks, counts its room and prepares its statement from one list of every change read (`recover::Read`).
 
 ### Shared channels (for when they are built)
 

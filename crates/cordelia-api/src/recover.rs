@@ -205,6 +205,48 @@ pub fn removed_by_any(read: &[&Statement]) -> Vec<[u8; 32]> {
     removed.into_iter().collect()
 }
 
+/// Every change that a recovery read (decision 2026-10-24 (removal),
+/// rule 22), taken whole from what the phrase opened, before
+/// [`found`] picks one to recover from. The command asks, counts its
+/// room and prepares its statement from this one list, so that no change
+/// it read is left out of any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read(Vec<Statement>);
+
+impl Read {
+    /// The statement of each change that the phrase opened.
+    pub fn of(candidates: &[Candidate]) -> Self {
+        Self(
+            candidates
+                .iter()
+                .map(|candidate| candidate.statement.statement.clone())
+                .collect(),
+        )
+    }
+
+    /// Each change read.
+    pub fn all(&self) -> Vec<&Statement> {
+        self.0.iter().collect()
+    }
+
+    /// Every key that any of them removes ([`removed_by_any`]).
+    pub fn removed(&self) -> Vec<[u8; 32]> {
+        removed_by_any(&self.all())
+    }
+
+    /// The recovery's statement ([`crate::change::prepare_recovery`]),
+    /// which lists as removed every key that any change read removes.
+    pub fn prepare(
+        &self,
+        from: &SignedStatement,
+        apart: Option<&SignedStatement>,
+        maker: cordelia_crypto::statement::Device,
+        removed: &[[u8; 32]],
+    ) -> Result<crate::change::Prepared, PersonError> {
+        crate::change::prepare_recovery(from, apart, &self.all(), maker, removed)
+    }
+}
+
 /// One of the three things that a person says of a device at a recovery
 /// (decision 2026-10-04 §9, step 3), or that nothing was asked of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1790,18 +1832,19 @@ mod tests {
         every.sort_unstable();
         assert_eq!(removed_by_any(&read), every);
 
+        // What the command reads from: every change the phrase opened,
+        // the third branch's included (the review's low of slice 4).
+        let changes = Read::of(&candidates);
+        assert_eq!(changes.all(), read);
+        assert_eq!(changes.removed(), every);
+
         let found = found(candidates).unwrap();
         let (second, on_neither) = found.second().unwrap();
         assert_eq!(on_neither, 1);
         let maker = || Device::new(Machine::new(9).key(), "new machine").unwrap();
-        let prepared = prepare_recovery(
-            &found.from.statement,
-            Some(&second.statement),
-            &read,
-            maker(),
-            &[],
-        )
-        .unwrap();
+        let prepared = changes
+            .prepare(&found.from.statement, Some(&second.statement), maker(), &[])
+            .unwrap();
         let signs = Statement::from_bytes(prepared.bytes()).unwrap();
         assert_eq!(signs.removed, every);
         assert_eq!(signs.devices, [maker()]);
