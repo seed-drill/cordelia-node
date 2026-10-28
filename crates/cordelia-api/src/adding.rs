@@ -790,6 +790,38 @@ pub fn accept(
     }
 }
 
+/// What a hand-over read with the key `typed` says of removals, kept
+/// before the hand-over is judged, in a transaction of its own that
+/// commits at once (decision 2026-10-24 (removal), rule 5): the keys that
+/// its change lists as removed, where the phrase this device follows
+/// signed it, and the close, where the change it follows is then not
+/// clear. A move to the hand-over's change, or to a head, then waits for
+/// the sync cycle's turn with the device closed, and sends nothing under
+/// the change it leaves meanwhile. Says whether it closed the device.
+///
+/// A hand-over that is no hand-over for this key, or whose change removes
+/// this device, is left to [`accept_typed`]: no move follows the second,
+/// which [`accept`] refuses, and closes after.
+pub fn know_what_is_handed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    typed: &TypedKey,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<bool, PersonError> {
+    in_one(conn, || {
+        let Ok(hand_over) = hand_over_in(identity, &typed.key, typed.typed_at, entry, now)? else {
+            return Ok(false);
+        };
+        let statement = &hand_over.statement;
+        if statement.statement.removes(&identity.public_key()) {
+            return Ok(false);
+        }
+        crate::person::know_removed_if_signed(conn, identity, statement, now)?;
+        crate::person::close_if_not_clear(conn)
+    })
+}
+
 /// Whether a key that was typed at `typed_at` still opens its pair
 /// channel at `now` (decision 2026-10-04 §2.2): for an hour from when it
 /// was typed, and not before.
