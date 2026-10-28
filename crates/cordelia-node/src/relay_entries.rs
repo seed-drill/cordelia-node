@@ -250,6 +250,14 @@ impl Proved {
     }
 }
 
+/// The entries a connection is remembered to have shown whole or been
+/// handed whole in one slot: the heads a relay keeps there, and the
+/// change a device follows with the heads it sets aside, which are as
+/// many (decision 2026-10-24 (removal), rule 16). Fewer, and a device
+/// that shows entries the relay does not keep would put out a head it was
+/// handed, and be handed it again at each show.
+const ENTRIES_SHOWN_IN_A_SLOT: usize = 2 * MAX_CHANGE_HEADS;
+
 /// What a relay remembers of one connection besides: for each author's
 /// slot in a channel, each entry that the connection showed whole there
 /// whose two signatures held, and each that the relay handed it whole
@@ -266,8 +274,12 @@ impl Proved {
 ///
 /// It lives and goes as [`Proved`] does. At most
 /// MAX_SLOTS_SHOWN_ON_A_CONNECTION slots are remembered: one more is not,
-/// and is shown whole each time. None is put out for it. In a slot, at most
-/// MAX_CHANGE_HEADS entries: one more puts out the one remembered longest.
+/// and is shown whole each time, and handed the same lowest head at each
+/// show. None is put out for it. That costs only the connection that shows
+/// them: a device chooses what it shows on its own connection, and shows
+/// its person's channel, one slot. In a slot, at most
+/// [`ENTRIES_SHOWN_IN_A_SLOT`]: one more puts out the one remembered
+/// longest.
 #[derive(Debug, Default)]
 pub struct ShownWhole {
     slots: Vec<ShownSlot>,
@@ -311,7 +323,7 @@ impl ShownWhole {
         let shown = (entry.rev, entry.id());
         if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == place) {
             if !kept.entries.contains(&shown) {
-                if kept.entries.len() >= MAX_CHANGE_HEADS {
+                if kept.entries.len() >= ENTRIES_SHOWN_IN_A_SLOT {
                     kept.entries.remove(0);
                 }
                 kept.entries.push(shown);
@@ -7042,5 +7054,53 @@ mod tests {
             .map(|passed| Entry::from_wire(&passed.entry).unwrap().id())
             .collect();
         assert_eq!(offered, [desktop.id()]);
+    }
+
+    /// Rule 16 where the relay keeps eight heads (the review of slice 6,
+    /// its second low): a device shows an entry that the relay does not
+    /// keep, below all eight and made apart from them. It is handed each
+    /// head once, and then, at every show, the first of them again: no
+    /// head is put out of what the connection remembers, so none is handed
+    /// anew. And a device that shows its eight, none of them kept, is
+    /// handed the relay's eight once each.
+    #[test]
+    fn a_connection_that_shows_entries_not_kept_is_handed_each_head_once() {
+        let at = relay();
+        let heads: Vec<CheckedEntry> = (0..MAX_CHANGE_HEADS as u8)
+            .map(|n| change(1, 1, 3 + u64::from(n), 0x30 + n, &[0x01, 0x02]))
+            .collect();
+        for head in &heads {
+            pushed(at.push(1, vec![head.to_wire()]));
+        }
+        let mut order: Vec<[u8; 32]> = heads.iter().map(|head| head.id()).collect();
+        let shown = change(1, 1, 2, 0x99, &[0x01]);
+        let mut whole = ShownWhole::default();
+        let handed: Vec<Option<[u8; 32]>> = (0..2 * MAX_CHANGE_HEADS)
+            .map(|_| handed_whole(&at.show_on(2, &mut whole, whole_of(&shown))))
+            .collect();
+        let mut expected: Vec<Option<[u8; 32]>> = order.iter().copied().map(Some).collect();
+        expected.extend(std::iter::repeat_n(Some(order[0]), MAX_CHANGE_HEADS));
+        assert_eq!(handed, expected);
+
+        // A device's own eight, the change it follows and seven set aside.
+        let own: Vec<CheckedEntry> = (0..MAX_CHANGE_HEADS as u8)
+            .map(|n| change(1, 1, 2, 0x90 + n, &[0x01]))
+            .collect();
+        let mut whole = ShownWhole::default();
+        let mut handed = Vec::new();
+        for _ in 0..2 {
+            for entry in &own {
+                if let Some(id) = handed_whole(&at.show_on(3, &mut whole, whole_of(entry))) {
+                    if !handed.contains(&id) {
+                        handed.push(id);
+                    } else {
+                        assert_eq!(id, order[0], "only the first is handed again");
+                    }
+                }
+            }
+        }
+        handed.sort();
+        order.sort();
+        assert_eq!(handed, order);
     }
 }
