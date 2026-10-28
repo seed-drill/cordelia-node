@@ -368,10 +368,9 @@ fn anew_again(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<(), PersonError> {
+    // The slot is named by this device's key, and a push holds only this
+    // device's entries.
     let own = identity.public_key();
-    if entry.author != own {
-        return Ok(());
-    }
     let slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
     if entry.slot != slot {
         return Ok(());
