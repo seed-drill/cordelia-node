@@ -49,6 +49,41 @@ pub fn checkpoint_truncating(conn: &Connection) -> Result<bool, StorageError> {
     Ok(busy == 0)
 }
 
+/// Turn SQLite's automatic checkpoint off on this connection, and keep
+/// its log's file at RELAY_LOG_KEPT_BYTES once the log starts again
+/// (issue #224): a relay's node sets it where it opens its store.
+/// Otherwise the checkpoint runs inside whichever commit crosses about
+/// 1,000 pages of log, and the request that made that commit pays for it
+/// with the lock held. A connection with it off checkpoints on a timer of
+/// its own ([`checkpoint_passive`]).
+pub fn automatic_checkpoint_off(conn: &Connection) -> Result<(), StorageError> {
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    conn.pragma_update(
+        None,
+        "journal_size_limit",
+        cordelia_core::protocol::RELAY_LOG_KEPT_BYTES,
+    )?;
+    Ok(())
+}
+
+/// Write the write-ahead log back into the database file, as much of it
+/// as no reader holds, without waiting for a reader (issue #224): SQLite's
+/// passive checkpoint, which calls no busy handler. Returns whether the
+/// log was written back whole. The log's file is not truncated here: the
+/// next commit after a whole one starts the log again from its start,
+/// over what the file holds, and cuts the file to RELAY_LOG_KEPT_BYTES
+/// where it is longer ([`automatic_checkpoint_off`]). Where a reader in
+/// another process holds a part of the log, the rest is written back, and
+/// the next checkpoint, once the reader is gone, writes back what is
+/// left.
+pub fn checkpoint_passive(conn: &Connection) -> Result<bool, StorageError> {
+    let (busy, log, written): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    Ok(busy == 0 && log == written)
+}
+
 /// Open an in-memory database with schema initialised: for testing, and
 /// for what a command reads in its own process and keeps in no file.
 pub fn open_in_memory() -> Result<Connection, StorageError> {
@@ -128,6 +163,100 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    fn wal_bytes(path: &Path) -> u64 {
+        std::fs::metadata(path.with_extension("db-wal")).map_or(0, |file| file.len())
+    }
+
+    /// With the automatic checkpoint off (issue #224), the log grows past
+    /// the 1,000 pages at which SQLite would have checkpointed inside a
+    /// commit; with it on, as a store is opened, it does not. A passive
+    /// checkpoint then writes it back whole, and the next commit starts the
+    /// log again and cuts its file to RELAY_LOG_KEPT_BYTES.
+    #[test]
+    fn with_the_automatic_checkpoint_off_no_commit_checkpoints() {
+        use cordelia_core::protocol::RELAY_LOG_KEPT_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let insert = |conn: &Connection, i: usize, value: &str| {
+            conn.execute(
+                "INSERT INTO node_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("k{i}"), value],
+            )
+            .unwrap();
+        };
+        let grown = |off: bool| -> (i64, i64, u64, Connection, std::path::PathBuf) {
+            let path = dir.path().join(format!("{off}.db"));
+            let conn = open(&path).unwrap();
+            if off {
+                automatic_checkpoint_off(&conn).unwrap();
+            }
+            let pragma = |name: &str| -> i64 {
+                conn.pragma_query_value(None, name, |row| row.get(0))
+                    .unwrap()
+            };
+            let (every, kept, page) = (
+                pragma("wal_autocheckpoint"),
+                pragma("journal_size_limit"),
+                pragma("page_size") as u64,
+            );
+            let value = "v".repeat(page as usize);
+            for i in 0..1_500 {
+                insert(&conn, i, &value);
+            }
+            (every, kept, wal_bytes(&path) / page, conn, path)
+        };
+        let (every, kept, pages, _, _) = grown(false);
+        assert_eq!((every, kept), (1000, -1));
+        assert!(pages < 1_500, "the automatic checkpoint ran: {pages}");
+        let (every, kept, pages, conn, path) = grown(true);
+        assert_eq!((every, kept), (0, RELAY_LOG_KEPT_BYTES));
+        assert!(pages > 3_000, "a commit checkpointed: {pages} pages");
+        let before = wal_bytes(&path);
+        assert!(checkpoint_passive(&conn).unwrap());
+        assert_eq!(
+            wal_bytes(&path),
+            before,
+            "a passive checkpoint cuts nothing"
+        );
+        insert(&conn, 1_500, "w");
+        assert!(wal_bytes(&path) <= RELAY_LOG_KEPT_BYTES as u64);
+    }
+
+    /// A passive checkpoint answers at once where a reader holds the log,
+    /// whatever the busy timeout (issue #224); once the reader is gone,
+    /// the next writes it back whole.
+    #[test]
+    fn a_passive_checkpoint_answers_at_once_while_a_reader_holds_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        let conn = open(&path).unwrap();
+        automatic_checkpoint_off(&conn).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO node_meta (key, value) VALUES ('a.setting', 'one')",
+            [],
+        )
+        .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: String = reader
+            .query_row("SELECT value FROM node_meta", [], |row| row.get(0))
+            .unwrap();
+        conn.execute("UPDATE node_meta SET value = 'two'", [])
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(!checkpoint_passive(&conn).unwrap(), "a reader holds it");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "it waited {:?}",
+            started.elapsed()
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert!(checkpoint_passive(&conn).unwrap(), "the reader is gone");
     }
 
     fn secure_delete(conn: &Connection) -> i64 {

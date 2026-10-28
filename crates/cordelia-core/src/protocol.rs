@@ -1700,6 +1700,28 @@ pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
 /// most this much of its uses, against ENTRY_CHANNEL_UNUSED_DAYS.
 pub const RELAY_USES_WRITE_INTERVAL_SECS: u64 = 60;
 
+/// How often a relay checkpoints its store's write-ahead log, in a take of
+/// its lock of its own, of kind Checkpoint (issue #224): every second,
+/// from when it starts; at a clean stop the log is also truncated. A
+/// relay's connection has SQLite's automatic checkpoint off, which would
+/// otherwise run inside whichever commit crossed about 1,000 pages of log,
+/// and hold that push for two syncs more. The checkpoint is passive: it
+/// waits for no reader. Chosen from a measurement (parameter-rationale.md
+/// §12.7): a checkpoint's hold grows with the log it writes back, and a
+/// long log slows every read of the store; a second keeps both small at
+/// the most a relay can take in, and with nothing written a checkpoint
+/// costs about 2 us.
+pub const RELAY_CHECKPOINT_INTERVAL_SECS: u64 = 1;
+
+/// The bytes of its write-ahead log's file that a relay's store keeps once
+/// a checkpoint has written the log back whole, and the next commit starts
+/// it again (issue #224; SQLite's `journal_size_limit`): a longer file is
+/// cut to this. Derived: what SQLite's automatic checkpoint kept the log
+/// at, 1,000 pages of 4,096 bytes, rounded up to 4 MiB. Below it the log
+/// is written over in place, which costs a commit less than a file that
+/// must grow.
+pub const RELAY_LOG_KEPT_BYTES: i64 = 4 * 1024 * 1024;
+
 /// How often a device sweeps from its own store the deletes that it has
 /// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
 /// 2026-10-04 §16). A channel that a sweep took a delete of is read
