@@ -783,3 +783,38 @@ fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     let labelled = label_plan(conn, identity, &removed, Some("old"));
     assert_eq!(word(labelled.err().unwrap()), "removed_key");
 }
+
+/// A device that leaves its person keeps no share it wrote, whose card
+/// holds the seed, and no key typed for a channel, which would take a
+/// share into the list of the person it joins next (decision 2026-10-10
+/// §3.1, §3.2; the record of 2026-10-04, §5.2).
+#[test]
+fn a_device_that_leaves_keeps_no_share_and_no_typed_key() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let plan = new_plan(conn, &relays(), "review", &[]).unwrap();
+    make_new(conn, identity, &plan.what, now).unwrap();
+    let alice = member(1).public_key();
+    let typed_key = encode_public_key(&alice).unwrap();
+    let to = share_plan(conn, identity, &relays(), "review", &typed_key, None, now).unwrap();
+    make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    typed(&s, 0, &member(2).public_key(), "design", now);
+    let (pair, _) = share_pair(identity, &alice).unwrap();
+    assert_eq!(
+        entries::author_entries(conn, &pair, &s.key(0))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert!(crate::leaving::forget(conn, identity, true, now + 1).unwrap());
+    assert!(
+        entries::author_entries(conn, &pair, &s.key(0))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(rows::shares(conn).unwrap().is_empty());
+    assert!(rows::typed_keys(conn).unwrap().is_empty());
+}

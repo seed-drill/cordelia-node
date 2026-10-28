@@ -290,6 +290,13 @@ pub fn forget(
             entries::remove_channel(conn, &row.channel)?;
         }
         cordelia_storage::shared::forget_all(conn)?;
+        // The shares it wrote, each holding a card, and the keys typed for
+        // a channel, which would take a share into the next person's list
+        // (§3.1, §3.2).
+        for row in cordelia_storage::shared_sharing::shares(conn)? {
+            entries::remove_channel(conn, &row.pair)?;
+        }
+        cordelia_storage::shared_sharing::forget_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }
