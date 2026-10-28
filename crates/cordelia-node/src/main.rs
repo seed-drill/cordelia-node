@@ -857,7 +857,9 @@ fn open_database(
 /// start without its database, and says why. The connection is set as a
 /// node of the role that `config` gives keeps it, before the schema's
 /// steps run ([`keeps_secure_delete`]); a relay's has the automatic
-/// checkpoint off ([`checkpoints_on_a_timer`]).
+/// checkpoint off, for it checkpoints on a timer of its own in a take of
+/// its lock of kind Checkpoint (issue #224; [`relay_entries::kept_by`],
+/// the same test that gives the node the relay's part that runs it).
 fn open_the_nodes_database(
     db_path: &std::path::Path,
     config: &Config,
@@ -866,7 +868,7 @@ fn open_the_nodes_database(
     let secure_delete = keeps_secure_delete(role);
     match cordelia_storage::db::open_as(db_path, secure_delete) {
         Ok(conn) => {
-            if checkpoints_on_a_timer(role) {
+            if relay_entries::kept_by(role) {
                 cordelia_storage::db::automatic_checkpoint_off(&conn)?;
             }
             Ok((conn, None))
@@ -893,16 +895,6 @@ fn open_the_nodes_database(
 /// not, and pays nothing for it.
 fn keeps_secure_delete(role: &str) -> bool {
     role == "personal"
-}
-
-/// Whether a node of `role` turns SQLite's automatic checkpoint off on the
-/// connection it runs on, and checkpoints on a timer of its own, in a take
-/// of its lock of kind Checkpoint (issue #224;
-/// RELAY_CHECKPOINT_INTERVAL_SECS): a relay does, so that no push or show
-/// pays for a checkpoint with the lock held. Only the node's own
-/// connection: a command that opens the store writes little.
-fn checkpoints_on_a_timer(role: &str) -> bool {
-    role == "relay"
 }
 
 /// The last line of `cordelia init`. Run by a person, it says how the
@@ -9356,7 +9348,8 @@ mod tests {
 
     /// The connection a relay's node runs on has SQLite's automatic
     /// checkpoint off (issue #224), and keeps RELAY_LOG_KEPT_BYTES of its
-    /// log's file: it checkpoints on its own timer. A personal node's, a
+    /// log's file: it checkpoints on its own timer, which runs on a node
+    /// that keeps the relay's part. A personal node's, a
     /// bootnode's and a command's keep SQLite's 1,000 pages, and no limit.
     #[test]
     fn a_relays_store_has_the_automatic_checkpoint_off() {
@@ -9382,6 +9375,13 @@ mod tests {
             let db_path = dir.path().join(format!("{role}.db"));
             let (started, _) = open_the_nodes_database(&db_path, &as_a(role)).unwrap();
             assert_eq!(every(&started), pages, "{role}");
+            // A node whose store has it off is one that keeps the relay's
+            // part, whose timer checkpoints it.
+            assert_eq!(
+                every(&started).0 == 0,
+                relay_entries::kept_by(role),
+                "{role}"
+            );
             drop(started);
             let command = open_database(&db_path, &as_a(role)).unwrap();
             assert_eq!(every(&command), (1000, -1), "{role}");

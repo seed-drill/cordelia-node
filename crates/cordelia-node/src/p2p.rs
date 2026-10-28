@@ -2749,7 +2749,7 @@ pub async fn p2p_loop(
     // the size of the older kind's, and the relays it works with. A node
     // of any other role has none, and answers none of their streams.
     let relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>> =
-        (node_role == "relay").then(|| {
+        crate::relay_entries::kept_by(&node_role).then(|| {
             std::sync::Arc::new(
                 crate::relay_entries::RelayEntries::new(
                     max_storage_bytes,
@@ -2893,7 +2893,8 @@ pub async fn p2p_loop(
     relay_uses_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The checkpoint of a relay's store (issue #224), in a take of the
     // lock of its own: its connection has SQLite's automatic checkpoint
-    // off. When it starts, and every second after.
+    // off. A tick each second from when it starts, which checkpoints once
+    // the log holds RELAY_CHECKPOINT_LOG_PAGES.
     let mut relay_checkpoint_interval = tokio::time::interval(std::time::Duration::from_secs(
         cordelia_core::protocol::RELAY_CHECKPOINT_INTERVAL_SECS,
     ));
@@ -3492,8 +3493,9 @@ pub async fn p2p_loop(
                 }
             }
 
-            // The store's log is written back and truncated (issue #224).
-            // Off the select loop: it writes under the db lock.
+            // The store's log is written back once it is long enough
+            // (issue #224). Off the select loop: it writes under the db
+            // lock. A tick that finds the last still running does nothing.
             _ = relay_checkpoint_interval.tick(), if relay_entries.is_some() => {
                 if let Some(entries) = relay_entries.clone() {
                     let checkpoint_state = state.clone();

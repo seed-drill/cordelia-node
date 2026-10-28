@@ -2199,12 +2199,13 @@ fn value_of(text: &str, name: &str) -> u64 {
         .unwrap()
 }
 
-/// A relay process checkpoints its store on its timer, in takes of its
-/// lock of kind Checkpoint, and at a clean stop (issue #224): its
-/// connection has SQLite's automatic checkpoint off. After pushes, the
-/// count of its checkpoints goes on rising, a second at a time, and a
-/// push is still answered; told to stop, it writes the log back and
-/// truncates it.
+/// A relay process ticks its store's checkpoint on its timer, in takes of
+/// its lock of kind Checkpoint, and checkpoints at a clean stop (issue
+/// #224): its connection has SQLite's automatic checkpoint off. After
+/// pushes, the count of those takes goes on rising, a second at a time
+/// (each tick takes the lock, and checkpoints once the log is long
+/// enough), and a push is still answered; told to stop, it writes the log
+/// back and truncates it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_checkpoints_its_store_on_its_timer_and_at_a_clean_stop() {
     let mut relay = relay_started(None);
