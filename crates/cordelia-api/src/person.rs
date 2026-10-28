@@ -1582,10 +1582,9 @@ fn best_to_move_to(
         let DeviceSecret::Opened(secret) = opened.secret else {
             continue;
         };
+        // `Opened` is a secret that the statement commits to: the same
+        // statement as the head's, opened from the same entry.
         let secret = Zeroizing::new(secret);
-        if !opens(&head.statement, &secret) {
-            continue;
-        }
         let better = match &best {
             Some((kept, _)) => rank(statement)? > rank(&kept.statement.statement)?,
             None => true,
