@@ -342,7 +342,8 @@ fn moves_relay(node: &mut Node, from: &Node, to: &Node) {
 ///   in a channel of the desktop's change 3, and none is in a channel of
 ///   any secret that the tablet's database holds;
 /// - (f) no entry that the laptop signed reaches either relay in a channel
-///   of its own change 3 after (a): at relay B, none ever.
+///   of its own change 3 once it is started with relay B, before the move
+///   as after it: at relay A from then, and at relay B, none ever.
 ///
 /// Taken out: rule 9 (the laptop is closed: (a) and (d) fail); rule 4 or
 /// 5 (it goes on under its own change: (e) and (f) fail); rule 11 (the
@@ -414,8 +415,12 @@ fn a_removal_made_apart_from_a_renewal_takes_effect_without_settle() {
     );
     desktop_applied(&desktop);
 
-    // The laptop is set up with relay B too, and started again.
+    // The laptop is set up with relay B too, and started again. What relay
+    // A holds of it is marked while it is stopped: from its start to the
+    // move, it learns of the removal, and rule 5's window is there.
     laptop.stop();
+    let laptop_key = key_bytes(&laptop);
+    let before_the_move = last_stored_by(&relay_a, &laptop_key);
     laptop.add_relay(&format!("127.0.0.1:{}", relay_b.p2p), None);
     laptop.start();
     let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet];
@@ -427,7 +432,6 @@ fn a_removal_made_apart_from_a_renewal_takes_effect_without_settle() {
         let seen = person_of(&laptop);
         (seen["latest"].as_str() == Some(removal.as_str())).then_some(())
     });
-    let laptop_key = key_bytes(&laptop);
     let marks = (
         last_stored_by(&relay_a, &laptop_key),
         last_stored_by(&relay_b, &laptop_key),
@@ -474,9 +478,10 @@ fn a_removal_made_apart_from_a_renewal_takes_effect_without_settle() {
             hex::encode(channel)
         );
     }
-    // (f) None in a channel of its own change 3 after (a), at either
-    // relay; at relay B, none ever.
-    for channel in pushed_a
+    // (f) None in a channel of its own change 3 from when it was started
+    // with relay B, at relay A, before the move as after it; at relay B,
+    // none ever.
+    for channel in channels_stored_by(&relay_a, &laptop_key, before_the_move)
         .iter()
         .chain(&channels_stored_by(&relay_b, &laptop_key, 0))
     {
