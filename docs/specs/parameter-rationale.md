@@ -1962,6 +1962,71 @@ disk, each of a channel whose time kept was two hours old: a proof's hold
 of the lock went from a mean of 517 µs (at most 31 ms) to 10 µs (at most
 0.2 ms), and the one write of the 2,000 uses held it for about 6 ms.
 
+#### RELAY_CHECKPOINT_INTERVAL_SECS = 1, RELAY_LOG_KEPT_BYTES = 4 MiB
+
+**Rationale:** A relay's store is in SQLite's write-ahead mode. SQLite's
+automatic checkpoint runs inside whichever commit crosses about 1,000 pages
+of log, so the push that crosses it paid for the checkpoint with the
+relay's lock held: in the scale test (issue #224) a push held the lock for a
+median of 2 ms, and for 38 to 42 ms where it checkpointed, with a sync of
+10 ms. A relay's connection has the automatic checkpoint off, and the relay
+checkpoints in a take of its lock of its own, of kind Checkpoint, on this
+timer, so that no push or show pays for it. A device does not: its store is
+written by its own cycles and passes, and its hourly task truncates the log
+(decision 2026-10-09 §7.1).
+
+**The checkpoint is passive.** It writes back as much of the log as no
+reader holds, and waits for none: a command that reads a relay's store from
+another process (`cordelia stats`) cannot hold the lock for the busy
+timeout. A checkpoint that a reader holds back writes back the rest, and the
+next one, a second later, what is left once the reader is gone. The next
+commit after a whole checkpoint starts the log again from the start of its
+file, over what the file holds, and cuts the file to `RELAY_LOG_KEPT_BYTES`
+where it is longer (SQLite's `journal_size_limit`). A relay that stops
+cleanly, once no stream asks, writes the log back whole and truncates it,
+waiting for a reader up to the connection's busy timeout (5 s, within
+`NODE_STOP_TIMEOUT_SECS`).
+
+**What bounds the log.** Between two checkpoints the log holds what the
+relay committed in a second, plus, while a reader holds a part of it, what
+was committed since that reader began. A push of a small entry writes about
+18 KiB of log (four or five pages: the entry's row and its indexes). What a
+relay can be pushed is bounded by `PUSH_BYTES_PER_PEER_PER_MINUTE` for each
+of at most `MAX_INBOUND_CONNECTIONS`: 400 MiB a minute of entries as they
+are counted, 6.7 MiB a second; and the relay's one lock puts its commits
+one after another, each holding it for some 0.7 ms on a fast disk, so at
+most some 1,400 a second. Measured at a thousand pushes a second, more than
+the scale test's busiest stage asks in a quarter of an hour, the log reached
+27 MiB between two checkpoints; at the scale test's own rates (stage 500:
+some 55 writes a minute) it is a few pages. With a ten-second timer the
+same load made a log of 180 MiB.
+
+**Why a second.** Measured on a relay's store on disk, 100 devices pushing
+from four threads, with the node's own counters (`bench_a_pushs_hold_with_
+and_without_the_automatic_checkpoint` in `relay_entries.rs`):
+
+- **A sync of 10 ms** (each `fsync` slowed by `strace`), 2,000 pushes, three
+  runs each way. With the automatic checkpoint, 11 pushes in each run held
+  the lock over 32 ms, about 36 ms each: those that checkpointed. With this
+  timer, 1 did in each run (49 to 56 ms, the same with no limit on the
+  log's file); the checkpoints held it for 23 ms on average, at most 25 ms
+  but once 57 ms. A push's mean hold was the same, 11.8 ms, and its p50 and
+  p99 in the same buckets (16 ms and 32 ms).
+- **A fast disk,** 20,000 pushes at about a thousand a second. A checkpoint
+  each second held the lock for 2.7 ms on average, at most 6 ms. A push's
+  mean hold rose from about 690 µs to 820 to 900 µs, its p99 at most 4 ms in
+  two runs of three: the log is longer than the automatic checkpoint's,
+  and a read of the store looks through more of it. Each ten seconds, the
+  log grew to 180 MiB and a push's mean was 935 µs; a checkpoint that does
+  not stop at a reader but truncates the log each time cost every push more
+  again (970 µs), since the file must grow again under each commit.
+
+With nothing written, a checkpoint costs a take of the lock and about 2 µs.
+
+**Why 4 MiB:** what SQLite's automatic checkpoint kept the log at, 1,000
+pages of 4,096 bytes, rounded up to a power of two. Below it the log's file
+is written over in place.
+
 #### KEYED_TOMBSTONE_RETENTION_DAYS = 90, for a delete among entries
 
 **Rationale:** The value is the one that the record of 2026-09-30 gives a
