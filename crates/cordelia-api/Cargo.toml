@@ -38,3 +38,8 @@ libc = "0.2"
 tempfile = { workspace = true }
 # The statements a test counts, to bound the work of a request.
 rusqlite = { workspace = true, features = ["trace"] }
+
+[lints.rust]
+# CI's coverage job builds with `--cfg coverage` (ci.yml), which leaves out
+# the test of a take-out's holds of the lock (shared.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
