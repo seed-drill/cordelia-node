@@ -739,3 +739,60 @@ fn the_model_counts_a_device_only_where_its_relay_holds_its_connection() {
     let (less, _) = model(true);
     assert_eq!(all - less, 6.0 * 6.0 * 3.0);
 }
+
+// ── Bar 7: the 2% is of the RSS a relay rose from ──
+
+/// A relay's first sample is taken as it starts, at a few MiB, and a start
+/// again lowers its median. Bar 7's 2% an hour is of the RSS it rose from in
+/// each half: a relay of 60 MiB that rises 1 MiB an hour, starts again, and
+/// fills again from 30 MiB does not grow; one that rises 2 MiB an hour from
+/// 60 MiB through the window does.
+#[test]
+fn bar_7_takes_its_two_percent_of_the_rss_it_rose_from() {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    becomes(&run, 0, 4400.0, Is::Stopped);
+    becomes(&run, 0, 4500.0, Is::Running);
+    window(&run, 600.0, 11_400.0);
+    let at = |node: usize, t: f64, mib: f64| {
+        run.samples.lock().unwrap().nodes.push(Sample {
+            t,
+            node,
+            proc: Some(crate::machine::ProcRead {
+                rss_kib: (mib * 1024.0) as u64,
+                ..Default::default()
+            }),
+            metrics: Some(HashMap::from([(
+                "cordelia_connections_open".to_string(),
+                10.0,
+            )])),
+            ..Sample::default()
+        });
+    };
+    for node in [0, 1] {
+        at(node, 0.0, 2.0);
+    }
+    for t in (2..=38).map(|n| n as f64 * 300.0) {
+        match t < 4400.0 {
+            true => at(0, t, 60.0 + (t - 600.0) / 3600.0),
+            false => at(0, t, 30.0 + 4.0 * (t - 4500.0) / 3600.0),
+        }
+        at(1, t, 60.0 + 2.0 * (t - 600.0) / 3600.0);
+    }
+    let read = read_of(&run);
+    let bar = bar_7(&read);
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    let said: Vec<&str> = bar.figure.split("; ").collect();
+    assert!(
+        said[0].starts_with("relay 1:")
+            && said[0].contains("no persistent growth (rises of 1.00 and 4.00 MiB an hour"),
+        "{}",
+        bar.figure
+    );
+    assert!(
+        said[1].starts_with("relay 2:")
+            && said[1].contains("growing in both halves (rises of 2.00 and 2.00 MiB an hour"),
+        "{}",
+        bar.figure
+    );
+}
