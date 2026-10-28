@@ -498,10 +498,12 @@ impl Device {
             no_place: own_channels.no_place(),
             mapped: true,
             per_folder_per_hour: 20,
+            shared_fetched: false,
+            shared_reached: false,
         };
         let request = Request {
             from: from.into(),
-            to,
+            address: sender::Address::Own(to),
             asks: false,
             link: None,
             body: body.into(),

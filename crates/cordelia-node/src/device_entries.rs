@@ -1631,6 +1631,18 @@ impl DeviceEntries {
             Err(e) => tracing::warn!(error = %e, "could not drop the messages that went"),
         }
         drop(db);
+        // The device's own messages in shared channels whose 30 days are up
+        // are cleared there (decision 2026-10-10 §6.1).
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        match cordelia_api::shared_sender::clear_expired(&db, identity, now, &fetched) {
+            Ok(0) => {}
+            Ok(cleared) => {
+                tracing::info!(cleared, "shared messages whose 30 days are up were cleared")
+            }
+            Err(e) => tracing::warn!(error = %e, "could not clear shared messages"),
+        }
+        drop(db);
         // What the hourly task began to take out of the shared channels
         // (quiet keys) goes in steps, each under a hold of the lock of its
         // own, of the hourly task's kind (decision 2026-10-10 §6.3, §8.4).
@@ -1741,6 +1753,46 @@ impl DeviceEntries {
         }
     }
 
+    /// Write the device's list of the shared messages its agents read and
+    /// sent, where its table holds a mark that the list lacks (decision
+    /// 2026-10-10 §6.1; [`cordelia_api::shared_messages::write_list`]): only
+    /// once the messages channel was fetched since the node started. Says
+    /// whether it wrote one.
+    fn write_shared_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let identity = &self.state.identity;
+        let written = cordelia_api::shared_messages::write_list(
+            &db,
+            identity,
+            self.unix(),
+            fetched.unwrap_or(false),
+        );
+        match written {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of shared marks");
+                false
+            }
+        }
+    }
+
+    /// Write again, each under the next number, the device's own messages in
+    /// shared channels that wait to be sent again (decision 2026-10-10 §6.1,
+    /// §6.4; [`cordelia_api::shared_sender::write_again`]): only in a channel
+    /// fetched since the node started, each counted in its channel's hour
+    /// alone.
+    fn shared_write_again(&self) {
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        let identity = &self.state.identity;
+        if let Err(e) =
+            cordelia_api::shared_sender::write_again(&db, identity, self.unix(), &fetched)
+        {
+            tracing::debug!(error = %e, "could not send shared messages again");
+        }
+    }
+
     /// Read once the lists of a person's reads and of bounds that the store
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
@@ -1751,6 +1803,15 @@ impl DeviceEntries {
             Ok(true) => tracing::info!("read the lists of messages held from before this version"),
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
+        }
+        // And the `sread/` lists held from before step 25 (decision
+        // 2026-10-10 §14).
+        let read =
+            cordelia_api::reader::read_held_shared_lists(&db, &self.state.identity, self.unix());
+        match read {
+            Ok(true) => tracing::info!("read the lists of shared marks held from before"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read the lists of shared marks held"),
         }
     }
 
@@ -2425,11 +2486,14 @@ impl DeviceEntries {
             if messages {
                 self.read_held_lists();
             }
+            // And its list of shared marks, `sread/`, by the same rules
+            // (decision 2026-10-10 §6.1).
             if messages
                 && (self.write_again()
                     | self.write_list()
                     | self.write_person_list()
-                    | self.write_bounds_list())
+                    | self.write_bounds_list()
+                    | self.write_shared_list())
             {
                 sent = match self.push(&at, channel, Which::Since).await {
                     Step::Done(sent) => sent,
@@ -3493,6 +3557,10 @@ impl DeviceEntries {
     /// waits. Nothing it is refused sets the status (§9).
     async fn shared_pass(&self, link: &Link, kind: Pass) {
         self.share_pushes(link).await;
+        // A shared message that waits to be sent again is written again
+        // under the next number before the pushes (decision 2026-10-10
+        // §6.1).
+        self.shared_write_again();
         let channels = self.shared_at(link);
         if channels.is_empty() {
             return;
@@ -3636,6 +3704,16 @@ impl DeviceEntries {
                         of.shared.handed += handed;
                         let read_here = pages.entry(*channel).or_default();
                         *read_here += 1;
+                        // Read to its end at this relay: a device writes in a
+                        // shared channel only once it has read it there since
+                        // it started (decision 2026-10-10 §6.1, `not_fetched`).
+                        if end {
+                            self.state.own_channels.fetched_from(
+                                channel,
+                                link.name(),
+                                self.clock.now(),
+                            );
+                        }
                         if end || !got_somewhere || *read_here >= RELAY_ENTRY_PULL_PAGES {
                             read.insert(*channel);
                         }

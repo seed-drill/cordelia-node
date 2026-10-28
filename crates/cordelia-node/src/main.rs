@@ -255,6 +255,36 @@ enum Commands {
         #[arg(long)]
         none: bool,
     },
+    /// Show the agent of this folder the messages of a shared channel, on
+    /// every device of yours
+    ///
+    /// Run it in a terminal, in the folder. It is shown a count of what
+    /// waits there, can read it, and can write there with
+    /// `cordelia msg send --channel <name>`. What was written there before
+    /// is in `cordelia msg log` only.
+    Subscribe {
+        /// The name you file the shared channel under
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Stop showing an agent a shared channel, on every device of yours
+    ///
+    /// In the folder, or from anywhere with --agent.
+    Unsubscribe {
+        /// The name you file the shared channel under
+        name: String,
+        /// The agent, as `cordelia sync status` names it, in place of this
+        /// folder's
+        #[arg(long)]
+        agent: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
     /// Channels shared between people: messages between your agents and
     /// other people's agents, never memory
     Shared {
@@ -490,7 +520,15 @@ enum MsgCommand {
     Read {
         /// 8 to 32 hex characters of the message's id, as `summary` shows
         /// it
-        id: String,
+        #[arg(
+            required_unless_present = "next_shared",
+            conflicts_with = "next_shared"
+        )]
+        id: Option<String>,
+        /// The oldest unread message of a shared channel this folder's
+        /// agent subscribes to
+        #[arg(long)]
+        next_shared: bool,
         /// Read as the agent of this folder, not of the one you run in:
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
@@ -498,9 +536,18 @@ enum MsgCommand {
     },
     /// Send a message, as this folder's agent: its text on standard input
     ///
-    /// Give one of --to, --all and --reply. A message is at most 1024
-    /// bytes: put the rest in the issue or pull request that --re names.
+    /// Give one of --to, --all and --reply, or --channel. A message is at
+    /// most 1024 bytes: put the rest in the issue or pull request that --re
+    /// names.
     Send {
+        /// A shared channel this folder's agent subscribes to: the only
+        /// way into one. Other people's agents read it
+        #[arg(long, value_name = "NAME")]
+        channel: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS", requires = "channel")]
+        words: Option<String>,
         /// The name of one of your agents, as `cordelia sync status` lists
         /// it
         #[arg(long)]
@@ -832,6 +879,12 @@ fn main() -> anyhow::Result<()> {
             let label = if none { None } else { label };
             shared_cmd::label(&cli.config, &key, label.as_deref())
         }
+        Some(Commands::Subscribe { name, words }) => {
+            shared_cmd::subscribe(&cli.config, &name, words.as_deref())
+        }
+        Some(Commands::Unsubscribe { name, agent, words }) => {
+            shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
+        }
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
             SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
@@ -886,8 +939,18 @@ fn main() -> anyhow::Result<()> {
                 msg_cmd::summary(&cli.config, started, folder, false);
                 Ok(())
             }
-            MsgCommand::Read { id, folder } => msg_cmd::read(&cli.config, &id, folder.as_deref()),
+            MsgCommand::Read {
+                id,
+                next_shared,
+                folder,
+            } => match (id, next_shared) {
+                (_, true) => msg_cmd::read_next_shared(&cli.config, folder.as_deref()),
+                (Some(id), false) => msg_cmd::read(&cli.config, &id, folder.as_deref()),
+                (None, false) => unreachable!("the parser asks for an id or --next-shared"),
+            },
             MsgCommand::Send {
+                channel,
+                words,
                 to,
                 all,
                 reply,
@@ -897,6 +960,8 @@ fn main() -> anyhow::Result<()> {
             } => msg_cmd::send(
                 &cli.config,
                 &msg_cmd::SendFlags {
+                    channel,
+                    words,
                     to,
                     all,
                     reply,
@@ -2831,6 +2896,13 @@ fn messages_at_start(state: &cordelia_api::state::AppState) {
         Ok(true) => tracing::info!("messages: read the lists held from before this version"),
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %e, "messages: could not read the lists held"),
+    }
+    // And the lists of shared marks held from before step 25 (decision
+    // 2026-10-10 §14), before the first pass.
+    match cordelia_api::reader::read_held_shared_lists(&db, &state.identity, now) {
+        Ok(true) => tracing::info!("messages: read the lists of shared marks held"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "messages: could not read the lists of shared marks"),
     }
 }
 
@@ -5812,6 +5884,25 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         ]);
     }
     print_columns(&rows);
+    // Each folder's subscriptions to shared channels (decision 2026-10-10
+    // §5.1), where it subscribes to any.
+    let shared =
+        api_post(config_path, "/api/v1/shared/list", serde_json::json!({})).unwrap_or_default();
+    for f in &folders {
+        let agent = text(&f["project"]);
+        let names: Vec<String> = list(&shared["subscriptions"])
+            .iter()
+            .filter(|row| row["agent"].as_str() == Some(agent.as_str()))
+            .map(|row| sync_label(&text(&row["channel"])))
+            .collect();
+        if !names.is_empty() {
+            println!(
+                "  {}: subscribes to: {}",
+                sync_label(&agent),
+                names.join(", ")
+            );
+        }
+    }
     for f in &folders {
         for s in list(&f["skipped"]) {
             println!(
