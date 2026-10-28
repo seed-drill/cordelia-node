@@ -276,8 +276,8 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
 /// A device judges the change entries it kept, at its first start on the
 /// version that keeps every head (decision 2026-10-24 (removal), rule 12):
 /// where schema step 22 marked it, it notes the time of each, and a device
-/// in a fork applies rule 8 to the entry it kept apart: it goes on, or
-/// stays closed (the move of rule 9 is a later slice). Once: the mark goes
+/// in a fork applies rule 8 to the entry it kept apart: it goes on, moves
+/// (rule 9), or stays closed. Once: the mark goes
 /// with the judging. What it came to is said in the log. One that cannot
 /// be judged is said, and judged again at the next first start: it stays
 /// closed meanwhile, as a device in a fork is closed.

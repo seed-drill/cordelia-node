@@ -2707,8 +2707,9 @@ async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_n
 /// it lists the lost device, which the laptop's removes, and the laptop's
 /// is clear (decision 2026-10-24 (removal), rule 8). The tablet, once it is
 /// shown the laptop's, knows the lost device to be removed: the change it
-/// follows is not clear, and it is closed (until the move of rule 9 is
-/// built).
+/// follows is not clear, and it moves, with no phrase, to the laptop's,
+/// which is clear and lists it, and sets the lost one's aside (rule 9;
+/// section 4, case 7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
     let (near, far) = (relay_started("near", None), relay_started("far", None));
@@ -2775,15 +2776,15 @@ async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_
         (shows.entry.id(), shows.set_aside),
         (again.id(), vec![unheard.id()])
     );
-    // And the tablet, which applied the lost one's, is closed once it is
-    // shown the laptop's, at the relay that holds that one.
+    // And the tablet, which applied the lost one's, moves to the
+    // laptop's once it is shown it, at the relay that holds that one.
     behind.connects("near", &near).await;
     behind.passes().await;
-    assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(behind.stands(), Stands::Applied);
     let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
     assert_eq!(
         (shows.entry.id(), shows.set_aside),
-        (unheard.id(), vec![again.id()])
+        (again.id(), vec![unheard.id()])
     );
 }
 
