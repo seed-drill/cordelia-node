@@ -1396,7 +1396,11 @@ fn to_hand<'a>(
 
 /// The entry that an entry at `rev` which the relay does not hold is
 /// answered with where nothing is left to hand: the first it keeps at that
-/// revision or a later one, the lowest number first, as today.
+/// revision or a later one, the lowest number first, as today. The
+/// connection was handed it already, so it is handed twice: the answers
+/// stay today's (decision 2026-10-24 (removal), section 6), and a device of
+/// this version takes no leave from a head handed twice at a relay that
+/// names the role `heads` (rule 18).
 fn ahead_of(kept: &[Kept], rev: u64) -> Option<&Kept> {
     kept.iter()
         .filter(|kept| kept.entry.rev >= rev)
