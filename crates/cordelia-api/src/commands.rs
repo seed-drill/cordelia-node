@@ -658,7 +658,20 @@ pub async fn add_look(
     asked(&req, &state)?;
     let device = key_of("device", &body.device)?;
     let label = body.label.as_deref().unwrap_or(NO_LABEL);
-    let would = adding::would_add(&db(&state), &state.identity, &device, label).map_err(refused)?;
+    let (would, shared) = {
+        let conn = db(&state);
+        let would = adding::would_add(&conn, &state.identity, &device, label).map_err(refused)?;
+        // The shared channels the new device is handed, with the keys of
+        // each (decision 2026-10-10 §5.2): adding a device trusts it with
+        // everything of the person's.
+        let shared =
+            crate::sharing::held_with_keys(&conn, &state.identity.public_key()).map_err(refused)?;
+        (would, shared)
+    };
+    let shared: Vec<serde_json::Value> = shared
+        .into_iter()
+        .map(|(name, keys)| json!({ "name": name, "keys": keys }))
+        .collect();
     let words = fingerprint::shown(&device);
     // The key that the node runs under: the command refuses where it is
     // another than the one in the device's key file (§16).
@@ -666,7 +679,7 @@ pub async fn add_look(
     Ok(HttpResponse::Ok().json(match would {
         WouldAdd::HandsAgain { label } => json!({
             "would": "hand_again", "label": label, "words": words,
-            "this_device": this_device,
+            "this_device": this_device, "shared": shared,
         }),
         WouldAdd::Adds {
             counts_already,
@@ -674,7 +687,7 @@ pub async fn add_look(
         } => json!({
             "would": "add", "label": label, "words": words,
             "counts_already": counts_already, "left_out_as": left_out_as,
-            "this_device": this_device,
+            "this_device": this_device, "shared": shared,
         }),
     }))
 }

@@ -770,8 +770,9 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
             }
             at.yes(&format!(
                 "This gives {} every name's memory, and the means to read what your devices \
-                 write from now on.",
-                named(label, &device)
+                 write from now on.{}",
+                named(label, &device),
+                shared_handed(&would)
             ))?
         }
     };
@@ -797,6 +798,30 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
         fingerprint::shown(&own)
     );
     Ok(())
+}
+
+/// What `add-device`'s yes adds where the person holds a shared channel
+/// (decision 2026-10-10 §5.2): that the new device holds each, and can read
+/// and write in each, with the keys of each. Nothing where it holds none.
+fn shared_handed(would: &Value) -> String {
+    let held: Vec<&Value> = list(would, "shared").collect();
+    if held.is_empty() {
+        return String::new();
+    }
+    let mut says = format!(
+        " It also holds the {} shared channel{} you are in, and can read and write in each:",
+        held.len(),
+        if held.len() == 1 { "" } else { "s" }
+    );
+    for channel in held {
+        let keys = channel["keys"].as_u64().unwrap_or(0);
+        says.push_str(&format!(
+            "\n  {:?}: {keys} key{}",
+            cordelia_api::messages::cleaned(text(channel, "name")),
+            if keys == 1 { "" } else { "s" }
+        ));
+    }
+    says
 }
 
 // ── cordelia accept ─────────────────────────────────────────────────
@@ -3091,6 +3116,24 @@ mod tests {
 
     const WORDS: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    /// `add-device`'s yes names each shared channel the person holds, with
+    /// the keys that wrote there (decision 2026-10-10 §5.2), and adds
+    /// nothing where the person holds none.
+    #[test]
+    fn add_device_names_each_shared_channel_with_its_keys() {
+        assert_eq!(shared_handed(&json!({ "shared": [] })), "");
+        assert_eq!(shared_handed(&json!({})), "");
+        let would = json!({ "shared": [
+            { "name": "review-with-alice", "keys": 3 },
+            { "name": "design", "keys": 1 },
+        ] });
+        assert_eq!(
+            shared_handed(&would),
+            " It also holds the 2 shared channels you are in, and can read and write in each:\n  \
+             \"review-with-alice\": 3 keys\n  \"design\": 1 key"
+        );
+    }
 
     /// A device under a phrase, at its second statement, which lists it
     /// and one other device and removes one key: the statement, its

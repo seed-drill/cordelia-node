@@ -848,8 +848,15 @@ pub fn labelled(conn: &Connection) -> Result<Vec<[u8; 32]>, CordeliaError> {
     Ok(keys)
 }
 
-/// The keys labelled are `keys`, from now.
+/// The keys labelled are `keys`, from now. Where they are already,
+/// nothing is written: a device works its lists out at every whole pass.
 pub fn set_labelled(conn: &Connection, keys: &[[u8; 32]]) -> Result<(), CordeliaError> {
+    let mut wanted = keys.to_vec();
+    wanted.sort();
+    wanted.dedup();
+    if labelled(conn)? == wanted {
+        return Ok(());
+    }
     conn.execute("DELETE FROM shared_labelled", [])
         .map_err(storage)?;
     for key in keys {

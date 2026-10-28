@@ -33,6 +33,8 @@ use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::share::Card;
+use cordelia_crypto::shared::anew_name;
+use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries;
 use cordelia_storage::relay::{Mark, NO_MARK};
 use cordelia_storage::shared::{self as kept, State};
@@ -318,13 +320,18 @@ pub fn to_send(
 /// with `answers`, one for each entry, in one transaction. An entry it
 /// holds, holds a later one of, holds another at its revision of, or
 /// refused as not signed is not sent there again; one it refused for room
-/// or for the address's allowance waits. Returns how many it refused so.
+/// or for the address's allowance waits. Where it holds another at the
+/// revision of this device's anew record, the record is written again
+/// above it (§2.3, [`anew_again`]), at `now`. Returns how many it refused
+/// for room or allowance.
 pub fn pushed(
     conn: &Connection,
+    identity: &NodeIdentity,
     usable: &Usable,
     relay: &[u8; 32],
     batch: &[CheckedEntry],
     answers: &[Pushed],
+    now: i64,
 ) -> Result<usize, PersonError> {
     in_one(conn, || {
         let mut refused = 0;
@@ -332,7 +339,10 @@ pub fn pushed(
             let answer = match pushed {
                 Pushed::Holds => Answer::Holds,
                 Pushed::HoldsLater => Answer::HoldsLater,
-                Pushed::HoldsAnother => Answer::HoldsAnother,
+                Pushed::HoldsAnother => {
+                    anew_again(conn, identity, usable, entry, now)?;
+                    Answer::HoldsAnother
+                }
                 Pushed::DoesNotCheck => Answer::DoesNotCheck,
                 Pushed::NoRoom | Pushed::OverAllowance => {
                     refused += 1;
@@ -343,6 +353,38 @@ pub fn pushed(
         }
         Ok(refused)
     })
+}
+
+/// A relay holds another entry of this device's at the revision of
+/// `entry` (§2.3, `Pushed::HoldsAnother`): where `entry` is this device's
+/// anew record, and the one its store holds, it is written again one
+/// revision above, holding the same, through the one door. A device that
+/// dropped a channel and took it again writes its record at revision 1
+/// once more, and a relay that kept the first answers so.
+fn anew_again(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<(), PersonError> {
+    // The slot is named by this device's key, and a push holds only this
+    // device's entries.
+    let own = identity.public_key();
+    let slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
+    if entry.slot != slot {
+        return Ok(());
+    }
+    let Some(held) = entries::author_entry(conn, &usable.channel, &slot, &own)? else {
+        return Ok(());
+    };
+    if held.entry.rev != entry.rev {
+        return Ok(());
+    }
+    let inside = Entry::check(held.entry)?.open(&usable.secret)?;
+    let again = Entry::seal(&usable.secret, identity, entry.rev + 1, &inside)?.check()?;
+    take(conn, identity, &again, now)?;
+    Ok(())
 }
 
 /// The share pair channel of this device and `key` (decision 2026-10-10
@@ -578,21 +620,35 @@ mod tests {
         assert_eq!(waits(&AT), std::slice::from_ref(&own));
         for refused in [Pushed::NoRoom, Pushed::OverAllowance] {
             assert_eq!(
-                pushed(conn, &here, &AT, std::slice::from_ref(&own), &[refused]).unwrap(),
+                pushed(
+                    conn,
+                    identity,
+                    &here,
+                    &AT,
+                    std::slice::from_ref(&own),
+                    &[refused],
+                    now
+                )
+                .unwrap(),
                 1
             );
             assert_eq!(waits(&AT), std::slice::from_ref(&own));
         }
-        for answer in [
-            Pushed::Holds,
-            Pushed::HoldsLater,
-            Pushed::HoldsAnother,
-            Pushed::DoesNotCheck,
-        ] {
+        // Another at its revision writes it again above: a test of its own.
+        for answer in [Pushed::Holds, Pushed::HoldsLater, Pushed::DoesNotCheck] {
             not_held_at(conn, &here, &AT).unwrap();
             assert_eq!(waits(&AT), std::slice::from_ref(&own));
             assert_eq!(
-                pushed(conn, &here, &AT, std::slice::from_ref(&own), &[answer]).unwrap(),
+                pushed(
+                    conn,
+                    identity,
+                    &here,
+                    &AT,
+                    std::slice::from_ref(&own),
+                    &[answer],
+                    now
+                )
+                .unwrap(),
                 0
             );
             assert!(waits(&AT).is_empty(), "{answer:?}");
@@ -616,9 +672,64 @@ mod tests {
         assert_eq!(waits(&AT), std::slice::from_ref(&later));
         // An answer at a lower revision does not undo one at a higher.
         let held = std::slice::from_ref(&later);
-        pushed(conn, &here, &AT, held, &[Pushed::Holds]).unwrap();
+        pushed(conn, identity, &here, &AT, held, &[Pushed::Holds], now).unwrap();
         rows::answered(conn, here.id, &AT, &own.slot, own.rev, Answer::Holds).unwrap();
         assert!(waits(&AT).is_empty());
+    }
+
+    /// A channel dropped and taken again has its empty anew record written
+    /// at revision 1 once more; a relay that kept the first answers that
+    /// it holds another at that revision, and the record is written again
+    /// above it and waits there (§2.3). Another key's entry, and a message
+    /// of this device's, are not written again.
+    #[test]
+    fn an_anew_record_a_relay_holds_another_of_is_written_again_above() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        assert_eq!(
+            crate::sharing::write_empty_anew_records(conn, identity, now).unwrap(),
+            1
+        );
+        acts(&s, 0, Do::Drop(channel.id), now + 1);
+        holds(&s, 0, 1, "review", now + 2);
+        assert_eq!(
+            crate::sharing::write_empty_anew_records(conn, identity, now + 2).unwrap(),
+            1
+        );
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        let first = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].rev, 1);
+        let theirs = anew(&member(3), &channel, 1);
+        let mine = message(identity, &channel, 1, "hello", now + 2);
+        crate::take::take(conn, identity, &mine, now + 2).unwrap();
+        let batch = [first[0].clone(), theirs, mine.clone()];
+        let answers = [Pushed::HoldsAnother; 3];
+        pushed(conn, identity, &here, &AT, &batch, &answers, now + 3).unwrap();
+        let again = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!((again[0].slot, again[0].rev), (first[0].slot, 2));
+        let opened = again[0].open(&channel.secret).unwrap();
+        assert_eq!(opened.name, anew_name(&identity.public_key()).unwrap());
+        // Answered at the revision it was written over: nothing more.
+        pushed(
+            conn,
+            identity,
+            &here,
+            &AT,
+            &first,
+            &[Pushed::HoldsAnother],
+            now + 4,
+        )
+        .unwrap();
+        assert_eq!(to_send(conn, identity, &here, &AT, most).unwrap(), again);
     }
 
     /// A read again from the start begins at most once a day for each

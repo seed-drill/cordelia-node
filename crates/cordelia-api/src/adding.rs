@@ -1027,7 +1027,7 @@ fn hand_over_in(
 
 /// Whether a hand-over that says it was made at `made`, in seconds, was
 /// made less than an hour before or after the key was typed.
-fn made_within_the_hour(made: u64, typed_at: i64) -> bool {
+pub(crate) fn made_within_the_hour(made: u64, typed_at: i64) -> bool {
     let Ok(made) = i64::try_from(made) else {
         return false;
     };

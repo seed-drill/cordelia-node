@@ -886,6 +886,114 @@ pub fn shown_keys(conn: &Connection, channel: &[u8; 32]) -> Result<Vec<[u8; 32]>
         .collect())
 }
 
+/// What the judge of a share made of an entry that the typed key signed
+/// in its share pair channel ([`accept_typed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Judged {
+    /// A share by rules 1 to 8 of §3.2: one that may be taken, where it is
+    /// the one.
+    Share(Box<CheckedEntry>),
+    /// No share that may be taken, and why.
+    Not(NotAShare),
+}
+
+/// Why an entry of a share pair channel is no share to take (decision
+/// 2026-10-10 §3.2, rules 2 to 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAShare {
+    /// Rule 2: not of the share pair channel of the typed key and this
+    /// device, or it does not open there.
+    NotThePairChannel,
+    /// Rule 3: another key signed it.
+    SignedByAnotherKey,
+    /// Rule 4: a delete, another name, or no share of the right length and
+    /// form, with a card of the form of 2.1.
+    NotAShare,
+    /// Rule 5: made an hour or more before or after the key was typed.
+    NotMadeWithinTheHour,
+    /// Rule 6: for another device.
+    NotForThisDevice,
+    /// Rule 8: the card gives another ID than its name says.
+    AnotherChannel,
+}
+
+/// Judge `entry`, handed from the share pair channel of the key `key`
+/// typed for a channel at `typed_at`, by rules 1 to 8 of §3.2 (decision
+/// 2026-10-10 §2.3, "the entries of a share pair channel never come through
+/// the door"): nothing is stored, and nothing is taken here. Which of the
+/// shares found is taken, and rules 9 to 11, are
+/// [`crate::sharing::take_share`]'s.
+///
+/// `None` where the key reads nothing now (rule 1): it was not typed for a
+/// channel at `typed_at`, a share was taken under that typing, or its hour
+/// has gone.
+pub fn accept_typed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    key: &[u8; 32],
+    typed_at: i64,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<Option<Judged>, PersonError> {
+    use cordelia_crypto::share::{Share, share_name};
+    use cordelia_storage::shared_sharing as typed_rows;
+    // Rule 1.
+    let reads = typed_rows::typed_key(conn, key)?.is_some_and(|row| {
+        row.typed_at == typed_at
+            && row.taken.is_none()
+            && crate::adding::within_its_hour(row.typed_at, now)
+    });
+    if !reads {
+        return Ok(None);
+    }
+    let not = |why: NotAShare| Ok(Some(Judged::Not(why)));
+    // Rule 2: the share pair channel of the typed key and this device.
+    let Some((pair, secret)) = crate::shared_pass::share_pair(identity, key) else {
+        return not(NotAShare::NotThePairChannel);
+    };
+    if entry.channel != pair {
+        return not(NotAShare::NotThePairChannel);
+    }
+    // Rule 3.
+    if entry.author != *key {
+        return not(NotAShare::SignedByAnotherKey);
+    }
+    if entry.delete {
+        return not(NotAShare::NotAShare);
+    }
+    let Ok(inside) = entry.open(&secret) else {
+        return not(NotAShare::NotThePairChannel);
+    };
+    // Rule 4.
+    let Ok(share) = Share::from_value(&inside.value) else {
+        return not(NotAShare::NotAShare);
+    };
+    let Some(named) = inside
+        .name
+        .strip_prefix(cordelia_core::protocol::SHARE_PREFIX)
+        .and_then(|id| hex::decode(id).ok())
+        .and_then(|id| <[u8; 32]>::try_from(id).ok())
+    else {
+        return not(NotAShare::NotAShare);
+    };
+    if inside.name != share_name(&named) {
+        return not(NotAShare::NotAShare);
+    }
+    // Rule 5.
+    if !crate::adding::made_within_the_hour(share.made, typed_at) {
+        return not(NotAShare::NotMadeWithinTheHour);
+    }
+    // Rule 6.
+    if share.for_key != identity.public_key() {
+        return not(NotAShare::NotForThisDevice);
+    }
+    // Rule 8.
+    if share.card.channel_id()? != named {
+        return not(NotAShare::AnotherChannel);
+    }
+    Ok(Some(Judged::Share(Box::new(entry.clone()))))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2529,7 +2637,15 @@ pub(crate) mod tests {
     /// still going, or gone with its revisions kept; the door stores
     /// nothing more of a key going, and the reader shows nothing of it; and
     /// the next start ends the take-out.
+    ///
+    /// Not under coverage (CI's coverage job builds with `--cfg
+    /// coverage`): its counters are in the holds it bounds, and they ran
+    /// over 100 ms there on 28 October; CI's test job runs it whole.
     #[test]
+    #[cfg_attr(
+        coverage,
+        ignore = "under coverage, its counters are in the holds it bounds"
+    )]
     fn a_take_out_holds_the_lock_one_key_at_a_time() {
         use cordelia_core::load::Kind;
         use cordelia_core::lock::{LockWhole, TimedLock, taking};

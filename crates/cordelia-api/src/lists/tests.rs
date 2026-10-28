@@ -2855,3 +2855,69 @@ fn a_whole_fetch_that_cannot_read_the_database_says_so() {
     s[0].conn.execute("DROP TABLE shared_lists", []).unwrap();
     assert!(fetched_whole(&s[0].conn, &s[0].identity, s.now + 1).is_err());
 }
+
+// ── A whole fetch that finds nothing new ─────────────────────────────────
+
+/// A copy of `conn` in a file at `path`, opened as the node opens its
+/// store: its commits go to a write-ahead log, whose frames can be counted.
+fn on_disk(conn: &rusqlite::Connection, path: &std::path::Path) -> rusqlite::Connection {
+    conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    cordelia_storage::db::open_as(path, true).unwrap()
+}
+
+/// How many pages `work` wrote to the write-ahead log of `conn`: a write
+/// that changes no row, as a delete of every row of an empty table, is
+/// counted as any other.
+fn frames_written(conn: &rusqlite::Connection, work: impl FnOnce()) -> i64 {
+    let truncate = "PRAGMA wal_checkpoint(TRUNCATE)";
+    let busy: i64 = conn.query_row(truncate, [], |row| row.get(0)).unwrap();
+    assert_eq!(busy, 0);
+    work();
+    let frames = "PRAGMA wal_checkpoint(PASSIVE)";
+    conn.query_row(frames, [], |row| row.get(1)).unwrap()
+}
+
+/// A whole fetch that finds the lists as they were writes nothing (decision
+/// 2026-10-10 §3.4, "what a device writes"): a device works its lists out
+/// at every whole pass, and one that changed nothing commits no page under
+/// the node's lock. Two devices of one person hold a channel filed and a
+/// key labelled, with an act of each taken; each then fetches ten times
+/// with nothing new. Neither the rows of when it took each act, nor the
+/// keys labelled, nor the row of the channel it holds is written again;
+/// nor, on a device whose person holds no shared channel, are the empty
+/// tables of either.
+#[test]
+fn a_whole_fetch_that_finds_nothing_new_writes_nothing() {
+    let alone = person(1, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = on_disk(&alone[0].conn, &dir.path().join("alone.db"));
+    let written = frames_written(&conn, || {
+        for pass in 0..10 {
+            let wrote = fetched_whole(&conn, &alone[0].identity, alone.now + pass).unwrap();
+            assert!(!wrote, "pass {pass}");
+        }
+    });
+    assert_eq!(written, 0, "a device of a person with no shared channel");
+
+    let s = person(2, 2);
+    let now = s.now + 10;
+    on(&s, 0, Do::File(filing(1, "review")), now + 1);
+    on(&s, 0, Do::Label(label(9, Some("bob"))), now + 2);
+    all_fetch(&s, &[0, 1], now + 3, 2);
+    for n in 0..2 {
+        let conn = on_disk(&s[n].conn, &dir.path().join(format!("{n}.db")));
+        assert_eq!(kept_rows::taken(&conn).unwrap().len(), 2, "device {n}");
+        let labelled = cordelia_storage::shared::labelled(&conn).unwrap();
+        assert_eq!(labelled, [[9; 32]], "device {n}");
+        let held = cordelia_storage::shared::channel(&conn, &channel(1)).unwrap();
+        assert!(held.is_some(), "device {n}");
+        let written = frames_written(&conn, || {
+            for pass in 0..10 {
+                let wrote = fetched_whole(&conn, &s[n].identity, now + 10 + pass).unwrap();
+                assert!(!wrote, "device {n}, pass {pass}");
+            }
+        });
+        assert_eq!(written, 0, "device {n}");
+    }
+}
