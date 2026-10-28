@@ -4984,7 +4984,8 @@ fn one_relay_each_now(
 /// one: off the select loop, since it waits on the relays. Each relay has
 /// its turn in a pass by itself: at a relay where an earlier pass is
 /// still at its turn, this one does nothing, and it goes on at every
-/// other relay. Only while the device wakes does one pass ask every
+/// other relay; except a whole pass behind a pass that sends, which
+/// waits for that turn where no other whole pass waits. Only while the device wakes does one pass ask every
 /// relay, and a second that finds it doing so does nothing.
 fn device_pass(
     device: &Option<std::sync::Arc<cordelia_node::device_entries::DeviceEntries>>,

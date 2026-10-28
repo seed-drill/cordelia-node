@@ -223,53 +223,65 @@ impl Relay {
     }
 }
 
-/// One relay's turn: one pass at a time holds it, and whether that is a
-/// whole pass is known.
+/// One relay's turn: one pass at a time holds it, and whether a whole
+/// pass holds it or waits for it is known.
 #[derive(Debug, Default)]
 struct Turn {
     held: tokio::sync::Mutex<()>,
     whole: AtomicBool,
 }
 
-/// A hold of a relay's [`Turn`], for as long as it is not dropped.
-struct TurnHeld<'a> {
-    turn: &'a Turn,
-    whole: bool,
-    _held: tokio::sync::MutexGuard<'a, ()>,
+/// A whole pass's claim on a relay's [`Turn`], from before it waits until
+/// it lets the turn go: the flag is cleared when the claim is dropped,
+/// whether the pass held the turn or was dropped while it waited.
+struct WholeClaim<'a>(&'a AtomicBool);
+
+impl Drop for WholeClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
-impl Drop for TurnHeld<'_> {
-    fn drop(&mut self) {
-        if self.whole {
-            self.turn.whole.store(false, Ordering::Release);
-        }
-    }
+/// A hold of a relay's [`Turn`], for as long as it is not dropped. The
+/// turn is let go before a whole pass's claim, so that no second whole
+/// pass finds the claim gone while the first still holds the turn.
+struct TurnHeld<'a> {
+    _held: tokio::sync::MutexGuard<'a, ()>,
+    _whole: Option<WholeClaim<'a>>,
 }
 
 impl Turn {
     /// Take the turn for a pass of `kind`, or `None` where the pass does
     /// nothing at this relay. A pass that sends does nothing where another
-    /// pass holds the turn, and a whole pass where another whole pass
-    /// does: that one is waiting for the relay, and a second would wait
-    /// with it. A whole pass waits for the turn of a pass that sends,
-    /// which is short: the node's two timers fire in step, the send's
-    /// every 2 s and the fetch's every 10 s, a few milliseconds apart, and
-    /// a whole pass that gave way to a send once gave way at every fetch
-    /// after it, and never showed or pulled again.
+    /// pass holds the turn. A whole pass does nothing where another whole
+    /// pass holds it or waits for it: that one will show and pull, and a
+    /// second would only do it again. Otherwise a whole pass claims the
+    /// turn first and then waits for the turn of a pass that sends, which
+    /// is short: the node's two timers fire in step, the send's every 2 s
+    /// and the fetch's every 10 s, a few milliseconds apart, and a whole
+    /// pass that gave way to a send once gave way at every fetch after
+    /// it, and never showed or pulled again.
     async fn take(&self, kind: Pass) -> Option<TurnHeld<'_>> {
-        let whole = kind == Pass::Whole;
+        if kind != Pass::Whole {
+            let held = self.held.try_lock().ok()?;
+            return Some(TurnHeld {
+                _held: held,
+                _whole: None,
+            });
+        }
+        if self.whole.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // Built before the wait, so that a pass dropped while it waits
+        // leaves the turn unclaimed.
+        let claim = WholeClaim(&self.whole);
         let held = match self.held.try_lock() {
             Ok(held) => held,
-            Err(_) if whole && !self.whole.load(Ordering::Acquire) => self.held.lock().await,
-            Err(_) => return None,
+            Err(_) => self.held.lock().await,
         };
-        if whole {
-            self.whole.store(true, Ordering::Release);
-        }
         Some(TurnHeld {
-            turn: self,
-            whole,
             _held: held,
+            _whole: Some(claim),
         })
     }
 }
@@ -666,7 +678,8 @@ impl DeviceEntries {
     /// Each relay has its turn, and the turns run beside one another: it
     /// comes back when each has ended. A relay at which a turn of an
     /// earlier pass is still running is left out of this one, and no
-    /// other relay waits for it.
+    /// other relay waits for it, except that a whole pass behind a pass
+    /// that sends waits for its turn ([`Turn::take`]).
     ///
     /// The whole pass also asks each relay for what the device of a key
     /// typed at `cordelia accept` hands over, beside everything else and
@@ -1470,7 +1483,8 @@ impl DeviceEntries {
     /// One turn runs at a time at a relay. A turn that finds another
     /// running there does nothing: that one is waiting for the relay,
     /// and a second would wait with it. But a whole pass waits for the
-    /// turn of a pass that sends ([`Turn::take`]).
+    /// turn of a pass that sends, where no other whole pass holds the
+    /// turn or waits for it ([`Turn::take`]).
     ///
     /// The whole pass shows on every connection. Where the answer to
     /// this turn's show gave no leave, the relay is left for the next
@@ -4016,33 +4030,73 @@ fn refused_wait(refusals: u32) -> Duration {
 mod tests {
     use super::*;
 
+    /// Whether a pass of `kind` does nothing at `turn` at once: `false`
+    /// where it takes the turn or waits for it. The take is polled once,
+    /// so that a take that waits fails the test instead of hanging it.
+    async fn gives_way(turn: &Turn, kind: Pass) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::ZERO, turn.take(kind)).await,
+            Ok(None)
+        )
+    }
+
     /// **A whole pass waits for the turn of a pass that sends**, and no
     /// other pass waits for a turn held: a pass that sends does nothing
     /// where any pass holds the turn, and a whole pass does nothing where
-    /// a whole pass holds it.
+    /// a whole pass holds it or waits for it.
     #[tokio::test]
     async fn a_whole_pass_waits_only_for_the_turn_of_a_pass_that_sends() {
         let turn = Arc::new(Turn::default());
         // A whole pass holds it: no other pass takes it, and none waits.
         let held = turn.take(Pass::Whole).await.unwrap();
-        assert!(turn.take(Pass::Send).await.is_none());
-        assert!(turn.take(Pass::Whole).await.is_none());
+        assert!(gives_way(&turn, Pass::Send).await);
+        assert!(gives_way(&turn, Pass::Whole).await);
         drop(held);
         // A pass that sends holds it: another that sends does nothing, and
         // a whole pass waits until it is let go, and then holds it.
         let sending = turn.take(Pass::Send).await.unwrap();
-        assert!(turn.take(Pass::Send).await.is_none());
+        assert!(gives_way(&turn, Pass::Send).await);
         let waiting = {
             let turn = Arc::clone(&turn);
             tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
         };
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
+        // A second whole pass behind the send does nothing: the first
+        // will show and pull, and the second would only do it again.
+        assert!(gives_way(&turn, Pass::Whole).await);
         drop(sending);
         assert!(waiting.await.unwrap());
         // Let go, it is free for either.
         drop(turn.take(Pass::Send).await.unwrap());
         drop(turn.take(Pass::Whole).await.unwrap());
+    }
+
+    /// **A whole pass dropped while it waits leaves the turn unclaimed**:
+    /// the next whole pass behind the same send waits for it, and holds it
+    /// once it is let go.
+    #[tokio::test]
+    async fn a_whole_pass_dropped_while_it_waits_leaves_the_turn_unclaimed() {
+        let turn = Arc::new(Turn::default());
+        let sending = turn.take(Pass::Send).await.unwrap();
+        let waiting = {
+            let turn = Arc::clone(&turn);
+            tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(!turn.whole.load(Ordering::Acquire));
+        let next = {
+            let turn = Arc::clone(&turn);
+            tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        drop(sending);
+        assert!(next.await.unwrap());
+        assert!(!turn.whole.load(Ordering::Acquire));
     }
 
     /// The state of a node over a store of its own in memory, which
