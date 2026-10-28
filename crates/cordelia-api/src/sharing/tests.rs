@@ -955,3 +955,68 @@ fn plan_channel(conn: &Connection, name: &str) -> Filing {
         .find(|filing| filing.name == name)
         .unwrap()
 }
+
+/// `accept --channel` asks for 8 channels at most at one time (§3.2,
+/// `MAX_TYPED_KEYS`): a ninth key is refused as `too_many_typed`, a key
+/// already asking is not, and one whose hour is over makes room.
+#[test]
+fn accept_asks_for_eight_channels_at_most() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    for n in 1..=8 {
+        typed(&s, 0, &member(n).public_key(), &format!("c{n}"), now);
+    }
+    let word = |n: u32, at: i64| {
+        let key = encode_public_key(&member(n).public_key()).unwrap();
+        match accept_plan(conn, identity, &relays(), &key, "next", at) {
+            Err(Failed::Refused(refusal)) => refusal.word,
+            Ok(_) => "ok",
+            Err(Failed::Error(e)) => panic!("{e}"),
+        }
+    };
+    assert_eq!(word(9, now), "too_many_typed");
+    assert_eq!(word(1, now), "ok");
+    assert_eq!(word(9, now + HOUR + 1), "ok");
+}
+
+/// `share` refuses a new key where the channel shows 64 keys on this
+/// device, and not a key among them (§5.5, `channel_full`).
+#[test]
+fn share_refuses_a_new_key_where_the_channel_shows_64() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let plan = new_plan(conn, &relays(), "review", &[]).unwrap();
+    make_new(conn, identity, &plan.what, now).unwrap();
+    let filing = plan_channel(conn, "review");
+    let shared = crate::shared::tests::Shared {
+        secret: filing.card.secret().unwrap(),
+        id: filing.channel,
+    };
+    let mut n = 1;
+    while crate::shared::shown_keys(conn, &filing.channel)
+        .unwrap()
+        .len()
+        < SHARED_MAX_KEYS
+    {
+        let entry = crate::shared::tests::message(&member(n), &shared, 1, "hello", now);
+        crate::take::take(conn, identity, &entry, now).unwrap();
+        n += 1;
+        assert!(n < 200, "the channel never showed 64 keys");
+    }
+    let shown = crate::shared::shown_keys(conn, &filing.channel).unwrap();
+    let word = |key: &[u8; 32]| {
+        let key = encode_public_key(key).unwrap();
+        match share_plan(conn, identity, &relays(), "review", &key, None, now) {
+            Err(Failed::Refused(refusal)) => refusal.word,
+            Ok(_) => "ok",
+            Err(Failed::Error(e)) => panic!("{e}"),
+        }
+    };
+    assert_eq!(word(&member(500).public_key()), "channel_full");
+    let among = shown.iter().find(|key| **key != s.key(0)).unwrap();
+    assert_eq!(word(among), "ok");
+}
