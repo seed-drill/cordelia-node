@@ -112,8 +112,8 @@ use cordelia_core::load::DeviceCounts;
 use cordelia_core::lock::{LockWhole, TimedLock};
 use cordelia_core::protocol::{
     BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, FRAME_LENGTH_BYTES,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
-    WAKE_WAIT_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, RELAY_ROLE_HEADS, SESSION_VALUE_BYTES,
+    SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -239,6 +239,10 @@ pub struct Link {
     /// The value of the connection's TLS session, where it gives one.
     session: Option<[u8; SESSION_VALUE_BYTES]>,
     id: LinkId,
+    /// Whether the relay named the role RELAY_ROLE_HEADS in its handshake
+    /// (decision 2026-10-24 (removal), rule 18): it keeps every head, and
+    /// hands each before it says that it holds the entry shown.
+    heads: bool,
 }
 
 impl Link {
@@ -262,7 +266,25 @@ impl Link {
             conn,
             session,
             id,
+            heads: false,
         }
+    }
+
+    /// The same connection, to a relay that said `roles` in its handshake:
+    /// whether it names the role RELAY_ROLE_HEADS is kept (decision
+    /// 2026-10-24 (removal), rule 18). A connection made with
+    /// [`Self::new`] alone is to a relay that names none.
+    pub fn naming(mut self, roles: &[String]) -> Self {
+        self.heads = roles.iter().any(|role| role == RELAY_ROLE_HEADS);
+        self
+    }
+
+    /// Whether the relay named the role RELAY_ROLE_HEADS in its handshake:
+    /// a relay of decision 2026-10-24 (removal), which keeps every head. A
+    /// device shows such a relay every head it keeps, and takes no leave
+    /// from a head that it hands twice in a round (rule 18).
+    pub fn keeps_heads(&self) -> bool {
+        self.heads
     }
 
     /// What the device's configuration calls the relay.

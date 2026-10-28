@@ -1487,6 +1487,18 @@ pub const CHANGE_HEADS_ROOM: usize = 2;
 // Checked at compile time: the room kept is for heads that a relay keeps.
 const _: () = assert!(CHANGE_HEADS_ROOM >= 2 && CHANGE_HEADS_ROOM <= MAX_CHANGE_HEADS);
 
+/// The role that a relay of this version names in its handshake, beside
+/// "relay" (decision 2026-10-24 (removal), rule 18): it keeps every head
+/// in a slot, and hands each before it says that it holds the entry shown
+/// (rules 14 and 16). A device shows such a relay every head it keeps; at
+/// a relay that does not name it, none numbered above the change it
+/// follows, since a relay of the version before takes an entry of a
+/// higher revision in place of the one it holds, a removal included. A
+/// node of the version before reads only "relay" and "bootnode" among the
+/// roles, and takes up to MAX_HANDSHAKE_ROLES of them, so it passes this
+/// one over.
+pub const RELAY_ROLE_HEADS: &str = "heads";
+
 /// The most keys a device keeps as removed (decision 2026-10-24
 /// (removal), rule 2): every key that a change it has seen and checked
 /// lists as removed, on any branch. They only grow. Past the bound the
@@ -3419,6 +3431,11 @@ mod tests {
         assert_eq!(MAX_KNOWN_REMOVED, MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS);
         assert_eq!(MAX_KNOWN_HOLDERS, 2_048);
         assert_eq!(CHANGE_HEADS_ROOM, 2);
+        // The role a relay of this version names (rule 18): one of the
+        // eight a handshake carries, and neither of the two a node of the
+        // version before reads.
+        assert_eq!(RELAY_ROLE_HEADS, "heads");
+        const { assert!(MAX_HANDSHAKE_ROLES >= 2) };
         // The holders of one change are never fewer than the records it
         // keeps of them, so the bound of records drops no holder first.
         const { assert!(MAX_KNOWN_HOLDERS > MAX_NOT_COUNTED_RECORDS + MAX_COUNTED_DEVICES) };

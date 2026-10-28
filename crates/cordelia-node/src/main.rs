@@ -2316,7 +2316,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let advertised_port = if accepts_inbound { p2p_port as u16 } else { 0 };
 
         // ── Connection manager ─────────────────────────────────────
-        let roles = vec![config.network.role.clone()];
+        let roles = p2p::handshake_roles(&config.network.role);
         let allow_private = config.network.allow_private_addresses;
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),

@@ -454,7 +454,7 @@ each: of those, the first are kept and the rest passed over.
 
 | List | Bound | Why |
 |------|-------|-----|
-| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with |
+| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with; a relay of decision 2026-10-24 (removal) says two, with `RELAY_ROLE_HEADS` (§12.7) |
 | Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
 | Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
 | Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
@@ -2009,6 +2009,37 @@ new entry does.
 
 **What it costs:** 32 KB more for each person at each relay, from the
 person's first change made on this version (the record's section 9).
+
+#### RELAY_ROLE_HEADS = `heads`
+
+**Rationale:** The role that a relay of this version names in its
+handshake, beside "relay" (decision 2026-10-24 (removal), rule 18). It
+says that the relay keeps every head in a slot by the lineages and hands
+each before it says that it holds the entry shown (rules 14 and 16). A
+device shows such a relay the change it follows first, then every head it
+sets aside. A relay that does not name it is taken for one of the version
+before, which takes an entry of a higher revision in place of the one it
+holds: shown a head numbered above the change a device follows, it would
+drop a removal for it. So a device shows such a relay no head numbered
+above the change it follows, and takes leave there where it hands one
+head that the device keeps twice in a round (it holds that head alone); at
+a relay that names the role, the same hand twice ends the round with no
+leave, since such a relay hands a head twice only where it lacks the
+change.
+
+**Why a role, and not the protocol's version:** a node of the version
+before reads only "relay" and "bootnode" among the roles, and takes up to
+`MAX_HANDSHAKE_ROLES` of them, so it passes this one over. Each end of a
+handshake offers and accepts only its own protocol version: raising it
+would need both ends changed first, or the two versions would refuse each
+other (the record's section 10).
+
+**What is derived from it:** nothing. Beside it, a device's round of shows
+at one relay has room for `3 x MAX_CHANGE_HEADS - 1` = 23 shows
+(`SHOWS_IN_A_PASS`, in `device_entries.rs`, as the record's section 11
+keeps it): a short show and a whole show for each of the eight heads a
+relay can hand, and a show of each of the seven heads the device sets
+aside.
 
 #### NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR = 256
 
