@@ -149,16 +149,42 @@ pub fn stands(conn: &Connection) -> Result<Stands, PersonError> {
 
 // ── The show ─────────────────────────────────────────────────────────
 
-/// The change entry that a device shows a relay, and what it keeps
-/// besides.
+/// The change entries that a device shows a relay (decision 2026-10-24
+/// (removal), rule 18): the change it follows, and each head it sets aside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shows {
     /// The change entry of the change the device follows: the one it
-    /// shows (decision 2026-10-24 (removal), rule 1).
+    /// shows first, and the one whose answer gives leave (rule 18).
     pub entry: CheckedEntry,
-    /// What each head it sets aside is named by. A relay that tells of one
-    /// of them is asked no more about it in that round.
+    /// What each head it sets aside is named by.
     pub set_aside: Vec<[u8; 32]>,
+    /// The change entry of each head it sets aside, checked again as it is
+    /// read, the lowest number first and of two at one number the lower
+    /// ID: the order in which a relay of this version hands them (rule 16).
+    /// A device shows each after the change it follows. One that does not
+    /// check is not shown.
+    pub heads: Vec<CheckedEntry>,
+}
+
+impl Shows {
+    /// The heads set aside that a device shows a relay, in their order: at
+    /// a relay that names the role RELAY_ROLE_HEADS (`keeps_heads`) every
+    /// one, and at one that does not, none numbered above the change
+    /// followed (decision 2026-10-24 (removal), rule 18). A relay of the
+    /// version before takes an entry of a higher revision in place of the
+    /// one it holds: shown such a head, it would drop a removal for it.
+    pub fn heads_shown(&self, keeps_heads: bool) -> impl Iterator<Item = &CheckedEntry> {
+        let followed = self.entry.rev;
+        self.heads
+            .iter()
+            .filter(move |head| keeps_heads || head.rev <= followed)
+    }
+
+    /// Whether the device keeps the change entry named `id`: the change it
+    /// follows, or a head it sets aside.
+    pub fn keeps(&self, id: &[u8; 32]) -> bool {
+        self.entry.id() == *id || self.set_aside.contains(id)
+    }
 }
 
 /// What this device shows a relay. `None` where it follows no phrase: it
@@ -167,9 +193,15 @@ pub fn to_show(conn: &Connection) -> Result<Option<Shows>, PersonError> {
     if held_rows::person(conn)?.is_none() {
         return Ok(None);
     }
+    let mut heads: Vec<CheckedEntry> = held_rows::set_aside_entries(conn)?
+        .into_iter()
+        .filter_map(|kept| kept.entry.check().ok())
+        .collect();
+    heads.sort_by_key(|head| (head.rev, head.id()));
     Ok(Some(Shows {
         entry: followed_entry(conn)?,
         set_aside: set_aside_ids(conn)?,
+        heads,
     }))
 }
 
@@ -1779,6 +1811,7 @@ mod tests {
             Some(Shows {
                 entry: first.clone(),
                 set_aside: Vec::new(),
+                heads: Vec::new(),
             })
         );
         assert_eq!(kept_id(&s[0].conn).unwrap(), Some(first.id()));
@@ -1806,6 +1839,7 @@ mod tests {
             Some(Shows {
                 entry: by_0.clone(),
                 set_aside: vec![by_1.id()],
+                heads: vec![by_1.clone()],
             })
         );
         assert_eq!(kept_id(&on.conn).unwrap(), Some(by_0.id()));

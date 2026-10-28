@@ -5,12 +5,17 @@
 //! build keeps it as a rule of time, and calls it leave:
 //!
 //! - **A device has leave on a connection for SHOW_LEAVE_SECS from an
-//!   answer there which says that the relay holds no later change than the
-//!   one the device keeps**: that it holds the entry shown; that it took
-//!   it; or that it would have taken it and did not, for room or for the
-//!   address's allowance. No other answer gives leave: not another entry,
-//!   or word of one; not "show it whole"; not a stream that is reset or
-//!   that times out.
+//!   answer there to the show of the change it follows which says that the
+//!   relay holds no later change than that one**: that it holds the entry
+//!   shown; that it took it; or that it would have taken it and did not,
+//!   for room or for the address's allowance. No other answer gives leave:
+//!   not another entry, or word of one; not "show it whole"; not a stream
+//!   that is reset or that times out. **The show of a head set aside
+//!   neither gives leave nor takes it away** (decision 2026-10-24
+//!   (removal), rule 18). **And a relay that does not name the role
+//!   RELAY_ROLE_HEADS, and hands one head that the device keeps twice in a
+//!   round, gives leave** ([`Leave::grant`]): a relay of the version
+//!   before does that, and holds that head alone.
 //! - **A device in a fork has no leave anywhere, nor has one that has
 //!   stopped,** nor one that follows no phrase: it has nothing to show.
 //! - **Leave ends at once, at every relay, when the entry that the device
@@ -726,15 +731,19 @@ impl Leave {
     /// what it is named by. Returns what the relay answered, and how many
     /// bytes the show was.
     ///
-    /// No leave is asked: this is what gives it. An answer that says the
-    /// relay holds no later change than the entry gives leave on the
-    /// connection from now, for that entry. Any other answer ends what
-    /// leave there was. A stream that is not answered changes nothing.
+    /// No leave is asked: this is what gives it. `followed` says that the
+    /// entry is that of the change the device follows: **only its answer
+    /// gives leave, or ends it** (decision 2026-10-24 (removal), rule 18).
+    /// An answer that says the relay holds no later change than that entry
+    /// gives leave on the connection from now, for that entry. Any other
+    /// answer to it ends what leave there was. The show of a head set
+    /// aside does neither. A stream that is not answered changes nothing.
     pub async fn show(
         &self,
         link: &Link,
         entry: &CheckedEntry,
         short: bool,
+        followed: bool,
     ) -> Result<ShowAnswered, String> {
         let request = if short {
             WireMessage::EntryShowShort(EntryShowShort {
@@ -757,23 +766,35 @@ impl Leave {
             WireMessage::EntryShown(shown) => shown.answer,
             _ => return Err("a show was not answered as one".into()),
         };
-        let now = self.clock.now();
-        let mut inner = lock(&self.inner);
-        if let Some(woke) = &mut inner.woke {
+        if let Some(woke) = &mut lock(&self.inner).woke {
             woke.heard.insert(link.name.clone());
         }
-        if gives_leave(&answer) {
-            inner.given.insert(
-                link.id(),
-                Given {
-                    at: now,
-                    entry: entry.id(),
-                },
-            );
-        } else {
-            inner.given.remove(&link.id());
+        if followed {
+            match gives_leave(&answer) {
+                true => self.grant(link, entry),
+                false => {
+                    lock(&self.inner).given.remove(&link.id());
+                }
+            }
         }
         Ok(ShowAnswered { answer, bytes })
+    }
+
+    /// Leave on `link` from now, for `entry`, the change entry of the
+    /// change the device follows: given by an answer to its show that says
+    /// the relay holds no later change ([`Self::show`]), or by a relay
+    /// that does not name the role RELAY_ROLE_HEADS and hands one head the
+    /// device keeps twice in a round (decision 2026-10-24 (removal), rule
+    /// 18).
+    pub fn grant(&self, link: &Link, entry: &CheckedEntry) {
+        let now = self.clock.now();
+        lock(&self.inner).given.insert(
+            link.id(),
+            Given {
+                at: now,
+                entry: entry.id(),
+            },
+        );
     }
 
     /// Open a stream for a channel of the device's own on `link`, ask
