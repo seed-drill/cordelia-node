@@ -33,8 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use cordelia_core::protocol::{
-    CHANGE_FETCH_MAX_SECS, CHANGE_FETCH_PASSES, PAIR_KEY_TYPED_SECS, RECEIVED_LAST_DAY_SECS,
-    RECEIVED_LAST_WEEK_SECS,
+    CHANGE_FETCH_MAX_SECS, CHANGE_FETCH_PASSES, MAX_STATEMENT_REMOVED, PAIR_KEY_TYPED_SECS,
+    RECEIVED_LAST_DAY_SECS, RECEIVED_LAST_WEEK_SECS,
 };
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -1145,12 +1145,22 @@ pub async fn change_prepare(
             .ok_or_else(|| refused(PersonError::FollowsNoPhrase))?;
         let keeps_a_head = !held_rows::set_aside_entries(conn)?.is_empty();
         let own = state.identity.public_key();
+        let removed = held_rows::removed_keys(conn)?;
+        // A change lists every key known to be removed (rule 20), and a
+        // statement lists at most 256: past that no change can be made
+        // here, and the device says so before anything is asked.
+        let too_many =
+            removed.len() > MAX_STATEMENT_REMOVED || held_rows::removed_past_bound(conn)?;
         match (held.state, keeps_a_head, body.settle) {
-            (State::Applied | State::Fork, _, _)
-                if held_rows::removed_keys(conn)?.contains(&own) =>
-            {
+            (State::Applied | State::Fork, _, _) if removed.contains(&own) => {
                 Err(refused(PersonError::RemovedAsKnown))
             }
+            (State::Applied | State::Fork, _, _) if too_many => Err(ApiError::BadRequest(format!(
+                "this device knows {} keys to be removed, and a change lists every one of them: \
+                 a change lists at most {MAX_STATEMENT_REMOVED}. No change can be made on this \
+                 device. Nothing was done.",
+                removed.len()
+            ))),
             (State::Applied | State::Fork, false, true) => Err(ApiError::BadRequest(
                 "this device has seen no two changes made apart: there is nothing to settle."
                     .into(),
@@ -2421,6 +2431,27 @@ exit 0"#,
                 assert!(said.contains("nothing to settle"), "{said}")
             }
             other => panic!("{other:?}"),
+        }
+        // 257 keys known to be removed: a change would list each, and a
+        // statement lists at most 256. It is refused, and says why.
+        let many: Vec<[u8; 32]> = (0..=MAX_STATEMENT_REMOVED)
+            .map(|n| {
+                let mut key = [0xa5; 32];
+                key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                key
+            })
+            .collect();
+        held_rows::keep_removed(&db(&state), &many[1..MAX_STATEMENT_REMOVED], now).unwrap();
+        assert_eq!(held_rows::removed_keys(&db(&state)).unwrap().len(), 256);
+        assert!(prepared(&state, false).await.is_ok(), "256 fit");
+        held_rows::keep_removed(&db(&state), &many[..1], now).unwrap();
+        for settle in [false, true] {
+            match prepared(&state, settle).await {
+                Err(ApiError::BadRequest(said)) => {
+                    assert!(said.contains("knows 257 keys to be removed"), "{said}")
+                }
+                other => panic!("{other:?}"),
+            }
         }
         // Its own key known to be removed: no change is prepared.
         held_rows::keep_removed(&db(&state), &[state.identity.public_key()], now).unwrap();

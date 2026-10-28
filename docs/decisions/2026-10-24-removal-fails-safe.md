@@ -232,6 +232,7 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 
 **Rule 20. Every change lists as removed every key that its device knows to be removed,** and lists none of them as a device. `cordelia remove-device`, `cordelia renew` and `cordelia settle` are handed the removed keys by the node, show them, and sign them; `cordelia recover` reads them itself (rule 22). The node refuses a change of its own that lacks one, or lists one as a device.
 
+- **Its limit:** a statement lists at most 256 removed keys (`MAX_STATEMENT_REMOVED`), and a device may know up to 2,048 (`MAX_KNOWN_REMOVED`). A device that knows more than 256, or is past its bound, can make no change: `change_prepare` refuses before anything is asked, and says why. It fails closed. In R1 that is a known limit.
 - **Where:** `commands::change_prepare` (`commands.rs` 1121), `change::prepare_change`, `prepare_settlement` and `prepare_recovery` (`change.rs` 125, 153, 192), and `person::apply_made` (`person.rs` 1203).
 
 **Rule 21. A change made on a device that keeps a head set aside joins it.** There, `cordelia remove-device` and `cordelia renew` make a settlement: its chain holds the change followed and every head set aside, and its prompt asks of each device of a head set aside as `cordelia settle` asks today. `cordelia settle` is the same, with no device named. So any change made there joins the histories. On a closed device the three make the settlement too.
