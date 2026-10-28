@@ -1986,6 +1986,30 @@ more than about half of a channel's cap in text may not fit (decision §10).
 personal channel nears this cap, `PERSONAL_CHANNEL_WARN_BYTES` (§12.10,
 decision 2026-10-19).
 
+#### CHANGE_HEADS_ROOM = 2
+
+**Rationale:** The heads that a relay keeps room for in an author's slot
+whose entry carries a lineage (decision 2026-10-24 (removal), rule 15).
+From when it takes the first such entry there it counts the slot at two
+heads' size, where it has the room: so a second change made apart from
+the first, a removal among them, always has room, and a removed device
+that fills a relay with the old channels it holds cannot keep a removal
+out of it. In a slot that is new the room for both is asked as for any
+new entry; where the first such entry replaces one of the version before
+(a person's first change made on this version), it is taken as a
+replacement that is no larger, and the second share is counted only where
+the relay has the room. The relay drops nothing to make room for a head:
+it cannot tell a change entry from any entry that ends with the mark, and
+a way to make room would be a stranger's way to push out its newest
+channels.
+
+**Why 2:** an honest person has two heads at most, now and then (see
+`MAX_CHANGE_HEADS`). A third head, and those after it, take room as any
+new entry does.
+
+**What it costs:** 32 KB more for each person at each relay, from the
+person's first change made on this version (the record's section 9).
+
 #### NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR = 256
 
 **Rationale:** How many channels from their secrets one address may make a

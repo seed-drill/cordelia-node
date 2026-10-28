@@ -47,7 +47,7 @@ cordelia-node/
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 22). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 23). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -233,6 +233,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `MAX_CHANGE_HEADS` | 8 (the heads a device and a relay keep, decision 2026-10-24 (removal)) | parameter-rationale.md §12.6 |
+| `CHANGE_HEADS_ROOM` | 2 (the heads a relay keeps room for in a slot whose entry carries a lineage, where it has the room; it makes none, decision 2026-10-24 (removal) rule 15) | parameter-rationale.md §12.7 |
 | `MAX_KNOWN_REMOVED`, `MAX_KNOWN_HOLDERS` | 2,048 (derived: `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`), 2,048 (the keys a device keeps as removed, and as holding one change's secret by its records; past either it is closed) | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
 | `PERSONAL_REACHED_PREFIX` | `reached/` (the carried word: what a device carried is at the relays it reaches, decision 2026-10-19 rule 4) | parameter-rationale.md §12.6 |
