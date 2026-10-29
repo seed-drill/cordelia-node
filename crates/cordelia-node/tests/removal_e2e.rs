@@ -900,12 +900,27 @@ fn new_at_either(
 /// - (g) neither the tablet's database nor the phone's holds change 4's
 ///   secret.
 ///
-/// Taken out: rule 10 (a device goes on under one of the two: (b) fails,
-/// or (a) where the state is not stored); rule 20 with the union of the
-/// heads' removals in `Statement::settle` (change 4 lacks a removal: (d)
-/// fails). Rule 20 alone is not caught here: a settlement lists every key
-/// that a head it joins removes (the record of 2026-10-04, 4.5, "undoes no
-/// removal"), and here both removals are on a head.
+/// Taken out, each run once by hand when the test was built:
+///
+/// - rule 10 (no device closes, and every gate takes the change followed
+///   as clear): (a) fails, as no device is closed; with (a)'s checks set
+///   aside for the run, (b) fails, as the laptop sends in a channel of its
+///   change 3;
+/// - rule 10's gates of a seal and a send alone (`Standing::to_write` and
+///   `at_relays::stands` taking a closed device as applied): (a) fails, as
+///   its status is no longer red; with (a)'s checks set aside, nothing is
+///   sent all the same, since other gates read the stored state;
+/// - rule 20 (the command lists no key that the node hands, and the node
+///   does not refuse a change that leaves one out): not caught here, since
+///   a settlement lists every key that a head it joins removes (the record
+///   of 2026-10-04, 4.5, "undoes no removal"), and here both removals are
+///   on a head; with that union taken out of `Statement::settle` too,
+///   change 4 lacks a removal, the command is refused by the check that no
+///   change undoes a removal, and (d) fails; with that check taken out of
+///   `statement::judge` as well, `person::judged` refuses it for the head
+///   set aside that it joins, and (d) fails;
+/// - rule 8, step 3 (a change made apart that removes a device is a fork
+///   there, as on the version before): (c) fails.
 #[test]
 fn two_removals_made_apart_close_both_sides_until_settle() {
     let mut relay_a = relay_started();
