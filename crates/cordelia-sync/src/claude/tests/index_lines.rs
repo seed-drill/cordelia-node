@@ -2105,3 +2105,46 @@ fn a_record_needs_both_of_this_devices_acts() {
     assert_eq!(a_minute_from(&p, 25).published, 0);
     assert_eq!(p.read(INDEX).unwrap(), format!("{NOTES}{OTHER_LINE}"));
 }
+
+/// Rule 7 (decision 2026-10-24 (removal), unit test 12): on a device that
+/// knows of a removal, a put-back takes no line removed from a version that
+/// a removed key signed. Here this device removed the line of `notes.md`
+/// from the tablet's index; the tablet is then removed, and when the memory
+/// comes back its line is not put back, and the record goes.
+#[test]
+fn a_put_back_takes_no_line_from_a_removed_devices_version() {
+    let mut p = listed();
+    let tablet = third(&p);
+    deliver(&p.st, &tablet, NAME);
+    write(
+        &tablet,
+        NAME,
+        INDEX,
+        Value::Text(format!("{NOTES}{OTHER_LINE}{EXTRA}")),
+    );
+    deliver(&tablet, &p.st, NAME);
+    assert_eq!(cycle_at(&p, 5).pulled, 1);
+    deletes_with_its_line(&p, 10);
+    let from = {
+        let db = p.st.db.lock().unwrap();
+        let folder = p.mem.display().to_string();
+        index_lines::whole(&db, &folder, &p.channel, T0 + 10).unwrap()
+    };
+    let notes: Vec<_> = from.iter().filter(|r| r.file == "notes.md").collect();
+    assert_eq!(notes[0].from, [tablet.identity.public_key()]);
+
+    // The tablet is removed; the other device applies it too.
+    let removal = removes(&p.st, &p.phrase, &tablet.identity.public_key());
+    {
+        let db = p.other.db.lock().unwrap();
+        take::take(&db, &p.other.identity, &removal, now()).unwrap();
+    }
+    p.channel = channel_of(&p.st);
+    assert_eq!(records(&p).len(), 1, "the record went with the folder");
+
+    comes_back(&p, 20);
+    let report = a_minute_from(&p, 25);
+    assert_eq!(report.published, 0, "{report:?}");
+    assert_eq!(p.read(INDEX).as_deref(), Some(OTHER_LINE));
+    assert_eq!(records(&p), []);
+}

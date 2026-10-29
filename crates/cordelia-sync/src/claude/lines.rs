@@ -64,6 +64,11 @@ pub(super) struct Beside {
     pub id: String,
     /// The lowest key that signed an entry of it.
     pub author: [u8; 32],
+    /// Every key that signed an entry of it, and the first 16 bytes of each
+    /// key its entries' chains name: no line is taken from it where one is
+    /// removed (decision 2026-10-24 (removal), rule 7).
+    pub signers: Vec<[u8; 32]>,
+    pub links: Vec<[u8; 16]>,
     pub text: String,
 }
 
@@ -98,6 +103,12 @@ pub(super) fn beside(slot: &Slot) -> Vec<Beside> {
                 id: ids.join("+"),
                 // A version's entries are in order of their signers' keys.
                 author: version.entries.first()?.author,
+                signers: version.entries.iter().map(|entry| entry.author).collect(),
+                links: version
+                    .entries
+                    .iter()
+                    .flat_map(|entry| entry.chain.iter().flatten().map(|link| link.signer))
+                    .collect(),
                 text: text.clone(),
             })
         })
@@ -159,8 +170,21 @@ pub(super) fn published(
                 removed.push((file, line.trim_end()));
             }
         }
-        // One write for the edit, however many lines it dropped.
-        return index_lines::lines_removed(db, folder, channel, &removed, now);
+        // One write for the edit, however many lines it dropped, with the
+        // keys that signed the version they were dropped from (decision
+        // 2026-10-24 (removal), rule 7).
+        let from: Vec<[u8; 32]> = ctx
+            .over
+            .map(|version| {
+                version
+                    .version
+                    .entries
+                    .iter()
+                    .map(|entry| entry.author)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return index_lines::lines_removed_from(db, folder, channel, &removed, &from, now);
     }
     if names::is_conflict_name(key) {
         return Ok(());
@@ -484,7 +508,37 @@ fn put_back(
             asked.insert(file.to_string(), deleted);
             Ok(deleted)
         };
-        let text = with_lines(there, &stands, due, &mut is_deleted)?;
+        // On a device that knows of a removal, no line is taken from a
+        // version that a removed key signed, or that names one in its chain,
+        // nor a line removed from such a version (decision 2026-10-24
+        // (removal), rule 7): what a carry left out is put back by nobody.
+        let removed = cordelia_storage::person::removed_keys(&db)?;
+        let removed_signers: Vec<[u8; 16]> = removed
+            .iter()
+            .map(cordelia_crypto::entry::Link::signer_of)
+            .collect();
+        let stands: Vec<Beside> = stands
+            .into_iter()
+            .filter(|version| {
+                !version.signers.iter().any(|key| removed.contains(key))
+                    && !version
+                        .links
+                        .iter()
+                        .any(|link| removed_signers.contains(link))
+            })
+            .collect();
+        let (due, of_removed): (Vec<&index_lines::Record>, Vec<&index_lines::Record>) = due
+            .iter()
+            .copied()
+            .partition(|record| !record.from.iter().any(|key| removed.contains(key)));
+        for record in &of_removed {
+            index_lines::drop_record(&db, folder, channel, &record.file)?;
+        }
+        let text = with_lines(there, &stands, &due, &mut is_deleted)?;
+        if text == *there {
+            return not_now("every line due was of a removed device's version");
+        }
+        let files: Vec<&str> = due.iter().map(|record| record.file.as_str()).collect();
         if !publish::fits(INDEX_FILE, &Value::Text(text.clone())) {
             for file in &files {
                 index_lines::drop_record(&db, folder, channel, file)?;

@@ -42,7 +42,7 @@ use serde::Serialize;
 
 use cordelia_core::protocol::{
     FALLBACK_PEER_KEYS, FALLBACK_PEERS, MAX_STATEMENT_NUMBER, PAIR_KEY_TYPED_SECS,
-    STATEMENTS_LEFT_SAID_BELOW,
+    REMOVAL_NOT_APPLIED_SHOWN_DAYS, STATEMENTS_LEFT_SAID_BELOW,
 };
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{encode_channel_id, encode_public_key};
@@ -442,6 +442,10 @@ pub struct Look {
     /// The files whose record could not be carried when the device
     /// applied the statement, as it noted them then.
     pub not_carried: Vec<NotCarried>,
+    /// How many edits a carry set aside (decision 2026-10-24 (removal),
+    /// rule 7), said for seven days from the last: each is in local
+    /// history alone.
+    pub edits_set_aside: u64,
     /// Why the device cannot go on, where it cannot.
     pub cannot_go_on: Option<String>,
     /// A few words for a line of status, where there is something to
@@ -596,6 +600,7 @@ pub fn look(
             names_not_listed: Vec::new(),
             names_not_shown: 0,
             not_carried: Vec::new(),
+            edits_set_aside: 0,
             cannot_go_on: None,
             short: None,
             says: Vec::new(),
@@ -979,6 +984,24 @@ fn of_its_names(
             if days == 1 { "" } else { "s" },
         ));
     }
+    // What a carry left out of the folders (decision 2026-10-24 (removal),
+    // rule 7): said for as long as a removal not yet applied is.
+    if let Some((edits, at)) = edits_set_aside(conn)?
+        && now.saturating_sub(at) < i64::from(REMOVAL_NOT_APPLIED_SHOWN_DAYS) * 24 * 60 * 60
+    {
+        look.edits_set_aside = edits;
+        let edits_were = match edits {
+            1 => "1 edit was".to_string(),
+            n => format!("{n} edits were"),
+        };
+        look.says.push(format!(
+            "{edits_were} set aside at a change: a removed device wrote {}, or {} written over \
+             what one wrote. `cordelia history` lists {}, and `cordelia restore` puts one back",
+            if edits == 1 { "it" } else { "them" },
+            if edits == 1 { "it was" } else { "they were" },
+            if edits == 1 { "it" } else { "them" },
+        ));
+    }
     if !look.not_carried.is_empty() {
         let each: Vec<String> = look
             .not_carried
@@ -1015,6 +1038,30 @@ fn counted(n: usize, noun: &str) -> String {
         1 => format!("1 {noun}"),
         n => format!("{n} {noun}s"),
     }
+}
+
+/// How many edits a carry set aside, and when the last was
+/// ([`note_set_aside`]).
+fn edits_set_aside(conn: &Connection) -> Result<Option<(u64, i64)>, PersonError> {
+    Ok(
+        meta::get(conn, meta::PERSON_EDITS_SET_ASIDE)?.and_then(|noted| {
+            let (edits, at) = noted.split_once(' ')?;
+            Some((edits.parse().ok()?, at.parse().ok()?))
+        }),
+    )
+}
+
+/// Count `edits` more that a carry set aside, the last at `now` (decision
+/// 2026-10-24 (removal), rule 7): the sync adapter counts each file whose
+/// text it put in local history alone.
+pub fn note_set_aside(conn: &Connection, edits: u64, now: i64) -> Result<(), PersonError> {
+    let had = edits_set_aside(conn)?.map_or(0, |(edits, _)| edits);
+    meta::set(
+        conn,
+        meta::PERSON_EDITS_SET_ASIDE,
+        &format!("{} {now}", had.saturating_add(edits)),
+    )?;
+    Ok(())
 }
 
 /// The files whose record could not be carried when this device applied
