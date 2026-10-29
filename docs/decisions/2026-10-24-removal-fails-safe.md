@@ -432,7 +432,7 @@ Each is given as it reads today, and as it would read. Where this is built, it a
 
 18. **`a_closed_device_shows_every_head_at_a_relay_that_keeps_heads`** (with real processes). The laptop uses relays A and B; a work laptop uses relay A alone; the desktop uses relay B; the relays are not listed together. The laptop removes the phone (its change 3); the desktop removes the tablet (its change 3), and then renews (change 4). It asserts: the laptop is closed; the work laptop is handed the desktop's change 4 at relay A and closes; no entry that the work laptop signed reaches relay A in a channel of the laptop's change 3 after that. Then relay A is replaced by a stand-in that names no role `heads`: the laptop does not show it change 4 there. Taken out: rule 18's showing at a relay that names the role (the work laptop goes on: the second fails); its bar at one that does not (the last fails).
 
-The threat model's T16 names tests 1, 2, 6, 7 and 18, and T20 names tests 3 and 5.
+The threat model's T16 lists tests 1, 2, 7 and 18, and names test 6 in its row, which says that CI runs it in its job of the ignored tests: the threat model's check refuses an ignored test in a list. T20 lists test 5, and says that test 3 is not built (section 14).
 
 ## 8. The window, for the threat model
 
