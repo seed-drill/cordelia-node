@@ -382,7 +382,7 @@ CORDELIA_SCALE_STAGE=100 CORDELIA_SCALE_SEED=1 CORDELIA_SCALE_OUT=/path/to/out \
 8. **Removals are made once the second relay has counted a churn after its start again,** at the next minute, spread over five minutes. A tenth of the people with three devices who are not in the office, chosen by the seed, each remove one device, with `cordelia remove-device` at a pseudo-terminal with the phrase, as `person_e2e.rs` does. The harness timestamps the line "The change is made". The removed device is then stopped for good. Bar 10 reads these, and the carry windows are treated apart.
 9. **The window ends** when the first relay has counted two churns in it, or 25 minutes after the last removal, whichever is later. It lasts about two and a half to three hours. **A window that reaches five hours without both is cut there, and the run is INVALID** (section 6, rule 7).
 10. **It ends.** Every node is told to stop (SIGTERM), and each must stop within `NODE_STOP_TIMEOUT_SECS`. The read-only reads of each relay are made a last time. The harness checks that every pid it started has gone.
-11. **It writes the run's summary,** and keeps the data directories only where `CORDELIA_E2E_KEEP` is set.
+11. **It writes the run's summary,** from the inputs it keeps beside it (section 4.4), and keeps the data directories only where `CORDELIA_E2E_KEEP` is set.
 
 So in the window each relay counts two churns at least: the first relay two, by step 9; the second one before it stops (step 7) and one after its start again (step 8). The steps follow the churns as they come, so a slow setup does not leave a churn outside the window. A run at stage 500 takes about four to five hours.
 
@@ -400,10 +400,20 @@ So in the window each relay counts two churns at least: the first relay two, by 
 In `CORDELIA_SCALE_OUT`:
 
 - **`SUMMARY.md`, the one file for a person to read.** First line: PASS, FAIL or INVALID, or NOT RESOLVED where no bar fails and a bar's figure cannot be told from its bar (bar 4's p99, read as the bound of a bucket of powers of two, in the bucket that holds the bar, where no count settles it: bar 4's reading), the stage, the seed, the commit, and which of changes C, D, B and A are in the build. Then each bar of section 3, one line each: the figure, the bar, pass or fail. Then the checks of section 6 (whether the run is valid). Then, per relay and per profile of device: the median and the worst of each measure, and the parts treated apart. Then the setup's figures and every setting given beyond the defaults. It names no machine and no host: it says "16 vCPU, 32 GB" from `/proc`, and no more.
-- `samples.jsonl`: every sample, one line each.
+- `report-inputs.json`: every input the report reads, as the run ended, so that the report can be made again from the folder alone. It holds the plan (the stage, the seed, the relays, the timing and the population); each node, its key and its settings, and of each device's log the lines that name a relay as a peer; each start, freeze, going on and stop of each node, and how each stop ended; every sample, whole and at full precision (`samples.jsonl` rounds the time and leaves out the buckets); what the observer kept (each edit, each wait, each arrival, the waits ended on a device removed and those still open, and its pace); the copies kept beside a file in each memory folder; the window, and whether it was cut; the outage; each removal and its carry window; the setup; the end; the faults; and the commit and the changes of the build, and the clock's ticks a second, so that the summary made again names the run's and not its own. It carries a version (1). `SUMMARY.md` is made from this file and nothing else, and the harness makes it again from the file at once and says, where the two differ, that the run's report will not be made again faithfully.
+- `samples.jsonl`: every sample, one line each, and each change of each node's state.
 - `edits.csv`: every edit, and its arrival on each other device.
 - `pids`: the pids the run started.
 - Each node's log, where `CORDELIA_E2E_KEEP` is set.
+
+**The report is made again from a run's folder.** A stage runs about three hours, and the report's reading of a bar is corrected now and then (bars 6, 7 and 15, and bar 4's count over 10 ms, so far). Without the inputs, each correction meant running again every stage run before it, to judge it by the reading corrected. With them, the harness of the correction reads the folder and writes `SUMMARY-again.md` beside the first:
+
+```bash
+CORDELIA_SCALE_REPORT_FROM=/path/to/out/stage-100-seed-1-relays-2 \
+  cargo test --release -p cordelia-node --test scale report_again -- --ignored --nocapture
+```
+
+It prints the summary's first line. Where the report has not changed, the summary made again is the run's, byte for byte: a test of the harness makes a run's folder from made-up samples (with something of every input above, counters that are not finite and times that are no round numbers), writes its summary, reads the folder back, and reports again, and the two must be the same; the small run of test 4 checks the same of its own folder. A folder without `report-inputs.json` (a run of a harness before it) is refused with a line that says so, and so is a file of another version: a harness reads only the version it writes, so that a run is never misread. A change to what the file holds, or to what one of its fields means, is a new version. A run's own measures are not changed by a report made again: only how the report reads them.
 
 ## 5. Set aside, and why
 
