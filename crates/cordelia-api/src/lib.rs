@@ -72,6 +72,7 @@ pub mod shared_messages;
 pub mod shared_pass;
 pub mod shared_routes;
 pub mod shared_sender;
+pub mod shared_status;
 pub mod sharing;
 pub mod sharing_routes;
 pub mod state;

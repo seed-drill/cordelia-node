@@ -1619,7 +1619,7 @@ pub(crate) fn notice_of_channel(channel: &[u8; 32], removed: usize) -> [u8; 32] 
 /// What `act` is, in words, and the command that undoes it (§3.5, the
 /// table of what undoes each act in force): its kind, the item, the undo.
 /// `filings` name the channels.
-fn described(
+pub(crate) fn described(
     act: &AnyAct,
     filings: &[Filing],
 ) -> Result<(&'static str, String, String), PersonError> {
