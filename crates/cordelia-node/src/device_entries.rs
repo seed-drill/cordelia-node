@@ -1869,7 +1869,8 @@ impl DeviceEntries {
     /// relay that names the role RELAY_ROLE_HEADS every one, and at one
     /// that does not none numbered above the change followed
     /// ([`at_relays::Shows::heads_shown`]). A head that a relay answers
-    /// with another entry is not shown again on the connection.
+    /// with another entry is not shown again in the round, nor on the
+    /// connection at a relay that does not name the role.
     ///
     /// **Leave comes from the answer to the change followed**, and a later
     /// show of a head does not take it away ([`Leave::show`]). An answer
@@ -2047,9 +2048,14 @@ impl DeviceEntries {
                         leave = false;
                     } else {
                         // A head answered with another entry is not shown
-                        // there again on the connection.
+                        // again in the round, nor on the connection at a
+                        // relay that does not name the role `heads`. One
+                        // that names it remembers what it was shown whole,
+                        // and is shown it in short at the next pass.
                         heads_shown.insert(id);
-                        self.not_again(link, &id);
+                        if !link.keeps_heads() {
+                            self.not_again(link, &id);
+                        }
                     }
                     let Some(another) = Entry::from_wire(&bytes)
                         .ok()
@@ -2127,8 +2133,9 @@ impl DeviceEntries {
     }
 
     /// The head set aside named `id` was answered with another entry on
-    /// the connection at `link`: it is not shown there again (decision
-    /// 2026-10-24 (removal), rule 18). A relay of the version before
+    /// the connection at `link`, a relay that does not name the role
+    /// `heads`: it is not shown there again (decision 2026-10-24
+    /// (removal), rule 18). A relay of the version before
     /// remembers one entry shown whole in a slot: shown two, each would
     /// cost a whole entry each way at every pass.
     fn not_again(&self, link: &Link, id: &[u8; 32]) {

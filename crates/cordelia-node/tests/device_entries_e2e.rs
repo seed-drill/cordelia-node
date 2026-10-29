@@ -11132,6 +11132,38 @@ async fn a_hand_of_a_head_the_device_keeps_gives_no_leave_and_the_round_goes_on(
     assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
 }
 
+/// At a relay that names the role `heads`, a head answered with another
+/// entry is shown again at the next pass on the same connection, in short
+/// (decision 2026-10-24 (removal), rule 18): a relay of this version
+/// remembers what it was shown whole, so the show costs little, and one
+/// that had no room for the head when it answered may have it later.
+///
+/// Taken out: the role asked before a head is put by on the connection (it
+/// is never shown there again: the second assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_a_relay_that_keeps_heads_a_head_answered_with_another_is_shown_again() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::naming(&["relay", "heads"]).await;
+    let entry = ShowAnswer::Another(followed.to_wire());
+    relay.hook(answering(vec![(f, ShowAnswer::Held), (two, entry)]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    assert!(laptop.link("relay").keeps_heads());
+    laptop.passes().await;
+    let shown = shows_in(&relay.requests());
+    assert!(shown.contains(&(two, true)), "{shown:?}");
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    // Room freed: the relay takes the head now.
+    relay.hook(answering(vec![
+        (f, ShowAnswer::Held),
+        (two, ShowAnswer::Taken),
+    ]));
+    laptop.passes().await;
+    let shown = shows_in(&relay.requests());
+    assert!(shown.contains(&(two, false)), "{shown:?}");
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+}
+
 /// Test 8 of decision 2026-10-24 (removal), section 7: a relay of the
 /// version before (it names no role `heads`) answers each show with a
 /// change that the device keeps as a head set aside, numbered above the
