@@ -2172,6 +2172,31 @@ impl DeviceEntries {
         now: i64,
     ) -> Result<Answered, PersonError> {
         let identity = &self.state.identity;
+        // What the entry says of removals commits first, with the close it
+        // brings, before anything waits for the cycle's turn (rule 5): an
+        // apply or a move then waits with the device closed, and no turn
+        // at another relay sends under the change it leaves meanwhile.
+        if another.channel == shown.channel
+            && another.author == shown.author
+            && another.slot == shown.slot
+        {
+            let known = cordelia_api::person::know_what_is_shown(
+                &lock(&self.state.db),
+                identity,
+                another,
+                now,
+            );
+            match known {
+                Ok(true) => {
+                    tracing::warn!(
+                        "a change shown removes a device that holds the secret this device follows: it sends nothing more under it"
+                    );
+                    self.state.own_channels.ask_whole();
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let (outcome, changed) = self.state.as_a_change_where(
             |db| {
                 cordelia_api::person::with_moves_held_back(|| {

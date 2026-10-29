@@ -11357,6 +11357,78 @@ async fn at_a_wake_a_relay_is_heard_once_its_answer_is_judged() {
     assert!(!laptop.engine.leave().is_waking());
 }
 
+/// A change made after the one followed that removes a key is known at
+/// once (decision 2026-10-24 (removal), rule 5): while relay A's answer, the
+/// desktop's change that removes the tablet, waits for the sync cycle's
+/// turn to be applied, the device is closed from the commit that keeps the
+/// keys it removes. Relay B, which still holds the change followed and has
+/// given leave, is pushed nothing sealed under it. Once the turn ends the
+/// change is applied.
+///
+/// Taken out: the keys and the close committed before the apply waits (the
+/// device stands applied while it waits: the check that it is closed
+/// fails, and without that check relay B is pushed what waits under the
+/// change that the tablet holds, and the check of B fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_after_the_one_followed_that_removes_a_key_is_known_at_once() {
+    let (a, b) = (StandIn::started().await, StandIn::started().await);
+    let (mut laptop, desktop, tablet) = (
+        Device::new("laptop"),
+        Device::new("desktop"),
+        Device::new("tablet"),
+    );
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.adds(&tablet);
+    laptop.holds("notes");
+    let change = desktop.changes(&phrase(), &[&laptop, &desktop], &[&tablet]);
+    laptop.connects_to("a", a.port, a.key).await;
+    laptop.connects_to("b", b.port, b.key).await;
+    laptop.passes().await;
+    assert_eq!(laptop.has_leave("b"), Ok(()));
+    laptop.sends().await;
+    a.requests();
+    b.requests();
+
+    // Relay A comes to hold the desktop's change; relay B does not.
+    a.says(
+        Say::Answer(ShowAnswer::Whole),
+        Say::Answer(ShowAnswer::Another(change.to_wire())),
+    );
+    laptop.writes("notes", "a.md", "waits to be sent");
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        let waited = std::time::Instant::now();
+        while !a.seen().contains(&Seen::Whole) {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no whole show");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        // The apply waits for the cycle's turn, with the device closed.
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let sends = scope
+            .spawn(|| {
+                handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), laptop.sends()).await
+                })
+            })
+            .join()
+            .unwrap();
+        assert!(sends.is_ok(), "the pass that sends waited");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !b.seen().contains(&Seen::Push),
+            "relay B was pushed what waits while relay A's answer waited for the turn"
+        );
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.latest().id(), change.id());
+    assert_eq!(laptop.stands(), Stands::Applied);
+}
+
 /// A push open at the commit after which the device may use the connection
 /// no more, and not yet answered, is reset (decision 2026-10-24 (removal),
 /// rule 5): from the commit that closes the device the stream is let go at
