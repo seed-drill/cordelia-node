@@ -1517,6 +1517,24 @@ pub const MAX_KNOWN_REMOVED: usize = MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS;
 /// past it, a stolen device among them before its removal is known.
 pub const MAX_KNOWN_HOLDERS: usize = 2048;
 
+/// The margin of a removed key's cut time (decision 2026-10-24 (removal),
+/// rule 2): the time of the change that first removes the key, by its
+/// maker's clock, less this. What of that key's reached a device at or
+/// after the cut time, in a generation the removal was made after, is not
+/// carried (rule 7), and a record it signed then counts for nothing (rule
+/// 6). A handshake allows MAX_CLOCK_SKEW_SECS of skew at each end, so two
+/// nodes that one relay accepts are within twice that of each other.
+/// Derived: 2 x MAX_CLOCK_SKEW_SECS.
+pub const REMOVAL_TAKEN_MARGIN_SECS: u64 = 2 * MAX_CLOCK_SKEW_SECS;
+
+/// The arrivals a device keeps for one file (decision 2026-10-24
+/// (removal), rule 7): each version another key signed that it stored,
+/// and each link that stands in a stored chain more times than in any
+/// chain of the file stored before, with its key, generation and time.
+/// The oldest go first past it, and a cut time before the oldest kept
+/// takes the file back to before it, which fails safe.
+pub const MAX_FILE_ARRIVALS: usize = 1024;
+
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
 /// forgotten. It is for a carry that a person asks for.
@@ -3430,6 +3448,11 @@ mod tests {
         assert_eq!(MAX_KNOWN_REMOVED, 2_048);
         assert_eq!(MAX_KNOWN_REMOVED, MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS);
         assert_eq!(MAX_KNOWN_HOLDERS, 2_048);
+        // What a device took before it knew (rules 2, 6 and 7): a margin of
+        // twice the skew a handshake allows, and 1,024 arrivals a file.
+        assert_eq!(REMOVAL_TAKEN_MARGIN_SECS, 600);
+        assert_eq!(REMOVAL_TAKEN_MARGIN_SECS, 2 * MAX_CLOCK_SKEW_SECS);
+        assert_eq!(MAX_FILE_ARRIVALS, 1_024);
         assert_eq!(CHANGE_HEADS_ROOM, 2);
         // The role a relay of this version names (rule 18): one of the
         // eight a handshake carries, and neither of the two a node of the

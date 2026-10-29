@@ -97,6 +97,21 @@
 >   its first start on this version it notes the time of each entry it kept,
 >   and a device in a fork judges the one it kept apart by rule 8 (rule 12).
 >
+> Step 24, per the same record (set out in §10.3 and §10.6):
+>
+> - **v24:** what a device took before it knew of a removal (decision
+>   2026-10-24 (removal), rules 2, 6 and 7). `person_change_times_lists`:
+>   beside the time of each change noted, the keys its statement lists as
+>   removed, its chain and its devices, from which each removed key's cut
+>   time is worked out. `person_removed_keys_by`: for a key that rule 6
+>   removed, the removed key whose record added it. `file_arrivals_stored`,
+>   `file_arrivals` and `file_arrivals_dropped`: the arrivals of each file,
+>   by channel and slot, kept across carries. `file_put_back`, beside
+>   `sync_files`: a folder's file that a carry left out, which the next
+>   cycle takes back. `file_line_from`, beside `index_lines`: the keys that
+>   signed the version a line was removed from. All empty at the step,
+>   which changes no older table or row.
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
@@ -1101,6 +1116,54 @@ CREATE TABLE person_change_times (                  -- v22
     PRIMARY KEY (number, hash)
 );
 
+CREATE TABLE person_change_times_lists (            -- v24
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
+    chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
+    devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_removed_keys_by (               -- v24
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
+);
+
+CREATE TABLE file_arrivals_stored (                 -- v24
+    place               INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash                BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    stored_at           INTEGER NOT NULL CHECK(typeof(stored_at) = 'integer'),
+    full_signers        BLOB CHECK(full_signers IS NULL OR length(full_signers) % 16 = 0),
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB
+);
+CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
+
+CREATE TABLE file_arrivals (                        -- v24
+    stored     INTEGER NOT NULL,
+    signer     BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 16),
+    link_hash  BLOB CHECK(link_hash IS NULL OR length(link_hash) = 16),
+    times      INTEGER NOT NULL DEFAULT 1 CHECK(typeof(times) = 'integer' AND times >= 1)
+);
+CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
+
+CREATE TABLE file_arrivals_dropped (                -- v24
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    number      INTEGER NOT NULL,
+    hash        BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at   INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, slot, number, hash)
+);
+
 CREATE TABLE person_clear_mark (                    -- v21
     one   INTEGER PRIMARY KEY CHECK(one = 1),
     mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
@@ -1118,6 +1181,10 @@ CREATE TABLE person_clear_mark (                    -- v21
 | `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
 | `person_change_entries` | The change entry of the change it follows (`followed` 1), whole, to show to a relay: on a device that stopped, the one that stopped it. And up to seven heads it sets aside (`followed` 0), each with when it set it aside: eight in all (`MAX_CHANGE_HEADS`). Step 22 made it again: the latest entry was carried as the change followed, and the one made apart as a head set aside at the step's time | §4.5, §4.6; decision 2026-10-24 (removal), rule 1 |
 | `person_change_times` | For each change it applied or kept, by its statement's number and hash, the time its lineage says it was made, or none for a change made on the version before. Kept after the change goes, until the device leaves its phrase, for the cut time of rule 2 | decision 2026-10-24 (removal), rule 2 |
+| `person_change_times_lists` | Beside a change's time, the keys its statement lists as removed, its chain (each link its number in 8 bytes, big-endian, then its hash) and the keys it lists as devices. A removed key's cut time is worked out from them: the time of the change that first removes it, where it and the change before it are noted, and otherwise of the newest earlier change noted, less ten minutes; a key that a change on the chain of its adder's removal lists is not removed by rule 6 | decision 2026-10-24 (removal), rules 2 and 6 |
+| `person_removed_keys_by` | For a key that rule 6 removed, the removed key whose record added it after that key's cut time, or in a generation made apart from its removal. Its cut is that key's | decision 2026-10-24 (removal), rule 6 |
+| `file_arrivals_stored`, `file_arrivals` | For each file, by its channel and slot, each entry the door stored that made arrivals: the generation it came in (the change followed, by number and hash), when it was stored, the version current before it as one entry (sealed again as this device's own at each carry), and, where its chain was full, the other keys its links name; and each arrival, a key's first 16 bytes and, for a link, its hash and how many times it stands. A carry goes back to the version before the first arrival it cuts, and leaves out that arrival and everything after it. At most 1,024 arrivals a file (`MAX_FILE_ARRIVALS`), the oldest going first | decision 2026-10-24 (removal), rule 7 |
+| `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound: judged as an arrival of every removed key, so that a cut time before the oldest kept takes the file back to before it | decision 2026-10-24 (removal), rule 7 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |
@@ -1252,6 +1319,16 @@ CREATE TABLE sync_files (
   is.
 - At a personal node's first start on this version both tables are emptied:
   every folder forgets what it had agreed (§12).
+- **Beside them (v24, decision 2026-10-24 (removal), rule 7):**
+  `file_put_back (folder, channel_id, key)` marks a file that a carry left
+  out: the record names the version the carry went back to (a NULL hash and
+  revision 0 for none), and the next cycle puts that version into the file,
+  whatever it holds, with what it held kept in local history alone; the
+  mark goes when the record is saved again. `file_line_from (folder,
+  channel_id, file, from_signers)` holds, for a record of `index_lines`, the
+  keys (32 bytes each) that signed the version its line was removed from:
+  no line is put back from a version that a removed key signed. Both move
+  with the folder's records, and go with them.
 
 ### 10.7 Messages Between the Person's Own Agents (v19; decision 2026-10-09 §2.3, §2.5, §6, §7, §9.2)
 

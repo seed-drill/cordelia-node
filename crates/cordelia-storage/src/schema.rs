@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1173,6 +1173,106 @@ CREATE TABLE relay_head_rooms (
 );
 "#;
 
+/// Migration v24: what a device took before it knew of a removal
+/// (decision 2026-10-24 (removal), rules 2, 6 and 7).
+///
+/// - `person_change_times_lists`: beside the time of a change
+///   (`person_change_times`), the keys its statement lists as removed
+///   (`removed`, 32 bytes each), its chain (`chain`, each link its number
+///   in 8 bytes, big-endian, then its hash) and the keys it lists as
+///   devices (`devices`, 32 bytes each): the cut time of a removed key is
+///   worked out from them (rule 2), and a key that rule 6 would remove is
+///   spared where a change on the chain of the removal lists it. A change noted before
+///   the step has none, and is asked of nothing that needs them: that
+///   fails safe.
+/// - `person_removed_keys_by`: beside a removed key, for one that rule 6
+///   removes, the removed key whose record added it after that key's cut
+///   time. Its cut is that key's.
+/// - `file_put_back`: beside a folder's record (`sync_files`), a file that a
+///   carry left out (rule 7): the next cycle takes the channel's version
+///   into the file, whatever is there, and keeps what was there in local
+///   history alone.
+/// - `file_line_from`: beside a record of an index line (`index_lines`),
+///   the keys that signed the version the line was removed from (32 bytes
+///   each), so that no line is put back from a version a removed key signed
+///   (rule 7).
+/// - `file_arrivals_stored` and `file_arrivals`: each entry the door stored
+///   in a file that another key signed, or whose chain holds a link more
+///   times than any chain of the file stored before, with the generation
+///   it came in, when it was stored, the version that was current before it
+///   (sealed as this device's own, to go back to), and, where its chain was
+///   full, the other keys its links name; and each arrival of it, a key
+///   (the first 16 bytes) and, for a link, its hash and how many times it
+///   stands. Kept per file, by its channel and slot, across carries; at
+///   most `MAX_FILE_ARRIVALS` a file.
+/// - `file_arrivals_dropped`: for each file and generation, the newest
+///   time of an arrival dropped past the bound.
+const MIGRATION_V24: &str = r#"
+CREATE TABLE person_change_times_lists (
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
+    chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
+    devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_removed_keys_by (
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
+);
+
+CREATE TABLE file_put_back (
+    folder      TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    PRIMARY KEY (folder, channel_id, key)
+);
+
+CREATE TABLE file_line_from (
+    folder        TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    file          TEXT NOT NULL,
+    from_signers  BLOB NOT NULL CHECK(typeof(from_signers) = 'blob'
+                                      AND length(from_signers) % 32 = 0),
+    PRIMARY KEY (folder, channel_id, file)
+);
+
+CREATE TABLE file_arrivals_stored (
+    place               INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash                BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    stored_at           INTEGER NOT NULL CHECK(typeof(stored_at) = 'integer'),
+    full_signers        BLOB CHECK(full_signers IS NULL OR length(full_signers) % 16 = 0),
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB
+);
+CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
+
+CREATE TABLE file_arrivals (
+    stored     INTEGER NOT NULL,
+    signer     BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 16),
+    link_hash  BLOB CHECK(link_hash IS NULL OR length(link_hash) = 16),
+    times      INTEGER NOT NULL DEFAULT 1 CHECK(typeof(times) = 'integer' AND times >= 1)
+);
+CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
+
+CREATE TABLE file_arrivals_dropped (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    number      INTEGER NOT NULL,
+    hash        BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at   INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, slot, number, hash)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1403,6 +1503,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 23 {
         tracing::info!("applying migration v23 (a relay keeps every head)");
         migrate_in_one(conn, MIGRATION_V23, 23)?;
+    }
+
+    if current < 24 {
+        tracing::info!("applying migration v24 (what a device took before it knew)");
+        migrate_in_one(conn, MIGRATION_V24, 24)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -2001,6 +2106,8 @@ mod tests {
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
+                   AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
             )
             .unwrap()
@@ -2211,7 +2318,7 @@ mod tests {
     /// test of its own.
     fn as_of_v22(held: Vec<String>) -> Vec<String> {
         held.into_iter()
-            .filter(|row| !row.contains("relay_head_rooms"))
+            .filter(|row| !row.contains("relay_head_rooms") && !is_of_v24(row))
             .map(|row| match row.strip_prefix("entries: ") {
                 Some(sql) if sql.starts_with("CREATE TABLE") => {
                     "entries: (its definition, read by itself)".to_string()
@@ -2225,6 +2332,18 @@ mod tests {
                 _ => row,
             })
             .collect()
+    }
+
+    /// Whether a row of what a database holds is of the step to version 24
+    /// (decision 2026-10-24 (removal), rules 2, 6 and 7): its tables are
+    /// left out of what each earlier step's test compares, and it has a
+    /// test of its own.
+    fn is_of_v24(row: &str) -> bool {
+        row.starts_with("file_")
+            || row.starts_with("sqlite_autoindex_file_")
+            || row.contains("file_arrivals")
+            || row.contains("person_removed_keys_by")
+            || row.contains("person_change_times_lists")
     }
 
     /// How a table or an index is defined.
@@ -2255,6 +2374,8 @@ mod tests {
                AND name NOT LIKE '%person_change_times%'
                AND name NOT LIKE '%idx_person_change_entries_followed%'
                AND name NOT LIKE '%message%'
+               AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -2468,6 +2589,8 @@ mod tests {
                    AND name NOT LIKE '%person_clear%'
                    AND name NOT LIKE '%person_change%'
                    AND name NOT LIKE '%message%'
+                   AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -3447,7 +3570,11 @@ mod tests {
     /// adds.
     fn everything_but_v20(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -3716,7 +3843,11 @@ mod tests {
     /// version 19 adds.
     fn everything_but_v19(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -4851,7 +4982,11 @@ mod tests {
     /// table, but what the step to version 21 adds.
     fn everything_but_v21(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -5025,7 +5160,11 @@ mod tests {
     /// table, but what the step to version 22 makes or writes.
     fn everything_but_v22(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -5266,7 +5405,7 @@ mod tests {
         assert_eq!(definition_of(&conn, "entries"), definition_before);
 
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 23);
+        assert!(version(&conn) >= 23);
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(everything_but_v22(&conn), before);
         assert_eq!(entries_as_at_v22(&conn), entries_before);
@@ -5319,22 +5458,189 @@ mod tests {
         assert!(conn.execute_batch(&row("'text'", 9007, 7)).is_err());
     }
 
-    /// The version before, whose schema is at step 22, stops on a database
-    /// that was stepped to 23, as every version stops on one from a later
+    /// What the step to version 24 makes, by name.
+    const NEW_IN_V24: [&str; 9] = [
+        "file_arrivals",
+        "file_arrivals_by_stored",
+        "file_arrivals_dropped",
+        "file_arrivals_stored",
+        "file_arrivals_stored_by_file",
+        "file_line_from",
+        "file_put_back",
+        "person_change_times_lists",
+        "person_removed_keys_by",
+    ];
+
+    /// What a database holds of the step to version 24, by name.
+    fn new_in_v24(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter(|name| NEW_IN_V24.contains(&name.as_str()))
+        .collect()
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 24 adds.
+    fn everything_but_v24(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V24
+                .iter()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 24 (decision 2026-10-24 (removal), rules 2, 6
+    /// and 7) adds the tables of what a device took before it knew, empty,
+    /// and changes no older definition or row; it is made in one step with
+    /// its version, so a failure between them leaves none of it, and asked
+    /// for twice it is run once. Its tables take no row that cannot be what
+    /// a device keeps.
+    #[test]
+    fn step_24_adds_what_a_device_took_before_it_knew_and_changes_no_older_row() {
+        let conn = at_v21();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        conn.execute_batch(
+            "INSERT INTO person_change_times (number, hash, made_at) VALUES (2, zeroblob(16), 9);",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v24(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert!(new_in_v24(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V24} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 24).is_err());
+        assert_eq!(version(&conn), 23);
+        assert!(
+            new_in_v24(&conn).is_empty(),
+            "the step goes with the version"
+        );
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v24(&conn), NEW_IN_V24);
+        assert_eq!(everything_but_v24(&conn), before);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
+        assert_eq!(everything_but_v24(&conn), before);
+        for table in ["file_arrivals_stored", "file_arrivals", "file_put_back"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+
+        let key = "X'0202020202020202020202020202020202020202020202020202020202020202'";
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, zeroblob(31), x'', x'')"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, zeroblob(32), x'', x'')"
+                ),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, x'', zeroblob(23), x'')"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, x'', zeroblob(24), x'')"
+                ),
+            ),
+            (
+                format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, 'k')"),
+                format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, {key})"),
+            ),
+            (
+                "INSERT INTO file_arrivals (stored, signer) VALUES (1, zeroblob(15))".into(),
+                "INSERT INTO file_arrivals (stored, signer) VALUES (1, zeroblob(16))".into(),
+            ),
+            (
+                "INSERT INTO file_arrivals (stored, signer, times) VALUES (1, zeroblob(16), 0)"
+                    .into(),
+                "INSERT INTO file_arrivals (stored, signer, times) VALUES (1, zeroblob(16), 2)"
+                    .into(),
+            ),
+            (
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+                     VALUES (zeroblob(32), zeroblob(32), 0, {hash}, 9)"
+                ),
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9)"
+                ),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// The version before, whose schema is at step 23, stops on a database
+    /// that was stepped to 24, as every version stops on one from a later
     /// version: it is refused with both versions, and nothing of it is
     /// changed.
     #[test]
-    fn the_version_before_stops_on_a_database_of_step_23() {
+    fn the_version_before_stops_on_a_database_of_step_24() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cordelia.db");
         drop(crate::db::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
-        let refused = refuse_a_later_version(&conn, 22);
+        let refused = refuse_a_later_version(&conn, 23);
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 23, own: 22 })
+                Err(StorageError::LaterVersion { found: 24, own: 23 })
             ),
             "{refused:?}"
         );

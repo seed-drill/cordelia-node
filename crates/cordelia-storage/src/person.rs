@@ -552,17 +552,130 @@ pub fn note_change_time(
     hash: &[u8; 16],
     made_at: Option<i64>,
 ) -> Result<(), CordeliaError> {
+    note_change(conn, number, hash, made_at, None, None, None)
+}
+
+/// A change as the device noted it ([`note_change`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotedChange {
+    pub number: u64,
+    pub hash: [u8; 16],
+    /// The time its lineage says it was made; `None` where it has none,
+    /// or none was known when it was noted.
+    pub made_at: Option<i64>,
+    /// The keys its statement lists as removed, where they were noted.
+    pub removed: Option<Vec<[u8; 32]>>,
+    /// Its statement's chain, each link by number and hash, where it was
+    /// noted.
+    pub chain: Option<Vec<(u64, [u8; 16])>>,
+    /// The keys its statement lists as devices, where they were noted.
+    pub devices: Option<Vec<[u8; 32]>>,
+}
+
+/// Note the change whose statement is numbered `number` and hashes to
+/// `hash` (decision 2026-10-24 (removal), rule 2): its time, as its
+/// lineage says it (`None` for a change of the version before, or where
+/// the entry is not at hand), the keys its statement lists as removed and
+/// its chain. What was noted of it before stays; what was not is filled.
+/// It is kept after the change goes, for the cut time of rules 6 and 7.
+pub fn note_change(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+    made_at: Option<i64>,
+    removed: Option<&[[u8; 32]]>,
+    chain: Option<&[(u64, [u8; 16])]>,
+    devices: Option<&[[u8; 32]]>,
+) -> Result<(), CordeliaError> {
+    let number = i64::try_from(number).unwrap_or(i64::MAX);
     conn.execute(
         "INSERT INTO person_change_times (number, hash, made_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(number, hash) DO NOTHING",
-        params![
-            i64::try_from(number).unwrap_or(i64::MAX),
-            hash.as_slice(),
-            made_at
-        ],
+         ON CONFLICT(number, hash) DO UPDATE SET made_at = COALESCE(made_at, excluded.made_at)",
+        params![number, hash.as_slice(), made_at],
     )
-    .map(|_| ())
-    .map_err(storage)
+    .map_err(storage)?;
+    if let (Some(removed), Some(chain), Some(devices)) = (removed, chain, devices) {
+        let mut row = Vec::with_capacity(chain.len() * 24);
+        for (number, hash) in chain {
+            row.extend_from_slice(&number.to_be_bytes());
+            row.extend_from_slice(hash);
+        }
+        conn.execute(
+            "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(number, hash) DO NOTHING",
+            params![
+                number,
+                hash.as_slice(),
+                removed.concat(),
+                row,
+                devices.concat()
+            ],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
+}
+
+/// Every change the device noted ([`note_change`]), in order of number
+/// and hash. A list that does not read as one is taken as not noted.
+pub fn changes_noted(conn: &Connection) -> Result<Vec<NotedChange>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.number, t.hash, t.made_at, l.removed, l.chain, l.devices
+             FROM person_change_times t
+             LEFT JOIN person_change_times_lists l ON l.number = t.number AND l.hash = t.hash
+             ORDER BY t.number, t.hash",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut noted = Vec::new();
+    for row in rows {
+        let (number, hash, made_at, removed, chain, devices) = row.map_err(storage)?;
+        let Ok(hash) = <[u8; 16]>::try_from(hash) else {
+            continue;
+        };
+        let keys = |row: Vec<u8>| {
+            let (keys, rest) = row.as_chunks::<32>();
+            rest.is_empty().then(|| keys.to_vec())
+        };
+        let removed = removed.and_then(keys);
+        let devices = devices.and_then(keys);
+        let chain = chain.and_then(|row| {
+            let (links, rest) = row.as_chunks::<24>();
+            rest.is_empty().then(|| {
+                links
+                    .iter()
+                    .map(|link| {
+                        let (number, hash) = link.split_at(8);
+                        (
+                            u64::from_be_bytes(number.try_into().unwrap_or_default()),
+                            hash.try_into().unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            })
+        });
+        noted.push(NotedChange {
+            number: number.max(0) as u64,
+            hash,
+            made_at,
+            removed,
+            chain,
+            devices,
+        });
+    }
+    Ok(noted)
 }
 
 /// The time of the change whose statement is numbered `number` and hashes
@@ -585,6 +698,8 @@ pub fn change_time(
 /// Forget the time of every change: the device leaves its phrase, and
 /// under another they would be another person's. Returns how many went.
 pub fn forget_change_times(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_change_times_lists", [])
+        .map_err(storage)?;
     conn.execute("DELETE FROM person_change_times", [])
         .map_err(storage)
 }
@@ -668,6 +783,24 @@ pub fn count_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError>
     Ok(())
 }
 
+/// A record that counted counts no more (decision 2026-10-24 (removal),
+/// rule 6): a removed key signed it after its cut time. `seen` is its
+/// place, which it keeps. A place that holds no record is refused.
+pub fn uncount_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE person_additions SET counted = 0 WHERE seen = ?1",
+            params![seen],
+        )
+        .map_err(storage)?;
+    if changed != 1 {
+        return Err(CordeliaError::Storage(format!(
+            "the device keeps no record at place {seen}"
+        )));
+    }
+    Ok(())
+}
+
 /// Keep no longer a record that is not counted: `seen` is its place in
 /// the order the device saw the records. The records that stay keep
 /// their places. A record that counts is never dropped here: a place
@@ -732,6 +865,48 @@ pub fn keep_removed(
         kept += 1;
     }
     Ok(kept)
+}
+
+/// Keep `key` as removed because a record that `adder`, a removed key,
+/// signed added it after `adder`'s cut time, or in a generation made apart
+/// from its removal (decision 2026-10-24 (removal), rule 6). Its cut is
+/// `adder`'s. As [`keep_removed`]: a key kept already stays as it was.
+/// Returns whether it was kept anew.
+pub fn keep_removed_added_by(
+    conn: &Connection,
+    key: &[u8; 32],
+    adder: &[u8; 32],
+    now: i64,
+) -> Result<bool, CordeliaError> {
+    if keep_removed(conn, &[*key], now)? == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO person_removed_keys_by (key, added_by) VALUES (?1, ?2)
+         ON CONFLICT(key) DO NOTHING",
+        params![key.as_slice(), adder.as_slice()],
+    )
+    .map_err(storage)?;
+    Ok(true)
+}
+
+/// A key the device keeps as removed, with the removed key whose record
+/// added it where rule 6 removed it.
+pub type RemovedBy = ([u8; 32], Option<[u8; 32]>);
+
+/// Every key the device keeps as removed, in order of key, each with the
+/// removed key whose record added it where rule 6 removed it.
+pub fn removed_with_adders(conn: &Connection) -> Result<Vec<RemovedBy>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT k.key, b.added_by FROM person_removed_keys k
+             LEFT JOIN person_removed_keys_by b ON b.key = k.key ORDER BY k.key ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
 /// How many keys the device keeps as removed.
@@ -907,9 +1082,11 @@ pub fn clear_mark(conn: &Connection) -> Result<Option<[u8; 16]>, CordeliaError> 
 pub fn forget_removals(conn: &Connection) -> Result<(), CordeliaError> {
     for table in [
         "person_removed_keys",
+        "person_removed_keys_by",
         "person_holders",
         "person_holders_past",
         "person_change_times",
+        "person_change_times_lists",
     ] {
         conn.execute(&format!("DELETE FROM {table}"), [])
             .map_err(storage)?;
