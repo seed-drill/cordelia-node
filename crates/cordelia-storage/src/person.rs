@@ -890,6 +890,32 @@ pub fn keep_removed_added_by(
     Ok(true)
 }
 
+/// Keep `key` as one that the person said, at the terminal of the
+/// recovery numbered `number` made on this device, is a device they still
+/// have (decision 2026-10-24 (removal), rule 6): it was shown to the
+/// person with the phrase, so a record of a removed key's that added it
+/// does not remove it. The first answer stays.
+pub fn keep_by_answer(conn: &Connection, key: &[u8; 32], number: u64) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_removed_keys_spared (key, number) VALUES (?1, ?2)
+         ON CONFLICT(key) DO NOTHING",
+        params![key.as_slice(), i64::try_from(number).unwrap_or(i64::MAX)],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Whether the person said, at the terminal of a recovery made on this
+/// device, that `key` is a device they still have ([`keep_by_answer`]).
+pub fn is_kept_by_answer(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM person_removed_keys_spared WHERE key = ?1)",
+        params![key.as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
 /// A key the device keeps as removed, with the removed key whose record
 /// added it where rule 6 removed it.
 pub type RemovedBy = ([u8; 32], Option<[u8; 32]>);
@@ -1083,6 +1109,7 @@ pub fn forget_removals(conn: &Connection) -> Result<(), CordeliaError> {
     for table in [
         "person_removed_keys",
         "person_removed_keys_by",
+        "person_removed_keys_spared",
         "person_holders",
         "person_holders_past",
         "person_change_times",

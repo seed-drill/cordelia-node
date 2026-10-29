@@ -104,7 +104,9 @@
 >   beside the time of each change noted, the keys its statement lists as
 >   removed, its chain and its devices, from which each removed key's cut
 >   time is worked out. `person_removed_keys_by`: for a key that rule 6
->   removed, the removed key whose record added it. `file_arrivals_stored`,
+>   removed, the removed key whose record added it. `person_removed_keys_spared`:
+>   a key that the person said, at a recovery made on this device, is a
+>   device they still have, which rule 6 does not remove. `file_arrivals_stored`,
 >   `file_arrivals` and `file_arrivals_dropped`: the arrivals of each file,
 >   by channel and slot, kept across carries. `file_put_back`, beside
 >   `sync_files`: a folder's file that a carry left out, which the next
@@ -1130,6 +1132,11 @@ CREATE TABLE person_removed_keys_by (               -- v24
     added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
 );
 
+CREATE TABLE person_removed_keys_spared (                -- v24
+    key     BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256)
+);
+
 CREATE TABLE file_arrivals_stored (                 -- v24
     place               INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
@@ -1183,6 +1190,7 @@ CREATE TABLE person_clear_mark (                    -- v21
 | `person_change_times` | For each change it applied or kept, by its statement's number and hash, the time its lineage says it was made, or none for a change made on the version before. Kept after the change goes, until the device leaves its phrase, for the cut time of rule 2 | decision 2026-10-24 (removal), rule 2 |
 | `person_change_times_lists` | Beside a change's time, the keys its statement lists as removed, its chain (each link its number in 8 bytes, big-endian, then its hash) and the keys it lists as devices. A removed key's cut time is worked out from them: the time of the change that first removes it, where it and the change before it are noted, and otherwise of the newest earlier change noted, less ten minutes; a key that a change on the chain of its adder's removal lists is not removed by rule 6 | decision 2026-10-24 (removal), rules 2 and 6 |
 | `person_removed_keys_by` | For a key that rule 6 removed, the removed key whose record added it after that key's cut time, or in a generation made apart from its removal. Its cut is that key's | decision 2026-10-24 (removal), rule 6 |
+| `person_removed_keys_spared` | A key that the person said, at the terminal of a recovery made on this device, is a device they still have, with that change's number. Rule 6 does not remove it: it is added again (decision 2026-10-04 §9, step 6) | decision 2026-10-24 (removal), rule 6 |
 | `file_arrivals_stored`, `file_arrivals` | For each file, by its channel and slot, each entry the door stored that made arrivals: the generation it came in (the change followed, by number and hash), when it was stored, the version current before it as one entry (sealed again as this device's own at each carry), and, where its chain was full, the other keys its links name; and each arrival, a key's first 16 bytes and, for a link, its hash and how many times it stands. A carry goes back to the version before the first arrival it cuts, and leaves out that arrival and everything after it. At most 1,024 arrivals a file (`MAX_FILE_ARRIVALS`), the oldest going first | decision 2026-10-24 (removal), rule 7 |
 | `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound: judged as an arrival of every removed key, so that a cut time before the oldest kept takes the file back to before it | decision 2026-10-24 (removal), rule 7 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |

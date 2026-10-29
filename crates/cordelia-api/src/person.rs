@@ -586,6 +586,13 @@ pub(crate) fn judge_records_by_their_cut(conn: &Connection, now: i64) -> Result<
             if cuts.listed_toward_a_removal(&record.adder, &record.key) {
                 continue;
             }
+            // Nor is a key that the person, at the terminal of a recovery
+            // made here, said is a device they still have: shown with the
+            // phrase, it is theirs by their answer, and is added again by
+            // the record of 2026-10-04, section 9, step 6.
+            if held_rows::is_kept_by_answer(conn, &record.key)? {
+                continue;
+            }
             if record.counted {
                 held_rows::uncount_addition(conn, record.seen)?;
                 again = true;
@@ -8918,6 +8925,22 @@ mod tests {
         know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
         assert_eq!(removed(&conn), vec![key(2)]);
         assert_eq!(counted(&conn), [true]);
+
+        // Nor is a key that the person, at the terminal of a recovery made
+        // here, said is a device they still have; the key beside it, of
+        // which they said nothing, is removed.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), cut).unwrap();
+        see_addition(&conn, &added(&two, 2, 7), cut).unwrap();
+        held_rows::keep_by_answer(&conn, &key(6), 3).unwrap();
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        assert_eq!(removed(&conn), {
+            let mut keys = vec![key(2), key(7)];
+            keys.sort();
+            keys
+        });
+        assert_eq!(counted(&conn), [true, false]);
 
         // Taken out, the judging again: nothing changes (the mutation of the
         // plan, "counted records not judged again").

@@ -1188,6 +1188,9 @@ CREATE TABLE relay_head_rooms (
 /// - `person_removed_keys_by`: beside a removed key, for one that rule 6
 ///   removes, the removed key whose record added it after that key's cut
 ///   time. Its cut is that key's.
+/// - `person_removed_keys_spared`: a key that the person said, at the terminal
+///   of a recovery made on this device, is a device they still have, with
+///   the number of that recovery's change: rule 6 does not remove it.
 /// - `file_put_back`: beside a folder's record (`sync_files`), a file that a
 ///   carry left out (rule 7): the next cycle takes the channel's version
 ///   into the file, whatever is there, and keeps what was there in local
@@ -1220,6 +1223,11 @@ CREATE TABLE person_change_times_lists (
 CREATE TABLE person_removed_keys_by (
     key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
     added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
+);
+
+CREATE TABLE person_removed_keys_spared (
+    key     BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256)
 );
 
 CREATE TABLE file_put_back (
@@ -2343,6 +2351,7 @@ mod tests {
             || row.starts_with("sqlite_autoindex_file_")
             || row.contains("file_arrivals")
             || row.contains("person_removed_keys_by")
+            || row.contains("person_removed_keys_spared")
             || row.contains("person_change_times_lists")
     }
 
@@ -5459,7 +5468,7 @@ mod tests {
     }
 
     /// What the step to version 24 makes, by name.
-    const NEW_IN_V24: [&str; 9] = [
+    const NEW_IN_V24: [&str; 10] = [
         "file_arrivals",
         "file_arrivals_by_stored",
         "file_arrivals_dropped",
@@ -5469,6 +5478,7 @@ mod tests {
         "file_put_back",
         "person_change_times_lists",
         "person_removed_keys_by",
+        "person_removed_keys_spared",
     ];
 
     /// What a database holds of the step to version 24, by name.

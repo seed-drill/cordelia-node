@@ -1198,6 +1198,13 @@ pub fn follow(
     let number = state.as_a_change(|conn| {
         let applied = in_one(conn, || {
             let applied = person::follow_recovered(conn, identity, entry, statement_key, left, at)?;
+            // What the person said is a device they still have is kept,
+            // before the look brings the records that added it: a removed
+            // key's record of it is judged again by its cut, and spares it
+            // (decision 2026-10-24 (removal), rule 6).
+            for (key, _) in &shown.still_have {
+                held_rows::keep_by_answer(conn, key, applied.number)?;
+            }
             // The word for the look is taken once (§16), as one with
             // the statement that it was given under.
             carry::take_once(conn, word, at)?;
