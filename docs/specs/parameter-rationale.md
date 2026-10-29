@@ -3117,7 +3117,8 @@ a factor of two; finer buckets cost an atomic each.
 **Rationale:** the lengths past which a wait or a hold is counted apart,
 for the bars that a histogram of powers of two cannot read exactly: 5 ms
 and 50 ms, the counts of §1.2 and bar 4 (c) (at most ten holds over 50 ms);
-10 ms, bar 4 (a)'s wait at p99; 100 ms, the waits of a device that bar 5
+10 ms, bar 4 (a)'s wait at p99 (barred for the kinds of a device's
+requests, and reported for a relay's own kinds); 100 ms, the waits of a device that bar 5
 counts (`cordelia msg summary` tries the lock for
 `AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms, which bar 4 (c) holds
 every write under. 10 ms falls inside the bucket of 8,193 to 16,384 µs and

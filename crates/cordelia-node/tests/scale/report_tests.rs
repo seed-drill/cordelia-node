@@ -246,8 +246,9 @@ fn histogram(
     lines
 }
 
-/// The waits and the holds of one kind, pull, at relay 1.
+/// The waits and the holds of one kind, pull unless it says, at relay 1.
 struct Takes<'a> {
+    kind: &'a str,
     waits: &'a [(u64, f64)],
     wait_over: &'a [(u64, f64)],
     wait_most: Option<f64>,
@@ -260,6 +261,7 @@ const FAST: [(u64, f64); 1] = [(64, 100.0)];
 impl Default for Takes<'_> {
     fn default() -> Self {
         Takes {
+            kind: "pull",
             waits: &FAST,
             wait_over: &[(5, 0.0), (10, 0.0), (50, 0.0)],
             wait_most: None,
@@ -275,14 +277,14 @@ fn bar_4_with(takes: Takes) -> Line {
     window(&run, 0.0, 200.0);
     let mut lines = histogram(
         &format!("{LOCK}_wait_microseconds"),
-        "pull",
+        takes.kind,
         takes.waits,
         takes.wait_over,
         takes.wait_most,
     );
     lines.extend(histogram(
         &format!("{LOCK}_hold_microseconds"),
-        "pull",
+        takes.kind,
         takes.holds,
         &[(5, 0.0), (10, 0.0), (50, 0.0)],
         takes.hold_most,
@@ -423,6 +425,132 @@ fn the_most_held_settles_a_p99_in_the_bucket_that_holds_the_bar_where_it_is_with
     };
     assert_eq!(waited(10_000.0).verdict, Verdict::Pass);
     assert_eq!(waited(10_001.0).verdict, Verdict::NotResolved);
+}
+
+/// Stage 190's relay 1, seed 1: its waits of kind sweep, 131 takes, 2 over
+/// 10 ms (the most 10,648 µs), in the minute of its hourly sweep. Bar 4 (a)
+/// bars the waits of a device's requests alone: the sweep's p99 is over
+/// 10 ms and is reported, and the bar passes. A request's kind with the
+/// same waits fails it.
+#[test]
+fn bar_4_bars_the_wait_of_a_devices_request_and_reports_the_relays_own() {
+    let waits = [(4096, 129.0), (16384, 2.0)];
+    let of = |kind| {
+        bar_4_with(Takes {
+            kind,
+            waits: &waits,
+            wait_over: &[(5, 2.0), (10, 2.0), (50, 0.0)],
+            wait_most: Some(10_648.0),
+            ..Takes::default()
+        })
+    };
+    let sweep = of("sweep");
+    assert_eq!(sweep.verdict, Verdict::Pass, "{}", sweep.figure);
+    assert!(
+        sweep.figure.contains(
+            "the relay's own wait p99 at most 16.4 ms (sweep, fail; 2 of 131 over 10 ms; \
+             reported, not barred)"
+        ),
+        "{}",
+        sweep.figure
+    );
+    for kind in ["show_whole", "show_short", "proof", "pull", "push"] {
+        let request = of(kind);
+        assert_eq!(request.verdict, Verdict::Fail, "{kind}: {}", request.figure);
+        assert!(
+            request.figure.contains(&format!(
+                "a request's wait p99 at most 16.4 ms ({kind}, fail; 2 of 131 over 10 ms)"
+            )),
+            "{}",
+            request.figure
+        );
+    }
+    for kind in ["relays", "checkpoint", "api", "other"] {
+        assert_eq!(
+            of(kind).verdict,
+            Verdict::Pass,
+            "{kind}: {}",
+            of(kind).figure
+        );
+    }
+}
+
+/// Bar 14 at a stage with an office: each relay sampled every minute, 5
+/// connections from the office's address at each sample but relay 1's at
+/// 300 s, which holds `held`. With `churned`, relay 1's warm churn closed a
+/// device's connection between its samples at 240 s and 300 s. With
+/// `started`, relay 1 is down from 180 s to 200 s: no churn, and not the
+/// outage of step 7, which is the second relay's.
+fn bar_14_with(churned: bool, held: usize, started: bool) -> Line {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plan = Plan::small(1);
+    plan.stage = crate::population::Stage::OneNinety;
+    let run = Run::made_up(plan, dir.path());
+    all_running(&run, 0.0);
+    if started {
+        becomes(&run, 0, 180.0, Is::Stopped);
+        becomes(&run, 0, 200.0, Is::Running);
+    }
+    window(&run, 0.0, 600.0);
+    let office = format!("{}:4000", crate::population::OFFICE_ADDRESS);
+    let closed = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+    let away = "cordelia_connections_turned_away_total{why=\"address\"}";
+    for node in 0..2 {
+        for t in (0..=10).map(|n| n as f64 * 60.0) {
+            let n = if node == 0 && t == 300.0 { held } else { 5 };
+            let peers = (0..n).map(|k| (format!("o{k}"), office.clone())).collect();
+            let churn = if churned && node == 0 && t >= 300.0 {
+                32.0
+            } else {
+                0.0
+            };
+            let metrics = [(closed, churn), (away, t / 60.0)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t,
+                node,
+                metrics: Some(metrics),
+                peers: Some(peers),
+                ..Sample::default()
+            });
+        }
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_14(&read, &edits)
+}
+
+/// A sample of 4 from the office's address right after the relay's warm
+/// churn closed a device's connection passes bar 14, and is counted; the
+/// same sample with no churn near it fails, and so do one of 6 after the
+/// churn and one of 4 100 s after relay 1 started again (a start is no
+/// churn: bar 14 excuses the second relay's outage alone).
+#[test]
+fn bar_14_allows_fewer_than_5_only_after_a_warm_churn() {
+    let churned = bar_14_with(true, 4, false);
+    assert_eq!(churned.verdict, Verdict::Pass, "{}", churned.figure);
+    assert!(
+        churned.figure.contains(
+            "relay 1: 0 samples not 5 from the office's address, 1 fewer within 150 s after a \
+             warm churn closed a device"
+        ),
+        "{}",
+        churned.figure
+    );
+    let more = bar_14_with(true, 6, false);
+    assert_eq!(more.verdict, Verdict::Fail, "{}", more.figure);
+    let not = bar_14_with(false, 4, false);
+    assert_eq!(not.verdict, Verdict::Fail, "{}", not.figure);
+    assert!(
+        not.figure
+            .contains("relay 1: 1 samples not 5 from the office's address (4 at 300 s)"),
+        "{}",
+        not.figure
+    );
+    let started = bar_14_with(false, 4, true);
+    assert_eq!(started.verdict, Verdict::Fail, "{}", started.figure);
 }
 
 // ── Medium 8: a device is excused only by its own proofs and carry ──
