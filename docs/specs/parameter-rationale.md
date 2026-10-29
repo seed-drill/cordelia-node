@@ -1690,8 +1690,9 @@ with a label at its longest and the signature.
 
 #### CHANGE_ENTRY_NAME = "change", HAND_OVER_NAME = "hand-over"
 
-**Rationale:** The phrase's channel holds one entry, and a pair channel is
-read for one. Each has one name, so that nothing else there is read. The
+**Rationale:** The phrase's channel holds the change entry (one, or one for
+each head a relay keeps, decision 2026-10-24 (removal), rule 14), and a
+pair channel is read for one. Each has one name, so that nothing else there is read. The
 change entry's slot is under the channel's ID and not under a key of the
 channel: a device holds no key of the phrase's channel, and has to know the
 change entry's slot from any other.

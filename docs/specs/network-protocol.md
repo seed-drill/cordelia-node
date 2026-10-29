@@ -15,7 +15,12 @@
 >   [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)
 >   §2.4. Every channel of a person's own is of this kind. These streams run
 >   between a device and a relay, and between relays that work together, and
->   nowhere else.
+>   nowhere else. The [decision record of 2026-10-24 (removal)](../decisions/2026-10-24-removal-fails-safe.md)
+>   adds to them, with no new stream and no new answer: a change entry says
+>   its lineage in the clear; a relay keeps every head of the phrase's
+>   channel, hands each before it says it holds the entry shown, passes each
+>   on until it is taken, and names the role `heads` in its handshake; and a
+>   device shows each head it keeps (§4.1, §4.9.2, §4.9.4 to §4.9.6).
 > - **The older kind,** on Channel-Announce, Item-Sync and Item-Push (§4.4 to
 >   §4.6, §6, §7), per the
 >   [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)
@@ -407,6 +412,14 @@ HandshakeAccept {
     reject_reason:   ?string     // Present only if version == 0
 }
 ```
+
+**A relay of this version also names the role `heads`** (`RELAY_ROLE_HEADS`)
+among its roles, in both messages: it keeps every head of a change entry,
+and hands each (§4.9.2; decision 2026-10-24 (removal), rule 18). A node of
+0.2.0-alpha.16 reads only `relay` and `bootnode` there and passes the other
+over, and a list holds up to 8 roles (`MAX_HANDSHAKE_ROLES`). So the
+protocol's version does not change: each end offers, and accepts, only its
+own.
 
 #### 4.1.2 Handshake Design: Privacy-First
 
@@ -1115,7 +1128,8 @@ ShowAnswer =
   / "whole"                             // Short form only: show it whole
   / { "other": { rev: u64, id: bytes(32) } }
                                         // Short form only: it holds another at that
-                                        //   revision or a later one; no more is said
+                                        //   revision or a later one, or a head not yet
+                                        //   handed whole here; no more is said
 
 EntryRefused = "not_signed" / "no_room" / "over_limit"
 ```
@@ -1126,17 +1140,37 @@ counts against what the connection may push (§4.9.7). An entry that answers
 (`another`) is signed like any entry, and counts against what the asker may
 be handed, as anything fetched does.
 
+**A relay hands every head before it says that it holds the entry shown**
+(decision 2026-10-24 (removal), rules 14 and 16). In a slot whose entries
+carry a lineage (the phrase's channel, data-formats.md §9.6), a relay keeps
+every head: each entry that no other it keeps was made after, by the
+lineages, up to 8 (`MAX_CHANGE_HEADS`), the highest numbers first. Shown an
+entry, whole or short, it first takes it as it takes a push (§4.9.4), and
+then hands, one in each answer, each head that it keeps there and that it
+has neither handed whole on the connection nor been shown whole there, the
+lowest number first, and of two at one number the lower ID: whole
+(`another`), or, to a short show, by its revision and ID (`other`), after
+which the device shows whole and is handed it whole. Only a whole hand
+counts as handed. Only once none is left does it answer `held`, `taken` or
+`refused`. It hands no entry that the one shown is ahead of. The answers
+are those of 0.2.0-alpha.16, so a device of that version reads each as it
+did.
+
 **After the first time on a connection, a show can be short.** A relay
-remembers, for a connection, the last entry that it was shown whole there in
-each author's slot, where the two signatures held, whatever it answered. It
-remembers at most 8 slots (`MAX_SLOTS_SHOWN_ON_A_CONNECTION`): a ninth is not
-remembered, and all are forgotten when the connection closes.
+remembers, for a connection, each entry that it was shown whole or handed
+whole there in each author's slot, where the two signatures held, whatever
+it answered: up to 16 in a slot (twice `MAX_CHANGE_HEADS`: the 8 heads it
+can keep there, and the 8 a device can keep), the one remembered longest
+put out first. It remembers at most 8 slots
+(`MAX_SLOTS_SHOWN_ON_A_CONNECTION`): a ninth is not remembered, and its
+shows are handed the same lowest head each time. All are forgotten when the
+connection closes.
 
 - **A short show of anything else,** a slot that the relay does not remember
   included, is answered `whole` from the connection's memory alone. The
   store is not looked at. So the short form tells nothing, and hands
   nothing, to anyone who has not shown that very entry whole.
-- **A short show of the entry remembered** is answered from the store:
+- **A short show of an entry remembered** is answered from the store:
   `held`; `whole`, where the relay holds none or an earlier one; or `other`,
   with the revision and ID of the one it holds. The answer to a short show
   never carries an entry. A device that is told of another which it does not
@@ -1208,7 +1242,15 @@ PushAnswer =
 
 A relay stores an entry only if both signatures hold and it is within the
 limits (decision §2.4, items 1 and 2). It keeps the newest revision for each
-author in each slot, and compares no author's entries with another's.
+author in each slot, and compares no author's entries with another's. **An
+entry with a lineage** (data-formats.md §9.6) is kept by its lineage instead
+(decision 2026-10-24 (removal), rule 14): one that a head kept was made
+after, or the same statement again, is not stored (`older`, or `another` at
+that revision); one made after some heads replaces them; one made apart
+from all is kept beside them, up to 8 (`MAX_CHANGE_HEADS`), the highest
+numbers first. An entry with no lineage is kept only where no entry of its
+author in the slot, a head among them, has its revision or a higher one,
+and it replaces no head.
 
 - **`not_signed`:** the bytes are not an entry's, or a signature does not
   hold, or a key is one that anyone can sign for.
@@ -1216,7 +1258,13 @@ author in each slot, and compares no author's entries with another's.
   this kind of channel, or the entry's channel more than one channel may (16
   MB, `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY`). A write that would take a relay
   past its cap is refused and drops nothing. A newer revision of an entry it
-  holds, that is no larger, is never refused for room.
+  holds, that is no larger, is never refused for room. A relay counts a slot
+  whose entry carries a lineage at twice that entry's size, from when it
+  takes the first such entry there, where it has the room
+  (`CHANGE_HEADS_ROOM`, decision 2026-10-24 (removal), rule 15): a second
+  head there then always has room. It drops no channel to make room. Where
+  it had none when the first came (a full relay, during the change-over), a
+  second head there is refused for room, as any new entry is.
 - **`over_limit`:** the sender's address has made the relay take as many new
   channels as one address may in an hour (256,
   `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR`).
@@ -1297,7 +1345,13 @@ Each time is in seconds, in UTC, by the clock of the relay that says it.
 - **What is passed on.** An entry that a relay takes, from anyone, is passed
   on to the listed relays that are connected, but for the one it came from,
   every 5 seconds (`ENTRY_OFFER_INTERVAL_SECS`). Nothing is tried again:
-  what did not arrive is pulled.
+  what did not arrive is pulled. **A head is the exception** (decision
+  2026-10-24 (removal), rule 17): each head a relay stores, from a push, a
+  relay it works with or a show, is offered again at each offer to each
+  listed relay that has not answered for it, connected or not when it was
+  taken, until that relay answers, a refusal included. One that the relay
+  no longer keeps, or that a later head was made after, waits no more. What
+  waits is in memory: after a restart the pull carries what was not taken.
 - **What is pulled.** Every 10 seconds (`RELAY_ENTRY_PULL_INTERVAL_SECS`) a
   relay asks each listed relay which channels it holds, and pulls what it
   lacks of them: at most 10 pages of one channel in a pass, and at most 10
@@ -1325,28 +1379,55 @@ none opens none of these streams, but for the pair channel at the end of this
 section.
 
 **A show comes before everything, and it is a rule of the connection**
-(decision §4.6). Each device keeps the latest change entry it has seen (the
-one entry of the phrase's channel, which carries the statement of the
-person's devices). On a connection to a relay, until the device has shown
-that entry there and dealt with what it was answered, it sends nothing in a
-channel of its own and takes nothing from one. The rule is kept as a rule of
-time, called **leave**:
+(decision §4.6). Each device keeps the change entry of the change it follows
+(an entry of the phrase's channel, which carries the statement of the
+person's devices), and of each head it sets aside, up to 8 in all
+(decision 2026-10-24 (removal), rule 1). On a connection to a relay, until
+the device has shown the change it follows there and dealt with what it was
+answered, it sends nothing in a channel of its own and takes nothing from
+one. **On every pass it shows the change it follows first, and then each
+head set aside** (rule 18): at a relay that names the role `heads` (§4.1),
+every one; at one that does not, none numbered above the change followed,
+since such a relay would take it in place of a removal. A head set aside
+that a relay answers with another entry is not shown again in that round,
+and at a relay that does not name the role, not on that connection. While
+the show of the change followed waits after an answer that gave no leave,
+each head is still shown. A round has room for 23 shows (`SHOWS_IN_A_PASS`,
+three times `MAX_CHANGE_HEADS` less one). Only the answer to the show of
+the change followed is the relay's latest answer, for the status. The rule
+is kept as a rule of time, called **leave**:
 
 - **A device has leave on a connection for 10 seconds** (`SHOW_LEAVE_SECS`)
-  from an answer there which says that the relay holds no later change than
-  the one the device keeps: `held`; `taken`; or `refused` for room or for the
-  address's allowance (the relay would have taken it).
+  from an answer there, to the show of the change it follows, which says
+  that the relay holds no change that the device does not keep: `held`;
+  `taken`; or `refused` for room or for the address's allowance (the relay
+  would have taken it). **A fourth case:** at a relay that does not name the
+  role `heads`, one that hands, twice in one round, a head the device keeps
+  set aside: such a relay keeps one entry, and holds that head alone. At a
+  relay that names the role, that ends the round and gives no leave: the
+  relay lacks the change, and the status says so.
 - **No other answer gives leave:** not `another`, or `other` (the device
-  deals with the entry, and shows again what it then keeps); not `whole` (it
-  shows it whole); not a stream that is reset or that times out.
+  deals with the entry, and shows again what it then keeps; an answer that
+  hands a head it keeps does not end the round); not `whole` (it shows it
+  whole); not a stream that is reset or that times out. The show of a head
+  set aside neither gives leave nor takes it away.
 - **A stream to prove, pull or push is opened only with leave,** and leave
   is asked again before what came back on it is taken: what arrives after
   the leave has run out is dropped, and asked for again.
 - **Leave ends at once, at every relay, when the entry that the device keeps
   changes.** A request is sent only under the change entry that it was built
   under.
-- **A device in a fork has no leave anywhere,** and nor has one that has
-  stopped, or one that was answered with a change and could not apply it.
+- **A closed device has no leave anywhere** (it follows no clear change,
+  decision 2026-10-24 (removal), rule 10), and nor has one that has stopped,
+  or one that was answered with a change and could not apply it. A closed
+  device sends the delete it wrote over a hand-over that a relay holds, and
+  nothing else.
+- **From the moment a device knows that the secret it follows is not
+  clear,** it sends nothing more under it (rule 5): the moment is the
+  commit that keeps the change or the record that makes it so, before any
+  apply or move waits for the sync cycle. A request built before is not
+  written, and a push open at that commit and not yet answered is reset:
+  only what the relay already had whole can be stored.
 - **Whatever finds no leave shows again by itself:** the pass, the timer
   that sends, and a publish. The first show on a connection is whole, and
   the later ones are short. A show that gets no leave is made again after a
@@ -1355,7 +1436,8 @@ time, called **leave**:
 **A device that wakes asks every relay first.** When the node starts, or
 reaches a relay after having reached none, it neither takes from a channel
 of its own nor sends to one until each relay it is set up with has answered
-a show, or 30 seconds have gone since the first of them was reached
+a show and its answer is judged (decision 2026-10-24 (removal), rule 5),
+or 30 seconds have gone since the first of them was reached
 (`WAKE_WAIT_SECS`). A machine that slept wakes: where the time of day has
 run ahead of the clock that leave is measured on by more than a leave lasts,
 every leave is dropped.
@@ -1372,8 +1454,10 @@ relay never holds up another once the device is awake.
 **What a device checks.** The same two signatures, on what a relay sends it.
 Further, in a channel of its own it stores an entry only if its signer
 counts: a device of the statement it has applied, or one added since under
-that statement (decision §4.4). It takes nothing from a channel of a
-generation it has left.
+that statement (decision §4.4), and not a key it knows to be removed, on any
+branch (decision 2026-10-24 (removal), rule 6). It takes nothing from a
+channel of a generation it has left, and a closed device takes nothing in a
+channel of its own.
 
 **A carry that a person asks for reads through one door** (decision §7.3,
 §9). `cordelia sync carry` and `cordelia recover` read, at each relay, a
