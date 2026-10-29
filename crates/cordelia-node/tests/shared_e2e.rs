@@ -835,7 +835,11 @@ struct Shared2 {
 
 impl Shared2 {
     fn new() -> Self {
-        let relay = relay_started();
+        Self::at(relay_started())
+    }
+
+    /// [`Shared2::new`], through `relay`.
+    fn at(relay: Node) -> Self {
         let alice = person("laptop", &relay);
         let bob = person("desktop", &relay);
         let alice_dir = maps_folder(&alice, "repo", AGENT);
@@ -2635,4 +2639,160 @@ fn the_status_carries_the_shared_object_and_no_level_of_it() {
     let other = device_started_with_its_relays_key("desktop", &relay);
     let status = status_json(&other);
     assert!(status.get("shared").is_none(), "{status}");
+}
+
+// ── The version before ───────────────────────────────────────────────
+
+/// A relay of the version before carries a shared channel with no change
+/// (decision 2026-10-10 §8, §14 "A relay on the version before", T2): the
+/// relay is the binary CI names as the version before, as
+/// `Node::binary_given` runs it. Through it Alice shares a channel and Bob
+/// takes it, by its share pair channel; each comes to hold the other's key
+/// from its empty anew record; Bob's agent writes there, and Alice's reads
+/// it inside the frame of another person, and answers; the relay holds
+/// each message, sealed, under its author's key.
+#[test]
+fn a_relay_carries_a_shared_channel_with_no_change() {
+    let Some(before) = binary_before() else {
+        return;
+    };
+    let relay = relay_run_by(before);
+    let version = relay.cli(&["--version"]);
+    assert!(
+        !version.contains(env!("CARGO_PKG_VERSION")),
+        "the relay is of this version: {version}"
+    );
+    let two = Shared2::at(relay);
+    let all = two.all();
+    let channel = id_of(&channel_of(&two.alice, "design-review").unwrap());
+    let id = sends_into(
+        &all,
+        &two.bob,
+        &two.bob_dir,
+        "review-with-alice",
+        &["--ask"],
+        "a branch to look at",
+    );
+    let said = reads_next(&all, &two.alice, &two.alice_dir);
+    assert!(
+        said.contains("START of a message from ANOTHER PERSON's agent, on the device"),
+        "{said}"
+    );
+    assert!(said.contains("\na branch to look at\n"), "{said}");
+    sends_into(
+        &all,
+        &two.alice,
+        &two.alice_dir,
+        "design-review",
+        &["--reply", &id],
+        "looked at it",
+    );
+    let said = reads_next(&all, &two.bob, &two.bob_dir);
+    assert!(said.contains("\nlooked at it\n"), "{said}");
+    assert!(said.contains(&format!("Answers {id}.")), "{said}");
+    // Each device's empty anew record and its message, at the relay.
+    for n in [&two.alice, &two.bob] {
+        assert!(
+            at_the_relay_by(&two.relay, &channel, &key_of(n)) >= 2,
+            "{}",
+            n.name
+        );
+    }
+}
+
+/// A device of the version before ignores the person's lists of shared
+/// channels (decision 2026-10-10 §3.4, §14 "A device of the version
+/// before"): the desktop runs the binary CI names as the version before,
+/// beside the laptop on this version, through the test's own relay. The
+/// laptop makes a shared channel and subscribes a folder, and its list
+/// goes into the personal channel; the desktop's names are
+/// as they were, its database stays at the version before's step, and
+/// `accept --channel` is refused there by its parser. Once the desktop
+/// takes this version, on the same data directory, it holds the channel
+/// and the subscription.
+#[test]
+fn a_device_of_the_version_before_ignores_shared_lists() {
+    let Some(before) = binary_before() else {
+        return;
+    };
+    let relay = relay_started();
+    let laptop = person("laptop", &relay);
+    let mut desktop = node_run_by(before, "desktop", relay.p2p);
+    desktop.add_relay(&format!("127.0.0.1:{}", relay.p2p), Some(&key_of(&relay)));
+    desktop.start();
+    wait_for("desktop healthy", &[&desktop], 30, || healthy(&desktop));
+    wait_for("desktop reaches its relay", &[&desktop, &relay], 60, || {
+        has_hot_peer(&desktop)
+    });
+    let all = [&relay, &laptop, &desktop];
+    adds(&laptop, &desktop, "desktop");
+    has_applied(&desktop, 1, &all);
+    sync_on(&desktop);
+    let laptop_notes = maps_folder(&laptop, "notes", "notes");
+    maps_folder(&desktop, "notes", "notes");
+    let names_before = wait_for("the desktop holds the name", &all, 120, || {
+        let names = desktop.cli(&["channels"]);
+        names.contains("notes").then_some(names)
+    });
+    let version: i64 = rusqlite::Connection::open_with_flags(
+        desktop.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("PRAGMA user_version", [], |row| row.get(0))
+    .unwrap();
+
+    makes(&laptop, "design-review", &[]);
+    subscribes(&laptop, &laptop_notes, "design-review");
+    // Long enough for the desktop's passes to have gone through every
+    // channel it holds, several times over.
+    std::thread::sleep(Duration::from_secs(30));
+    assert_eq!(desktop.cli(&["channels"]), names_before);
+    assert!(healthy(&desktop).is_some());
+    let db = rusqlite::Connection::open_with_flags(
+        desktop.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let after: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, version);
+    assert!(after < 21, "the version before is at step {after}");
+    let tables: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'shared%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0);
+    drop(db);
+    let said = desktop.command(&["accept", &key_of(&laptop), "--channel", "review"]);
+    assert_eq!(
+        said.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+
+    // The desktop takes this version, on the same data directory.
+    desktop.stop();
+    desktop.bin = None;
+    desktop.start();
+    let all = [&relay, &laptop, &desktop];
+    wait_for("desktop healthy on this version", &all, 60, || {
+        healthy(&desktop)
+    });
+    let held = holds_in_the_end(&all, &desktop, "design-review");
+    assert_eq!(held["reached"], true);
+    let subscribed = wait_for("the subscription is held", &all, 120, || {
+        let subscribed = subscriptions_on(&desktop);
+        (!subscribed.is_empty()).then_some(subscribed)
+    });
+    assert!(
+        subscribed.contains(&("notes".to_string(), "design-review".to_string())),
+        "{subscribed:?}"
+    );
 }
