@@ -252,7 +252,7 @@ cordelia devices                 # every device, what each has applied, what eac
 cordelia devices --clear         # go through what this device has to tell you
 cordelia remove-device <key>     # remove a device (asks for the phrase)
 cordelia renew                   # a new secret for the devices that stay (asks for the phrase)
-cordelia settle                  # settle two changes that were made apart (asks for the phrase)
+cordelia settle                  # join changes that were made apart (asks for the phrase)
 cordelia recover                 # on a new machine, with no device left (asks for the phrase)
 cordelia sync carry [<name>]     # bring in what a device that never came back had sent to the relays
 ```
@@ -292,21 +292,48 @@ The command shows you:
 Then it asks you to type yes, and then for the phrase.
 
 - **The removal is one change, for every name at once.** Once one of your
-  devices applies it, the removed device can read nothing that device
-  writes. That device also accepts nothing the removed device writes.
+  devices has read it, the removed device can read nothing that device
+  writes. That device also accepts nothing the removed device sends from
+  then on: no file, no message between your agents, and no device that it
+  adds. This holds even where that device also holds another change that
+  still lists the removed device. The removed device can still read who
+  your devices are in each later change, by key and label. That is a known
+  limit.
 - **Keep the machine on until the command says you can close it.** The
   command stays until every relay has the change and this device has sent
   what it has.
 - **A device that is off applies the removal later,** when it next reaches a
   relay that has it. Until then, the removed device can still read what that
   device writes. `cordelia devices` shows which devices have not applied
-  the change.
-- **You keep what the removed device wrote,** wherever one of your other
-  devices had received it. `cordelia history` shows what this device
-  received from which device. `cordelia restore` puts a version back.
-- **Make a change once, on one device.** Two changes made apart stop every
-  device that sees both. To start them again, run `cordelia settle` on one
-  of them, with the phrase.
+  the change. A device that is on reads the removal within 90 seconds of a
+  relay it is connected to having it. A relay has it within 5 seconds of
+  being connected to a relay it works with that has it.
+- **You keep what the removed device wrote before the removal,** wherever
+  one of your other devices had received it. `cordelia history` shows what
+  this device received from which device. `cordelia restore` puts a
+  version back.
+- **What it wrote after the removal is set aside.** Say your laptop took an
+  edit from the removed tablet before the laptop knew of the removal. When
+  the laptop applies the removal, it takes that edit, and anything written
+  over it, out of the folder and into local history. It goes by when the
+  edit reached the laptop: after the removal was made, less ten minutes. It
+  does the same for what the tablet wrote under a change made apart from
+  the removal. `cordelia status` and `cordelia devices` say how many edits
+  were set aside, for seven days. `cordelia history` lists them, and
+  `cordelia restore` puts one back. With local history off, they are gone.
+  - The limits: a device whose clock is more than ten minutes behind the
+    clock of the device that made the change keeps what reached it in that
+    gap. A device of 0.2.0-alpha.16 or earlier carries the removed device's
+    late writing on at the removal, as before, and a device of this version
+    takes it from there. This holds fully once all your devices have this
+    version.
+- **Make a change once, on one device.** If two changes are made apart (on
+  two devices that had not met), each device follows the one that lists it
+  and lists no device that the other removed. It moves to it by itself,
+  with no phrase. A device for which no such change exists stops: it keeps
+  your files on the device and sends nothing. Run `cordelia settle` on it,
+  with the phrase, to join them. Any change you make on a device that holds
+  both, with `remove-device` or `renew` too, joins them.
 - **A device that you removed by mistake cannot come back under its key.**
   Run `cordelia init --new-key` on it. That gives it a new key and keeps
   its memory folders. Then add it as a new device.
@@ -493,6 +520,15 @@ upgrades, if the message is not yet 30 days old.
   that one, and no version makes another. So going back is by that copy,
   which holds nothing since it was made, or by a copy that you made
   yourself before this version first started.
+- **Upgrade your own relays first, if you run any, then your devices,**
+  one at a time and in any order. Nothing breaks if you do not keep that
+  order. A relay of this version keeps each change made apart and hands it
+  to every device. A relay of `v0.2.0-alpha.16` or earlier keeps one, as
+  before.
+- **Make changes of devices on a machine that has upgraded.** A machine of
+  `v0.2.0-alpha.16` or earlier applies a change made on this version, but
+  cannot make one over it: `remove-device`, `renew`, `settle`, `sync carry
+  --phrase` and `recover` there refuse.
 
 **From `v0.2.0-alpha.9`:** run the install command again with the new
 version, on each machine. Nothing else is needed.
@@ -566,7 +602,8 @@ of the most serious level. Its tooltip shows everything that applies.
 - Whether sync is on or off:
   - This device was removed.
   - This device is in no list of the last change. Add it again.
-  - Two changes were made apart. Settle them with the phrase.
+  - Two changes were made apart, and a removed device can read each one
+    that lists this device. Join them with the phrase (`cordelia settle`).
   - A change could not be opened or applied here.
   - The first start on this version has not succeeded.
   - The database is from a later version.
@@ -587,6 +624,9 @@ If you do not mean to add a machine, turn sync off on it.
 - About your devices, whether sync is on or off:
   - Some device has not applied a removal. This shows for the removal's
     first seven days.
+  - A change made apart from the one this device follows is set aside.
+    This shows for seven days from when it was set aside. `cordelia
+    devices` names it until a change joins the two.
   - A device was added since the last change. Every device shows it until
     you confirm it there with `cordelia devices --clear`, or until a
     renewal lists it (`cordelia renew`).
@@ -738,9 +778,11 @@ reads it at a terminal and signs in its own process.
 
 Relays and relay operators see channel IDs, device public keys, and the
 sizes (by class) and timing of entries; never content, file names, the list
-of your devices, or keys. A relay stores an entry only if the channel's own
-key signed it, and hands a channel only to a connection that proves it holds
-that key. The node on your machine dials out to the relays it was configured
+of your devices, or keys. A relay also reads, in the clear, how your
+changes of devices follow each other, when two were made apart, and when
+each was made: it keeps each change made apart by that. A relay stores an
+entry only if the channel's own key signed it, and hands a channel only to
+a connection that proves it holds that key. The node on your machine dials out to the relays it was configured
 with, which it knows by name and by key (UDP 9474), and listens only on its
 local API (127.0.0.1): nothing on a network you join can connect to it.
 
