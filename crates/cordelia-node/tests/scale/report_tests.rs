@@ -861,3 +861,73 @@ fn bar_7_says_where_growth_was_not_tested() {
         );
     }
 }
+
+// ── Bar 15: a split edit is owed where both its devices ran ──
+
+/// An edit of a split person held up by the relay's outage is owed within
+/// 120 s of the relay's start where its writer and the device it waits on
+/// both ran through those 120 s. One whose device was off then is owed by
+/// bar 3, from when it ran again, and is not late here.
+#[test]
+fn bar_15_owes_a_split_edit_only_where_both_its_devices_ran() {
+    for (case, off, arrived, late) in [
+        ("both ran", None, 700.0, true),
+        ("the device it waits on was off", Some(1), 905.0, false),
+        ("its writer was off", Some(0), 905.0, false),
+    ] {
+        let (_dir, run) = made_up();
+        all_running(&run, 0.0);
+        window(&run, 0.0, 1500.0);
+        *run.outage.lock().unwrap() = Outage {
+            stopped: Some(400.0),
+            started: Some(520.0),
+            back: Vec::new(),
+        };
+        let person = run
+            .plan
+            .population
+            .people
+            .iter()
+            .position(|p| p.split && !p.office)
+            .unwrap();
+        if let Some(device) = off {
+            let node = run.fleet.device(person, device);
+            becomes(&run, node, 460.0, Is::Stopped);
+            becomes(&run, node, 900.0, Is::Running);
+        }
+        {
+            let mut o = run.observer.lock().unwrap();
+            let edit = Written {
+                number: 20,
+                person,
+                writer: 0,
+                name: 0,
+                file: "f001.md".into(),
+                size: 600,
+                at: 450.0,
+                burst: false,
+                new: false,
+                replaced: None,
+            };
+            o.wrote(edit, vec![(1, run.out.clone())]);
+            o.arrivals.insert(
+                (20, 1),
+                Arrival {
+                    at: arrived,
+                    in_copy: false,
+                },
+            );
+        }
+        let read = read_of(&run);
+        let edits = edits_of(&read);
+        let bar = bar_15(&read, &edits);
+        assert_eq!(
+            bar.figure
+                .contains("1 split people's edits later than 120 s"),
+            late,
+            "{case}: {}",
+            bar.figure
+        );
+        assert_eq!(bar.verdict == Verdict::Fail, late, "{case}: {}", bar.figure);
+    }
+}

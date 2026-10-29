@@ -2466,11 +2466,21 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
     let p50 = quantile(&both, 0.5).unwrap_or(0.0);
     let p95 = quantile(&both, 0.95).unwrap_or(0.0);
     let most = both.iter().copied().fold(0.0, f64::max);
+    // A split person's edit held up by the outage is owed within 120 s of
+    // the start where its writer and the device it waits on both ran
+    // through those 120 s; one whose device was off is owed by bar 3, from
+    // when it ran again.
     let split_late = edits
         .of_person(read, false)
         .filter(|p| people[p.edit.person].split)
         .filter(during)
         .filter(|p| !p.gone && !p.replaced)
+        .filter(|p| {
+            let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+            [writer, p.node]
+                .iter()
+                .all(|&node| read.lives.ran_through(node, started, started + 120.0))
+        })
         .filter(|p| p.arrived.is_none_or(|a| a.at - started > 120.0))
         .count();
     let keep = |_: f64, _: f64| true;
@@ -2515,7 +2525,8 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
             mm(&rss, "MiB")
         ),
         "each device set up with it connected again within 120 s; bar 2 through the outage for \
-         people with both; held-up split edits within 120 s of its start; none refused for rate \
+         people with both; held-up split edits within 120 s of its start, where both their \
+         devices ran through those 120 s; none refused for rate \
          in the five minutes after, and none held back but for what the minute of a \
          connection's proofs holds back",
         holds,
