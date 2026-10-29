@@ -209,13 +209,15 @@ fn a_process_read_by_proc_alone_was_not_sampled() {
 // ── Medium 5: a p99 in the bucket that holds the bar is not resolved ──
 
 /// The counters of one kind's histogram: `counts` of takes in buckets
-/// ending at each bound, with the counts over 5 and 50 ms.
+/// ending at each bound, the counts over each length of `over` (ms), and
+/// its most where `most` is given. A length not in `over` is not counted,
+/// as by a node of a version that does not count it.
 fn histogram(
     name: &str,
     kind: &str,
     counts: &[(u64, f64)],
-    over_5: f64,
-    over_50: f64,
+    over: &[(u64, f64)],
+    most: Option<f64>,
 ) -> Vec<(String, f64)> {
     let mut lines = Vec::new();
     let mut summed = 0.0;
@@ -235,28 +237,55 @@ fn histogram(
         format!("{name}_bucket{{kind=\"{kind}\",le=\"+Inf\"}}"),
         summed,
     ));
-    lines.push((format!("{name}_over{{kind=\"{kind}\",ms=\"5\"}}"), over_5));
-    lines.push((format!("{name}_over{{kind=\"{kind}\",ms=\"50\"}}"), over_50));
+    for (ms, n) in over {
+        lines.push((format!("{name}_over{{kind=\"{kind}\",ms=\"{ms}\"}}"), *n));
+    }
+    if let Some(most) = most {
+        lines.push((format!("{name}_max{{kind=\"{kind}\"}}"), most));
+    }
     lines
 }
 
-fn bar_4_of(waits: &[(u64, f64)], over_5: f64, over_50: f64, holds: &[(u64, f64)]) -> Line {
+/// The waits and the holds of one kind, pull, at relay 1.
+struct Takes<'a> {
+    waits: &'a [(u64, f64)],
+    wait_over: &'a [(u64, f64)],
+    wait_most: Option<f64>,
+    holds: &'a [(u64, f64)],
+    hold_most: Option<f64>,
+}
+
+const FAST: [(u64, f64); 1] = [(64, 100.0)];
+
+impl Default for Takes<'_> {
+    fn default() -> Self {
+        Takes {
+            waits: &FAST,
+            wait_over: &[(5, 0.0), (10, 0.0), (50, 0.0)],
+            wait_most: None,
+            holds: &FAST,
+            hold_most: None,
+        }
+    }
+}
+
+fn bar_4_with(takes: Takes) -> Line {
     let (_dir, run) = made_up();
     all_running(&run, 0.0);
     window(&run, 0.0, 200.0);
     let mut lines = histogram(
         &format!("{LOCK}_wait_microseconds"),
         "pull",
-        waits,
-        over_5,
-        over_50,
+        takes.waits,
+        takes.wait_over,
+        takes.wait_most,
     );
     lines.extend(histogram(
         &format!("{LOCK}_hold_microseconds"),
         "pull",
-        holds,
-        0.0,
-        0.0,
+        takes.holds,
+        &[(5, 0.0), (10, 0.0), (50, 0.0)],
+        takes.hold_most,
     ));
     let zero: Vec<(&str, f64)> = lines.iter().map(|(k, _)| (k.as_str(), 0.0)).collect();
     let after: Vec<(&str, f64)> = lines.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -266,14 +295,25 @@ fn bar_4_of(waits: &[(u64, f64)], over_5: f64, over_50: f64, holds: &[(u64, f64)
     bar_4(&read)
 }
 
-/// A wait p99 between 8.192 and 16.384 ms, where the waits over 5 ms do
-/// not settle it, cannot be told from the bar of 10 ms: NOT RESOLVED, not
-/// PASS. Within the bucket that ends under the bar it passes, and in the
-/// one that begins over it it fails. A read's hold p99 between 513 and
-/// 1,024 µs is not resolved against 1 ms.
+/// A node that counts its waits over 5 and 50 ms and not over 10 ms.
+fn bar_4_of(waits: &[(u64, f64)], over_5: f64, over_50: f64, holds: &[(u64, f64)]) -> Line {
+    bar_4_with(Takes {
+        waits,
+        wait_over: &[(5, over_5), (50, over_50)],
+        holds,
+        ..Takes::default()
+    })
+}
+
+/// A node that does not count its waits over 10 ms: a wait p99 between
+/// 8.192 and 16.384 ms, where the waits over 5 ms do not settle it, cannot
+/// be told from the bar of 10 ms: NOT RESOLVED, not PASS. Within the
+/// bucket that ends under the bar it passes, and in the one that begins
+/// over it it fails. A read's hold p99 between 513 and 1,024 µs is not
+/// resolved against 1 ms where its most is not given.
 #[test]
 fn a_p99_in_the_bucket_that_holds_the_bar_is_not_resolved() {
-    let fast = [(64, 100.0)];
+    let fast = FAST;
     // 98 waits under 4 ms and 2 between 8.2 and 16.4 ms: 2% over 5 ms.
     let straddle = bar_4_of(&[(4096, 98.0), (16384, 2.0)], 2.0, 0.0, &fast);
     assert_eq!(
@@ -296,6 +336,93 @@ fn a_p99_in_the_bucket_that_holds_the_bar_is_not_resolved() {
         "{}",
         read_straddle.figure
     );
+}
+
+/// The waits of stage 190's relay 2, of kind sweep (decision 2026-10-22
+/// §7.3): 104 waits, 2 over 5 ms, none over 50 ms, the most 17,004 µs; so
+/// the p99, the second largest, is in the bucket of 8,193 to 16,384 µs.
+/// The count over 10 ms settles it: with one wait over 10 ms (under 1% of
+/// 104, 1.04) the p99 is within the bar, and with two it is over it.
+/// Without that count it is NOT RESOLVED, as it was.
+#[test]
+fn the_count_over_10_ms_settles_a_wait_p99_in_the_bucket_that_holds_the_bar() {
+    let waits = [(4096, 102.0), (16384, 1.0), (32768, 1.0)];
+    let with = |ten: Option<f64>| {
+        let mut over = vec![(5, 2.0), (50, 0.0)];
+        over.extend(ten.map(|ten| (10, ten)));
+        bar_4_with(Takes {
+            waits: &waits,
+            wait_over: &over,
+            wait_most: Some(17_004.0),
+            ..Takes::default()
+        })
+    };
+    let one = with(Some(1.0));
+    assert_eq!(one.verdict, Verdict::Pass, "{}", one.figure);
+    assert!(one.figure.contains("1 of 104 over 10 ms"), "{}", one.figure);
+    let two = with(Some(2.0));
+    assert_eq!(two.verdict, Verdict::Fail, "{}", two.figure);
+    assert!(two.figure.contains("2 of 104 over 10 ms"), "{}", two.figure);
+    let none = with(None);
+    assert_eq!(none.verdict, Verdict::NotResolved, "{}", none.figure);
+    assert!(!none.figure.contains("over 10 ms"), "{}", none.figure);
+}
+
+/// The count over 10 ms rules where it is counted: the waits over 5 ms
+/// alone would pass a p99 that more than 1% over 10 ms puts over the bar,
+/// and they cannot (two in 100 over 5 and over 10 ms fails; one passes).
+#[test]
+fn the_count_over_10_ms_is_read_against_1_percent_of_the_kinds_waits() {
+    let waits = [(4096, 98.0), (16384, 2.0)];
+    let at = |ten: f64| {
+        bar_4_with(Takes {
+            waits: &waits,
+            wait_over: &[(5, 2.0), (10, ten), (50, 0.0)],
+            ..Takes::default()
+        })
+    };
+    assert_eq!(at(0.0).verdict, Verdict::Pass, "{}", at(0.0).figure);
+    assert_eq!(at(1.0).verdict, Verdict::Pass, "{}", at(1.0).figure);
+    assert_eq!(at(2.0).verdict, Verdict::Fail, "{}", at(2.0).figure);
+}
+
+/// The most held settles a read's hold p99 in the bucket of 513 to 1,024
+/// µs where it is at most 1 ms (bar 4 (b)), and nothing else does: with
+/// the most at 1,000 µs it passes, at 1,001 µs it is NOT RESOLVED. A wait
+/// of a node that does not count over 10 ms is settled so too.
+#[test]
+fn the_most_held_settles_a_p99_in_the_bucket_that_holds_the_bar_where_it_is_within() {
+    let holds = [(64, 98.0), (1024, 2.0)];
+    let held = |most: f64| {
+        bar_4_with(Takes {
+            holds: &holds,
+            hold_most: Some(most),
+            ..Takes::default()
+        })
+    };
+    assert_eq!(
+        held(1_000.0).verdict,
+        Verdict::Pass,
+        "{}",
+        held(1_000.0).figure
+    );
+    assert_eq!(
+        held(1_001.0).verdict,
+        Verdict::NotResolved,
+        "{}",
+        held(1_001.0).figure
+    );
+    let waits = [(4096, 98.0), (16384, 2.0)];
+    let waited = |most: f64| {
+        bar_4_with(Takes {
+            waits: &waits,
+            wait_over: &[(5, 2.0), (50, 0.0)],
+            wait_most: Some(most),
+            ..Takes::default()
+        })
+    };
+    assert_eq!(waited(10_000.0).verdict, Verdict::Pass);
+    assert_eq!(waited(10_001.0).verdict, Verdict::NotResolved);
 }
 
 // ── Medium 8: a device is excused only by its own proofs and carry ──
