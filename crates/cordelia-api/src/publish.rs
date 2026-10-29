@@ -45,7 +45,9 @@
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{ENTRY_LINK_HASH_BYTES, MAX_ENTRY_NAME_AND_VALUE_BYTES};
+use cordelia_core::protocol::{
+    ENTRY_LINK_HASH_BYTES, MAX_ENTRY_LINKS, MAX_ENTRY_NAME_AND_VALUE_BYTES,
+};
 use cordelia_core::revision::band;
 use cordelia_crypto::chain;
 use cordelia_crypto::derive;
@@ -508,7 +510,30 @@ fn written_over(
     now: i64,
 ) -> Result<Option<CheckedEntry>, PersonError> {
     let current = over.slot.current.as_ref();
-    let chain = chain_over(current, &identity.public_key(), over.merge)?;
+    let mut chain = chain_over(current, &identity.public_key(), over.merge)?;
+    // A conflict copy's first version is written after the text it keeps
+    // (decision 2026-10-24 (removal), rule 7; the second read of slice 8, its
+    // first finding): a device that takes it then makes an arrival of each
+    // key that wrote that text, as it would of the file it was copied from.
+    let channel = derive::channel_id(over.channel)?;
+    let slot = slot_id(&derive::slot_key(over.channel)?, file);
+    let copy = match (current, over.merge) {
+        (None, None) => cordelia_storage::arrivals::copy_chain(conn, &channel, &slot)?,
+        _ => None,
+    };
+    if let Some(kept) = &copy {
+        chain = kept
+            .iter()
+            .map(|link| {
+                let (hash, signer) = link.split_at(16);
+                Link {
+                    hash: hash.try_into().unwrap_or_default(),
+                    signer: signer.try_into().unwrap_or_default(),
+                }
+            })
+            .take(MAX_ENTRY_LINKS)
+            .collect();
+    }
     let Some(rev) = over.slot.next else {
         return Ok(None);
     };
@@ -523,7 +548,52 @@ fn written_over(
             "the store holds an entry of this device's at or above the slot's next revision".into(),
         ));
     }
+    if copy.is_some() {
+        cordelia_storage::arrivals::copy_done(conn, &channel, &slot)?;
+    }
     Ok(Some(entry))
+}
+
+/// A folder (`folder`) is about to make `copy` a conflict copy of `file`,
+/// in the name `name`, keeping a text written after `chain` (decision
+/// 2026-10-24 (removal), rule 7; the second read of slice 8, its first
+/// finding). The copy is a new name, published as this device's own, and
+/// this device's own versions make no arrivals: so every event of `file`
+/// becomes the copy's too, and the copy's first version is written after
+/// `chain`. A carry before it is published judges it as any file
+/// (`person::move_records`). Called before the copy is written: a copy that
+/// is then not written leaves events that cut nothing honest.
+pub fn copy_made(
+    conn: &Connection,
+    name: &str,
+    folder: &str,
+    file: &str,
+    copy: &str,
+    chain: &[Link],
+) -> Result<(), PersonError> {
+    let standing = Standing::of(conn)?;
+    let secret = standing.name_secret(conn, name)?;
+    let channel = derive::channel_id(&secret)?;
+    let slot_key = derive::slot_key(&secret)?;
+    let links: Vec<[u8; 32]> = chain
+        .iter()
+        .take(MAX_ENTRY_LINKS)
+        .map(|link| {
+            let mut both = [0u8; 32];
+            both[..16].copy_from_slice(&link.hash);
+            both[16..].copy_from_slice(&link.signer);
+            both
+        })
+        .collect();
+    Ok(cordelia_storage::arrivals::copy_file(
+        conn,
+        &channel,
+        &slot_id(&slot_key, file),
+        &slot_id(&slot_key, copy),
+        folder,
+        copy,
+        &links,
+    )?)
 }
 
 /// The chain of an entry that the device whose key is `own` writes over

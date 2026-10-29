@@ -217,7 +217,13 @@ pub(crate) fn cut_of_channel(
     if cuts.keys().is_empty() {
         return Ok(cut);
     }
-    for slot in entries::channel_slots(conn, &channel)? {
+    // Every file that holds an entry, and every one that holds arrivals
+    // and none: a conflict copy that is not yet published.
+    let mut slots = entries::channel_slots(conn, &channel)?;
+    slots.extend(kept::files_of_channel(conn, &channel)?);
+    slots.sort();
+    slots.dedup();
+    for slot in slots {
         let (events, dropped) = kept::of_file(conn, &channel, &slot)?;
         let any_key = |generation: &Change, at: i64| {
             cuts.keys().iter().any(|key| cuts.cuts(key, generation, at))

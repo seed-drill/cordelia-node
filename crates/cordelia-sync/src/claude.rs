@@ -2625,6 +2625,20 @@ fn apply(
                              so the file is left as it is"
                         ))
                     };
+                    // The copy is noted first, with the arrivals of the
+                    // file and the chain of the text it keeps (decision
+                    // 2026-10-24 (removal), rule 7): it is published as
+                    // this device's own, which makes no arrival, so a
+                    // removed device's late text would otherwise come out
+                    // of the cut in it. A copy not noted is not written.
+                    let chain = kept_after(ctx.agreed.get(key), &text, &me);
+                    let noted = lock(state).and_then(|db| {
+                        publish::copy_made(&db, ctx.agent, folder, key, &name, &chain)
+                            .map_err(of_person)
+                    });
+                    if let Err(error) = noted {
+                        return Err(not_kept(error.to_string()));
+                    }
                     // The name was free. If something has it by the time
                     // the text is flushed, or it can no longer be looked
                     // at, that is not written over.
@@ -2723,6 +2737,41 @@ fn apply(
         }
     }
     Ok(true)
+}
+
+/// The chain that a conflict copy of a file keeps `text` after (decision
+/// 2026-10-24 (removal), rule 7): what the text was written after, as the
+/// folder's record of the file (`agreed`) says it. Where the text is the
+/// version agreed, it is that version, as a carry carries it
+/// ([`cordelia_crypto::chain::carried_from`]); where it is an edit not yet published, it was
+/// written over that version
+/// ([`cordelia_crypto::chain::written_over`]). With no record, or
+/// one that names no signer, it is a new text of this device's, and its
+/// chain is empty.
+fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Vec<Link> {
+    let Some(agreed) = agreed else {
+        return Vec::new();
+    };
+    let Some(signer) = agreed.signer else {
+        return Vec::new();
+    };
+    let mut hash = [0u8; 16];
+    if let Some(whole) = agreed.hash {
+        hash.copy_from_slice(&whole[..16]);
+    }
+    let link = Link {
+        hash,
+        signer: Link::signer_of(&signer),
+    };
+    let chain = agreed.chain.as_deref();
+    let mut built = match agreed.hash == Some(Content::new(text).hash) && signer == *me {
+        true => chain.unwrap_or_default().to_vec(),
+        false => std::iter::once(link)
+            .chain(chain.unwrap_or_default().iter().copied())
+            .collect(),
+    };
+    built.truncate(cordelia_core::protocol::MAX_ENTRY_LINKS);
+    built
 }
 
 /// Count an edit that a carry set aside (decision 2026-10-24 (removal),
@@ -3234,6 +3283,160 @@ mod tests {
                 !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
                 "{inside:?}"
             );
+        }
+    }
+
+    /// `st` renews with `phrase`, removing nobody, and applies it: a carry
+    /// of what it holds, as any change makes one.
+    fn renews(st: &AppState, phrase: &Phrase) -> CheckedEntry {
+        let db = st.db.lock().unwrap();
+        let held = person::held(&db).unwrap().unwrap();
+        let latest = held_rows::followed_entry(&db)
+            .unwrap()
+            .unwrap()
+            .check()
+            .unwrap();
+        let stay: Vec<Device> = person::who_counts(&db)
+            .unwrap()
+            .keys()
+            .into_iter()
+            .map(|key| Device::new(key, "device").unwrap())
+            .collect();
+        let own = st.identity.public_key();
+        let entry = change::make_change_at(
+            phrase,
+            &held.statement,
+            &latest,
+            &own,
+            stay,
+            &[],
+            now() as u64,
+        )
+        .unwrap();
+        person::apply_made(&db, &st.identity, &entry, &latest.id(), &[], now()).unwrap();
+        entry
+    }
+
+    /// A conflict copy never carries a removed device's late text out of
+    /// the cut (the second read of slice 8, its first finding). The tablet
+    /// writes `notes.md` late, and the laptop takes it; the tablet then
+    /// writes it again at a higher revision, with a chain that does not
+    /// name the first, and the laptop keeps the first beside the file as a
+    /// conflict copy, which it publishes as its own. When the laptop applies
+    /// the removal, the copy goes too: it was given the file's arrivals when
+    /// it was made. A phone that took the laptop's copy before it heard of
+    /// the removal leaves it out at its own carry: the copy's first version
+    /// names the tablet's text in its chain.
+    ///
+    /// Each way: with no carry between; with the laptop's renewal between
+    /// (made apart from the removal, which it then moves to); and with the
+    /// carry before the copy is published.
+    #[test]
+    fn a_conflict_copy_never_carries_a_removed_devices_late_text_out_of_the_cut() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Between {
+            Nothing,
+            Renewal,
+            NotPublished,
+        }
+        for between in [Between::Nothing, Between::Renewal, Between::NotPublished] {
+            let tmp = tempfile::tempdir().unwrap();
+            let st = state(tmp.path());
+            let (_, phrase) = person_of(&st, NAME);
+            let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+            let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+            let phone = another_device(&st, &tmp.path().join("phone"), NAME);
+            for other in [&desktop, &tablet, &phone] {
+                deliver(&st, other, NAME);
+            }
+            let mem = tmp.path().join("memory");
+            std::fs::create_dir_all(&mem).unwrap();
+            let cycle = || {
+                let generation = st.sync_control.generation();
+                sync_folder(&st, &mem, &channel_now(&st), NAME, "abcd", generation).unwrap()
+            };
+            std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
+            assert_eq!(cycle().published, 1);
+
+            // The tablet writes late, and the laptop takes it.
+            deliver(&st, &tablet, NAME);
+            write(&tablet, NAME, "notes.md", text("the tablet's late text\n"));
+            deliver(&tablet, &st, NAME);
+            assert_eq!(cycle().pulled, 1);
+            // Then again, at a higher revision, naming nothing.
+            let next = {
+                let db = tablet.db.lock().unwrap();
+                publish::read(&db, NAME, "notes.md")
+                    .unwrap()
+                    .slot
+                    .next
+                    .unwrap()
+            };
+            entry_at(
+                &tablet,
+                NAME,
+                "notes.md",
+                text("the tablet again\n"),
+                next,
+                Some(Vec::new()),
+            );
+            deliver(&tablet, &st, NAME);
+            let report = cycle();
+            assert_eq!((report.conflicts, report.pulled), (1, 1), "{report:?}");
+            let copy = names::conflict_name("notes.md", "abcd");
+            assert_eq!(
+                std::fs::read_to_string(mem.join(&copy)).unwrap(),
+                "the tablet's late text\n"
+            );
+            if between != Between::NotPublished {
+                assert_eq!(cycle().published, 1);
+                // The phone takes the laptop's copy, before it hears.
+                deliver(&st, &phone, NAME);
+            }
+            if between == Between::Renewal {
+                renews(&st, &phrase);
+                assert_eq!(cycle().published, 0);
+            }
+
+            // The desktop removes the tablet now; the laptop and the phone
+            // take it.
+            let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+            for on in [&st, &phone] {
+                let db = on.db.lock().unwrap();
+                let taken = take::take(&db, &on.identity, &removal, now()).unwrap();
+                assert!(
+                    matches!(
+                        taken,
+                        take::Taken::Shown(person::Shown::Applied(_) | person::Shown::Moved(_))
+                    ),
+                    "{between:?}: {taken:?}"
+                );
+            }
+            let report = cycle();
+            assert_eq!(report.published, 0, "{between:?}: {report:?}");
+            assert_eq!(
+                std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+                "mine\n",
+                "{between:?}"
+            );
+            assert!(
+                !mem.join(&copy).exists(),
+                "{between:?}: the copy is put back to none"
+            );
+            assert_eq!(cycle().published, 0, "{between:?}");
+            for on in [&st, &desktop, &phone] {
+                if on.identity.public_key() == desktop.identity.public_key() {
+                    deliver(&st, &desktop, NAME);
+                }
+                let secret = name_secret(on, NAME);
+                for entry in held(on, NAME) {
+                    let inside = entry.open(&secret).unwrap();
+                    assert!(
+                        !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                        "{between:?}: {inside:?}"
+                    );
+                }
+            }
         }
     }
 

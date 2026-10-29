@@ -520,6 +520,204 @@ pub fn move_file(
     Ok(())
 }
 
+/// A conflict copy that a folder made and has not yet published
+/// (decision 2026-10-24 (removal), rule 7): the file of its name, the
+/// folder, its name, and the chain of the text it keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    pub slot: [u8; 32],
+    pub folder: String,
+    pub key: String,
+    /// Each link as its hash and then its signer, 16 bytes each.
+    pub chain: Vec<[u8; 32]>,
+}
+
+/// A folder (`folder`) makes `key`, the file `to_slot` in `channel`, a
+/// conflict copy of the file `from_slot` there, keeping a text written
+/// after `chain`: every event of the file and what went past its bound are
+/// the copy's too from now on, each with no version to go back to (the copy
+/// held none), and the copy is kept as not yet published. Its first version
+/// is written after `chain` ([`copy_chain`]). All of it, or none.
+pub fn copy_file(
+    conn: &Connection,
+    channel: &[u8; 32],
+    from_slot: &[u8; 32],
+    to_slot: &[u8; 32],
+    folder: &str,
+    key: &str,
+    chain: &[[u8; 32]],
+) -> Result<(), CordeliaError> {
+    conn.execute_batch("SAVEPOINT file_copy").map_err(storage)?;
+    let copied = (|| -> rusqlite::Result<()> {
+        let places: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT place FROM file_arrivals_stored
+                 WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
+            )?;
+            stmt.query_map(params![channel.as_slice(), from_slot.as_slice()], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        for place in places {
+            conn.execute(
+                "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                     full_signers)
+                 SELECT channel_id, ?2, number, hash, stored_at, full_signers
+                 FROM file_arrivals_stored WHERE place = ?1",
+                params![place, to_slot.as_slice()],
+            )?;
+            let copy = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_arrivals (stored, signer, link_hash, times)
+                 SELECT ?2, signer, link_hash, times FROM file_arrivals WHERE stored = ?1",
+                params![place, copy],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
+                 first_place)
+             SELECT channel_id, ?3, number, hash, newest_at, first_place
+             FROM file_arrivals_dropped WHERE channel_id = ?1 AND slot = ?2
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
+                           first_place = MIN(first_place, excluded.first_place),
+                           before_author = NULL, before_rev = NULL, before_delete = NULL,
+                           before_content = NULL, before_author_sig = NULL,
+                           before_channel_sig = NULL, first_stored_id = NULL",
+            params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
+        )?;
+        keep_to_the_bound(conn, channel, to_slot)?;
+        conn.execute(
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(channel_id, slot) DO UPDATE SET folder = excluded.folder,
+                 key = excluded.key, chain = excluded.chain",
+            params![
+                channel.as_slice(),
+                to_slot.as_slice(),
+                folder,
+                key,
+                chain.concat()
+            ],
+        )?;
+        Ok(())
+    })();
+    let end = match copied {
+        Ok(()) => "RELEASE file_copy",
+        Err(_) => "ROLLBACK TO file_copy; RELEASE file_copy",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    copied.map_err(storage)
+}
+
+/// The chain that the first version of the conflict copy in the file
+/// `slot` of `channel` is written after, where the copy is not yet
+/// published ([`copy_file`]): `None` where it is no such copy.
+pub fn copy_chain(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<Option<Vec<[u8; 32]>>, CordeliaError> {
+    let chain: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT chain FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    Ok(chain.map(|chain| chain.as_chunks::<32>().0.to_vec()))
+}
+
+/// The conflict copy in the file `slot` of `channel` is published, or put
+/// back: it is kept as a copy not yet published no more.
+pub fn copy_done(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "DELETE FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+        params![channel.as_slice(), slot.as_slice()],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// Every conflict copy not yet published in `channel`.
+pub fn copies_of_channel(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<Copy>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT slot, folder, key, chain FROM file_copies WHERE channel_id = ?1
+             ORDER BY folder, key",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], |row| {
+            let slot: Vec<u8> = row.get(0)?;
+            let chain: Vec<u8> = row.get(3)?;
+            Ok(Copy {
+                slot: slot.try_into().unwrap_or_default(),
+                folder: row.get(1)?,
+                key: row.get(2)?,
+                chain: chain.as_chunks::<32>().0.to_vec(),
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// The conflict copy not yet published in the file `slot` of `channel` is
+/// the one in the file `to_slot` of `to` from now on, with its arrivals: a
+/// carry (rule 7).
+pub fn move_copy(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    to: &[u8; 32],
+    to_slot: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    move_file(conn, channel, slot, to, to_slot)?;
+    conn.execute(
+        "UPDATE file_copies SET channel_id = ?3, slot = ?4 WHERE channel_id = ?1 AND slot = ?2",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            to.as_slice(),
+            to_slot.as_slice()
+        ],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// Every file that holds an event or what went past its bound in
+/// `channel`: a conflict copy not yet published holds no entry, and is one
+/// of them.
+pub fn files_of_channel(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT slot FROM file_arrivals_stored WHERE channel_id = ?1
+             UNION SELECT slot FROM file_arrivals_dropped WHERE channel_id = ?1
+             ORDER BY 1",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], |row| {
+            let slot: Vec<u8> = row.get(0)?;
+            Ok(slot.try_into().unwrap_or_default())
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Keep nothing of the files of `channel`: it was left, or dropped.
 pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), CordeliaError> {
     conn.execute(
@@ -528,7 +726,11 @@ pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), Corde
         params![channel.as_slice()],
     )
     .map_err(storage)?;
-    for table in ["file_arrivals_stored", "file_arrivals_dropped"] {
+    for table in [
+        "file_arrivals_stored",
+        "file_arrivals_dropped",
+        "file_copies",
+    ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE channel_id = ?1"),
             params![channel.as_slice()],
@@ -544,6 +746,7 @@ pub fn forget_all(conn: &Connection) -> Result<(), CordeliaError> {
         "file_arrivals",
         "file_arrivals_stored",
         "file_arrivals_dropped",
+        "file_copies",
     ] {
         conn.execute(&format!("DELETE FROM {table}"), [])
             .map_err(storage)?;

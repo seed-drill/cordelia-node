@@ -1217,6 +1217,15 @@ CREATE TABLE relay_head_rooms (
 ///   went with the version current before it (sealed as this device's own)
 ///   and the ID of the entry it stored (`first_stored_id`): where what
 ///   went is cut, the file goes back to that version.
+/// - `file_copies`: a conflict copy that a folder made and has not yet
+///   published, by the channel and slot of its name, with the folder, the
+///   name and the chain of the text it keeps (each link its hash, then its
+///   signer, 16 bytes each). The copy's first version is written after
+///   that chain, and the arrivals of the file it was made from are kept
+///   with it from when it is made, so that no copy carries out of the cut
+///   what a removed device wrote (the second read of slice 8, its first
+///   finding). The row goes once the copy is published; a carry before
+///   that judges it, and puts the folder's file back where it is cut.
 const MIGRATION_V24: &str = r#"
 CREATE TABLE person_change_times_lists (
     number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
@@ -1294,6 +1303,15 @@ CREATE TABLE file_arrivals_dropped (
     before_channel_sig  BLOB,
     first_stored_id     BLOB CHECK(first_stored_id IS NULL OR length(first_stored_id) = 32),
     PRIMARY KEY (channel_id, slot, number, hash)
+);
+
+CREATE TABLE file_copies (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    folder      TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    chain       BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 32 = 0),
+    PRIMARY KEY (channel_id, slot)
 );
 "#;
 
@@ -5484,12 +5502,13 @@ mod tests {
     }
 
     /// What the step to version 24 makes, by name.
-    const NEW_IN_V24: [&str; 10] = [
+    const NEW_IN_V24: [&str; 11] = [
         "file_arrivals",
         "file_arrivals_by_stored",
         "file_arrivals_dropped",
         "file_arrivals_stored",
         "file_arrivals_stored_by_file",
+        "file_copies",
         "file_line_from",
         "file_put_back",
         "person_change_times_lists",
@@ -5641,6 +5660,26 @@ mod tests {
                     "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
                      VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9)"
                 ),
+            ),
+            (
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(32))"
+                ),
+            ),
+            (
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(31))"
+                    .into(),
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32))"
+                    .into(),
             ),
         ];
         for (refused, taken) in cases {

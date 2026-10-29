@@ -2940,6 +2940,35 @@ fn move_records(
     for (folder, file, agreed) in put_back {
         sync_state::save_put_back(conn, &folder, &new, &file, &agreed)?;
     }
+    // A conflict copy that a folder made and has not yet published holds
+    // no entry, and is in no record: it is judged by the arrivals it was
+    // given from the file it was copied from (the second read of slice 8,
+    // its first finding). Where the cut leaves it out, the folder's file is
+    // put back to none, as a file the carry left out is; otherwise its
+    // arrivals go with it, and it is published in the new channel.
+    let to_channel = derive::channel_id(to)?;
+    let to_slot_key = derive::slot_key(to)?;
+    for copy in cordelia_storage::arrivals::copies_of_channel(conn, &channel)? {
+        match cut.contains_key(&copy.slot) {
+            true => {
+                let none = sync_state::Agreed {
+                    hash: None,
+                    rev: 0,
+                    signer: None,
+                    chain: None,
+                };
+                sync_state::save_put_back(conn, &copy.folder, &new, &copy.key, &none)?;
+                cordelia_storage::arrivals::copy_done(conn, &channel, &copy.slot)?;
+            }
+            false => cordelia_storage::arrivals::move_copy(
+                conn,
+                &channel,
+                &copy.slot,
+                &to_channel,
+                &slot_id(&to_slot_key, &copy.key),
+            )?,
+        }
+    }
     Ok(dropped)
 }
 
