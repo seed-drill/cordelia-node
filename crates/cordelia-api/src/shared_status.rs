@@ -253,18 +253,15 @@ fn channel_of(
     let mut offers = Vec::new();
     let mut not_moved_yet = 0;
     if let Some(row) = row.as_ref().filter(|row| row.state == State::Held) {
-        // Each message once, however many of the folders that subscribe
-        // have not read it.
-        let mut unread = HashSet::new();
+        // For each folder that subscribes, the messages unread by its
+        // agent: a message unread by two counts twice, as the `messages`
+        // object counts a message to every name once for each folder.
         for agent in &subscribed {
-            unread.extend(
-                crate::shared_messages::unread(conn, identity, agent, now)?
-                    .into_iter()
-                    .filter(|seen| seen.row.channel == filing.channel)
-                    .map(|seen| seen.id),
-            );
+            unread_by_an_agent += crate::shared_messages::unread(conn, identity, agent, now)?
+                .iter()
+                .filter(|seen| seen.row.channel == filing.channel)
+                .count();
         }
-        unread_by_an_agent = unread.len();
         let read_here = st(message_rows::read_by_a_person(conn, row.id))?;
         for message in crate::shared::shown(conn, identity, &filing.channel, now)? {
             let id = crate::shared_messages::id_of(&message.id)?;

@@ -1008,12 +1008,12 @@ fn a_send_waits_where_the_channel_is_not_clean_or_paused() {
     );
 }
 
-/// The status's `unread_by_an_agent` counts each message once (decision
-/// 2026-10-10 §9, section 19 item 83): a message neither of two
-/// subscribed folders has read is one, not two; read by one of them, it
-/// still counts, unread by the other.
+/// The status's `unread_by_an_agent` counts, for each subscribed folder,
+/// the messages unread by its agent (decision 2026-10-10 §9, section 19
+/// item 83), as the `messages` object counts its own: a message neither of
+/// two subscribed folders has read counts twice; read by one, once.
 #[test]
-fn unread_by_an_agent_counts_each_message_once() {
+fn unread_by_an_agent_counts_for_each_subscribed_folder() {
     let (s, channel) = devices(1);
     let t = s.now + 10;
     subscribes(&s, 0, &channel, "notes", true, t + 1);
@@ -1034,7 +1034,7 @@ fn unread_by_an_agent_counts_each_message_once() {
             .unwrap()["channels"][0]["unread_by_an_agent"]
             .clone()
     };
-    assert_eq!(unread_by_an_agent(t + 3), 1);
+    assert_eq!(unread_by_an_agent(t + 3), 2);
     reads(&s, 0, "notes", &id, t + 4).unwrap();
     assert!(unread(&s, 0, "notes", t + 5).is_empty());
     assert_eq!(unread_by_an_agent(t + 5), 1);
