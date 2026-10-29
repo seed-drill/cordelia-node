@@ -47,7 +47,8 @@ cordelia-node/
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 23). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 24). entries; arrivals (the arrivals of
+                         #   each file, decision 2026-10-24 rule 7); person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -73,7 +74,9 @@ cordelia-node/
                          #   and the notice), first_start (a node that is held up), sync,
                          #   history; reader (what a device keeps of an entry of the
                          #   messages channel that the door stores, and the hourly task of
-                         #   messages); own_read (a read of a channel of the device's own
+                         #   messages); cut and arrivals (a removed key's cut time, and
+                         #   what a carry leaves out, decision 2026-10-24 rules 2, 6, 7);
+                         #   own_read (a read of a channel of the device's own
                          #   with places of its own, kept in memory under its ID: the read
                          #   before a carried name is let go); let_go (what that read
                          #   finds: the entries this device signed, each held where a
@@ -233,6 +236,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
 | `MAX_CHANGE_HEADS` | 8 (the heads a device and a relay keep, decision 2026-10-24 (removal)) | parameter-rationale.md §12.6 |
+| `REMOVAL_TAKEN_MARGIN_SECS`, `MAX_FILE_ARRIVALS` | 600s (derived: 2 x `MAX_CLOCK_SKEW_SECS`; a removed key's cut time is the time of the change that first removes it less this), 1,024 (the arrivals a device keeps for a file, decision 2026-10-24 (removal), rules 2 and 7) | parameter-rationale.md §12.6 |
 | `CHANGE_HEADS_ROOM` | 2 (the heads a relay keeps room for in a slot whose entry carries a lineage, where it has the room; it makes none, decision 2026-10-24 (removal) rule 15) | parameter-rationale.md §12.7 |
 | `RELAY_ROLE_HEADS` | `heads` (the role a relay of this version names in its handshake: it keeps every head, and a device shows it each; at a relay that does not name it, none above the change followed, decision 2026-10-24 (removal) rule 18) | parameter-rationale.md §12.7 |
 | `MAX_KNOWN_REMOVED`, `MAX_KNOWN_HOLDERS` | 2,048 (derived: `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`), 2,048 (the keys a device keeps as removed, and as holding one change's secret by its records; past either it is closed) | parameter-rationale.md §12.6 |
