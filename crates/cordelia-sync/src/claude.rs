@@ -3329,8 +3329,11 @@ mod tests {
     /// names the tablet's text in its chain.
     ///
     /// Each way: with no carry between; with the laptop's renewal between
-    /// (made apart from the removal, which it then moves to); and with the
-    /// carry before the copy is published.
+    /// (made apart from the removal, which it then moves to); with the
+    /// carry before the copy is published; and with the copy's name used
+    /// before, by an honest copy that the person deleted, so that the copy
+    /// is written over that delete (the third read of slice 8, its first
+    /// finding).
     #[test]
     fn a_conflict_copy_never_carries_a_removed_devices_late_text_out_of_the_cut() {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3338,8 +3341,14 @@ mod tests {
             Nothing,
             Renewal,
             NotPublished,
+            OverADelete,
         }
-        for between in [Between::Nothing, Between::Renewal, Between::NotPublished] {
+        for between in [
+            Between::Nothing,
+            Between::Renewal,
+            Between::NotPublished,
+            Between::OverADelete,
+        ] {
             let tmp = tempfile::tempdir().unwrap();
             let st = state(tmp.path());
             let (_, phrase) = person_of(&st, NAME);
@@ -3357,6 +3366,28 @@ mod tests {
             };
             std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
             assert_eq!(cycle().published, 1);
+            let copy = names::conflict_name("notes.md", "abcd");
+            if between == Between::OverADelete {
+                // An honest conflict with the desktop first: the laptop
+                // keeps its edit beside the file, publishes it, and the
+                // person deletes it.
+                deliver(&st, &desktop, NAME);
+                std::fs::write(mem.join("notes.md"), "mine, edited\n").unwrap();
+                write(&desktop, NAME, "notes.md", text("the desktop's\n"));
+                deliver(&desktop, &st, NAME);
+                let report = cycle();
+                assert_eq!(report.conflicts, 1, "{report:?}");
+                assert_eq!(
+                    std::fs::read_to_string(mem.join(&copy)).unwrap(),
+                    "mine, edited\n"
+                );
+                assert_eq!(cycle().published, 1);
+                std::fs::remove_file(mem.join(&copy)).unwrap();
+                assert_eq!(cycle().published, 1);
+                let db = st.db.lock().unwrap();
+                let slot = publish::read(&db, NAME, &copy).unwrap().slot;
+                assert_eq!(slot.current.map(|v| v.value), Some(Value::Delete));
+            }
 
             // The tablet writes late, and the laptop takes it.
             deliver(&st, &tablet, NAME);
@@ -3383,7 +3414,6 @@ mod tests {
             deliver(&tablet, &st, NAME);
             let report = cycle();
             assert_eq!((report.conflicts, report.pulled), (1, 1), "{report:?}");
-            let copy = names::conflict_name("notes.md", "abcd");
             assert_eq!(
                 std::fs::read_to_string(mem.join(&copy)).unwrap(),
                 "the tablet's late text\n"
@@ -3414,9 +3444,13 @@ mod tests {
             }
             let report = cycle();
             assert_eq!(report.published, 0, "{between:?}: {report:?}");
+            let before = match between {
+                Between::OverADelete => "the desktop's\n",
+                _ => "mine\n",
+            };
             assert_eq!(
                 std::fs::read_to_string(mem.join("notes.md")).unwrap(),
-                "mine\n",
+                before,
                 "{between:?}"
             );
             assert!(

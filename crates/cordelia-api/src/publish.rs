@@ -515,24 +515,26 @@ fn written_over(
     // (decision 2026-10-24 (removal), rule 7; the second read of slice 8, its
     // first finding): a device that takes it then makes an arrival of each
     // key that wrote that text, as it would of the file it was copied from.
+    // **Whatever its slot held before** (the third read of slice 8, its
+    // first finding): a copy's name is fixed for its file and device, so a
+    // copy made again after a person deleted the last one is written over
+    // that delete. The links of the text it keeps come first, and then what
+    // its slot held.
     let channel = derive::channel_id(over.channel)?;
     let slot = slot_id(&derive::slot_key(over.channel)?, file);
-    let copy = match (current, over.merge) {
-        (None, None) => cordelia_storage::arrivals::copy_chain(conn, &channel, &slot)?,
-        _ => None,
+    let copy = match over.merge {
+        None => cordelia_storage::arrivals::copy_chain(conn, &channel, &slot)?,
+        Some(_) => None,
     };
     if let Some(kept) = &copy {
-        chain = kept
-            .iter()
-            .map(|link| {
-                let (hash, signer) = link.split_at(16);
-                Link {
-                    hash: hash.try_into().unwrap_or_default(),
-                    signer: signer.try_into().unwrap_or_default(),
-                }
-            })
-            .take(MAX_ENTRY_LINKS)
-            .collect();
+        let kept = kept.iter().map(|link| {
+            let (hash, signer) = link.split_at(16);
+            Link {
+                hash: hash.try_into().unwrap_or_default(),
+                signer: signer.try_into().unwrap_or_default(),
+            }
+        });
+        chain = kept.chain(chain).take(MAX_ENTRY_LINKS).collect();
     }
     let Some(rev) = over.slot.next else {
         return Ok(None);
