@@ -563,6 +563,10 @@ fn a_removal_makes_each_shared_channel_anew_without_the_removed_key() {
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(said[0].starts_with("\"review\" is made anew without the device removed"));
     assert!(!is_not_clean(conn, &channel.id).unwrap());
+    assert!(
+        st(rows::not_clean_of(conn, &channel.id)).unwrap().is_none(),
+        "its mark goes"
+    );
     let offer = st(rows::offer_from(conn, &channel.id, &s.key(0)))
         .unwrap()
         .unwrap();
@@ -1399,4 +1403,71 @@ fn a_notice_of_a_channel_not_clean_is_named_again_at_a_later_removal() {
     s.pass(0, 1);
     assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
     assert!(named(&s).is_some(), "named again at the second removal");
+}
+
+/// An older revision of an offer is ignored (decision 2026-10-10 §7): the
+/// reader keeps the offer at revision 3, and one read after it at revision
+/// 2 changes nothing.
+#[test]
+fn an_older_revision_of_an_offer_is_ignored() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let conn = &s[0].conn;
+    let alice = member(1);
+    let offer = |seed: u8| {
+        Anew::Offer(Offer::make(now as u64, &channel.id, &new_card(seed), &[s.key(0)]).unwrap())
+    };
+    let held = row(&s, 0, &channel);
+    read(
+        conn,
+        &s.key(0),
+        &held,
+        &alice.public_key(),
+        3,
+        &offer(20),
+        now,
+    )
+    .unwrap();
+    read(
+        conn,
+        &s.key(0),
+        &held,
+        &alice.public_key(),
+        2,
+        &offer(21),
+        now,
+    )
+    .unwrap();
+    let kept = st(rows::offer_from(conn, &channel.id, &alice.public_key()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.rev, 3);
+    assert_eq!(kept.new_channel, new_card(20).channel_id().unwrap());
+}
+
+/// The machine of a recovery makes a channel anew only once it has read
+/// it since it started (decision 2026-10-10 §3.5; §19 item 67).
+#[test]
+fn a_recovery_makes_a_channel_anew_only_once_it_has_read_it() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.change(0, &[0], &[1]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    recovered(conn, now).unwrap();
+    assert_eq!(make_owed(conn, &s[0].identity, now, &|_| false).unwrap(), 0);
+    assert!(
+        st(rows::made_of_channel(conn, &channel.id))
+            .unwrap()
+            .is_none()
+    );
+    assert!(is_not_clean(conn, &channel.id).unwrap());
+    assert_eq!(make_owed(conn, &s[0].identity, now, &|_| true).unwrap(), 1);
+    assert!(
+        st(rows::made_of_channel(conn, &channel.id))
+            .unwrap()
+            .is_some()
+    );
 }
