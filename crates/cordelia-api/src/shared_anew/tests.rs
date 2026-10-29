@@ -893,3 +893,503 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
             .is_empty()
     );
 }
+
+// ── The fix round of slice 8 ─────────────────────────────────────────
+
+/// The channel that device `n` files as `name` now, as a `Shared`.
+fn filed_as(s: &Several, n: usize, name: &str) -> Shared {
+    let filing = sharing::filed(&s[n].conn)
+        .unwrap()
+        .into_iter()
+        .find(|filing| filing.name == name)
+        .unwrap();
+    Shared {
+        secret: filing.card.secret().unwrap(),
+        id: filing.channel,
+    }
+}
+
+/// Bob's three devices hold "review", each following the others' lists,
+/// with Alice's key shown on device `n`; and the laptop then removes the
+/// tablet. Returns the channel and Alice.
+fn removed_the_tablet(s: &mut Several, n: usize) -> (Shared, NodeIdentity) {
+    let now = s.now + 10;
+    let channel = holds(s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for k in 0..3 {
+        crate::lists::follow(&s[k].conn, &s[k].identity, now).unwrap();
+        out(s, k, now);
+    }
+    let alice = member(1);
+    written_by(s, n, &channel, &[&alice], now);
+    let tablet = crate::several::identity_of(2);
+    stores(s, n, &anew(&tablet, &channel, 1), now);
+    s.change(0, &[0, 1], &[2]);
+    (channel, alice)
+}
+
+/// A move never takes a device into a channel that a key its statement
+/// removed reads (the review of slice 8, high 1; decision 2026-10-24,
+/// rules 4 and 23): Bob's laptop removes his tablet and the channel is
+/// made anew at the removal; Alice, who does not know of the removal, makes
+/// the new channel anew sealed to the tablet as well as to the laptop. On
+/// the laptop her offer is the fault `seals_removed`, named with its maker,
+/// and `shared move` is refused `no_offer`; Carol's offer, which seals to
+/// no removed key, is one to move to.
+#[test]
+fn a_move_never_takes_a_device_into_a_channel_that_a_removed_key_reads() {
+    let mut s = bob(3);
+    let (_, alice) = removed_the_tablet(&mut s, 0);
+    let now = s.now + 20;
+    let tablet = crate::several::identity_of(2);
+    anew_at_removal(&s[0].conn, &s[0].identity, &relays(), now).unwrap();
+    let new = filed_as(&s, 0, "review");
+    let carol = member(2);
+    written_by(&s, 0, &new, &[&alice, &carol], now);
+    stores(
+        &s,
+        0,
+        &offer_by(
+            &alice,
+            &new,
+            30,
+            &[alice.public_key(), s.key(0), tablet.public_key()],
+            now,
+            2,
+        ),
+        now,
+    );
+    assert_eq!(
+        what_is(&s, 0, &new, now),
+        vec![(alice.public_key(), OfferIs::Fault(Fault::SealsRemoved))]
+    );
+    let lines = offer_lines(
+        &s[0].conn,
+        &s[0].identity,
+        &judged(&s[0].conn, &s[0].identity, &row(&s, 0, &new), Some(now)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        lines[0].ends_with("sealed to a device you removed: a fault, not a move"),
+        "{lines:?}"
+    );
+    let refused = move_plan(
+        &s[0].conn,
+        &s[0].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    );
+    assert_eq!(refusal_word(refused), "no_offer");
+    // An offer that seals to no removed key is one to move to.
+    stores(
+        &s,
+        0,
+        &offer_by(&carol, &new, 31, &[carol.public_key(), s.key(0)], now, 2),
+        now,
+    );
+    let plan = move_plan(
+        &s[0].conn,
+        &s[0].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    )
+    .unwrap();
+    assert!(
+        plan.asks.contains("faults: 1 (seals_removed)"),
+        "{}",
+        plan.asks
+    );
+}
+
+/// `shared move` is refused in a channel not yet clean (the review of
+/// slice 8, high 1; decision 2026-10-24, rule 25): the laptop removes the
+/// tablet and is lost before its offer; the desktop applies the removal,
+/// and reads Alice's offer, which seals to no removed key; its `shared
+/// move` is refused `not_clean`, the offer listed above the line that
+/// names the command that makes the channel anew.
+#[test]
+fn shared_move_is_refused_in_a_channel_not_yet_clean() {
+    let mut s = bob(3);
+    let (channel, alice) = removed_the_tablet(&mut s, 1);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
+    stores(
+        &s,
+        1,
+        &offer_by(
+            &alice,
+            &channel,
+            30,
+            &[alice.public_key(), s.key(1)],
+            now,
+            2,
+        ),
+        now,
+    );
+    assert!(matches!(
+        what_is(&s, 1, &channel, now)[..],
+        [(_, OfferIs::ForThisDevice(_))]
+    ));
+    match move_plan(
+        &s[1].conn,
+        &s[1].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    ) {
+        Err(Failed::Refused(refusal)) => {
+            assert_eq!(refusal.word, "not_clean");
+            let lines: Vec<&str> = refusal.line.lines().collect();
+            assert_eq!(lines.len(), 2, "{}", refusal.line);
+            assert!(lines[0].contains("made anew by"), "{}", refusal.line);
+            assert_eq!(lines[1], not_clean_line("review"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A refused `shared anew` writes and sends nothing, at a removal too (the
+/// review of slice 8, medium 2): the desktop, which counts, holds the
+/// filing of "review" at the time bound with the highest count; the laptop
+/// removes the tablet, and the channel could not be made anew: no offer is
+/// stored, no row of what was made is kept, the channel stays filed and not
+/// clean, and the pass has nothing of the laptop's to push there; `shared
+/// anew` after it is refused `held_at_bound` the same way.
+#[test]
+fn a_refused_anew_writes_and_sends_nothing() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for k in 0..3 {
+        crate::lists::follow(&s[k].conn, &s[k].identity, now).unwrap();
+        out(&s, k, now);
+    }
+    crate::lists::held_at_the_bound(&s[1].conn, &s[1].identity, filing(7, "review"), now).unwrap();
+    s.meet(&[0, 1]);
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let slot = slot_id(
+        &derive::slot_key(&channel.secret).unwrap(),
+        &anew_name(&s.key(0)).unwrap(),
+    );
+    let rev_of = || {
+        entries::author_entry(conn, &channel.id, &slot, &s.key(0))
+            .unwrap()
+            .map(|held| held.entry.rev)
+    };
+    let before = rev_of();
+    let nothing_written = || {
+        assert_eq!(rev_of(), before, "no offer is stored");
+        assert!(
+            st(rows::offer_from(conn, &channel.id, &s.key(0)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            st(rows::made_of_channel(conn, &channel.id))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(sharing::filed(conn).unwrap()[0].channel, channel.id);
+        assert!(is_not_clean(conn, &channel.id).unwrap());
+        let usable = crate::shared_pass::usable(conn, &channel.id, &AT)
+            .unwrap()
+            .unwrap();
+        let most = crate::at_relays::Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        assert!(
+            crate::shared_pass::to_send(conn, identity, &usable, &AT, most)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.slot != slot),
+            "nothing of the laptop's to push"
+        );
+    };
+    let said = anew_at_removal(conn, identity, &relays(), now).unwrap();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("\"review\" could not be made anew: "),
+        "{said:?}"
+    );
+    nothing_written();
+    let listed = asked_of(conn, identity, "review", now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    let refused = make_anew(conn, identity, &relays(), &plan.unwrap().what, now);
+    assert_eq!(refusal_word(refused), "held_at_bound");
+    nothing_written();
+}
+
+/// A removal leaves a channel it does not reach not clean, and names it,
+/// rather than making it anew (the review of slice 8, medium 3; decision
+/// 2026-10-24, rules 24 and 25): the laptop, whose relays are not the
+/// channel's, removes the tablet; nothing is written in the channel, it
+/// stays filed and not clean, and `cordelia devices` names it with the
+/// command to run on a device that reaches its relays.
+#[test]
+fn a_removal_leaves_a_channel_it_does_not_reach_not_clean() {
+    let mut s = bob(3);
+    let (channel, _) = removed_the_tablet(&mut s, 0);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let elsewhere = vec![OwnRelay {
+        name: "elsewhere.example.org:9474".into(),
+        key: [9; 32],
+    }];
+    let said = anew_at_removal(conn, identity, &elsewhere, now).unwrap();
+    assert_eq!(said, vec![unreached_line("review")]);
+    assert!(is_not_clean(conn, &channel.id).unwrap());
+    assert_eq!(sharing::filed(conn).unwrap()[0].channel, channel.id);
+    assert!(
+        st(rows::offer_from(conn, &channel.id, &s.key(0)))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        st(rows::made_of_channel(conn, &channel.id))
+            .unwrap()
+            .is_none()
+    );
+    let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
+    assert!(
+        seen.notices
+            .iter()
+            .any(|notice| notice.says == unreached_line("review")),
+        "{:?}",
+        seen.notices
+    );
+    assert!(unreached_line("review").ends_with(
+        "make it anew with cordelia shared anew review on a device of yours that reaches its \
+         relays"
+    ));
+}
+
+/// The subscriptions a move moves do not fill the room of the old ones
+/// (the review of slice 8, medium 4; decision 2026-10-10 §3.4, §7): 17
+/// agents subscribe to "review", and Bob makes it anew; the 17 move with
+/// it, and an 18th agent's subscribe to the new channel is made, not
+/// refused for room.
+#[test]
+fn moved_subscriptions_leave_room_for_a_new_one() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    for k in 0..17 {
+        let subscription = Subscription {
+            channel: channel.id,
+            agent: format!("github.com/owner/repo{k}"),
+            subscribed: true,
+        };
+        acts(&s, 0, Do::Subscribe(subscription), now + 1 + k);
+    }
+    let now = now + 100;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let listed = asked_of(conn, identity, "review", now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
+    let new = filed_as(&s, 0, "review");
+    let in_new = || {
+        crate::shared_messages::in_force(conn)
+            .unwrap()
+            .into_iter()
+            .filter(|(channel, _)| *channel == new.id)
+            .count()
+    };
+    assert_eq!(in_new(), 17);
+    let one_more = Subscription {
+        channel: new.id,
+        agent: "github.com/owner/another".into(),
+        subscribed: true,
+    };
+    acts(&s, 0, Do::Subscribe(one_more), now + 1);
+    assert_eq!(in_new(), 18);
+}
+
+/// The line of a removal says how many keys the cap and the rows let go
+/// left out (the review of slice 8, medium 5; decision 2026-10-10,
+/// property 7): with a member's 100 keys and 3 rows let go, the laptop's
+/// removal of the tablet leaves out 38 keys past the 64 that stay, and 3
+/// no longer known; `remove-device` says so at its end.
+#[test]
+fn a_removal_says_how_many_keys_the_cap_and_the_rows_let_go_left_out() {
+    let mut s = bob(3);
+    let (channel, _) = removed_the_tablet(&mut s, 0);
+    let now = s.now + 20;
+    let members: Vec<NodeIdentity> = (0..99).map(|k| member(1_000 + k)).collect();
+    let refs: Vec<&NodeIdentity> = members.iter().collect();
+    written_by(&s, 0, &channel, &refs, now);
+    let conn = &s[0].conn;
+    conn.execute(
+        "UPDATE shared_channels SET let_go = 3 WHERE channel = ?1",
+        [&channel.id[..]],
+    )
+    .unwrap();
+    let said = anew_at_removal(conn, &s[0].identity, &relays(), now).unwrap();
+    let besides = "Left out besides: 38 keys past the 64 that stay, and 3 no longer known on \
+                   this device.";
+    assert!(said[0].ends_with(besides), "{said:?}");
+    let at_the_end = made_at_the_last_removal(conn, Some(0)).unwrap();
+    assert_eq!(at_the_end, said);
+    let offer = st(rows::offer_from(conn, &channel.id, &s.key(0)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(offer.sealed_to.len(), SHARED_MAX_KEYS);
+}
+
+/// The asked keys of `shared anew` are those it listed (the review of
+/// slice 8, low 8; property 7): Dave writes in the channel after the
+/// listing, and the answers to the keys listed are refused, with nothing
+/// done, rather than leaving Dave out unasked.
+#[test]
+fn shared_anew_refuses_where_a_key_came_after_the_listing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let alice = member(1);
+    written_by(&s, 0, &channel, &[&alice], now);
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let listed = asked_of(conn, identity, "review", now);
+    assert_eq!(listed.len(), 1);
+    let dave = member(9);
+    written_by(&s, 0, &channel, &[&dave], now);
+    match anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some((&listed, &listed)),
+        now,
+    ) {
+        Err(Failed::Refused(refusal)) => assert_eq!(refusal.line, sharing::CHANGED_KEYS),
+        other => panic!("{:?}", other.map(|(_, plan)| plan.map(|plan| plan.asks))),
+    }
+    assert_eq!(sharing::filed(conn).unwrap()[0].channel, channel.id);
+}
+
+/// A relay that holds another entry at the offer's revision does not hold
+/// the offer (the review of slice 8, low 6; §7): the old channel's entries
+/// stay until a relay holds the record written again above it.
+#[test]
+fn an_offer_is_delivered_only_where_a_relay_holds_it() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    let listed = asked_of(conn, identity, "review", now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
+    out(&s, 0, now);
+    let usable = crate::shared_pass::usable(conn, &channel.id, &AT)
+        .unwrap()
+        .unwrap();
+    let most = crate::at_relays::Most {
+        entries: 100,
+        bytes: 1 << 20,
+    };
+    let batch = crate::shared_pass::to_send(conn, identity, &usable, &AT, most).unwrap();
+    assert_eq!(batch.len(), 1, "the offer alone");
+    let another = vec![crate::at_relays::Pushed::HoldsAnother];
+    crate::shared_pass::pushed(conn, identity, &usable, &AT, &batch, &another, now).unwrap();
+    out(&s, 0, now);
+    assert!(
+        !s[0].stored_in(&channel.secret).is_empty(),
+        "its entries wait for the offer"
+    );
+    let batch = crate::shared_pass::to_send(conn, identity, &usable, &AT, most).unwrap();
+    assert_eq!(batch.len(), 1, "the record written again");
+    let holds = vec![crate::at_relays::Pushed::Holds];
+    crate::shared_pass::pushed(conn, identity, &usable, &AT, &batch, &holds, now).unwrap();
+    out(&s, 0, now);
+    assert!(
+        s[0].stored_in(&channel.secret).is_empty(),
+        "its entries went"
+    );
+}
+
+/// A notice of a channel not yet clean is named again at a later removal
+/// (the review of slice 8, low 9; §3.5): the desktop clears it, a second
+/// removal comes while the channel is still not clean, and `cordelia
+/// devices` names it again.
+#[test]
+fn a_notice_of_a_channel_not_clean_is_named_again_at_a_later_removal() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2, 3]);
+    for k in 0..4 {
+        crate::lists::follow(&s[k].conn, &s[k].identity, now).unwrap();
+        out(&s, k, now);
+    }
+    s.change(0, &[0, 1, 3], &[2]);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
+    let line = not_clean_line("review");
+    let named = |s: &Several| {
+        crate::look::look(&s[1].conn, &s[1].identity, &Default::default(), now)
+            .unwrap()
+            .notices
+            .into_iter()
+            .find(|notice| notice.says == line)
+    };
+    let notice = named(&s).unwrap();
+    let id: [u8; 32] = hex::decode(&notice.id).unwrap().try_into().unwrap();
+    crate::look::clear(&s[1].conn, &s[1].identity, &id, now)
+        .unwrap()
+        .unwrap();
+    assert!(named(&s).is_none());
+    s.change(0, &[0, 1], &[3]);
+    s.pass(0, 1);
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
+    assert!(named(&s).is_some(), "named again at the second removal");
+}

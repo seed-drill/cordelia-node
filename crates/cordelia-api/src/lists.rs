@@ -1400,5 +1400,29 @@ pub fn lists_in(
     Ok(found)
 }
 
+/// A test's device writes, as its own list, a filing of `filing` at the
+/// time bound with the highest count: no act can go above that item while
+/// the device counts (`held_at_bound`).
+#[cfg(test)]
+pub(crate) fn held_at_the_bound(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    filing: Filing,
+    now: i64,
+) -> Result<(), PersonError> {
+    let act = Act::make(
+        filing,
+        SHARED_ACT_TIME_MAX,
+        SHARED_ACT_TIME_MAX,
+        identity,
+        is_a_name,
+    )
+    .map_err(|e| not_held("an act", e))?;
+    in_one(conn, || {
+        let standing = Standing::to_write(conn)?;
+        write_list(conn, identity, &standing, &[AnyAct::Filing(act)], now)
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests;

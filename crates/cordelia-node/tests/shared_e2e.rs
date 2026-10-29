@@ -2147,6 +2147,133 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     assert_eq!(held, 0);
 }
 
+/// A device of Alice's that knows both relays by their keys, started and
+/// connected: `one` her personal relay, `two` the shared channel's.
+fn with_both_relays(name: &'static str, one: &Node, two: &Node) -> Node {
+    let mut device = node(name, "personal", Some(one.p2p));
+    device.add_relay(&format!("127.0.0.1:{}", one.p2p), Some(&key_of(one)));
+    device.add_relay(&format!("127.0.0.1:{}", two.p2p), Some(&key_of(two)));
+    device.start();
+    wait_for("the device answers", &[&device], 30, || healthy(&device));
+    wait_for(
+        "the device reaches its relays",
+        &[&device, one, two],
+        60,
+        || has_hot_peer(&device),
+    );
+    device
+}
+
+/// No move takes a device into a channel that a removed key reads, and a
+/// removal leaves a channel it does not reach not clean (the review of
+/// slice 8, high 1 and medium 3; decision 2026-10-24, rules 4, 23 to 25):
+/// Alice's laptop and tablet reach the channel's relay, her desktop does
+/// not. The desktop removes the tablet: its prompt and its end say that
+/// "review" is not reached from it and not made anew, and nothing is
+/// written there. Bob, who does not know, makes the channel anew keeping
+/// the laptop and the tablet. On the laptop, which holds the channel not
+/// clean, `shared move` is refused `not_clean`, with Bob's offer above it
+/// as a fault sealed to a device Alice removed; `shared anew` there makes
+/// it anew without the tablet.
+#[test]
+fn no_move_goes_into_a_channel_a_removed_key_reads() {
+    let one = relay_started();
+    let two = relay_started();
+    let laptop = with_both_relays("laptop", &one, &two);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &one);
+    let tablet = with_both_relays("tablet", &one, &two);
+    let bob = person("bob", &two);
+    let all = [&one, &two, &laptop, &desktop, &tablet, &bob];
+    for (device, label) in [(&desktop, "desktop"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    let at_two = format!("127.0.0.1:{}", two.p2p);
+    makes(&laptop, "review", &["--relay", &at_two]);
+    shares(&laptop, "review", &key_of(&bob));
+    accepting(&bob, &key_of(&laptop), "review").ends();
+    holds_in_the_end(&all, &bob, "review");
+    for device in [&desktop, &tablet] {
+        holds_in_the_end(&all, device, "review");
+    }
+    wait_for(
+        "Bob holds the keys of the laptop and the tablet",
+        &all,
+        300,
+        || (channel_of(&bob, "review")?["keys"] == 2).then_some(()),
+    );
+    let old = id_filed(&laptop, "review").unwrap();
+    let old_card = card_of_node(&laptop, &old);
+    let unreached = "These shared channels are not reached from this device, so they are not \
+                     made anew in this change: \"review\"";
+
+    let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
+    at.says("The change is made (change 2)");
+    assert!(at.said.contains(unreached), "{}", at.said);
+    assert!(
+        !at.said.contains("These shared channels are made anew"),
+        "{}",
+        at.said
+    );
+    at.says("The wait has ended.").says(
+        "\"review\" was held by a device that was removed, and is not reached from this \
+         device: make it anew with cordelia shared anew review on a device of yours that \
+         reaches its relays",
+    );
+    drop(at);
+    assert_eq!(id_filed(&desktop, "review"), Some(old));
+    let after = [&one, &two, &laptop, &desktop, &bob];
+    has_applied(&laptop, 2, &after);
+
+    // Bob makes the channel anew, keeping the laptop and the tablet.
+    makes_anew(
+        &bob,
+        "review",
+        &[(key_of(&laptop), "keep"), (key_of(&tablet), "keep")],
+        &[],
+    );
+    let refused = wait_for("the laptop reads Bob's offer", &after, 300, || {
+        let (status, answer) = laptop.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": "review", "look": true }),
+        );
+        let message = answer["error"]["message"].as_str().unwrap_or_default();
+        (status == 409
+            && answer["error"]["code"] == "not_clean"
+            && message.contains("made anew by"))
+        .then(|| message.to_string())
+    });
+    assert!(
+        refused.contains("sealed to a device you removed: a fault, not a move"),
+        "{refused}"
+    );
+    let (ended, _, err) = laptop.at_terminal_into_a_pipe(&["shared", "move", "review"]);
+    assert_eq!(ended, Some(false));
+    assert!(
+        err.contains(
+            "\"review\" was held by a device that was removed: make it anew with cordelia \
+             shared anew review"
+        ),
+        "{err}"
+    );
+    assert_eq!(id_filed(&laptop, "review"), Some(old));
+
+    // Made anew on the laptop, without the tablet.
+    makes_anew(&laptop, "review", &[(key_of(&bob), "keep")], &[]);
+    let offer = offer_at(&two, &old_card, &key_of(&laptop));
+    let sealed: Vec<String> = offer
+        .seals
+        .iter()
+        .map(|seal| cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap())
+        .collect();
+    assert!(!sealed.contains(&key_of(&tablet)), "{sealed:?}");
+    assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
+    assert_ne!(id_filed(&laptop, "review"), Some(old));
+}
+
 /// A removal lists what the removed key did, with the command that undoes
 /// each (decision 2026-10-10 §3.5, property 9, T23): Bob's laptop accepts a
 /// channel from Alice's key, labels that key `alice` and subscribes an
