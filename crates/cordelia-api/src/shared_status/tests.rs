@@ -40,7 +40,8 @@ fn the_shared_object_says_each_channel_held() {
     let channel = holds(&s, 0, 7, "review", now);
     let carol = member(1);
     let dave = member(2);
-    for member in [&carol, &dave] {
+    let erin = member(3);
+    for member in [&carol, &dave, &erin] {
         stores(&s, 0, &anew(member, &channel, 1), now);
     }
     labels(&s, 0, &carol.public_key(), Some("carol"), now);
@@ -64,7 +65,7 @@ fn the_shared_object_says_each_channel_held() {
     assert_eq!(one["words"], channel_words(&channel.id));
     assert_eq!(
         (one["keys"].as_u64(), one["labelled"].as_u64()),
-        (Some(2), Some(1))
+        (Some(3), Some(1))
     );
     assert_eq!(one["subscribed"], json!(["github.com/owner/repo"]));
     assert_eq!(one["not_stored"], 3);
@@ -149,8 +150,18 @@ fn a_channel_not_yet_clean_is_said_as_held_by_a_removed_device() {
         .unwrap()
         .timestamp();
     assert!(since <= now, "{since} {now}");
-    // Dropped, the removed device holds nothing the person holds.
-    acts(&s, 1, Do::Drop(channel.id), now);
+    // Dropped, the removed device holds nothing the person holds: at once,
+    // while its take-out has not ended and its mark is still kept, and
+    // after.
+    crate::lists::act(&s[1].conn, &s[1].identity, Do::Drop(channel.id), now).unwrap();
+    assert!(
+        cordelia_storage::shared_anew::not_clean_of(&s[1].conn, &channel.id)
+            .unwrap()
+            .is_some()
+    );
+    let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
+    assert_eq!(shared["removed_device_holds"], json!([]), "{shared}");
+    out(&s, 1, now);
     let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
     assert_eq!(shared["removed_device_holds"], json!([]), "{shared}");
     assert_eq!(shared["channels"], json!([]));

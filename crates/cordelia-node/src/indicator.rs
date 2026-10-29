@@ -3621,6 +3621,15 @@ mod tests {
             "shared: a removed device still holds 1 shared channel: make each anew \
              (cordelia devices)"
         );
+        // A channel named by two removals counts once.
+        let twice = with_shared(
+            &shared_at_its_worst(serde_json::json!([
+                { "device": "tablet", "channels": ["review"], "since": before(now, 2 * day) },
+                { "device": "phone", "channels": ["review"], "since": before(now, day) },
+            ])),
+            &|_| {},
+        );
+        assert_eq!(twice.summary, one.summary);
         // Of eight days, it is in `cordelia devices` only.
         let eight = with_shared(&holding(8, &["review"]), &|_| {});
         assert_eq!((eight.level, eight.holds.len()), (None, 0));
