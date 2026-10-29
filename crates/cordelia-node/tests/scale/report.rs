@@ -2124,7 +2124,7 @@ fn reconnects(read: &Read) -> Vec<f64> {
     gaps
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

@@ -1512,7 +1512,8 @@ fn a_run_with_every_input(dir: &Path) -> Run {
     std::fs::write(folder.join("f003.conflict-abcd.md"), "a copy").unwrap();
     run.folders.insert((1, 1, 0), folder);
     // A device's log: its connection to the first relay closed and made
-    // again, in the window and outside the outage.
+    // again, in the window and outside the outage, in colour as a node
+    // writes it.
     let relay_hex = run.fleet.made[0].key_hex.clone();
     let at = |secs: f64| {
         let t = run.fleet.clock.wall + std::time::Duration::from_secs_f64(secs);
@@ -1520,7 +1521,8 @@ fn a_run_with_every_input(dir: &Path) -> Run {
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
     };
     let log = format!(
-        "{}  INFO cordelia_network: peer connection closed peer={relay_hex}\n\
+        "{}  \x1b[32mINFO\x1b[0m cordelia_network: peer connection closed \
+         \x1b[3mpeer\x1b[0m\x1b[2m=\x1b[0m{relay_hex}\n\
          {}  INFO cordelia_network: an unrelated line\n\
          {}  INFO cordelia_network: post_connect: checking peer roles peer={relay_hex}\n",
         at(700.25),

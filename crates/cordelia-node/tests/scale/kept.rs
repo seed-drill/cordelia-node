@@ -37,8 +37,9 @@ pub struct KeptNode {
     pub key_hex: String,
     pub settings: Settings,
     /// The lines of its log that name one of the run's relays as a peer
-    /// (`peer=<its key in hex>`), as the log wrote them: what the report
-    /// reads of a device's connections to the relays (bar 11).
+    /// (`peer=<its key in hex>`, once the log's colours are taken out), as
+    /// the log wrote them: what the report reads of a device's
+    /// connections to the relays (bar 11).
     pub log: Vec<String>,
 }
 
@@ -179,7 +180,10 @@ impl Kept {
                     What::Device { .. } => std::fs::read_to_string(m.node.log())
                         .unwrap_or_default()
                         .lines()
-                        .filter(|l| relay_hex.iter().any(|h| l.contains(h.as_str())))
+                        .filter(|l| {
+                            let text = crate::report::strip_ansi(l);
+                            relay_hex.iter().any(|h| text.contains(h.as_str()))
+                        })
                         .map(str::to_string)
                         .collect(),
                     What::Relay(_) => Vec::new(),
