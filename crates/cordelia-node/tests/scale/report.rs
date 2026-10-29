@@ -1973,14 +1973,17 @@ fn closed_lately(read: &Read, node: usize, t: f64) -> bool {
 /// device, from its last sample that carries the count before then to its
 /// first at or after `t`.
 fn churned_lately(read: &Read, relay: usize, t: f64) -> bool {
-    let from = t - 150.0;
-    if read
-        .lives
+    read.lives
         .running_since(relay, t)
-        .is_some_and(|since| since > from)
-    {
-        return true;
-    }
+        .is_some_and(|since| since > t - 150.0)
+        || warm_churn_closed_lately(read, relay, t)
+}
+
+/// Whether relay `relay`'s warm churn closed a device's connection in the
+/// 150 s before `t`, read as [`churned_lately`] reads it: from its last
+/// sample that carries the count before then to its first at or after `t`.
+fn warm_churn_closed_lately(read: &Read, relay: usize, t: f64) -> bool {
+    let from = t - 150.0;
     let key = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
     let series = read.series(relay);
     let carrying = || series.iter().filter(|s| metric(s, key).is_some());
@@ -2506,7 +2509,7 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
     for r in 0..read.run.plan.relays {
         let i = read.run.fleet.relays[r];
         let series = read.series(i);
-        let mut off = Vec::new();
+        let (mut off, mut after_churn) = (Vec::new(), 0);
         for s in series
             .iter()
             .filter(|s| s.t >= read.start && s.t <= read.end)
@@ -2525,7 +2528,14 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
                         == Some(std::net::IpAddr::V4(crate::population::OFFICE_ADDRESS))
                 })
                 .count();
-            if n != 5 {
+            // Fewer within 150 s after this relay's warm churn closed a
+            // device's connection, as bar 9 allows: the churn may close
+            // one of the office's, and its next dial takes the place
+            // again 10 s later at the soonest (the record of a relay out
+            // of reach §2). More than 5 is never excused.
+            if n < 5 && warm_churn_closed_lately(read, i, s.t) {
+                after_churn += 1;
+            } else if n != 5 {
                 off.push(format!("{n} at {:.0} s", s.t));
             }
         }
@@ -2545,8 +2555,9 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
         );
         holds &= off.is_empty() && away > 0.0 && for_a_time == 0.0;
         said.push(format!(
-            "relay {}: {} samples not 5 from the office's address{}; {away:.0} dials turned away \
-             for the address, {for_a_time:.0} refusals for a time",
+            "relay {}: {} samples not 5 from the office's address{}, {after_churn} fewer within \
+             150 s after a warm churn closed a device; {away:.0} dials turned away for the \
+             address, {for_a_time:.0} refusals for a time",
             r + 1,
             off.len(),
             if off.is_empty() {
@@ -2569,7 +2580,8 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
         "The office is as expected",
         said.join("; "),
         "exactly 5 from its address at each relay at every sample but the outage and the 120 s \
-         after; other dials turned away and counted; no refusal for a time",
+         after, and fewer only within 150 s after that relay's warm churn closed a device's \
+         connection; other dials turned away and counted; no refusal for a time",
         holds,
     )
 }

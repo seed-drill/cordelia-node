@@ -475,6 +475,84 @@ fn bar_4_bars_the_wait_of_a_devices_request_and_reports_the_relays_own() {
     }
 }
 
+/// Bar 14 at a stage with an office: each relay sampled every minute, 5
+/// connections from the office's address at each sample but relay 1's at
+/// 300 s, which holds `held`. With `churned`, relay 1's warm churn closed a
+/// device's connection between its samples at 240 s and 300 s. With
+/// `started`, relay 1 is down from 180 s to 200 s: no churn, and not the
+/// outage of step 7, which is the second relay's.
+fn bar_14_with(churned: bool, held: usize, started: bool) -> Line {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plan = Plan::small(1);
+    plan.stage = crate::population::Stage::OneNinety;
+    let run = Run::made_up(plan, dir.path());
+    all_running(&run, 0.0);
+    if started {
+        becomes(&run, 0, 180.0, Is::Stopped);
+        becomes(&run, 0, 200.0, Is::Running);
+    }
+    window(&run, 0.0, 600.0);
+    let office = format!("{}:4000", crate::population::OFFICE_ADDRESS);
+    let closed = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+    let away = "cordelia_connections_turned_away_total{why=\"address\"}";
+    for node in 0..2 {
+        for t in (0..=10).map(|n| n as f64 * 60.0) {
+            let n = if node == 0 && t == 300.0 { held } else { 5 };
+            let peers = (0..n).map(|k| (format!("o{k}"), office.clone())).collect();
+            let churn = if churned && node == 0 && t >= 300.0 {
+                32.0
+            } else {
+                0.0
+            };
+            let metrics = [(closed, churn), (away, t / 60.0)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t,
+                node,
+                metrics: Some(metrics),
+                peers: Some(peers),
+                ..Sample::default()
+            });
+        }
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_14(&read, &edits)
+}
+
+/// A sample of 4 from the office's address right after the relay's warm
+/// churn closed a device's connection passes bar 14, and is counted; the
+/// same sample with no churn near it fails, and so do one of 6 after the
+/// churn and one of 4 100 s after relay 1 started again (a start is no
+/// churn: bar 14 excuses the second relay's outage alone).
+#[test]
+fn bar_14_allows_fewer_than_5_only_after_a_warm_churn() {
+    let churned = bar_14_with(true, 4, false);
+    assert_eq!(churned.verdict, Verdict::Pass, "{}", churned.figure);
+    assert!(
+        churned.figure.contains(
+            "relay 1: 0 samples not 5 from the office's address, 1 fewer within 150 s after a \
+             warm churn closed a device"
+        ),
+        "{}",
+        churned.figure
+    );
+    let more = bar_14_with(true, 6, false);
+    assert_eq!(more.verdict, Verdict::Fail, "{}", more.figure);
+    let not = bar_14_with(false, 4, false);
+    assert_eq!(not.verdict, Verdict::Fail, "{}", not.figure);
+    assert!(
+        not.figure
+            .contains("relay 1: 1 samples not 5 from the office's address (4 at 300 s)"),
+        "{}",
+        not.figure
+    );
+    let started = bar_14_with(false, 4, true);
+    assert_eq!(started.verdict, Verdict::Fail, "{}", started.figure);
+}
+
 // ── Medium 8: a device is excused only by its own proofs and carry ──
 
 /// Device 2 (person 0) holds back requests in a pair where another device
