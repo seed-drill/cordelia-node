@@ -4,8 +4,8 @@
 //! the code to them.
 //!
 //! The file pins the three sizes of the layout and where each place is,
-//! the layout of the version before (0.2.0-alpha.16), the mark, and the
-//! lineage of the two statements of `step4-test-vectors.json`, byte by
+//! the layout of the version before (v0.2.0-alpha.17 and earlier), the
+//! mark, and the lineage of the two statements of `step4-test-vectors.json`, byte by
 //! byte. Those are made from fixed inputs, and a change here that changes
 //! one fails the test until the file is written again, on purpose:
 //!
@@ -155,10 +155,10 @@ fn vectors(entries: Value) -> Value {
     json!({
         "about": "Test vectors for decision 2026-10-24, rule 13: the layout of a change \
                   entry with its lineage, and the layout of the version before \
-                  (0.2.0-alpha.16). Bytes are in hex; offsets and sizes are in bytes of the \
-                  entry's content. The inputs are those of step4-test-vectors.json: its \
-                  phrase, its devices and its two statements. A lineage is its mark, the \
-                  time (eight bytes, the higher first), the statement's hash cut to eight \
+                  (v0.2.0-alpha.17 and earlier). Bytes are in hex; offsets and sizes are in \
+                  bytes of the entry's content. The inputs are those of \
+                  step4-test-vectors.json: its phrase, its devices and its two \
+                  statements. A lineage is its mark, the time (eight bytes, the higher first), the statement's hash cut to eight \
                   bytes, a count (two bytes) and the hash of each statement on its chain \
                   cut to eight bytes; then zeros to the end of its region. The two entries \
                   are of the second statement at revision 2, sealed under the phrase's \

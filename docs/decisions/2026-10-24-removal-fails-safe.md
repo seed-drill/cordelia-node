@@ -7,7 +7,7 @@
 Words used throughout:
 
 - **The record of 2026-10-04** is [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md). **The record of 2026-10-19** is [`2026-10-19-a-relay-out-of-reach.md`](2026-10-19-a-relay-out-of-reach.md). **The record of relays** is [`2026-10-17-a-devices-relays-and-connections.md`](2026-10-17-a-devices-relays-and-connections.md). **The messages record** is [`2026-10-09-messages-between-your-own-agents.md`](2026-10-09-messages-between-your-own-agents.md). **The shared record** is `2026-10-10-a-shared-channel-for-messages.md`, on the branch `docs/shared-converge`: settled, and not built.
-- **This version** is the first that carries what is below. **The version before** is 0.2.0-alpha.16. **Main** is commit abcc079d: every file and line below is of main.
+- **This version** is the first that carries what is below. **The version before** is any version before this one: `v0.2.0-alpha.17` or earlier. **Main** is commit abcc079d: every file and line below is of main.
 - **A change** is a statement and its change entry (the record of 2026-10-04, 4.1 and 4.6). **Change n** is a change whose statement is numbered n. Two changes can have one number.
 - **Made after.** A change is made after each change on its chain. **Made apart:** neither is on the other's chain (the record of 2026-10-04, 4.5).
 - **A head,** on a device or at a relay, is a change that it keeps and that no other change it keeps was made after.
@@ -368,7 +368,7 @@ Each is given as it reads today, and as it would read. Where this is built, it a
 
 ## 6. A device of the version before
 
-**What a device of 0.2.0-alpha.16 meets.**
+**What a device of `v0.2.0-alpha.17` or earlier meets.**
 
 - **A change entry made on this version.** It opens the part for the devices, which has not moved and keeps its size (rule 13), and applies the change as any; its check of the zeros is inside that part. Its node never opens the part for the phrase. **Its commands cannot make a change over such an entry:** `cordelia remove-device`, `renew`, `settle`, `sync carry --phrase` and `recover` of the version before open the part for the phrase at its old place, find that it does not open, and refuse. A change is made on a device of this version.
 - **A relay of this version that keeps two heads.** It is handed the other with today's answer (`Another`), judges a fork as today, and stops. It fails closed. A device behind both is handed the lower first, applies it where it can, and is then handed the other, and stops. A relay of this version hands no change that is behind another it keeps, nor one behind the entry shown, which it takes first (rules 14 and 16).

@@ -850,9 +850,9 @@ offset 29696  the lineage                3072 bytes, in the clear
 ```
 
 **The part for the devices does not move or grow** (`CHANGE_ENTRY_DEVICES_PART_BYTES`
-is fixed, not derived). In the layout of 0.2.0-alpha.16 the part for the
-phrase was the last 4,096 bytes, and there was no lineage. A device of that
-version opens the part for the devices of an entry of this layout as it
+is fixed, not derived). In the layout of `v0.2.0-alpha.17` and earlier the part for
+the phrase was the last 4,096 bytes, and there was no lineage. A device of
+those versions opens the part for the devices of an entry of this layout as it
 opens its own, and applies the change. Its commands open the part for the
 phrase at its old place, find that it does not open, and refuse: a change
 made over an entry of this layout is made on a device of this version.
@@ -888,7 +888,7 @@ lineage of a chain of 256 needs 2,074 (`MAX_LINEAGE_BYTES`).
   tells a relay how the person's statements follow each other, when two
   were made apart, and when each was made.
 - **An entry whose lineage region does not open with the mark has no
-  lineage:** it was made on 0.2.0-alpha.16, and is judged by its statement
+  lineage:** it was made on `v0.2.0-alpha.17` or earlier, and is judged by its statement
   alone. A lineage that does not match its statement (another statement's
   hash, or another chain), or is not in its form, is refused, whoever reads.
 

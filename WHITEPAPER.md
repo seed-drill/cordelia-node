@@ -409,7 +409,7 @@ removed key among the keys removed, and a commitment to a new person secret.
   so for as long as that lasts. `cordelia devices` shows which devices have
   not applied the change. A device whose clock is behind the maker's by
   more than ten minutes carries what reached it in that excess, and a
-  device of 0.2.0-alpha.16 carries the removed device's late writing into
+  device of `v0.2.0-alpha.17` or earlier carries the removed device's late writing into
   the removal's change, as before.
 - **Only the phrase changes who is removed,** and nothing undoes a removal.
   Where two changes are made apart, by two devices that had not met, each
@@ -550,8 +550,8 @@ removed device still reads each later statement; a device that reaches no
 relay which holds the removal writes where the removed device can read for
 as long as that lasts; a device whose clock is more than ten minutes behind
 carries what reached it in that excess; and until every device of a
-person's has this version, a device of 0.2.0-alpha.16 carries the removed
-device's late writing on, and cannot make a change over one made on this
+person's has this version, a device of `v0.2.0-alpha.17` or earlier carries the
+removed device's late writing on, and cannot make a change over one made on this
 version. Shared channels are not built, so the record's rules for them are
 not either.
 

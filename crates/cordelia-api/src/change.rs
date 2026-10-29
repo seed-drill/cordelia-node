@@ -1318,9 +1318,9 @@ mod tests {
     // ── The lineage, and entries of the version before (decision
     // 2026-10-24 rule 13) ────────────────────────────────────────────
 
-    /// `entry` as the version before (0.2.0-alpha.16) made it: the same
-    /// part for the devices, the part for the phrase in the last 4096
-    /// bytes, and no lineage. Signed by the phrase, at its revision.
+    /// `entry` as the version before (v0.2.0-alpha.17 and earlier) made
+    /// it: the same part for the devices, the part for the phrase in the
+    /// last 4096 bytes, and no lineage. Signed by the phrase, at its revision.
     fn as_the_version_before_made_it(s: &Several, entry: &CheckedEntry) -> CheckedEntry {
         use cordelia_core::protocol::{
             CHANGE_ENTRY_DEVICES_PART_BYTES, CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES,

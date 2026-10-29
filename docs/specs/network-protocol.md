@@ -416,7 +416,7 @@ HandshakeAccept {
 **A relay of this version also names the role `heads`** (`RELAY_ROLE_HEADS`)
 among its roles, in both messages: it keeps every head of a change entry,
 and hands each (§4.9.2; decision 2026-10-24 (removal), rule 18). A node of
-0.2.0-alpha.16 reads only `relay` and `bootnode` there and passes the other
+`v0.2.0-alpha.17` or earlier reads only `relay` and `bootnode` there and passes the other
 over, and a list holds up to 8 roles (`MAX_HANDSHAKE_ROLES`). So the
 protocol's version does not change: each end offers, and accepts, only its
 own.
@@ -1153,8 +1153,8 @@ lowest number first, and of two at one number the lower ID: whole
 which the device shows whole and is handed it whole. Only a whole hand
 counts as handed. Only once none is left does it answer `held`, `taken` or
 `refused`. It hands no entry that the one shown is ahead of. The answers
-are those of 0.2.0-alpha.16, so a device of that version reads each as it
-did.
+are those of the versions before, so a device of `v0.2.0-alpha.17` or earlier reads
+each as it did.
 
 **After the first time on a connection, a show can be short.** A relay
 remembers, for a connection, each entry that it was shown whole or handed

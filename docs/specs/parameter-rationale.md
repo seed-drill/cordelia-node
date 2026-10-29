@@ -1418,7 +1418,7 @@ which change was made after which (decision 2026-10-24 rule 13). Each
 sealed part is one size whatever it says.
 
 **Why the part for the devices is fixed, and not derived:** a device of
-the version before (0.2.0-alpha.16) opens that part at this place and of
+the version before (`v0.2.0-alpha.17` or earlier) opens that part at this place and of
 this size. It was derived there as what the part for the phrase leaves;
 left so, it would grow to 31,744 bytes when the part for the phrase
 shrinks, and every device of the version before would refuse every new

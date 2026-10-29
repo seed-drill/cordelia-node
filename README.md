@@ -323,7 +323,7 @@ Then it asks you to type yes, and then for the phrase.
   `cordelia restore` puts one back. With local history off, they are gone.
   - The limits: a device whose clock is more than ten minutes behind the
     clock of the device that made the change keeps what reached it in that
-    gap. A device of 0.2.0-alpha.16 or earlier carries the removed device's
+    gap. A device of `v0.2.0-alpha.17` or earlier carries the removed device's
     late writing on at the removal, as before, and a device of this version
     takes it from there. This holds fully once all your devices have this
     version.
@@ -523,10 +523,10 @@ upgrades, if the message is not yet 30 days old.
 - **Upgrade your own relays first, if you run any, then your devices,**
   one at a time and in any order. Nothing breaks if you do not keep that
   order. A relay of this version keeps each change made apart and hands it
-  to every device. A relay of `v0.2.0-alpha.16` or earlier keeps one, as
+  to every device. A relay of `v0.2.0-alpha.17` or earlier keeps one, as
   before.
 - **Make changes of devices on a machine that has upgraded.** A machine of
-  `v0.2.0-alpha.16` or earlier applies a change made on this version, but
+  `v0.2.0-alpha.17` or earlier applies a change made on this version, but
   cannot make one over it: `remove-device`, `renew`, `settle`, `sync carry
   --phrase` and `recover` there refuse.
 
