@@ -750,6 +750,7 @@ pub struct AnewOf {
 /// the listing of every key, which is said before anything is asked; and,
 /// once the person has answered each (`keep`, the keys answered `keep`,
 /// each as `cordelia id` writes it), what it makes and its yes.
+#[allow(clippy::too_many_arguments)]
 pub fn anew_plan(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1611,6 +1612,16 @@ pub fn acts_named(
         if !of(&act.maker(), maker) {
             continue;
         }
+        // A subscription of a channel that is filed no more (moved from,
+        // or dropped) shows nothing, and has no name to be undone by: it
+        // is not named.
+        if let AnyAct::Subscription(subscription) = &act
+            && !filings
+                .iter()
+                .any(|filing| filing.channel == subscription.item.channel)
+        {
+            continue;
+        }
         let (kind, item, undo) = described(&act, &filings)?;
         named.push(Named {
             maker: act.maker(),
@@ -1729,12 +1740,13 @@ pub fn acts_of_removed(conn: &Connection) -> Result<Vec<Named>, PersonError> {
     acts_named(conn, |_, maker| maker == Maker::Removed)
 }
 
+/// A notice: what it is named by, its kind, and what it says.
+pub(crate) type Told = ([u8; 32], &'static str, String);
+
 /// What a notice of `cordelia devices` says of each channel not yet clean,
 /// and of each act of a removed key in force, each with what it is named
 /// by (§3.5): `(id, kind, says)`.
-pub(crate) fn notices(
-    conn: &Connection,
-) -> Result<Vec<([u8; 32], &'static str, String)>, PersonError> {
+pub(crate) fn notices(conn: &Connection) -> Result<Vec<Told>, PersonError> {
     let mut told = Vec::new();
     for channel in st(rows::not_clean_all(conn))? {
         if !is_not_clean(conn, &channel.channel)? {

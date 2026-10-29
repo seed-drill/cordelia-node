@@ -63,10 +63,7 @@ fn offer_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfferRow> {
         made: row.get::<_, i64>(3)? as u64,
         new_channel: row.get(4)?,
         relays: row.get(5)?,
-        sealed_to: sealed
-            .chunks_exact(32)
-            .map(|key| key.try_into().expect("32 bytes"))
-            .collect(),
+        sealed_to: sealed.as_chunks::<32>().0.to_vec(),
         own_seal: row.get(7)?,
         first_held: row.get(8)?,
         stayed: row.get::<_, i64>(9)? == 1,

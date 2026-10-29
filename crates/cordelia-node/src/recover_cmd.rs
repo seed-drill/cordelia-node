@@ -1788,7 +1788,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         &labelled("gone"),
         &labelled("still_have"),
     )?;
-    for line in &shared_lines {
+    for line in shared_lines.iter().flat_map(|line| line.split('\n')) {
         println!("{}", crate::history_cmd::printable(line));
     }
     if !at.yes("\nRecover on this machine?")? {
@@ -2562,7 +2562,10 @@ fn after_the_recovery(
             }
             // What it brought back of the shared channels, as before its
             // yes (decision 2026-10-10 §3.5).
-            for line in list(&asked, "shared").filter_map(Value::as_str) {
+            for line in list(&asked, "shared")
+                .filter_map(Value::as_str)
+                .flat_map(|line| line.split('\n'))
+            {
                 say(crate::history_cmd::printable(line));
             }
             break;
@@ -4084,6 +4087,7 @@ mod tests {
             names: Vec::new(),
             cut_short: None,
             carried_word: None,
+            lists: Vec::new(),
         };
         let names = recover::Names {
             carried: vec!["lab".into(), "no\u{1b}tes".into()],

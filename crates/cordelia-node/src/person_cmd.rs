@@ -2099,7 +2099,9 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
             println!("\n{}", not_shown_stay_behind(not_shown));
         }
         for line in shared_at_a_removal(&handed, &signs) {
-            println!("{}", crate::history_cmd::printable(&line));
+            for line in line.split('\n') {
+                println!("{}", crate::history_cmd::printable(line));
+            }
         }
         if !at.yes("\nMake this change?")? {
             println!("{NOT_A_YES}");
@@ -2919,6 +2921,11 @@ fn waits_after(
             // 2026-10-10 §3.5), among the lines of its end.
             for line in list(&seen, "shared_made_anew").filter_map(Value::as_str) {
                 say(crate::history_cmd::printable(line));
+            }
+            // And each act of the removed device still in force, with what
+            // undoes it, as before the yes.
+            for notice in list(&seen, "notices").filter(|notice| notice["kind"] == "removed_act") {
+                say(crate::history_cmd::printable(text(notice, "says")));
             }
             return Ok(Waited::Ended(end));
         }
