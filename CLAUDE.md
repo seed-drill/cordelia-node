@@ -104,7 +104,9 @@ cordelia-node/
                          #   (offers read and judged, `shared anew`, `move` and
                          #   `stay`, a channel made anew at a removal and after
                          #   a recovery, not clean, paused, and what a removal,
-                         #   `devices` and `recover` name), at_relays (and
+                         #   `devices` and `recover` name), shared_status (the
+                         #   status's `shared` object, decision 2026-10-10 §9),
+                         #   at_relays (and
                          #   known: what a device knows of which relay holds which change),
                          #   local (the local
                          #   API for the names a device holds), commands (the routes behind
@@ -151,7 +153,8 @@ cordelia-node/
                          #   channels, and leave with the doors of shared channels;
                          #   reach: whether
                          #   each relay can be reached, and its class), indicator (the
-                         #   state and the level of a status)
+                         #   state and the level of a status; of a shared channel
+                         #   only a removed device that holds one)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
     specs/               # Protocol and component specs + TLA+ model
@@ -186,7 +189,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
