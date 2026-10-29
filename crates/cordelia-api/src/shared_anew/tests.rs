@@ -983,6 +983,13 @@ fn a_move_never_takes_a_device_into_a_channel_that_a_removed_key_reads() {
         now,
     );
     assert_eq!(refusal_word(refused), "no_offer");
+    // And a command that writes there does not tell Bob to move to it.
+    let held = crate::person::held(&s[0].conn).unwrap().unwrap();
+    let said = after_who_wrote(&s[0].conn, &held, &s.key(0), &new.id, "review").unwrap();
+    assert!(
+        !said.iter().any(|line| line.contains("was made anew by")),
+        "{said:?}"
+    );
     // An offer that seals to no removed key is one to move to.
     stores(
         &s,
