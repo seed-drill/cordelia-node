@@ -245,6 +245,15 @@ pub struct Devices {
     pub carried_to_go: usize,
     /// For how long the first of those has waited, in seconds.
     pub carried_to_go_secs: Option<u64>,
+    /// How long ago, in seconds, this device applied a statement that
+    /// removed a key that held a shared channel which the person still
+    /// holds and has not made anew and moved from, or dropped: a channel
+    /// not yet clean (decision 2026-10-10 §9; decision 2026-10-24, rule
+    /// 25). The latest such, where there are several. `None` where none.
+    pub removed_holds_shared_secs: Option<u64>,
+    /// How many shared channels not yet clean the line names: those of a
+    /// removal applied within the seven days.
+    pub removed_holds_shared: usize,
 }
 
 /// A relay that is not known to hold the latest change, as a status goes
@@ -301,6 +310,32 @@ pub fn without_memory(says: &str) -> &str {
     says.strip_prefix("memory: ")
         .or_else(|| says.strip_prefix("memory "))
         .unwrap_or(says)
+}
+
+/// What the line says of the one fact of a shared channel that sets a
+/// level (decision 2026-10-10 §9): a removed device still holds `n` shared
+/// channels that the person has not made anew.
+pub fn removed_holds_shared_says(n: usize) -> String {
+    format!(
+        "shared: a removed device still holds {n} shared {}: make each anew (cordelia devices)",
+        plural(n as u64, "channel")
+    )
+}
+
+/// The word of that hold, which the plain status says on a line of its
+/// own, `Shared:`, and not under `Memory:` (decision 2026-10-10 §9; the
+/// words of a change, rule 5).
+pub const SHARED_HOLD: &str = "shared_removed_device_holds";
+
+/// What the plain status says on its line `Shared:`: the hold's words
+/// without their first word, as `Memory:` says its own.
+pub fn without_shared(says: &str) -> &str {
+    says.strip_prefix("shared: ").unwrap_or(says)
+}
+
+/// Whether `holds` is the one hold of a shared channel.
+pub fn is_shared(holds: &Holds) -> bool {
+    holds.what == SHARED_HOLD
 }
 
 impl Holds {
@@ -448,7 +483,10 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 2. entries that relays keep refusing;
 /// 3. a running node that is not the version this command is;
 /// 4. a removal that some device has not applied, for seven days from
-///    when this device applied it;
+///    when this device applied it; and after it, a removed device that
+///    still holds a shared channel the person has not made anew, for seven
+///    days from when this device applied that removal (decision 2026-10-10
+///    §9): the one fact of a shared channel that sets a level;
 /// 5. a device added since the last change that nobody has cleared;
 /// 6. a device that has said it left;
 /// 7. names that a recovery, or a carry by command, holds with no folder
@@ -583,6 +621,20 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
                 "memory: a removal not yet applied by every device".into(),
             );
         }
+        // The one fact of a shared channel that sets a level (decision
+        // 2026-10-10 §9, property 16): a removed device still holds a
+        // shared channel that the person has not made anew, for seven days
+        // from when this device applied the removal. A fact about the
+        // person's own removal, and about nothing a shared channel holds.
+        if d.removed_holds_shared > 0
+            && d.removed_holds_shared_secs
+                .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
+        {
+            amber(
+                "shared_removed_device_holds",
+                removed_holds_shared_says(d.removed_holds_shared),
+            );
+        }
         if d.added_not_cleared > 0 {
             let devices = count(d.added_not_cleared, "device");
             amber("added", format!("memory: {devices} added, not yet cleared"));
@@ -711,6 +763,43 @@ pub fn running(f: &mut Facts, live: &serde_json::Value) {
         .flatten()
         .filter(|r| r["refusals"].as_u64() >= Some(REFUSALS_BEFORE_ATTENTION))
         .count() as u64;
+}
+
+/// What the facts take from the status's `shared` object (decision
+/// 2026-10-10 §9, property 16), at `now` in seconds: **only
+/// `removed_device_holds`,** each removed device that still holds shared
+/// channels the person has not made anew, with since when. Nothing else
+/// of the object is read: nothing a shared channel holds, waits for or is
+/// refused sets a level, appears among the holds, or changes the line.
+pub fn shared(devices: &mut Devices, shared: &serde_json::Value, now: i64) {
+    let mut latest: Option<u64> = None;
+    let mut named: Vec<&str> = Vec::new();
+    for holds in shared["removed_device_holds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(since) = holds["since"]
+            .as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        else {
+            continue;
+        };
+        let ago = now.saturating_sub(since.timestamp()).max(0) as u64;
+        latest = Some(latest.map_or(ago, |latest| latest.min(ago)));
+        if ago > REMOVAL_SHOWN_SECS {
+            continue;
+        }
+        for channel in holds["channels"].as_array().into_iter().flatten() {
+            if let Some(channel) = channel.as_str()
+                && !named.contains(&channel)
+            {
+                named.push(channel);
+            }
+        }
+    }
+    devices.removed_holds_shared_secs = latest;
+    devices.removed_holds_shared = named.len();
 }
 
 /// What `cordelia status` shows (see the module's documentation): the
@@ -3423,5 +3512,160 @@ mod tests {
             assert_eq!(whats(&shown)[0], "channel_nearly_full");
             assert_eq!(shown.summary, NAMES_FILL);
         }
+    }
+
+    // ── A shared channel (decision 2026-10-10 §9) ────────────────────
+
+    /// A moment `secs` seconds before `now`, in RFC 3339.
+    fn before(now: i64, secs: i64) -> String {
+        chrono::DateTime::from_timestamp(now - secs, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// The `shared` object of a status with every field at its worst, as a
+    /// shared channel can make it, and `holds` as its removed devices.
+    fn shared_at_its_worst(holds: serde_json::Value) -> serde_json::Value {
+        let n = 1_000;
+        let channel = serde_json::json!({
+            "id": "00", "name": "review-with-alice", "words": "able bake cold dune",
+            "keys": n, "labelled": n, "new_since_written": n, "not_moved_yet": n,
+            "unread_by_an_agent": n, "unread_by_a_person": n, "held_back": n,
+            "beyond_shown": n, "subscribed": ["github.com/owner/repo"], "waiting": n,
+            "not_stored": n, "refused_for_room": n,
+            "refused_keys": [{ "key": "cordelia_pk1x", "words": "a b c d e f",
+                               "first_refused": "2026-10-01T00:00:00Z", "bytes": n }],
+            "rows_let_go": n, "refused_at_a_relay": n, "reached": false,
+            "relays": [{ "relay": "relay.example.org:9474", "words": "a b c d",
+                         "connected": false, "not_reached": "not_own" }],
+            "offers": [{ "fault": "held" }], "also_a_name": true,
+        });
+        serde_json::json!({
+            "channels": vec![channel; 16],
+            "typed": [{ "key": "cordelia_pk1x", "channel": "x", "until": "", "became": "x" }],
+            "removed_device_holds": holds,
+            "acts_of_removed_devices": [{ "device": "laptop", "act": "label",
+                                          "item": "x", "undo": "cordelia label x --none" }],
+            "passed_over": [{ "key": "cordelia_pk1x", "acts": n }],
+            "past_a_bound": ["x"],
+        })
+    }
+
+    /// Nothing shared holds a level or changes the line (decision 2026-10-10
+    /// §9, property 16, §13 item 16): with every field of the `shared`
+    /// object at its worst, and no removed device, the facts, `holds`,
+    /// `derive`, the line and the bar are as without it, for a device that
+    /// is synced, one that waits, one with no relay, and one with sync off.
+    #[test]
+    fn nothing_shared_holds_a_level_or_changes_the_line() {
+        let now = 2_000_000_000;
+        let worst = shared_at_its_worst(serde_json::json!([]));
+        for edit in [
+            (&|_: &mut Facts| {}) as Edit,
+            &|f| f.outbox_waiting = 3,
+            &|f| {
+                f.peers_hot = 0;
+                f.no_relay_secs = Some(4_000);
+            },
+            &|f| f.sync_enabled = false,
+        ] {
+            let seen = |shared: Option<&serde_json::Value>| {
+                let mut f = synced();
+                edit(&mut f);
+                if let Some(shared) = shared {
+                    super::shared(&mut f.devices, shared, now);
+                }
+                let shown = shown(&f);
+                let line = line(shown.state, shown.level, &shown.summary, false);
+                let bar = bar(shown.state, shown.level, &shown.summary, &[]);
+                (format!("{f:?}"), derive(&f), holds(&f), shown, line, bar)
+            };
+            assert_eq!(seen(Some(&worst)), seen(None));
+            assert_eq!(seen(Some(&serde_json::Value::Null)), seen(None));
+        }
+    }
+
+    /// A removed device that holds a shared channel makes the line amber for
+    /// seven days (decision 2026-10-10 §9, property 16, §13 item 16): of six
+    /// days it is amber, of eight it is not; a channel made anew and moved
+    /// from, or dropped, is listed by the node no more, and ends it; an act
+    /// of the removed key still in force, with no channel held, is not amber.
+    /// It holds with sync off and with nothing mapped, as every fact of the
+    /// person's devices does, and not on a device that follows no phrase.
+    #[test]
+    fn a_removed_device_that_holds_a_shared_channel_makes_the_line_amber_for_seven_days() {
+        let now = 2_000_000_000;
+        let day = 24 * 60 * 60;
+        let holding = |days: i64, channels: &[&str]| {
+            shared_at_its_worst(serde_json::json!([
+                { "device": "tablet", "channels": channels, "since": before(now, days * day) },
+            ]))
+        };
+        let with_shared = |shared: &serde_json::Value, edit: Edit| {
+            let mut f = synced();
+            edit(&mut f);
+            super::shared(&mut f.devices, shared, now);
+            shown(&f)
+        };
+        let six = with_shared(&holding(6, &["review", "design"]), &|_| {});
+        assert_eq!(six.level, Some(Level::Amber));
+        assert_eq!(whats(&six), [SHARED_HOLD]);
+        assert_eq!(
+            six.summary,
+            "shared: a removed device still holds 2 shared channels: make each anew \
+             (cordelia devices)"
+        );
+        let one = with_shared(&holding(6, &["review"]), &|_| {});
+        assert_eq!(
+            one.summary,
+            "shared: a removed device still holds 1 shared channel: make each anew \
+             (cordelia devices)"
+        );
+        // Of eight days, it is in `cordelia devices` only.
+        let eight = with_shared(&holding(8, &["review"]), &|_| {});
+        assert_eq!((eight.level, eight.holds.len()), (None, 0));
+        assert_eq!(eight.summary, "memory synced");
+        // Made anew and moved from, or dropped: the node lists it no more.
+        let done = with_shared(&holding(6, &[]), &|_| {});
+        assert_eq!((done.level, done.holds.len()), (None, 0));
+        let none = with_shared(&shared_at_its_worst(serde_json::json!([])), &|_| {});
+        assert_eq!((none.level, none.holds.len()), (None, 0));
+        // Of two removals, the channels of the one within the seven days.
+        let two = shared_at_its_worst(serde_json::json!([
+            { "device": "phone", "channels": ["old"], "since": before(now, 9 * day) },
+            { "device": "tablet", "channels": ["review"], "since": before(now, day) },
+        ]));
+        let two = with_shared(&two, &|_| {});
+        assert!(
+            two.summary.contains("holds 1 shared channel:"),
+            "{}",
+            two.summary
+        );
+        // With sync off, and with nothing mapped: still amber.
+        for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
+            f.mapped = 0;
+            f.folders = 0;
+        }] {
+            let shown = with_shared(&holding(6, &["review"]), edit);
+            assert_eq!(whats(&shown), [SHARED_HOLD]);
+        }
+        // A device that follows no phrase knows of no removal.
+        let no_phrase = with_shared(&holding(6, &["review"]), &|f| {
+            f.stands = "no_phrase".into();
+            f.sync_enabled = false;
+        });
+        assert!(!whats(&no_phrase).contains(&SHARED_HOLD));
+        // Its place: after a removal not yet applied, before what follows.
+        let both = with_shared(&holding(6, &["review"]), &|f| {
+            f.devices.removal_not_applied_secs = Some(3_600);
+            f.devices.added_not_cleared = 1;
+        });
+        assert_eq!(whats(&both), ["removal_not_applied", SHARED_HOLD, "added"]);
+        // The plain status says it on a line of its own, without its word.
+        assert_eq!(
+            without_shared(&six.summary),
+            "a removed device still holds 2 shared channels: make each anew (cordelia devices)"
+        );
+        assert!(is_shared(&six.holds[0]));
     }
 }

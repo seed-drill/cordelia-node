@@ -1477,6 +1477,26 @@ fn memory_line(summary: &str) -> String {
     format!("  Memory:    {}", indicator::without_memory(summary))
 }
 
+/// The line of the plain `cordelia status` that says the one hold of a
+/// shared channel (decision 2026-10-10 §9): its label says "Shared" once,
+/// and the words come without their first word.
+fn shared_line(says: &str) -> String {
+    format!("  Shared:    {}", indicator::without_shared(says))
+}
+
+/// What the plain status says under `Memory:`, worked out from `facts`
+/// without the hold of a shared channel, and that hold, where it holds
+/// (decision 2026-10-10 §9).
+fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
+    let shared = indicator::shown(facts)
+        .holds
+        .into_iter()
+        .find(indicator::is_shared);
+    let mut without = facts.clone();
+    without.devices.removed_holds_shared = 0;
+    (indicator::shown(&without), shared)
+}
+
 fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
@@ -1630,6 +1650,13 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             // here alone, and in nothing the level is worked out from.
             if live["messages"].is_object() {
                 out["messages"] = live["messages"].clone();
+            }
+            // What the node says of the shared channels, as it gave it,
+            // where it gives it (decision 2026-10-10 §9): apart from
+            // `messages`, never mixed in one count. The level reads one
+            // fact of it alone ([`indicator::shared`]).
+            if live["shared"].is_object() {
+                out["shared"] = live["shared"].clone();
             }
         }
         if let Some(sync) = &status.sync {
@@ -1813,9 +1840,22 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 );
             }
             if config.network.role == "personal" {
-                println!("{}", memory_line(&summary));
-                for more in &also {
+                // The hold of a shared channel is said on a line of its
+                // own, `Shared:`, and not under `Memory:` (decision
+                // 2026-10-10 §9; the words of a change, rule 5): what
+                // `Memory:` says is worked out without it.
+                let (memory, shared) = memory_and_shared(&status.facts);
+                println!("{}", memory_line(&memory.summary));
+                for more in memory
+                    .holds
+                    .iter()
+                    .filter(|holds| holds.says != memory.summary)
+                    .map(indicator::Holds::detail)
+                {
                     println!("    also:     {more}");
+                }
+                if let Some(shared) = shared {
+                    println!("{}", shared_line(&shared.says));
                 }
                 for c in &status.facts.conflicts {
                     println!("    conflict: {c}");
@@ -2039,6 +2079,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.devices = devices_facts(&person, chrono::Utc::now().timestamp());
         out.person = Some(person);
     }
+    // The one fact of the shared channels that sets a level: a removed
+    // device that still holds one (decision 2026-10-10 §9, property 16).
+    if let Some(live) = &out.live {
+        let now = chrono::Utc::now().timestamp();
+        indicator::shared(&mut out.facts.devices, &live["shared"], now);
+    }
     if let Some(sync) = &out.sync {
         let person = out.person.as_ref().unwrap_or(&serde_json::Value::Null);
         out.facts.channel = channel_facts(&sync["report"], person, out.device.as_deref());
@@ -2152,6 +2198,10 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
             .as_array()
             .map_or(0, Vec::len),
         carried_to_go_secs: ago(&person["names"]["carried_to_go_since"]),
+        // From the status's `shared` object, not from the look
+        // ([`indicator::shared`]).
+        removed_holds_shared_secs: None,
+        removed_holds_shared: 0,
     }
 }
 
@@ -7449,6 +7499,8 @@ mod tests {
                 // Of those, the names that a carry holds with no folder.
                 carried_to_go: 2,
                 carried_to_go_secs: Some(20),
+                removed_holds_shared_secs: None,
+                removed_holds_shared: 0,
             }
         );
 
@@ -9319,6 +9371,60 @@ mod tests {
             memory_line("memory: node stopped"),
             "  Memory:    node stopped"
         );
+    }
+
+    /// **The plain status says the hold of a shared channel on a line of its
+    /// own** (decision 2026-10-10 §9, section 19 item 22): `Shared:`, with
+    /// its words after its label, and `Memory:` says what it would say
+    /// without it, its other holds among the "also" lines and that hold not
+    /// among them. The line itself (`--line`) says it as it is.
+    #[test]
+    fn the_plain_status_says_a_removed_device_that_holds_a_shared_channel_apart() {
+        let mut f = indicator::Facts {
+            initialised: true,
+            running: true,
+            role: "personal".into(),
+            stands: "applied".into(),
+            peers_hot: 2,
+            sync_enabled: true,
+            report_age_secs: Some(3),
+            folders: 1,
+            mapped: 1,
+            ..Default::default()
+        };
+        f.devices.removed_holds_shared = 1;
+        f.devices.removed_holds_shared_secs = Some(3_600);
+        let line = indicator::shown(&f).summary;
+        assert_eq!(
+            line,
+            "shared: a removed device still holds 1 shared channel: make each anew \
+             (cordelia devices)"
+        );
+        let (memory, shared) = memory_and_shared(&f);
+        assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
+        assert!(memory.holds.is_empty(), "{:?}", memory.holds);
+        assert_eq!(
+            shared_line(&shared.unwrap().says),
+            "  Shared:    a removed device still holds 1 shared channel: make each anew \
+             (cordelia devices)"
+        );
+        // Beside another amber hold: that one is under `Memory:`.
+        f.devices.said_left = 1;
+        let (memory, shared) = memory_and_shared(&f);
+        assert_eq!(
+            memory_line(&memory.summary),
+            "  Memory:    a device has left"
+        );
+        assert!(shared.is_some());
+        assert!(
+            memory
+                .holds
+                .iter()
+                .all(|holds| !indicator::is_shared(holds))
+        );
+        // With none, there is no `Shared:` line.
+        f.devices.removed_holds_shared = 0;
+        assert!(memory_and_shared(&f).1.is_none());
     }
 
     /// `cordelia --help`, and `cordelia` with no command, are headed by
