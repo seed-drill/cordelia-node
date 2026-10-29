@@ -1799,7 +1799,9 @@ impl DeviceEntries {
     ///
     /// Where the relay answered the entry shown whole, and there is no
     /// leave, the show is made again there only after a wait, a little
-    /// longer each time (§16): nothing is shown while it lasts. An answer
+    /// longer each time (§16): the change followed is not shown while it
+    /// lasts, and each head set aside is (decision 2026-10-24 (removal),
+    /// rule 18), in a round that is no attempt at the relay. An answer
     /// that gives leave ends it. **Only an answer starts the wait:** a
     /// whole show whose stream is reset, which is how a relay says "not
     /// now" to an asker that is over its bytes for the minute, is made
@@ -1882,6 +1884,11 @@ impl DeviceEntries {
     /// this version hands a head twice only where it lacks the change. An
     /// `Other` is always followed by a whole show, of the entry shown.
     ///
+    /// **While the show of the change followed waits** after an answer
+    /// that gave no leave ([`Self::show_waits`]), only that show is left
+    /// out: each head is shown, on every pass, and the round gives no
+    /// leave, and is no attempt at the relay for the status.
+    ///
     /// Only the answer to the show of the change followed is the relay's
     /// latest answer (decision 2026-10-19 §1): what `round` says of it.
     async fn show_round(&self, link: &Link, round: &mut Round, gated: bool) -> bool {
@@ -1893,6 +1900,8 @@ impl DeviceEntries {
         let mut handed: HashMap<[u8; 32], u32> = HashMap::new();
         let mut whole_of: Option<[u8; 32]> = None;
         let mut leave = false;
+        // Whether the show of the change followed waits in this round.
+        let mut waits = false;
         for _ in 0..SHOWS_IN_A_PASS {
             let shows = match at_relays::to_show(&lock(&self.state.db)) {
                 Ok(Some(shows)) => shows,
@@ -1936,7 +1945,12 @@ impl DeviceEntries {
                 // for.
                 let must_be_heard = self.leave.is_waking() && !self.leave.has_heard(link.name());
                 if !must_be_heard && self.show_waits(link.name(), &id) {
-                    return false;
+                    // Only the show of the change followed waits: each head
+                    // is still shown, on every pass (rule 18). The round
+                    // gives no leave, and says nothing of whether the relay
+                    // holds the change.
+                    (waits, followed_due) = (true, false);
+                    continue;
                 }
             }
             let short = whole_of != Some(id) && self.known_whole(link, &id);
@@ -1946,7 +1960,10 @@ impl DeviceEntries {
             if gated && !self.asks_after_refusals(link) {
                 return leave;
             }
-            if !round.shown {
+            // A round in which only heads are shown, while the show of the
+            // change followed waits, is no attempt at the relay (decision
+            // 2026-10-19 §1): what the status says of it stands.
+            if !round.shown && (is_followed || !waits) {
                 round.shown = true;
                 self.reach.show_begins(&self.id_of(link));
             }

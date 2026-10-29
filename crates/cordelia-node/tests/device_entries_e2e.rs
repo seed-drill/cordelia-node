@@ -11132,6 +11132,38 @@ async fn a_hand_of_a_head_the_device_keeps_gives_no_leave_and_the_round_goes_on(
     assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
 }
 
+/// While the show of the change followed waits after an answer that gave
+/// no leave, each head set aside is still shown, on every pass (decision
+/// 2026-10-24 (removal), rule 18); the change followed is not, and the
+/// round gives no leave and changes nothing that the status says of the
+/// relay.
+///
+/// Taken out: the round ended at the wait (no head is shown on the second
+/// pass: the second assertion fails); a round of heads alone counted as an
+/// attempt at the relay (the relay is no longer reached: the last fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_the_show_of_the_change_followed_waits_each_head_is_shown() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::started().await;
+    // The relay holds another change, and names it to the whole show:
+    // it lacks the change followed, gives no leave, and the show waits.
+    let other = ShowAnswer::Other {
+        rev: followed.rev + 1,
+        id: [7; 32],
+    };
+    relay.hook(answering(vec![(f, other), (two, ShowAnswer::Held)]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true)]);
+    let before = laptop.at("relay");
+    assert_eq!(before.holds_latest, Some(false));
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(two, true)]);
+    assert_eq!(laptop.has_leave("relay"), Err(NoLeave::NotGiven));
+    assert_eq!(laptop.at("relay"), before);
+}
+
 /// At a relay that names the role `heads`, a head answered with another
 /// entry is shown again at the next pass on the same connection, in short
 /// (decision 2026-10-24 (removal), rule 18): a relay of this version
