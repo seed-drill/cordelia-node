@@ -2105,3 +2105,93 @@ fn a_record_needs_both_of_this_devices_acts() {
     assert_eq!(a_minute_from(&p, 25).published, 0);
     assert_eq!(p.read(INDEX).unwrap(), format!("{NOTES}{OTHER_LINE}"));
 }
+
+/// Rule 7 (decision 2026-10-24 (removal), unit test 12): on a device that
+/// knows of a removal, a put-back takes no line removed from a version that
+/// a removed key signed, where the cut leaves out what that key wrote. Here
+/// this device removed the line of `notes.md` from the tablet's index; the
+/// tablet is then removed, and the memory comes back. Where the tablet's
+/// index reached this device before the cut time, it is the person's, and
+/// the line is put back (the review of slice 8, its seventh finding: the
+/// generation of the removal cuts nothing of the key's). Where it came
+/// after it, the carry left it out, and with it the record: nothing is put
+/// back.
+#[test]
+fn a_put_back_takes_no_line_from_a_removed_devices_version() {
+    use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+    for late in [false, true] {
+        let mut p = listed();
+        let tablet = third(&p);
+        deliver(&p.st, &tablet, NAME);
+        write(
+            &tablet,
+            NAME,
+            INDEX,
+            Value::Text(format!("{NOTES}{OTHER_LINE}{EXTRA}")),
+        );
+        deliver(&tablet, &p.st, NAME);
+        assert_eq!(cycle_at(&p, 5).pulled, 1);
+        deletes_with_its_line(&p, 10);
+        let from = {
+            let db = p.st.db.lock().unwrap();
+            let folder = p.mem.display().to_string();
+            index_lines::whole(&db, &folder, &p.channel, T0 + 10).unwrap()
+        };
+        let notes: Vec<_> = from.iter().filter(|r| r.file == "notes.md").collect();
+        assert_eq!(notes[0].from, [tablet.identity.public_key()]);
+
+        // The tablet is removed; the other device applies it too. Made
+        // now, the tablet's index came after its cut time; made more than
+        // ten minutes from now, before it.
+        let made = match late {
+            true => now(),
+            false => now() + REMOVAL_TAKEN_MARGIN_SECS as i64 + 1,
+        };
+        let removal = removes_at(&p.st, &p.phrase, &tablet.identity.public_key(), made);
+        {
+            let db = p.other.db.lock().unwrap();
+            take::take(&db, &p.other.identity, &removal, now()).unwrap();
+        }
+        p.channel = channel_of(&p.st);
+        match late {
+            false => assert_eq!(records(&p).len(), 1, "the record went with the folder"),
+            true => assert_eq!(records(&p), [], "the carry left the record out"),
+        }
+
+        match late {
+            false => comes_back(&p, 20),
+            // The index goes back to this device's own text from before
+            // the tablet's, which the carry left out with everything after
+            // it (rule 7).
+            true => {
+                p.other_writes("notes.md", Some("two\n"));
+                cycle_at(&p, 20);
+                assert_eq!(p.read("notes.md").as_deref(), Some("two\n"));
+                assert_eq!(
+                    p.read(INDEX).as_deref(),
+                    Some(format!("{NOTES}{OTHER_LINE}").as_str())
+                );
+            }
+        }
+        let report = a_minute_from(&p, 25);
+        match late {
+            false => {
+                assert_eq!(report.published, 1, "{report:?}");
+                assert!(
+                    p.read(INDEX).is_some_and(|index| index.contains(NOTES)),
+                    "{:?}",
+                    p.read(INDEX)
+                );
+            }
+            true => {
+                assert_eq!(report.published, 0, "{report:?}");
+                assert!(
+                    !p.read(INDEX).is_some_and(|index| index.contains(EXTRA)),
+                    "{:?}",
+                    p.read(INDEX)
+                );
+                assert_eq!(records(&p), []);
+            }
+        }
+    }
+}

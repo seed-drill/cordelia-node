@@ -35,7 +35,6 @@ use cordelia_storage::person::{self as held_rows, State};
 
 use crate::adding::{Accepted, Added, accept, add_device};
 use crate::carry::{Allows, Word};
-use crate::change::make_change;
 use crate::own_read::ReadId;
 use crate::person::{
     Applied, Held, Shown, applied_name, applied_secret, first_statement, followed_entry, held,
@@ -210,6 +209,12 @@ impl Machine {
             .into_iter()
             .map(|held| held.entry.check().unwrap())
             .collect()
+    }
+
+    /// The ID of the slot of `file` in the name `name`, in the generation
+    /// applied.
+    pub(crate) fn slot_of(&self, name: &str, file: &str) -> [u8; 32] {
+        slot_id(&derive::slot_key(&self.own(name)).unwrap(), file)
     }
 
     /// The slot of `file` in the name `name`, as the device reads it.
@@ -464,13 +469,16 @@ impl Several {
         let now = self.tick();
         let removed: Vec<[u8; 32]> = removed.iter().map(|n| self.key(*n)).collect();
         let on = &self[maker];
-        let entry = make_change(
+        // Made by the fixture's clock, as a device's lineage says its own
+        // (decision 2026-10-24 (removal), rule 13).
+        let entry = crate::change::make_change_at(
             &self.phrase,
             &on.held().statement,
             &on.latest(),
             &on.key(),
             self.listed(stay),
             &removed,
+            now as u64,
         )
         .unwrap();
         let outcome = shown(&on.conn, &on.identity, &entry, now).unwrap();
@@ -1109,6 +1117,7 @@ pub(crate) fn change_that_does_not_open_for(
 mod tests {
     use super::*;
 
+    use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
     use cordelia_storage::entries::Outcome;
 
     use crate::change::make_settlement;
@@ -1394,6 +1403,10 @@ mod tests {
     #[test]
     fn test_a_device_is_removed_and_the_others_apply_carry_and_take_nothing_it_signs() {
         let mut s = four_with_notes();
+        // What device 2 wrote was taken more than ten minutes before the
+        // removal is made: before its cut time, so it is carried (decision
+        // 2026-10-24 (removal), rules 2 and 7).
+        s.now += REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
         let old_secret = s[0].secret();
         let change = s.change(0, &[0, 1, 3], &[2]);
         assert_eq!((change.rev, s[0].number()), (2, 2));
@@ -1535,12 +1548,15 @@ mod tests {
 
     /// Device 3 is not shown the change, and goes on. It takes what the
     /// removed device writes late, and edits it. When it is shown the
-    /// change it carries the edit. On every other device the edit is the
-    /// current version, and is known to follow no text but the one it was
-    /// written over: the removed device signed a version between.
+    /// change it carries neither (decision 2026-10-24 (removal), rule 7):
+    /// the late write arrived after the removal's cut time, and the edit
+    /// was stored over it, so the file goes back to the version before
+    /// them. The edit of a file the removed device did not touch is carried
+    /// as before.
     #[test]
-    fn test_an_edit_of_what_a_removed_device_wrote_late_is_known_to_follow_no_other_text() {
+    fn test_what_a_removed_device_wrote_late_and_an_edit_over_it_are_not_carried() {
         let mut s = four_with_notes();
+        s.now += REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
         s.change(0, &[0, 1, 3], &[2]);
         s.pass(0, 1);
         assert_eq!((s[1].number(), s[3].number()), (2, 1));
@@ -1559,7 +1575,8 @@ mod tests {
         assert_eq!(edit.rev, 3);
         s.write(3, "notes", "b.md", "b two, by device 3");
 
-        // It is shown the change, applies it, and carries what it holds.
+        // It is shown the change, applies it, and carries what it holds:
+        // a.md as it was before the late write.
         let taken = s.pass(0, 3);
         assert!(matches!(
             taken[0],
@@ -1570,37 +1587,22 @@ mod tests {
                 ..
             }))
         ));
+        assert_eq!(s[3].text("notes", "a.md").as_deref(), Some("a one"));
         s.pass(3, 0);
         s.pass(3, 1);
 
-        let (maker, removed) = (s.key(0), s.key(2));
-        for n in [0, 1] {
+        for n in [0, 1, 3] {
             let version = s[n].slot("notes", "a.md").current.unwrap();
-            assert_eq!(
-                (version.value, version.rev),
-                (text("a three, by device 3"), 3),
-                "{n}"
-            );
-            assert_eq!(version.entries.len(), 1);
-            assert_eq!(version.entries[0].author, s.key(3));
-            // The chain says who signed each version: the removed device
-            // signed the one between.
-            assert_eq!(
-                version.entries[0].chain,
-                Some(vec![
-                    link("a two, written late", removed),
-                    link("a one", maker)
-                ])
-            );
-            // This device's text is "a one": the edit is not known to
-            // follow it, and the folder keeps its text.
-            assert!(!s[n].follows("notes", "a.md", "a one"));
-            // Known only for the text it was written over, which no
-            // device under the statement has as its own.
-            assert!(s[n].follows("notes", "a.md", "a two, written late"));
-
+            assert_eq!(version.value, text("a one"), "{n}");
+            for one in s[n].stored() {
+                let said = one.open(&s[n].own("notes")).map(|inside| inside.value);
+                assert!(
+                    !matches!(&said, Ok(Value::Text(t)) if t.starts_with("a two") || t.starts_with("a three")),
+                    "{n}"
+                );
+            }
             // The control: the edit of a file that the removed device did
-            // not touch is known to follow this device's text.
+            // not touch is carried, and known to follow this device's text.
             let version = s[n].slot("notes", "b.md").current.unwrap();
             assert_eq!(version.value, text("b two, by device 3"));
             assert!(s[n].follows("notes", "b.md", "b one"));

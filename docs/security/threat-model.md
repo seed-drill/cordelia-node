@@ -163,7 +163,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-storage/src/psk.rs`: `a_key_that_was_waiting_is_not_kept_when_its_version_is_passed`
 - `crates/cordelia-storage/src/psk.rs`: `a_key_that_was_waiting_does_not_survive_the_older_rotation`
 - `crates/cordelia-api/src/several.rs`: `test_a_device_is_removed_and_the_others_apply_carry_and_take_nothing_it_signs`
-- `crates/cordelia-api/src/several.rs`: `test_an_edit_of_what_a_removed_device_wrote_late_is_known_to_follow_no_other_text`
+- `crates/cordelia-api/src/several.rs`: `test_what_a_removed_device_wrote_late_and_an_edit_over_it_are_not_carried`
 - `crates/cordelia-api/src/person.rs`: `test_a_version_another_key_signed_is_carried_with_that_key_in_a_first_link`
 - `crates/cordelia-api/src/change.rs`: `test_a_change_brings_no_removed_key_back`
 - `crates/cordelia-node/tests/person_e2e.rs`: `a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply`

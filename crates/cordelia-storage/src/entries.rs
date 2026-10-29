@@ -351,8 +351,11 @@ pub fn move_last_to(
     .map_err(storage)
 }
 
-/// Remove every entry of a channel. Returns how many there were.
+/// Remove every entry of a channel, and what a device kept of its files'
+/// arrivals (decision 2026-10-24 (removal), rule 7): a carry moves those it
+/// keeps first. Returns how many entries there were.
 pub fn remove_channel(conn: &Connection, channel: &[u8; 32]) -> Result<usize, CordeliaError> {
+    crate::arrivals::forget_channel(conn, channel)?;
     conn.execute(
         "DELETE FROM entries WHERE channel_id = ?1",
         params![channel.as_slice()],

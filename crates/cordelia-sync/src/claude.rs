@@ -107,6 +107,11 @@ pub struct FolderReport {
     pub published: usize,
     pub pulled: usize,
     pub conflicts: usize,
+    /// Files whose text a carry left out in this cycle (decision 2026-10-24
+    /// (removal), rule 7): each went back to the version before, and what
+    /// it held is in local history alone.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub set_aside: usize,
     /// Conflict files in the folder now, full paths: each holds a version of
     /// a memory that lost to a concurrent edit, until someone merges it
     /// and deletes the file.
@@ -1443,7 +1448,7 @@ fn sync_folder_with(
     // and who counts, of one moment (decision 2026-10-04 §2.3). What the
     // plan asks of a version it asks of this read, and what is published
     // is published over the version that was read or not at all.
-    let (remote, deleted, taken, agreed, index_read, counting) = {
+    let (remote, deleted, taken, agreed, index_read, counting, put_back) = {
         let db = lock(state)?;
         let read = publish::read_name(&db, agent).map_err(of_person)?;
         let own = state.identity.public_key();
@@ -1493,11 +1498,22 @@ fn sync_folder_with(
             );
         }
         let agreed: HashMap<String, Agreed> = sync_state::load(&db, &folder, channel)?;
+        // The files that a carry left out (decision 2026-10-24 (removal),
+        // rule 7): each takes the channel's version back.
+        let put_back = sync_state::put_back(&db, &folder, channel)?;
         let index_read = match hooks.lines {
             true => lines::read_index(&db, agent, beside)?,
             false => lines::IndexRead::default(),
         };
-        (remote, deleted, taken, agreed, index_read, read.counting)
+        (
+            remote,
+            deleted,
+            taken,
+            agreed,
+            index_read,
+            read.counting,
+            put_back,
+        )
     };
 
     // What is not a file is listed only where the channel has a memory
@@ -1575,14 +1591,21 @@ fn sync_folder_with(
             continue;
         }
         let seen = local.get(key).map(|c| c.hash);
-        let actions = (hooks.plan)(
-            key,
-            local.get(key),
-            remote.get(key),
-            agreed.get(key),
-            &deleted,
-            &counting,
-        );
+        let actions = match agreed.get(key) {
+            // A file that a carry left out goes back, whatever it holds
+            // (decision 2026-10-24 (removal), rule 7).
+            Some(record) if put_back.contains(key) => {
+                plan::put_back(local.get(key), remote.get(key), record)
+            }
+            _ => (hooks.plan)(
+                key,
+                local.get(key),
+                remote.get(key),
+                agreed.get(key),
+                &deleted,
+                &counting,
+            ),
+        };
         let ctx = ctx_of(key);
         // A minute of looking at a file's line starts again when a cycle
         // applies any action to the file, or to the index, at that moment
@@ -2370,7 +2393,10 @@ fn apply(
     } = *ctx;
     let writes_file = matches!(
         action,
-        Action::Pull { .. } | Action::RemoveFile { .. } | Action::SaveConflict(_)
+        Action::Pull { .. }
+            | Action::RemoveFile { .. }
+            | Action::SaveConflict(_)
+            | Action::PutBack { .. }
     );
     if writes_file && state.sync_control.generation() != generation {
         return Ok(false);
@@ -2394,7 +2420,10 @@ fn apply(
     let deferred = || {
         tracing::debug!(file = %dir.join(key).display(), "the file, or the copy of its text, changed during the cycle; deferring");
     };
-    let replaces_file = matches!(action, Action::RemoveFile { .. } | Action::Merge(_));
+    let replaces_file = matches!(
+        action,
+        Action::RemoveFile { .. } | Action::Merge(_) | Action::PutBack { text: None, .. }
+    );
     if replaces_file && !unchanged() {
         deferred();
         return Ok(false);
@@ -2655,8 +2684,58 @@ fn apply(
             record(made.agreed(Some(Content::new(text).hash), me))?;
         }
         Action::Record(agreed) => record(agreed)?,
+        Action::PutBack { text, agreed } => {
+            // What the file holds was left out by a carry (decision
+            // 2026-10-24 (removal), rule 7): it is kept in local history
+            // alone, never beside the file, and the file takes the version
+            // the carry went back to, or goes. Nothing is published.
+            let replaced_by = match (ctx.over, &text) {
+                (Some(version), Some(_)) => history::Replacement::Entry(written_by(ctx, version)),
+                _ => history::Replacement::Nothing,
+            };
+            let ahead = match keep_here(ctx, key, seen, history::Change::SetAside, replaced_by)? {
+                KeptHere::Ahead(ahead) => ahead,
+                KeptHere::Changed => {
+                    deferred();
+                    return Ok(false);
+                }
+            };
+            match &text {
+                Some(text) => {
+                    if !write_atomic(dir, key, text, &flushed, &unchanged).map_err(io)? {
+                        deferred();
+                        return Ok(false);
+                    }
+                }
+                None => match std::fs::remove_file(dir.join(key)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io(e)),
+                },
+            }
+            settle(ctx, ahead);
+            if seen.is_some() {
+                report.set_aside += 1;
+                note_set_aside(state);
+            }
+            forget_kept(ctx, key);
+            record(agreed)?;
+        }
     }
     Ok(true)
+}
+
+/// Count an edit that a carry set aside (decision 2026-10-24 (removal),
+/// rule 7), for the status to say. A count that cannot be written is said
+/// in the log: the text is in local history either way.
+fn note_set_aside(state: &AppState) {
+    let noted = lock(state).and_then(|db| {
+        cordelia_api::look::note_set_aside(&db, 1, chrono::Utc::now().timestamp())
+            .map_err(of_person)
+    });
+    if let Err(error) = noted {
+        tracing::warn!(%error, "an edit was set aside, and it could not be counted");
+    }
 }
 
 mod lines;
@@ -3013,7 +3092,23 @@ mod tests {
     /// `st` makes a change that removes the key `gone`, with `phrase`, and
     /// applies it: every other key that counts for it stays. Returns the
     /// change entry, which another device is shown through `take`.
+    /// `st` removes `gone` with `phrase`, and applies it. The change says it
+    /// was made more than ten minutes from now (decision 2026-10-24
+    /// (removal), rule 2): what this test's devices took up to now was
+    /// taken before the cut time, and is carried. A test of the cut makes
+    /// the change at the time it says ([`removes_at`]).
     fn removes(st: &AppState, phrase: &Phrase, gone: &[u8; 32]) -> CheckedEntry {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        removes_at(
+            st,
+            phrase,
+            gone,
+            now() + REMOVAL_TAKEN_MARGIN_SECS as i64 + 1,
+        )
+    }
+
+    /// [`removes`], where the change says it was made at `made_at`.
+    fn removes_at(st: &AppState, phrase: &Phrase, gone: &[u8; 32], made_at: i64) -> CheckedEntry {
         let db = st.db.lock().unwrap();
         let held = person::held(&db).unwrap().unwrap();
         let latest = held_rows::followed_entry(&db)
@@ -3029,10 +3124,117 @@ mod tests {
             .map(|key| Device::new(key, "device").unwrap())
             .collect();
         let own = st.identity.public_key();
-        let entry =
-            change::make_change(phrase, &held.statement, &latest, &own, stay, &[*gone]).unwrap();
+        let entry = change::make_change_at(
+            phrase,
+            &held.statement,
+            &latest,
+            &own,
+            stay,
+            &[*gone],
+            made_at as u64,
+        )
+        .unwrap();
         person::apply_made(&db, &st.identity, &entry, &latest.id(), &[], now()).unwrap();
         entry
+    }
+
+    /// Rule 7 in a folder (decision 2026-10-24 (removal), unit test 12):
+    /// the tablet's text, taken after the removal's cut time, and a line an
+    /// agent appended over it here, are left out at the carry. The folder
+    /// takes back the version before, as `cordelia restore` puts one back:
+    /// what it held is in local history alone, not beside the file, and
+    /// nothing is published. The status counts the edit set aside, and the
+    /// desktop is never given the text.
+    #[test]
+    fn a_file_a_carry_left_out_goes_back_with_its_text_in_local_history_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let (channel, phrase) = person_of(&st, NAME);
+        let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+        let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+        deliver(&st, &desktop, NAME);
+        deliver(&st, &tablet, NAME);
+        let store = history::Store::new(&st.home_dir, 30, 1 << 24).unwrap();
+        st.history.open(Some(store.clone()));
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let cycle = |channel: &str| {
+            let generation = st.sync_control.generation();
+            sync_folder(&st, &mem, channel, NAME, "abcd", generation).unwrap()
+        };
+        std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+
+        // The tablet writes over it; the laptop takes it, and its agent
+        // appends a line, which the laptop publishes.
+        deliver(&st, &tablet, NAME);
+        write(&tablet, NAME, "notes.md", text("mine\nthe tablet's\n"));
+        deliver(&tablet, &st, NAME);
+        assert_eq!(cycle(&channel).pulled, 1);
+        let appended = "mine\nthe tablet's\nmy line\n";
+        std::fs::write(mem.join("notes.md"), appended).unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+
+        // The desktop removes the tablet now; the laptop applies it.
+        let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+        {
+            let db = st.db.lock().unwrap();
+            let taken = take::take(&db, &st.identity, &removal, now()).unwrap();
+            assert!(
+                matches!(taken, take::Taken::Shown(person::Shown::Applied(_))),
+                "{taken:?}"
+            );
+        }
+        let channel = {
+            let db = st.db.lock().unwrap();
+            let id = held_rows::channel_of_name(&db, NAME).unwrap().unwrap();
+            encode_channel_id(&id).unwrap()
+        };
+        let report = cycle(&channel);
+        assert_eq!((report.set_aside, report.published), (1, 0), "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\n"
+        );
+        assert!(conflict_files(&mem).is_empty());
+        let kept = kept_in(&store);
+        let set_aside: Vec<_> = briefly(&kept)
+            .into_iter()
+            .filter(|(_, change, _)| *change == history::Change::SetAside)
+            .collect();
+        assert_eq!(
+            set_aside,
+            [("notes.md", history::Change::SetAside, Some(appended))]
+        );
+        let noted = {
+            let db = st.db.lock().unwrap();
+            meta::get(&db, meta::PERSON_EDITS_SET_ASIDE)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(noted.starts_with("1 "), "{noted}");
+        // The next cycle has nothing to do.
+        let again = cycle(&channel);
+        assert_eq!((again.set_aside, again.published, again.pulled), (0, 0, 0));
+        // It is put back once: an edit made after is published, and stays.
+        std::fs::write(mem.join("notes.md"), "mine\nafter\n").unwrap();
+        let edited = cycle(&channel);
+        assert_eq!((edited.set_aside, edited.published), (0, 1), "{edited:?}");
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\nafter\n"
+        );
+
+        // The desktop is given what the laptop carried: none of it.
+        deliver(&st, &desktop, NAME);
+        let secret = name_secret(&desktop, NAME);
+        for entry in held(&desktop, NAME) {
+            let inside = entry.open(&secret).unwrap();
+            assert!(
+                !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                "{inside:?}"
+            );
+        }
     }
 
     /// The folder and channel that an action is applied to by hand, as

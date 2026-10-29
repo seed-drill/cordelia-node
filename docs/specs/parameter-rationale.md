@@ -1823,6 +1823,52 @@ before its removal is known. The way on is a change made with the phrase.
 **Why 2,048:** as `MAX_KNOWN_REMOVED`, and eight times the records a
 device keeps as not counted; no measurement behind it yet.
 
+#### REMOVAL_TAKEN_MARGIN_SECS = 600
+
+**Derivation:** 2 x `MAX_CLOCK_SKEW_SECS`.
+
+**Rationale:** A removed key's cut time is the time, by its maker's clock,
+of the change that first removes it, where the device has seen it and the
+change before it, and otherwise of the newest earlier change it has seen,
+less this margin (decision 2026-10-24 (removal), rule 2). What of that
+key's a device took at or after its cut time, in a generation that the
+removal was made after, is not carried at the next carry (rule 7), and a
+record of an addition that it signed then counts for nothing (rule 6).
+A handshake allows `MAX_CLOCK_SKEW_SECS` of skew at each end, so two nodes
+that one relay accepts are within twice that of each other: a device whose
+clock is behind the maker's by up to that still cuts what came after the
+removal.
+
+**What it costs:** honest writing of the removed device in the ten minutes
+before its removal is set aside, to local history alone. Across two
+relays their own difference adds to the skew, and a device whose clock is
+behind the maker's by more than the margin carries what reached it in that
+excess: the limit of rule 7, stated in the record.
+
+#### MAX_FILE_ARRIVALS = 1,024
+
+**Rationale:** The arrivals a device keeps for one file (decision
+2026-10-24 (removal), rule 7): each version of the file that another key
+signed, and each link that stands in a stored chain more times than in any
+chain of the file stored before, with its key, the generation and the time
+the device stored it, and the version current before it, to go back to.
+Kept per file across carries. Past the bound the oldest go first, and the
+newest time of what went is kept for each generation, with the version
+before the first event of it that went: where what went is cut, the file
+goes back to that version, which fails safe. Not to before the oldest
+event kept: the bound counts arrivals, and a removed key chooses its own
+chain, so one version with 100 links of its own is 101 arrivals, and a
+dozen late versions push its first one out; the oldest kept would then go
+back to its own late version.
+
+**What it costs:** a busy file that other devices write fills it faster,
+each version of theirs being one or two arrivals; the device's own versions
+make none. Each event keeps the version before it, so a file at its bound
+holds up to that many versions of itself in the store.
+
+**Why 1,024:** chosen as room to spare over the arrivals of a file between
+two changes of an honest person; no measurement behind it yet.
+
 #### KEPT_OUT_PER_ADDER = 3
 
 **Derivation:** the lesser of

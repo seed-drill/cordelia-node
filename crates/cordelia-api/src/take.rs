@@ -275,7 +275,43 @@ fn taken_as_its_own(
         return Ok(Some(Taken::Refused(NotTaken::BandAboveTheStatements)));
     }
 
+    // An entry that another key signed in the channel of a name makes
+    // arrivals in its file (decision 2026-10-24 (removal), rule 7): what
+    // the file held before it is read first.
+    let own = identity.public_key();
+    let file = match (taker, is_personal || is_messages || entry.author == own) {
+        (Taker::Device, false) => match held_rows::name_of_channel(conn, &entry.channel)? {
+            Some(name) => {
+                let secret = derive::own_secret(&secret, &name)?;
+                let before = crate::arrivals::before(
+                    conn,
+                    &own,
+                    entry,
+                    &secret,
+                    statement.number,
+                    &counting,
+                )?;
+                Some((secret, before))
+            }
+            None => None,
+        },
+        _ => None,
+    };
     let stored = entries::store(conn, entry, now)?;
+    if stored == Outcome::Stored
+        && let Some((secret, before)) = &file
+    {
+        let link = statement.link()?;
+        crate::arrivals::noted_at_the_door(
+            conn,
+            &own,
+            entry,
+            secret,
+            &(link.number, link.hash),
+            before,
+            now,
+        )?;
+    }
     // What the store kept of the messages channel the reader reads in
     // this write (decision 2026-10-09 §7.1): an entry it held already, or
     // one below what it holds, is not read again.

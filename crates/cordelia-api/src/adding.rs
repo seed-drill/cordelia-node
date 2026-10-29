@@ -758,7 +758,10 @@ pub fn accept(
             // clear change that counts it (decision 2026-10-24 (removal),
             // rule 10): rule 8 judges it, as any hand-over.
             _ if under_the_same => {
-                *handed.borrow_mut() = Some(hand_over.statement.clone());
+                *handed.borrow_mut() = Some((
+                    hand_over.statement.clone(),
+                    hand_over.change_entry.content.clone(),
+                ));
                 brought.taken_by(conn, identity, &held, now)
             }
             State::Applied if is_alone(conn, &held, &identity.public_key())? => {
@@ -783,9 +786,9 @@ pub fn accept(
     // kept though it is refused, and in a transaction of their own: one
     // refused as not clear is undone whole (decision 2026-10-24 (removal),
     // rule 2).
-    if let Some(statement) = handed.into_inner() {
+    if let Some((statement, content)) = handed.into_inner() {
         in_one(conn, || {
-            crate::person::know_removed_if_signed(conn, identity, &statement, now)?;
+            crate::person::know_removed_if_signed(conn, identity, &statement, Some(&content), now)?;
             // What it knows of removals grew: where the change it follows
             // is no longer clear, it is closed (rule 8).
             crate::person::close_if_not_clear(conn).map(|_| ())
@@ -833,7 +836,13 @@ pub fn know_what_is_handed(
         if statement.statement.removes(&identity.public_key()) {
             return Ok(false);
         }
-        crate::person::know_removed_if_signed(conn, identity, statement, now)?;
+        crate::person::know_removed_if_signed(
+            conn,
+            identity,
+            statement,
+            Some(&hand_over.change_entry.content),
+            now,
+        )?;
         crate::person::close_if_not_clear(conn)
     })
 }
@@ -1402,6 +1411,9 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     // 2026-10-24 (removal), rule 2): under another phrase they are another
     // person's keys.
     held_rows::forget_removals(conn)?;
+    // And what it kept of each file's arrivals (decision 2026-10-24
+    // (removal), rule 7): under another phrase they are another person's.
+    cordelia_storage::arrivals::forget_all(conn)?;
     // Nor does it keep a head set aside of that phrase, or judge one.
     held_rows::drop_all_set_aside(conn)?;
     held_rows::judged_kept(conn)?;

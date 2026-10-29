@@ -2038,7 +2038,8 @@ fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() 
 /// 2026-10-24 (removal), schema step 21): its state `fork`, the change
 /// entry it follows kept as `latest` and the head it sets aside as
 /// `apart`, no time of any change, and schema version 21. What step 23
-/// adds goes too: the table of the room a relay keeps for heads. (Step 23
+/// adds goes too: the table of the room a relay keeps for heads; and the
+/// tables step 24 adds (decision 2026-10-24 (removal), rules 6 and 7). (Step 23
 /// makes the table of entries again from the columns it had at step 22,
 /// so the one column more it finds there changes nothing.)
 fn as_a_fork_of_the_version_before(node: &Node) {
@@ -2063,6 +2064,14 @@ fn as_a_fork_of_the_version_before(node: &Node) {
          ALTER TABLE person_change_entries_21 RENAME TO person_change_entries;
          DROP TABLE person_change_times;
          DROP TABLE relay_head_rooms;
+         DROP TABLE person_change_times_lists;
+         DROP TABLE person_removed_keys_by;
+         DROP TABLE person_removed_keys_spared;
+         DROP TABLE file_put_back;
+         DROP TABLE file_line_from;
+         DROP TABLE file_arrivals;
+         DROP TABLE file_arrivals_stored;
+         DROP TABLE file_arrivals_dropped;
          DELETE FROM node_meta WHERE key = 'person.judge_kept';
          UPDATE person SET state = 'fork';
          COMMIT;",
@@ -2146,7 +2155,10 @@ fn a_device_in_a_fork_judges_what_it_kept_at_its_first_start() {
         forked.log_tail()
     );
     let db = database_of(forked);
-    assert_eq!(schema_version(&db), 23);
+    assert_eq!(
+        schema_version(&db),
+        cordelia_storage::schema::SCHEMA_VERSION
+    );
     let marked: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM node_meta WHERE key = 'person.judge_kept'",

@@ -95,6 +95,19 @@ impl Prepared {
         held: &CheckedEntry,
         joined: &[&CheckedEntry],
     ) -> Result<CheckedEntry, PersonError> {
+        self.sign_at(phrase, held, joined, made_now())
+    }
+
+    /// [`Prepared::sign`], with `made_at` as the time its lineage says the
+    /// change was made (decision 2026-10-24 rule 13): for a fixture whose
+    /// clock is its own.
+    pub fn sign_at(
+        self,
+        phrase: &Phrase,
+        held: &CheckedEntry,
+        joined: &[&CheckedEntry],
+        made_at: u64,
+    ) -> Result<CheckedEntry, PersonError> {
         let one = applied_with(phrase, &self.applied, held)?;
         if joined.len() != self.joined.len() {
             return Err(PersonError::NotTheStatementsEntry);
@@ -110,7 +123,12 @@ impl Prepared {
         let mut before = vec![(self.applied.statement.number, &one)];
         before.extend(opened_heads.iter().map(|(number, said)| (*number, said)));
         let mut for_phrase = ForPhrase::following(*self.secret, &before);
-        let entry = entry_of(phrase, Statement::from_bytes(&self.bytes)?, &for_phrase);
+        let entry = entry_of(
+            phrase,
+            Statement::from_bytes(&self.bytes)?,
+            &for_phrase,
+            made_at,
+        );
         // The secrets that the phrase opened, and the new one, are
         // overwritten here: they are in the entry, sealed.
         for_phrase.secret.zeroize();
@@ -260,8 +278,22 @@ pub fn make_change(
     stay: Vec<Device>,
     removed: &[[u8; 32]],
 ) -> Result<CheckedEntry, PersonError> {
+    make_change_at(phrase, applied, held, maker, stay, removed, made_now())
+}
+
+/// [`make_change`], with `made_at` as the time its lineage says the change
+/// was made: for a fixture whose clock is its own.
+pub fn make_change_at(
+    phrase: &Phrase,
+    applied: &SignedStatement,
+    held: &CheckedEntry,
+    maker: &[u8; 32],
+    stay: Vec<Device>,
+    removed: &[[u8; 32]],
+    made_at: u64,
+) -> Result<CheckedEntry, PersonError> {
     applied_with(phrase, applied, held)?;
-    prepare_change(applied, maker, stay, removed)?.sign(phrase, held, &[])
+    prepare_change(applied, maker, stay, removed)?.sign_at(phrase, held, &[], made_at)
 }
 
 /// Make the statement that joins changes made apart (decision 2026-10-04
@@ -368,15 +400,16 @@ fn stays_among(maker: &[u8; 32], stay: &[Device]) -> Result<(), PersonError> {
 }
 
 /// The change entry of `statement`, signed and sealed with the phrase. Its
-/// lineage says that it was made now, by this process's clock (decision
-/// 2026-10-24 rule 13).
+/// lineage says that it was made at `made_at`: now, by this process's
+/// clock, but in a fixture (decision 2026-10-24 rule 13).
 fn entry_of(
     phrase: &Phrase,
     statement: Statement,
     for_phrase: &ForPhrase,
+    made_at: u64,
 ) -> Result<CheckedEntry, PersonError> {
     let signed = statement.sign(&phrase.signing_key()?)?;
-    Ok(change_entry::entry_of(phrase, &signed, for_phrase, made_now())?.check()?)
+    Ok(change_entry::entry_of(phrase, &signed, for_phrase, made_at)?.check()?)
 }
 
 /// When a change is made, by the clock of the process that makes it, in
@@ -816,7 +849,9 @@ mod tests {
     /// A record of an addition that arrives between the prompt and the
     /// phrase never has a command ask again: the change is made, and the
     /// key it adds is in neither list, and is shown as not in the last
-    /// change.
+    /// change. Where the device that is being removed signed the record,
+    /// after the removal's cut time, the key it adds is removed with it
+    /// (decision 2026-10-24 (removal), rule 6), and is no key left out.
     #[test]
     fn test_a_record_that_arrives_after_the_prompt_never_restarts_a_command() {
         let mut s = Several::of_one_person(3);
@@ -826,23 +861,31 @@ mod tests {
         let over = held.id();
         // The prompt: device 2 is removed.
         let prepared = prepare_change(&applied, &s.key(0), s.listed(&[0, 1]), &[s.key(2)]).unwrap();
-        // Meanwhile the device that is being removed adds another, and
-        // device 0 takes the record.
+        // Meanwhile a device that stays adds another, and so does the one
+        // that is being removed; device 0 takes both records.
         let now = s.tick();
         let late = crate::several::Machine::new(9);
-        let added = crate::adding::add_device(&s[2].conn, &s[2].identity, &late.key(), "late", now)
-            .unwrap();
+        let later = crate::several::Machine::new(8);
         let on = &s[0];
-        crate::take::take(&on.conn, &on.identity, &added.record.unwrap(), now).unwrap();
-        assert!(on.counts(&late.key()));
+        for (by, new, label) in [(1, &late, "late"), (2, &later, "later")] {
+            let added =
+                crate::adding::add_device(&s[by].conn, &s[by].identity, &new.key(), label, now)
+                    .unwrap();
+            crate::take::take(&on.conn, &on.identity, &added.record.unwrap(), now).unwrap();
+            assert!(on.counts(&new.key()));
+        }
         assert_eq!(on.latest().id(), over);
 
+        // The change is made now, by the clock: the record that device 2
+        // signed was taken after its cut time (the test's clock is ahead).
         let entry = prepared.sign(&s.phrase, &held, &[]).unwrap();
         let made = apply_made(&on.conn, &on.identity, &entry, &over, &[], now + 1).unwrap();
         assert_eq!(made.number, 3);
         let statement = on.held().statement.statement;
         assert!(!statement.lists(&late.key()) && !statement.removes(&late.key()));
         assert!(!on.counts(&late.key()));
+        let removed = cordelia_storage::person::removed_keys(&on.conn).unwrap();
+        assert!(removed.contains(&later.key()) && !removed.contains(&late.key()));
         let left_out = cordelia_storage::acts::left_out(&on.conn).unwrap();
         assert_eq!(left_out.len(), 1);
         assert_eq!(

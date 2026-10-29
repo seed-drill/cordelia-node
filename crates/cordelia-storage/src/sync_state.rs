@@ -188,7 +188,59 @@ pub fn save(
         ],
     )
     .map_err(storage)?;
+    // A record saved is what the folder and the channel agree on: a file
+    // that a carry left out is put back no more (decision 2026-10-24
+    // (removal), rule 7). Put back again, it would overwrite every later
+    // edit with the version the carry went back to.
+    conn.execute(
+        "DELETE FROM file_put_back WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
     Ok(())
+}
+
+/// Record that a carry left out what `folder` holds of `key` in
+/// `channel_id` (decision 2026-10-24 (removal), rule 7), with `agreed`, the
+/// version the file goes back to (`hash` `None` and `rev` 0 where it goes
+/// back to none): the next cycle puts that version into the file, whatever
+/// is there, and keeps what was there in local history alone. A record
+/// saved after ([`save`]) is put back no more.
+pub fn save_put_back(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    key: &str,
+    agreed: &Agreed,
+) -> Result<(), CordeliaError> {
+    save(conn, folder, channel_id, key, agreed)?;
+    conn.execute(
+        "INSERT INTO file_put_back (folder, channel_id, key) VALUES (?1, ?2, ?3)
+         ON CONFLICT DO NOTHING",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The files of `folder` in `channel_id` that a carry left out, and that
+/// the folder is to take back ([`save_put_back`]).
+pub fn put_back(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+) -> Result<std::collections::HashSet<String>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.key FROM file_put_back p JOIN sync_files f
+                 ON f.folder = p.folder AND f.channel_id = p.channel_id AND f.key = p.key
+             WHERE p.folder = ?1 AND p.channel_id = ?2",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![folder, channel_id], |row| row.get(0))
+        .map_err(storage)?;
+    rows.collect::<Result<_, _>>().map_err(storage)
 }
 
 /// Every folder's records in `channel_id`: each folder with a key it has a
@@ -231,6 +283,11 @@ pub fn forget_file(
     key: &str,
 ) -> Result<bool, CordeliaError> {
     conn.execute(
+        "DELETE FROM file_put_back WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
+    conn.execute(
         "DELETE FROM sync_files WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
         params![folder, channel_id, key],
     )
@@ -266,11 +323,16 @@ pub fn move_channel(
         .collect::<Result<_, _>>()
         .map_err(storage)?
     };
-    for table in ["sync_files", "index_lines"] {
+    for (table, of) in [
+        ("sync_files", "sync_files"),
+        ("index_lines", "index_lines"),
+        ("file_put_back", "sync_files"),
+        ("file_line_from", "index_lines"),
+    ] {
         conn.execute(
             &format!(
                 "DELETE FROM {table} WHERE channel_id = ?2
-                 AND folder IN (SELECT folder FROM {table} WHERE channel_id = ?1)"
+                 AND folder IN (SELECT folder FROM {of} WHERE channel_id = ?1)"
             ),
             params![from, to],
         )
@@ -291,11 +353,13 @@ pub fn move_channel(
         )
         .map_err(storage)?;
     }
-    conn.execute(
-        "UPDATE index_lines SET channel_id = ?2 WHERE channel_id = ?1",
-        params![from, to],
-    )
-    .map_err(storage)?;
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("UPDATE {table} SET channel_id = ?2 WHERE channel_id = ?1"),
+            params![from, to],
+        )
+        .map_err(storage)?;
+    }
     Ok(rows.len())
 }
 
@@ -330,11 +394,13 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
                 params![folder, channel_id],
             )
             .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-        conn.execute(
-            "DELETE FROM index_lines WHERE folder = ?1 AND channel_id = ?2",
-            params![folder, channel_id],
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        for table in ["index_lines", "file_put_back", "file_line_from"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE folder = ?1 AND channel_id = ?2"),
+                params![folder, channel_id],
+            )
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        }
     }
     Ok(forgotten)
 }
@@ -342,8 +408,13 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
 /// Forget what one folder agreed, with every channel. Returns the number
 /// of keys forgotten.
 pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaError> {
-    conn.execute("DELETE FROM index_lines WHERE folder = ?1", params![folder])
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE folder = ?1"),
+            params![folder],
+        )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
     conn.execute("DELETE FROM sync_files WHERE folder = ?1", params![folder])
         .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
@@ -356,11 +427,13 @@ pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaE
 /// a folder that comes to sync the name again meets the channel as on any
 /// first sync, and what it lost in between is not taken for deletes.
 pub fn forget_channel(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
-    conn.execute(
-        "DELETE FROM index_lines WHERE channel_id = ?1",
-        params![channel_id],
-    )
-    .map_err(storage)?;
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE channel_id = ?1"),
+            params![channel_id],
+        )
+        .map_err(storage)?;
+    }
     conn.execute(
         "DELETE FROM sync_files WHERE channel_id = ?1",
         params![channel_id],

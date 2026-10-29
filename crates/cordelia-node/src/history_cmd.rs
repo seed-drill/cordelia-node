@@ -322,6 +322,9 @@ fn change(record: &Value) -> (String, String) {
         "deleted_here" => "deleted here",
         "restored" => "replaced by a restore",
         "arrived" => "arrived",
+        "set_aside" => {
+            "set aside: a removed device wrote it, or it was written over what one wrote"
+        }
         other => other,
     };
     let interrupted = if record["interrupted"] == true {

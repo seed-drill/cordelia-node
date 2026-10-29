@@ -99,6 +99,11 @@ pub enum Change {
     Restored,
     /// A file arrived that was not here. No text is kept.
     Arrived,
+    /// A carry left out what the file held (decision 2026-10-24 (removal),
+    /// rule 7): a removed device wrote it after its removal, or in a branch
+    /// made apart from it, or it was stored over such writing. The file went
+    /// back to the version before, and the text is kept here alone.
+    SetAside,
 }
 
 /// A device's entry for a file: who wrote it, and at which revision.

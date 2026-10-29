@@ -543,14 +543,86 @@ thread_local! {
 /// Keep the keys that `statement` lists as removed (decision 2026-10-24
 /// (removal), rule 2): it is a change this device has seen and checked,
 /// whether it follows it, keeps it apart, finds it behind, or is stopped
-/// by it. They only grow.
+/// by it. They only grow. Where they grew, or `noted` says that a change
+/// was just noted with what was not noted of it before (its time or its
+/// lists, which can move a cut time earlier: two removals made apart, the
+/// later seen first), the records are judged again (rule 6).
 pub(crate) fn know_removed(
     conn: &Connection,
     statement: &Statement,
+    own: &[u8; 32],
     now: i64,
+    noted: bool,
 ) -> Result<(), PersonError> {
-    held_rows::keep_removed(conn, &statement.removed, now)?;
+    if held_rows::keep_removed(conn, &statement.removed, now)? > 0 || noted {
+        judge_records_by_their_cut(conn, own, now)?;
+    }
     Ok(())
+}
+
+/// Judge again, by each removed key's cut (decision 2026-10-24 (removal),
+/// rules 2 and 6), the records of additions that this device keeps under
+/// the change it follows: one that a removed key signed counts for nothing
+/// where the device took it at or after that key's cut time, or in a
+/// generation made apart from its removal, and the key it adds is removed,
+/// with that key as its adder. So in turn is each key that such a key
+/// added. A record taken before the cut time stays: a device added honestly
+/// before the removal stays the person's. Done from the moment the device
+/// knows, and again whenever what it knows grows. Says whether anything
+/// changed.
+pub(crate) fn judge_records_by_their_cut(
+    conn: &Connection,
+    own: &[u8; 32],
+    now: i64,
+) -> Result<bool, PersonError> {
+    let Some(held) = held(conn)? else {
+        return Ok(false);
+    };
+    let link = held.statement.statement.link()?;
+    let generation = (link.number, link.hash);
+    let mut changed = false;
+    loop {
+        let cuts = crate::cut::Cuts::read(conn)?;
+        let mut again = false;
+        for record in held_rows::additions(conn)? {
+            if !cuts.cuts_key(&record.adder, &generation, record.seen_at) {
+                continue;
+            }
+            // A key that a removal of the adder lists as a device is the
+            // person's by the phrase: it holds the secret by that change,
+            // and not by the record alone.
+            if cuts.listed_toward_a_removal(&record.adder, &record.key) {
+                continue;
+            }
+            // Nor is a key that the person, at the terminal of a recovery
+            // made here, said is a device they still have: shown with the
+            // phrase, it is theirs by their answer, and is added again by
+            // the record of 2026-10-04, section 9, step 6.
+            if held_rows::is_kept_by_answer(conn, &record.key)? {
+                continue;
+            }
+            // Nor, on this device, its own key: rule 6 is against keys
+            // that the removed device holds by its record alone, and this
+            // device knows it holds its own. The others judge it by what
+            // each took, and a recovery adds it again (the record of
+            // 2026-10-04, section 9, step 6), which a removed key could
+            // never be.
+            if record.key == *own {
+                continue;
+            }
+            if record.counted {
+                held_rows::uncount_addition(conn, record.seen)?;
+                again = true;
+            }
+            if held_rows::keep_removed_added_by(conn, &record.key, &record.adder, now)? {
+                again = true;
+            }
+        }
+        if !again {
+            return Ok(changed);
+        }
+        changed = true;
+    }
 }
 
 /// Keep the keys that `shown` lists as removed, where the phrase that this
@@ -566,6 +638,7 @@ pub(crate) fn know_removed_if_signed(
     conn: &Connection,
     identity: &NodeIdentity,
     shown: &SignedStatement,
+    content: Option<&[u8]>,
     now: i64,
 ) -> Result<(), PersonError> {
     let Some(held) = held(conn)? else {
@@ -575,6 +648,18 @@ pub(crate) fn know_removed_if_signed(
     if shown.statement.phrase_key != *follows || shown.verify().is_err() {
         return Ok(());
     }
+    // Noted first, with its time where its entry is at hand: the cut of
+    // each key it removes is worked out from it (rules 2 and 6). So is the
+    // change followed, with its lists, where it was not noted so: on a
+    // device stepped to this version, its time and lists give the cut its
+    // time, which is otherwise none, and cuts everything.
+    let followed = kept_followed(conn)?;
+    let mut noted = note_change(
+        conn,
+        followed.as_ref().map(|entry| entry.content.as_slice()),
+        &held.statement.statement,
+    )?;
+    noted |= note_change(conn, content, &shown.statement)?;
     let own = identity.public_key();
     let mut removes = shown.statement.clone();
     if held.state != State::Fork
@@ -582,7 +667,7 @@ pub(crate) fn know_removed_if_signed(
     {
         removes.removed.retain(|key| *key != own);
     }
-    know_removed(conn, &removes, now)
+    know_removed(conn, &removes, &own, now, noted)
 }
 
 /// Whether the secret of `statement`'s change is clear on this device
@@ -1366,7 +1451,7 @@ pub(crate) fn decide(
             // Refused, and still what the person removed where the phrase
             // signed it (rule 2): a change that drops a removal and makes
             // another says that the other key is removed.
-            know_removed_if_signed(conn, identity, statement, now)?;
+            know_removed_if_signed(conn, identity, statement, Some(&entry.content), now)?;
             // What it knows of removals grew: rule 8 moves or closes a
             // device whose change is no longer clear.
             if !follows_a_clear_change(conn)? {
@@ -1382,7 +1467,8 @@ pub(crate) fn decide(
         kept.link().is_ok_and(|kept| kept == link) || kept.has_on_chain(&link)
     });
     if judgement == Judgement::Behind || behind_a_head {
-        know_removed(conn, shown, now)?;
+        let noted = note_time(conn, entry, shown)?;
+        know_removed(conn, shown, &own, now, noted)?;
         return Ok(Shown::Behind);
     }
 
@@ -1395,8 +1481,8 @@ pub(crate) fn decide(
     if removes_this_device {
         removes.removed.retain(|key| *key != own);
     }
-    know_removed(conn, &removes, now)?;
-    note_time(conn, entry, shown)?;
+    let noted = note_time(conn, entry, shown)?;
+    know_removed(conn, &removes, &own, now, noted)?;
     let mut left = heads.len();
     for head in &heads {
         if shown.has_on_chain(&head.statement.statement.link()?) {
@@ -1829,12 +1915,42 @@ pub(crate) fn note_time(
     conn: &Connection,
     entry: &CheckedEntry,
     statement: &Statement,
-) -> Result<(), PersonError> {
-    let made_at = change_entry::lineage(&entry.content)?
-        .and_then(|lineage| i64::try_from(lineage.made_at).ok());
+) -> Result<bool, PersonError> {
+    note_change(conn, Some(&entry.content), statement)
+}
+
+/// Note the change of `statement` (decision 2026-10-24 (removal), rule 2):
+/// its time, as the lineage in its entry's `content` says it (none where
+/// the entry has none, or is not at hand), the keys it lists as removed and
+/// its chain, from which each removed key's cut time is worked out. Says
+/// whether it filled what was not noted of the change before.
+pub(crate) fn note_change(
+    conn: &Connection,
+    content: Option<&[u8]>,
+    statement: &Statement,
+) -> Result<bool, PersonError> {
+    let made_at = match content {
+        Some(content) => {
+            change_entry::lineage(content)?.and_then(|lineage| i64::try_from(lineage.made_at).ok())
+        }
+        None => None,
+    };
     let link = statement.link()?;
-    held_rows::note_change_time(conn, link.number, &link.hash, made_at)?;
-    Ok(())
+    let chain: Vec<(u64, [u8; 16])> = statement
+        .chain
+        .iter()
+        .map(|link| (link.number, link.hash))
+        .collect();
+    let devices: Vec<[u8; 32]> = statement.devices.iter().map(|device| device.key).collect();
+    Ok(held_rows::note_change(
+        conn,
+        link.number,
+        &link.hash,
+        made_at,
+        Some(&statement.removed),
+        Some(&chain),
+        Some(&devices),
+    )?)
 }
 
 /// The device is closed (decision 2026-10-24 (removal), rule 10), where it
@@ -1908,7 +2024,7 @@ pub fn know_what_is_shown(
         if statement.statement.removes(&identity.public_key()) {
             return Ok(false);
         }
-        know_removed_if_signed(conn, identity, statement, now)?;
+        know_removed_if_signed(conn, identity, statement, Some(&entry.content), now)?;
         close_if_not_clear(conn)
     })
 }
@@ -2492,11 +2608,30 @@ fn come_to(
     // its word that it applied. So a change that is not clear is refused
     // here, whoever calls (decision 2026-10-24 (removal), rule 4). The
     // keys that the change it leaves and this one remove are kept first
-    // (rule 2).
+    // (rule 2), each change noted with its lists before: the cut of each key
+    // they remove is worked out from them (rules 2, 6 and 7).
+    note_time(conn, change.entry, statement)?;
     if let Some(before) = before {
-        know_removed(conn, &before.statement.statement, now)?;
+        let followed = kept_followed(conn)?;
+        note_change(
+            conn,
+            followed.as_ref().map(|entry| entry.content.as_slice()),
+            &before.statement.statement,
+        )?;
+        know_removed(
+            conn,
+            &before.statement.statement,
+            &identity.public_key(),
+            now,
+            false,
+        )?;
     }
-    know_removed(conn, statement, now)?;
+    know_removed(conn, statement, &identity.public_key(), now, false)?;
+    // The records are judged again once at each carry, by every cut as it
+    // stands (rule 6): what is known of removals may have grown or moved
+    // since they were last judged. A key it removes that this change lists
+    // makes it not clear, here.
+    judge_records_by_their_cut(conn, &identity.public_key(), now)?;
     if !is_clear(conn, statement, false)? {
         // Where this device's own key is among the removed, no change that
         // lists it is clear, and its way on is a new key: it says so, and
@@ -2538,11 +2673,14 @@ fn come_to(
         if from.secret == to.secret {
             return Err(StatementError::SameSecret.into());
         }
-        // The carry reads the generation it leaves as it did before this
-        // record: what a removed key wrote there, and was taken before
-        // the device knew, is cut by a later slice of decision 2026-10-24
-        // (removal), rule 7.
+        // The carry reads the generation it leaves as the device took it:
+        // what a removed key wrote there before the device knew counts,
+        // and the cut of rule 7 (decision 2026-10-24 (removal)) leaves out
+        // what of it, and of the keys that key added, came after its cut
+        // time or in a generation made apart from its removal, with
+        // everything stored over it ([`crate::arrivals::cut_of_channel`]).
         let counting = Counting::of(leaving, &held_rows::additions(conn)?, &[]);
+        let cuts = crate::cut::Cuts::read(conn)?;
         applied.left = Some(from.number);
 
         let own = identity.public_key();
@@ -2568,6 +2706,7 @@ fn come_to(
             &personal.1,
             |key| *key == own,
             is_its_word_to_carry,
+            None,
         )?;
         applied.carried += carried;
 
@@ -2578,12 +2717,21 @@ fn come_to(
             // name's new channel with each revision renumbered (§4.2). A
             // record in whose slot the store holds no version is dropped
             // first: nothing is carried there.
-            let dropped = move_records(conn, &carry, &counting, &old, &new)?;
+            // What the cut leaves out of each file (rule 7) is worked out
+            // first: the folders' records and the carry both go by it.
+            let cut = crate::arrivals::cut_of_channel(conn, &old, &cuts)?;
+            let dropped = move_records(conn, &carry, &counting, &old, &new, &cut)?;
             applied
                 .not_carried
                 .extend(dropped.into_iter().map(|file| (name.name.clone(), file)));
-            let (carried, no_version) =
-                carry.channel(conn, &old, &new, |key| counting.counts(key), |_| true)?;
+            let (carried, no_version) = carry.channel(
+                conn,
+                &old,
+                &new,
+                |key| counting.counts(key),
+                |_| true,
+                Some(&cut),
+            )?;
             applied.carried += carried;
             if no_version > 0 {
                 applied.no_version.push(name.name.clone());
@@ -2732,6 +2880,7 @@ fn move_records(
     counting: &Counting,
     from: &[u8; 32],
     to: &[u8; 32],
+    cut: &BTreeMap<[u8; 32], crate::arrivals::FileCut>,
 ) -> Result<Vec<String>, PersonError> {
     let written = |secret: &[u8; 32]| -> Result<String, PersonError> {
         Ok(encode_channel_id(&derive::channel_id(secret)?)?)
@@ -2740,7 +2889,40 @@ fn move_records(
     let channel = derive::channel_id(from)?;
     let slot_key = derive::slot_key(from)?;
     let mut dropped: Vec<String> = Vec::new();
+    // A file that the cut leaves out goes back (decision 2026-10-24
+    // (removal), rule 7): its record names the version the carry carries,
+    // or none, and the folder takes that version back, whatever its file
+    // holds, with that kept in local history alone. The record is written
+    // once the others have moved.
+    let mut put_back: Vec<(String, String, sync_state::Agreed)> = Vec::new();
     for (folder, file, rev) in sync_state::files_at(conn, &old)? {
+        if let Some(cut) = cut.get(&slot_id(&slot_key, &file)) {
+            let back = cut.target.as_ref().and_then(|version| {
+                let rev = carry.renumbered(version.rev)?;
+                let hash = match &version.value {
+                    Value::Text(text) => cordelia_crypto::sha256(text.as_bytes()),
+                    Value::Other(bytes) => cordelia_crypto::sha256(bytes),
+                    Value::Delete => return None,
+                };
+                Some((hash, rev))
+            });
+            let agreed = sync_state::Agreed {
+                hash: back.map(|(hash, _)| hash),
+                rev: back.map_or(0, |(_, rev)| rev),
+                signer: back.map(|_| carry.identity.public_key()),
+                chain: None,
+            };
+            // A line of the index removed from a version that was left out
+            // is put back by nobody (rule 7).
+            if file == INDEX_FILE {
+                cordelia_storage::index_lines::drop_lines_removed_since(
+                    conn, &folder, &old, cut.at,
+                )?;
+            }
+            sync_state::forget_file(conn, &folder, &old, &file)?;
+            put_back.push((folder, file, agreed));
+            continue;
+        }
         let held = entries::slot_entries(conn, &channel, &slot_id(&slot_key, &file))?;
         let read = version::current(&held, from, carry.statement, |key| counting.counts(key))?;
         let carried = read
@@ -2755,8 +2937,15 @@ fn move_records(
     dropped.dedup();
     // Each record left has a revision that the renumbering carries.
     sync_state::move_channel(conn, &old, &new, |rev| carry.renumbered(rev).unwrap_or(rev))?;
+    for (folder, file, agreed) in put_back {
+        sync_state::save_put_back(conn, &folder, &new, &file, &agreed)?;
+    }
     Ok(dropped)
 }
+
+/// The name of a folder's index file (decision 2026-09-30 §4.5): its lines
+/// are put back by a rule of their own.
+const INDEX_FILE: &str = "MEMORY.md";
 
 /// Note each key that this device counted under the statement `leaving`
 /// and that `statement`, which it now applies, has in neither of its
@@ -2892,6 +3081,12 @@ impl Carry<'_> {
     /// lower one, a version in a band above it ([`carried_rev`]): its
     /// record was dropped ([`move_records`]), and it is no slot that held
     /// no version.
+    ///
+    /// `cut` is, in the channel of a name, what the cut of rule 7 leaves
+    /// out of each file (decision 2026-10-24 (removal)): such a file is
+    /// carried as the version it goes back to, or not at all. The arrivals
+    /// of each file carried go with it, those the cut left out but; in the
+    /// personal channel there are none.
     fn channel(
         &self,
         conn: &Connection,
@@ -2899,10 +3094,35 @@ impl Carry<'_> {
         to: &[u8; 32],
         counts: impl Fn(&[u8; 32]) -> bool,
         carries: impl Fn(&Version) -> bool,
+        cut: Option<&BTreeMap<[u8; 32], crate::arrivals::FileCut>>,
     ) -> Result<(usize, usize), PersonError> {
         let channel = derive::channel_id(from)?;
         let (mut carried, mut no_version) = (0, 0);
         for slot in entries::channel_slots(conn, &channel)? {
+            if let Some(file) = cut.and_then(|cut| cut.get(&slot)) {
+                if let Some(place) = file.place {
+                    cordelia_storage::arrivals::drop_from(conn, &channel, &slot, place)?;
+                } else {
+                    cordelia_storage::arrivals::drop_from(conn, &channel, &slot, i64::MIN)?;
+                }
+                cordelia_storage::arrivals::forget_dropped(conn, &channel, &slot)?;
+                let Some(target) = file.target.as_ref().filter(|version| carries(version)) else {
+                    continue;
+                };
+                let Some(rev) = self.renumbered(target.rev) else {
+                    continue;
+                };
+                let entry = carried_entry_at(self.identity, to, target, rev)?;
+                if entries::store(conn, &entry, self.now)? != Outcome::Stored {
+                    return Err(PersonError::Held(
+                        "the store holds an entry of this device's in a generation it has not come to"
+                            .into(),
+                    ));
+                }
+                self.arrivals_carried(conn, from, to, &slot, &entry.slot)?;
+                carried += 1;
+                continue;
+            }
             let held = entries::slot_entries(conn, &channel, &slot)?;
             let read = version::current(&held, from, self.statement, &counts)?;
             let Some(version) = read.current else {
@@ -2924,13 +3144,71 @@ impl Carry<'_> {
                         .into(),
                 ));
             }
+            if cut.is_some() {
+                self.arrivals_carried(conn, from, to, &slot, &entry.slot)?;
+            }
             carried += 1;
         }
-        // What the store holds of the channel that was left is dropped.
+        // What the store holds of the channel that was left is dropped, and
+        // with it the arrivals of each file that was not carried.
         entries::remove_channel(conn, &channel)?;
         // And with it what the device kept of each relay for it.
         kept_rows::forget_channel(conn, &channel)?;
         Ok((carried, no_version))
+    }
+}
+
+impl Carry<'_> {
+    /// The arrivals of the file `slot` of the channel whose secret is
+    /// `from` go with it to the file `to_slot` of the channel whose secret
+    /// is `to` (decision 2026-10-24 (removal), rule 7), with the version each
+    /// goes back to sealed again there, as this carry carries a version: one
+    /// that it does not carry goes back to none, which fails safe.
+    fn arrivals_carried(
+        &self,
+        conn: &Connection,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        slot: &[u8; 32],
+        to_slot: &[u8; 32],
+    ) -> Result<(), PersonError> {
+        use cordelia_storage::arrivals as kept;
+        let channel = derive::channel_id(from)?;
+        let (events, dropped) = kept::of_file(conn, &channel, slot)?;
+        let sealed_again = |before: Option<&Entry>| -> Result<Option<Entry>, PersonError> {
+            let before = match before {
+                Some(before) => crate::arrivals::version_of(before, from)?,
+                None => None,
+            };
+            Ok(match before {
+                Some(version) => match self.renumbered(version.rev) {
+                    Some(rev) => {
+                        let sealed = carried_entry_at(self.identity, to, &version, rev)?;
+                        Some(Entry::clone(&sealed))
+                    }
+                    None => None,
+                },
+                None => None,
+            })
+        };
+        for event in &events {
+            let sealed = sealed_again(event.before.as_ref())?;
+            kept::set_before(conn, event.place, sealed.as_ref())?;
+        }
+        // And the version before what went past the bound.
+        for went in &dropped {
+            let sealed = sealed_again(went.before.as_ref())?;
+            kept::set_dropped_before(
+                conn,
+                &channel,
+                slot,
+                went.number,
+                &went.hash,
+                sealed.as_ref(),
+            )?;
+        }
+        kept::move_file(conn, &channel, slot, &derive::channel_id(to)?, to_slot)?;
+        Ok(())
     }
 }
 
@@ -8244,13 +8522,13 @@ mod tests {
         // Its signature broken: nothing is kept.
         let mut forged = sign(&drops, &phrase);
         forged.statement.removed = vec![key(6)];
-        know_removed_if_signed(&conn, &device(0), &forged, NOW).unwrap();
+        know_removed_if_signed(&conn, &device(0), &forged, None, NOW).unwrap();
         assert_eq!(removed(&conn), known);
         // Signed, it is kept, though nothing applies it.
         let mut signed = drops.clone();
         signed.removed = vec![key(6)];
         signed.validate().unwrap();
-        know_removed_if_signed(&conn, &device(0), &sign(&signed, &phrase), NOW).unwrap();
+        know_removed_if_signed(&conn, &device(0), &sign(&signed, &phrase), None, NOW).unwrap();
         known.push(key(6));
         known.sort_unstable();
         assert_eq!(removed(&conn), known);
@@ -8611,6 +8889,239 @@ mod tests {
             crate::take::take(&conn, &device(0), &by_five, NOW).unwrap(),
             crate::take::Taken::Refused(crate::take::NotTaken::Closed)
         );
+    }
+
+    /// The change entry of `statement` as [`change`] makes it, with the
+    /// time `made_at` in its lineage.
+    fn change_made_at(
+        phrase: &Phrase,
+        statement: &Statement,
+        secret: [u8; 32],
+        made_at: i64,
+    ) -> CheckedEntry {
+        change_entry::entry_of(
+            phrase,
+            &sign(statement, phrase),
+            &ForPhrase::first(secret),
+            made_at as u64,
+        )
+        .unwrap()
+        .check()
+        .unwrap()
+    }
+
+    /// Rule 6, its records (decision 2026-10-24 (removal), unit test 12): a
+    /// counted record that a removed key signed, taken at or after that
+    /// key's cut time, counts for nothing from the moment the device knows;
+    /// the key it added is removed, and so is each key that key added in
+    /// its turn. A record taken a second before the cut time stays: a
+    /// device added honestly before the removal stays the person's. And the
+    /// next change made here lists each as removed (rule 20).
+    #[test]
+    fn test_records_a_removed_key_signed_after_its_cut_time_count_for_nothing() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        // Statement 3 removes device 2, made at `made`: the cut time is ten
+        // minutes before it.
+        let made = NOW + 50_000;
+        let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
+        see_addition(&conn, &added(&two, 2, 5), cut - 1).unwrap();
+        see_addition(&conn, &added(&two, 2, 6), cut).unwrap();
+        see_addition(&conn, &added(&two, 6, 7), cut + 5).unwrap();
+        let counted = |conn: &Connection| -> Vec<bool> {
+            held_rows::additions(conn)
+                .unwrap()
+                .iter()
+                .map(|record| record.counted)
+                .collect()
+        };
+        assert_eq!(counted(&conn), [true, true, true]);
+        assert!(who_counts(&conn).unwrap().counts(&key(7)));
+
+        // The device is shown the removal: it knows at once, before the
+        // apply waits for the cycle.
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        assert!(know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap());
+        assert_eq!(counted(&conn), [true, false, false]);
+        let counting = who_counts(&conn).unwrap();
+        assert!(counting.counts(&key(5)));
+        assert!(!counting.counts(&key(6)) && !counting.counts(&key(7)));
+        assert_eq!(removed(&conn), {
+            let mut keys = vec![key(2), key(6), key(7)];
+            keys.sort();
+            keys
+        });
+        // What they added is known as theirs: each has device 2's cut.
+        let cuts = crate::cut::Cuts::read(&conn).unwrap();
+        assert_eq!(cuts.of_key(&key(7)).unwrap().at, Some(cut));
+        // The removal is applied: what it knows of removals stays, and a
+        // change that does not list them as removed is refused here.
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, made + 2).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert!(removed(&conn).contains(&key(6)) && removed(&conn).contains(&key(7)));
+        assert!(!removed(&conn).contains(&key(5)));
+
+        // A key that the removal itself lists as a device, or a change on
+        // its chain, is the person's by the phrase, and is not removed,
+        // though the removed key added it after its cut time.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), cut).unwrap();
+        let lists_six = two
+            .next(key(0), &secret(13), listed(&[0, 1, 6]), &[key(2)])
+            .unwrap();
+        let entry = change_made_at(&phrase, &lists_six, secret(13), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        assert_eq!(removed(&conn), vec![key(2)]);
+        assert_eq!(counted(&conn), [true]);
+
+        // Nor is a key that the person, at the terminal of a recovery made
+        // here, said is a device they still have; the key beside it, of
+        // which they said nothing, is removed.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), cut).unwrap();
+        see_addition(&conn, &added(&two, 2, 7), cut).unwrap();
+        held_rows::keep_by_answer(&conn, &key(6), 3).unwrap();
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        assert_eq!(removed(&conn), {
+            let mut keys = vec![key(2), key(7)];
+            keys.sort();
+            keys
+        });
+        assert_eq!(counted(&conn), [true, false]);
+
+        // Taken out, the judging again: nothing changes (the mutation of the
+        // plan, "counted records not judged again").
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), cut).unwrap();
+        held_rows::keep_removed(&conn, &[key(2)], made).unwrap();
+        assert_eq!(counted(&conn), [true]);
+        note_change(&conn, Some(&entry.content), &three).unwrap();
+        // On the device whose key it is, its own key is not removed.
+        assert!(!judge_records_by_their_cut(&conn, &key(6), made).unwrap());
+        assert_eq!(counted(&conn), [true]);
+        assert!(judge_records_by_their_cut(&conn, &key(0), made).unwrap());
+        assert_eq!(counted(&conn), [false]);
+        assert!(!judge_records_by_their_cut(&conn, &key(0), made).unwrap());
+    }
+
+    /// Records are judged again when a change is first noted with its
+    /// lists, and not only when a new key is removed (the review of slice
+    /// 8, its third finding). Two removals of device 2 are made apart: the
+    /// one at `made` is seen first, and the record that device 2 signed
+    /// before its cut stays; then the one made earlier is seen, which
+    /// removes no new key, and moves the cut before the record. The key it
+    /// added is removed.
+    #[test]
+    fn test_records_are_judged_again_where_a_removal_seen_later_moves_the_cut_earlier() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let margin = REMOVAL_TAKEN_MARGIN_SECS as i64;
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        let made = NOW + 50_000;
+        let earlier = made - 3 * margin;
+        // Device 2 adds device 6 after the earlier removal's cut, and
+        // before the later one's.
+        see_addition(&conn, &added(&two, 2, 6), made - margin - 1).unwrap();
+        let counted = |conn: &Connection| -> Vec<bool> {
+            held_rows::additions(conn)
+                .unwrap()
+                .iter()
+                .map(|record| record.counted)
+                .collect()
+        };
+        let later = change_made_at(&phrase, &three, secret(3), made);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&three, &phrase),
+            Some(&later.content),
+            made + 1,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [true]);
+        assert_eq!(removed(&conn), vec![key(2)]);
+        // The removal made apart, and earlier.
+        let apart = two
+            .next(key(1), &secret(33), listed(&[0, 1]), &[key(2)])
+            .unwrap();
+        let first = change_made_at(&phrase, &apart, secret(33), earlier);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&apart, &phrase),
+            Some(&first.content),
+            made + 2,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [false]);
+        assert_eq!(removed(&conn), {
+            let mut keys = vec![key(2), key(6)];
+            keys.sort();
+            keys
+        });
+    }
+
+    /// The change followed is noted with its lists when a change is shown
+    /// (the review of slice 8, its sixth finding): on a device stepped to
+    /// this version, which noted none, rule 6 would otherwise find no time
+    /// for the removal's cut, and cut everything, so that a record device 2
+    /// signed before its removal stopped counting. The lists are taken out
+    /// by hand, as a device stepped to this version has them.
+    #[test]
+    fn test_the_change_followed_is_noted_with_its_lists_when_a_change_is_shown() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        conn.execute("DELETE FROM person_change_times_lists", [])
+            .unwrap();
+        let made = NOW + 50_000;
+        let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
+        see_addition(&conn, &added(&two, 2, 5), cut - 1).unwrap();
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        assert!(
+            held_rows::additions(&conn)
+                .unwrap()
+                .iter()
+                .all(|record| record.counted)
+        );
+        assert_eq!(removed(&conn), vec![key(2)]);
+    }
+
+    /// The gate of rule 4 in `come_to` holds where rule 6, run there at the
+    /// carry, removes a key that the change lists (the review of slice 8,
+    /// its fourth finding). Device 2 added device 6 by a record that was
+    /// not judged again (the rows set so by hand): no noted change gives
+    /// device 2's removal a time, so it is cut everywhere. A change that
+    /// lists device 6, and does not remove device 2, passes every check
+    /// before `come_to`; there rule 6 removes device 6, and it is refused as
+    /// not clear, with nothing changed.
+    #[test]
+    fn test_come_to_refuses_a_change_that_lists_a_key_rule_6_removes_at_the_carry() {
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), NOW).unwrap();
+        held_rows::keep_removed(&conn, &[key(2)], NOW).unwrap();
+        assert!(who_counts(&conn).unwrap().counts(&key(6)));
+        let lists_six = two
+            .next(key(0), &secret(14), listed(&[0, 1, 6]), &[])
+            .unwrap();
+        let entry = change(&phrase, &lists_six, secret(14));
+        let signed = sign(&lists_six, &phrase);
+        assert!(matches!(
+            apply(&conn, &device(0), &signed, &secret(14), &entry, NOW + 1),
+            Err(PersonError::NotClear)
+        ));
+        assert_eq!(applied_number(&conn), 2);
+        assert_eq!(removed(&conn), vec![key(2)]);
     }
 
     /// A device that leaves its phrase forgets what it knew of removals:

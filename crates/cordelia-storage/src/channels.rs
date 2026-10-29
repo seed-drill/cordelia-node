@@ -593,7 +593,7 @@ pub fn drop_stored(conn: &Connection, channel_id: &str) -> Result<usize, Cordeli
 /// A table that comes to refer to a channel by ID belongs here too: the
 /// test of [`remove_swarm_channels`] reads the schema, and fails until it
 /// is added.
-const TABLES_OF_A_CHANNEL: [&str; 7] = [
+const TABLES_OF_A_CHANNEL: [&str; 9] = [
     "channel_members",
     "channel_keys",
     "dm_peers",
@@ -601,6 +601,8 @@ const TABLES_OF_A_CHANNEL: [&str; 7] = [
     "state_offers",
     "sync_files",
     "index_lines",
+    "file_put_back",
+    "file_line_from",
 ];
 
 /// Remove a channel from the database with everything held for it there:
@@ -1169,6 +1171,9 @@ mod tests {
              VALUES (?1, X'04', 1, 'ci_state', 0, 0)",
             "INSERT INTO sync_files (folder, channel_id, key, rev) VALUES ('/m', ?1, 'notes.md', 1)",
             "INSERT INTO index_lines (folder, channel_id, file) VALUES ('/m', ?1, 'notes.md')",
+            "INSERT INTO file_put_back (folder, channel_id, key) VALUES ('/m', ?1, 'notes.md')",
+            "INSERT INTO file_line_from (folder, channel_id, file, from_signers)
+             VALUES ('/m', ?1, 'notes.md', x'')",
         ] {
             conn.execute(sql, params![channel_id]).unwrap();
         }

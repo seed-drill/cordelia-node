@@ -55,6 +55,11 @@ pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 /// at each statement applied.
 pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 
+/// How many edits a carry set aside (decision 2026-10-24 (removal), rule
+/// 7), and when the last was: two numbers, the count and then the time in
+/// seconds. What each held is in local history.
+pub const PERSON_EDITS_SET_ASIDE: &str = "person.edits_set_aside";
+
 /// Present where the statement that this device has applied removes a key
 /// that the statement it held before did not (decision 2026-10-04
 /// §10.1), as the device found it at the moment it applied the
