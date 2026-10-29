@@ -702,6 +702,69 @@ pub(crate) fn newest_of(
     Ok(carry::newest(all))
 }
 
+/// [`newest_of`], each with every generation it was read in, by its change
+/// where this device knows it ([`Generation::change`]): what `--from`
+/// brings is judged by the cut where it was read ([`left_out_from`]).
+pub(crate) fn newest_read_in(
+    read: &[Generation],
+    keys: &[[u8; 32]],
+) -> Result<Vec<(Version, Vec<Option<carry::Generation>>)>, PersonError> {
+    let mut all: Vec<(Version, Option<carry::Generation>)> = Vec::new();
+    for generation in read {
+        let was = carry::read(
+            &generation.entries,
+            &generation.secret,
+            generation.number,
+            |key| keys.contains(key),
+        )?;
+        all.extend(was.versions.into_iter().map(|v| (v, generation.change)));
+    }
+    let newest = carry::newest(all.iter().map(|(version, _)| version.clone()).collect());
+    Ok(newest
+        .into_iter()
+        .map(|version| {
+            let same = |other: &Version| {
+                other.name == version.name
+                    && other.rev == version.rev
+                    && other.value == version.value
+            };
+            let read_in = all
+                .iter()
+                .filter(|(other, _)| same(other))
+                .map(|(_, change)| *change)
+                .collect();
+            (version, read_in)
+        })
+        .collect())
+}
+
+/// Whether the cut leaves out `version`, which `--from` would bring for
+/// the removed keys `named`, read in each generation of `read_in` (the
+/// third read of slice 8, its first low finding): it judges every key
+/// that signed it, or that its chain names, but those the person named,
+/// as a carry by command does ([`crate::cut::Cuts::leaves_out`]). So
+/// `--from <one device>` brings only what the keys named wrote: a version
+/// of theirs over what another removed key wrote late is left out, and
+/// naming that key too brings it.
+fn left_out_from(
+    conn: &rusqlite::Connection,
+    version: &Version,
+    read_in: &[Option<carry::Generation>],
+    named: &[[u8; 32]],
+) -> Result<bool, PersonError> {
+    let cuts = crate::cut::Cuts::read(conn)?;
+    let signers: Vec<[u8; 32]> = version.entries.iter().map(|one| one.author).collect();
+    let chains: Vec<Option<&[cordelia_crypto::entry::Link]>> = version
+        .entries
+        .iter()
+        .map(|one| one.chain.as_deref())
+        .collect();
+    let now = now();
+    Ok(read_in
+        .iter()
+        .any(|change| cuts.leaves_out(&signers, &chains, change.as_ref(), now, named)))
+}
+
 /// What the relays hold of the channel of `name` in the generation
 /// applied, for a name that this device does not hold (decision
 /// 2026-10-04 §7.3): read through the door, as a channel that was left
@@ -937,12 +1000,16 @@ pub async fn look_from(
     // not be read.
     let (tally, has_folder) = {
         let conn = db(state);
-        let versions = newest_of(&read, &keys)?;
+        let versions = newest_read_in(&read, &keys)?;
         let judge = || -> Result<Tally, PersonError> {
             let mut tally = Tally::default();
-            for version in versions.iter().filter(|_| new_read) {
-                let would =
-                    carry::would_bring(&conn, &state.identity, name, version, Rule::EmptySlots)?;
+            for (version, read_in) in versions.iter().filter(|_| new_read) {
+                let would = match left_out_from(&conn, version, read_in, &keys)? {
+                    true => carry::Brought::Cut,
+                    false => {
+                        carry::would_bring(&conn, &state.identity, name, version, Rule::EmptySlots)?
+                    }
+                };
                 tally.count(&version.name, would);
             }
             Ok(tally)
@@ -978,6 +1045,9 @@ pub async fn look_from(
         "higher": tally.higher,
         "ties": tally.ties,
         "deletes": tally.deletes,
+        // Left out by the cut: another removed key wrote them, or what
+        // they were written over.
+        "cut": tally.cut,
         "has_folder": has_folder,
         "generations": read.iter().map(|g| g.says(0)).collect::<Vec<_>>(),
         "read_all": read.iter().all(Generation::read_all),
@@ -1132,10 +1202,14 @@ pub async fn take_from(state: &AppState, word: &Word) -> Result<serde_json::Valu
         // then: where it keeps another by now, nothing is taken. And it
         // is taken once, as one with what it brings in.
         allowed_still(&conn, state, word)?;
-        let versions = newest_of(&read, &keys)?;
+        let versions = newest_read_in(&read, &keys)?;
         let brings = || -> Result<Tally, PersonError> {
             let mut tally = Tally::default();
-            for version in &versions {
+            for (version, read_in) in &versions {
+                if left_out_from(&conn, version, read_in, &keys)? {
+                    tally.count(&version.name, carry::Brought::Cut);
+                    continue;
+                }
                 let rule = match above.contains(&version.name) {
                     true => Rule::Above,
                     false => Rule::EmptySlots,
@@ -1604,6 +1678,64 @@ mod tests {
         let node = Node::of(s.machines.remove(0));
         node.relay_holds(&old, &at_the_relay);
         (node, phrase, removed, counts)
+    }
+
+    /// `--from <one device>` brings only what the keys named wrote (the
+    /// third read of slice 8, its first low finding). The desktop (0)
+    /// removes the tablet (2) and the phone (3). The phone wrote `a.md` in
+    /// the generation left, and the tablet wrote over it; the tablet also
+    /// wrote `b.md` alone. `--from` the tablet brings `b.md`, and leaves
+    /// `a.md` out, as the look says before the phrase: the phone wrote what
+    /// it was written over, and the person did not name the phone. Named
+    /// with the phone, it comes in.
+    #[actix_web::test]
+    async fn test_from_one_removed_device_brings_only_what_the_keys_named_wrote() {
+        let mut s = Several::of_one_person(4);
+        // `--from` judges by the wall clock: the fixture's is set behind it.
+        s.now = now() - 3600;
+        s.hold(&[0, 2, 3], LAB);
+        let old = s[2].own(LAB);
+        s.write(3, LAB, "a.md", "the phone's text");
+        s.pass(3, 2);
+        s.write(2, LAB, "a.md", "the phone's text, and the tablet's line");
+        s.write(2, LAB, "b.md", "the tablet's own");
+        let mut at_the_relay = s[2].stored_in(&old);
+        at_the_relay.extend(s[3].stored_in(&old));
+        s.change(0, &[0, 1], &[2, 3]);
+        let (tablet, phone) = (s.key(2), s.key(3));
+        let phrase = Phrase::parse(crate::several::WORDS).unwrap();
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&old, &at_the_relay);
+        node.maps_a_folder(LAB);
+
+        let named = [carry::naming_words(&tablet)];
+        let found = look_from(&node.state, LAB, &named).await.unwrap();
+        assert_eq!(
+            (&found["empty"], &found["cut"]),
+            (&json!(1), &json!(1)),
+            "{found}"
+        );
+        let word = node.word(&phrase, &from(&[tablet], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(
+            (&done["carried"], &done["cut"]),
+            (&json!(1), &json!(1)),
+            "{done}"
+        );
+        assert_eq!(node.text(LAB, "b.md").as_deref(), Some("the tablet's own"));
+        assert_eq!(node.text(LAB, "a.md"), None);
+
+        let word = node.word(&phrase, &from(&[tablet, phone], &[]));
+        let done = take_from(&node.state, &word).await.unwrap();
+        assert_eq!(
+            (&done["carried"], &done["cut"]),
+            (&json!(1), &json!(0)),
+            "{done}"
+        );
+        assert_eq!(
+            node.text(LAB, "a.md").as_deref(),
+            Some("the phone's text, and the tablet's line")
+        );
     }
 
     fn from(keys: &[[u8; 32]], above: &[&str]) -> Allows {
