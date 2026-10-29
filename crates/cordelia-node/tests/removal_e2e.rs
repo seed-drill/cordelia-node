@@ -842,6 +842,22 @@ impl Client {
         })
     }
 
+    /// Push `entries`, each as it is on the wire, and read the answer.
+    async fn push(&self, entries: Vec<Vec<u8>>) -> Result<(), String> {
+        use cordelia_network::messages::{EntryPush, Protocol, WireMessage};
+        let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| e.to_string())?;
+        let mut stream = tokio::io::join(&mut recv, &mut send);
+        let request = WireMessage::EntryPush(EntryPush {
+            entries: entries.into_iter().map(Into::into).collect(),
+        });
+        let answer =
+            cordelia_network::codec::send_request(&mut stream, Protocol::EntryPush, &request)
+                .await
+                .map_err(|e| e.to_string());
+        let _ = send.finish();
+        answer.map(|_| ())
+    }
+
     /// Show `entry` whole, and read the answer.
     async fn show(&self, entry: &[u8]) -> Result<(), String> {
         use cordelia_network::messages::{EntryShow, Protocol, WireMessage};
@@ -1590,4 +1606,503 @@ fn the_window_before_a_device_reads_a_removal_is_bounded() {
         "read the removal {:?} after relay A held it; last under the old secret {after:?} after",
         read_at.saturating_duration_since(held_from)
     );
+}
+
+// ── Slice 8: what a device took before it knew (rules 6 and 7) ───────
+
+/// The key pair that `node` runs under, read from its key file.
+fn identity_of(node: &Node) -> NodeIdentity {
+    NodeIdentity::from_file(&node.data_dir().join("identity.key")).unwrap()
+}
+
+/// An entry that `author` signs, in the channel of the name `lab` in the
+/// generation of `secret`, holding `text` under `file`, written over nothing
+/// at the first revision of the statement numbered `number`.
+fn a_new_file(
+    author: &NodeIdentity,
+    secret: &[u8; 32],
+    number: u64,
+    file: &str,
+    text: &str,
+) -> Entry {
+    let lab = derive::own_secret(secret, "lab").unwrap();
+    let rev = cordelia_core::revision::next_under(None, number).unwrap();
+    let inside = Inside {
+        name: file.into(),
+        value: Value::Text(text.into()),
+        chain: Some(Vec::new()),
+    };
+    Entry::seal(&lab, author, rev, &inside).unwrap()
+}
+
+/// Push `entries` to `relay`, as a client of the test's own, which holds
+/// no secret: a relay checks only the two signatures of an entry.
+fn pushes(relay: &Node, entries: &[Entry]) {
+    let wire: Vec<Vec<u8>> = entries.iter().map(Entry::to_wire).collect();
+    let at = RelayAt {
+        p2p: relay.p2p,
+        key: key_of(relay),
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async move {
+        let client = Client::to_relay(&at).await.expect("the client connects");
+        client.push(wire).await.expect("the relay answers the push");
+        // Closed at once: a relay takes so many connections from one
+        // address, and every node of the test shares this one.
+        client.conn.close(0u32.into(), b"done");
+    });
+}
+
+/// Every text of the channel of `lab` in the generation of `secret` that
+/// `node`'s store holds, opened with that secret.
+fn texts_held(node: &Node, secret: &[u8; 32]) -> Vec<String> {
+    let lab = derive::own_secret(secret, "lab").unwrap();
+    let channel = derive::channel_id(&lab).unwrap();
+    let db = store_of(node);
+    let mut stmt = db
+        .prepare(
+            "SELECT channel_id, slot, author, rev, is_delete, content, author_sig, channel_sig
+             FROM entries WHERE channel_id = ?1",
+        )
+        .unwrap();
+    let entries: Vec<Entry> = stmt
+        .query_map([channel.as_slice()], |row| {
+            Ok(Entry {
+                channel: row.get(0)?,
+                slot: row.get(1)?,
+                author: row.get(2)?,
+                rev: row.get::<_, i64>(3)? as u64,
+                delete: row.get(4)?,
+                content: row.get(5)?,
+                author_signature: row.get(6)?,
+                channel_signature: row.get(7)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    entries
+        .iter()
+        .filter_map(
+            |entry| match entry.clone().check().ok()?.open(&lab).ok()?.value {
+                Value::Text(text) => Some(text),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// Every text in the files of a memory folder, conflict files among them.
+fn folder_texts(memory: &Path) -> Vec<String> {
+    std::fs::read_dir(memory)
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter_map(|file| std::fs::read_to_string(file.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The highest place in `node`'s own store of an entry that `author`
+/// signed.
+fn last_taken_from(node: &Node, author: &[u8; 32]) -> i64 {
+    last_stored_by(node, author)
+}
+
+/// `cordelia msg <args>` on `node`, run in `dir`, its input a pipe that
+/// gives `input` and ends.
+fn msg_given(node: &Node, dir: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut command = node.command_for(&[], &[&["msg"], args].concat());
+    command
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A command that refuses before it reads may have closed its end.
+    let _ = stdin.write_all(input);
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// [`msg_given`], with nothing on its input.
+fn msg_in(node: &Node, dir: &Path, args: &[&str]) -> std::process::Output {
+    msg_given(node, dir, args, b"")
+}
+
+/// What the laptop's folder must not hold, nor the desktop's, nor any
+/// channel of the desktop's change: the words of each text the tablet wrote
+/// after its removal, or a key it added wrote.
+const LATE: [&str; 4] = [
+    "the tablet, late, under change 2",
+    "the tablet, late, carried by the phone",
+    "the tablet's text, made apart",
+    "written by a key the tablet added",
+];
+
+/// Test 7 of decision 2026-10-24 (removal), section 7: nothing a removed
+/// device sends after its removal is taken by a device that knows
+/// (property 5, the owner's ruling). As test 1, with the tablet's folder
+/// mapped and a phone that uses relay A and is stopped on change 2.
+///
+/// - **In the generation the removal was made after:** once the desktop
+///   has removed the tablet, and before the laptop renews, the tablet
+///   edits `h.md` under change 2; the laptop takes it, and carries it into
+///   its own change 3 when it renews. Once the laptop has moved: (h) its
+///   folder and every channel of the desktop's change 3, at either relay,
+///   hold none of that edit, which is in the laptop's local history.
+/// - **A carry of a carry:** the phone, still on change 2, takes a second
+///   late edit of the tablet's (`i.md`; given to its door while it is
+///   stopped, as relay A would have handed it), and carries it into the
+///   laptop's change 3 when it applies it; the laptop takes only the
+///   phone's version. (i) After the move, neither the laptop's folder nor
+///   any channel of the desktop's change 3 holds it.
+/// - **In a branch made apart:** once the tablet has applied the laptop's
+///   change 3, it writes `a.md` and sends a message to the laptop's agent;
+///   the laptop takes both, and its agent appends a line to that file. After
+///   the move: (a) the laptop's folder holds neither the tablet's text nor
+///   the line over it, which are in its local history (`cordelia history`),
+///   and its status says edits were set aside; (b) no channel of the
+///   desktop's change 3, at either relay, holds that text; (c) the desktop's
+///   folder never holds it, nor a conflict file beside a file; (d) `cordelia
+///   msg summary` and `msg read` on the laptop no longer show the message,
+///   and `msg log` shows it as from a device that is no longer one of
+///   yours.
+/// - **A key that the tablet adds:** the tablet adds a key of the test's
+///   own under the laptop's change 3, and that key writes `x.md`; the
+///   laptop takes the record and the file before it knows. After the move:
+///   (j) no folder of the laptop's or the desktop's, and no channel of the
+///   desktop's change 3, holds it; (k) the laptop keeps that key as removed,
+///   and the next change it makes is to list it as removed.
+/// - **After the laptop knows:** a client of the test's own that holds the
+///   tablet's key writes in every channel the tablet holds, of the laptop's
+///   change 3 and of change 2, its messages channels among them. (e)
+///   Neither the laptop nor the desktop stores any of it; (f) no folder of
+///   either holds that text; (g) neither shows a message from the tablet.
+///
+/// Taken out: rule 7's cut of a branch made apart ((a) to (c) fail);
+/// rule 7's cut of what is stored after an arrival cut (the appended line
+/// carries the text: (a) and (b) fail); rule 7's cut by time, or the
+/// arrivals kept across a carry ((h) or (i) fails); rule 6's judging again
+/// of records ((j) and (k) fail); rule 6 in the messages' check of who
+/// counts ((d) fails); a move that still reads the generation it left
+/// ((e) to (g) fail).
+#[test]
+fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_knows() {
+    let relay_a = relay_started();
+    let relay_b = relay_started();
+    let mut laptop = device_started("laptop", &relay_a);
+    let mut desktop = device_started("desktop", &relay_a);
+    let mut tablet = device_started("tablet", &relay_a);
+    let mut phone = device_started("phone", &relay_a);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    adds(&laptop, &tablet, "tablet");
+    adds(&laptop, &phone, "phone");
+    let (l_notes, l_mem) = notes_of(&laptop);
+    let (d_notes, d_mem) = notes_of(&desktop);
+    let (t_notes, t_mem) = notes_of(&tablet);
+    let (p_notes, p_mem) = notes_of(&phone);
+    std::fs::write(l_mem.join("h.md"), "h one\n").unwrap();
+    for (n, notes) in [
+        (&laptop, &l_notes),
+        (&desktop, &d_notes),
+        (&tablet, &t_notes),
+        (&phone, &p_notes),
+    ] {
+        syncs_lab(n, notes);
+    }
+    // The tablet's agent of another folder, to send a message from.
+    let t_plan = tablet.home().join("plan");
+    std::fs::create_dir_all(&t_plan).unwrap();
+    tablet.cli(&["sync", "map", &path(&t_plan), "plan"]);
+    let everyone = [&relay_a, &relay_b, &laptop, &desktop, &tablet, &phone];
+    for mem in [&d_mem, &t_mem, &p_mem] {
+        wait_for("each device has h.md", &everyone, 180, || {
+            (read(&mem.join("h.md"))?.as_str() == "h one\n").then_some(())
+        });
+    }
+    // All on change 2, which lists each.
+    let mut at = renews(&laptop, &["stays", "stays", "stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    for n in [&desktop, &tablet, &phone] {
+        has_applied(n, 2, &everyone);
+    }
+    let two = applied_secret_of(&laptop);
+    phone.stop();
+
+    // The desktop uses relay B alone, and removes the tablet: its change 3.
+    moves_relay(&mut desktop, &relay_a, &relay_b);
+    let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
+    let moved_to = applied_secret_of(&desktop);
+
+    // (h) The tablet edits h.md under change 2, after its removal; the
+    // laptop, which has not heard, takes it.
+    let late_h = "h one\nthe tablet, late, under change 2\n";
+    std::fs::write(t_mem.join("h.md"), late_h).unwrap();
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet];
+    wait_for("the laptop takes the tablet's late edit", &all, 120, || {
+        (read(&l_mem.join("h.md"))?.as_str() == late_h).then_some(())
+    });
+
+    // (i) The phone, stopped on change 2, holds a second late edit of the
+    // tablet's, which the tablet never held.
+    let tablet_id = identity_of(&tablet);
+    let late_i = a_new_file(&tablet_id, &two, 2, "i.md", &format!("{}\n", LATE[1]));
+    {
+        // Through the phone's own door, as a relay hands it: the phone
+        // keeps its arrival.
+        let db = cordelia_storage::db::open(&phone.data_dir().join("cordelia.db")).unwrap();
+        let entry = late_i.clone().check().unwrap();
+        let taken = cordelia_api::take::take(
+            &db,
+            &identity_of(&phone),
+            &entry,
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+        assert!(
+            matches!(taken, cordelia_api::take::Taken::Own { .. }),
+            "{taken:?}"
+        );
+    }
+
+    // The laptop renews, apart from the removal, and carries h.md; the
+    // tablet applies its change.
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let own = applied_secret_of(&laptop);
+    has_applied(&tablet, 3, &all);
+    assert_eq!(person_of(&tablet)["latest"], person_of(&laptop)["latest"]);
+
+    // The phone applies the laptop's change, carrying i.md; the laptop
+    // takes the phone's version alone.
+    phone.start();
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet, &phone];
+    wait_for("the phone is healthy", &all, 30, || healthy(&phone));
+    has_applied(&phone, 3, &all);
+    wait_for("the laptop takes the phone's carry", &all, 180, || {
+        read(&l_mem.join("i.md"))?.contains(LATE[1]).then_some(())
+    });
+
+    // (a) In the branch made apart, the tablet writes a.md, and its agent
+    // sends the laptop's a message.
+    let made_apart = format!("{}\n", LATE[2]);
+    std::fs::write(t_mem.join("a.md"), &made_apart).unwrap();
+    wait_for("the laptop takes the tablet's file", &all, 120, || {
+        (read(&l_mem.join("a.md"))? == made_apart).then_some(())
+    });
+    let appended = format!("{made_apart}the laptop's line\n");
+    std::fs::write(l_mem.join("a.md"), &appended).unwrap();
+    wait_for("the tablet takes the laptop's line", &all, 120, || {
+        (read(&t_mem.join("a.md"))? == appended).then_some(())
+    });
+    let said = wait_for("the tablet's message is sent", &all, 120, || {
+        let said = msg_given(
+            &tablet,
+            &t_plan,
+            &["send", "--to", "lab"],
+            b"from the tablet, made apart\n",
+        );
+        let refused = String::from_utf8_lossy(&said.stderr).into_owned();
+        match said.status.success() {
+            true => Some(said),
+            false if refused.contains("has not yet read its own messages back") => None,
+            false if refused.contains("No device of yours syncs") => None,
+            false => panic!("the tablet's send was refused: {refused}"),
+        }
+    });
+    let sent = String::from_utf8_lossy(&said.stdout).into_owned();
+    let id = sent
+        .strip_prefix("Sent ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{sent}"))
+        .to_string();
+    wait_for("the laptop's agent is shown the message", &all, 120, || {
+        let said = msg_in(&laptop, &l_notes, &["summary"]);
+        String::from_utf8_lossy(&said.stdout)
+            .contains(&id)
+            .then_some(())
+    });
+
+    // (j) The tablet adds a key of the test's own under the laptop's
+    // change 3, and that key writes x.md; the laptop takes both.
+    let added = NodeIdentity::generate().unwrap();
+    tablet.stop();
+    writes_a_record_adding(&tablet, &added.public_key(), "added late");
+    tablet.start();
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet, &phone];
+    wait_for("the tablet is healthy", &all, 30, || healthy(&tablet));
+    let by_added = a_new_file(&added, &own, 3, "x.md", &format!("{}\n", LATE[3]));
+    // Pushed once: once the record makes the key count, the laptop reads
+    // the channel at its relays again from the start, and takes it.
+    pushes(&relay_a, std::slice::from_ref(&by_added));
+    wait_for("the laptop takes the key's file", &all, 180, || {
+        read(&l_mem.join("x.md"))?.contains(LATE[3]).then_some(())
+    });
+
+    // The laptop is set up with relay B too, and moves.
+    laptop.stop();
+    laptop.add_relay(&format!("127.0.0.1:{}", relay_b.p2p), None);
+    laptop.start();
+    let all = [&relay_a, &relay_b, &laptop, &desktop, &tablet, &phone];
+    wait_for("the laptop is healthy", &all, 30, || healthy(&laptop));
+    wait_for("the laptop follows the desktop's change", &all, 180, || {
+        (person_of(&laptop)["latest"].as_str() == Some(removal.as_str())).then_some(())
+    });
+    assert_eq!(applied_secret_of(&laptop), moved_to);
+    let tablet_key = key_bytes(&tablet);
+    let marks = (
+        last_taken_from(&laptop, &tablet_key),
+        last_taken_from(&desktop, &tablet_key),
+    );
+
+    // The laptop's folder goes back.
+    wait_for("the laptop's folder goes back", &all, 120, || {
+        let back = read(&l_mem.join("h.md"))?.as_str() == "h one\n"
+            && read(&l_mem.join("a.md")).is_none()
+            && read(&l_mem.join("i.md")).is_none()
+            && read(&l_mem.join("x.md")).is_none();
+        back.then_some(())
+    });
+    // (a) In its local history, and the status says so.
+    let history = laptop.cli(&["history", "lab"]);
+    assert!(history.contains("set aside"), "(a): {history}");
+    assert!(
+        history.contains("a.md") && history.contains("h.md"),
+        "(a): {history}"
+    );
+    let status = laptop.cli(&["status"]);
+    assert!(status.contains("set aside"), "(a): {status}");
+    // (h), (i), (a), (j): the laptop's folder holds none of it.
+    for text in folder_texts(&l_mem) {
+        for late in LATE {
+            assert!(!text.contains(late), "the laptop's folder: {text}");
+        }
+    }
+
+    // Some passes and cycles, for what the laptop sends after the move.
+    std::fs::write(l_mem.join("after.md"), "written after the move\n").unwrap();
+    wait_for("the desktop has the file written after", &all, 180, || {
+        (read(&d_mem.join("after.md"))?.as_str() == "written after the move\n").then_some(())
+    });
+
+    // (b), (h), (i), (j): no channel of the desktop's change 3, at either
+    // relay, holds any of it, whoever signed it; (c) nor the desktop's
+    // folder, conflict files among them.
+    for relay in [&relay_a, &relay_b] {
+        for text in texts_held(relay, &moved_to) {
+            for late in LATE {
+                assert!(!text.contains(late), "a relay: {text}");
+            }
+        }
+    }
+    for text in folder_texts(&d_mem) {
+        for late in LATE {
+            assert!(!text.contains(late), "(c) the desktop's folder: {text}");
+        }
+    }
+
+    // (d) The message is shown by `msg log` alone.
+    let summary = msg_in(&laptop, &l_notes, &["summary"]);
+    assert!(
+        !String::from_utf8_lossy(&summary.stdout).contains(&id),
+        "(d): {}",
+        String::from_utf8_lossy(&summary.stdout)
+    );
+    let read_it = msg_in(&laptop, &l_notes, &["read", &id]);
+    assert!(!read_it.status.success(), "(d)");
+    assert!(
+        String::from_utf8_lossy(&read_it.stderr).contains("no longer one of yours"),
+        "(d): {}",
+        String::from_utf8_lossy(&read_it.stderr)
+    );
+    let logged = msg_in(&laptop, &l_notes, &["log"]);
+    let printed = String::from_utf8_lossy(&logged.stdout).into_owned();
+    assert!(printed.contains(&format!("Message {id}")), "(d): {printed}");
+    assert!(
+        printed.contains("From a device that is no longer one of yours."),
+        "(d): {printed}"
+    );
+
+    // (k) The key the tablet added is kept as removed, and the next change
+    // made here is to list it as removed (rule 20).
+    let removed: Vec<[u8; 32]> = {
+        let db = store_of(&laptop);
+        let mut stmt = db.prepare("SELECT key FROM person_removed_keys").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert!(removed.contains(&added.public_key()), "(k)");
+    let prepared = laptop.post("/api/v1/change/prepare", serde_json::json!({}));
+    let added_key = cordelia_crypto::bech32::encode_public_key(&added.public_key()).unwrap();
+    assert!(
+        prepared["removed"].as_array().is_some_and(|keys| keys
+            .iter()
+            .any(|key| key.as_str() == Some(added_key.as_str()))),
+        "(k): {prepared}"
+    );
+
+    // After the laptop knows: a client with the tablet's key writes in every
+    // channel the tablet holds.
+    let mut late = Vec::new();
+    for secret in secrets_of(&tablet) {
+        let number = 3;
+        late.push(a_new_file(
+            &tablet_id,
+            &secret,
+            number,
+            "late.md",
+            "the tablet, after the laptop knew\n",
+        ));
+        for channel in [
+            derive::personal_secret(&secret).unwrap(),
+            derive::messages_secret(&secret).unwrap(),
+        ] {
+            let inside = Inside {
+                name: "msg/late".into(),
+                value: Value::Text("the tablet, after the laptop knew".into()),
+                chain: Some(Vec::new()),
+            };
+            let rev = cordelia_core::revision::next_under(None, number).unwrap();
+            late.push(Entry::seal(&channel, &tablet_id, rev, &inside).unwrap());
+        }
+    }
+    pushes(&relay_a, &late);
+    pushes(&relay_b, &late);
+    std::thread::sleep(Duration::from_secs(30));
+    // (e)
+    assert_eq!(
+        last_taken_from(&laptop, &tablet_key),
+        marks.0,
+        "(e) the laptop"
+    );
+    assert_eq!(
+        last_taken_from(&desktop, &tablet_key),
+        marks.1,
+        "(e) the desktop"
+    );
+    // (f)
+    for mem in [&l_mem, &d_mem] {
+        for text in folder_texts(mem) {
+            assert!(!text.contains("after the laptop knew"), "(f): {text}");
+        }
+    }
+    // (g)
+    for (n, notes) in [(&laptop, &l_notes), (&desktop, &d_notes)] {
+        let said = msg_in(n, notes, &["summary"]);
+        let said = String::from_utf8_lossy(&said.stdout).into_owned();
+        assert!(!said.contains("tablet"), "(g): {said}");
+    }
+    let _ = p_notes;
 }
