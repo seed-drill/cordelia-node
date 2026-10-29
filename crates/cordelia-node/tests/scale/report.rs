@@ -1364,6 +1364,61 @@ fn against(bound: Option<u64>, bar: u64) -> Verdict {
     }
 }
 
+/// What `key` rose by over the pairs kept, as [`rise`] reads it, where the
+/// node counts it: `None` where no sample of the node carries it (a node
+/// of a version that does not count it), which is no count of nothing.
+fn rise_counted(
+    series: &Series,
+    key: &str,
+    a: f64,
+    b: f64,
+    keep: &dyn Fn(f64, f64) -> bool,
+) -> Option<f64> {
+    series
+        .iter()
+        .any(|s| metric(s, key).is_some())
+        .then(|| rise(series, key, a, b, keep))
+}
+
+/// The most of a histogram, `key` its `_max`, in µs, over every life of
+/// the node up to `b`: the largest that any sample at or before `b`
+/// carries, since each life's most counts from its start. It bounds every
+/// take of the window, and of what came before it. `None` where no sample
+/// carries it.
+fn most_up_to(series: &Series, key: &str, b: f64) -> Option<f64> {
+    series
+        .iter()
+        .filter(|s| s.t <= b)
+        .filter_map(|s| metric(s, key))
+        .reduce(f64::max)
+}
+
+/// How the p99 of `n` takes meets a bar of `bar` µs (decision 2026-10-22
+/// §3, bar 4). Where the takes over the bar are counted (`over_bar`), that
+/// settles it: the p99 is within the bar where at most 1% of the takes are
+/// over it, and over the bar where more are. Otherwise the p99 is read as
+/// its bucket's bound, `bound` ([`against`]); where that bucket holds the
+/// bar, the most held, `most`, settles it where it is within the bar, and
+/// nothing else does.
+fn p99_against(
+    n: f64,
+    bound: Option<u64>,
+    bar: u64,
+    over_bar: Option<f64>,
+    most: Option<f64>,
+) -> Verdict {
+    if let Some(over) = over_bar {
+        return match over <= 0.01 * n {
+            true => Verdict::Pass,
+            false => Verdict::Fail,
+        };
+    }
+    match against(bound, bar) {
+        Verdict::NotResolved if most.is_some_and(|m| m <= bar as f64) => Verdict::Pass,
+        judged => judged,
+    }
+}
+
 /// The worse of two verdicts: a failure, then what is not resolved.
 fn worse(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
@@ -1381,6 +1436,7 @@ fn bar_4(read: &Read) -> Line {
         let series = relay_series(read, r);
         let mut worst_wait = (0u64, "", Verdict::Pass);
         let mut worst_read = (0u64, "", Verdict::Pass);
+        let mut worst_over_10 = None;
         let (mut over_250, mut over_50) = (0.0, 0.0);
         for kind in RELAY_TAKES {
             let label = format!("kind=\"{kind}\"");
@@ -1403,16 +1459,31 @@ fn bar_4(read: &Read) -> Line {
                 &[0.99],
             );
             if n > 0.0 {
-                // At most 1% over 5 ms: the p99 is within 10 ms whatever
-                // its bucket; over 1% over 50 ms: it is over.
-                let judged = match (over("wait", "5"), over("wait", "50")) {
-                    (five, _) if five <= 0.01 * n => Verdict::Pass,
-                    (_, fifty) if fifty > 0.01 * n => Verdict::Fail,
-                    _ => against(w[0], 10_000),
+                // The count over 10 ms settles the p99 against 10 ms. A
+                // node that does not count it: at most 1% over 5 ms, the
+                // p99 is within 10 ms whatever its bucket; over 1% over
+                // 50 ms, it is over; else its bucket, or its most.
+                let over_10 = rise_counted(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_over{{{label},ms=\"10\"}}"),
+                    read.start,
+                    read.end,
+                    &keep,
+                );
+                let most = most_up_to(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_max{{{label}}}"),
+                    read.end,
+                );
+                let judged = match (over_10, over("wait", "5"), over("wait", "50")) {
+                    (None, five, _) if five <= 0.01 * n => Verdict::Pass,
+                    (None, _, fifty) if fifty > 0.01 * n => Verdict::Fail,
+                    _ => p99_against(n, w[0], 10_000, over_10, most),
                 };
                 let w99 = w[0].unwrap_or(u64::MAX);
                 if w99 > worst_wait.0 {
                     worst_wait = (w99, kind, judged);
+                    worst_over_10 = over_10.map(|ten| (ten, n));
                 }
                 verdict = worse(verdict, judged);
             }
@@ -1427,7 +1498,12 @@ fn bar_4(read: &Read) -> Line {
                     &[0.99],
                 );
                 if n > 0.0 {
-                    let judged = against(h[0], 1_000);
+                    let most = most_up_to(
+                        &series,
+                        &format!("{LOCK}_hold_microseconds_max{{{label}}}"),
+                        read.end,
+                    );
+                    let judged = p99_against(n, h[0], 1_000, None, most);
                     let h99 = h[0].unwrap_or(u64::MAX);
                     if h99 > worst_read.0 {
                         worst_read = (h99, kind, judged);
@@ -1448,10 +1524,14 @@ fn bar_4(read: &Read) -> Line {
             true => "none".to_string(),
             false => format!("{}, {}", worst.1, worst.2.word().to_lowercase()),
         };
+        let counted = match worst_over_10 {
+            Some((ten, n)) => format!("; {ten:.0} of {n:.0} over 10 ms"),
+            None => String::new(),
+        };
         said.push(format!(
-            "relay {}: wait p99 at most {} ({}), a read's hold p99 at most {} ({}), {over_250:.0} \
-             other holds over 250 ms and {over_50:.0} over 50 ms, the lock held at most {:.1}% of \
-             a minute",
+            "relay {}: wait p99 at most {} ({}{counted}), a read's hold p99 at most {} ({}), \
+             {over_250:.0} other holds over 250 ms and {over_50:.0} over 50 ms, the lock held at \
+             most {:.1}% of a minute",
             r + 1,
             us(Some(worst_wait.0)),
             named(&worst_wait),
@@ -1465,9 +1545,10 @@ fn bar_4(read: &Read) -> Line {
         figure: said.join("; "),
         bar: "each kind's wait p99 at most 10 ms; a read's hold p99 at most 1 ms; every other \
               hold under 250 ms and at most 10 over 50 ms; held at most a quarter of any minute \
-              (a p99 is read as its bucket's bound, a power of two of µs, and is NOT RESOLVED \
-              where its bucket holds the bar: from 513 to 1,024 µs for 1 ms, and from 8,193 to \
-              16,384 µs for 10 ms where the waits over 5 ms do not settle it)"
+              (a p99 is read as its bucket's bound, a power of two of µs; where its bucket holds \
+              the bar, a wait's p99 is settled by the count over 10 ms, within the bar where at \
+              most 1% are over it, and a read's hold by its most, where that is at most 1 ms; NOT \
+              RESOLVED only where nothing counted settles it)"
             .into(),
         verdict,
     }
@@ -3023,7 +3104,8 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             };
             lock.push(format!(
                 "{kind}: {n:.0} takes, wait p50/p99/p99.9 {}/{}/{}, hold p50/p99/p99.9 {}/{}/{}, \
-                 the most held {most:.0} µs, {:.0} over 5 ms and {:.0} over 50 ms",
+                 the most held {most:.0} µs, {:.0} over 5 ms, {:.0} over 10 ms and {:.0} over 50 \
+                 ms; {:.0} waits over 10 ms",
                 us(w[0]),
                 us(w[1]),
                 us(w[2]),
@@ -3031,7 +3113,15 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
                 us(h[1]),
                 us(h[2]),
                 over("5"),
-                over("50")
+                over("10"),
+                over("50"),
+                rise(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_over{{{label},ms=\"10\"}}"),
+                    read.start,
+                    read.end,
+                    &keep,
+                )
             ));
         }
         let _ = writeln!(

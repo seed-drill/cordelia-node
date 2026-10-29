@@ -3112,17 +3112,33 @@ least 16 s; checked at compile time.
 them reads other bounds. A power of two a bucket keeps a percentile within
 a factor of two; finer buckets cost an atomic each.
 
-### LOCK_COUNTED_OVER_MS = [5, 50, 100, 250]
+### LOCK_COUNTED_OVER_MS = [5, 10, 50, 100, 250]
 
 **Rationale:** the lengths past which a wait or a hold is counted apart,
 for the bars that a histogram of powers of two cannot read exactly: 5 ms
 and 50 ms, the counts of §1.2 and bar 4 (c) (at most ten holds over 50 ms);
-100 ms, the waits of a device that bar 5 counts (`cordelia msg summary`
-tries the lock for `AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms,
-which bar 4 (c) holds every write under. 250 ms falls inside the bucket of
-131 to 262 ms, so it is counted by itself.
+10 ms, bar 4 (a)'s wait at p99; 100 ms, the waits of a device that bar 5
+counts (`cordelia msg summary` tries the lock for
+`AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms, which bar 4 (c) holds
+every write under. 10 ms falls inside the bucket of 8,193 to 16,384 µs and
+250 ms inside the bucket of 131 to 262 ms, so each is counted by itself.
+
+**How bar 4 (a) reads 10 ms:** a kind's wait at p99 is at most 10 ms where
+at most 1% of that kind's waits in the window are over 10 ms, and over it
+where more are; the count settles the bar where the p99's bucket holds it.
+Before 10 ms was counted, a p99 in that bucket was settled only where at
+most 1% were over 5 ms or more than 1% over 50 ms, and was otherwise NOT
+RESOLVED, as relay 2's sweeps were in two of stage 190's runs (104 waits,
+2 over 5 ms, the most 17,004 µs). Bar 4 (b)'s 1 ms is settled where its
+bucket holds it only by the most held, where that is at most 1 ms.
+
+**Derivation:** chosen, each from the bar that reads it; checked at
+compile time to rise and to fall inside the histogram.
 
 **If you change it:** a bar that reads one of these reads another count.
+A route's line for each is added or lost (`ms="10"` and the rest), and the
+scale test's report reads a count that is missing as one it cannot use:
+bar 4 (a) is then NOT RESOLVED where the bucket holds the bar.
 
 ### LOAD_RELAYS_COUNTED = 16
 

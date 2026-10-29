@@ -581,6 +581,43 @@ mod tests {
         );
     }
 
+    /// A sweep that waits 40 ms behind another holder is counted, in the
+    /// route, as one wait of kind sweep over 10 ms (decision 2026-10-22
+    /// §3, bar 4 (a)); the holder's 40 ms as one hold of its kind over
+    /// 10 ms; and a pull that waits for nothing as none.
+    #[test]
+    fn a_wait_and_a_hold_over_10_ms_are_counted_by_kind_in_the_route() {
+        let lock = Arc::new(TimedLock::new(()));
+        let holder = held_for(&lock, 40);
+        {
+            let _sweep = taking(Kind::Sweep);
+            drop(lock.lock().unwrap());
+        }
+        holder.join().unwrap();
+        {
+            let _pull = taking(Kind::Pull);
+            drop(lock.lock().unwrap());
+        }
+        let said = crate::load::render(&crate::load::Load::default(), lock.times(), 0.0);
+        let value = |key: &str| {
+            said.lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+                .unwrap_or_else(|| panic!("{key} is not said"))
+                .to_string()
+        };
+        let over_10 = |what: &str, kind: &str| {
+            value(&format!(
+                "cordelia_lock_{what}_microseconds_over{{kind=\"{kind}\",ms=\"10\"}}"
+            ))
+        };
+        assert_eq!(over_10("wait", "sweep"), "1");
+        assert_eq!(over_10("hold", "sweep"), "0");
+        assert_eq!(over_10("hold", "other"), "1");
+        assert_eq!(over_10("wait", "pull"), "0");
+        assert_eq!(over_10("hold", "pull"), "0");
+        assert_eq!(lock.times().wait(Kind::Sweep).over_ms(10), Some(1));
+    }
+
     /// `future`'s output, where it is ready at its first poll: every
     /// pause these tests give is.
     fn at_once<F: Future>(future: F) -> F::Output {
@@ -631,7 +668,7 @@ mod tests {
         assert!(wait.max_micros >= 100_000, "{wait:?}");
         assert_eq!(
             wait.over,
-            [1, 1, 1, 0],
+            [1, 1, 1, 1, 0],
             "a wait over 100 ms, as bar 5 counts"
         );
         assert_eq!(lock.times().given_up(Kind::Api), 0);
