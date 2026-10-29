@@ -2975,7 +2975,7 @@ fn move_records(
 
 /// The name of a folder's index file (decision 2026-09-30 §4.5): its lines
 /// are put back by a rule of their own.
-const INDEX_FILE: &str = "MEMORY.md";
+pub(crate) const INDEX_FILE: &str = "MEMORY.md";
 
 /// Note each key that this device counted under the statement `leaving`
 /// and that `statement`, which it now applies, has in neither of its

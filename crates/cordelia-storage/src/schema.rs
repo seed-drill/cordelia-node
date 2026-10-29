@@ -1320,9 +1320,9 @@ CREATE TABLE file_copies (
 );
 "#;
 
-/// Migration v25: a conflict copy whose text's history is not known
-/// (decision 2026-10-24 (removal), rule 7; the third read of slice 8, its
-/// second low finding).
+/// Migration v25: a conflict copy whose text's history is not known, and an
+/// arrival whose chain may have dropped links (decision 2026-10-24
+/// (removal), rule 7; the third read of slice 8).
 ///
 /// - `file_copies.held`: 1 where the folder's record of the file the copy
 ///   was made from names no signer, or no chain, so that what the copy's
@@ -1333,12 +1333,24 @@ CREATE TABLE file_copies (
 ///   still held. Every copy noted before the step is 0, as it was: its
 ///   chain was given when it was made.
 ///
+/// - `file_arrivals_stored.unknown`: 1 where the entry's chain may have
+///   dropped what it was written after: it was missing, or held
+///   `MAX_ENTRY_LINKS` links, the most a chain keeps, and named no version
+///   that the file held here before (or the file is the index, whose merges
+///   drop links from either side). A removed key's link may have fallen off
+///   it, so at a carry the event is judged as an arrival of every removed
+///   key (the extra look of the third read of slice 8). An event kept before
+///   the step whose chain was full is so too: that fails safe.
+///
 /// A step of its own, and not step 24 changed again: step 24 was changed
 /// in place twice while unreleased, and no node or relay ran a build of it
 /// (slice 8's notes).
 const MIGRATION_V25: &str = r#"
 ALTER TABLE file_copies ADD COLUMN held INTEGER NOT NULL DEFAULT 0
     CHECK(typeof(held) = 'integer' AND held IN (0, 1));
+ALTER TABLE file_arrivals_stored ADD COLUMN unknown INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(unknown) = 'integer' AND unknown IN (0, 1));
+UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -5734,8 +5746,9 @@ mod tests {
     }
 
     /// The step to version 25 adds `file_copies.held`, 0 on every copy noted
-    /// before it, and takes no value but 0 or 1; it is made in one step with
-    /// its version, and asked for twice it is run once.
+    /// before it, and `file_arrivals_stored.unknown`, 1 on an event whose
+    /// chain was full; each takes no value but 0 or 1; it is made in one
+    /// step with its version, and asked for twice it is run once.
     #[test]
     fn step_25_holds_no_copy_noted_before_it() {
         let conn = at_v21();
@@ -5748,7 +5761,12 @@ mod tests {
         }
         conn.execute_batch(
             "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
-             VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32))",
+             VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32));
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9);
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                 full_signers)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 10, zeroblob(16));",
         )
         .unwrap();
         let version = |conn: &Connection| -> u32 {
@@ -5765,6 +5783,16 @@ mod tests {
             .query_row("SELECT held FROM file_copies", [], |row| row.get(0))
             .unwrap();
         assert_eq!(held, 0);
+        // An event whose chain was full is judged as one that may have
+        // dropped links; one that was not, is not.
+        let unknown: Vec<i64> = conn
+            .prepare("SELECT unknown FROM file_arrivals_stored ORDER BY stored_at")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(unknown, [0, 1]);
         for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
             let sql = format!(
                 "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)

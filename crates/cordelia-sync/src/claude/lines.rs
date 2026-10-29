@@ -26,7 +26,7 @@ use rusqlite::Connection;
 use cordelia_api::publish::{self, PlannedAgainst};
 use cordelia_api::state::{LineFound, Look};
 use cordelia_core::CordeliaError;
-use cordelia_core::protocol::{INDEX_LINE_LOOK_GAP_SECS, INDEX_LINE_LOOK_SECS};
+use cordelia_core::protocol::{INDEX_LINE_LOOK_GAP_SECS, INDEX_LINE_LOOK_SECS, MAX_ENTRY_LINKS};
 use cordelia_crypto::entry::Value;
 use cordelia_crypto::version::Slot;
 use cordelia_storage::atomic::write_atomic;
@@ -69,6 +69,10 @@ pub(super) struct Beside {
     /// removed (decision 2026-10-24 (removal), rule 7).
     pub signers: Vec<[u8; 32]>,
     pub links: Vec<[u8; 16]>,
+    /// Whether an entry's chain may have dropped links: it is missing, or
+    /// holds the most a chain keeps. It then names every removed key (the
+    /// extra look of the third read of slice 8).
+    pub unknown: bool,
     pub text: String,
 }
 
@@ -109,6 +113,12 @@ pub(super) fn beside(slot: &Slot) -> Vec<Beside> {
                     .iter()
                     .flat_map(|entry| entry.chain.iter().flatten().map(|link| link.signer))
                     .collect(),
+                unknown: version.entries.iter().any(|entry| {
+                    entry
+                        .chain
+                        .as_ref()
+                        .is_none_or(|chain| chain.len() >= MAX_ENTRY_LINKS)
+                }),
                 text: text.clone(),
             })
         })
@@ -523,6 +533,7 @@ fn put_back(
             .filter(|version| {
                 !version.signers.iter().any(|key| cut.key(key))
                     && !version.links.iter().any(|link| cut.signer(link))
+                    && !(version.unknown && cut.any())
             })
             .collect();
         let (due, of_removed): (Vec<&index_lines::Record>, Vec<&index_lines::Record>) = due

@@ -347,6 +347,13 @@ impl CutNow {
             .any(|cut| self.cut(cut))
     }
 
+    /// Whether anything of any removed key is cut: what a chain names that
+    /// may have dropped links, missing or at the most a chain keeps (the
+    /// extra look of the third read of slice 8).
+    pub fn any(&self) -> bool {
+        self.cuts.keys().iter().any(|cut| self.cut(cut))
+    }
+
     fn cut(&self, cut: &KeyCut) -> bool {
         match &self.generation {
             Some(generation) => self.cuts.cuts(cut, generation, self.now),
@@ -607,12 +614,22 @@ mod tests {
         for generation in [Some(at(2)), None] {
             assert!(now(generation).key(&[9; 32]));
             assert!(now(generation).signer(&signer));
+            // A chain that may have dropped links names every removed key
+            // (the extra look of the third read of slice 8).
+            assert!(now(generation).any());
         }
         for generation in [at(3), at(4)] {
             assert!(!now(Some(generation)).key(&[9; 32]));
             assert!(!now(Some(generation)).signer(&signer));
+            assert!(!now(Some(generation)).any());
         }
         assert!(!now(Some(at(2))).key(&[8; 32]));
+        let none = CutNow {
+            cuts: Cuts::of(&noted, &[]),
+            generation: Some(at(2)),
+            now: 1_000_000,
+        };
+        assert!(!none.any());
     }
 
     /// What a carry by command leaves out (the second read of slice 8, its

@@ -56,6 +56,9 @@ pub struct Stored {
     /// Where its chain was full, the other keys that its links name: a
     /// removed key's link among them is cut all the same.
     pub full_signers: Vec<[u8; 16]>,
+    /// Whether its chain may have dropped what it was written after
+    /// ([`noted_unknown`]): it is judged as an arrival of every removed key.
+    pub unknown: bool,
     /// The version that was current in the file before it, as one entry:
     /// `None` where there was none.
     pub before: Option<Entry>,
@@ -200,6 +203,20 @@ pub fn note(
     noted.map_err(storage)
 }
 
+/// The event at `place` ([`note`]) stored an entry whose chain may have
+/// dropped what it was written after (decision 2026-10-24 (removal), rule
+/// 7): it was missing, or full and named no version the file held before.
+/// A removed key's link may have fallen off it, so a carry judges it as an
+/// arrival of every removed key.
+pub fn noted_unknown(conn: &Connection, place: i64) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_stored SET unknown = 1 WHERE place = ?1",
+        params![place],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
 /// How a file counts toward its bound: each arrival, and an event that
 /// has none of its own (its chain was full) as one.
 fn counted(conn: &Connection, channel: &[u8; 32], slot: &[u8; 32]) -> rusqlite::Result<i64> {
@@ -273,7 +290,7 @@ pub fn of_file(
         .prepare(
             "SELECT place, number, hash, stored_at, full_signers, before_author, before_rev,
                     before_delete, before_content, before_author_sig, before_channel_sig,
-                    stored_id
+                    stored_id, unknown
              FROM file_arrivals_stored WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
         )
         .map_err(storage)?;
@@ -291,6 +308,7 @@ pub fn of_file(
                     .unwrap_or_default(),
                 before,
                 stored_id: id_of(row.get(11)?),
+                unknown: row.get(12)?,
                 arrivals: Vec::new(),
             })
         })
@@ -581,8 +599,8 @@ pub fn copy_file(
         for place in places {
             conn.execute(
                 "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
-                     full_signers)
-                 SELECT channel_id, ?2, number, hash, stored_at, full_signers
+                     full_signers, unknown)
+                 SELECT channel_id, ?2, number, hash, stored_at, full_signers, unknown
                  FROM file_arrivals_stored WHERE place = ?1",
                 params![place, to_slot.as_slice()],
             )?;

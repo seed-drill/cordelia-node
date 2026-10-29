@@ -2195,3 +2195,41 @@ fn a_put_back_takes_no_line_from_a_removed_devices_version() {
         }
     }
 }
+
+/// A version beside the index's whose chain may have dropped links,
+/// missing or at the most a chain keeps, is marked so (the extra look of
+/// the third read of slice 8): the put-back takes no line from it where
+/// anything of a removed key is cut, since a removed key's link may have
+/// fallen off it. One link fewer is not.
+#[test]
+fn a_version_beside_whose_chain_may_have_dropped_links_is_marked() {
+    use cordelia_core::protocol::MAX_ENTRY_LINKS;
+    use cordelia_crypto::entry::Link;
+    use cordelia_crypto::version::{Slot, VersionEntry};
+    let link = Link {
+        hash: [1; 16],
+        signer: [2; 16],
+    };
+    let of = |chain: Option<Vec<Link>>| Version {
+        rev: 1,
+        name: INDEX.into(),
+        value: Value::Text(OTHER_LINE.into()),
+        entries: vec![VersionEntry {
+            id: [3; 32],
+            author: [4; 32],
+            chain,
+        }],
+    };
+    let slot = Slot {
+        current: None,
+        lost: vec![
+            of(None),
+            of(Some(vec![link; MAX_ENTRY_LINKS])),
+            of(Some(vec![link; MAX_ENTRY_LINKS - 1])),
+        ],
+        highest: None,
+        next: None,
+    };
+    let marked: Vec<bool> = lines::beside(&slot).iter().map(|v| v.unknown).collect();
+    assert_eq!(marked, [true, true, false]);
+}
