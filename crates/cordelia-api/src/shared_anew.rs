@@ -33,7 +33,7 @@
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{AGENT_MESSAGE_KEPT_DAYS, SEALED_SECRET_BYTES, SHARED_MAX_KEYS};
+use cordelia_core::protocol::{SEALED_SECRET_BYTES, SHARED_MAX_KEYS, SHARED_OFFER_DELIVERED_SECS};
 use cordelia_crypto::acts::{Came, Filing};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::derive;
@@ -55,10 +55,8 @@ use crate::sharing::{
 };
 
 /// How long the entries of a channel moved from wait in the store for its
-/// offer to be at each relay of its card: 30 days, as a key is let go
-/// (`AGENT_MESSAGE_KEPT_DAYS`, §6.3). A relay of the card that is not one
-/// of the device's own never answers, and the entries go then.
-const DELIVERING_SECS: i64 = AGENT_MESSAGE_KEPT_DAYS as i64 * 24 * 60 * 60;
+/// offer to be at each relay of its card (§7, `SHARED_OFFER_DELIVERED_SECS`).
+const DELIVERING_SECS: i64 = SHARED_OFFER_DELIVERED_SECS as i64;
 
 /// The first bytes of the name of every notice of this record that
 /// `cordelia devices` shows: a statement forgets the notices a person
