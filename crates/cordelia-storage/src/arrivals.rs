@@ -550,6 +550,11 @@ pub struct Copy {
 /// the copy's too from now on, each with no version to go back to (the copy
 /// held none), and the copy is kept as not yet published. Its first version
 /// is written after `chain` ([`copy_chain`]). All of it, or none.
+///
+/// **`None`: what the text was written after is not known** (the folder's
+/// record names no signer, or no chain): the copy is kept as one that is
+/// never published ([`copy_held`]; the third read of slice 8, its second
+/// low finding).
 pub fn copy_file(
     conn: &Connection,
     channel: &[u8; 32],
@@ -557,8 +562,10 @@ pub fn copy_file(
     to_slot: &[u8; 32],
     folder: &str,
     key: &str,
-    chain: &[[u8; 32]],
+    chain: Option<&[[u8; 32]]>,
 ) -> Result<(), CordeliaError> {
+    let held = chain.is_none();
+    let chain = chain.unwrap_or_default();
     conn.execute_batch("SAVEPOINT file_copy").map_err(storage)?;
     let copied = (|| -> rusqlite::Result<()> {
         let places: Vec<i64> = {
@@ -601,16 +608,17 @@ pub fn copy_file(
         )?;
         keep_to_the_bound(conn, channel, to_slot)?;
         conn.execute(
-            "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(channel_id, slot) DO UPDATE SET folder = excluded.folder,
-                 key = excluded.key, chain = excluded.chain",
+                 key = excluded.key, chain = excluded.chain, held = excluded.held",
             params![
                 channel.as_slice(),
                 to_slot.as_slice(),
                 folder,
                 key,
-                chain.concat()
+                chain.concat(),
+                held
             ],
         )?;
         Ok(())
@@ -640,6 +648,26 @@ pub fn copy_chain(
         .optional()
         .map_err(storage)?;
     Ok(chain.map(|chain| chain.as_chunks::<32>().0.to_vec()))
+}
+
+/// Whether the conflict copy in the file `slot` of `channel` is one whose
+/// text's history was not known when it was made ([`copy_file`]): it is
+/// never published. A carry that leaves it out puts it back to none; one
+/// that does not moves it, still so.
+pub fn copy_held(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<bool, CordeliaError> {
+    let held: Option<bool> = conn
+        .query_row(
+            "SELECT held FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    Ok(held == Some(true))
 }
 
 /// The conflict copy in the file `slot` of `channel` is published, or put

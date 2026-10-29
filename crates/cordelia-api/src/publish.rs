@@ -208,6 +208,12 @@ pub enum Published {
     /// (decision 2026-10-04 §2.3): the name is out of reach. Nothing was
     /// written.
     OutOfReach,
+    /// The file is a conflict copy whose text's history was not known when
+    /// a folder made it ([`copy_made`] with no chain): it is kept on this
+    /// device, and never published (decision 2026-10-24 (removal), rule 7;
+    /// the third read of slice 8, its second low finding). Nothing was
+    /// written.
+    KeptHere,
 }
 
 /// Publish a value under a file's name in a name that this device holds,
@@ -229,6 +235,11 @@ pub fn publish(
         let slot = standing.slot(conn, &channel, write.file)?;
         if !write.planned.is_still(slot.current.as_ref()) {
             return Ok(Published::Changed);
+        }
+        let id = derive::channel_id(&channel)?;
+        let file = slot_id(&derive::slot_key(&channel)?, write.file);
+        if cordelia_storage::arrivals::copy_held(conn, &id, &file)? {
+            return Ok(Published::KeptHere);
         }
         let over = Over {
             channel: &channel,
@@ -565,28 +576,39 @@ fn written_over(
 /// `chain`. A carry before it is published judges it as any file
 /// (`person::move_records`). Called before the copy is written: a copy that
 /// is then not written leaves events that cut nothing honest.
+///
+/// **`None`: the folder does not know what the text was written after**
+/// (its record names no signer, or no chain; the third read of slice 8,
+/// its second low finding). Its first version would name nothing, so a
+/// device that took it would make no arrival of a removed key whose text
+/// it keeps, and a carry made before this device knew of the removal
+/// judges nothing of it either. So it is never published
+/// ([`Published::KeptHere`]): it stays in the folder, on this device alone,
+/// and a carry that leaves it out puts it back to none.
 pub fn copy_made(
     conn: &Connection,
     name: &str,
     folder: &str,
     file: &str,
     copy: &str,
-    chain: &[Link],
+    chain: Option<&[Link]>,
 ) -> Result<(), PersonError> {
     let standing = Standing::of(conn)?;
     let secret = standing.name_secret(conn, name)?;
     let channel = derive::channel_id(&secret)?;
     let slot_key = derive::slot_key(&secret)?;
-    let links: Vec<[u8; 32]> = chain
-        .iter()
-        .take(MAX_ENTRY_LINKS)
-        .map(|link| {
-            let mut both = [0u8; 32];
-            both[..16].copy_from_slice(&link.hash);
-            both[16..].copy_from_slice(&link.signer);
-            both
-        })
-        .collect();
+    let links: Option<Vec<[u8; 32]>> = chain.map(|chain| {
+        chain
+            .iter()
+            .take(MAX_ENTRY_LINKS)
+            .map(|link| {
+                let mut both = [0u8; 32];
+                both[..16].copy_from_slice(&link.hash);
+                both[16..].copy_from_slice(&link.signer);
+                both
+            })
+            .collect()
+    });
     Ok(cordelia_storage::arrivals::copy_file(
         conn,
         &channel,
@@ -594,7 +616,7 @@ pub fn copy_made(
         &slot_id(&slot_key, copy),
         folder,
         copy,
-        &links,
+        links.as_deref(),
     )?)
 }
 

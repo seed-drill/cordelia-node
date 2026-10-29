@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1320,6 +1320,27 @@ CREATE TABLE file_copies (
 );
 "#;
 
+/// Migration v25: a conflict copy whose text's history is not known
+/// (decision 2026-10-24 (removal), rule 7; the third read of slice 8, its
+/// second low finding).
+///
+/// - `file_copies.held`: 1 where the folder's record of the file the copy
+///   was made from names no signer, or no chain, so that what the copy's
+///   text was written after is not known: its first version would name
+///   nothing, and a device that took it would make no arrival of a removed
+///   key whose text it keeps. Such a copy is never published: a carry that
+///   leaves it out puts it back to none, and one that does not moves it,
+///   still held. Every copy noted before the step is 0, as it was: its
+///   chain was given when it was made.
+///
+/// A step of its own, and not step 24 changed again: step 24 was changed
+/// in place twice while unreleased, and no node or relay ran a build of it
+/// (slice 8's notes).
+const MIGRATION_V25: &str = r#"
+ALTER TABLE file_copies ADD COLUMN held INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(held) = 'integer' AND held IN (0, 1));
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1555,6 +1576,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 24 {
         tracing::info!("applying migration v24 (what a device took before it knew)");
         migrate_in_one(conn, MIGRATION_V24, 24)?;
+    }
+
+    if current < 25 {
+        tracing::info!("applying migration v25 (a conflict copy kept on this device)");
+        migrate_in_one(conn, MIGRATION_V25, 25)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5707,6 +5733,50 @@ mod tests {
         }
     }
 
+    /// The step to version 25 adds `file_copies.held`, 0 on every copy noted
+    /// before it, and takes no value but 0 or 1; it is made in one step with
+    /// its version, and asked for twice it is run once.
+    #[test]
+    fn step_25_holds_no_copy_noted_before_it() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+             VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32))",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V25} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 25).is_err());
+        assert_eq!(version(&conn), 24);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 25);
+        migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
+        let held: i64 = conn
+            .query_row("SELECT held FROM file_copies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(held, 0);
+        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
+            let sql = format!(
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
+                 VALUES (zeroblob(32), X'{}', '/m', 'b.md', x'', {value})",
+                "01".repeat(32)
+            );
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
     /// The version before, whose schema is at step 23, stops on a database
     /// that was stepped to 24, as every version stops on one from a later
     /// version: it is refused with both versions, and nothing of it is
@@ -5722,7 +5792,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 24, own: 23 })
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 23
+                })
             ),
             "{refused:?}"
         );

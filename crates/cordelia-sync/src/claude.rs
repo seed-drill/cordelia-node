@@ -2085,6 +2085,15 @@ fn publish_over(
             return Ok(None);
         }
         Published::OutOfReach => return Err(Failure::File(out_of_reach())),
+        Published::KeptHere => {
+            tracing::debug!(
+                folder,
+                channel,
+                key,
+                "a conflict copy whose text's history is not known is kept here; not published"
+            );
+            return Ok(None);
+        }
     }
     // Something was written in a channel of the device's own: the pass
     // that sends is woken.
@@ -2632,8 +2641,15 @@ fn apply(
                     // removed device's late text would otherwise come out
                     // of the cut in it. A copy not noted is not written.
                     let chain = kept_after(ctx.agreed.get(key), &text, &me);
+                    if chain.is_none() {
+                        tracing::info!(
+                            file = %dir.join(&name).display(),
+                            "what this conflict copy's text was written after is not known: it is \
+                             kept on this device, and not published"
+                        );
+                    }
                     let noted = lock(state).and_then(|db| {
-                        publish::copy_made(&db, ctx.agent, folder, key, &name, &chain)
+                        publish::copy_made(&db, ctx.agent, folder, key, &name, chain.as_deref())
                             .map_err(of_person)
                     });
                     if let Err(error) = noted {
@@ -2745,16 +2761,20 @@ fn apply(
 /// version agreed, it is that version, as a carry carries it
 /// ([`cordelia_crypto::chain::carried_from`]); where it is an edit not yet published, it was
 /// written over that version
-/// ([`cordelia_crypto::chain::written_over`]). With no record, or
-/// one that names no signer, it is a new text of this device's, and its
-/// chain is empty.
-fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Vec<Link> {
+/// ([`cordelia_crypto::chain::written_over`]). With no record, it is a
+/// new text of this device's, and its chain is empty.
+///
+/// **`None` where the record names no signer, or no chain** (the third
+/// read of slice 8, its second low finding): what the text was written
+/// after is not known, and an empty chain would name nothing of a removed
+/// key whose text it keeps. Such a copy is kept on this device, and never
+/// published ([`publish::copy_made`]).
+fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Option<Vec<Link>> {
     let Some(agreed) = agreed else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let Some(signer) = agreed.signer else {
-        return Vec::new();
-    };
+    let signer = agreed.signer?;
+    let chain = agreed.chain.as_deref()?;
     let mut hash = [0u8; 16];
     if let Some(whole) = agreed.hash {
         hash.copy_from_slice(&whole[..16]);
@@ -2763,15 +2783,12 @@ fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Vec<Link> {
         hash,
         signer: Link::signer_of(&signer),
     };
-    let chain = agreed.chain.as_deref();
     let mut built = match agreed.hash == Some(Content::new(text).hash) && signer == *me {
-        true => chain.unwrap_or_default().to_vec(),
-        false => std::iter::once(link)
-            .chain(chain.unwrap_or_default().iter().copied())
-            .collect(),
+        true => chain.to_vec(),
+        false => std::iter::once(link).chain(chain.iter().copied()).collect(),
     };
     built.truncate(cordelia_core::protocol::MAX_ENTRY_LINKS);
-    built
+    Some(built)
 }
 
 /// Count an edit that a carry set aside (decision 2026-10-24 (removal),
@@ -3468,6 +3485,113 @@ mod tests {
                     assert!(
                         !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
                         "{between:?}: {inside:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A conflict copy made over a folder's record that names no chain, or
+    /// no signer, is kept on this device and never published (the third
+    /// read of slice 8, its second low finding): what its text was written
+    /// after is not known, so its first version would name nothing of the
+    /// tablet's, and a phone that took it would carry the tablet's late text
+    /// at its carry. The laptop's own carry leaves it out by the arrivals it
+    /// was given, and puts it back to none.
+    #[test]
+    fn a_conflict_copy_whose_texts_history_is_not_known_is_never_published() {
+        for lacks in ["chain", "author"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let st = state(tmp.path());
+            let (_, phrase) = person_of(&st, NAME);
+            let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+            let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+            let phone = another_device(&st, &tmp.path().join("phone"), NAME);
+            for other in [&desktop, &tablet, &phone] {
+                deliver(&st, other, NAME);
+            }
+            let mem = tmp.path().join("memory");
+            std::fs::create_dir_all(&mem).unwrap();
+            let cycle = || {
+                let generation = st.sync_control.generation();
+                sync_folder(&st, &mem, &channel_now(&st), NAME, "abcd", generation).unwrap()
+            };
+            std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
+            assert_eq!(cycle().published, 1);
+
+            // The tablet writes late, and the laptop takes it; its record of
+            // the file then names no chain, or no signer, as a record kept
+            // before either was can.
+            deliver(&st, &tablet, NAME);
+            write(&tablet, NAME, "notes.md", text("the tablet's late text\n"));
+            deliver(&tablet, &st, NAME);
+            assert_eq!(cycle().pulled, 1);
+            {
+                let db = st.db.lock().unwrap();
+                let sql = format!("UPDATE sync_files SET {lacks} = NULL WHERE key = 'notes.md'");
+                assert_eq!(db.execute(&sql, []).unwrap(), 1);
+            }
+            let next = {
+                let db = tablet.db.lock().unwrap();
+                publish::read(&db, NAME, "notes.md")
+                    .unwrap()
+                    .slot
+                    .next
+                    .unwrap()
+            };
+            entry_at(
+                &tablet,
+                NAME,
+                "notes.md",
+                text("the tablet again\n"),
+                next,
+                Some(Vec::new()),
+            );
+            deliver(&tablet, &st, NAME);
+            let report = cycle();
+            assert_eq!(report.conflicts, 1, "{lacks}: {report:?}");
+            let copy = names::conflict_name("notes.md", "abcd");
+            assert_eq!(
+                std::fs::read_to_string(mem.join(&copy)).unwrap(),
+                "the tablet's late text\n"
+            );
+            // Never published, cycle after cycle: the phone never has it.
+            for _ in 0..2 {
+                let report = cycle();
+                assert_eq!(
+                    (report.published, report.failed.len()),
+                    (0, 0),
+                    "{lacks}: {report:?}"
+                );
+            }
+            assert!(mem.join(&copy).exists());
+            deliver(&st, &phone, NAME);
+            let secret = name_secret(&phone, NAME);
+            let names: Vec<String> = held(&phone, NAME)
+                .iter()
+                .map(|entry| entry.open(&secret).unwrap().name)
+                .collect();
+            assert!(!names.contains(&copy), "{lacks}: {names:?}");
+
+            // The desktop removes the tablet; the laptop's carry leaves the
+            // copy out, and puts it back to none.
+            let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+            for on in [&st, &phone] {
+                let db = on.db.lock().unwrap();
+                take::take(&db, &on.identity, &removal, now()).unwrap();
+            }
+            assert_eq!(cycle().published, 0, "{lacks}");
+            assert!(
+                !mem.join(&copy).exists(),
+                "{lacks}: the copy is put back to none"
+            );
+            for on in [&st, &phone] {
+                let secret = name_secret(on, NAME);
+                for entry in held(on, NAME) {
+                    let inside = entry.open(&secret).unwrap();
+                    assert!(
+                        !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                        "{lacks}: {inside:?}"
                     );
                 }
             }
