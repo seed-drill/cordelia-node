@@ -419,6 +419,22 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
     );
     assert_eq!(listing.lines.last().unwrap(), LABEL_FIRST);
 
+    // A key it did not ask about is no answer: the tablet's, removed.
+    let unasked = vec![encode_public_key(&tablet.public_key()).unwrap()];
+    let refused = anew_plan(
+        conn,
+        &s[0].identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some(&unasked),
+        now,
+    );
+    assert_eq!(
+        refusal_word(refused.map(|(_, plan)| plan.map(|p| p.asks))),
+        ""
+    );
     // A keep past 64 staying is refused.
     let too_many: Vec<String> = listing.asked[..63]
         .iter()
@@ -501,6 +517,14 @@ fn a_removal_makes_each_shared_channel_anew_without_the_removed_key() {
     written_by(&s, 0, &channel, &[&alice], now);
     let tablet = crate::several::identity_of(2);
     stores(&s, 0, &anew(&tablet, &channel, 1), now);
+    // A message of the laptop's own there, not yet at the relay: after the
+    // removal it is never sent there (rule 23).
+    stores(
+        &s,
+        0,
+        &crate::shared::tests::message(&s[0].identity, &channel, 1, "before", now),
+        now,
+    );
 
     s.change(0, &[0, 1], &[2]);
     let now = s.now + 20;
@@ -613,12 +637,28 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
     // `cordelia devices` names it.
     let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
     let line = not_clean_line("review");
+    let notice = seen
+        .notices
+        .iter()
+        .find(|notice| notice.says == line)
+        .unwrap_or_else(|| panic!("{:?}", seen.notices));
+    // Cleared, it is named no more, and a statement after does not bring
+    // it back (§3.5: clearing ends the naming).
+    let id: [u8; 32] = hex::decode(&notice.id).unwrap().try_into().unwrap();
+    crate::look::clear(conn, identity, &id, now)
+        .unwrap()
+        .unwrap();
+    s.change(1, &[0, 1], &[]);
+    let conn = &s[1].conn;
+    let identity = &s[1].identity;
+    let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
     assert!(
-        seen.notices.iter().any(|notice| notice.says == line),
+        !seen.notices.iter().any(|notice| notice.says == line),
         "{:?}",
         seen.notices
     );
-    // `shared anew` goes through, and ends both.
+    assert!(is_not_clean(conn, &channel.id).unwrap());
+    // `shared anew` goes through, and ends it.
     let (_, plan) = anew_plan(
         conn,
         identity,
@@ -632,8 +672,6 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
     .unwrap();
     make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
     assert!(!is_not_clean(conn, &channel.id).unwrap());
-    let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
-    assert!(!seen.notices.iter().any(|notice| notice.says == line));
 }
 
 /// A recovery takes and names the acts of a device in someone else's hands
@@ -695,6 +733,13 @@ fn a_recovery_takes_and_names_the_acts_of_a_device_in_someone_elses_hands() {
         "{all}"
     );
     assert!(all.contains("\"desk\" filed"), "{all}");
+    // Passed over, it is neither brought back nor named with its undoing.
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("\"desk\" filed") && line.contains("undo it with")),
+        "{all}"
+    );
     // The new machine takes the laptop's acts, and not the desktop's.
     let (written, _) = lists::recovered(&lists, |key| (*key == s.key(0)).then_some(Maker::Removed));
     let filed: Vec<String> = lists::acts_of(&written)
