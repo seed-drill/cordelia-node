@@ -11,10 +11,11 @@
 //! key's record added it after that key's cut time) has its adder's cut.
 //!
 //! [`Cuts::cuts`] says whether what a removed key wrote, or added, and that
-//! this device took at a time in a generation, is cut: where it came
-//! 1. in a generation made apart from a change that removed the key; or
-//! 2. in a generation that such a change was made after, at or after the
-//!    key's cut time, or at any time where there is none.
+//! this device took at a time in a generation, is cut: where it came in a
+//! generation that is no removal of the key and was made after none, and
+//! 1. made apart from a change that removed the key; or
+//! 2. that such a change was made after, at or after the key's cut time, or
+//!    at any time where there is none.
 //!
 //! What it does not know fails safe: a generation whose chain it did not
 //! note is taken as made apart, and a key that no noted change removes has
@@ -176,7 +177,22 @@ impl Cuts {
             return true;
         }
         let generation_chain = self.chains.get(generation).cloned().flatten();
-        for (removal, chain) in &cut.removals {
+        // A generation that is a removal of the key, or made after one,
+        // knew it to be removed: nothing of it is cut there. Every later
+        // change lists the key as removed (rule 20), so without this a
+        // generation made after the first removal, which is on the chain of
+        // the next, would be judged by time, and honest arrivals there cut
+        // again at every later change.
+        let after_a_removal = cut.removals.iter().any(|(removal, _)| {
+            removal == generation
+                || generation_chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.contains(removal))
+        });
+        if after_a_removal {
+            return false;
+        }
+        for (_, chain) in &cut.removals {
             if chain.contains(generation) {
                 // A generation the removal was made after: by time.
                 if cut.at.is_none_or(|from| at >= from) {
@@ -184,14 +200,9 @@ impl Cuts {
                 }
                 continue;
             }
-            let after_it = removal == generation
-                || generation_chain
-                    .as_ref()
-                    .is_some_and(|chain| chain.contains(removal));
-            if !after_it {
-                // Made apart from the removal, or not known: cut.
-                return true;
-            }
+            // Neither on its chain nor after it: made apart from the
+            // removal, or not known. Cut.
+            return true;
         }
         false
     }
@@ -321,6 +332,27 @@ mod tests {
         assert!(!cuts.cuts(added, &at(2), from - 1));
         // A key this device does not know to be removed is cut nowhere.
         assert!(!cuts.cuts_key(&[8; 32], &at(2), i64::MAX));
+    }
+
+    /// A generation that is a removal of the key, or made after one, cuts
+    /// nothing of it, though a later change that lists the key again has
+    /// that generation on its chain (rule 20): honest arrivals made after
+    /// the first removal are not cut again at every later change.
+    #[test]
+    fn a_generation_after_a_removal_cuts_nothing_of_the_key() {
+        let noted = [
+            change(2, Some(100), &[], &[1]),
+            change(3, Some(5_000), &[9], &[1, 2]),
+            change(4, Some(9_000), &[9], &[1, 2, 3]),
+            change(5, Some(9_500), &[9], &[1, 2, 3, 4]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        let long_after = 1_000_000;
+        assert!(!cuts.cuts_key(&[9; 32], &at(3), long_after));
+        assert!(!cuts.cuts_key(&[9; 32], &at(4), long_after));
+        // Before the first removal it is still cut by time.
+        assert!(cuts.cuts_key(&[9; 32], &at(2), long_after));
+        assert!(!cuts.cuts_key(&[9; 32], &at(2), 5_000 - MARGIN - 1));
     }
 
     /// A key that no noted change removes has everything cut.
