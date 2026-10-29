@@ -460,6 +460,16 @@ mod tests {
         ];
         let cuts = Cuts::of(&noted, &[([9; 32], None)]);
         assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(4_000 - MARGIN));
+        // Of two made apart, change 3, newer on the chain, gives the time,
+        // though change 2's clock says later.
+        let noted = [
+            change(1, Some(100), &[], &[]),
+            change(2, Some(5_000), &[], &[1]),
+            change(3, Some(4_000), &[], &[1]),
+            change(4, Some(6_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(4_000 - MARGIN));
     }
 
     /// Where no change on the chain has a time, there is none: everything
