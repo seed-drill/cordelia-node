@@ -297,6 +297,7 @@ pub fn forget(
             entries::remove_channel(conn, &row.pair)?;
         }
         cordelia_storage::shared_sharing::forget_all(conn)?;
+        cordelia_storage::shared_anew::forget_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }

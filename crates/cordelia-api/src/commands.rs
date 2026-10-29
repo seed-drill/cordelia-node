@@ -1204,6 +1204,18 @@ pub async fn change_prepare(
         .collect();
     let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
     let (names, names_not_shown) = names_handed(&conn)?;
+    // What a removal names of the shared channels (decision 2026-10-10
+    // §3.5): each the person holds, and each act in force of each device
+    // that counts, with what undoes it; the command names those of the
+    // devices it removes.
+    let (shared_names, shared_acts) = crate::shared_anew::at_a_removal(&conn).map_err(refused)?;
+    let mut acts_handed = Vec::new();
+    for named in shared_acts {
+        acts_handed.push(json!({
+            "maker": written(&named.maker)?,
+            "line": named.line(),
+        }));
+    }
     Ok(HttpResponse::Ok().json(json!({
         "this_device": written(&state.identity.public_key())?,
         "statement": hex::encode(statement),
@@ -1221,6 +1233,8 @@ pub async fn change_prepare(
         "names": names,
         "names_not_shown": names_not_shown,
         "received": received(&state, now()),
+        "shared_channels": shared_names,
+        "shared_acts": acts_handed,
         "look": seen,
     })))
 }
@@ -1332,9 +1346,27 @@ pub async fn change_make(
             "what this device held of a file could not be read, and was not carried: it meets its channel as a new file does"
         );
     }
+    // A removal makes each shared channel anew in the same act, after the
+    // transaction that applies it (decision 2026-10-24, rule 24; decision
+    // 2026-10-10 §3.5): every key of the device's table stays but the
+    // removed ones. A renewal or a settlement that removes nobody changes
+    // none.
+    let made_anew = {
+        let conn = db(&state);
+        let removed =
+            cordelia_storage::meta::get(&conn, cordelia_storage::meta::PERSON_REMOVED_A_KEY)
+                .map_err(|e| refused(PersonError::Storage(e)))?
+                .is_some();
+        match removed {
+            true => crate::shared_anew::anew_at_removal(&conn, &state.identity, now())
+                .map_err(refused)?,
+            false => Vec::new(),
+        }
+    };
     state.own_channels.written();
     state.own_channels.ask_whole();
     Ok(HttpResponse::Ok().json(json!({
+        "made_anew": made_anew,
         "change": applied.number,
         "carried": applied.carried,
         "no_version": applied.no_version,

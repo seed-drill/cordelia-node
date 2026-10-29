@@ -909,6 +909,16 @@ pub enum Do {
     /// newest of the filings, never refused for room, and a drop of the
     /// old one, which takes no place.
     Move { from: [u8; 32], to: Filing },
+    /// The same, with each agent that subscribed to the old channel
+    /// subscribed to the new (decision 2026-10-10 §7: `shared move` "moves
+    /// each subscription of the old channel to the new, each a new act").
+    /// The subscriptions are never refused for room: a move is never
+    /// refused but by `held_at_bound`.
+    MoveWith {
+        from: [u8; 32],
+        to: Filing,
+        agents: Vec<String>,
+    },
     /// Subscribe an agent to a channel, or end its subscription.
     Subscribe(Subscription),
     /// Give a key a label, or take its label away.
@@ -1047,6 +1057,29 @@ fn decide(
             Ok(vec![signed(
                 make(dropped, dated(&key)?, identity).map(AnyAct::Drop),
             )?])
+        }
+        Do::MoveWith { from, to, agents } => {
+            let mut made = decide(
+                computed,
+                makers,
+                identity,
+                &Do::Move {
+                    from: *from,
+                    to: to.clone(),
+                },
+                now,
+            )?;
+            for agent in agents {
+                let subscription = Subscription {
+                    channel: to.channel,
+                    agent: agent.clone(),
+                    subscribed: true,
+                };
+                let key = (Part::Subscription, subscription.item());
+                let made_one = make(subscription, dated(&key)?, identity);
+                made.push(signed(made_one.map(AnyAct::Subscription))?);
+            }
+            Ok(made)
         }
         Do::Move { from, to } => {
             if !filed(from) {
@@ -1292,6 +1325,26 @@ pub fn recovered(
     );
     let computed = compute(lists, &makers, &Takings::default(), Bounds::OF_A_LIST);
     (list_of(computed.written), list_of(computed.past_bound))
+}
+
+/// The machine of a recovery writes, as its own list, what the recovery
+/// takes of `lists`, the lists of the devices it showed (§3.5), with the
+/// keys of `gone` as removed keys and every other in no list: the acts of
+/// a device it removes are taken, as copies; the acts of one the person
+/// still has are passed over until it is added again. The table of shared
+/// channels follows. In the caller's transaction.
+pub fn write_recovered(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    lists: &[([u8; 32], SharedList)],
+    gone: &[[u8; 32]],
+    now: i64,
+) -> Result<(), PersonError> {
+    let (written, _) = recovered(lists, |key| gone.contains(key).then_some(Maker::Removed));
+    let standing = Standing::to_write(conn)?;
+    write_list(conn, identity, &standing, &acts_of(&written), now)?;
+    crate::shared::keep(conn, &identity.public_key(), now)?;
+    Ok(())
 }
 
 /// The list of each key of `shown` among `handed`, the entries of a

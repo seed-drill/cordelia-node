@@ -363,3 +363,190 @@ pub async fn list(
     listed["this_device"] = this_device(&state)?.into();
     Ok(HttpResponse::Ok().json(listed))
 }
+
+// ── POST /api/v1/shared/anew ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnewRequest {
+    pub name: String,
+    #[serde(default)]
+    pub words: Option<String>,
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The keys answered `keep`, each as `cordelia id` writes it; none
+    /// before the person has answered.
+    #[serde(default)]
+    pub keep: Option<Vec<String>>,
+    #[serde(default)]
+    pub look: bool,
+    #[serde(default)]
+    pub said_yes_to: Option<String>,
+}
+
+/// `cordelia shared anew` (decision 2026-10-10 §5.1, §7). Asked first with
+/// `look` and no `keep`: the listing of every key and the keys asked about,
+/// with nothing done. Then with `look` and `keep`: what its yes is for.
+/// Then with `keep` and `said_yes_to`.
+pub async fn anew(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<AnewRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let identity = &state.identity;
+    let plan = |conn: &rusqlite::Connection, own: &[OwnRelay], now: i64| {
+        crate::shared_anew::anew_plan(
+            conn,
+            identity,
+            own,
+            &body.name,
+            body.words.as_deref(),
+            &body.relays,
+            body.keep.as_deref(),
+            now,
+        )
+    };
+    if body.keep.is_none() {
+        let own = sharing::own_relays(&state);
+        let now = state.sync_control.now();
+        let conn = db(&state);
+        let (listing, _) = match plan(&conn, &own, now) {
+            Ok(planned) => planned,
+            Err(failed) => return answer_of(failed),
+        };
+        let mut asked = Vec::new();
+        let held = crate::person::held(&conn)
+            .map_err(crate::commands::refused)?
+            .ok_or_else(|| crate::commands::refused(crate::person::PersonError::FollowsNoPhrase))?;
+        for key in &listing.asked {
+            asked.push(json!({
+                "key": encode_public_key(key).map_err(|e| ApiError::Internal(e.to_string()))?,
+                "form": sharing::sender_form(&conn, &held, &identity.public_key(), key)
+                    .map_err(crate::commands::refused)?,
+            }));
+        }
+        return Ok(HttpResponse::Ok().json(json!({
+            "listing": listing.lines,
+            "ask": asked,
+            "own_devices": listing.own_devices.len(),
+            "this_device": this_device(&state)?,
+        })));
+    }
+    asked_then(
+        &state,
+        body.look,
+        body.said_yes_to.as_deref(),
+        |conn, own, now| match plan(conn, own, now)? {
+            (_, Some(plan)) => Ok(plan),
+            (_, None) => Err(Failed::Refused(sharing::Refusal {
+                word: "",
+                line: "No key was answered.".into(),
+            })),
+        },
+        |conn, own, of, now| {
+            let said = crate::shared_anew::make_anew(conn, identity, own, of, now)?;
+            Ok(json!({ "said": said }))
+        },
+    )
+}
+
+// ── POST /api/v1/shared/move ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveRequest {
+    pub name: String,
+    #[serde(default)]
+    pub words: Option<String>,
+    /// The new channel's four words, where the channel was made anew twice.
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub look: bool,
+    #[serde(default)]
+    pub said_yes_to: Option<String>,
+}
+
+/// `cordelia shared move` (decision 2026-10-10 §5.1, §7).
+pub async fn move_to(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<MoveRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let identity = &state.identity;
+    asked_then(
+        &state,
+        body.look,
+        body.said_yes_to.as_deref(),
+        |conn, own, now| {
+            crate::shared_anew::move_plan(
+                conn,
+                identity,
+                own,
+                &body.name,
+                body.words.as_deref(),
+                body.to.as_deref(),
+                now,
+            )
+        },
+        |conn, _, to, now| {
+            let said = crate::shared_anew::make_move(conn, identity, to, now)?;
+            Ok(json!({ "said": said }))
+        },
+    )
+}
+
+// ── POST /api/v1/shared/stay ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StayRequest {
+    pub name: String,
+    #[serde(default)]
+    pub words: Option<String>,
+    #[serde(default)]
+    pub look: bool,
+    #[serde(default)]
+    pub said_yes_to: Option<String>,
+}
+
+/// `cordelia shared stay` (decision 2026-10-10 §5.1; decision 2026-10-24,
+/// rule 26). Where nothing pauses the channel it says so, with nothing
+/// done (`said`, with no `asks`).
+pub async fn stay(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<StayRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let identity = &state.identity;
+    {
+        let conn = db(&state);
+        match crate::shared_anew::stay_plan(&conn, identity, &body.name, body.words.as_deref()) {
+            Ok(Err(line)) => return Ok(HttpResponse::Ok().json(json!({ "said": [line] }))),
+            Ok(Ok(_)) => {}
+            Err(failed) => return answer_of(failed),
+        }
+    }
+    asked_then(
+        &state,
+        body.look,
+        body.said_yes_to.as_deref(),
+        |conn, _, _| match crate::shared_anew::stay_plan(
+            conn,
+            identity,
+            &body.name,
+            body.words.as_deref(),
+        ) {
+            Ok(Ok(plan)) => Ok(plan),
+            Ok(Err(line)) => Err(Failed::Refused(sharing::Refusal { word: "", line })),
+            Err(failed) => Err(failed),
+        },
+        |conn, _, channel, _| {
+            let said = crate::shared_anew::make_stay(conn, channel, &body.name)?;
+            Ok(json!({ "said": [said] }))
+        },
+    )
+}

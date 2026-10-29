@@ -41,7 +41,7 @@ use cordelia_crypto::share::{Card, Relays, Share, share_name};
 use cordelia_crypto::shared::{Anew, anew_name};
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries;
-use cordelia_storage::shared::{self as kept, State};
+use cordelia_storage::shared as kept;
 use cordelia_storage::shared_sharing::{self as rows, ShareRow, TypedForChannel};
 
 use crate::lists::{self, Do, Done, Part, Refused};
@@ -657,6 +657,9 @@ pub fn who_wrote(
         ),
     }];
     lines.extend(changes);
+    lines.extend(crate::shared_anew::after_who_wrote(
+        conn, held, own, channel, name,
+    )?);
     Ok(lines)
 }
 
@@ -682,7 +685,7 @@ pub struct New {
 /// the configuration gives a relay it knows by its key, one or two, each
 /// once; or, with none named, the device's own relays that have a key, at
 /// most two.
-fn relays_named(own: &[OwnRelay], named: &[String]) -> Out<Vec<OwnRelay>> {
+pub(crate) fn relays_named(own: &[OwnRelay], named: &[String]) -> Out<Vec<OwnRelay>> {
     if named.is_empty() {
         let taken: Vec<OwnRelay> = own.iter().take(SHARED_MAX_RELAYS).cloned().collect();
         if taken.is_empty() {
@@ -1506,7 +1509,9 @@ pub fn write_empty_anew_records(
     let own = identity.public_key();
     let mut written = 0;
     for row in kept::channels(conn)? {
-        if row.state != State::Held {
+        // Nothing is written in a channel not yet clean, or paused, but the
+        // offer that makes it anew (decision 2026-10-24, rules 23 to 26).
+        if !crate::shared_anew::writes_there(conn, identity, &row)? {
             continue;
         }
         let card = Card::from_bytes(&row.card)

@@ -174,6 +174,24 @@ pub enum Refused {
     /// it or in its threads, wait to be read by a person on this device.
     #[error("messages of this agent's loop in the channel wait to be read by a person")]
     SharedHeld { from: String, waiting: u64 },
+    /// The shared channel was held by a device that was removed, and is
+    /// not yet made anew (decision 2026-10-24, rules 23 and 25).
+    #[error("the shared channel was held by a device that was removed")]
+    NotClean,
+    /// An offer that seals to this person and leaves out a key was read in
+    /// the shared channel, and the person has neither moved nor stayed
+    /// (decision 2026-10-24, rule 26): who made it, when, and how many keys
+    /// it leaves out.
+    #[error("the shared channel was made anew without some keys")]
+    Paused {
+        maker: [u8; 32],
+        made: u64,
+        left_out: usize,
+    },
+    /// A reply to a message of a channel this person moved away from
+    /// (decision 2026-10-10 §5.5).
+    #[error("message {id} is of a channel that was made anew")]
+    Moved { id: String, channel: [u8; 32] },
 }
 
 impl Refused {
@@ -203,6 +221,9 @@ impl Refused {
             Self::ReplyElsewhere { .. } => "reply_elsewhere",
             Self::ChannelRate { .. } => "channel_rate",
             Self::SharedHeld { .. } => "pair_held",
+            Self::NotClean => "not_clean",
+            Self::Paused { .. } => "paused",
+            Self::Moved { .. } => "moved",
         }
     }
 }

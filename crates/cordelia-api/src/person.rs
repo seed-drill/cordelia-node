@@ -1642,7 +1642,7 @@ fn come_to(
             acts::drop_left_out(conn, &shown.key)?;
         }
     }
-    acts::forget_cleared(conn)?;
+    acts::forget_cleared_but(conn, crate::shared_anew::SHARED_NOTICE)?;
     for name in &names {
         let channel = derive::channel_id(&derive::own_secret(&to.secret, &name.name)?)?;
         held_rows::move_name(conn, &name.name, &channel)?;
@@ -1665,6 +1665,11 @@ fn come_to(
         statement.removed.iter().any(|key| !had.removes(key))
     });
     crate::look::note_removed_a_key(conn, removes_a_key)?;
+    // A removal makes every shared channel this device holds not yet clean
+    // (decision 2026-10-24, rule 23; decision 2026-10-10 §3.5).
+    if removes_a_key {
+        crate::shared_anew::removal_applied(conn, now)?;
+    }
     // The look of a recovery was of the statement that is left: under
     // this one the device carried what it holds, in this transaction.
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
