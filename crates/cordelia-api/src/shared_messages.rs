@@ -5,7 +5,7 @@
 //! - **Subscriptions** are items of the person's list (§3.4): of an agent,
 //!   which is a name, on every device of the person. **Each starts when
 //!   this device first takes it** ([`keep_starts`], kept with the table of
-//!   shared channels): an agent is shown only messages whose shown time and
+//!   shared channels, and only while its channel is held): an agent is shown only messages whose shown time and
 //!   first holding here are both at or after it.
 //! - **Who is shown what** ([`unread`], §6.2): a message of a channel the
 //!   agent subscribes to, shown by the reader (§2.4), after the start, with
@@ -55,10 +55,23 @@ pub fn in_force(conn: &Connection) -> Result<Vec<([u8; 32], String)>, PersonErro
 
 /// Keep the starts of the subscriptions with what is in force, at `now`
 /// (§4.1): a subscription this device has just taken starts now; one taken
-/// again in the same state keeps its start; one that ended goes. Run where
-/// the table of shared channels is kept (`shared::keep`).
+/// again in the same state keeps its start; one that ended goes. A start
+/// is kept only while its channel is held here: a channel dropped, moved
+/// from or not in force loses its starts, so that one taken again starts
+/// again and its agents are shown nothing written while it was not held.
+/// Run where the table of shared channels is kept (`shared::keep`), after
+/// the channels' states.
 pub fn keep_starts(conn: &Connection, now: i64) -> Result<(), PersonError> {
-    kept_in(rows::keep_subscribed(conn, &in_force(conn)?, now))
+    let held: HashSet<[u8; 32]> = kept_in(kept::channels(conn))?
+        .into_iter()
+        .filter(|row| row.state == State::Held)
+        .map(|row| row.channel)
+        .collect();
+    let starts: Vec<_> = in_force(conn)?
+        .into_iter()
+        .filter(|(channel, _)| held.contains(channel))
+        .collect();
+    kept_in(rows::keep_subscribed(conn, &starts, now))
 }
 
 /// Where the agent `agent` subscribes to the shared channel `channel` on

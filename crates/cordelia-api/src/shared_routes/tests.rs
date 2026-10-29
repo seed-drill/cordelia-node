@@ -536,6 +536,59 @@ fn sending_again_in_a_shared_channel_costs_that_channel_alone() {
     let _ = HOUR;
 }
 
+/// A subscription's start is kept only while its channel is held (decision
+/// 2026-10-10 §4.1): `notes` subscribes; the channel is dropped; a member
+/// writes while it is dropped; it is filed again, and that message is
+/// first held after. The agent is not shown it, since its subscription
+/// starts again when the channel is held again; what is written after is
+/// shown.
+#[test]
+fn a_channel_taken_again_after_a_drop_starts_its_subscriptions_again() {
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    assert_eq!(
+        seen::start_of(&s[0].conn, &channel.id, "notes").unwrap(),
+        Some(t)
+    );
+    acts(&s, 0, Do::Drop(channel.id), t + 100);
+    assert_eq!(
+        seen::start_of(&s[0].conn, &channel.id, "notes").unwrap(),
+        None
+    );
+    // The subscription stays in force through the drop.
+    assert!(
+        seen::in_force(&s[0].conn)
+            .unwrap()
+            .contains(&(channel.id, "notes".into()))
+    );
+    let gap = message(&member(1), &channel, 1, "while dropped", t + 200);
+    acts(
+        &s,
+        0,
+        Do::File(crate::lists::tests::filing(7, "review")),
+        t + 5000,
+    );
+    assert_eq!(
+        kept::channel(&s[0].conn, &channel.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        State::Held
+    );
+    assert_eq!(
+        seen::start_of(&s[0].conn, &channel.id, "notes").unwrap(),
+        Some(t + 5000)
+    );
+    given(&s, 0, &gap, t + 5001);
+    assert!(unread(&s, 0, "notes", t + 5002).is_empty());
+    let after = id_given(&s, 0, &channel, 2, "after", t + 5003);
+    assert_eq!(
+        unread(&s, 0, "notes", t + 5004),
+        std::slice::from_ref(&after)
+    );
+}
+
 /// One value written in two channels is two messages (decision 2026-10-10
 /// §4.2): the index holds two rows, a reply with `--channel` finds the one
 /// in that channel, `read <id>` is refused with `more_than_one`, and an
