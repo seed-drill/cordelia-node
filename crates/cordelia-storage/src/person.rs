@@ -552,7 +552,7 @@ pub fn note_change_time(
     hash: &[u8; 16],
     made_at: Option<i64>,
 ) -> Result<(), CordeliaError> {
-    note_change(conn, number, hash, made_at, None, None, None)
+    note_change(conn, number, hash, made_at, None, None, None).map(|_| ())
 }
 
 /// A change as the device noted it ([`note_change`]).
@@ -578,6 +578,8 @@ pub struct NotedChange {
 /// the entry is not at hand), the keys its statement lists as removed and
 /// its chain. What was noted of it before stays; what was not is filled.
 /// It is kept after the change goes, for the cut time of rules 6 and 7.
+/// Says whether anything was filled that was not noted before, its time or
+/// its lists: a cut time may then have moved, and records are judged again.
 pub fn note_change(
     conn: &Connection,
     number: u64,
@@ -586,8 +588,17 @@ pub fn note_change(
     removed: Option<&[[u8; 32]]>,
     chain: Option<&[(u64, [u8; 16])]>,
     devices: Option<&[[u8; 32]]>,
-) -> Result<(), CordeliaError> {
+) -> Result<bool, CordeliaError> {
     let number = i64::try_from(number).unwrap_or(i64::MAX);
+    let had: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT made_at FROM person_change_times WHERE number = ?1 AND hash = ?2",
+            params![number, hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let mut filled = made_at.is_some() && had.flatten().is_none();
     conn.execute(
         "INSERT INTO person_change_times (number, hash, made_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(number, hash) DO UPDATE SET made_at = COALESCE(made_at, excluded.made_at)",
@@ -600,20 +611,22 @@ pub fn note_change(
             row.extend_from_slice(&number.to_be_bytes());
             row.extend_from_slice(hash);
         }
-        conn.execute(
-            "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(number, hash) DO NOTHING",
-            params![
-                number,
-                hash.as_slice(),
-                removed.concat(),
-                row,
-                devices.concat()
-            ],
-        )
-        .map_err(storage)?;
+        filled |= conn
+            .execute(
+                "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(number, hash) DO NOTHING",
+                params![
+                    number,
+                    hash.as_slice(),
+                    removed.concat(),
+                    row,
+                    devices.concat()
+                ],
+            )
+            .map_err(storage)?
+            > 0;
     }
-    Ok(())
+    Ok(filled)
 }
 
 /// Every change the device noted ([`note_change`]), in order of number
@@ -2098,6 +2111,32 @@ mod tests {
         );
         assert_eq!(drop_all_set_aside(&conn).unwrap(), 3);
         assert_eq!(followed_entry(&conn).unwrap().unwrap(), *followed);
+    }
+
+    /// A change noted says whether it filled what was not noted before:
+    /// its time, or its lists (decision 2026-10-24 (removal), rule 6, where
+    /// records are judged again).
+    #[test]
+    fn test_a_change_noted_says_whether_it_filled_anything() {
+        let conn = db::open_in_memory().unwrap();
+        let lists = |conn: &Connection, made_at| {
+            note_change(
+                conn,
+                3,
+                &[3; 16],
+                made_at,
+                Some(&[[9; 32]]),
+                Some(&[(2, [2; 16])]),
+                Some(&[]),
+            )
+            .unwrap()
+        };
+        assert!(!note_change(&conn, 3, &[3; 16], None, None, None, None).unwrap());
+        assert!(lists(&conn, None));
+        assert!(!lists(&conn, None));
+        assert!(lists(&conn, Some(NOW)));
+        assert!(!lists(&conn, Some(NOW + 9)));
+        assert!(note_change(&conn, 4, &[4; 16], Some(NOW), None, None, None).unwrap());
     }
 
     /// The time of each change is kept by its number and hash, once, as
