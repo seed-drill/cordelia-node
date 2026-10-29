@@ -403,6 +403,22 @@ pub fn drop_old_hand_overs(conn: &Connection, now: i64) -> Result<usize, PersonE
     })
 }
 
+/// Drop from this device's store every hand-over it made, where it is
+/// closed: the change it follows is not clear, closed or stored so, as
+/// `fork` (decision 2026-10-24 (removal), rules 5 and 10). Each carries
+/// that change's secret, which a key it knows to be removed holds: it is
+/// sent nowhere more, and [`write_over_dropped`] writes the delete over
+/// each that a relay was sent, which a closed device sends. Returns how
+/// many went. A device that is not closed drops none here.
+pub fn drop_hand_overs_not_clear(conn: &Connection) -> Result<usize, PersonError> {
+    in_one(conn, || match crate::at_relays::stands(conn)? {
+        crate::at_relays::Stands::Closed | crate::at_relays::Stands::Stopped(State::Fork) => {
+            drop_hand_overs(conn, |_| false)
+        }
+        _ => Ok(0),
+    })
+}
+
 /// Write a delete over each hand-over that this device made and that has
 /// gone from its store (decision 2026-10-04 §6): its own entry under the
 /// name `hand-over` in the pair channel, one revision above the

@@ -149,16 +149,42 @@ pub fn stands(conn: &Connection) -> Result<Stands, PersonError> {
 
 // ── The show ─────────────────────────────────────────────────────────
 
-/// The change entry that a device shows a relay, and what it keeps
-/// besides.
+/// The change entries that a device shows a relay (decision 2026-10-24
+/// (removal), rule 18): the change it follows, and each head it sets aside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shows {
     /// The change entry of the change the device follows: the one it
-    /// shows (decision 2026-10-24 (removal), rule 1).
+    /// shows first, and the one whose answer gives leave (rule 18).
     pub entry: CheckedEntry,
-    /// What each head it sets aside is named by. A relay that tells of one
-    /// of them is asked no more about it in that round.
+    /// What each head it sets aside is named by.
     pub set_aside: Vec<[u8; 32]>,
+    /// The change entry of each head it sets aside, checked again as it is
+    /// read, the lowest number first and of two at one number the lower
+    /// ID: the order in which a relay of this version hands them (rule 16).
+    /// A device shows each after the change it follows. One that does not
+    /// check is not shown.
+    pub heads: Vec<CheckedEntry>,
+}
+
+impl Shows {
+    /// The heads set aside that a device shows a relay, in their order: at
+    /// a relay that names the role RELAY_ROLE_HEADS (`keeps_heads`) every
+    /// one, and at one that does not, none numbered above the change
+    /// followed (decision 2026-10-24 (removal), rule 18). A relay of the
+    /// version before takes an entry of a higher revision in place of the
+    /// one it holds: shown such a head, it would drop a removal for it.
+    pub fn heads_shown(&self, keeps_heads: bool) -> impl Iterator<Item = &CheckedEntry> {
+        let followed = self.entry.rev;
+        self.heads
+            .iter()
+            .filter(move |head| keeps_heads || head.rev <= followed)
+    }
+
+    /// Whether the device keeps the change entry named `id`: the change it
+    /// follows, or a head it sets aside.
+    pub fn keeps(&self, id: &[u8; 32]) -> bool {
+        self.entry.id() == *id || self.set_aside.contains(id)
+    }
 }
 
 /// What this device shows a relay. `None` where it follows no phrase: it
@@ -167,9 +193,15 @@ pub fn to_show(conn: &Connection) -> Result<Option<Shows>, PersonError> {
     if held_rows::person(conn)?.is_none() {
         return Ok(None);
     }
+    let mut heads: Vec<CheckedEntry> = held_rows::set_aside_entries(conn)?
+        .into_iter()
+        .filter_map(|kept| kept.entry.check().ok())
+        .collect();
+    heads.sort_by_key(|head| (head.rev, head.id()));
     Ok(Some(Shows {
         entry: followed_entry(conn)?,
         set_aside: set_aside_ids(conn)?,
+        heads,
     }))
 }
 
@@ -380,6 +412,52 @@ pub fn channels(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, 
         own.push(messages);
     }
     pairs.append(&mut own);
+    Ok(pairs)
+}
+
+/// The pair channels in which a closed device sends something: the delete
+/// that it wrote over a hand-over that a relay was sent, and nothing else
+/// (decision 2026-10-24 (removal), rules 4, 5 and 10). A hand-over that it
+/// made carries the secret it follows, which is not clear: it is dropped,
+/// and written over (`crate::adding::drop_hand_overs_not_clear`,
+/// [`crate::adding::write_over_dropped`]), and the delete withdraws it at
+/// each relay that holds it. The delete hands on no secret.
+///
+/// A channel is one where the store holds no hand-over of this device's,
+/// and holds what it wrote there, all of it deletes: the channel of a
+/// hand-over that has gone, of this device and that key. None for a device
+/// that is not closed: one that stands applied sends what it wrote in a
+/// pair channel with the rest ([`channels`]), and one that has stopped
+/// otherwise sends nothing.
+pub fn withdrawals(conn: &Connection, identity: &NodeIdentity) -> Result<Vec<Own>, PersonError> {
+    if !matches!(stands(conn)?, Stands::Closed | Stands::Stopped(State::Fork)) {
+        return Ok(Vec::new());
+    }
+    let own = identity.public_key();
+    let mut pairs: Vec<Own> = Vec::new();
+    for gone in held_rows::hand_overs_gone(conn)? {
+        let Ok(pair) = derive::pair_secret(identity, &gone.key) else {
+            continue;
+        };
+        if derive::channel_id(&pair)? != gone.channel || pairs.iter().any(|p| p.id == gone.channel)
+        {
+            continue;
+        }
+        let written: Vec<Entry> = entries::channel_entries_after(conn, &gone.channel, 0, u32::MAX)?
+            .into_iter()
+            .map(|held| held.entry)
+            .filter(|entry| entry.author == own)
+            .collect();
+        if written.is_empty() || written.iter().any(|entry| !entry.delete) {
+            continue;
+        }
+        pairs.push(Own {
+            kind: Kind::Pair,
+            id: gone.channel,
+            secret: None,
+        });
+    }
+    pairs.sort_by_key(|pair| pair.id);
     Ok(pairs)
 }
 
@@ -1779,6 +1857,7 @@ mod tests {
             Some(Shows {
                 entry: first.clone(),
                 set_aside: Vec::new(),
+                heads: Vec::new(),
             })
         );
         assert_eq!(kept_id(&s[0].conn).unwrap(), Some(first.id()));
@@ -1806,6 +1885,7 @@ mod tests {
             Some(Shows {
                 entry: by_0.clone(),
                 set_aside: vec![by_1.id()],
+                heads: vec![by_1.clone()],
             })
         );
         assert_eq!(kept_id(&on.conn).unwrap(), Some(by_0.id()));
@@ -3419,6 +3499,64 @@ mod tests {
         // nothing is kept of that.
         assert!(sends(on, &OTHER_RELAY, &pair, Which::Since).is_empty());
         assert!(!kept_rows::keeps_any(&on.conn, &OTHER_RELAY, &pair.id).unwrap());
+    }
+
+    /// A closed device sends the delete that it wrote over a hand-over
+    /// that a relay was sent, and nothing else (decision 2026-10-24
+    /// (removal), rules 4, 5 and 10): a hand-over that it made carries the
+    /// secret it follows, which is not clear, and is dropped; the delete
+    /// written over it is what [`withdrawals`] lists, and goes only to the
+    /// relay that was sent the hand-over. A device that stands applied
+    /// withdraws nothing, and a closed one nothing while it holds the
+    /// hand-over.
+    #[test]
+    fn test_a_closed_device_withdraws_a_hand_over_and_sends_nothing_else() {
+        let mut s = Several::new(2);
+        s.make_phrase(0);
+        let handed = s.hand(0, 1).hand_over;
+        let on = &s[0];
+        let pair = channel_of(on, Kind::Pair);
+        let batch = sends(on, &RELAY, &pair, Which::Since);
+        opened_for(&on.conn, &RELAY, &pair, &batch).unwrap();
+        assert_eq!(sends_all(on, &RELAY, &pair, Which::Since), [handed.id()]);
+        // Applied: the pair channel is one of its own; nothing is withdrawn.
+        assert!(withdrawals(&on.conn, &on.identity).unwrap().is_empty());
+        assert_eq!(
+            crate::adding::drop_hand_overs_not_clear(&on.conn).unwrap(),
+            0
+        );
+
+        // Closed: a key it knows to be removed, the one it handed the
+        // secret to, holds the secret it follows (set so by hand).
+        held_rows::keep_removed(&on.conn, &[s.key(1)], 2).unwrap();
+        assert_eq!(stands(&on.conn).unwrap(), Stands::Closed);
+        assert!(channels(&on.conn, &on.identity).unwrap().is_empty());
+        // While it holds the hand-over, it withdraws nothing.
+        assert!(withdrawals(&on.conn, &on.identity).unwrap().is_empty());
+        // The hand-over is dropped, and the delete written over it.
+        assert_eq!(
+            crate::adding::drop_hand_overs_not_clear(&on.conn).unwrap(),
+            1
+        );
+        assert_eq!(
+            write_over_dropped(&on.conn, &on.identity, s.now).unwrap(),
+            1
+        );
+        let pairs = withdrawals(&on.conn, &on.identity).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((&pairs[0].kind, pairs[0].id), (&Kind::Pair, pair.id));
+        // The delete alone goes, and only to the relay sent the hand-over.
+        let batch = sends(on, &RELAY, &pairs[0], Which::Since);
+        assert_eq!(batch.entries.len(), 1);
+        let delete = &batch.entries[0];
+        assert!(delete.delete && delete.author == on.identity.public_key());
+        assert!(sends(on, &OTHER_RELAY, &pairs[0], Which::Since).is_empty());
+        // Stored as closed, as `fork`, the same.
+        held_rows::set_state(&on.conn, State::Fork).unwrap();
+        assert_eq!(withdrawals(&on.conn, &on.identity).unwrap(), pairs);
+        // A device that has stopped otherwise withdraws nothing here.
+        held_rows::set_state(&on.conn, State::Removed).unwrap();
+        assert!(withdrawals(&on.conn, &on.identity).unwrap().is_empty());
     }
 
     /// What is kept of a pair channel at the relays is forgotten once

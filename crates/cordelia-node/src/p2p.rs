@@ -3960,6 +3960,19 @@ pub async fn p2p_loop(
     }
 }
 
+/// The roles a node says in its handshake: the role it is configured
+/// with, and, for a relay, the role RELAY_ROLE_HEADS (decision 2026-10-24
+/// (removal), rule 18): it keeps every head in a slot and hands each, so a
+/// device shows it every head it keeps. A node of the version before reads
+/// only "relay" and "bootnode" there, and passes the other over.
+pub(crate) fn handshake_roles(role: &str) -> Vec<String> {
+    let mut roles = vec![role.to_string()];
+    if role == "relay" {
+        roles.push(cordelia_core::protocol::RELAY_ROLE_HEADS.to_string());
+    }
+    roles
+}
+
 /// Publish the connected peers to the shared state, for `cordelia peers`.
 fn publish_peers(
     state: &cordelia_api::state::AppState,
@@ -4849,9 +4862,13 @@ fn relays_with_links(
         .zip(one)
         .filter(|(_, one)| !matches!(one, OneRelay::SameAs(_)))
         .map(|((relay, peer), _)| {
+            // Whether the relay keeps every head is what it said in its
+            // handshake (decision 2026-10-24 (removal), rule 18).
             let link = peer.and_then(|peer| {
-                let conn = conn_mgr.get_connection(&peer)?.clone();
-                Some(Link::new(relay.host.clone(), peer, conn))
+                let at = conn_mgr.get_peer(&peer)?;
+                let roles = at.handshake.peer_roles.clone();
+                let link = Link::new(relay.host.clone(), peer.clone(), at.conn.clone());
+                Some(link.naming(&roles))
             });
             Relay {
                 name: relay.host.clone(),
@@ -10478,6 +10495,19 @@ mod tests {
         std::net::SocketAddr,
         impl Sized,
     ) {
+        connected_to_a_relay_saying(vec![]).await
+    }
+
+    /// [`connected_to_a_relay`], to a relay that says `roles` in its
+    /// handshake.
+    async fn connected_to_a_relay_saying(
+        roles: Vec<String>,
+    ) -> (
+        cordelia_network::connection::ConnectionManager,
+        [u8; 32],
+        std::net::SocketAddr,
+        impl Sized,
+    ) {
         use cordelia_network::{connection, transport};
         let identity = |seed: u8| {
             std::sync::Arc::new(
@@ -10489,7 +10519,7 @@ mod tests {
         let relay_end = transport::create_endpoint(&relay, here).unwrap();
         let relay_addr = relay_end.local_addr().unwrap();
         let relay_mgr =
-            connection::ConnectionManager::new(relay.clone(), relay_end, vec![], vec![], 9474);
+            connection::ConnectionManager::new(relay.clone(), relay_end, vec![], roles, 9474);
         let (accepts, as_relay) = (relay_mgr.endpoint(), relay_mgr.connect_context());
         let accepted = tokio::spawn(async move {
             let incoming = accepts.accept().await.unwrap();
@@ -10508,6 +10538,44 @@ mod tests {
             relay_addr,
             (relay_mgr, accepted),
         )
+    }
+
+    /// A relay of this version names the role `heads` in its handshake,
+    /// beside "relay", and a device's connection to it keeps that it does
+    /// (decision 2026-10-24 (removal), rule 18): it shows such a relay every
+    /// head it keeps. A connection to a relay that says "relay" alone, as a
+    /// relay of the version before does, keeps that it does not. A node of
+    /// another role names none.
+    #[tokio::test]
+    async fn a_connection_keeps_whether_its_relay_names_the_role_heads() {
+        use cordelia_network::bootstrap::{Relay, RelayAddr};
+        assert_eq!(handshake_roles("relay"), ["relay", "heads"]);
+        assert_eq!(handshake_roles("personal"), ["personal"]);
+        assert_eq!(handshake_roles("bootnode"), ["bootnode"]);
+        for (roles, heads) in [
+            (handshake_roles("relay"), true),
+            (vec!["relay".to_string()], false),
+        ] {
+            let (conn_mgr, key, addr, _relay) = connected_to_a_relay_saying(roles.clone()).await;
+            let peer = NodeId(key);
+            assert_eq!(
+                conn_mgr.get_peer(&peer).unwrap().handshake.peer_roles,
+                roles
+            );
+            let set_up = [Relay {
+                host: "reached.test:9474".into(),
+                key: None,
+            }];
+            let addrs: RelayAddrs = std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {
+                host: "reached.test:9474".into(),
+                addr,
+                key: None,
+            }]));
+            let own = cordelia_api::state::OwnChannels::default();
+            let relays = relays_with_links(&set_up, &addrs, &conn_mgr, &own);
+            let link = relays[0].link.as_ref().expect("the relay is connected");
+            assert_eq!(link.keeps_heads(), heads, "{roles:?}");
+        }
     }
 
     /// A relay given no key is never taken for another relay (decision

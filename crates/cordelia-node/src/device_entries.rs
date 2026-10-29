@@ -21,9 +21,14 @@
 //! - **The whole pass**, as often as the node fetches. The hand-overs
 //!   that this device made and that are two hours old go from its store,
 //!   and a delete is written over each that a relay was sent (§6). Then
-//!   the device **shows** its change entry on every connection, and deals
-//!   with what it is answered (§4.6): the first time on a connection
-//!   whole, and from then on in short. And then, at each relay where it
+//!   the device **shows** its change entries on every connection, and
+//!   deals with what it is answered (§4.6): the change it follows first,
+//!   and then each head it sets aside, every one at a relay that names the
+//!   role `heads` and none numbered above the change it follows at one that
+//!   does not (decision 2026-10-24 (removal), rule 18); each the first time
+//!   on a connection whole, and from then on in short. A closed device
+//!   then pushes the delete it wrote over each hand-over that a relay was
+//!   sent, and nothing else (rules 5 and 10). And then, at each relay where it
 //!   has leave, for each channel of its own: it **proves** the channel's
 //!   key, once on a connection and again after a day; **pulls** the
 //!   channel from the place it keeps, each page through the one door;
@@ -112,7 +117,7 @@ pub mod leave;
 mod own_read;
 pub mod reach;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -134,10 +139,11 @@ use cordelia_core::load::Kind as TakeKind;
 use cordelia_core::lock::{LockWhole, take_as, taking};
 use cordelia_core::protocol::{
     CHANNEL_PROOF_AGAIN_SECS, DEVICE_DELETE_SWEEP_INTERVAL_SECS, ENTRY_OVERHEAD_BYTES,
-    ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION,
-    MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE, OUTBOX_FLUSH_INTERVAL_SECS,
-    OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE, RELAY_ENTRY_PULL_PAGES,
-    SHOW_ANSWER_ROOM_BYTES, SMALL_PAGE_BYTES, entry_cost, left_proofs_kept_back,
+    ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANGE_HEADS,
+    MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
+    OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
+    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, SMALL_PAGE_BYTES, entry_cost,
+    left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -159,9 +165,11 @@ pub use reach::{Reach, Said};
 /// connection that lasts.
 const PROOF_AGAIN: Duration = Duration::from_secs(CHANNEL_PROOF_AGAIN_SECS);
 
-/// The most shows on one connection in one pass: the entry in short, then
-/// whole, and again for each change that the device applies on the way.
-const SHOWS_IN_A_PASS: usize = 6;
+/// The most shows on one connection in one round (decision 2026-10-24
+/// (removal), rule 18): a short show and a whole show for each of the
+/// eight heads a relay can hand, and a show of each of the seven heads the
+/// device sets aside. Derived: three times MAX_CHANGE_HEADS, less one.
+const SHOWS_IN_A_PASS: usize = 3 * MAX_CHANGE_HEADS - 1;
 
 /// What a read through the door for a carry is said to have ended with
 /// where it asked the relay nothing: the relay has refused for now as
@@ -242,6 +250,10 @@ struct At<'a> {
     /// now ([`DeviceEntries::asks_after_refusals`]): a read's are, and a
     /// pass's are not.
     gated: bool,
+    /// Whether the device is closed, and pushes through the one door of a
+    /// closed device the deletes it wrote over hand-overs, and nothing else
+    /// ([`Leave::withdraw`], decision 2026-10-24 (removal), rule 10).
+    closed: bool,
 }
 
 /// The relays of `relays` by their keys, where every one is connected
@@ -284,9 +296,14 @@ enum Step {
 /// What is kept of one connection, and gone with it.
 #[derive(Default)]
 struct OfLink {
-    /// The entry that was last shown whole on it, by what it is named by:
-    /// only that one may be shown in short.
-    shown_whole: Option<[u8; 32]>,
+    /// The change entries that were shown whole on it, or that the relay
+    /// handed whole there, by what each is named by: only those may be
+    /// shown in short (decision 2026-10-24 (removal), rule 16). At most
+    /// twice MAX_CHANGE_HEADS, as a relay of this version remembers them.
+    known_whole: VecDeque<[u8; 32]>,
+    /// The heads set aside that the relay answered with another entry on
+    /// it: none is shown there again (rule 18).
+    not_again: HashSet<[u8; 32]>,
     /// The channels whose keys were proved on it, and when: those of the
     /// device's own, and those that were read as channels of a generation
     /// that was left, each from the moment its proof is sent. It is what
@@ -388,6 +405,10 @@ struct Round {
     /// Whether a show was made: an attempt at the relay (decision
     /// 2026-10-19 §1).
     shown: bool,
+    /// Whether a show was answered: once the round has judged what it was
+    /// answered, the relay is heard while the device wakes (decision
+    /// 2026-10-24 (removal), rule 5).
+    answered: bool,
     /// What the latest show that counts said: "show it whole" to a short
     /// show, and a short show not answered, are followed by a whole one,
     /// whose answer is what counts.
@@ -471,6 +492,10 @@ pub struct DeviceEntries {
     /// Whether the start was noted in what is known of the relays
     /// ([`known::started`]): once a node runs, at its first pass.
     started: AtomicBool,
+    /// Whether the leave counts the commits of the node's database
+    /// ([`Leave::watch_commits`]): from the first pass, which is the first
+    /// that can push.
+    watching: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -499,6 +524,7 @@ impl DeviceEntries {
         Arc::new(Self {
             state,
             leave: Leave::new(clock.clone()).counting(counts),
+            watching: AtomicBool::new(false),
             clock,
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
@@ -559,6 +585,13 @@ impl DeviceEntries {
     async fn passing(self: &Arc<Self>, relays: &[Relay], kind: Pass) {
         if self.state.held.why().is_some() {
             return;
+        }
+        // A push open at the commit after which the device may use the
+        // connection no more is reset (decision 2026-10-24 (removal), rule
+        // 5): from the first pass, which is the first that can push, the
+        // commits of the node's database are counted.
+        if !self.watching.swap(true, Ordering::SeqCst) {
+            self.leave.watch_commits(&lock(&self.state.db));
         }
         let whole = kind == Pass::Whole;
         let number = whole.then(|| self.state.own_channels.whole_pass_begins());
@@ -1339,6 +1372,16 @@ impl DeviceEntries {
             None if whole => Some(self.show_at(link, false).await),
             None => None,
         };
+        // A closed device sends the delete it wrote over a hand-over that
+        // the relay was sent, and nothing else (decision 2026-10-24
+        // (removal), rules 5 and 10).
+        let closed = matches!(
+            at_relays::stands(&lock(&self.state.db)),
+            Ok(Stands::Closed | Stands::Stopped(State::Fork))
+        );
+        if closed {
+            self.withdraw_at(link).await;
+        }
         // (A device that has stopped, or is in a fork, has no channel
         // that a pass goes through. And one that wakes while this turn
         // runs has no leave from then on, anywhere: the one way in
@@ -1347,6 +1390,37 @@ impl DeviceEntries {
             return false;
         }
         self.relay_pass(link, kind).await
+    }
+
+    /// A closed device's turn at `link`: it pushes the delete it wrote
+    /// over each hand-over that the relay was sent, through the one door
+    /// of a closed device ([`Leave::withdraw`]), and nothing else
+    /// (decision 2026-10-24 (removal), rules 4, 5 and 10).
+    async fn withdraw_at(&self, link: &Link) {
+        let read = {
+            let db = lock(&self.state.db);
+            at_relays::withdrawals(&db, &self.state.identity)
+                .and_then(|pairs| Ok((pairs, at_relays::kept_id(&db)?)))
+        };
+        let (pairs, under) = match read {
+            Ok((pairs, Some(under))) => (pairs, under),
+            Ok((_, None)) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read what a closed device withdraws");
+                return;
+            }
+        };
+        let at = At {
+            link,
+            under,
+            gated: false,
+            closed: true,
+        };
+        for pair in &pairs {
+            if matches!(self.push(&at, pair, Which::Since).await, Step::Stop) {
+                return;
+            }
+        }
     }
 
     // ── Old deletes ─────────────────────────────────────────────────
@@ -1583,6 +1657,20 @@ impl DeviceEntries {
             Ok(dropped) => tracing::info!(dropped, "hand-overs left the store: two hours old"),
             Err(e) => tracing::debug!(error = %e, "could not drop the old hand-overs"),
         }
+        // A closed device drops every hand-over it made: each carries the
+        // secret it follows, which is not clear (decision 2026-10-24
+        // (removal), rule 5). The delete over each that a relay was sent is
+        // written below, and is all that a closed device sends.
+        match adding::drop_hand_overs_not_clear(&db) {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(
+                dropped,
+                "hand-overs left the store: they carry a secret that a removed device holds"
+            ),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not drop the hand-overs of a closed device")
+            }
+        }
         match write_over_dropped(&db, &self.state.identity, now) {
             Ok(0) => {}
             Ok(written) => {
@@ -1711,7 +1799,9 @@ impl DeviceEntries {
     ///
     /// Where the relay answered the entry shown whole, and there is no
     /// leave, the show is made again there only after a wait, a little
-    /// longer each time (§16): nothing is shown while it lasts. An answer
+    /// longer each time (§16): the change followed is not shown while it
+    /// lasts, and each head set aside is (decision 2026-10-24 (removal),
+    /// rule 18), in a round that is no attempt at the relay. An answer
     /// that gives leave ends it. **Only an answer starts the wait:** a
     /// whole show whose stream is reset, which is how a relay says "not
     /// now" to an asker that is over its bytes for the minute, is made
@@ -1721,6 +1811,10 @@ impl DeviceEntries {
         let gave_leave = self.show_round(link, &mut round, gated).await;
         if round.shown {
             self.round_ended(link, &round);
+        }
+        // Its answers are judged: the relay is heard (rule 5).
+        if round.answered {
+            self.leave.heard(link.name());
         }
         let now = self.clock.now();
         let mut kept = lock(&self.kept);
@@ -1771,12 +1865,43 @@ impl DeviceEntries {
     }
 
     /// [`Self::show_at`], for one round of shows, with what became of
-    /// them said in `round`.
+    /// them said in `round` (decision 2026-10-24 (removal), rule 18).
+    ///
+    /// **The change followed first, and then each head set aside:** at a
+    /// relay that names the role RELAY_ROLE_HEADS every one, and at one
+    /// that does not none numbered above the change followed
+    /// ([`at_relays::Shows::heads_shown`]). A head that a relay answers
+    /// with another entry is not shown again in the round, nor on the
+    /// connection at a relay that does not name the role.
+    ///
+    /// **Leave comes from the answer to the change followed**, and a later
+    /// show of a head does not take it away ([`Leave::show`]). An answer
+    /// that hands a head the device keeps gives no leave, and does not end
+    /// the round: the change followed is shown again. The same head handed
+    /// twice in the round ends it: at a relay that does not name the role,
+    /// with leave, since a relay of the version before does that and holds
+    /// that head alone; at one that names it, with none, since a relay of
+    /// this version hands a head twice only where it lacks the change. An
+    /// `Other` is always followed by a whole show, of the entry shown.
+    ///
+    /// **While the show of the change followed waits** after an answer
+    /// that gave no leave ([`Self::show_waits`]), only that show is left
+    /// out: each head is shown, on every pass, and the round gives no
+    /// leave, and is no attempt at the relay for the status.
+    ///
+    /// Only the answer to the show of the change followed is the relay's
+    /// latest answer (decision 2026-10-19 §1): what `round` says of it.
     async fn show_round(&self, link: &Link, round: &mut Round, gated: bool) -> bool {
-        // The entry is shown whole where it was not yet on this
-        // connection, where the relay asks for it, and where the relay
-        // tells of another that the device does not keep.
-        let mut whole = false;
+        // Whether the change followed is to be shown, the heads shown in
+        // this round, how often each entry was handed whole in it, and the
+        // entry that is shown whole next.
+        let mut followed_due = true;
+        let mut heads_shown: HashSet<[u8; 32]> = HashSet::new();
+        let mut handed: HashMap<[u8; 32], u32> = HashMap::new();
+        let mut whole_of: Option<[u8; 32]> = None;
+        let mut leave = false;
+        // Whether the show of the change followed waits in this round.
+        let mut waits = false;
         for _ in 0..SHOWS_IN_A_PASS {
             let shows = match at_relays::to_show(&lock(&self.state.db)) {
                 Ok(Some(shows)) => shows,
@@ -1786,98 +1911,169 @@ impl DeviceEntries {
                     return false;
                 }
             };
-            let entry = &shows.entry;
-            round.entry = Some(entry.id());
-            // While the device wakes, a relay that it has not heard from
-            // since it woke is shown the entry whatever wait its last
-            // show there left (§16): the device goes on only once every
-            // relay has answered, and a relay that is not asked is one
-            // that every wake would wait its whole time for.
-            let must_be_heard = self.leave.is_waking() && !self.leave.has_heard(link.name());
-            if !must_be_heard && self.show_waits(link.name(), &entry.id()) {
-                return false;
-            }
-            let shown_whole = lock(&self.kept)
+            let followed = shows.entry.clone();
+            round.entry = Some(followed.id());
+            let not_again = lock(&self.kept)
                 .links
                 .get(&link.id())
-                .and_then(|of| of.shown_whole);
-            let short = !whole && shown_whole == Some(entry.id());
+                .map(|of| of.not_again.clone())
+                .unwrap_or_default();
+            let mut heads = shows.heads_shown(link.keeps_heads()).filter(|head| {
+                !heads_shown.contains(&head.id()) && !not_again.contains(&head.id())
+            });
+            let next = match whole_of {
+                // A head to be shown whole goes on being shown.
+                Some(id) if !followed_due && id != followed.id() => {
+                    heads.find(|head| head.id() == id).cloned()
+                }
+                _ if followed_due => Some(followed.clone()),
+                _ => heads.next().cloned(),
+            };
+            // Every head is shown: the round ends with what the change
+            // followed was answered.
+            let Some(entry) = next else {
+                return leave;
+            };
+            let id = entry.id();
+            let is_followed = id == followed.id();
+            if is_followed {
+                // While the device wakes, a relay that it has not heard
+                // from since it woke is shown the entry whatever wait its
+                // last show there left (§16): the device goes on only
+                // once every relay has answered, and a relay that is not
+                // asked is one that every wake would wait its whole time
+                // for.
+                let must_be_heard = self.leave.is_waking() && !self.leave.has_heard(link.name());
+                if !must_be_heard && self.show_waits(link.name(), &id) {
+                    // Only the show of the change followed waits: each head
+                    // is still shown, on every pass (rule 18). The round
+                    // gives no leave, and says nothing of whether the relay
+                    // holds the change.
+                    (waits, followed_due) = (true, false);
+                    continue;
+                }
+            }
+            let short = whole_of != Some(id) && self.known_whole(link, &id);
             // A show of a read is held to the relay's count of refusals
             // for now, as each of its requests is: a short show refused
             // for now is followed by a whole one only below the count.
             if gated && !self.asks_after_refusals(link) {
-                return false;
+                return leave;
             }
-            if !round.shown {
+            // A round in which only heads are shown, while the show of the
+            // change followed waits, is no attempt at the relay (decision
+            // 2026-10-19 §1): what the status says of it stands.
+            if !round.shown && (is_followed || !waits) {
                 round.shown = true;
                 self.reach.show_begins(&self.id_of(link));
             }
-            let answered = match self.leave.show(link, entry, short).await {
+            let answered = match self.leave.show(link, &entry, short, is_followed).await {
                 Ok(answered) => answered,
                 // A short show that is not answered is followed by a
                 // whole one.
                 Err(_) if short => {
-                    whole = true;
+                    whole_of = Some(id);
                     continue;
                 }
                 Err(e) => {
                     tracing::debug!(relay = link.name(), error = %e, "a show was not answered");
-                    round.said = None;
-                    return false;
+                    if is_followed {
+                        round.said = None;
+                        return false;
+                    }
+                    return leave;
                 }
             };
-            round.whole_answered |= !short;
-            self.shown(link, entry, short, answered.bytes);
+            round.answered = true;
+            if is_followed {
+                round.whole_answered |= !short;
+            }
+            if !short {
+                whole_of = None;
+            }
+            self.shown(link, &entry, short, answered.bytes);
             match answered.answer {
-                ShowAnswer::Held | ShowAnswer::Taken => {
-                    self.holds(link, entry, true);
+                ShowAnswer::Held | ShowAnswer::Taken if is_followed => {
+                    self.holds(link, &entry, true);
                     round.said = Some(Said::Holds);
-                    return true;
+                    (leave, followed_due) = (true, false);
                 }
-                ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit) => {
+                ShowAnswer::Refused(EntryRefused::NoRoom | EntryRefused::OverLimit)
+                    if is_followed =>
+                {
                     // The relay holds none, or an earlier one, and would
                     // have taken this one: it holds no later change.
                     let over_allowance =
                         answered.answer == ShowAnswer::Refused(EntryRefused::OverLimit);
-                    self.holds(link, entry, false);
+                    self.holds(link, &entry, false);
                     round.said = Some(Said::Lacks);
                     let refused = self.no_room(link, over_allowance, RefusedOf::Change);
                     self.lacks_for_room(link, refused);
-                    return true;
+                    (leave, followed_due) = (true, false);
                 }
                 ShowAnswer::Refused(EntryRefused::NotSigned) => {
                     tracing::warn!(
                         relay = link.name(),
-                        "a relay says that the change entry this device keeps is not signed as it must be"
+                        "a relay says that a change entry this device keeps is not signed as it must be"
                     );
-                    round.said = None;
-                    return false;
+                    if is_followed {
+                        round.said = None;
+                        return false;
+                    }
+                    heads_shown.insert(id);
+                }
+                // A head that the relay holds, took, or has no room for:
+                // the next.
+                ShowAnswer::Held | ShowAnswer::Taken | ShowAnswer::Refused(_) => {
+                    heads_shown.insert(id);
                 }
                 // "Show it whole" to a short show is no answer: the whole
                 // show that follows is what counts.
-                ShowAnswer::Whole if short => whole = true,
+                ShowAnswer::Whole if short => whole_of = Some(id),
                 // "Show it whole" is no answer to the whole entry.
-                ShowAnswer::Whole => {
+                ShowAnswer::Whole if is_followed => {
                     round.said = None;
                     return false;
                 }
-                ShowAnswer::Other { id, .. } => {
-                    // The relay holds another. One that the device keeps
-                    // as a head set aside it asks no more about. For any
-                    // other it shows its own whole, and is answered with
-                    // the entry.
-                    self.holds(link, entry, false);
-                    round.said = Some(Said::Lacks);
-                    self.lacks_for_another(link, None);
-                    if !short || shows.set_aside.contains(&id) {
-                        return false;
+                ShowAnswer::Whole => {
+                    heads_shown.insert(id);
+                }
+                ShowAnswer::Other { .. } => {
+                    // The relay holds another, and says only its name. An
+                    // `Other` hands nothing: the entry shown is shown whole,
+                    // and the relay hands the other whole (rules 16 and 18).
+                    if is_followed {
+                        self.holds(link, &entry, false);
+                        round.said = Some(Said::Lacks);
+                        self.lacks_for_another(link, None);
+                        leave = false;
                     }
-                    whole = true;
+                    if !short {
+                        if is_followed {
+                            return false;
+                        }
+                        heads_shown.insert(id);
+                        continue;
+                    }
+                    whole_of = Some(id);
                 }
                 ShowAnswer::Another(bytes) => {
-                    self.holds(link, entry, false);
-                    round.said = Some(Said::Lacks);
-                    self.lacks_for_another(link, None);
+                    if is_followed {
+                        self.holds(link, &entry, false);
+                        round.said = Some(Said::Lacks);
+                        self.lacks_for_another(link, None);
+                        leave = false;
+                    } else {
+                        // A head answered with another entry is not shown
+                        // again in the round, nor on the connection at a
+                        // relay that does not name the role `heads`. One
+                        // that names it remembers what it was shown whole,
+                        // and is shown it in short at the next pass.
+                        heads_shown.insert(id);
+                        if !link.keeps_heads() {
+                            self.not_again(link, &id);
+                        }
+                    }
                     let Some(another) = Entry::from_wire(&bytes)
                         .ok()
                         .and_then(|entry| entry.check().ok())
@@ -1886,17 +2082,85 @@ impl DeviceEntries {
                             relay = link.name(),
                             "a relay answered a show with what is no entry; nothing is done with it"
                         );
-                        return false;
+                        return leave;
                     };
-                    if !self.answered_with(link, entry, &another) {
-                        return false;
+                    // The relay handed it whole on this connection.
+                    self.knows_whole(link, &another.id());
+                    let times = handed.entry(another.id()).or_insert(0);
+                    *times += 1;
+                    if shows.keeps(&another.id()) {
+                        // An answer that hands a head the device keeps gives
+                        // no leave, and does not end the round. Handed twice
+                        // in it, it ends it.
+                        if *times >= 2 {
+                            return match link.keeps_heads() {
+                                // A relay of this version lacks the change.
+                                true => false,
+                                // A relay of the version before holds that
+                                // head alone: leave, and it lacks the change.
+                                false => {
+                                    self.leave.grant(link, &followed);
+                                    true
+                                }
+                            };
+                        }
+                        followed_due = true;
+                        continue;
                     }
-                    // It applied the change: it shows what it keeps now.
-                    whole = false;
+                    // One it does not keep goes through the one door. Where
+                    // the device keeps it then, applied, moved to, set
+                    // aside or kept by a close, it shows what it follows
+                    // again: the hand gave no leave.
+                    if !self.answered_with(link, &entry, &another) {
+                        if is_followed {
+                            return false;
+                        }
+                        continue;
+                    }
+                    followed_due = true;
                 }
             }
         }
-        false
+        leave
+    }
+
+    /// Whether the relay at `link` was shown whole on this connection the
+    /// entry named `id`, or handed it whole there: it may be shown in
+    /// short there (decision 2026-10-24 (removal), rule 16).
+    fn known_whole(&self, link: &Link, id: &[u8; 32]) -> bool {
+        lock(&self.kept)
+            .links
+            .get(&link.id())
+            .is_some_and(|of| of.known_whole.contains(id))
+    }
+
+    /// The relay at `link` was shown whole, or handed whole, the entry
+    /// named `id` on this connection. As a relay of this version
+    /// remembers them, at most twice MAX_CHANGE_HEADS are kept, the one
+    /// kept longest put out first. A relay that remembers fewer answers a
+    /// short show of one it forgot with "show it whole", and is shown it.
+    fn knows_whole(&self, link: &Link, id: &[u8; 32]) {
+        let mut kept = lock(&self.kept);
+        let known = &mut kept.links.entry(link.id()).or_default().known_whole;
+        known.retain(|known| known != id);
+        if known.len() >= 2 * MAX_CHANGE_HEADS {
+            known.pop_front();
+        }
+        known.push_back(*id);
+    }
+
+    /// The head set aside named `id` was answered with another entry on
+    /// the connection at `link`, a relay that does not name the role
+    /// `heads`: it is not shown there again (decision 2026-10-24
+    /// (removal), rule 18). A relay of the version before
+    /// remembers one entry shown whole in a slot: shown two, each would
+    /// cost a whole entry each way at every pass.
+    fn not_again(&self, link: &Link, id: &[u8; 32]) {
+        let mut kept = lock(&self.kept);
+        let of = kept.links.entry(link.id()).or_default();
+        if of.not_again.len() < MAX_CHANGE_HEADS {
+            of.not_again.insert(*id);
+        }
     }
 
     /// Give the one door the entry `another` that the device was answered
@@ -1932,6 +2196,31 @@ impl DeviceEntries {
         now: i64,
     ) -> Result<Answered, PersonError> {
         let identity = &self.state.identity;
+        // What the entry says of removals commits first, with the close it
+        // brings, before anything waits for the cycle's turn (rule 5): an
+        // apply or a move then waits with the device closed, and no turn
+        // at another relay sends under the change it leaves meanwhile.
+        if another.channel == shown.channel
+            && another.author == shown.author
+            && another.slot == shown.slot
+        {
+            let known = cordelia_api::person::know_what_is_shown(
+                &lock(&self.state.db),
+                identity,
+                another,
+                now,
+            );
+            match known {
+                Ok(true) => {
+                    tracing::warn!(
+                        "a change shown removes a device that holds the secret this device follows: it sends nothing more under it"
+                    );
+                    self.state.own_channels.ask_whole();
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let (outcome, changed) = self.state.as_a_change_where(
             |db| {
                 cordelia_api::person::with_moves_held_back(|| {
@@ -2009,7 +2298,9 @@ impl DeviceEntries {
 
     /// The device was answered on `link` with `another`, where it showed
     /// `shown`: the entry goes through the one door. Returns whether the
-    /// device applied a change by it, and so keeps another entry now.
+    /// device keeps it now: it applied it, moved, set it aside, or kept it
+    /// as it closed (decision 2026-10-24 (removal), rule 18: an answer
+    /// that hands a head the device keeps does not end a round).
     fn answered_with(&self, link: &Link, shown: &CheckedEntry, another: &CheckedEntry) -> bool {
         let now = self.unix();
         let outcome = self.answered_as_a_change(shown, another, now);
@@ -2039,7 +2330,7 @@ impl DeviceEntries {
                     "a relay holds a change made apart from the one this device follows: it is set aside, and this device goes on"
                 );
                 self.state.own_channels.ask_whole();
-                false
+                true
             }
             Ok(Answered::Shown(Shown::Closed)) => {
                 tracing::warn!(
@@ -2047,7 +2338,7 @@ impl DeviceEntries {
                     "a relay holds a change made apart, and no change that lists this device is clear of a removed device: it is closed until the two are settled"
                 );
                 self.state.own_channels.ask_whole();
-                false
+                true
             }
             Ok(Answered::Shown(
                 stopped @ (Shown::Removed | Shown::NotListed | Shown::NotOpened),
@@ -2108,10 +2399,10 @@ impl DeviceEntries {
     /// A show on `link` was answered: of `entry`, in short or whole, in
     /// so many bytes.
     fn shown(&self, link: &Link, entry: &CheckedEntry, short: bool, bytes: usize) {
-        let mut kept = lock(&self.kept);
         if !short {
-            kept.links.entry(link.id()).or_default().shown_whole = Some(entry.id());
+            self.knows_whole(link, &entry.id());
         }
+        let mut kept = lock(&self.kept);
         let of = kept.relays.entry(link.name().to_string()).or_default();
         if short {
             of.counts.short_shows += 1;
@@ -2248,6 +2539,7 @@ impl DeviceEntries {
             link,
             under,
             gated: false,
+            closed: false,
         };
         let whole = kind == Pass::Whole;
         // A connection that is to be made again for the device's memory
@@ -2403,6 +2695,12 @@ impl DeviceEntries {
             gated: at.gated,
         };
         let link = at.link;
+        if at.closed {
+            return self
+                .leave
+                .withdraw(&self.state, link, request, &opened, &read, &take)
+                .await;
+        }
         let open = || self.leave.open(db, link, asked, &opened, &read, &take);
         match open().await {
             Err(Refused::NoLeave(NoLeave::NotGiven)) => {

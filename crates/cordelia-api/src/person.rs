@@ -1866,6 +1866,53 @@ pub(crate) fn close_if_not_clear(conn: &Connection) -> Result<bool, PersonError>
     Ok(true)
 }
 
+/// What a change entry that a relay answered a show with says of
+/// removals, kept before the entry is judged, in a transaction of its own
+/// that commits at once (decision 2026-10-24 (removal), rule 5): the keys
+/// that its change lists as removed, where the phrase this device follows
+/// signed it, and the close, where the change it follows is then not
+/// clear. The apply of a change made after the one followed, or a move,
+/// then waits for the sync cycle's turn with the device closed, and sends
+/// nothing under the change it leaves meanwhile, at any relay. Says
+/// whether it closed the device. It is what [`crate::adding::know_what_is_handed`]
+/// does at `cordelia accept`.
+///
+/// Nothing is done for a device that does not stand applied, for an entry
+/// that is not the phrase's change entry as this device opens it, or for
+/// a change that removes this device: [`shown`] stops it as removed, and
+/// no apply follows.
+pub fn know_what_is_shown(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<bool, PersonError> {
+    in_one(conn, || {
+        let Some(held) = held(conn)? else {
+            return Ok(false);
+        };
+        if held.state != State::Applied {
+            return Ok(false);
+        }
+        let following = &held.following;
+        let Ok(opened) = change_entry::open_for_device(
+            entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            identity,
+        ) else {
+            return Ok(false);
+        };
+        let statement = &opened.statement;
+        if statement.statement.removes(&identity.public_key()) {
+            return Ok(false);
+        }
+        know_removed_if_signed(conn, identity, statement, now)?;
+        close_if_not_clear(conn)
+    })
+}
+
 /// At its first start on the version that keeps every head, a device
 /// judges what it kept (decision 2026-10-24 (removal), rule 12): it notes
 /// the time of each change entry it keeps, and a device in a fork applies

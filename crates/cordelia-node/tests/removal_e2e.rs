@@ -7,7 +7,11 @@
 //! a secret that a key it knows to be removed holds, and takes nothing that
 //! such a key signs (rules 2 to 6). Slice 5 moves a device to a clear
 //! change (rule 9); slice 6 has relays keep every head, hand each before
-//! they say "held", and pass each on until it is taken (rules 14 to 17).
+//! they say "held", and pass each on until it is taken (rules 14 to 17);
+//! slice 7 has a device show every head at a relay that names the role
+//! `heads`, and none above the change it follows at one that does not
+//! (rule 18), and bounds the window before a device reads a removal
+//! (rule 5, section 8).
 
 mod common;
 
@@ -414,6 +418,8 @@ struct Fault {
     laptop: Node,
     desktop: Node,
     tablet: Node,
+    /// A phone on change 2, stopped, where the test has one.
+    phone: Option<Node>,
     l_mem: PathBuf,
     d_mem: PathBuf,
     /// The ID of the desktop's change 3, which removes the tablet.
@@ -438,14 +444,25 @@ impl Fault {
 }
 
 fn the_fault(renewals: u64) -> Fault {
+    the_fault_with(renewals, false)
+}
+
+/// [`the_fault`], with a phone where `phone` says so: it uses relay A, is
+/// on change 2 with the others, and is stopped before the desktop removes
+/// the tablet.
+fn the_fault_with(renewals: u64, phone: bool) -> Fault {
     let relay_a = relay_started();
     let relay_b = relay_started();
     let laptop = device_started("laptop", &relay_a);
     let mut desktop = device_started("desktop", &relay_a);
     let tablet = device_started("tablet", &relay_a);
+    let mut phone = phone.then(|| device_started("phone", &relay_a));
     let words = makes_a_phrase(&laptop, "laptop");
     adds(&laptop, &desktop, "desktop");
     adds(&laptop, &tablet, "tablet");
+    if let Some(phone) = &phone {
+        adds(&laptop, phone, "phone");
+    }
     let (l_notes, l_mem) = notes_of(&laptop);
     let (d_notes, d_mem) = notes_of(&desktop);
     std::fs::write(l_mem.join("first.md"), "what both hold\n").unwrap();
@@ -455,12 +472,20 @@ fn the_fault(renewals: u64) -> Fault {
     wait_for("the desktop has the laptop's file", &all, 120, || {
         (read(&d_mem.join("first.md"))?.as_str() == "what both hold\n").then_some(())
     });
-    // All three on change 2, which lists each.
-    let mut at = renews(&laptop, &["stays", "stays"], &words);
+    // All on change 2, which lists each.
+    let stays: &[&str] = match phone {
+        Some(_) => &["stays", "stays", "stays"],
+        None => &["stays", "stays"],
+    };
+    let mut at = renews(&laptop, stays, &words);
     at.says("The change is made (change 2).");
     drop(at);
     has_applied(&desktop, 2, &all);
     has_applied(&tablet, 2, &all);
+    if let Some(phone) = &mut phone {
+        has_applied(phone, 2, &all);
+        phone.stop();
+    }
     let mut handed = change_entries_at(&relay_a);
 
     // The desktop uses relay B alone from here.
@@ -503,6 +528,7 @@ fn the_fault(renewals: u64) -> Fault {
         laptop,
         desktop,
         tablet,
+        phone,
         l_mem,
         d_mem,
         removal,
@@ -930,4 +956,638 @@ fn a_removed_device_that_shows_old_changes_pushes_no_head_out() {
         "the removal was pushed out"
     );
     desktop_applied(&f.desktop);
+}
+
+// ── Slice 7: a device shows every head (rule 18) ─────────────────────
+
+/// Test 4 of decision 2026-10-24 (removal), section 7: a device that slept
+/// through changes made apart follows the clear one. As test 2, with a
+/// phone that uses relay A and is stopped on change 2. The laptop renews
+/// twice (changes 3 and 4) while the desktop removes the tablet; the relays
+/// are then listed together, and relay A comes to keep the desktop's change
+/// beside the laptop's change 4. The phone is started.
+///
+/// It asserts: the phone follows the desktop's change 3, with the laptop's
+/// change 4 set aside, not clear; and no entry that it signed reaches
+/// either relay in a channel of the laptop's change 3 or 4.
+///
+/// Taken out: rule 16's order with rule 9 (it applies change 4, and is then
+/// closed: the first assertion fails); rule 9's move to a lower number
+/// (closed: the same).
+#[test]
+fn a_device_that_slept_through_changes_made_apart_follows_the_clear_one() {
+    let mut f = the_fault_with(2, true);
+    lists_together(&mut f);
+    wait_for(
+        "relay A holds the desktop's change",
+        &f.nodes(),
+        120,
+        || holds_change(&f.relay_a, &f.removal).then_some(()),
+    );
+    let mut phone = f.phone.take().unwrap();
+    let phone_key = key_bytes(&phone);
+    phone.start();
+    wait_for("the phone is healthy", &[&phone], 30, || healthy(&phone));
+    // It is handed the lower first, applies it, and is then handed the
+    // laptop's change 4, which it sets aside.
+    wait_for(
+        "the phone follows the desktop's change, with the laptop's set aside",
+        &[&phone, &f.relay_a, &f.relay_b],
+        180,
+        || {
+            let seen = person_of(&phone);
+            let follows = seen["latest"].as_str() == Some(f.removal.as_str());
+            let set_aside = seen["set_aside"]
+                .as_array()
+                .is_some_and(|heads| !heads.is_empty());
+            (follows && set_aside).then_some(())
+        },
+    );
+    let seen = person_of(&phone);
+    assert_eq!(seen["state"], "applied", "{seen}");
+    assert_eq!(seen["change"].as_u64(), Some(3), "{seen}");
+    let set_aside = seen["set_aside"].as_array().cloned().unwrap_or_default();
+    assert_eq!(set_aside.len(), 1, "{seen}");
+    assert_eq!(set_aside[0]["number"].as_u64(), Some(4), "{seen}");
+    assert_eq!(set_aside[0]["clear"], false, "{seen}");
+    // A few passes more, for whatever the phone has to send.
+    std::thread::sleep(Duration::from_secs(15));
+    let laptops: Vec<[u8; 32]> = f.own_secrets.iter().flat_map(channels_of).collect();
+    for relay in [&f.relay_a, &f.relay_b] {
+        for channel in channels_stored_by(relay, &phone_key, 0) {
+            assert!(!laptops.contains(&channel), "{}", hex::encode(channel));
+        }
+    }
+    assert_eq!(
+        person_of(&phone)["latest"].as_str(),
+        Some(f.removal.as_str())
+    );
+}
+
+/// A stand-in for a relay of the version before, at a port of this
+/// machine: it says "relay" alone among its roles, and names no role
+/// `heads` (decision 2026-10-24 (removal), rule 18). It answers each show
+/// "held", and keeps what it was shown, each change entry by its ID; it
+/// resets every other stream.
+struct RelayBefore {
+    shown: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl RelayBefore {
+    fn at(port: u16) -> Self {
+        use cordelia_network::messages::{EntryShown, ShowAnswer, WireMessage};
+        use cordelia_network::{codec, connection, transport};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let shown = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = shown.clone();
+        runtime.block_on(async {
+            let identity = Arc::new(NodeIdentity::generate().unwrap());
+            let here: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let endpoint = transport::create_endpoint(&identity, here).unwrap();
+            let manager = connection::ConnectionManager::new(
+                identity,
+                endpoint.clone(),
+                vec![],
+                vec!["relay".into()],
+                port,
+            );
+            let ctx = manager.connect_context();
+            tokio::spawn(async move {
+                let _manager = manager;
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
+                        continue;
+                    };
+                    let (conn, kept) = (outcome.conn, kept.clone());
+                    tokio::spawn(async move {
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let kept = kept.clone();
+                            tokio::spawn(async move {
+                                let Ok(protocol) = codec::read_protocol_byte(&mut recv).await
+                                else {
+                                    return;
+                                };
+                                let Ok(request) = codec::read_frame(&mut recv, protocol).await
+                                else {
+                                    return;
+                                };
+                                let id = match &request {
+                                    WireMessage::EntryShow(show) => {
+                                        Entry::from_wire(&show.entry).ok().map(|e| e.id())
+                                    }
+                                    WireMessage::EntryShowShort(show) => Some(show.id),
+                                    _ => None,
+                                };
+                                let Some(id) = id else {
+                                    let _ = send.reset(0u32.into());
+                                    return;
+                                };
+                                kept.lock().unwrap().push(id);
+                                let answer = WireMessage::EntryShown(EntryShown {
+                                    answer: ShowAnswer::Held,
+                                });
+                                let _ = codec::write_frame(&mut send, &answer).await;
+                                let _ = send.finish();
+                            });
+                        }
+                    });
+                }
+            });
+        });
+        Self {
+            shown,
+            _runtime: runtime,
+        }
+    }
+
+    /// The change entries it was shown, by their IDs, in their order.
+    fn shown(&self) -> Vec<[u8; 32]> {
+        self.shown.lock().unwrap().clone()
+    }
+}
+
+/// The change entry's ID that `person_of` names as `latest`: hex.
+fn id_of(hex_id: &str) -> [u8; 32] {
+    hex::decode(hex_id).unwrap().try_into().unwrap()
+}
+
+/// Test 18 of decision 2026-10-24 (removal), section 7: a closed device
+/// shows every head at a relay that keeps heads. The laptop uses relays A
+/// and B; a work laptop uses relay A alone; the desktop uses relay B; the
+/// relays are not listed together. The laptop removes the phone (its
+/// change 3), while it reaches relay A alone; the desktop removes the
+/// tablet (its change 3), and then renews (change 4). The laptop is then
+/// set up with relay B too.
+///
+/// It asserts: the laptop is closed (each change lists a key the other
+/// removes); the work laptop is handed the desktop's change 4 at relay A,
+/// which the laptop showed there, and closes; no entry that the work laptop
+/// signed reaches relay A after that. Then relay A is replaced by a
+/// stand-in that names no role `heads`: the laptop shows it the change it
+/// follows, and never the desktop's change 4, which is above it.
+///
+/// Taken out: rule 18's showing at a relay that names the role (the work
+/// laptop is never handed change 4, and goes on: its close times out); its
+/// bar at one that does not (the laptop shows the stand-in change 4: the
+/// last assertion fails).
+#[test]
+fn a_closed_device_shows_every_head_at_a_relay_that_keeps_heads() {
+    let relay_a = relay_started();
+    let relay_b = relay_started();
+    let mut laptop = device_started("laptop", &relay_a);
+    let work = device_started("work", &relay_a);
+    let mut desktop = device_started("desktop", &relay_a);
+    let mut phone = device_started("phone", &relay_a);
+    let mut tablet = device_started("tablet", &relay_a);
+    let words = makes_a_phrase(&laptop, "laptop");
+    for (device, label) in [
+        (&work, "work-laptop"),
+        (&desktop, "desktop"),
+        (&phone, "phone"),
+        (&tablet, "tablet"),
+    ] {
+        adds(&laptop, device, label);
+    }
+    // The nodes whose logs a wait prints, as they are when it waits.
+    macro_rules! all {
+        () => {
+            [&relay_a, &relay_b, &laptop, &work, &desktop]
+        };
+    }
+    let mut at = renews(&laptop, &["stays"; 4], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    for device in [&work, &desktop, &phone, &tablet] {
+        has_applied(device, 2, &all!());
+    }
+    // The phone and the tablet are needed no more.
+    phone.stop();
+    tablet.stop();
+    let (w_notes, w_mem) = notes_of(&work);
+    syncs_lab(&work, &w_notes);
+
+    // The desktop uses relay B alone from here, and the laptop relay A.
+    moves_relay(&mut desktop, &relay_a, &relay_b);
+    let mut at = removes(&laptop, &key_of(&phone), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    has_applied(&work, 3, &all!());
+    let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let mut at = renews(&desktop, &[], &words);
+    at.says("The change is made (change 4).");
+    drop(at);
+    let change_4 = person_of(&desktop)["latest"].as_str().unwrap().to_string();
+    let laptops_3 = person_of(&laptop)["latest"].as_str().unwrap().to_string();
+
+    // The laptop is set up with relay B too: it is handed change 4 there,
+    // and is closed.
+    laptop.stop();
+    laptop.add_relay(&format!("127.0.0.1:{}", relay_b.p2p), None);
+    laptop.start();
+    wait_for("the laptop is healthy", &all!(), 30, || healthy(&laptop));
+    wait_for("the laptop is closed", &all!(), 120, || {
+        (stands(&laptop).0 == "fork").then_some(())
+    });
+    assert_eq!(
+        person_of(&laptop)["latest"].as_str(),
+        Some(laptops_3.as_str())
+    );
+
+    // It shows change 4 at relay A, which keeps heads, and the work laptop
+    // is handed it there, and closes.
+    wait_for("relay A holds change 4", &all!(), 120, || {
+        holds_change(&relay_a, &change_4).then_some(())
+    });
+    wait_for("the work laptop is closed", &all!(), 120, || {
+        (stands(&work).0 == "fork").then_some(())
+    });
+    // What was on its way when it closed has had its ten seconds; from
+    // here nothing the work laptop signs reaches relay A.
+    std::thread::sleep(Duration::from_secs(12));
+    let work_key = key_bytes(&work);
+    let closed_at = last_stored_by(&relay_a, &work_key);
+    std::fs::write(w_mem.join("while-closed.md"), "written while closed\n").unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+    assert_eq!(
+        last_stored_by(&relay_a, &work_key),
+        closed_at,
+        "an entry the work laptop signed reached relay A while it was closed"
+    );
+
+    // Relay A is replaced by a stand-in that names no role `heads`.
+    let port_a = relay_a.p2p;
+    let mut relay_a = relay_a;
+    relay_a.stop();
+    let before = RelayBefore::at(port_a);
+    let (followed, above) = (id_of(&laptops_3), id_of(&change_4));
+    wait_for(
+        "the laptop shows the stand-in what it follows, a few times",
+        &[&laptop, &relay_b],
+        180,
+        || {
+            let shown = before.shown();
+            (shown.iter().filter(|id| **id == followed).count() >= 3).then_some(())
+        },
+    );
+    let shown = before.shown();
+    assert!(
+        !shown.contains(&above),
+        "the laptop showed change 4 at a relay that does not keep heads"
+    );
+    assert_eq!(stands(&laptop).0, "fork");
+}
+
+// ── Slice 7: the window, bounded (section 8, rule 5) ─────────────────
+
+/// How long the stand-in of test 6 holds back each stage of a stream: just
+/// under STREAM_TIMEOUT_SECS, so that each stage runs near its limit and
+/// none is given up.
+const HELD_BACK: Duration = Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS - 1);
+
+/// What the stand-in of test 6 keeps.
+#[derive(Default)]
+struct Held {
+    /// The removal's change entry, as it is on the wire.
+    removal: Vec<u8>,
+    /// From when it holds the removal: the time the test set.
+    from: Option<std::time::Instant>,
+    /// Each entry pushed to it, with when it arrived whole, and its channel.
+    pushed: Vec<(std::time::Instant, [u8; 32])>,
+}
+
+/// A stand-in for relay A in test 6, at a port of this machine, that
+/// answers as the test says (`relay.says`). It names the role `heads`.
+/// Until the test says that it holds the removal, it answers each show
+/// "held", a proof as one for a channel it does not hold, a pull with a
+/// page of nothing, and each entry of a push "stored", keeping what was
+/// pushed. From then it answers each show with the removal, whole, and
+/// holds back each stage of each stream for just under the stream's
+/// timeout ([`HELD_BACK`]): its opening, by stream credit (it takes one
+/// stream at a time, and lets one go only that long after it answered);
+/// its reading, where the request does not fit in the stream's window;
+/// and its answer.
+struct HeldBackRelay {
+    held: Arc<std::sync::Mutex<Held>>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl HeldBackRelay {
+    fn at(port: u16, removal: Vec<u8>) -> Self {
+        use cordelia_network::messages::{
+            ChannelProved, EntryPulled, EntryPushed, EntryShown, PushAnswer, ShowAnswer,
+            WireMessage,
+        };
+        use cordelia_network::{codec, connection, transport};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let held = Arc::new(std::sync::Mutex::new(Held {
+            removal,
+            ..Held::default()
+        }));
+        let kept = held.clone();
+        runtime.block_on(async {
+            let identity = Arc::new(NodeIdentity::generate().unwrap());
+            let here: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let endpoint = transport::create_endpoint(&identity, here).unwrap();
+            // One stream at a time: the next waits for credit.
+            let mut server = transport::server_config(&identity).unwrap();
+            let mut limits = quinn::TransportConfig::default();
+            limits.max_concurrent_bidi_streams(1u32.into());
+            limits.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+            limits.keep_alive_interval(Some(Duration::from_secs(15)));
+            server.transport_config(Arc::new(limits));
+            endpoint.set_server_config(Some(server));
+            let manager = connection::ConnectionManager::new(
+                identity,
+                endpoint.clone(),
+                vec![],
+                vec!["relay".into(), "heads".into()],
+                port,
+            );
+            let ctx = manager.connect_context();
+            tokio::spawn(async move {
+                let _manager = manager;
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(outcome) = connection::inbound_accept(&ctx, incoming).await else {
+                        continue;
+                    };
+                    let (conn, kept) = (outcome.conn, kept.clone());
+                    tokio::spawn(async move {
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let kept = kept.clone();
+                            // One at a time: the stream is answered and
+                            // held before the next is accepted.
+                            let holding = kept.lock().unwrap().from.is_some();
+                            let Ok(protocol) = codec::read_protocol_byte(&mut recv).await else {
+                                continue;
+                            };
+                            let Ok(len) = codec::read_frame_len(&mut recv).await else {
+                                continue;
+                            };
+                            // A request larger than the stream's window waits
+                            // for its reading.
+                            if holding && len > cordelia_core::protocol::QUIC_STREAM_RECEIVE_WINDOW
+                            {
+                                tokio::time::sleep(HELD_BACK).await;
+                            }
+                            let Ok(body) = codec::read_frame_body(&mut recv, len).await else {
+                                continue;
+                            };
+                            let Ok(request) = codec::decode_message(protocol, &body) else {
+                                let _ = send.reset(0u32.into());
+                                continue;
+                            };
+                            let arrived = std::time::Instant::now();
+                            let answer = {
+                                let mut held = kept.lock().unwrap();
+                                match request {
+                                    WireMessage::EntryShow(_) | WireMessage::EntryShowShort(_) => {
+                                        let answer = match held.from.is_some() {
+                                            true => ShowAnswer::Another(held.removal.clone()),
+                                            false => ShowAnswer::Held,
+                                        };
+                                        Some(WireMessage::EntryShown(EntryShown { answer }))
+                                    }
+                                    WireMessage::ChannelProve(_) => {
+                                        Some(WireMessage::ChannelProved(ChannelProved {
+                                            proved: false,
+                                        }))
+                                    }
+                                    WireMessage::EntryPull(pull) => {
+                                        Some(WireMessage::EntryPulled(EntryPulled {
+                                            entries: Vec::new(),
+                                            next: pull.after,
+                                            mark: pull.mark,
+                                        }))
+                                    }
+                                    WireMessage::EntryPush(push) => {
+                                        for bytes in &push.entries {
+                                            if let Ok(entry) = Entry::from_wire(bytes) {
+                                                held.pushed.push((arrived, entry.channel));
+                                            }
+                                        }
+                                        Some(WireMessage::EntryPushed(EntryPushed {
+                                            answers: vec![PushAnswer::Stored; push.entries.len()],
+                                        }))
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if holding {
+                                tokio::time::sleep(HELD_BACK).await;
+                            }
+                            match answer {
+                                Some(answer) => {
+                                    let _ = codec::write_frame(&mut send, &answer).await;
+                                    let _ = send.finish();
+                                }
+                                None => {
+                                    let _ = send.reset(0u32.into());
+                                }
+                            }
+                            // The stream's credit comes back that long after.
+                            if holding {
+                                tokio::time::sleep(HELD_BACK).await;
+                            }
+                            drop((send, recv));
+                        }
+                    });
+                }
+            });
+        });
+        Self {
+            held,
+            _runtime: runtime,
+        }
+    }
+
+    /// From now on it holds the removal, and holds back each stage.
+    fn holds_the_removal(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        self.held.lock().unwrap().from = Some(now);
+        now
+    }
+
+    /// Each entry pushed to it, with when it arrived and its channel.
+    fn pushed(&self) -> Vec<(std::time::Instant, [u8; 32])> {
+        self.held.lock().unwrap().pushed.clone()
+    }
+}
+
+/// Test 6 of decision 2026-10-24 (removal), section 7: the window before a
+/// device reads a removal is bounded. As test 1, but that the laptop uses a
+/// stand-in for relay A that answers as the test says, and a third relay,
+/// C; neither holds the removal at first, and the laptop's edits reach both
+/// under the secret of its own change 3, which the tablet holds (the
+/// window, shown). At a time the test sets, relay A comes to hold the
+/// removal, and from then holds back each stage of each stream for just
+/// under STREAM_TIMEOUT_SECS (its opening, by stream credit; its reading;
+/// its answer), so that each stage of section 8 runs near its limit.
+///
+/// It asserts: the last entry that the laptop pushes under the old secret,
+/// at either relay, arrives no more than 90 seconds after relay A first
+/// holds the removal (section 8); and none reaches relay C more than 10
+/// seconds after the laptop has read the removal (rule 5: only a push whose
+/// last byte was already sent), when it is closed, or has moved.
+///
+/// Taken out, by hand (the slice's mutation check): none of the three that
+/// the record names is caught here. A leave ten times SHOW_LEAVE_SECS long
+/// is not, since every whole pass shows at each relay whatever its leave,
+/// so the device reads the removal at its next pass all the same; nor is
+/// rule 5's reset, since relay C answers a push at once, and none is open
+/// at the commit. Rule 5's moment is held by slice 5's tests of a move that
+/// waits for the cycle, and the reset by
+/// `a_push_open_at_the_commit_that_closes_the_device_is_reset`
+/// (`device_entries_e2e.rs`). What this test holds is the bound itself.
+#[test]
+#[ignore = "waits out the window of section 8, each stage held near its limit: some minutes"]
+fn the_window_before_a_device_reads_a_removal_is_bounded() {
+    let relay_c = relay_started();
+    let relay_b = relay_started();
+    let mut laptop = device_started("laptop", &relay_c);
+    let mut desktop = device_started("desktop", &relay_c);
+    let mut tablet = device_started("tablet", &relay_c);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    adds(&laptop, &tablet, "tablet");
+    let (l_notes, l_mem) = notes_of(&laptop);
+    syncs_lab(&laptop, &l_notes);
+    let mut at = renews(&laptop, &["stays", "stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    has_applied(&desktop, 2, &[&relay_c, &laptop, &desktop, &tablet]);
+    has_applied(&tablet, 2, &[&relay_c, &laptop, &desktop, &tablet]);
+    tablet.stop();
+
+    // The desktop removes the tablet through relay B: its change 3. The
+    // laptop renews through relay C: its own change 3, which lists the
+    // tablet.
+    moves_relay(&mut desktop, &relay_c, &relay_b);
+    let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
+    wait_for(
+        "relay B holds the removal",
+        &[&relay_b, &desktop],
+        60,
+        || holds_change(&relay_b, &removal).then_some(()),
+    );
+    let removal_bytes = change_entries_at(&relay_b)
+        .into_iter()
+        .find(|bytes| hex::encode(Entry::from_wire(bytes).unwrap().id()) == removal)
+        .expect("relay B holds the removal");
+    let mut at = renews(&laptop, &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let old = channels_of(&applied_secret_of(&laptop));
+    let laptop_key = key_bytes(&laptop);
+
+    // The laptop is set up with relay A too, the stand-in.
+    let port_a = free_port();
+    let relay_a = HeldBackRelay::at(port_a, removal_bytes);
+    laptop.stop();
+    laptop.add_relay(&format!("127.0.0.1:{port_a}"), None);
+    laptop.start();
+    wait_for("the laptop is healthy", &[&laptop], 30, || healthy(&laptop));
+    let nodes = [&relay_b, &relay_c, &laptop, &desktop];
+
+    // It edits a file every two seconds, through the test.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (stop, l_mem) = (stop.clone(), l_mem.clone());
+        std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let _ = std::fs::write(l_mem.join("edited.md"), format!("edit {n}\n"));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        })
+    };
+    // The window, shown: its edits reach both relays under the old secret.
+    let mut seen_at_c: std::collections::BTreeMap<i64, std::time::Instant> = Default::default();
+    let old_at_c = |seen: &mut std::collections::BTreeMap<i64, std::time::Instant>| {
+        let now = std::time::Instant::now();
+        let db = store_of(&relay_c);
+        let mut stmt = db
+            .prepare("SELECT seq, channel_id FROM entries WHERE author = ?1")
+            .unwrap();
+        let rows: Vec<(i64, [u8; 32])> = stmt
+            .query_map([laptop_key.as_slice()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (seq, channel) in rows {
+            if old.contains(&channel) {
+                seen.entry(seq).or_insert(now);
+            }
+        }
+    };
+    old_at_c(&mut seen_at_c);
+    let before_window = seen_at_c.len();
+    wait_for("the laptop's edits reach both relays", &nodes, 120, || {
+        old_at_c(&mut seen_at_c);
+        let at_a = relay_a
+            .pushed()
+            .iter()
+            .any(|(_, channel)| old.contains(channel));
+        (at_a && seen_at_c.len() > before_window).then_some(())
+    });
+
+    // Relay A comes to hold the removal.
+    let held_from = relay_a.holds_the_removal();
+    let mut read_at: Option<std::time::Instant> = None;
+    let began = std::time::Instant::now();
+    loop {
+        assert!(
+            began.elapsed() < Duration::from_secs(300),
+            "the laptop never read the removal"
+        );
+        old_at_c(&mut seen_at_c);
+        let seen = person_of(&laptop);
+        let latest = seen["latest"].as_str() == Some(removal.as_str());
+        if read_at.is_none() && (seen["state"] == "fork" || latest) {
+            read_at = Some(std::time::Instant::now());
+        }
+        if latest && read_at.is_some_and(|at| at.elapsed() > Duration::from_secs(20)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    let read_at = read_at.unwrap();
+
+    // The last entry under the old secret, at either relay, arrived within
+    // 90 seconds of relay A's holding the removal.
+    let last_at_a = relay_a
+        .pushed()
+        .into_iter()
+        .filter(|(_, channel)| old.contains(channel))
+        .map(|(at, _)| at)
+        .max();
+    let last_at_c = seen_at_c.values().copied().max();
+    let last = last_at_a.into_iter().chain(last_at_c).max().unwrap();
+    let after = last.saturating_duration_since(held_from);
+    assert!(
+        after <= Duration::from_secs(90),
+        "the last entry under the old secret arrived {after:?} after relay A held the removal"
+    );
+    // None reached relay C more than 10 seconds after the laptop read it.
+    for at in seen_at_c.values() {
+        let after_read = at.saturating_duration_since(read_at);
+        assert!(
+            after_read <= Duration::from_secs(10),
+            "an entry under the old secret reached relay C {after_read:?} after the laptop read the removal"
+        );
+    }
+    eprintln!(
+        "read the removal {:?} after relay A held it; last under the old secret {after:?} after",
+        read_at.saturating_duration_since(held_from)
+    );
 }
