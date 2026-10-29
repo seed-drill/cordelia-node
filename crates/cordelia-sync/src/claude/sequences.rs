@@ -1262,12 +1262,15 @@ impl World {
                 .into_iter()
                 .collect()
         };
+        // A conflict copy that a carry left out is let go of by its root,
+        // as every copy is looked for.
         for file in set_aside {
             if let Some(text) = self.read(d, &file) {
-                if file == INDEX_FILE {
+                let root = root_of(&file);
+                if root == INDEX_FILE {
                     self.let_go_lines.extend(text.lines().map(String::from));
                 }
-                self.let_go.insert((file, text));
+                self.let_go.insert((root, text));
             }
         }
         let device = &self.devices[d];
