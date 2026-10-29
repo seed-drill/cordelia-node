@@ -1047,6 +1047,14 @@ fn a_shared_message_is_read_inside_the_frame_of_another_person() {
             &id[..8]
         )
     );
+    // `read <id>` reads it in the same frame.
+    let by_id = msg_in(&two.alice, &two.alice_dir, &["read", &id], b"");
+    assert!(by_id.status.success(), "{}", err_of(&by_id));
+    assert!(
+        out_of(&by_id).contains("START of a message from ANOTHER PERSON's agent"),
+        "{}",
+        out_of(&by_id)
+    );
     // Read, it waits no more for this agent.
     let next = msg_in(&two.alice, &two.alice_dir, &["read", "--next-shared"], b"");
     assert!(

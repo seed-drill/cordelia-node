@@ -344,6 +344,7 @@ fn a_subscription_starts_when_this_device_first_takes_it() {
         assert!(listed.contains(&id.as_str()), "{listed:?}");
     }
     // Away from a terminal, nothing it says.
+    id_given(&s, 0, &channel, 4, "later", t + 11);
     let asked = LogRequest {
         folder: Some(folder("notes")),
         terminal: false,
@@ -358,6 +359,7 @@ fn a_subscription_starts_when_this_device_first_takes_it() {
     )
     .unwrap();
     let messages = log["channels"][0]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{log}");
     assert!(messages.iter().all(|message| message["body"].is_null()));
 }
 
