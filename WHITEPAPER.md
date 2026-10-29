@@ -178,7 +178,7 @@ Where each channel's secret comes from:
 | Personal | The person secret | Every device of the person. It holds what the devices tell each other: which names each syncs, the devices added since the last statement, and which statement each has applied |
 | A name's (memory) | The person secret and the name | Every device of the person, for every name |
 | Pair | The two devices' keys (X25519) | Those two devices. It is used for one thing: handing a device what it needs when it is added |
-| The phrase's | The phrase | Whoever has the phrase. It holds the latest statement, as it travels (§3.4): one, or one for each change made apart that no later change was made after |
+| The phrase's | The phrase | Whoever has the phrase. It holds, as it travels (§3.4), each statement that no later one was made after: one, or more where changes were made apart |
 
 A channel has no key ring, no list of members and no owner, and a node has
 no inbox. The channels derived from one person secret are a *generation*:
@@ -417,7 +417,10 @@ removed key among the keys removed, and a commitment to a new person secret.
   be removed holds its secret. It moves to such a change by itself, with no
   phrase, and keeps the other set aside. A device for which no change is
   clear is **closed**: it seals nothing, sends nothing, keeps new content on
-  the device, and asks for `cordelia settle`. The next change made on a
+  the device, and asks for a change made with the phrase: `cordelia
+  settle` where it keeps a change made apart, and `cordelia renew`
+  otherwise. Devices on two clear changes made apart do not sync with each
+  other until a change joins them. The next change made on a
   device that keeps both, with the phrase, joins them, and lists every key
   that device knows to be removed.
 - `cordelia renew` makes a statement that removes nobody: it lists the

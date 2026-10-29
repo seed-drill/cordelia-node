@@ -353,7 +353,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia devices [--clear]` | Your devices, what each has applied, and what each relay holds. `--clear` goes through what this device has to tell you | `--clear` does |
 > | `cordelia remove-device <key>` | Remove one of your devices. Given a key that this device knows nothing of (it is in no list of the last change, and was not added since), it says so, and that removing it refuses that key for good, and asks a typed answer, `refuse`, before it goes on as any removal | Yes, and the phrase |
 > | `cordelia renew` | Give the devices that stay a new secret: of each device added since the last change, you say whether it stays | Yes, and the phrase |
-> | `cordelia settle` | Join the changes that were made apart, on a device that keeps a head set aside or is closed (decision 2026-10-24 (removal), rule 21). There `remove-device` and `renew` make such a change too, and every change lists as removed every key this device knows to be removed (rule 20) | Yes, and the phrase |
+> | `cordelia settle` | Join the changes that were made apart, on a device that keeps a head set aside (decision 2026-10-24 (removal), rule 21). On a device that keeps none it is refused: "there is nothing to settle"; a closed device there asks for `cordelia renew`. There `remove-device` and `renew` make such a change too, and every change lists as removed every key this device knows to be removed (rule 20) | Yes, and the phrase |
 > | `cordelia recover [--name <label>]` | On a machine that follows no phrase, with no device left that you trust: bring back what the relays hold. It asks the relays that the machine is set up with, and takes no other. Of each device it asks a typed `have`, `lost` or `hands` (§9) | Yes, and the phrase, which it asks for first |
 > | `cordelia sync claude [--dir <path>] [--mapped-only] [--no-home] [--reset]` | Turn on Claude Code memory sync. Nothing syncs until a folder is mapped. `--dir` sets the Claude Code directory, and `--reset` goes back to `~/.claude`; `--no-home` unmaps the home directory; `--mapped-only` is taken, and is the only scope there is. `--all` and `--exclude` are refused | |
 > | `cordelia sync map <folder> [name] [--home]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop. `--home` maps the home directory itself | |
@@ -540,11 +540,15 @@ JSON output (`--json`):
 > carry`. It names each change made apart that this device sets aside, with
 > its lists, and, where it is not clear, the removed device it lists ("a
 > change made apart on laptop (change 3) lists tablet, which a change made
-> on desktop removed: it is set aside"); and, for seven days from the last,
-> how many edits a change set aside because a removed device wrote them or
-> they were written over what one wrote, with `cordelia history` and
-> `cordelia restore` named (decision 2026-10-24 (removal), rules 7 and 11).
-> `cordelia status` says that count too.
+> on desktop removed: it is set aside", decision 2026-10-24 (removal), rule
+> 11).
+>
+> `cordelia status`, and not `cordelia devices`, says for seven days from
+> the last how many edits a change set aside because a removed device wrote
+> them or they were written over what one wrote, with `cordelia history`
+> and `cordelia restore` named (rule 7). It says so only while the device
+> has applied the change it follows: a device stored as `fork` (closed
+> among changes made apart), or one that has stopped, does not say it.
 
 ### 4.4 `cordelia peers`
 

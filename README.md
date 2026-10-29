@@ -318,22 +318,30 @@ Then it asks you to type yes, and then for the phrase.
   over it, out of the folder and into local history. It goes by when the
   edit reached the laptop: after the removal was made, less ten minutes. It
   does the same for what the tablet wrote under a change made apart from
-  the removal. `cordelia status` and `cordelia devices` say how many edits
-  were set aside, for seven days. `cordelia history` lists them, and
+  the removal. `cordelia status` says how many edits were set aside, for
+  seven days. `cordelia history` lists them, and
   `cordelia restore` puts one back. With local history off, they are gone.
-  - The limits: a device whose clock is more than ten minutes behind the
-    clock of the device that made the change keeps what reached it in that
-    gap. A device of `v0.2.0-alpha.17` or earlier carries the removed device's
+  - The limits. Each device goes by its own clock. If its clock is more
+    than ten minutes behind the clock of the device that made the change,
+    it keeps what reached it in the time past those ten minutes. If its
+    clock is ahead, it can set aside edits that were not late. A device
+    keeps when each of the last 1,024 edits of a file reached it; past
+    that, it can set aside more of that file's edits than were late.
+  - A device of `v0.2.0-alpha.17` or earlier carries the removed device's
     late writing on at the removal, as before, and a device of this version
     takes it from there. This holds fully once all your devices have this
     version.
 - **Make a change once, on one device.** If two changes are made apart (on
-  two devices that had not met), each device follows the one that lists it
-  and lists no device that the other removed. It moves to it by itself,
-  with no phrase. A device for which no such change exists stops: it keeps
-  your files on the device and sends nothing. Run `cordelia settle` on it,
-  with the phrase, to join them. Any change you make on a device that holds
-  both, with `remove-device` or `renew` too, joins them.
+  two devices that had not met), each device follows a change that lists
+  it and is clear: no key it knows to be removed holds that change's
+  secret. It moves to such a change by itself, with no phrase. Devices on
+  two different clear changes do not sync with each other until a change
+  made on a device that holds both joins them. A device for which no
+  change is clear stops: it keeps your files on the device and sends
+  nothing. It tells you what to run there, with the phrase: `cordelia
+  settle` where it keeps a change made apart, and `cordelia renew`
+  otherwise. Any change you make on a device that holds both, with
+  `remove-device` or `renew` too, joins them.
 - **A device that you removed by mistake cannot come back under its key.**
   Run `cordelia init --new-key` on it. That gives it a new key and keeps
   its memory folders. Then add it as a new device.
@@ -602,8 +610,11 @@ of the most serious level. Its tooltip shows everything that applies.
 - Whether sync is on or off:
   - This device was removed.
   - This device is in no list of the last change. Add it again.
-  - Two changes were made apart, and a removed device can read each one
-    that lists this device. Join them with the phrase (`cordelia settle`).
+  - No change that lists this device is clear: a removed device can read
+    each one. Where two changes were made apart, join them with the phrase
+    (`cordelia settle`); otherwise make a change with it (`cordelia renew`).
+  - A removed device holds the secret of the change this device follows.
+    Make a change with the phrase (`cordelia renew`).
   - A change could not be opened or applied here.
   - The first start on this version has not succeeded.
   - The database is from a later version.
