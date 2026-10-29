@@ -1099,6 +1099,8 @@ pub fn read(config_path: &str, id: &str, given: Option<&str>) -> anyhow::Result<
             return Ok(());
         }
         Posted::Answered(_, answer) if answer["error"]["code"] == "no_such_message" => {}
+        // A node with no route of shared channels holds none.
+        Posted::Answered(404, _) => {}
         Posted::Answered(status, answer) => {
             refuse(&shared_refused_by(status, &answer, &shown, Does::Show))
         }
@@ -1655,11 +1657,13 @@ pub fn log(config_path: &str, since: Option<&str>) -> anyhow::Result<()> {
     let posted = node.post("/api/v1/shared/log", &shared_request, node.answer_wait());
     let shared = match posted {
         Posted::Answered(200, shared) if shared["channels"].is_array() => shared,
-        Posted::Answered(200, _) | Posted::NotKnown => refuse(says::READ_NOT_ANSWERED),
-        Posted::Answered(status, shared) => {
-            refuse(&shared_refused_by(status, &shared, &shown, Does::Show))
+        Posted::Answered(409, shared) => {
+            refuse(&shared_refused_by(409, &shared, &shown, Does::Show))
         }
         Posted::NotReached => refuse(&says::not_running()),
+        // A node that answers no route of shared channels holds none: its
+        // own threads are what it lists.
+        _ => json!({ "channels": [] }),
     };
     let (shared_said, shared_printed) = shared_log_says(&shared, at_a_terminal, marker);
     written(&shared_said);
