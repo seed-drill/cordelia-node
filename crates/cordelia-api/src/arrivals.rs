@@ -769,11 +769,12 @@ mod tests {
     /// is cut, and goes back to `z late`, which no kept event stored: it is
     /// judged at the cut, and the file goes back to none. Where device 0's
     /// entry is the one gone back to, the event that stored it brought it,
-    /// and it is carried.
+    /// and it is carried. Each way with the laptop's renewal between, which
+    /// names anew the entry each event stored where it seals it again.
     #[test]
     fn a_version_gone_back_to_is_brought_only_where_a_kept_event_stored_it() {
         use crate::several::entry_by;
-        for over_honest in [false, true] {
+        for (over_honest, renewed) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut s = Several::of_one_person(3);
             s.hold(&[0, 1, 2], "notes");
             s.meet(&[0, 1, 2]);
@@ -825,13 +826,31 @@ mod tests {
             take(&mut s, &later);
             let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
             assert_eq!(events.len(), 2);
+            if renewed {
+                s.change(1, &[1, 0, 2], &[]);
+                // The event that stored the version carried names the entry
+                // that carries it.
+                let channel = s[1].own("notes");
+                let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
+                let slot = s[1].slot_of("notes", "z.md");
+                let carried = s[1]
+                    .stored_in(&channel)
+                    .into_iter()
+                    .find(|entry| entry.slot == slot)
+                    .unwrap();
+                let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
+                assert_eq!(events[1].stored_id, Some(carried.id()));
+            }
 
             s.now = made - 1;
             let removal = s.change(0, &[0, 1], &[2]);
             let now = s.tick();
             let on = &s[1];
             let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
-            assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+            assert!(
+                matches!(taken, Taken::Shown(Shown::Applied(_) | Shown::Moved(_))),
+                "{taken:?}"
+            );
             match over_honest {
                 false => assert_eq!(s[1].text("notes", "z.md"), None),
                 true => assert_eq!(s[1].text("notes", "z.md").as_deref(), Some("z honest")),
