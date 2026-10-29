@@ -2234,8 +2234,15 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     );
     drop(at);
     assert_eq!(id_filed(&desktop, "review"), Some(old));
+    // The desktop holds a channel not clean that the tablet held: its
+    // status is amber for it, from the node to the command (§9, property
+    // 16), and names the tablet as the device removed.
+    removed_device_holds_review(&desktop, "tablet");
     let after = [&one, &two, &laptop, &desktop, &bob];
     has_applied(&laptop, 2, &after);
+    // So is the laptop's, which applied the removal and has not made the
+    // channel anew.
+    removed_device_holds_review(&laptop, "tablet");
 
     // Bob makes the channel anew, keeping the laptop and the tablet.
     makes_anew(
@@ -2281,6 +2288,43 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert!(!sealed.contains(&key_of(&tablet)), "{sealed:?}");
     assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
     assert_ne!(id_filed(&laptop, "review"), Some(old));
+    // Made anew and moved from, it is amber no more there.
+    let status = status_json(&laptop);
+    assert_eq!(
+        status["shared"]["removed_device_holds"],
+        json!([]),
+        "{status}"
+    );
+    assert!(!holds_of(&status).contains(&"shared_removed_device_holds".to_string()));
+    let plain = laptop.cli(&["status"]);
+    assert!(!plain.contains("Shared:"), "{plain}");
+}
+
+/// `n` applied a removal of the device labelled `removed` and holds
+/// "review" not clean: `cordelia status --json` has the amber hold
+/// `shared_removed_device_holds` and names the device of that removal, and
+/// the plain status says it on its `Shared:` line (decision 2026-10-10 §9).
+fn removed_device_holds_review(n: &Node, removed: &str) {
+    let status = status_json(n);
+    let holds_it = status["shared"]["removed_device_holds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(holds_it.len(), 1, "{status}");
+    assert_eq!(holds_it[0]["channels"], json!(["review"]), "{status}");
+    let device = holds_it[0]["device"].as_str().unwrap();
+    assert!(device.starts_with(&format!("\"{removed}\" (")), "{device}");
+    assert!(
+        holds_of(&status).contains(&"shared_removed_device_holds".to_string()),
+        "{status}"
+    );
+    let plain = n.cli(&["status"]);
+    assert!(
+        plain.contains(
+            "  Shared:    a removed device still holds 1 shared channel: make each anew \
+             (cordelia devices)"
+        ),
+        "{plain}"
+    );
 }
 
 /// A removal lists what the removed key did, with the command that undoes
