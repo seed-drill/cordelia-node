@@ -409,6 +409,9 @@ struct Found {
     above: Vec<String>,
     /// How many deletes of theirs there are, which are never taken.
     deletes: usize,
+    /// How many the cut leaves out: another removed key wrote them, or
+    /// what they were written over (decision 2026-10-24 (removal), rule 7).
+    cut: usize,
     /// How many the new channel holds already, or holds a higher
     /// revision of.
     held: usize,
@@ -439,6 +442,7 @@ impl Found {
             empty: number("empty"),
             above: files("above"),
             deletes: number("deletes"),
+            cut: number("cut"),
             held: number("held"),
             higher: number("higher"),
             ties: files("ties"),
@@ -500,6 +504,28 @@ impl Found {
                     1 => "1 delete is".to_string(),
                     n => format!("{n} deletes are"),
                 }
+            ));
+        }
+        if self.cut > 0 {
+            lines.push(format!(
+                "  {} out: another removed device wrote {}, or what {} written over. Name that \
+                 device too to bring {}.",
+                match self.cut {
+                    1 => "1 version is left".to_string(),
+                    n => format!("{n} versions are left"),
+                },
+                match self.cut {
+                    1 => "it",
+                    _ => "them",
+                },
+                match self.cut {
+                    1 => "it was",
+                    _ => "they were",
+                },
+                match self.cut {
+                    1 => "it",
+                    _ => "them",
+                },
             ));
         }
         let there = self.held + self.higher + self.ties.len();
@@ -1390,10 +1416,20 @@ mod tests {
                 }],
                 "under": hex::encode([3u8; 32]),
                 "empty": 2, "above": above, "deletes": 1, "held": 1, "higher": 1,
-                "ties": ["t.md"], "has_folder": has_folder,
+                "ties": ["t.md"], "has_folder": has_folder, "cut": 1,
             })
         };
         let read = Found::of(&found(json!(["a.md", "b\u{202e}.md"]), true)).unwrap();
+        // What the cut leaves out, which naming the other device brings
+        // (the third read of slice 8, its first low finding).
+        assert!(
+            read.lines("lab").join("\n").contains(
+                "1 version is left out: another removed device wrote it, or what it was \
+                 written over. Name that device too to bring it."
+            ),
+            "{:?}",
+            read.lines("lab")
+        );
         assert_eq!(read.keys, [key]);
         assert_eq!(read.under, [3u8; 32]);
         assert_eq!((read.empty, read.deletes), (2, 1));
