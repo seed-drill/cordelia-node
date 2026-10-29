@@ -21,6 +21,7 @@ pub mod relay;
 pub mod schema;
 pub mod search;
 pub mod shared;
+pub mod shared_anew;
 pub mod shared_lists;
 pub mod shared_messages;
 pub mod shared_pass;

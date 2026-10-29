@@ -578,6 +578,30 @@ fn refusal_of(conn: &Connection, why: &Refused, name: &str) -> Result<HttpRespon
              by a person on this device, so this agent writes no more there until a person reads \
              them with: cordelia msg log (at a terminal)"
         )),
+        Refused::NotClean => line(crate::shared_anew::not_clean_line(name)),
+        Refused::Paused {
+            maker,
+            made,
+            left_out,
+        } => {
+            let form = match crate::person::held(conn).map_err(crate::commands::refused)? {
+                Some(held) => sharing::sender_form(conn, &held, &[0; 32], maker)
+                    .map_err(crate::commands::refused)?,
+                None => format!("({})", sharing::six_words(maker)),
+            };
+            line(format!(
+                "\"{shown}\" was made anew by {form} on {} without {left_out} keys, so your devices \
+                 send nothing more there: move with cordelia shared move {word}, or go on there, \
+                 where those keys read, with cordelia shared stay {word} (at a terminal).",
+                sharing::date_of(i64::try_from(*made).unwrap_or(i64::MAX)),
+                word = shell_word(name)
+            ))
+        }
+        Refused::Moved { id, .. } => line(format!(
+            "Message {} is from \"{shown}\" before it was made anew, and your devices moved: \
+             answer in the new channel without --reply.",
+            cleaned(id)
+        )),
         Refused::FolderRate { limit, next_at } => Ok(refused_with(
             why.word(),
             "",
@@ -1112,6 +1136,7 @@ fn log_in(
                 }
             }
             entry["held"] = json!(holds);
+            entry["anew"] = json!(crate::shared_anew::log_lines(conn, identity, &row, now)?);
         }
         channels.push(entry);
     }

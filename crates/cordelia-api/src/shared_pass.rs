@@ -121,7 +121,9 @@ pub fn usable(
     let Some(row) = kept::channel(conn, channel)? else {
         return Ok(Err(NotUsable::NotHeld));
     };
-    if row.state != State::Held {
+    // A channel moved from whose offer waits to be at each relay is used
+    // for that push alone (§7; [`to_send`]).
+    if row.state != State::Held && !crate::shared_anew::delivering(conn, &row)? {
         return Ok(Err(NotUsable::NotHeld));
     }
     let card = card_of(&row)?;
@@ -145,6 +147,25 @@ pub fn at_relay(conn: &Connection, relay: &[u8; 32]) -> Result<Vec<[u8; 32]>, Pe
     let mut at = Vec::new();
     for row in kept::channels(conn)? {
         if row.state == State::Held && card_of(&row)?.relays().keys().contains(relay) {
+            at.push(row.channel);
+        }
+    }
+    Ok(at)
+}
+
+/// The shared channels moved from whose offer waits to be at the relay
+/// whose node key is `relay` (§7): the pass pushes the offer there, and
+/// asks nothing else of them. None where the device does not stand applied
+/// with sync on.
+pub fn delivering_at(conn: &Connection, relay: &[u8; 32]) -> Result<Vec<[u8; 32]>, PersonError> {
+    if may_open(conn)?.is_err() {
+        return Ok(Vec::new());
+    }
+    let mut at = Vec::new();
+    for row in kept::channels(conn)? {
+        if crate::shared_anew::delivering(conn, &row)?
+            && card_of(&row)?.relays().keys().contains(relay)
+        {
             at.push(row.channel);
         }
     }
@@ -295,8 +316,22 @@ pub fn to_send(
     let own = identity.public_key();
     let mut batch: Vec<CheckedEntry> = Vec::new();
     let mut bytes = 0usize;
+    // Where the channel is not clean, paused or moved from, nothing of the
+    // device's own is sent there but the offer it made (decision
+    // 2026-10-24, rules 23, 25 and 26; §7).
+    let Some(row) = kept::channel(conn, &usable.channel)? else {
+        return Ok(batch);
+    };
+    let only_the_offer = match crate::shared_anew::sends_only_its_offer(conn, identity, &row)? {
+        None => return Ok(batch),
+        Some(only) => only,
+    };
+    let anew_slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
     for held in entries::author_entries(conn, &usable.channel, &own)? {
         let entry = &held.entry;
+        if only_the_offer && entry.slot != anew_slot {
+            continue;
+        }
         let answered = rows::answer(conn, usable.id, relay, &entry.slot)?;
         if answered.is_some_and(|(rev, _)| rev >= entry.rev) {
             continue;
@@ -354,6 +389,9 @@ pub fn pushed(
             // relay of its card (decision 2026-10-10 §6.1).
             crate::shared_sender::answered(conn, usable.id, entry, answer)?;
         }
+        // An offer at each relay of the old channel's card: its entries go
+        // now (§7).
+        crate::shared_anew::deliveries(conn, &identity.public_key(), now)?;
         Ok(refused)
     })
 }
@@ -386,7 +424,20 @@ fn anew_again(
     }
     let inside = Entry::check(held.entry)?.open(&usable.secret)?;
     let again = Entry::seal(&usable.secret, identity, entry.rev + 1, &inside)?.check()?;
-    take(conn, identity, &again, now)?;
+    // In a channel this device made anew and moved from, the door takes
+    // nothing: the offer, the one entry it still sends there, is stored as
+    // it was made (`shared_anew::make_anew_of`), so that it reaches the
+    // relay that held another at its revision.
+    let held_here =
+        kept::channel(conn, &usable.channel)?.is_some_and(|row| row.state == State::Held);
+    match held_here {
+        true => {
+            take(conn, identity, &again, now)?;
+        }
+        false => {
+            entries::store(conn, &again, now)?;
+        }
+    }
     Ok(())
 }
 

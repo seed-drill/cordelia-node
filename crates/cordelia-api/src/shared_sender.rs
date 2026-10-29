@@ -193,6 +193,18 @@ pub(crate) fn sends(
     if crate::shared_messages::start_of(conn, channel, &request.from)?.is_none() {
         return refused(Refused::NotSubscribed);
     }
+    // Nothing is sent in a channel not yet clean, or paused by an offer
+    // (decision 2026-10-24, rules 23, 25 and 26).
+    if crate::shared_anew::is_not_clean(conn, channel)? {
+        return refused(Refused::NotClean);
+    }
+    if let Some(pause) = crate::shared_anew::pause_of(conn, identity, &ring.row)? {
+        return refused(Refused::Paused {
+            maker: pause.offer.maker,
+            made: pause.offer.made,
+            left_out: pause.left_out.len(),
+        });
+    }
     if !at.shared_reached {
         return refused(Refused::NotReached);
     }
@@ -319,9 +331,37 @@ fn elsewhere(
                 id: given,
                 channel: Some(other),
             },
-            _ => Refused::NoSuchMessage(given),
+            _ => match moved_from(conn, &given)? {
+                Some(old) => Refused::Moved {
+                    id: given,
+                    channel: old,
+                },
+                None => Refused::NoSuchMessage(given),
+            },
         },
     )
+}
+
+/// The channel moved from whose index holds the one message that `given`
+/// begins, where one does (decision 2026-10-10 §5.5, `moved`): what a
+/// device showed of a channel it moved from stays until each expires.
+fn moved_from(conn: &Connection, given: &str) -> Result<Option<[u8; 32]>, PersonError> {
+    let prefix = given.to_ascii_lowercase();
+    let mut found = None;
+    for row in stored(kept_rows::channels(conn))? {
+        if row.state != State::Moved {
+            continue;
+        }
+        for (id, _) in stored(kept_rows::index_first_held(conn, row.id))? {
+            if hex::encode(&id).starts_with(&prefix) {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(row.channel);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Whether the shared channel of a row was fetched since the node started,
@@ -485,7 +525,7 @@ pub fn write_again(
             let Some(row) = stored(kept_rows::channel_of_row(conn, waiting.channel))? else {
                 continue;
             };
-            if row.state != State::Held || !fetched(&row) {
+            if !crate::shared_anew::writes_there(conn, identity, &row)? || !fetched(&row) {
                 continue;
             }
             let ring = Ring::of_row(identity, row)?;
@@ -529,7 +569,7 @@ pub fn clear_expired(
         }
         let mut cleared = 0;
         for row in stored(kept_rows::channels(conn))? {
-            if row.state != State::Held || !fetched(&row) {
+            if !crate::shared_anew::writes_there(conn, identity, &row)? || !fetched(&row) {
                 continue;
             }
             let ring = Ring::of_row(identity, row)?;

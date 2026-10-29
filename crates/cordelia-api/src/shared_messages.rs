@@ -71,6 +71,26 @@ pub fn keep_starts(conn: &Connection, now: i64) -> Result<(), PersonError> {
         .into_iter()
         .filter(|(channel, _)| held.contains(channel))
         .collect();
+    // A subscription moved with its channel keeps the start it had in the
+    // channel moved from (decision 2026-10-10 §7), where this device held
+    // one: it is taken before the old one goes.
+    let kept_starts = kept_in(rows::subscribed(conn))?;
+    for row in kept_in(kept::channels(conn))? {
+        let cordelia_storage::shared::Came::Moved(from) = row.came else {
+            continue;
+        };
+        if row.state != State::Held {
+            continue;
+        }
+        for (channel, agent) in starts.iter().filter(|(channel, _)| *channel == row.channel) {
+            if let Some(old) = kept_starts
+                .iter()
+                .find(|start| start.channel == from && start.agent == *agent)
+            {
+                kept_in(rows::start_at(conn, channel, agent, old.start))?;
+            }
+        }
+    }
     kept_in(rows::keep_subscribed(conn, &starts, now))
 }
 

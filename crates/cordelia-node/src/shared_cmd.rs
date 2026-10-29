@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use cordelia_core::protocol::SHARED_MAX_KEYS;
 use cordelia_crypto::bech32::decode_public_key;
 
 use crate::person_cmd::{NOT_A_YES, list, own_key, text, time_of};
@@ -243,6 +244,116 @@ pub fn unsubscribe(
     Ok(())
 }
 
+// ── cordelia shared anew, move and stay ──────────────────────────────
+
+/// What `shared anew` asks of each key (decision 2026-10-10 §7).
+fn stays_asked(form: &str) -> String {
+    format!("Does {form} stay? Type keep or out, or out for the rest: ")
+}
+
+/// What `shared anew` says to an answer it does not take (§5.5).
+pub const KEEP_OR_OUT: &str = "Type keep or out, or out for the rest.";
+
+/// The answers of `shared anew` to each key it asks about, in order (§7):
+/// `keep` or `out` typed for each, and `out for the rest` once, for that
+/// key and every key not yet answered. **None is suggested:** anything else
+/// is asked again, and a `keep` past 64 staying is asked again. Returns the
+/// keys answered `keep`.
+pub(crate) fn answers(
+    asked: &[(String, String)],
+    own_devices: usize,
+    mut answer: impl FnMut(&str) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<Vec<String>> {
+    let mut keep = Vec::new();
+    'keys: for (key, form) in asked {
+        loop {
+            let typed = answer(&stays_asked(form))?;
+            match typed.as_deref() {
+                Some("keep") if own_devices + keep.len() >= SHARED_MAX_KEYS => {
+                    println!("{}", cordelia_api::shared_anew::STAY_PAST_64);
+                }
+                Some("keep") => {
+                    keep.push(key.clone());
+                    continue 'keys;
+                }
+                Some("out") => continue 'keys,
+                Some("out for the rest") => break 'keys,
+                Some(_) => println!("{KEEP_OR_OUT}"),
+                None => anyhow::bail!(
+                    "the input ended before every key was answered. Nothing was made."
+                ),
+            }
+        }
+    }
+    Ok(keep)
+}
+
+/// `cordelia shared anew <name> [--relay <relay>]... [--words]` (§5.1, §7):
+/// every key is listed before anything is asked; each is answered; then the
+/// yes, naming how many stay and how many are left out.
+pub fn anew(
+    config_path: &str,
+    name: &str,
+    relays: &[String],
+    words: Option<&str>,
+) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let path = "/api/v1/shared/anew";
+    let body = json!({ "name": name, "relays": relays, "words": words });
+    let listed = asked(config_path, path, &body)?;
+    crate::person_cmd::names_this_device(&listed, &own_key(config_path)?)?;
+    for line in list(&listed, "listing").filter_map(Value::as_str) {
+        println!("{}", crate::history_cmd::printable(line));
+    }
+    let ask: Vec<(String, String)> = list(&listed, "ask")
+        .map(|key| {
+            (
+                text(key, "key").to_string(),
+                crate::history_cmd::printable(text(key, "form")),
+            )
+        })
+        .collect();
+    let own_devices = listed["own_devices"].as_u64().unwrap_or(0) as usize;
+    let keep = answers(&ask, own_devices, |asks| at.answer(asks))?;
+    let mut body = body;
+    body["keep"] = json!(keep);
+    body["asked"] = json!(ask.iter().map(|(key, _)| key).collect::<Vec<_>>());
+    if let Some(made) = with_a_yes(config_path, &at, path, body)? {
+        print_said(&made);
+    }
+    Ok(())
+}
+
+/// `cordelia shared move <name> [--to <channel words>] [--words]` (§5.1,
+/// §7).
+pub fn move_to(
+    config_path: &str,
+    name: &str,
+    to: Option<&str>,
+    words: Option<&str>,
+) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "to": to, "words": words });
+    if let Some(moved) = with_a_yes(config_path, &at, "/api/v1/shared/move", body)? {
+        print_said(&moved);
+    }
+    Ok(())
+}
+
+/// `cordelia shared stay <name> [--words]` (§5.1; decision 2026-10-24,
+/// rule 26).
+pub fn stay(config_path: &str, name: &str, words: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "words": words });
+    if let Some(stayed) = with_a_yes(config_path, &at, "/api/v1/shared/stay", body)? {
+        print_said(&stayed);
+    }
+    Ok(())
+}
+
 // ── cordelia shared rename, drop and list ────────────────────────────
 
 /// `cordelia shared rename <name> <new name> [--words <four words>]`
@@ -417,6 +528,51 @@ mod tests {
             Ok(Some(Commands::Id { words: true })) => {}
             _ => panic!("id --words"),
         }
+    }
+
+    /// `shared anew` asks of each key in turn and suggests nothing
+    /// (decision 2026-10-10 §7, property 7): an empty line and `yes` are
+    /// asked again; `out for the rest`, typed at the first question, leaves
+    /// out every key not yet answered; a `keep` past 64 staying is asked
+    /// again.
+    #[test]
+    fn each_key_is_answered_and_out_for_the_rest_leaves_out_the_rest() {
+        let asked: Vec<(String, String)> = (0..100)
+            .map(|k| (format!("key{k}"), format!("form{k}")))
+            .collect();
+        let script = |typed: Vec<&'static str>| {
+            let mut typed = typed.into_iter();
+            let mut questions = Vec::new();
+            let keep = answers(&asked, 2, |asks| {
+                questions.push(asks.to_string());
+                Ok(typed.next().map(str::to_string))
+            })
+            .unwrap();
+            (keep, questions)
+        };
+        let (keep, questions) = script(vec!["", "yes", "keep", "out", "out for the rest"]);
+        assert_eq!(keep, ["key0"]);
+        assert_eq!(
+            questions[0],
+            "Does form0 stay? Type keep or out, or out for the rest: "
+        );
+        // Asked of form0 three times, then form1, then form2.
+        assert_eq!(questions.len(), 5);
+        assert!(questions[2].starts_with("Does form0 stay?"));
+        assert!(questions[3].starts_with("Does form1 stay?"));
+        assert!(questions[4].starts_with("Does form2 stay?"));
+        let (keep, _) = script(vec!["out for the rest"]);
+        assert!(keep.is_empty());
+        // 62 kept beside 2 of the person's own: a 63rd keep is asked again.
+        let mut typed = vec!["keep"; 63];
+        typed.push("out for the rest");
+        let (keep, questions) = script(typed);
+        assert_eq!(keep.len(), 62);
+        assert!(questions[62].starts_with("Does form62 stay?"));
+        assert!(questions[63].starts_with("Does form62 stay?"));
+        // The input ends: nothing is made.
+        let mut none = answers(&asked, 2, |_| Ok(None));
+        assert!(none.as_mut().is_err());
     }
 
     /// `cordelia channels` is said for what it does now (decision

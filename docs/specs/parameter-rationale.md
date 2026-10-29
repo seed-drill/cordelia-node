@@ -2867,6 +2867,21 @@ and when the hourly task has made room where a key has bytes refused
 within the day begins when the day is up. A member that lets one key go
 quiet each hour then costs one read a day, within the share.
 
+#### SHARED_OFFER_DELIVERED_SECS = 2,592,000
+
+**Derivation:** `AGENT_MESSAGE_KEPT_DAYS` (30) in seconds.
+
+**Rationale:** A device that makes a channel anew, or moves from it, takes
+the old channel's entries out of its store (record §6.3, §7); but the offer
+it wrote there is in that store, and reaches the old channel's relays only
+by its pushes. So the old channel's entries wait in the store until each
+relay of the old card answers that it holds the offer, and the pass pushes
+the offer alone there, nothing else of the device's own. A relay that is
+not one of the device's own, or is gone, never answers: the entries go at
+the end of this time, the time after which a quiet key is let go, by which
+every message the old channel showed has expired. The bound is the store's
+of 42.13 MiB of one channel, held no longer than that (record §6.3).
+
 #### SHARED_REQUESTS_PER_MINUTE = 600
 
 **Rationale:** The shared pass's own counter of requests at each relay

@@ -921,3 +921,89 @@ fn send_says_what_came_since_this_folder_last_wrote() {
     let (_, _, again) = sends(&s, 0, &asking("notes", "review", "four"), t + 5).unwrap();
     assert!(!new_key(&again), "{again:?}");
 }
+
+/// A send waits where the channel is not yet clean, or paused by an offer
+/// (decision 2026-10-24, rules 23, 25 and 26; decision 2026-10-10 §5.5):
+/// `not_clean` while it is marked so; `paused` once an offer that seals to
+/// Bob and leaves out Carol is read, until Bob stays; and, once Bob has
+/// moved, a reply to a message of the old channel is `moved`.
+#[test]
+fn a_send_waits_where_the_channel_is_not_clean_or_paused() {
+    use crate::shared::tests::{anew, anew_of};
+    use cordelia_crypto::shared::{Anew, Offer};
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    let (alice, carol) = (member(1), member(2));
+    for member in [&alice, &carol] {
+        given(&s, 0, &anew(member, &channel, 1), t);
+    }
+    let old_id = id_given(&s, 0, &channel, 1, "before it was made anew", t);
+    assert!(sends(&s, 0, &asking("notes", "review", "clean"), t + 1).is_ok());
+
+    // Not clean: nothing is sent.
+    let conn = &s[0].conn;
+    cordelia_storage::shared_anew::not_clean(conn, &channel.id, t, false).unwrap();
+    assert_eq!(
+        refused(&s, 0, &asking("notes", "review", "x"), t + 2),
+        "not_clean"
+    );
+    match sends(&s, 0, &asking("notes", "review", "x"), t + 2) {
+        Err(NotSentHere::Refused(why, name)) => {
+            let answer = refusal_of(conn, &why, &name).unwrap();
+            assert_eq!(answer.status(), 409);
+        }
+        other => panic!("{other:?}"),
+    }
+    cordelia_storage::shared_anew::clean(conn, &channel.id).unwrap();
+
+    // Alice's offer, sealed to Bob and not to Carol: paused.
+    let card = crate::lists::tests::filing(30, "x").card;
+    let offer = Offer::make(
+        (t + 3) as u64,
+        &channel.id,
+        &card,
+        &[alice.public_key(), s.key(0)],
+    )
+    .unwrap();
+    given(
+        &s,
+        0,
+        &anew_of(&alice, &channel, 2, Anew::Offer(offer).to_value().unwrap()),
+        t + 3,
+    );
+    assert_eq!(
+        refused(&s, 0, &asking("notes", "review", "x"), t + 4),
+        "paused"
+    );
+    // Bob stays: it is sent again.
+    crate::shared_anew::make_stay(conn, &channel.id, "review").unwrap();
+    assert!(sends(&s, 0, &asking("notes", "review", "stayed"), t + 5).is_ok());
+
+    // Bob moves: a reply to the old channel's message is `moved`, and the
+    // subscription is in the new channel.
+    let plan = crate::shared_anew::move_plan(
+        conn,
+        &s[0].identity,
+        &at(t).own_relays,
+        "review",
+        None,
+        None,
+        t + 6,
+    )
+    .unwrap();
+    crate::shared_anew::make_move(conn, &s[0].identity, &plan.what, t + 6).unwrap();
+    out(&s, 0, t + 6);
+    let mut reply = asking("notes", "review", "an answer");
+    reply.reply = Some(old_id[..8].to_string());
+    assert_eq!(refused(&s, 0, &reply, t + 7), "moved");
+    assert!(
+        sends(
+            &s,
+            0,
+            &asking("notes", "review", "in the new channel"),
+            t + 7
+        )
+        .is_ok()
+    );
+}

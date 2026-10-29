@@ -1645,6 +1645,15 @@ struct Handed {
     /// How many versions each key wrote that this device received, in
     /// the last day and in the last week. `None` with local history off.
     received: Option<Vec<([u8; 32], u64, u64)>>,
+    /// The shared channels the person holds, by name, and each act in
+    /// force in the person's lists with its maker and what undoes it
+    /// (decision 2026-10-10 §3.5).
+    shared_channels: Vec<String>,
+    /// Those of them that this device does not reach, which the removal
+    /// leaves not clean rather than making anew (decision 2026-10-24,
+    /// rules 24 and 25).
+    shared_unreached: Vec<String>,
+    shared_acts: Vec<([u8; 32], String)>,
 }
 
 impl Handed {
@@ -1755,7 +1764,22 @@ impl Handed {
         // entry that was handed, and is not the node's word of it (§16).
         let held = entry_of(text(handed, "entry"))?;
         let over = hex::encode(held.id());
+        let shared_channels: Vec<String> = list(handed, "shared_channels")
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        let shared_unreached: Vec<String> = list(handed, "shared_unreached")
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        let shared_acts: Vec<([u8; 32], String)> = list(handed, "shared_acts")
+            .filter_map(|act| {
+                let maker = decode_public_key(act["maker"].as_str()?).ok()?;
+                Some((maker, act["line"].as_str()?.to_string()))
+            })
+            .collect();
         Ok(Self {
+            shared_channels,
+            shared_unreached,
+            shared_acts,
             this_device: *own,
             applied,
             held,
@@ -1829,6 +1853,69 @@ impl Handed {
             })
             .unwrap_or_default()
     }
+}
+
+/// What a removal says before its yes of the shared channels (decision
+/// 2026-10-10 §3.5; decision 2026-10-24, rule 24): each the person holds,
+/// that it is made anew without the device removed, and that the other
+/// people in it move with a yes of their own; and each act in force of a
+/// device it removes, with the command that undoes it. Nothing where the
+/// change removes no device that the statement applied lists or that was
+/// added since.
+fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
+    let removes = |key: &[u8; 32]| signs.removes(key) && !handed.applied.statement.removes(key);
+    let removes_any = handed
+        .applied
+        .statement
+        .devices
+        .iter()
+        .any(|d| removes(&d.key))
+        || handed.added.iter().any(|r| removes(&r.addition.device.key));
+    let mut lines = Vec::new();
+    if !removes_any {
+        return lines;
+    }
+    if !handed.shared_channels.is_empty() {
+        let names: Vec<String> = handed
+            .shared_channels
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        lines.push(format!(
+            "\nThese shared channels are made anew without the device removed, in this change: \
+             {}. The other people in each move with a yes of their own, and their devices send \
+             nothing more in the old channel meanwhile.",
+            names.join(", ")
+        ));
+    }
+    if !handed.shared_unreached.is_empty() {
+        let names: Vec<String> = handed
+            .shared_unreached
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        lines.push(format!(
+            "\nThese shared channels are not reached from this device, so they are not made anew \
+             in this change: {}. Your devices send nothing in each until you make it anew with \
+             cordelia shared anew <name> on a device of yours that reaches its relays.",
+            names.join(", ")
+        ));
+    }
+    let acts: Vec<&String> = handed
+        .shared_acts
+        .iter()
+        .filter(|(maker, _)| removes(maker))
+        .map(|(_, line)| line)
+        .collect();
+    if !acts.is_empty() {
+        lines.push(
+            "\nWhat the device removed did in your shared channels, still in force, each with \
+             what undoes it:"
+                .into(),
+        );
+        lines.extend(acts.into_iter().map(|line| format!("  {line}")));
+    }
+    lines
 }
 
 /// What a removal says of the things that a device being removed lists
@@ -2031,6 +2118,11 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         let not_shown = handed.names_not_shown_of(|key| signs.removes(key));
         if not_shown > 0 {
             println!("\n{}", not_shown_stay_behind(not_shown));
+        }
+        for line in shared_at_a_removal(&handed, &signs) {
+            for line in line.split('\n') {
+                println!("{}", crate::history_cmd::printable(line));
+            }
         }
         if !at.yes("\nMake this change?")? {
             println!("{NOT_A_YES}");
@@ -2845,6 +2937,21 @@ fn waits_after(
             say(wait::Told::ended(at));
             for line in wait::end_lines(end, &relays, word, at) {
                 say(line);
+            }
+            // Each shared channel the removal made anew (decision
+            // 2026-10-10 §3.5), among the lines of its end.
+            for line in list(&seen, "shared_made_anew").filter_map(Value::as_str) {
+                say(crate::history_cmd::printable(line));
+            }
+            // Each shared channel it left not clean, which this device does
+            // not reach (decision 2026-10-24, rules 24 and 25), with the
+            // command to run on a device that does; and each act of the
+            // removed device still in force, with what undoes it, as before
+            // the yes.
+            for notice in list(&seen, "notices")
+                .filter(|notice| notice["kind"] == "not_clean" || notice["kind"] == "removed_act")
+            {
+                say(crate::history_cmd::printable(text(notice, "says")));
             }
             return Ok(Waited::Ended(end));
         }

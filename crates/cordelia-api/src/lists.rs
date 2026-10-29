@@ -659,10 +659,20 @@ impl Computed {
     /// The items in force and the undoes kept for something that the
     /// device writes in `part`, and the writers of the lists that carry the
     /// acts below those undoes.
+    #[cfg(test)]
     fn placed(&self, part: usize) -> (usize, Vec<[u8; 32]>) {
+        self.placed_but(part, |_| false)
+    }
+
+    /// The same, less the acts that `passed` names.
+    fn placed_but(&self, part: usize, passed: impl Fn(&AnyAct) -> bool) -> (usize, Vec<[u8; 32]>) {
         let mut devices = BTreeSet::new();
         let mut placed = 0;
-        for act in self.written.iter().filter(|act| act.part() == part) {
+        for act in self
+            .written
+            .iter()
+            .filter(|act| act.part() == part && !passed(act))
+        {
             let acts = &self.valid[&act.key()];
             if !act.undoes() {
                 placed += 1;
@@ -909,6 +919,16 @@ pub enum Do {
     /// newest of the filings, never refused for room, and a drop of the
     /// old one, which takes no place.
     Move { from: [u8; 32], to: Filing },
+    /// The same, with each agent that subscribed to the old channel
+    /// subscribed to the new (decision 2026-10-10 §7: `shared move` "moves
+    /// each subscription of the old channel to the new, each a new act").
+    /// The subscriptions are never refused for room: a move is never
+    /// refused but by `held_at_bound`.
+    MoveWith {
+        from: [u8; 32],
+        to: Filing,
+        agents: Vec<String>,
+    },
     /// Subscribe an agent to a channel, or end its subscription.
     Subscribe(Subscription),
     /// Give a key a label, or take its label away.
@@ -1012,11 +1032,23 @@ fn decide(
     // A filing, a subscribe or a label of a new item is refused where its
     // part holds its bound of items in force and undoes kept for
     // something; an act on an item that holds a place takes that place.
+    // A subscription of a channel that is filed no more (moved from, or
+    // dropped) shows nothing and cannot be undone by its name: it holds no
+    // room, so that the subscriptions a move moves do not fill the room of
+    // the old ones (decision 2026-10-10 §7). The list's bound still writes
+    // the newest first.
+    let unfiled = |act: &AnyAct| match act {
+        AnyAct::Subscription(subscription) => matches!(
+            newest(&(Part::Channel, subscription.item.channel.to_vec())),
+            Some(AnyAct::Drop(_))
+        ),
+        _ => false,
+    };
     let room = |key: &Key, part: usize, bound: usize, as_part: Part| {
         if computed.holds_a_place(key, part) {
             return Ok(());
         }
-        let (placed, devices) = computed.placed(part);
+        let (placed, devices) = computed.placed_but(part, unfiled);
         if placed >= bound {
             return Err(Refused::Full {
                 part: as_part,
@@ -1047,6 +1079,29 @@ fn decide(
             Ok(vec![signed(
                 make(dropped, dated(&key)?, identity).map(AnyAct::Drop),
             )?])
+        }
+        Do::MoveWith { from, to, agents } => {
+            let mut made = decide(
+                computed,
+                makers,
+                identity,
+                &Do::Move {
+                    from: *from,
+                    to: to.clone(),
+                },
+                now,
+            )?;
+            for agent in agents {
+                let subscription = Subscription {
+                    channel: to.channel,
+                    agent: agent.clone(),
+                    subscribed: true,
+                };
+                let key = (Part::Subscription, subscription.item());
+                let made_one = make(subscription, dated(&key)?, identity);
+                made.push(signed(made_one.map(AnyAct::Subscription))?);
+            }
+            Ok(made)
         }
         Do::Move { from, to } => {
             if !filed(from) {
@@ -1294,6 +1349,26 @@ pub fn recovered(
     (list_of(computed.written), list_of(computed.past_bound))
 }
 
+/// The machine of a recovery writes, as its own list, what the recovery
+/// takes of `lists`, the lists of the devices it showed (§3.5), with the
+/// keys of `gone` as removed keys and every other in no list: the acts of
+/// a device it removes are taken, as copies; the acts of one the person
+/// still has are passed over until it is added again. The table of shared
+/// channels follows. In the caller's transaction.
+pub fn write_recovered(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    lists: &[([u8; 32], SharedList)],
+    gone: &[[u8; 32]],
+    now: i64,
+) -> Result<(), PersonError> {
+    let (written, _) = recovered(lists, |key| gone.contains(key).then_some(Maker::Removed));
+    let standing = Standing::to_write(conn)?;
+    write_list(conn, identity, &standing, &acts_of(&written), now)?;
+    crate::shared::keep(conn, &identity.public_key(), now)?;
+    Ok(())
+}
+
 /// The list of each key of `shown` among `handed`, the entries of a
 /// personal channel whose secret is `personal`: that key's own entry
 /// under its own list's name, the newest it signed there (§3.5). One that
@@ -1323,6 +1398,30 @@ pub fn lists_in(
         }
     }
     Ok(found)
+}
+
+/// A test's device writes, as its own list, a filing of `filing` at the
+/// time bound with the highest count: no act can go above that item while
+/// the device counts (`held_at_bound`).
+#[cfg(test)]
+pub(crate) fn held_at_the_bound(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    filing: Filing,
+    now: i64,
+) -> Result<(), PersonError> {
+    let act = Act::make(
+        filing,
+        SHARED_ACT_TIME_MAX,
+        SHARED_ACT_TIME_MAX,
+        identity,
+        is_a_name,
+    )
+    .map_err(|e| not_held("an act", e))?;
+    in_one(conn, || {
+        let standing = Standing::to_write(conn)?;
+        write_list(conn, identity, &standing, &[AnyAct::Filing(act)], now)
+    })
 }
 
 #[cfg(test)]

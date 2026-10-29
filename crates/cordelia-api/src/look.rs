@@ -430,6 +430,10 @@ pub struct Look {
     /// seconds: a relay not known to hold the latest change is amber for
     /// seven days from it (decision 2026-10-19, rule 11).
     pub relays_known_since: Option<i64>,
+    /// What the removal that this device applied last made anew of the
+    /// shared channels, a line each (decision 2026-10-10 §3.5): what
+    /// `remove-device` says among the lines of its end.
+    pub shared_made_anew: Vec<String>,
 }
 
 impl Look {
@@ -567,6 +571,7 @@ pub fn look(
             word_to_come: at_relays.word_to_come,
             woke_at: at_relays.woke_at,
             relays_known_since: relays_known_since(conn, now)?,
+            shared_made_anew: Vec::new(),
         };
         match held(conn)? {
             None => {
@@ -723,6 +728,7 @@ fn of_its_person(
     }
 
     look.notices = notices(conn, identity, statement, &kept, &reader)?;
+    look.shared_made_anew = crate::shared_anew::made_at_the_last_removal(conn, look.applied_at)?;
 
     // Why it cannot go on.
     let why = match held.state {
@@ -1401,6 +1407,12 @@ fn told(
             says,
             Some(shown.key),
         ));
+    }
+    // Each shared channel not yet clean, and each act of a removed device
+    // in force, until each is done or a person clears it (decision
+    // 2026-10-10 §3.5; decision 2026-10-24, rule 25).
+    for (id, kind, says) in crate::shared_anew::notices(conn)? {
+        all.push(tell(id, kind, says, None));
     }
     Ok(all)
 }

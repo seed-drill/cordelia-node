@@ -2663,6 +2663,16 @@ pub const SHARED_TAKE_OUT_STEP_ENTRIES: usize = AGENT_MESSAGE_RING + 1;
 /// day begins when the day is up.
 pub const SHARED_READ_AGAIN_SECS: u64 = 24 * 60 * 60;
 
+/// How long, at most, the entries of a shared channel a device moved from
+/// wait in its store for the offer it wrote there to be at each relay of
+/// the old card (decision 2026-10-10 §7, §6.3): the pass pushes the offer
+/// alone until each relay answers that it holds it, and the entries are
+/// then taken out as of any channel moved from. A relay of the card that
+/// is not one of the device's own never answers, and the entries go at the
+/// end of this time. Derived: AGENT_MESSAGE_KEPT_DAYS, in seconds, as a
+/// quiet key is let go.
+pub const SHARED_OFFER_DELIVERED_SECS: u64 = AGENT_MESSAGE_KEPT_DAYS as u64 * 24 * 60 * 60;
+
 /// How many requests the shared pass makes of one relay in a minute, at
 /// most, on a counter of its own (decision 2026-10-10 §8.4). With the
 /// device's own, OWN_ENTRY_REQUESTS_PER_MINUTE, and its shows of a minute,
@@ -4540,6 +4550,8 @@ mod tests {
         assert!(entry_cost(MAX_ITEM_BYTES) <= SHARED_BYTES_PER_MINUTE);
         assert!(entry_cost(SHARED_ANEW_CONTENT_BYTES) <= SHARED_PUSH_BYTES_PER_MINUTE);
         assert_eq!(SHARED_READ_AGAIN_SECS, 86_400);
+        // An offer waits for its relays at most 30 days, as a quiet key.
+        assert_eq!(SHARED_OFFER_DELIVERED_SECS, 30 * 86_400);
         let read_again = SHARED_MAX_CHANNELS as u64 * MAX_ENTRY_CHANNEL_BYTES_AT_RELAY;
         assert_eq!(read_again, 256 * 1024 * 1024);
         let a_day = SHARED_BYTES_PER_MINUTE * (SHARED_READ_AGAIN_SECS / 60);

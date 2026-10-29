@@ -383,6 +383,17 @@ pub fn forget_cleared(conn: &Connection) -> Result<usize, CordeliaError> {
         .map_err(storage)
 }
 
+/// Keep no word of what was cleared, but of the notices whose names begin
+/// with `prefix`: those are of no statement (decision 2026-10-10 §3.5, the
+/// naming of a removed device's acts, which a person ends by clearing it).
+pub fn forget_cleared_but(conn: &Connection, prefix: &[u8]) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM person_cleared WHERE substr(notice, 1, ?2) != ?1",
+        params![prefix, prefix.len() as i64],
+    )
+    .map_err(storage)
+}
+
 /// Keep nothing of what a person typed, cleared or is to be told: for a
 /// device that leaves the phrase it followed (decision 2026-10-04 §5.2).
 /// Returns how many rows went.

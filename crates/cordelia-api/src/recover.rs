@@ -308,6 +308,10 @@ pub struct Generation {
     /// 2026-10-19 §4, rule 5): what it carried is at the relays that the
     /// word names ([`Generation::judged`]).
     pub carried_word: Option<CarriedWordLook>,
+    /// The list of shared channels of each key of a row, as that key's own
+    /// entry in the personal channel holds it (decision 2026-10-10 §3.5):
+    /// what the recovery takes acts from by the rules of §3.4.
+    pub lists: Vec<([u8; 32], cordelia_crypto::acts::SharedList)>,
 }
 
 /// What a recovery judges of the one device of the statement it recovers
@@ -633,6 +637,8 @@ pub fn read_generation(
             carried_word = device.and_then(|device| device.carried_word.clone());
         }
     }
+    let shown_keys: Vec<[u8; 32]> = rows.iter().map(|row| row.key).collect();
+    let lists = crate::lists::lists_in(handed, &personal, &shown_keys)?;
     Ok(Generation {
         rows,
         not_shown,
@@ -640,6 +646,7 @@ pub fn read_generation(
         names,
         cut_short,
         carried_word,
+        lists,
     })
 }
 
@@ -1051,6 +1058,19 @@ pub struct MakeRequest {
     /// The word that the phrase gave for the look ([`Allows::Look`]),
     /// under this very change entry.
     pub word: Word,
+    /// The list of shared channels of each device the recovery showed, as
+    /// its own entry in the personal channel recovered from holds it: each
+    /// the key, in hex, and the list's value, in hex (decision 2026-10-10
+    /// §3.5).
+    #[serde(default)]
+    pub shared_lists: Vec<SharedListHanded>,
+}
+
+/// A device's list of shared channels, as a command hands it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SharedListHanded {
+    pub key: String,
+    pub list: String,
 }
 
 /// What a recovery is to look at, as its word allows.
@@ -1130,6 +1150,7 @@ pub fn follow(
     left: &[(u64, [u8; 32])],
     shown: &Shown,
     word: &Word,
+    shared_lists: &[([u8; 32], cordelia_crypto::acts::SharedList)],
 ) -> Result<(u64, ToLook), PersonError> {
     let to_look = to_look(state, entry, word)?;
     let at = now();
@@ -1170,6 +1191,18 @@ pub fn follow(
             // that has ended it does not write that it has sent what it
             // carried (§8).
             meta::set(conn, meta::PERSON_LOOK_PENDING, "1")?;
+            // The person's lists of shared channels (decision 2026-10-10
+            // §3.5): the acts the recovery takes by the rules of §3.4, the
+            // devices it removes as removed keys and those still had in no
+            // list, written as this machine's list; it holds the channels
+            // they file, and owes each its making anew once it has read it
+            // where the recovery removed a key (decision 2026-10-24, rule
+            // 24).
+            let gone: Vec<[u8; 32]> = shown.gone.iter().map(|(key, _)| *key).collect();
+            crate::lists::write_recovered(conn, identity, shared_lists, &gone, at)?;
+            if !gone.is_empty() {
+                crate::shared_anew::recovered(conn, at)?;
+            }
             Ok(applied.number)
         });
         if applied.is_ok() {
@@ -1237,7 +1270,28 @@ pub async fn make(
         still_have: labelled(&body.still_have)?,
         not_shown: labelled(&body.not_shown)?,
     };
-    let made = follow(&state, &entry, &statement_key, &left, &shown, &body.word);
+    let mut shared_lists = Vec::new();
+    for handed in &body.shared_lists {
+        let key = carry::key_named(&handed.key).ok_or_else(|| bad("a key"))?;
+        let value = hex::decode(&handed.list)
+            .map_err(|_| ApiError::BadRequest("a list is not hex".into()))?;
+        // A list that is no list is passed over, as any device passes it
+        // over (§3.4).
+        if let Ok(list) =
+            cordelia_crypto::acts::SharedList::from_value(&Value::Other(value), names::is_a_name)
+        {
+            shared_lists.push((key, list));
+        }
+    }
+    let made = follow(
+        &state,
+        &entry,
+        &statement_key,
+        &left,
+        &shown,
+        &body.word,
+        &shared_lists,
+    );
     // What was handed of the secrets is overwritten here: the store
     // holds them now, or nothing was made.
     for (_, secret) in &mut left {
@@ -1255,6 +1309,12 @@ pub async fn make(
         "names": to_look.names.len(),
         "read": 0,
     }));
+    // What the end of the look says of the shared channels, as before the
+    // yes (decision 2026-10-10 §3.5).
+    let shared_said =
+        crate::shared_anew::recovery_lines(&shared_lists, &shown.gone, &shown.still_have)
+            .map_err(commands::refused)?;
+    state.own_channels.set_shared_recovered(shared_said);
     state.own_channels.written();
     state.own_channels.ask_whole();
     state.sync_control.ask_cycle();
@@ -1319,7 +1379,10 @@ pub async fn progress(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
     commands::asked(&req, &state)?;
-    Ok(HttpResponse::Ok().json(json!({ "look": state.own_channels.look() })))
+    Ok(HttpResponse::Ok().json(json!({
+        "look": state.own_channels.look(),
+        "shared": state.own_channels.shared_recovered(),
+    })))
 }
 
 /// The look of a recovery (decision 2026-10-04 §9, step 5), made once.
@@ -2248,6 +2311,7 @@ mod tests {
         word: Word,
         names: Names,
         cut_short: Option<[u8; 32]>,
+        shared_lists: Vec<([u8; 32], cordelia_crypto::acts::SharedList)>,
     }
 
     fn makes(node: &Node, from: &Candidate, handed: &[CheckedEntry], answers: &[Answer]) -> Made {
@@ -2312,6 +2376,7 @@ mod tests {
             word,
             names,
             cut_short: read.cut_short,
+            shared_lists: read.lists.clone(),
         }
     }
 
@@ -2323,6 +2388,7 @@ mod tests {
             &made.left,
             &made.shown,
             &made.word,
+            &made.shared_lists,
         )
     }
 
@@ -3878,6 +3944,7 @@ mod tests {
             word: made.word.clone(),
             names: made.names.clone(),
             cut_short: made.cut_short,
+            shared_lists: made.shared_lists.clone(),
         }
     }
 

@@ -282,6 +282,10 @@ pub struct OwnChannels {
     /// How far the look of a recovery is, and what it found, where this
     /// node has made one since it started (decision 2026-10-04 §9).
     look: Mutex<Option<serde_json::Value>>,
+    /// What the recovery made on this node says of the shared channels, a
+    /// line each (decision 2026-10-10 §3.5): said again at the end of its
+    /// look.
+    shared_recovered: Mutex<Vec<String>>,
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -635,6 +639,23 @@ impl OwnChannels {
     /// again by itself, and a node that starts again says nothing of one.
     pub fn set_look(&self, said: serde_json::Value) {
         *self.look.lock().unwrap_or_else(|e| e.into_inner()) = Some(said);
+    }
+
+    /// Keep what a recovery says of the shared channels, for the end of its
+    /// look.
+    pub fn set_shared_recovered(&self, said: Vec<String>) {
+        *self
+            .shared_recovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = said;
+    }
+
+    /// What was kept of what a recovery says of the shared channels.
+    pub fn shared_recovered(&self) -> Vec<String> {
+        self.shared_recovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// What was last kept of the look of a recovery ([`Self::set_look`]).

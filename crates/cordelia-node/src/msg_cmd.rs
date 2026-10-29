@@ -1872,6 +1872,12 @@ pub fn shared_log_says(
                 name_shown(agent.as_str().unwrap_or_default())
             ));
         }
+        // What the node says of making anew there (decision 2026-10-10
+        // §5.1, §7): the offers and their faults, a channel not yet clean,
+        // the keys not moved yet, those no longer shown.
+        for line in channel["anew"].as_array().into_iter().flatten() {
+            out.push_str(&format!("{}\n", text(line)));
+        }
         let messages = channel["messages"].as_array().cloned().unwrap_or_default();
         if messages.is_empty() {
             out.push_str("  No message to show here.\n");

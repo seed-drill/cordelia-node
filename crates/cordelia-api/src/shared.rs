@@ -338,7 +338,7 @@ pub(crate) fn taken_as_shared(
     // Rule 6: only an entry of a key the device shows is opened.
     let shown = knows.shown(conn, row.id)?;
     let read = if shown.iter().any(|key| key.key == entry.author) {
-        index(conn, &row, &secret, entry, now)?
+        index(conn, own, &row, &secret, entry, now)?
     } else {
         kept::unopened(conn, row.id, &entry.author, &entry.slot)?;
         Read::NotShown
@@ -359,6 +359,7 @@ pub(crate) fn taken_as_shared(
 /// else is counted as no message.
 pub fn index(
     conn: &Connection,
+    own: &[u8; 32],
     row: &Channel,
     secret: &[u8; 32],
     entry: &CheckedEntry,
@@ -406,7 +407,12 @@ pub fn index(
         Ok(SharedTaken::Clearing { number }) => Ok(Read::Clearing {
             dropped: kept::clear(conn, row.id, &signer, number, now)?,
         }),
-        Ok(SharedTaken::Anew(record)) => Ok(Read::Anew(record)),
+        Ok(SharedTaken::Anew(record)) => {
+            // An offer is kept as it says, once for this revision of it
+            // (§7).
+            crate::shared_anew::read(conn, own, row, &signer, entry.rev, &record, now)?;
+            Ok(Read::Anew(record))
+        }
         Err(why) => no_message(why),
     }
 }
@@ -423,6 +429,7 @@ pub fn keep(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonErr
             return Ok(());
         };
         follow_the_lists(conn, own, now)?;
+        crate::shared_anew::deliveries(conn, own, now)?;
         let knows = Knows::of(conn, &held)?;
         let seen = kept::labelled(conn)?;
         let newly_labelled = knows.labels.iter().any(|key| !seen.contains(key));
@@ -439,7 +446,7 @@ pub fn keep(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonErr
                 kept::ask_read_again(conn, row.id, now)?;
             }
             keep_known(conn, &knows, &row, now)?;
-            open_shown(conn, &knows, &row, now)?;
+            open_shown(conn, own, &knows, &row, now)?;
         }
         // Each subscription starts when this device first takes it
         // (decision 2026-10-10 §4.1).
@@ -517,7 +524,15 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                     false => (State::Dropped, ChannelOut::Dropped),
                 };
                 kept::set_state(conn, row.id, state, now)?;
-                pass_rows::begin_channel(conn, row.id, how)?;
+                // A channel this device made anew keeps its entries until
+                // its offer is at each relay of its card (§7): they are
+                // taken out then ([`crate::shared_anew::deliveries`]).
+                let offer_waits = moved
+                    && cordelia_storage::shared_anew::made_of_channel(conn, &row.channel)?
+                        .is_some_and(|made| made.delivering);
+                if !offer_waits {
+                    pass_rows::begin_channel(conn, row.id, how)?;
+                }
             }
         } else if anywhere.contains(&row.channel) {
             if row.state == State::Held {
@@ -606,6 +621,7 @@ fn keep_known(
 /// reader has not read, by revision.
 fn open_shown(
     conn: &Connection,
+    own: &[u8; 32],
     knows: &Knows,
     row: &Channel,
     now: i64,
@@ -633,7 +649,7 @@ fn open_shown(
         }
         waiting.sort_by_key(|entry| entry.rev);
         for entry in &waiting {
-            index(conn, row, &secret, entry, now)?;
+            index(conn, own, row, &secret, entry, now)?;
         }
     }
     Ok(())
@@ -753,6 +769,16 @@ pub fn take_out_step(conn: &Connection, now: i64) -> Result<Stepped, PersonError
             SHARED_TAKE_OUT_STEP_ENTRIES,
         )?;
         if step == ChannelStep::Done {
+            // What step 26 keeps of the channel: of one dropped or
+            // forgotten, everything; of one moved from, the offers read
+            // there, which say who has not moved yet (§7).
+            let anew = |e| PersonError::Storage(e);
+            cordelia_storage::shared_anew::clean(conn, &row.channel).map_err(anew)?;
+            if how != ChannelOut::Moved {
+                cordelia_storage::shared_anew::forget_offers_in(conn, &row.channel)
+                    .map_err(anew)?;
+                cordelia_storage::shared_anew::forget_made(conn, &row.channel).map_err(anew)?;
+            }
             match how {
                 ChannelOut::Forgotten => kept::forget(conn, id)?,
                 ChannelOut::Dropped | ChannelOut::Moved => {

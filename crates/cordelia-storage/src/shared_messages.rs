@@ -61,6 +61,23 @@ pub fn subscribed(conn: &Connection) -> Result<Vec<Subscribed>, CordeliaError> {
         .map_err(storage)
 }
 
+/// The subscription of `agent` to `channel` starts at `start`, where it
+/// has no start: a move keeps the start of the subscription it moves
+/// (decision 2026-10-10 §7).
+pub fn start_at(
+    conn: &Connection,
+    channel: &[u8; 32],
+    agent: &str,
+    start: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO shared_msg_subscribed (channel, agent, start) VALUES (?1, ?2, ?3)",
+        params![&channel[..], agent, start],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
 /// Keep the starts with what is in force, `in_force`, at `now` (decision
 /// 2026-10-10 §4.1): one in force that has no start starts now; one that
 /// keeps its state keeps its start; one no longer in force goes, so that it

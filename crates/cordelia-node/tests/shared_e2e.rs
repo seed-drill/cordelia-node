@@ -607,6 +607,39 @@ fn a_shared_channel_lives_only_at_its_relays_that_are_your_own() {
         err.contains("127.0.0.1:9 is not one of your relays known by its key, and a shared channel lives only at those: nothing was done."),
         "{err}"
     );
+
+    // Made anew at the second relay, which Bob's device does not know:
+    // `shared move` there is refused with `not_own_relay` (§8.2).
+    let at_two = format!("127.0.0.1:{}", two.p2p);
+    wait_for("Alice holds Bob's key", &all, 300, || {
+        (channel_of(&alice, "review")?["keys"] == 1).then_some(())
+    });
+    let mut at = alice.at_terminal(&["shared", "anew", "review", "--relay", &at_two]);
+    at.says(LABEL_FIRST)
+        .says("Does (")
+        .says("out for the rest: ")
+        .types("keep");
+    at.says("Type yes to go on").types("yes");
+    let said = at.done();
+    assert!(said.contains("Made \"review\" anew"), "{said}");
+    let refused = wait_for("Bob reads the offer", &all, 300, || {
+        let (status, answer) = bob.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": "review", "look": true }),
+        );
+        (status == 409 && answer["error"]["code"] == "not_own_relay").then(|| {
+            answer["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+    });
+    assert!(
+        refused.contains(
+            "is not one of your relays, and a shared channel lives only at your own relays"
+        ),
+        "{refused}"
+    );
 }
 
 /// Where the relay holds two shares from the typed key for this device,
@@ -1505,7 +1538,9 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
         );
     }
 
-    // A message Bob sends after is unread for `notes` alone.
+    // The removal made the channel anew (decision 2026-10-24, rule 24):
+    // Bob moves, and a message he sends after is unread for `notes` alone.
+    moves(&after_removal, &bob, "review", None);
     sends_into(
         &[&relay, &bob],
         &bob,
@@ -1519,5 +1554,971 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
             (summary_in(device, &notes[n]) == shared_line(1)).then_some(())
         });
         assert_eq!(summary_in(device, &work[n]), "");
+    }
+}
+
+// ── Making anew, moving, a removal and a recovery (slice 8) ─────────
+
+/// What `shared anew` says once it has listed every key (decision
+/// 2026-10-10 §7).
+const LABEL_FIRST: &str = "A key you label is listed first, before keys you have not labelled";
+
+/// `cordelia shared anew <name>` on `n`, at a terminal: it lists every key
+/// first; each key it asks about is answered as `answers` says of the key
+/// the question names, after typing each of `again` first, which must each
+/// be asked again; then its yes. What it said.
+fn makes_anew(n: &Node, name: &str, answers: &[(String, &str)], again: &[&str]) -> String {
+    let mut at = n.at_terminal(&["shared", "anew", name]);
+    at.says(LABEL_FIRST);
+    let questions: Vec<String> = answers
+        .iter()
+        .map(|(key, _)| format!("Does ({}) ", six_words_of(key)))
+        .collect();
+    let questions: Vec<&str> = questions.iter().map(String::as_str).collect();
+    let mut asked_again = again.iter();
+    for _ in answers {
+        let which = at.says_one_of(&questions);
+        at.says("out for the rest: ");
+        if let Some(first) = asked_again.next() {
+            at.types(first);
+            at.says("Type keep or out, or out for the rest.");
+            at.says(questions[which]).says("out for the rest: ");
+        }
+        at.types(answers[which].1);
+    }
+    at.says("are left out.")
+        .says("Type yes to go on")
+        .types("yes");
+    let said = at.done();
+    assert!(
+        said.contains(&format!("Made \"{name}\" anew: it is channel ")),
+        "{said}"
+    );
+    said
+}
+
+/// What `shared move <name>` on `n` would do, once `n` has read an offer
+/// it may move to: its yes's text.
+fn offer_read(all: &[&Node], n: &Node, name: &str, to: Option<&str>) -> String {
+    wait_for("an offer to move to is read", all, 300, || {
+        let (status, answer) = n.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": name, "to": to, "look": true }),
+        );
+        (status == 200).then(|| answer["asks"].as_str().unwrap_or_default().to_string())
+    })
+}
+
+/// `cordelia shared move <name>` on `n`, at a terminal, with its yes, once
+/// it has read the offer: what it said.
+fn moves(all: &[&Node], n: &Node, name: &str, to: Option<&str>) -> String {
+    offer_read(all, n, name, to);
+    let mut args = vec!["shared", "move", name];
+    if let Some(to) = to {
+        args.extend(["--to", to]);
+    }
+    let mut at = n.at_terminal(&args);
+    at.says("These stay, each if its seal opens for it")
+        .says("Type yes to go on")
+        .types("yes");
+    let said = at.done();
+    assert!(
+        said.contains(&format!("Moved \"{name}\" to channel ")),
+        "{said}"
+    );
+    said
+}
+
+/// The ID of the channel `n` files as `name`, where it does.
+fn id_filed(n: &Node, name: &str) -> Option<[u8; 32]> {
+    channel_of(n, name).map(|channel| id_of(&channel))
+}
+
+/// Three people, each with one device: Alice's laptop makes a channel and
+/// shares it with Bob's desktop and Carol's tablet; each subscribes a
+/// folder to it, and holds the others' keys.
+struct Shared3 {
+    relay: Node,
+    alice: Node,
+    bob: Node,
+    carol: Node,
+    alice_dir: std::path::PathBuf,
+    bob_dir: std::path::PathBuf,
+    carol_dir: std::path::PathBuf,
+}
+
+impl Shared3 {
+    fn new() -> Self {
+        let relay = relay_started();
+        let alice = person("laptop", &relay);
+        let bob = person("desktop", &relay);
+        let carol = person("tablet", &relay);
+        let all = [&relay, &alice, &bob, &carol];
+        let alice_dir = maps_folder(&alice, "repo", AGENT);
+        let bob_dir = maps_folder(&bob, "repo", AGENT);
+        let carol_dir = maps_folder(&carol, "repo", AGENT);
+        makes(&alice, "design-review", &[]);
+        for other in [&bob, &carol] {
+            shares(&alice, "design-review", &key_of(other));
+            accepting(other, &key_of(&alice), "review").ends();
+            holds_in_the_end(&all, other, "review");
+        }
+        wait_for("each holds the others' keys", &all, 300, || {
+            let a = channel_of(&alice, "design-review")?;
+            let b = channel_of(&bob, "review")?;
+            let c = channel_of(&carol, "review")?;
+            (a["keys"] == 2 && b["keys"] == 2 && c["keys"] == 2).then_some(())
+        });
+        subscribes(&alice, &alice_dir, "design-review");
+        subscribes(&bob, &bob_dir, "review");
+        subscribes(&carol, &carol_dir, "review");
+        Self {
+            relay,
+            alice,
+            bob,
+            carol,
+            alice_dir,
+            bob_dir,
+            carol_dir,
+        }
+    }
+
+    fn all(&self) -> [&Node; 4] {
+        [&self.relay, &self.alice, &self.bob, &self.carol]
+    }
+}
+
+/// `shared anew` lists every key before it asks, asks of each, and
+/// suggests nothing (decision 2026-10-10 §7, property 7, T23): Alice's
+/// laptop and phone, Bob's desktop and Carol's tablet hold the channel; the
+/// list shows Bob's and Carol's keys and Alice's phone as staying, and asks
+/// of Bob and Carol alone; an empty line and `yes` are asked again; the
+/// offer seals to exactly the key answered `keep` and Alice's own devices.
+#[test]
+fn shared_anew_asks_of_each_key_and_suggests_nothing() {
+    let three = Shared3::new();
+    let phone = device_started_with_its_relays_key("phone", &three.relay);
+    let mut all: Vec<&Node> = three.all().to_vec();
+    all.push(&phone);
+    adds(&three.alice, &phone, "phone");
+    has_applied(&phone, 1, &all);
+    sync_on(&phone);
+    holds_in_the_end(&all, &phone, "design-review");
+    wait_for("Alice's laptop holds the phone's key", &all, 300, || {
+        (channel_of(&three.alice, "design-review")?["keys"] == 3).then_some(())
+    });
+    let old = id_filed(&three.alice, "design-review").unwrap();
+    let said = makes_anew(
+        &three.alice,
+        "design-review",
+        &[(key_of(&three.bob), "keep"), (key_of(&three.carol), "out")],
+        &["", "yes"],
+    );
+    // Every key was listed before the first question, the phone as staying.
+    let listed = &said[..said.find("Does (").unwrap()];
+    for key in [key_of(&three.bob), key_of(&three.carol)] {
+        assert!(listed.contains(&six_words_of(&key)), "{said}");
+    }
+    assert!(
+        listed.contains(&format!(
+            "your own device ({}) \"phone\": stays, as your own device",
+            six_words_of(&key_of(&phone))
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("Does your own device"), "{said}");
+    assert!(said.contains(
+        "A device of a person who stays is left out only once that person removes it from their \
+         own devices"
+    ));
+    assert!(said.contains("3 keys stay, your own devices among them, and 1 are left out."));
+    // The offer, as the relay holds it, seals to Bob, the laptop and the
+    // phone.
+    let card = card_of_node(&three.alice, &old);
+    let offer = offer_at(&three.relay, &card, &key_of(&three.alice));
+    let mut sealed: Vec<[u8; 32]> = offer.seals.iter().map(|seal| seal.key).collect();
+    sealed.sort();
+    let mut expected: Vec<[u8; 32]> = [&three.alice, &three.bob, &phone]
+        .iter()
+        .map(|n| cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap())
+        .collect();
+    expected.sort();
+    assert_eq!(sealed, expected);
+}
+
+/// The card of the channel `channel` as `n` holds it, from its database.
+fn card_of_node(n: &Node, channel: &[u8; 32]) -> Card {
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let card: Vec<u8> = db
+        .query_row(
+            "SELECT card FROM shared_channels WHERE channel = ?1",
+            [&channel[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    Card::from_bytes(&card).unwrap()
+}
+
+/// Every entry `node` holds of the channel of `card`, opened.
+fn opened_at(node: &Node, card: &Card) -> Vec<(CheckedEntryOf, Inside)> {
+    let db = rusqlite::Connection::open_with_flags(
+        node.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let channel = card.channel_id().unwrap();
+    let secret = card.secret().unwrap();
+    let authors: Vec<Vec<u8>> = db
+        .prepare("SELECT DISTINCT author FROM entries WHERE channel_id = ?1")
+        .unwrap()
+        .query_map([&channel[..]], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut opened = Vec::new();
+    for author in authors {
+        let author: [u8; 32] = author.try_into().unwrap();
+        for held in cordelia_storage::entries::author_entries(&db, &channel, &author).unwrap() {
+            let entry = Entry::check(held.entry).unwrap();
+            if let Ok(inside) = entry.open(&secret) {
+                opened.push((entry, inside));
+            }
+        }
+    }
+    opened
+}
+
+type CheckedEntryOf = cordelia_crypto::entry::CheckedEntry;
+
+/// The offer that `maker` wrote in the channel of `card`, as the relay
+/// holds it.
+fn offer_at(relay: &Node, card: &Card, maker: &str) -> cordelia_crypto::shared::Offer {
+    let maker = cordelia_crypto::bech32::decode_public_key(maker).unwrap();
+    wait_for("the relay holds the offer", &[relay], 300, || {
+        opened_at(relay, card)
+            .into_iter()
+            .find_map(|(entry, inside)| {
+                if entry.author != maker {
+                    return None;
+                }
+                match cordelia_crypto::shared::Anew::from_value(&inside.value) {
+                    Ok(cordelia_crypto::shared::Anew::Offer(offer)) => Some(offer),
+                    _ => None,
+                }
+            })
+    })
+}
+
+/// A key left out reads nothing of the new channel (decision 2026-10-10
+/// §7, property 6, T23): Alice makes the channel anew and answers `out` for
+/// Carol; Bob moves, his subscription with him; Alice and Bob write in the
+/// new channel. Carol's device, with the old seed and the offer, reads the
+/// offer as made without her, holds no seed of the new channel, and nothing
+/// written there reaches its store.
+#[test]
+fn a_key_left_out_reads_nothing_of_the_new_channel() {
+    let three = Shared3::new();
+    let all = three.all();
+    makes_anew(
+        &three.alice,
+        "design-review",
+        &[(key_of(&three.bob), "keep"), (key_of(&three.carol), "out")],
+        &[],
+    );
+    let new = id_filed(&three.alice, "design-review").unwrap();
+    let asks = offer_read(&all, &three.bob, "review", None);
+    assert!(
+        asks.contains(&format!(
+            "These subscriptions of yours move with it: {AGENT}."
+        )),
+        "{asks}"
+    );
+    assert!(
+        asks.contains(&format!(
+            "These are left out: ({}) no label of yours",
+            six_words_of(&key_of(&three.carol))
+        )),
+        "{asks}"
+    );
+    moves(&all, &three.bob, "review", None);
+    assert_eq!(id_filed(&three.bob, "review"), Some(new));
+    sends_into(
+        &all,
+        &three.alice,
+        &three.alice_dir,
+        "design-review",
+        &[],
+        "after the move",
+    );
+    sends_into(
+        &all,
+        &three.bob,
+        &three.bob_dir,
+        "review",
+        &[],
+        "Bob after the move",
+    );
+    wait_for("Alice reads Bob's message there", &all, 300, || {
+        let next = msg_in(
+            &three.alice,
+            &three.alice_dir,
+            &["read", "--next-shared"],
+            b"",
+        );
+        out_of(&next).contains("Bob after the move").then_some(())
+    });
+    // Carol reads the offer as made without her, and moves nowhere.
+    let refused = wait_for("Carol reads the offer", &all, 300, || {
+        let (status, answer) = three.carol.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": "review", "look": true }),
+        );
+        let message = answer["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (status == 409 && message.contains("without you")).then_some(message)
+    });
+    assert!(
+        refused.contains("has not been made anew by a key this device shows"),
+        "{refused}"
+    );
+    assert_eq!(held_at(&three.carol, &new), 0);
+    let db = rusqlite::Connection::open_with_flags(
+        three.carol.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let held: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM shared_channels WHERE channel = ?1",
+            [&new[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(held, 0, "no seed of the new channel");
+    let _ = &three.carol_dir;
+}
+
+/// A device of a person who stays holds the new channel (decision
+/// 2026-10-10 §7, property 6): Carol stays and moves; Carol's phone, added
+/// after the offer was made and sealed to by nobody, holds the new channel
+/// through Carol's list, and writes its empty anew record there.
+#[test]
+fn a_device_of_a_person_who_stays_holds_the_new_channel() {
+    let three = Shared3::new();
+    let all = three.all();
+    makes_anew(
+        &three.alice,
+        "design-review",
+        &[(key_of(&three.bob), "out"), (key_of(&three.carol), "keep")],
+        &[],
+    );
+    let new = id_filed(&three.alice, "design-review").unwrap();
+    moves(&all, &three.carol, "review", None);
+    let phone = device_started_with_its_relays_key("phone", &three.relay);
+    let mut with_phone = all.to_vec();
+    with_phone.push(&phone);
+    adds(&three.carol, &phone, "phone");
+    has_applied(&phone, 1, &with_phone);
+    sync_on(&phone);
+    let held = holds_in_the_end(&with_phone, &phone, "review");
+    assert_eq!(id_of(&held), new);
+    wait_for(
+        "Alice holds the phone's key in the new channel",
+        &with_phone,
+        300,
+        || (channel_of(&three.alice, "design-review")?["keys"] == 2).then_some(()),
+    );
+}
+
+/// Two offers split a channel in two (decision 2026-10-10 §7, T23): Alice
+/// makes the channel anew without Carol, and Carol without Alice; Bob reads
+/// both, and `shared move` without `--to` is refused with `two_offers`;
+/// with `--to` it moves him to the one named, and he holds that channel.
+#[test]
+fn two_offers_split_a_channel_in_two() {
+    let three = Shared3::new();
+    let all = three.all();
+    makes_anew(
+        &three.alice,
+        "design-review",
+        &[(key_of(&three.bob), "keep"), (key_of(&three.carol), "out")],
+        &[],
+    );
+    makes_anew(
+        &three.carol,
+        "review",
+        &[(key_of(&three.alice), "out"), (key_of(&three.bob), "keep")],
+        &[],
+    );
+    let alices = id_filed(&three.alice, "design-review").unwrap();
+    let carols = id_filed(&three.carol, "review").unwrap();
+    assert_ne!(alices, carols);
+    let refused = wait_for("Bob reads both offers", &all, 300, || {
+        let (status, answer) = three.bob.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": "review", "look": true }),
+        );
+        let message = answer["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (status == 409 && answer["error"]["code"] == "two_offers").then_some(message)
+    });
+    assert!(refused.contains("was made anew twice"), "{refused}");
+    let words = cordelia_crypto::fingerprint::shown(&alices);
+    moves(&all, &three.bob, "review", Some(&words));
+    assert_eq!(id_filed(&three.bob, "review"), Some(alices));
+}
+
+/// A send into `name` on `n` in `dir`: refused, with what it said on
+/// standard error, or `None` where it was sent.
+fn send_refused(n: &Node, dir: &Path, name: &str, body: &str) -> Option<String> {
+    let said = msg_in(n, dir, &["send", "--channel", name], body.as_bytes());
+    (!said.status.success()).then(|| err_of(&said))
+}
+
+/// `cordelia remove-device <key>` on `device`, a device that the change
+/// before does not list, at a terminal: it lists this machine, asks nothing
+/// else, and is given its yes and the phrase `words`. The command, still
+/// running.
+fn removes_from_an_added(device: &Node, key: &str, words: &str) -> AtTerminal {
+    let mut at = device.at_terminal(&["remove-device", key]);
+    at.says("Type `list` to list this machine").types("list");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says(ASKS_THE_PHRASE).types(words);
+    at
+}
+
+/// `cordelia label <key> <label>` on `n`, with its yes.
+fn labels_key(n: &Node, key: &str, label: &str) {
+    let mut at = n.at_terminal(&["label", key, label]);
+    at.says("Type yes to go on").types("yes");
+    let said = at.done();
+    assert!(said.contains("Labelled ("), "{said}");
+}
+
+/// A removal makes each shared channel anew, and the removed device reads
+/// nothing new (decision 2026-10-24, rules 23, 24 and 26; decision
+/// 2026-10-10 §3.5, property 20, T23; the removal record's test 9): Alice's
+/// laptop, desktop and tablet and Bob's device hold a channel. The desktop
+/// removes the tablet: `remove-device` names the channel before its yes and
+/// among the lines of its end; the channel is made anew in the same act,
+/// without the tablet; the laptop moves with no yes; no entry of Alice's
+/// devices reaches the old channel but the desktop's offer; Bob's device
+/// sends nothing in the old channel once it has read the offer (`paused`)
+/// until Bob stays, and then moves; the tablet holds no seed of the new
+/// channel.
+#[test]
+fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing_new() {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let bob = person("bob", &relay);
+    let all = [&relay, &laptop, &desktop, &tablet, &bob];
+    for (device, label) in [(&desktop, "desktop"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    makes(&laptop, "review", &[]);
+    shares(&laptop, "review", &key_of(&bob));
+    accepting(&bob, &key_of(&laptop), "review").ends();
+    holds_in_the_end(&all, &bob, "review");
+    for device in [&desktop, &tablet] {
+        holds_in_the_end(&all, device, "review");
+    }
+    wait_for(
+        "Bob holds the keys of Alice's three devices",
+        &all,
+        300,
+        || (channel_of(&bob, "review")?["keys"] == 3).then_some(()),
+    );
+    wait_for("the desktop holds every key", &all, 300, || {
+        (channel_of(&desktop, "review")?["keys"] == 3).then_some(())
+    });
+    let bob_dir = maps_folder(&bob, "repo", AGENT);
+    subscribes(&bob, &bob_dir, "review");
+    let old = id_filed(&laptop, "review").unwrap();
+    let old_card = card_of_node(&laptop, &old);
+    let before_laptop = at_the_relay_by(&relay, &old, &key_of(&laptop));
+    let before_desktop = at_the_relay_by(&relay, &old, &key_of(&desktop));
+
+    let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
+    at.says("The change is made (change 2)");
+    let before_yes = at.said.clone();
+    assert!(
+        before_yes.contains(
+            "These shared channels are made anew without the device removed, in this change: \
+             \"review\". The other people in each move with a yes of their own"
+        ),
+        "{before_yes}"
+    );
+    at.says("The wait has ended.")
+        .says("\"review\" is made anew without the device removed: it is channel ");
+    drop(at);
+    let new = id_filed(&desktop, "review").unwrap();
+    assert_ne!(new, old);
+    // The laptop follows the filing, with no yes.
+    let after_removal = [&relay, &laptop, &desktop, &bob];
+    has_applied(&laptop, 2, &after_removal);
+    wait_for(
+        "the laptop holds the new channel",
+        &after_removal,
+        300,
+        || (id_filed(&laptop, "review")? == new).then_some(()),
+    );
+    // The offer is the desktop's one entry there since; nothing of the
+    // laptop's.
+    let offer = offer_at(&relay, &old_card, &key_of(&desktop));
+    assert_eq!(offer.new_channel, new);
+    assert!(!offer.seals.iter().any(|seal| {
+        cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap() == key_of(&tablet)
+    }));
+    // Bob's device reads it and sends nothing in the old channel.
+    let paused = wait_for("Bob's device is paused", &after_removal, 300, || {
+        send_refused(&bob, &bob_dir, "review", "into the old channel")
+            .filter(|said| said.contains("so your devices send nothing more there"))
+    });
+    assert!(paused.contains("cordelia shared stay review"), "{paused}");
+    // Bob stays: he writes there again, where the tablet reads.
+    let mut at = bob.at_terminal(&["shared", "stay", "review"]);
+    at.says("If you stay, what your agents write there is read by the keys left out")
+        .says("Type yes to go on")
+        .types("yes");
+    let said = at.done();
+    assert!(
+        said.contains("Your devices write in \"review\" again"),
+        "{said}"
+    );
+    sends_into(
+        &after_removal,
+        &bob,
+        &bob_dir,
+        "review",
+        &[],
+        "after staying",
+    );
+    // And then moves.
+    moves(&after_removal, &bob, "review", None);
+    assert_eq!(id_filed(&bob, "review"), Some(new));
+    sends_into(
+        &after_removal,
+        &bob,
+        &bob_dir,
+        "review",
+        &[],
+        "in the new channel",
+    );
+    assert_eq!(
+        at_the_relay_by(&relay, &old, &key_of(&laptop)),
+        before_laptop
+    );
+    assert_eq!(
+        at_the_relay_by(&relay, &old, &key_of(&desktop)),
+        before_desktop
+    );
+    // The tablet holds no seed of the new channel.
+    let db = rusqlite::Connection::open_with_flags(
+        tablet.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let held: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM shared_channels WHERE channel = ?1",
+            [&new[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(held, 0);
+}
+
+/// A device of Alice's that knows both relays by their keys, started and
+/// connected: `one` her personal relay, `two` the shared channel's.
+fn with_both_relays(name: &'static str, one: &Node, two: &Node) -> Node {
+    let mut device = node(name, "personal", Some(one.p2p));
+    device.add_relay(&format!("127.0.0.1:{}", one.p2p), Some(&key_of(one)));
+    device.add_relay(&format!("127.0.0.1:{}", two.p2p), Some(&key_of(two)));
+    device.start();
+    wait_for("the device answers", &[&device], 30, || healthy(&device));
+    wait_for(
+        "the device reaches its relays",
+        &[&device, one, two],
+        60,
+        || has_hot_peer(&device),
+    );
+    device
+}
+
+/// No move takes a device into a channel that a removed key reads, and a
+/// removal leaves a channel it does not reach not clean (the review of
+/// slice 8, high 1 and medium 3; decision 2026-10-24, rules 4, 23 to 25):
+/// Alice's laptop and tablet reach the channel's relay, her desktop does
+/// not. The desktop removes the tablet: its prompt and its end say that
+/// "review" is not reached from it and not made anew, and nothing is
+/// written there. Bob, who does not know, makes the channel anew keeping
+/// the laptop and the tablet. On the laptop, which holds the channel not
+/// clean, `shared move` is refused `not_clean`, with Bob's offer above it
+/// as a fault sealed to a device Alice removed; `shared anew` there makes
+/// it anew without the tablet.
+#[test]
+fn no_move_goes_into_a_channel_a_removed_key_reads() {
+    let one = relay_started();
+    let two = relay_started();
+    let laptop = with_both_relays("laptop", &one, &two);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &one);
+    let tablet = with_both_relays("tablet", &one, &two);
+    let bob = person("bob", &two);
+    let all = [&one, &two, &laptop, &desktop, &tablet, &bob];
+    for (device, label) in [(&desktop, "desktop"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    let at_two = format!("127.0.0.1:{}", two.p2p);
+    makes(&laptop, "review", &["--relay", &at_two]);
+    shares(&laptop, "review", &key_of(&bob));
+    accepting(&bob, &key_of(&laptop), "review").ends();
+    holds_in_the_end(&all, &bob, "review");
+    for device in [&desktop, &tablet] {
+        holds_in_the_end(&all, device, "review");
+    }
+    wait_for(
+        "Bob holds the keys of the laptop and the tablet",
+        &all,
+        300,
+        || (channel_of(&bob, "review")?["keys"] == 2).then_some(()),
+    );
+    let old = id_filed(&laptop, "review").unwrap();
+    let old_card = card_of_node(&laptop, &old);
+    let unreached = "These shared channels are not reached from this device, so they are not \
+                     made anew in this change: \"review\"";
+
+    let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
+    at.says("The change is made (change 2)");
+    assert!(at.said.contains(unreached), "{}", at.said);
+    assert!(
+        !at.said.contains("These shared channels are made anew"),
+        "{}",
+        at.said
+    );
+    at.says("The wait has ended.").says(
+        "\"review\" was held by a device that was removed, and is not reached from this \
+         device: make it anew with cordelia shared anew review on a device of yours that \
+         reaches its relays",
+    );
+    drop(at);
+    assert_eq!(id_filed(&desktop, "review"), Some(old));
+    let after = [&one, &two, &laptop, &desktop, &bob];
+    has_applied(&laptop, 2, &after);
+
+    // Bob makes the channel anew, keeping the laptop and the tablet.
+    makes_anew(
+        &bob,
+        "review",
+        &[(key_of(&laptop), "keep"), (key_of(&tablet), "keep")],
+        &[],
+    );
+    let refused = wait_for("the laptop reads Bob's offer", &after, 300, || {
+        let (status, answer) = laptop.post_told(
+            "/api/v1/shared/move",
+            &json!({ "name": "review", "look": true }),
+        );
+        let message = answer["error"]["message"].as_str().unwrap_or_default();
+        (status == 409
+            && answer["error"]["code"] == "not_clean"
+            && message.contains("made anew by"))
+        .then(|| message.to_string())
+    });
+    assert!(
+        refused.contains("sealed to a device you removed: a fault, not a move"),
+        "{refused}"
+    );
+    let (ended, _, err) = laptop.at_terminal_into_a_pipe(&["shared", "move", "review"]);
+    assert_eq!(ended, Some(false));
+    assert!(
+        err.contains(
+            "\"review\" was held by a device that was removed: make it anew with cordelia \
+             shared anew review"
+        ),
+        "{err}"
+    );
+    assert_eq!(id_filed(&laptop, "review"), Some(old));
+
+    // Made anew on the laptop, without the tablet.
+    makes_anew(&laptop, "review", &[(key_of(&bob), "keep")], &[]);
+    let offer = offer_at(&two, &old_card, &key_of(&laptop));
+    let sealed: Vec<String> = offer
+        .seals
+        .iter()
+        .map(|seal| cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap())
+        .collect();
+    assert!(!sealed.contains(&key_of(&tablet)), "{sealed:?}");
+    assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
+    assert_ne!(id_filed(&laptop, "review"), Some(old));
+}
+
+/// A removal lists what the removed key did, with the command that undoes
+/// each (decision 2026-10-10 §3.5, property 9, T23): Bob's laptop accepts a
+/// channel from Alice's key, labels that key `alice` and subscribes an
+/// agent to the channel; Bob removes the laptop from his desktop:
+/// `remove-device` names each of the three with its undoing before its
+/// yes and at its end; `cordelia devices` on the desktop, and on a tablet
+/// added afterwards, names them; after `cordelia label <key> --none` that
+/// line is gone.
+#[test]
+fn a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each() {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let alice = person("alice", &relay);
+    let all = [&relay, &laptop, &desktop, &alice];
+    adds(&laptop, &desktop, "desktop");
+    has_applied(&desktop, 1, &all);
+    sync_on(&desktop);
+    makes(&alice, "design-review", &[]);
+    shares(&alice, "design-review", &key_of(&laptop));
+    accepting(&laptop, &key_of(&alice), "review").ends();
+    holds_in_the_end(&all, &laptop, "review");
+    let alice_key = key_of(&alice);
+    labels_key(&laptop, &alice_key, "alice");
+    let dir = maps_folder(&laptop, "repo", AGENT);
+    subscribes(&laptop, &dir, "review");
+    wait_for("the desktop holds the laptop's acts", &all, 300, || {
+        let listed = listed(&desktop);
+        (listed["subscriptions"].as_array()?.len() == 1).then_some(())
+    });
+    let lines = [
+        "\"review\" filed (channel ".to_string(),
+        format!(
+            "{AGENT} subscribed to \"review\": undo it with cordelia unsubscribe review --agent {AGENT}"
+        ),
+        format!(
+            "({}) labelled \"alice\": undo it with cordelia label {alice_key} --none, or cordelia \
+             label {alice_key} <label>",
+            six_words_of(&alice_key)
+        ),
+    ];
+    let mut at = removes_from_an_added(&desktop, &key_of(&laptop), &words);
+    at.says("The change is made (change 2)");
+    let before_yes = at.said.clone();
+    assert!(
+        before_yes.contains("What the device removed did in your shared channels, still in force"),
+        "{before_yes}"
+    );
+    for line in &lines {
+        assert!(before_yes.contains(line.as_str()), "{line}: {before_yes}");
+    }
+    // The removal made the channel anew: the filing and the subscription
+    // in force are now the desktop's, of the new channel, and the label
+    // is the one act of the laptop's still in force.
+    at.says("The wait has ended.").says(&lines[2]);
+    drop(at);
+    let lines = [lines[2].clone()];
+    let named = |n: &Node| n.cli(&["devices"]);
+    let shown = named(&desktop);
+    assert!(shown.contains(lines[0].as_str()), "{shown}");
+    // A tablet added afterwards names them too.
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let after = [&relay, &desktop, &alice, &tablet];
+    adds(&desktop, &tablet, "tablet");
+    has_applied(&tablet, 2, &after);
+    sync_on(&tablet);
+    wait_for("the tablet names the laptop's acts", &after, 300, || {
+        let shown = named(&tablet);
+        lines
+            .iter()
+            .all(|line| shown.contains(line.as_str()))
+            .then_some(())
+    });
+    // Undone, it is named no more.
+    let mut at = desktop.at_terminal(&["label", &alice_key, "--none"]);
+    at.says("Type yes to go on").types("yes");
+    at.done();
+    let shown = named(&desktop);
+    assert!(!shown.contains(lines[0].as_str()), "{shown}");
+}
+
+/// `cordelia recover` on `new`, at a terminal: the phrase `words`; of each
+/// device, in the order asked, the answer in `answers`; and the yes. The
+/// command, still running.
+fn recovers(new: &Node, words: &str, answers: &[&str]) -> AtTerminal {
+    let mut at = new.at_terminal(&["recover", "--name", new.name]);
+    at.says("Type your recovery phrase, one word at a time")
+        .types(words);
+    for answer in answers {
+        at.says("Type `have`, `lost` or `hands`: ").types(answer);
+    }
+    at.says("Recover on this machine?");
+    at
+}
+
+/// A recovery brings the shared channels back and names each (decision
+/// 2026-10-10 §3.5, property 20): Alice's laptop files a channel shared
+/// with Bob, subscribes an agent and labels Bob's key; her desktop
+/// subscribes another. She recovers on a new machine, the laptop answered
+/// as in someone else's hands and the desktop as still had: the look
+/// prints, before its yes, each channel, subscription and label it brings
+/// back with the device that made it, the laptop's acts with what undoes
+/// each, and the desktop's as passed over until it is added again; the end
+/// of the look prints them again; the new machine then holds the channel,
+/// and makes it anew once it has read it.
+#[test]
+fn a_recovery_brings_the_shared_channels_back_and_names_each() {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let bob = person("bob", &relay);
+    let all = [&relay, &laptop, &desktop, &bob];
+    adds(&laptop, &desktop, "desktop");
+    has_applied(&desktop, 1, &all);
+    sync_on(&desktop);
+    makes(&laptop, "review", &[]);
+    shares(&laptop, "review", &key_of(&bob));
+    accepting(&bob, &key_of(&laptop), "review").ends();
+    holds_in_the_end(&all, &bob, "review");
+    holds_in_the_end(&all, &desktop, "review");
+    let laptop_dir = maps_folder(&laptop, "repo", AGENT);
+    subscribes(&laptop, &laptop_dir, "review");
+    labels_key(&laptop, &key_of(&bob), "bob");
+    let desktop_dir = maps_folder(&desktop, "notes", NOTES);
+    subscribes(&desktop, &desktop_dir, "review");
+    wait_for("every list is at the relay", &all, 300, || {
+        (listed(&laptop)["subscriptions"].as_array()?.len() == 2
+            && listed(&desktop)["subscriptions"].as_array()?.len() == 2)
+            .then_some(())
+    });
+    let old = id_filed(&laptop, "review").unwrap();
+
+    let new = device_started_with_its_relays_key("phone", &relay);
+    let mut at = recovers(&new, &words, &["hands", "have"]);
+    let before_yes = at.said.clone();
+    let brought = [
+        "Of your shared channels, this recovery brings back:".to_string(),
+        "\"review\" filed (channel ".to_string(),
+        format!("{AGENT} subscribed to \"review\", by \"laptop\" ("),
+        format!(
+            "({}) labelled \"bob\", by \"laptop\" (",
+            six_words_of(&key_of(&bob))
+        ),
+        format!("undo it with cordelia unsubscribe review --agent {AGENT}"),
+        "What the devices you still have did in your shared channels is passed over".to_string(),
+        format!("{NOTES} subscribed to \"review\", by \"desktop\" ("),
+    ];
+    for line in &brought {
+        assert!(before_yes.contains(line.as_str()), "{line}: {before_yes}");
+    }
+    at.says("Type yes to go on").types("yes");
+    at.says("The look is made");
+    for line in &brought[..5] {
+        at.says(line);
+    }
+    drop(at);
+    sync_on(&new);
+    let after = [&relay, &new, &bob];
+    holds_in_the_end(&after, &new, "review");
+    // It made the channel anew once it had read it, without the laptop.
+    let made = wait_for(
+        "the new machine makes the channel anew",
+        &after,
+        300,
+        || {
+            let now = id_filed(&new, "review")?;
+            (now != old).then_some(now)
+        },
+    );
+    let card = card_of_node(&new, &old);
+    let offer = offer_at(&relay, &card, &key_of(&new));
+    assert_eq!(offer.new_channel, made);
+    let sealed: Vec<String> = offer
+        .seals
+        .iter()
+        .map(|seal| cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap())
+        .collect();
+    assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
+    assert!(!sealed.contains(&key_of(&laptop)), "{sealed:?}");
+}
+
+/// An honest node writes nothing in a shared channel but messages,
+/// clearings and anew records (decision 2026-10-10 property 2, T23): after
+/// a channel is made, shared, subscribed to, written in, read, made anew
+/// and moved to, every entry the relay holds of the old and of the new
+/// channel opens to form 6, 0 or 5, and no message names an agent of the
+/// sender's.
+#[test]
+fn an_honest_node_writes_only_messages_clearings_and_anew_records() {
+    let three = Shared3::new();
+    let all = three.all();
+    sends_into(&all, &three.bob, &three.bob_dir, "review", &[], "from Bob");
+    sends_into(
+        &all,
+        &three.alice,
+        &three.alice_dir,
+        "design-review",
+        &[],
+        "from Alice",
+    );
+    reads_next(&all, &three.carol, &three.carol_dir);
+    let old = id_filed(&three.alice, "design-review").unwrap();
+    makes_anew(
+        &three.alice,
+        "design-review",
+        &[(key_of(&three.bob), "keep"), (key_of(&three.carol), "out")],
+        &[],
+    );
+    moves(&all, &three.bob, "review", None);
+    sends_into(
+        &all,
+        &three.bob,
+        &three.bob_dir,
+        "review",
+        &[],
+        "in the new one",
+    );
+    let new = id_filed(&three.alice, "design-review").unwrap();
+    let old_card = card_of_node(&three.carol, &old);
+    let new_card = card_of_node(&three.bob, &new);
+    offer_at(&three.relay, &old_card, &key_of(&three.alice));
+    wait_for(
+        "the relay holds Bob's message in the new channel",
+        &all,
+        300,
+        || (opened_at(&three.relay, &new_card).len() >= 3).then_some(()),
+    );
+    for card in [&old_card, &new_card] {
+        let opened = opened_at(&three.relay, card);
+        assert!(!opened.is_empty());
+        for (_, inside) in opened {
+            let Value::Other(bytes) = &inside.value else {
+                panic!("an entry of kind {:?}", inside.value);
+            };
+            assert!(matches!(bytes[0], 0 | 5 | 6), "form {}", bytes[0]);
+            if bytes[0] == 6 {
+                assert!(
+                    !String::from_utf8_lossy(bytes).contains(AGENT),
+                    "a message names the agent"
+                );
+            }
+        }
     }
 }

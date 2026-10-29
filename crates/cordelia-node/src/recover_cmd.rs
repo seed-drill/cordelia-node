@@ -1772,6 +1772,25 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     ) {
         println!("{line}");
     }
+    // What it brings back of the shared channels, and the acts of the
+    // devices it removes (decision 2026-10-10 §3.5).
+    let labels = labels_for_the_node(&generation, &answers, &own);
+    let labelled = |field: &str| -> Vec<([u8; 32], String)> {
+        list(&labels, field)
+            .filter_map(|one| {
+                let key: [u8; 32] = hex::decode(one["key"].as_str()?).ok()?.try_into().ok()?;
+                Some((key, one["label"].as_str().unwrap_or_default().to_string()))
+            })
+            .collect()
+    };
+    let shared_lines = cordelia_api::shared_anew::recovery_lines(
+        &generation.lists,
+        &labelled("gone"),
+        &labelled("still_have"),
+    )?;
+    for line in shared_lines.iter().flat_map(|line| line.split('\n')) {
+        println!("{}", crate::history_cmd::printable(line));
+    }
     if !at.yes("\nRecover on this machine?")? {
         println!("{NOT_A_YES}");
         return Ok(());
@@ -1807,8 +1826,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         left.push(json!({ "number": earlier.number, "secret": hex::encode(&earlier.secret[..]) }));
     }
     drop(for_phrase);
-    let labels = labels_for_the_node(&generation, &answers, &own);
+    let mut shared_lists = Vec::new();
+    for (key, shared) in &generation.lists {
+        if let Ok(value) = shared.to_value(cordelia_api::names::is_a_name) {
+            shared_lists.push(json!({ "key": hex::encode(key), "list": hex::encode(value) }));
+        }
+    }
     let mut body = json!({
+        "shared_lists": shared_lists,
         "entry": hex::encode(entry.to_wire()),
         "statement_key": hex::encode(*statement_key),
         "left": left,
@@ -2534,6 +2559,14 @@ fn after_the_recovery(
         if found["finished"] == true {
             for line in look_lines(found) {
                 say(line);
+            }
+            // What it brought back of the shared channels, as before its
+            // yes (decision 2026-10-10 §3.5).
+            for line in list(&asked, "shared")
+                .filter_map(Value::as_str)
+                .flat_map(|line| line.split('\n'))
+            {
+                say(crate::history_cmd::printable(line));
             }
             break;
         }
@@ -4054,6 +4087,7 @@ mod tests {
             names: Vec::new(),
             cut_short: None,
             carried_word: None,
+            lists: Vec::new(),
         };
         let names = recover::Names {
             carried: vec!["lab".into(), "no\u{1b}tes".into()],
