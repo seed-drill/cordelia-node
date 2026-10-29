@@ -628,6 +628,10 @@ mod tests {
                     hash: [i as u8; 16],
                     signer: Link::signer_of(&s.key(0)),
                 }));
+                // Its old end names the version device 1 holds, so the chain
+                // is not taken as one that may have dropped links (the third
+                // read of slice 8): only the keys a full chain names cut it.
+                chain[MAX_ENTRY_LINKS - 1] = Link::of(&Value::Text("one\n".into()), s.key(0));
             }
             let second = entry_by(
                 &s[0].identity,
