@@ -1978,9 +1978,13 @@ new one starts with none (decision 2026-10-17 §4).
 #### MAX_SLOTS_SHOWN_ON_A_CONNECTION = 8
 
 **Rationale:** The most slots for which a relay remembers, for one
-connection, the last entry it was shown whole there. A device shows one
-entry, the change entry of the phrase it follows, so 8 is room to spare. A
-ninth is not remembered, and is shown whole each time.
+connection, the entries it was shown whole or handed whole there. In each
+slot it remembers up to 16: twice `MAX_CHANGE_HEADS`, for the 8 heads a
+relay can keep there and the 8 a device can keep. That 16 has no constant
+of its own. A device shows the entries of one slot, the change
+entries of the phrase it follows, so 8 slots is room to spare. A ninth slot
+is not remembered: a short show there is answered `whole`, so the device
+shows whole each time.
 
 #### CHANNEL_MARK_BYTES = 8
 

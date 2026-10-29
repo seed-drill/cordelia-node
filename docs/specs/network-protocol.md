@@ -1145,8 +1145,8 @@ be handed, as anything fetched does.
 carry a lineage (the phrase's channel, data-formats.md §9.6), a relay keeps
 every head: each entry that no other it keeps was made after, by the
 lineages, up to 8 (`MAX_CHANGE_HEADS`), the highest numbers first. Shown an
-entry, whole or short, it first takes it as it takes a push (§4.9.4), and
-then hands, one in each answer, each head that it keeps there and that it
+entry whole, it first takes it as it takes a push (§4.9.4); shown one short,
+it takes nothing. It then hands, one in each answer, each head that it keeps there and that it
 has neither handed whole on the connection nor been shown whole there, the
 lowest number first, and of two at one number the lower ID: whole
 (`another`), or, to a short show, by its revision and ID (`other`), after
@@ -1169,7 +1169,8 @@ connection closes.
 - **A short show of anything else,** a slot that the relay does not remember
   included, is answered `whole` from the connection's memory alone. The
   store is not looked at. So the short form tells nothing, and hands
-  nothing, to anyone who has not shown that very entry whole.
+  nothing, to anyone who has not shown that very entry whole, or been
+  handed it whole, on that connection.
 - **A short show of an entry remembered** is answered from the store:
   `held`; `whole`, where the relay holds none or an earlier one; or `other`,
   with the revision and ID of the one it holds. The answer to a short show
@@ -1260,11 +1261,16 @@ and it replaces no head.
   past its cap is refused and drops nothing. A newer revision of an entry it
   holds, that is no larger, is never refused for room. A relay counts a slot
   whose entry carries a lineage at twice that entry's size, from when it
-  takes the first such entry there, where it has the room
-  (`CHANGE_HEADS_ROOM`, decision 2026-10-24 (removal), rule 15): a second
-  head there then always has room. It drops no channel to make room. Where
-  it had none when the first came (a full relay, during the change-over), a
-  second head there is refused for room, as any new entry is.
+  takes the first such entry there (`CHANGE_HEADS_ROOM`, decision 2026-10-24
+  (removal), rule 15): a second head there then always has room. In a slot
+  that is new, the room for both is asked as for any new entry: where the
+  relay has no room for both, the first entry is refused for room itself.
+  Where the first such entry replaces one of the version before (a person's
+  first change made on this version), it is taken as a replacement that is
+  no larger, and the second share is counted only where the relay has the
+  room; where it had none (a full relay, during the change-over), a second
+  head there is refused for room, as any new entry is. It drops no channel
+  to make room.
 - **`over_limit`:** the sender's address has made the relay take as many new
   channels as one address may in an hour (256,
   `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR`).

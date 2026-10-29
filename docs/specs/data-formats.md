@@ -889,8 +889,11 @@ lineage of a chain of 256 needs 2,074 (`MAX_LINEAGE_BYTES`).
   were made apart, and when each was made.
 - **An entry whose lineage region does not open with the mark has no
   lineage:** it was made on `v0.2.0-alpha.17` or earlier, and is judged by its statement
-  alone. A lineage that does not match its statement (another statement's
-  hash, or another chain), or is not in its form, is refused, whoever reads.
+  alone. A device refuses an entry whose lineage does not match its
+  statement (another statement's hash, or another chain), or is not in its
+  form. A relay cannot open the statement, so it cannot tell whether a
+  lineage matches: it keeps an entry whose lineage is not in its form as
+  one with no lineage, by the store's rule.
 
 - **A secret sealed to a device** is 92 bytes: an ephemeral X25519 key (32),
   a nonce (12), the 32 bytes and a tag (16), as the node seals to a key
@@ -1011,7 +1014,8 @@ CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_pla
 - The table refers to no other: an entry is stored with no list of members
   and no state of the channel.
 - **A row is replaced only by a higher revision** from that author in that
-  slot. An entry at the revision of the one held is not stored. Nothing
+  slot. An entry at the revision of the one held is not stored, except
+  as a head at a relay (below): two heads can share a number. Nothing
   compares one author's entries with another's.
 - **A head** (`head` holds its ID) is kept by a relay where the entry
   carries a lineage (§9.6): one that no other entry it keeps there was made
@@ -1022,11 +1026,14 @@ CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_pla
   a lower revision, and it replaces the row of the store's rule, never a
   head. A device's rows all have `head` empty.
 - **`relay_head_rooms`** (v23) names each author's slot where a relay counts
-  the entry with a lineage at twice its size, from when it took the first
-  one there with the room: so a second head always has room (rule 15). A
-  relay makes no room by dropping channels. Where it had no room at the
-  first, it counts the share at a later entry with a lineage taken there,
-  if it then has the room.
+  the entry with a lineage at twice its size, so that a second head always
+  has room (rule 15). In a slot that is new, the first entry with a lineage
+  is taken only with room for both, and is otherwise refused for room
+  itself. Where it replaces an entry of the version before, it is taken as
+  a replacement that is no larger, and the share is counted only where the
+  relay has the room; where it had none, it counts the share at a later
+  entry with a lineage taken there, if it then has the room. A relay makes
+  no room by dropping channels.
 
   ```sql
   CREATE TABLE relay_head_rooms (
@@ -1082,7 +1089,9 @@ CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
   shown that the relay holds. It is written at most once an hour, and never
   an earlier time than the one kept. What nobody uses for 90 days is dropped.
 - `bytes`: what the channel holds, as entries are counted (content and 1 KB
-  each), and not as the database's pages count it.
+  each), and not as the database's pages count it. From step 23 it also
+  counts, in each slot that `relay_head_rooms` names and that holds one
+  head, the room kept for a second (§10.1).
 - `mark`: 8 random bytes that are this holding's own. A channel that is
   dropped loses its row and its entries, and is taken again under another
   mark: a place in a channel means something only with its mark.
