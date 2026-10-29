@@ -3625,6 +3625,15 @@ mod tests {
         let eight = with_shared(&holding(8, &["review"]), &|_| {});
         assert_eq!((eight.level, eight.holds.len()), (None, 0));
         assert_eq!(eight.summary, "memory synced");
+        // The hold keeps its seven days by itself too, whatever fills the
+        // facts.
+        for (days, amber) in [(6, true), (8, false)] {
+            let shown = with(&|f| {
+                f.devices.removed_holds_shared = 1;
+                f.devices.removed_holds_shared_secs = Some(days * day as u64);
+            });
+            assert_eq!(whats(&shown).contains(&SHARED_HOLD), amber, "{days} days");
+        }
         // Made anew and moved from, or dropped: the node lists it no more.
         let done = with_shared(&holding(6, &[]), &|_| {});
         assert_eq!((done.level, done.holds.len()), (None, 0));
