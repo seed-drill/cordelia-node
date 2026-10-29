@@ -4,7 +4,7 @@
 use super::*;
 use crate::lists::Do;
 use crate::several::Several;
-use crate::shared::tests::{HOUR, Shared, acts, bob, given, holds, member, message, out, says};
+use crate::shared::tests::{Shared, acts, bob, given, holds, member, message, out, says};
 use crate::shared_pass::Usable;
 use cordelia_crypto::entry::Value as EntryValue;
 use cordelia_crypto::message::{To, message_name, message_rev};
@@ -423,7 +423,10 @@ fn shared_marks_have_a_list_of_their_own_and_cross_a_statement() {
 fn the_hold_counts_only_the_loop_this_agent_is_in() {
     let (s, channel) = devices(1);
     let t = s.now + 10;
+    // Both agents subscribe from the start, so that both are shown every
+    // message here.
     subscribes(&s, 0, &channel, "notes", true, t);
+    subscribes(&s, 0, &channel, "work", true, t);
     for n in 1..=10 {
         id_given(&s, 0, &channel, n, &format!("among themselves {n}"), t + 1);
     }
@@ -449,8 +452,13 @@ fn the_hold_counts_only_the_loop_this_agent_is_in() {
         refused(&s, 0, &asking("notes", "review", "more"), t + 4),
         "pair_held"
     );
-    // Another agent is not in that loop.
-    subscribes(&s, 0, &channel, "work", true, t + 5);
+    // Another agent is not in that loop: the hold is of the agent, not of
+    // the channel.
+    assert!(sends(&s, 0, &asking("work", "review", "not held"), t + 5).is_ok());
+    assert_eq!(
+        refused(&s, 0, &asking("notes", "review", "more"), t + 5),
+        "pair_held"
+    );
     // A person reads them, here: the loop is free.
     let row = kept::channel(&s[0].conn, &channel.id).unwrap().unwrap();
     for shown in crate::shared::shown(&s[0].conn, &s[0].identity, &channel.id, t + 6).unwrap() {
@@ -532,8 +540,54 @@ fn sending_again_in_a_shared_channel_costs_that_channel_alone() {
         per_folder_per_hour: 20,
     };
     assert!(crate::messages::send_of(conn, &s[0].identity, &own, &at_own, |_| false).is_ok());
-    // A fifth number is never needed: past four, the kept value goes.
-    let _ = HOUR;
+}
+
+/// A shared message is written under four numbers at most (decision
+/// 2026-10-10 §6.1, `AGENT_MESSAGE_SENDS_MAX`): written again three times,
+/// each answered "another" by the relay, it is under four; answered so
+/// once more, its kept value goes and nothing more is written.
+#[test]
+fn past_four_numbers_the_kept_value_of_a_shared_message_goes() {
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    let conn = &s[0].conn;
+    let (id, _, _) = sends(&s, 0, &asking("notes", "review", "once"), t + 1).unwrap();
+    let usable = crate::shared_pass::usable(conn, &channel.id, &AT)
+        .unwrap()
+        .unwrap();
+    let again = |now: i64| {
+        let mine: Vec<_> = crate::shared_pass::to_send(
+            conn,
+            &s[0].identity,
+            &usable,
+            &AT,
+            crate::at_relays::Most {
+                entries: 100,
+                bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let answers: Vec<_> = mine
+            .iter()
+            .map(|_| crate::at_relays::Pushed::HoldsAnother)
+            .collect();
+        crate::shared_pass::pushed(conn, &s[0].identity, &usable, &AT, &mine, &answers, now)
+            .unwrap();
+        crate::shared_sender::write_again(conn, &s[0].identity, now, &|_| true).unwrap()
+    };
+    for (k, numbers) in [vec![1, 2], vec![1, 2, 3], vec![1, 2, 3, 4]]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(again(t + 2 + k as i64), 1);
+        let kept_now = rows::kept(conn).unwrap();
+        assert_eq!(kept_now.len(), 1);
+        assert_eq!(hex::encode(kept_now[0].id), id);
+        assert_eq!(kept_now[0].numbers, numbers);
+    }
+    assert_eq!(again(t + 5), 0, "a fifth number is never written");
+    assert!(rows::kept(conn).unwrap().is_empty());
 }
 
 /// A subscription's start is kept only while its channel is held (decision
