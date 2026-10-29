@@ -167,7 +167,7 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 
 - It keeps new content on the device: its folders keep their files, and nothing is published. What waits stays in its store.
 - It shows each relay the heads that rule 18 says, and has no leave anywhere.
-- It says, in red on its status line and in `cordelia devices`: "two changes were made apart, and none that lists this device is clear of a removed device: settle it with the phrase (`cordelia settle`)", with the lists of each head.
+- It says, in red on its status line and in `cordelia devices`: "two changes were made apart, and none that lists this device is clear of a removed device: settle it with the phrase (`cordelia settle`)", with the lists of each head. Where it keeps no head set aside (what it knows of removals grew, with no change kept), `settle` has nothing to join and refuses; the device says instead that a removed device holds the secret of the change it follows, and asks for a change made with the phrase there (`cordelia renew`).
 - It leaves the state by rule 8, when it is shown a clear change that counts it: the settlement, or a change made after it.
 - `cordelia add-device` and the commands of `msg` refuse there, as in a fork today. `cordelia accept` takes there only a hand-over whose change is clear and counts this device (rule 8): it is how a closed device is added again. `cordelia remove-device`, `cordelia renew` and `cordelia settle` there make the settlement (rule 21).
 - **Where:** `held_rows::set_state`, `at_relays::stands` (`at_relays.rs` 123), `device_entries::pass_at` (`device_entries.rs` 1006) and `say` (2921).
