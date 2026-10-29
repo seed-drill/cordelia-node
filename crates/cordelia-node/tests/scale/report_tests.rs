@@ -862,72 +862,260 @@ fn bar_7_says_where_growth_was_not_tested() {
     }
 }
 
-// ── Bar 15: a split edit is owed where both its devices ran ──
+// ── Bar 15: a split edit held up by the outage ──
 
-/// An edit of a split person held up by the relay's outage is owed within
-/// 120 s of the relay's start where its writer and the device it waits on
-/// both ran through those 120 s. One whose device was off then is owed by
-/// bar 3, from when it ran again, and is not late here.
+/// An edit of a split person (device 0 set up with the first relay, device
+/// 1 with the second, which stops at 400 and starts at 520), written at
+/// 450 and held up by the outage, judged by bar 15. It is owed within 120
+/// s of the start where the device it waits on ran through those 120 s and
+/// its writer ran until it could push; else within 60 s of the later of
+/// the two running again, never sooner. One that never arrives is late
+/// there where both ran at the end. Each case: the writer, the changes of
+/// each device (device, at, is; `None` for "never started" before them),
+/// the arrival, and whether it is late.
 #[test]
-fn bar_15_owes_a_split_edit_only_where_both_its_devices_ran() {
-    for (case, off, arrived, late) in [
-        ("both ran", None, 700.0, true),
-        ("the device it waits on was off", Some(1), 905.0, false),
-        ("its writer was off", Some(0), 905.0, false),
-    ] {
-        let (_dir, run) = made_up();
-        all_running(&run, 0.0);
-        window(&run, 0.0, 1500.0);
-        *run.outage.lock().unwrap() = Outage {
-            stopped: Some(400.0),
-            started: Some(520.0),
-            back: Vec::new(),
-        };
-        let person = run
-            .plan
-            .population
-            .people
-            .iter()
-            .position(|p| p.split && !p.office)
-            .unwrap();
-        if let Some(device) = off {
-            let node = run.fleet.device(person, device);
-            becomes(&run, node, 460.0, Is::Stopped);
-            becomes(&run, node, 900.0, Is::Running);
-        }
-        {
-            let mut o = run.observer.lock().unwrap();
-            let edit = Written {
-                number: 20,
-                person,
-                writer: 0,
-                name: 0,
-                file: "f001.md".into(),
-                size: 600,
-                at: 450.0,
-                burst: false,
-                new: false,
-                replaced: None,
-            };
-            o.wrote(edit, vec![(1, run.out.clone())]);
-            o.arrivals.insert(
-                (20, 1),
-                Arrival {
-                    at: arrived,
-                    in_copy: false,
-                },
-            );
-        }
-        let read = read_of(&run);
-        let edits = edits_of(&read);
-        let bar = bar_15(&read, &edits);
+fn bar_15_gives_a_held_up_split_edit_a_later_deadline_and_never_drops_it() {
+    use Is::{Frozen, Running, Stopped};
+    type Changes = &'static [(usize, f64, Is)];
+    let cases: [(&str, usize, Changes, Option<usize>, Option<f64>, bool); 20] = [
+        ("both ran", 0, &[], None, Some(700.0), true),
+        ("both ran, on time", 0, &[], None, Some(630.0), false),
+        (
+            "both ran, never arrived, the receiver stopped later",
+            0,
+            &[(1, 1400.0, Stopped)],
+            None,
+            None,
+            true,
+        ),
+        (
+            "the receiver off 460 to 900, arrived 5 s after",
+            0,
+            &[(1, 460.0, Stopped), (1, 900.0, Running)],
+            None,
+            Some(905.0),
+            false,
+        ),
+        (
+            "the receiver off 460 to 900, arrived at 2000",
+            0,
+            &[(1, 460.0, Stopped), (1, 900.0, Running)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+        (
+            "the receiver off 460 to 900, arrived at 1000",
+            0,
+            &[(1, 460.0, Stopped), (1, 900.0, Running)],
+            None,
+            Some(1000.0),
+            true,
+        ),
+        (
+            "the receiver off 460 to 900, never arrived, running at the end",
+            0,
+            &[(1, 460.0, Stopped), (1, 900.0, Running)],
+            None,
+            None,
+            true,
+        ),
+        (
+            "the receiver off from 460 to the end, never arrived",
+            0,
+            &[(1, 460.0, Stopped)],
+            None,
+            None,
+            false,
+        ),
+        (
+            "the receiver off 460 to 900 and from 1400, never arrived",
+            0,
+            &[
+                (1, 460.0, Stopped),
+                (1, 900.0, Running),
+                (1, 1400.0, Stopped),
+            ],
+            None,
+            None,
+            false,
+        ),
+        (
+            "the writer stopped at 460 for good, arrived at 2000",
+            0,
+            &[(0, 460.0, Stopped)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+        (
+            "the receiver frozen 600 to 605, arrived at 2000",
+            0,
+            &[(1, 600.0, Frozen), (1, 605.0, Running)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+        (
+            "the receiver frozen 600 to 605, arrived at 660",
+            0,
+            &[(1, 600.0, Frozen), (1, 605.0, Running)],
+            None,
+            Some(660.0),
+            false,
+        ),
+        (
+            "the receiver frozen 530 to 535 and 600 to 605, arrived at 650",
+            0,
+            &[
+                (1, 530.0, Frozen),
+                (1, 535.0, Running),
+                (1, 600.0, Frozen),
+                (1, 605.0, Running),
+            ],
+            None,
+            Some(650.0),
+            false,
+        ),
+        (
+            "the receiver first ran at 560, arrived at 2000",
+            0,
+            &[(1, 560.0, Running)],
+            Some(1),
+            Some(2000.0),
+            true,
+        ),
+        (
+            "the receiver first ran at 560, arrived at 625",
+            0,
+            &[(1, 560.0, Running)],
+            Some(1),
+            Some(625.0),
+            false,
+        ),
+        (
+            "the writer off 460 to 900, arrived 5 s after",
+            0,
+            &[(0, 460.0, Stopped), (0, 900.0, Running)],
+            None,
+            Some(905.0),
+            false,
+        ),
+        (
+            "the writer off 460 to 900, arrived at 2000",
+            0,
+            &[(0, 460.0, Stopped), (0, 900.0, Running)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+        (
+            "the writer stopped 600 to 610, after it pushed, arrived at 2000",
+            0,
+            &[(0, 600.0, Stopped), (0, 610.0, Running)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+        (
+            "a writer on the second relay off 530 to 900, arrived 5 s after",
+            1,
+            &[(1, 530.0, Stopped), (1, 900.0, Running)],
+            None,
+            Some(905.0),
+            false,
+        ),
+        (
+            "a writer on the second relay off 530 to 900, arrived at 2000",
+            1,
+            &[(1, 530.0, Stopped), (1, 900.0, Running)],
+            None,
+            Some(2000.0),
+            true,
+        ),
+    ];
+    for (case, writer, changes, never_started, arrived, late) in cases {
+        let bar = split_edit_at_the_outage(writer, 450.0, changes, never_started, arrived);
         assert_eq!(
-            bar.figure
-                .contains("1 split people's edits later than 120 s"),
+            bar.figure.contains("1 split people's edits late"),
             late,
             "{case}: {}",
             bar.figure
         );
         assert_eq!(bar.verdict == Verdict::Fail, late, "{case}: {}", bar.figure);
     }
+    // A writer on the second relay that wrote 30 s before its stop had
+    // pushed: a stop of its own after the start holds nothing up, so it is
+    // owed by 640.
+    let bar = split_edit_at_the_outage(
+        1,
+        370.0,
+        &[(1, 600.0, Is::Stopped), (1, 610.0, Is::Running)],
+        None,
+        Some(660.0),
+    );
+    assert!(
+        bar.figure.contains("1 split people's edits late") && bar.verdict == Verdict::Fail,
+        "a writer that pushed before the stop: {}",
+        bar.figure
+    );
+}
+
+/// Bar 15 of a run whose second relay stops at 400 and starts at 520, and
+/// whose split person's device `writer` wrote an edit at `at` that the
+/// other device received at `arrived`, given each device's changes after
+/// all ran from 0 (or, for `never_started`, only those).
+fn split_edit_at_the_outage(
+    writer: usize,
+    at: f64,
+    changes: &[(usize, f64, Is)],
+    never_started: Option<usize>,
+    arrived: Option<f64>,
+) -> Line {
+    let receiver = 1 - writer;
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2500.0);
+    *run.outage.lock().unwrap() = Outage {
+        stopped: Some(400.0),
+        started: Some(520.0),
+        back: Vec::new(),
+    };
+    let person = run
+        .plan
+        .population
+        .people
+        .iter()
+        .position(|p| p.split && !p.office)
+        .unwrap();
+    if let Some(device) = never_started {
+        let node = run.fleet.device(person, device);
+        run.fleet.changes.lock().unwrap().retain(|c| c.node != node);
+    }
+    for &(device, t, is) in changes {
+        becomes(&run, run.fleet.device(person, device), t, is);
+    }
+    {
+        let mut o = run.observer.lock().unwrap();
+        let edit = Written {
+            number: 20,
+            person,
+            writer,
+            name: 0,
+            file: "f001.md".into(),
+            size: 600,
+            at,
+            burst: false,
+            new: false,
+            replaced: None,
+        };
+        o.wrote(edit, vec![(receiver, run.out.clone())]);
+        if let Some(at) = arrived {
+            o.arrivals
+                .insert((20, receiver), Arrival { at, in_copy: false });
+        }
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_15(&read, &edits)
 }
