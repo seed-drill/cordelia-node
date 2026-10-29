@@ -354,7 +354,24 @@ fn time_of(
         let noted = noted.get(change)?;
         Some(noted.removed.as_ref()?.contains(key))
     };
-    let made_at = |change: &Change| noted.get(change).and_then(|noted| noted.made_at);
+    // A change's time, by its maker's clock, no later than that of any
+    // noted change made after it (the second read of slice 8, a low
+    // finding): an honest change made on a fast clock does not move the
+    // cut later than a change that followed it, the removal among them.
+    let made_at = |change: &Change| -> Option<i64> {
+        let own = noted.get(change)?.made_at?;
+        let after = noted
+            .values()
+            .filter(|later| {
+                later
+                    .chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.contains(change))
+            })
+            .filter_map(|later| later.made_at)
+            .min();
+        Some(after.map_or(own, |after| own.min(after)))
+    };
     let first = links
         .iter()
         .position(|change| removes(change) == Some(true))?;
@@ -364,11 +381,14 @@ fn time_of(
     {
         return Some(time);
     }
+    // The newest change on the chain, by the chain's order, that the
+    // device noted with its time and that does not remove the key: not
+    // the latest time of any, which a fast clock on an older change gives.
     links[..first]
         .iter()
+        .rev()
         .filter(|change| removes(change) == Some(false))
-        .filter_map(made_at)
-        .max()
+        .find_map(made_at)
 }
 
 #[cfg(test)]
@@ -417,6 +437,29 @@ mod tests {
         ];
         let cuts = Cuts::of(&noted, &[([9; 32], None)]);
         assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(100 - MARGIN));
+    }
+
+    /// The cut time goes by the chain's order, and no change's time is
+    /// later than that of a noted change made after it (the second read of
+    /// slice 8, a low finding): an honest change 2 made on a clock that is
+    /// fast does not move the cut later than the removal, change 4; and of
+    /// the changes before it, the newest gives the time, not the latest.
+    #[test]
+    fn the_cut_time_goes_by_the_chain_and_no_later_than_a_change_after() {
+        let noted = [
+            change(1, Some(100), &[], &[]),
+            change(2, Some(90_000), &[], &[1]),
+            change(4, Some(6_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(6_000 - MARGIN));
+        let noted = [
+            change(1, Some(5_000), &[], &[]),
+            change(2, Some(4_000), &[], &[1]),
+            change(4, Some(6_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(4_000 - MARGIN));
     }
 
     /// Where no change on the chain has a time, there is none: everything
