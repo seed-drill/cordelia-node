@@ -381,6 +381,8 @@ mod tests {
     use cordelia_core::protocol::{MAX_FILE_ARRIVALS, REMOVAL_TAKEN_MARGIN_SECS};
 
     const MARGIN: i64 = REMOVAL_TAKEN_MARGIN_SECS as i64;
+    /// The name of a folder's index file.
+    const INDEX: &str = "MEMORY.md";
 
     /// Every text the device's store holds of the name `notes`, in the
     /// generation it follows.
@@ -834,6 +836,79 @@ mod tests {
                 false => assert_eq!(s[1].text("notes", "z.md"), None),
                 true => assert_eq!(s[1].text("notes", "z.md").as_deref(), Some("z honest")),
             }
+        }
+    }
+
+    /// An index merge (the second read of slice 8, a low finding): the
+    /// tablet writes `MEMORY.md` back to its own earlier text, the desktop
+    /// merges that with an edit of its own, and the laptop stores only the
+    /// desktop's merge. The merge's chain says the tablet's text one time
+    /// more than any chain the laptop held: that is an arrival of the
+    /// tablet's, and the cut leaves the merge out. Each way the tablet
+    /// writes back: over the desktop's version, and over its own earlier
+    /// one, not having seen the desktop's.
+    #[test]
+    fn a_merge_of_a_text_written_back_is_an_arrival_of_its_writer() {
+        use crate::several::entry_by;
+        use cordelia_crypto::chain;
+        for over_its_own in [false, true] {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[0, 1, 2], "notes");
+            s.meet(&[0, 1, 2]);
+            let channel = s[1].own("notes");
+            let rev = cordelia_core::revision::next_under(None, 1).unwrap();
+            let (t1, t2) = (Value::Text("- one\n".into()), Value::Text("- two\n".into()));
+            let (k, b) = (s.key(2), s.key(0));
+            let by = |s: &Several, n: usize, rev: u64, value: &Value, chain: &[Link]| {
+                entry_by(&s[n].identity, &channel, rev, INDEX, value.clone(), chain)
+            };
+            // Long before the removal: the tablet's text, and the desktop's
+            // over it, both taken by the laptop.
+            let first = by(&s, 2, rev, &t1, &[]);
+            let over_k = chain::written_over(&t1, &k, Some(&[]));
+            let second = by(&s, 0, rev + 1, &t2, &over_k);
+            for entry in [&first, &second] {
+                let now = s.tick();
+                crate::take::take(&s[1].conn, &s[1].identity, entry, now).unwrap();
+            }
+            // Late: the tablet writes its own text back, and the desktop
+            // merges it with its own edit. The laptop stores the merge.
+            let made = s.now + 10 * MARGIN;
+            s.now = made - MARGIN / 2;
+            let back = match over_its_own {
+                false => chain::written_over(&t2, &b, Some(&over_k)),
+                true => chain::written_over(&t1, &k, Some(&[])),
+            };
+            let other = Link::of(&t2, b);
+            let merged = chain::merged(&t1, &k, Some(&back), &other, Some(&over_k));
+            let merge = by(
+                &s,
+                0,
+                rev + 3,
+                &Value::Text("- one\n- mine\n".into()),
+                &merged,
+            );
+            let now = s.tick();
+            crate::take::take(&s[1].conn, &s[1].identity, &merge, now).unwrap();
+            let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
+            let slot = s[1].slot_of("notes", INDEX);
+            let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
+            let last = events.last().unwrap();
+            assert!(
+                last.arrivals
+                    .iter()
+                    .any(|arrival| arrival.signer == Link::signer_of(&k)),
+                "{over_its_own}: {:?}",
+                last.arrivals
+            );
+
+            s.now = made - 1;
+            let removal = s.change(0, &[0, 1], &[2]);
+            let now = s.tick();
+            let on = &s[1];
+            let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+            assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+            assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- two\n"));
         }
     }
 
