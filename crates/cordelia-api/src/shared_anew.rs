@@ -45,7 +45,7 @@ use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries;
 use cordelia_storage::shared::{self as kept, Channel, State};
 use cordelia_storage::shared_anew::{self as rows, MadeRow, OfferRow};
-use cordelia_storage::shared_pass::{self as pass_rows, ChannelOut};
+use cordelia_storage::shared_pass::{self as pass_rows, Answer, ChannelOut};
 
 use crate::lists::{self, AnyAct, Do, Maker};
 use crate::person::{Counting, Held, PersonError, held, in_one};
@@ -136,6 +136,10 @@ pub enum Fault {
     Held,
     /// Its maker is a key this person's statement lists as removed.
     MakerRemoved,
+    /// It seals to a key this person's statement lists as removed: a move
+    /// to it would take the person into a channel that a removed device
+    /// reads (decision 2026-10-24, rules 4 and 23).
+    SealsRemoved,
     /// Its seal for this device does not open, or opens to a seed whose
     /// card does not give the offer's new ID.
     DidNotOpen,
@@ -147,6 +151,7 @@ impl Fault {
         match self {
             Fault::Held => "held",
             Fault::MakerRemoved => "maker_removed",
+            Fault::SealsRemoved => "seals_removed",
             Fault::DidNotOpen => "did_not_open",
         }
     }
@@ -238,6 +243,8 @@ fn judge(
         OfferIs::Fault(Fault::Held)
     } else if held.statement.statement.removed.contains(&offer.maker) {
         OfferIs::Fault(Fault::MakerRemoved)
+    } else if seals_removed(held, offer) {
+        OfferIs::Fault(Fault::SealsRemoved)
     } else if offer.sealed_to.contains(&own) {
         match opened(identity, row, offer) {
             Some(card) => OfferIs::ForThisDevice(card),
@@ -257,6 +264,13 @@ fn judge(
         is,
         left_out,
     }
+}
+
+/// Whether `offer` seals to a key this person's statement lists as removed
+/// (decision 2026-10-24, rules 4 and 23): a fault, whatever else it is.
+fn seals_removed(held: &Held, offer: &OfferRow) -> bool {
+    let removed = &held.statement.statement.removed;
+    offer.sealed_to.iter().any(|key| removed.contains(key))
 }
 
 /// The card this device's seal in `offer` opens to: `None` where it does
@@ -394,36 +408,88 @@ pub(crate) fn removal_applied(conn: &Connection, now: i64) -> Result<(), PersonE
     Ok(())
 }
 
+/// What a removal or a recovery left out of a channel it made anew, beside
+/// the removed keys (decision 2026-10-10, property 7): the keys of the
+/// table past the 64 that stay, and the rows the table had let go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeftOut {
+    pub past_64: u64,
+    pub let_go: u64,
+}
+
 /// The keys that stay at a removal or at a recovery, with no question
 /// (decision 2026-10-24, rule 24): the person's own devices, and then every
 /// key of the table of the channel of `row` but the removed keys, in the
-/// order of the listing, 64 at most.
+/// order of the listing, 64 at most; and what it left out besides.
 fn staying_with_no_question(
     conn: &Connection,
     held: &Held,
     own: &[u8; 32],
     row: &Channel,
-) -> Result<Vec<[u8; 32]>, PersonError> {
+) -> Result<(Vec<[u8; 32]>, LeftOut), PersonError> {
     let listed = listing_of(conn, held, own, row)?;
     let mut stay = listed.own_devices.clone();
+    let mut past_64 = 0;
     for key in &listed.asked {
         if stay.len() >= SHARED_MAX_KEYS {
-            break;
+            past_64 += 1;
+            continue;
         }
         stay.push(*key);
     }
-    Ok(stay)
+    Ok((
+        stay,
+        LeftOut {
+            past_64,
+            let_go: listed.let_go,
+        },
+    ))
+}
+
+/// The line said of a channel a removal made anew (decision 2026-10-10
+/// §3.5), with how many keys it left out besides the removed ones
+/// (property 7).
+fn made_anew_line(name: &str, new: &[u8; 32], left: LeftOut) -> String {
+    let mut line = format!(
+        "\"{}\" is made anew without the device removed: it is channel {} now. The other people \
+         in it move with a yes of their own.",
+        crate::messages::cleaned(name),
+        channel_words(new)
+    );
+    if left != LeftOut::default() {
+        line.push_str(&format!(
+            " Left out besides: {} keys past the 64 that stay, and {} no longer known on this \
+             device.",
+            left.past_64, left.let_go
+        ));
+    }
+    line
+}
+
+/// The line of a channel that a removal left not clean, since this device
+/// does not reach its relays (decision 2026-10-24, rules 24 and 25).
+pub fn unreached_line(name: &str) -> String {
+    let word = crate::shared_routes::shell_word(name);
+    format!(
+        "\"{}\" was held by a device that was removed, and is not reached from this device: make \
+         it anew with cordelia shared anew {word} on a device of yours that reaches its relays",
+        crate::messages::cleaned(name)
+    )
 }
 
 /// Make each shared channel the person holds anew, as `shared anew` does,
 /// with no key asked about (decision 2026-10-24, rule 24): on the device
 /// that makes a removal, after the transaction that applies it; and on the
 /// machine of a recovery, each once it has read it ([`make_owed`]). Each
-/// keeps its relays. Returns the lines said of each, and the names of those
-/// that could not be made anew, with why.
+/// keeps its relays. A channel none of whose relays is one of `own_relays`
+/// is left not clean, and named so: its offer would wait in this device's
+/// store, read by none of the others in it, while the person's devices
+/// followed the filing out of it. Returns the lines said of each, and the
+/// names of those that could not be made anew, with why.
 pub fn anew_at_removal(
     conn: &Connection,
     identity: &NodeIdentity,
+    own_relays: &[OwnRelay],
     now: i64,
 ) -> Result<Vec<String>, PersonError> {
     let mut said = Vec::new();
@@ -432,6 +498,11 @@ pub fn anew_at_removal(
             continue;
         };
         if !matches!(row.state, State::Held | State::NotInForce) || channel.owed {
+            continue;
+        }
+        if !sharing::any_own(own_relays, &card_of(&row)?) {
+            st(rows::unreached(conn, &row.channel))?;
+            said.push(unreached_line(&row.name));
             continue;
         }
         said.push(anew_one_at_removal(conn, identity, &row, now)?);
@@ -449,7 +520,7 @@ fn anew_one_at_removal(
         return Err(PersonError::FollowsNoPhrase);
     };
     let own = identity.public_key();
-    let stay = staying_with_no_question(conn, &held, &own, row)?;
+    let (stay, left) = staying_with_no_question(conn, &held, &own, row)?;
     let card = card_of(row)?;
     let filing = Filing {
         channel: row.channel,
@@ -464,15 +535,10 @@ fn anew_one_at_removal(
         row,
         card.relays().clone(),
         &stay,
-        true,
+        Some(left),
         now,
     ) {
-        Ok(new) => Ok(format!(
-            "\"{}\" is made anew without the device removed: it is channel {} now. The other \
-             people in it move with a yes of their own.",
-            crate::messages::cleaned(&row.name),
-            channel_words(&new)
-        )),
+        Ok(new) => Ok(made_anew_line(&row.name, &new, left)),
         Err(Failed::Refused(refusal)) => Ok(format!(
             "\"{}\" could not be made anew: {}",
             crate::messages::cleaned(&row.name),
@@ -537,7 +603,7 @@ fn make_anew_of(
     row: &Channel,
     relays: Relays,
     stay: &[[u8; 32]],
-    at_removal: bool,
+    at_removal: Option<LeftOut>,
     now: i64,
 ) -> Out<[u8; 32]> {
     let held = standing(conn)?;
@@ -563,7 +629,11 @@ fn make_anew_of(
         name: filing.name.clone(),
         came: Came::Moved(row.channel),
     };
-    in_one(conn, || -> Result<Out<()>, PersonError> {
+    // A refusal of the act undoes the whole transaction, the offer and the
+    // row of what was made among it: a refused `shared anew` writes and
+    // sends nothing.
+    let mut refusal = None;
+    let done = in_one(conn, || -> Result<(), PersonError> {
         let rev = entries::author_entry(conn, &row.channel, &slot, &own)?
             .map_or(1, |held| held.entry.rev + 1);
         let inside = Inside {
@@ -587,8 +657,10 @@ fn make_anew_of(
                 new_channel,
                 rev,
                 made_at: now,
-                at_removal,
+                at_removal: at_removal.is_some(),
                 delivering: true,
+                past_64: at_removal.unwrap_or_default().past_64,
+                let_go: at_removal.unwrap_or_default().let_go,
             },
         ))?;
         let what = Do::MoveWith {
@@ -596,13 +668,22 @@ fn make_anew_of(
             to: to.clone(),
             agents: agents.clone(),
         };
-        if let Err(failed) = sharing::act(conn, identity, &held, what, now) {
-            return Ok(Err(failed));
+        match sharing::act(conn, identity, &held, what, now) {
+            Ok(()) => {}
+            Err(Failed::Error(e)) => return Err(e),
+            Err(Failed::Refused(refused)) => {
+                refusal = Some(refused);
+                return Err(PersonError::Held("refused, and undone".into()));
+            }
         }
         st(rows::clean(conn, &row.channel))?;
         sharing::write_empty_anew_records(conn, identity, now)?;
-        Ok(Ok(()))
-    })??;
+        Ok(())
+    });
+    if let Some(refused) = refusal {
+        return Err(Failed::Refused(refused));
+    }
+    done?;
     Ok(new_channel)
 }
 
@@ -756,7 +837,7 @@ pub fn anew_plan(
     name: &str,
     words: Option<&str>,
     named: &[String],
-    keep: Option<&[String]>,
+    keep: Option<(&[String], &[String])>,
     now: i64,
 ) -> Out<(Listing, Option<Plan<AnewOf>>)> {
     let held = standing(conn)?;
@@ -791,9 +872,19 @@ pub fn anew_plan(
         );
     }
     let listing = listing_of(conn, &held, &own, &row)?;
-    let Some(keep) = keep else {
+    let Some((keep, asked)) = keep else {
         return Ok((listing, None));
     };
+    // The keys asked about must be those listed to the person: a key that
+    // came to the table since it was listed would be left out unasked
+    // (property 7).
+    let asked: Option<Vec<[u8; 32]>> = asked
+        .iter()
+        .map(|typed| cordelia_crypto::bech32::decode_public_key(typed.trim()).ok())
+        .collect();
+    if asked.as_deref() != Some(&listing.asked[..]) {
+        return refused("", sharing::CHANGED_KEYS.into());
+    }
     let mut stay = listing.own_devices.clone();
     for typed in keep {
         let key = cordelia_crypto::bech32::decode_public_key(typed.trim())
@@ -877,7 +968,7 @@ pub fn make_anew(
         })
     })?;
     let new = make_anew_of(
-        conn, identity, &of.filing, &row, relays, &of.stay, false, now,
+        conn, identity, &of.filing, &row, relays, &of.stay, None, now,
     )?;
     let at: Vec<String> = of
         .relays
@@ -921,6 +1012,10 @@ fn offer_line(
         OfferIs::Fault(Fault::MakerRemoved) => {
             format!("made anew by {by} on {on}, a device you removed: a fault, not a move")
         }
+        OfferIs::Fault(Fault::SealsRemoved) => format!(
+            "made anew by {by} on {on} into channel {new}, sealed to a device you removed: a \
+             fault, not a move"
+        ),
         OfferIs::Fault(Fault::DidNotOpen) => format!(
             "made anew by {by} on {on} into channel {new}, with a seal for this device that does \
              not open: a fault, not a move"
@@ -991,6 +1086,14 @@ pub fn move_plan(
         lines.push(line);
         lines.join("\n")
     };
+    // A channel not yet clean is made anew by the person, and not moved
+    // from to an offer (decision 2026-10-24, rule 25): its seed a removed
+    // device holds, and an offer read there may have been made by a member
+    // who did not know of the removal. The offers read there are listed
+    // above the refusal, each fault with its maker.
+    if is_not_clean(conn, &row.channel)? {
+        return refused("not_clean", above(not_clean_line(&row.name)));
+    }
     let mut open: Vec<(&Judged, &Card)> = all
         .iter()
         .filter_map(|one| match &one.is {
@@ -1261,7 +1364,8 @@ pub(crate) fn after_who_wrote(
                 .any(|key| key == own || counting.counts(key));
             let fault = offer.new_channel == *channel
                 || held_channels.contains(&offer.new_channel)
-                || held.statement.statement.removed.contains(&offer.maker);
+                || held.statement.statement.removed.contains(&offer.maker)
+                || seals_removed(held, &offer);
             let left_out = shown
                 .iter()
                 .filter(|key| {
@@ -1430,8 +1534,13 @@ pub(crate) fn deliveries(conn: &Connection, own: &[u8; 32], now: i64) -> Result<
         let slot = slot_id(&derive::slot_key(&card.secret()?)?, &anew_name(own)?);
         let mut at_each = true;
         for relay in card.relays().keys() {
+            // Only a relay that holds this record, or a later one of this
+            // device's, holds the offer: one that holds another entry at
+            // its revision may hold something else there.
             let answered = st(pass_rows::answer(conn, row.id, relay, &slot))?;
-            if !answered.is_some_and(|(rev, _)| rev >= made.rev) {
+            if !answered.is_some_and(|(rev, answer)| {
+                rev >= made.rev && matches!(answer, Answer::Holds | Answer::HoldsLater)
+            }) {
                 at_each = false;
             }
         }
@@ -1494,10 +1603,14 @@ fn notice_of(act: &AnyAct) -> [u8; 32] {
     id
 }
 
-/// What a notice of a channel not yet clean is named by.
-pub(crate) fn notice_of_channel(channel: &[u8; 32]) -> [u8; 32] {
+/// What a notice of a channel not yet clean is named by: the channel, and
+/// how many keys the person's statement removes, which grows at each
+/// removal and at no other statement (a removed key is never taken out of a
+/// statement). So a notice cleared is named again at a later removal.
+pub(crate) fn notice_of_channel(channel: &[u8; 32], removed: usize) -> [u8; 32] {
     let mut named = b"cordelia shared channel not clean".to_vec();
     named.extend_from_slice(channel);
+    named.extend_from_slice(&(removed as u64).to_be_bytes());
     let mut id = cordelia_crypto::sha256(&named);
     id[..4].copy_from_slice(SHARED_NOTICE);
     id
@@ -1746,6 +1859,7 @@ pub(crate) type Told = ([u8; 32], &'static str, String);
 /// by (§3.5): `(id, kind, says)`.
 pub(crate) fn notices(conn: &Connection) -> Result<Vec<Told>, PersonError> {
     let mut told = Vec::new();
+    let removed = held(conn)?.map_or(0, |held| held.statement.statement.removed.len());
     for channel in st(rows::not_clean_all(conn))? {
         if !is_not_clean(conn, &channel.channel)? {
             continue;
@@ -1754,9 +1868,12 @@ pub(crate) fn notices(conn: &Connection) -> Result<Vec<Told>, PersonError> {
             continue;
         };
         told.push((
-            notice_of_channel(&channel.channel),
+            notice_of_channel(&channel.channel, removed),
             "not_clean",
-            not_clean_line(&row.name),
+            match channel.unreached {
+                true => unreached_line(&row.name),
+                false => not_clean_line(&row.name),
+            },
         ));
     }
     let removed = crate::look::removed_labels(conn)?;
@@ -1798,12 +1915,11 @@ pub(crate) fn made_at_the_last_removal(
         let name = st(kept::channel(conn, &made.new_channel))?
             .map(|row| row.name)
             .unwrap_or_default();
-        lines.push(format!(
-            "\"{}\" is made anew without the device removed: it is channel {} now. The other \
-             people in it move with a yes of their own.",
-            crate::messages::cleaned(&name),
-            channel_words(&made.new_channel)
-        ));
+        let left = LeftOut {
+            past_64: made.past_64,
+            let_go: made.let_go,
+        };
+        lines.push(made_anew_line(&name, &made.new_channel, left));
     }
     Ok(lines)
 }
@@ -1818,18 +1934,24 @@ pub fn not_clean_line(name: &str) -> String {
     )
 }
 
+/// What a removal names of the shared channels before its yes: the names
+/// of those it makes anew, of those it leaves not clean, and the acts.
+pub type AtARemoval = (Vec<String>, Vec<String>, Vec<Named>);
+
 /// What the device of `identity` names of its shared channels at a removal,
-/// before its yes (§3.5): each shared channel the person holds, by name; and
-/// each act in force of any device of the person's that counts, each with
-/// its maker and what undoes it, for the command to name those of the
-/// device it removes.
-pub fn at_a_removal(conn: &Connection) -> Result<(Vec<String>, Vec<Named>), PersonError> {
-    let names: Vec<String> = sharing::filed(conn)?
+/// before its yes (§3.5): each shared channel the person holds that one of
+/// `own_relays` reaches, by name, which the removal makes anew; each that
+/// none does, which it leaves not clean (decision 2026-10-24, rules 24 and
+/// 25); and each act in force of any device of the person's that counts,
+/// each with its maker and what undoes it, for the command to name those of
+/// the device it removes.
+pub fn at_a_removal(conn: &Connection, own_relays: &[OwnRelay]) -> Result<AtARemoval, PersonError> {
+    let (reached, unreached): (Vec<Filing>, Vec<Filing>) = sharing::filed(conn)?
         .into_iter()
-        .map(|filing| filing.name)
-        .collect();
+        .partition(|filing| sharing::any_own(own_relays, &filing.card));
+    let names = |filings: Vec<Filing>| filings.into_iter().map(|filing| filing.name).collect();
     let acts = acts_named(conn, |_, maker| maker == Maker::Counts)?;
-    Ok((names, acts))
+    Ok((names(reached), names(unreached), acts))
 }
 
 #[cfg(test)]

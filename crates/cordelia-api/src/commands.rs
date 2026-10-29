@@ -1208,7 +1208,9 @@ pub async fn change_prepare(
     // §3.5): each the person holds, and each act in force of each device
     // that counts, with what undoes it; the command names those of the
     // devices it removes.
-    let (shared_names, shared_acts) = crate::shared_anew::at_a_removal(&conn).map_err(refused)?;
+    let own_relays = crate::sharing::own_relays(&state);
+    let (shared_names, shared_unreached, shared_acts) =
+        crate::shared_anew::at_a_removal(&conn, &own_relays).map_err(refused)?;
     let mut acts_handed = Vec::new();
     for named in shared_acts {
         acts_handed.push(json!({
@@ -1234,6 +1236,7 @@ pub async fn change_prepare(
         "names_not_shown": names_not_shown,
         "received": received(&state, now()),
         "shared_channels": shared_names,
+        "shared_unreached": shared_unreached,
         "shared_acts": acts_handed,
         "look": seen,
     })))
@@ -1358,8 +1361,11 @@ pub async fn change_make(
                 .map_err(|e| refused(PersonError::Storage(e)))?
                 .is_some();
         match removed {
-            true => crate::shared_anew::anew_at_removal(&conn, &state.identity, now())
-                .map_err(refused)?,
+            true => {
+                let own = crate::sharing::own_relays(&state);
+                crate::shared_anew::anew_at_removal(&conn, &state.identity, &own, now())
+                    .map_err(refused)?
+            }
             false => Vec::new(),
         }
     };

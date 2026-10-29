@@ -318,6 +318,7 @@ pub fn anew(
     let keep = answers(&ask, own_devices, |asks| at.answer(asks))?;
     let mut body = body;
     body["keep"] = json!(keep);
+    body["asked"] = json!(ask.iter().map(|(key, _)| key).collect::<Vec<_>>());
     if let Some(made) = with_a_yes(config_path, &at, path, body)? {
         print_said(&made);
     }

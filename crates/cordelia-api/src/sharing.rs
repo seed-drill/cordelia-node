@@ -174,6 +174,11 @@ pub(crate) fn refused<T>(word: &'static str, line: String) -> Out<T> {
     Err(Failed::Refused(Refusal { word, line }))
 }
 
+/// What `shared anew` says where the keys it would ask about are not those
+/// it listed (decision 2026-10-10 §7, property 7).
+pub const CHANGED_KEYS: &str = "The keys of this channel changed while you were answering: \
+                                nothing was done. Run it again to see every key.";
+
 /// The line of `too_many_channels` (§5.5).
 pub const TOO_MANY_CHANNELS: &str = "Your devices hold 16 shared channels, which is the most: \
                                      drop one first with cordelia shared drop <name>.";

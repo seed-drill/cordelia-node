@@ -424,7 +424,20 @@ fn anew_again(
     }
     let inside = Entry::check(held.entry)?.open(&usable.secret)?;
     let again = Entry::seal(&usable.secret, identity, entry.rev + 1, &inside)?.check()?;
-    take(conn, identity, &again, now)?;
+    // In a channel this device made anew and moved from, the door takes
+    // nothing: the offer, the one entry it still sends there, is stored as
+    // it was made (`shared_anew::make_anew_of`), so that it reaches the
+    // relay that held another at its revision.
+    let held_here =
+        kept::channel(conn, &usable.channel)?.is_some_and(|row| row.state == State::Held);
+    match held_here {
+        true => {
+            take(conn, identity, &again, now)?;
+        }
+        false => {
+            entries::store(conn, &again, now)?;
+        }
+    }
     Ok(())
 }
 

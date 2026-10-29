@@ -61,6 +61,17 @@ fn what_is(s: &Several, n: usize, channel: &Shared, now: i64) -> Vec<([u8; 32], 
         .collect()
 }
 
+/// The keys `shared anew` lists and asks about in the channel named `name`
+/// on the device of `identity`, each as `cordelia id` writes it.
+fn asked_of(conn: &Connection, identity: &NodeIdentity, name: &str, now: i64) -> Vec<String> {
+    let (listing, _) = anew_plan(conn, identity, &relays(), name, None, &[], None, now).unwrap();
+    listing
+        .asked
+        .iter()
+        .map(|key| encode_public_key(key).unwrap())
+        .collect()
+}
+
 fn refusal_word<T: std::fmt::Debug>(done: Out<T>) -> &'static str {
     match done {
         Err(Failed::Refused(refusal)) => refusal.word,
@@ -196,6 +207,19 @@ fn an_offer_leaves_out_or_is_a_fault_by_its_seals_and_your_statement_alone() {
         lines.iter().any(|line| line.ends_with("without you")),
         "{lines:?}"
     );
+    // The channel is not clean on the laptop, which applied the removal of
+    // the tablet: `shared move` is refused there (rule 25).
+    let refused = move_plan(
+        &s[0].conn,
+        &s[0].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    );
+    assert_eq!(refusal_word(refused), "not_clean");
+    st(rows::clean(&s[0].conn, &channel.id)).unwrap();
     // None of them is an offer to move to.
     let refused = move_plan(
         &s[0].conn,
@@ -419,6 +443,11 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
     );
     assert_eq!(listing.lines.last().unwrap(), LABEL_FIRST);
 
+    let listed: Vec<String> = listing
+        .asked
+        .iter()
+        .map(|key| encode_public_key(key).unwrap())
+        .collect();
     // A key it did not ask about is no answer: the tablet's, removed.
     let unasked = vec![encode_public_key(&tablet.public_key()).unwrap()];
     let refused = anew_plan(
@@ -428,7 +457,7 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
         "review",
         None,
         &[],
-        Some(&unasked),
+        Some((&unasked, &listed)),
         now,
     );
     assert_eq!(
@@ -447,7 +476,7 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
         "review",
         None,
         &[],
-        Some(&too_many),
+        Some((&too_many, &listed)),
         now,
     );
     assert_eq!(
@@ -464,7 +493,7 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
         "review",
         None,
         &[],
-        Some(&keep),
+        Some((&keep, &listed)),
         now,
     )
     .unwrap();
@@ -530,7 +559,7 @@ fn a_removal_makes_each_shared_channel_anew_without_the_removed_key() {
     let now = s.now + 20;
     let conn = &s[0].conn;
     assert!(is_not_clean(conn, &channel.id).unwrap(), "rule 23");
-    let said = anew_at_removal(conn, &s[0].identity, now).unwrap();
+    let said = anew_at_removal(conn, &s[0].identity, &relays(), now).unwrap();
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(said[0].starts_with("\"review\" is made anew without the device removed"));
     assert!(!is_not_clean(conn, &channel.id).unwrap());
@@ -659,6 +688,7 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
     );
     assert!(is_not_clean(conn, &channel.id).unwrap());
     // `shared anew` goes through, and ends it.
+    let listed = asked_of(conn, identity, "review", now);
     let (_, plan) = anew_plan(
         conn,
         identity,
@@ -666,7 +696,7 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
         "review",
         None,
         &[],
-        Some(&[]),
+        Some((&[], &listed)),
         now,
     )
     .unwrap();

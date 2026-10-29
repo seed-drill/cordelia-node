@@ -659,10 +659,20 @@ impl Computed {
     /// The items in force and the undoes kept for something that the
     /// device writes in `part`, and the writers of the lists that carry the
     /// acts below those undoes.
+    #[cfg(test)]
     fn placed(&self, part: usize) -> (usize, Vec<[u8; 32]>) {
+        self.placed_but(part, |_| false)
+    }
+
+    /// The same, less the acts that `passed` names.
+    fn placed_but(&self, part: usize, passed: impl Fn(&AnyAct) -> bool) -> (usize, Vec<[u8; 32]>) {
         let mut devices = BTreeSet::new();
         let mut placed = 0;
-        for act in self.written.iter().filter(|act| act.part() == part) {
+        for act in self
+            .written
+            .iter()
+            .filter(|act| act.part() == part && !passed(act))
+        {
             let acts = &self.valid[&act.key()];
             if !act.undoes() {
                 placed += 1;
@@ -1022,11 +1032,23 @@ fn decide(
     // A filing, a subscribe or a label of a new item is refused where its
     // part holds its bound of items in force and undoes kept for
     // something; an act on an item that holds a place takes that place.
+    // A subscription of a channel that is filed no more (moved from, or
+    // dropped) shows nothing and cannot be undone by its name: it holds no
+    // room, so that the subscriptions a move moves do not fill the room of
+    // the old ones (decision 2026-10-10 §7). The list's bound still writes
+    // the newest first.
+    let unfiled = |act: &AnyAct| match act {
+        AnyAct::Subscription(subscription) => matches!(
+            newest(&(Part::Channel, subscription.item.channel.to_vec())),
+            Some(AnyAct::Drop(_))
+        ),
+        _ => false,
+    };
     let room = |key: &Key, part: usize, bound: usize, as_part: Part| {
         if computed.holds_a_place(key, part) {
             return Ok(());
         }
-        let (placed, devices) = computed.placed(part);
+        let (placed, devices) = computed.placed_but(part, unfiled);
         if placed >= bound {
             return Err(Refused::Full {
                 part: as_part,

@@ -1649,6 +1649,10 @@ struct Handed {
     /// force in the person's lists with its maker and what undoes it
     /// (decision 2026-10-10 §3.5).
     shared_channels: Vec<String>,
+    /// Those of them that this device does not reach, which the removal
+    /// leaves not clean rather than making anew (decision 2026-10-24,
+    /// rules 24 and 25).
+    shared_unreached: Vec<String>,
     shared_acts: Vec<([u8; 32], String)>,
 }
 
@@ -1763,6 +1767,9 @@ impl Handed {
         let shared_channels: Vec<String> = list(handed, "shared_channels")
             .filter_map(|name| name.as_str().map(str::to_string))
             .collect();
+        let shared_unreached: Vec<String> = list(handed, "shared_unreached")
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
         let shared_acts: Vec<([u8; 32], String)> = list(handed, "shared_acts")
             .filter_map(|act| {
                 let maker = decode_public_key(act["maker"].as_str()?).ok()?;
@@ -1771,6 +1778,7 @@ impl Handed {
             .collect();
         Ok(Self {
             shared_channels,
+            shared_unreached,
             shared_acts,
             this_device: *own,
             applied,
@@ -1877,6 +1885,19 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
             "\nThese shared channels are made anew without the device removed, in this change: \
              {}. The other people in each move with a yes of their own, and their devices send \
              nothing more in the old channel meanwhile.",
+            names.join(", ")
+        ));
+    }
+    if !handed.shared_unreached.is_empty() {
+        let names: Vec<String> = handed
+            .shared_unreached
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        lines.push(format!(
+            "\nThese shared channels are not reached from this device, so they are not made anew \
+             in this change: {}. Your devices send nothing in each until you make it anew with \
+             cordelia shared anew <name> on a device of yours that reaches its relays.",
             names.join(", ")
         ));
     }
@@ -2922,9 +2943,14 @@ fn waits_after(
             for line in list(&seen, "shared_made_anew").filter_map(Value::as_str) {
                 say(crate::history_cmd::printable(line));
             }
-            // And each act of the removed device still in force, with what
-            // undoes it, as before the yes.
-            for notice in list(&seen, "notices").filter(|notice| notice["kind"] == "removed_act") {
+            // Each shared channel it left not clean, which this device does
+            // not reach (decision 2026-10-24, rules 24 and 25), with the
+            // command to run on a device that does; and each act of the
+            // removed device still in force, with what undoes it, as before
+            // the yes.
+            for notice in list(&seen, "notices")
+                .filter(|notice| notice["kind"] == "not_clean" || notice["kind"] == "removed_act")
+            {
                 say(crate::history_cmd::printable(text(notice, "says")));
             }
             return Ok(Waited::Ended(end));

@@ -378,6 +378,11 @@ pub struct AnewRequest {
     /// before the person has answered.
     #[serde(default)]
     pub keep: Option<Vec<String>>,
+    /// The keys that were listed and asked about, in order, each as
+    /// `cordelia id` writes it: with `keep`, they must be the keys the
+    /// listing asks about now (§7, property 7).
+    #[serde(default)]
+    pub asked: Vec<String>,
     #[serde(default)]
     pub look: bool,
     #[serde(default)]
@@ -403,7 +408,7 @@ pub async fn anew(
             &body.name,
             body.words.as_deref(),
             &body.relays,
-            body.keep.as_deref(),
+            body.keep.as_deref().map(|keep| (keep, &body.asked[..])),
             now,
         )
     };
