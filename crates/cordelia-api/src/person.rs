@@ -3156,13 +3156,13 @@ impl Carry<'_> {
     ) -> Result<(), PersonError> {
         use cordelia_storage::arrivals as kept;
         let channel = derive::channel_id(from)?;
-        let (events, _) = kept::of_file(conn, &channel, slot)?;
-        for event in &events {
-            let before = match &event.before {
+        let (events, dropped) = kept::of_file(conn, &channel, slot)?;
+        let sealed_again = |before: Option<&Entry>| -> Result<Option<Entry>, PersonError> {
+            let before = match before {
                 Some(before) => crate::arrivals::version_of(before, from)?,
                 None => None,
             };
-            let sealed = match before {
+            Ok(match before {
                 Some(version) => match self.renumbered(version.rev) {
                     Some(rev) => {
                         let sealed = carried_entry_at(self.identity, to, &version, rev)?;
@@ -3171,8 +3171,23 @@ impl Carry<'_> {
                     None => None,
                 },
                 None => None,
-            };
+            })
+        };
+        for event in &events {
+            let sealed = sealed_again(event.before.as_ref())?;
             kept::set_before(conn, event.place, sealed.as_ref())?;
+        }
+        // And the version before what went past the bound.
+        for went in &dropped {
+            let sealed = sealed_again(went.before.as_ref())?;
+            kept::set_dropped_before(
+                conn,
+                &channel,
+                slot,
+                went.number,
+                &went.hash,
+                sealed.as_ref(),
+            )?;
         }
         kept::move_file(conn, &channel, slot, &derive::channel_id(to)?, to_slot)?;
         Ok(())

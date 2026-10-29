@@ -1209,7 +1209,9 @@ CREATE TABLE relay_head_rooms (
 ///   stands. Kept per file, by its channel and slot, across carries; at
 ///   most `MAX_FILE_ARRIVALS` a file.
 /// - `file_arrivals_dropped`: for each file and generation, the newest
-///   time of an arrival dropped past the bound.
+///   time of an arrival dropped past the bound, and the first event that
+///   went with the version current before it (sealed as this device's own):
+///   where what went is cut, the file goes back to that version.
 const MIGRATION_V24: &str = r#"
 CREATE TABLE person_change_times_lists (
     number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
@@ -1272,11 +1274,18 @@ CREATE TABLE file_arrivals (
 CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
 
 CREATE TABLE file_arrivals_dropped (
-    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
-    slot        BLOB NOT NULL CHECK(length(slot) = 32),
-    number      INTEGER NOT NULL,
-    hash        BLOB NOT NULL CHECK(length(hash) = 16),
-    newest_at   INTEGER NOT NULL,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL,
+    hash                BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at           INTEGER NOT NULL,
+    first_place         INTEGER NOT NULL,
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB,
     PRIMARY KEY (channel_id, slot, number, hash)
 );
 "#;

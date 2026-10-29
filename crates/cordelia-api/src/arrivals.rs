@@ -20,8 +20,11 @@
 //! (`cordelia_storage::sync_state::save_put_back`), with what it held kept
 //! in local history alone. What the bound let go of a file is judged as an
 //! arrival of every removed key at the newest time that went: where it is
-//! cut, the file goes back to before the oldest kept. The arrivals that are
-//! not cut go with the file to the channel it is carried to.
+//! cut, the file goes back to the version before the first event that went,
+//! which is kept with it. A version gone back to that nothing kept brought
+//! is judged at the cut's own time, by its signers and the keys its chain
+//! names, and where one is cut the file goes back to none. The arrivals that
+//! are not cut go with the file to the channel it is carried to.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -170,6 +173,20 @@ pub(crate) fn noted_at_the_door(
     Ok(())
 }
 
+/// The first event of a file that the cut leaves out, or what went past
+/// its bound.
+struct First<'a> {
+    /// Its place; `None` where what went past the bound is cut.
+    place: Option<i64>,
+    generation: Change,
+    at: i64,
+    /// The version current in the file before it.
+    before: Option<&'a Entry>,
+    /// Whether an event kept, or one that went and is not cut, came
+    /// before it: what it goes back to was then judged when it arrived.
+    brought: bool,
+}
+
 /// What the cut leaves of a file at a carry (rule 7).
 #[derive(Debug, Clone)]
 pub(crate) struct FileCut {
@@ -208,17 +225,27 @@ pub(crate) fn cut_of_channel(
                 .any(|key| cuts.cuts(key, generation, at))
         };
         // What went past the bound is judged as an arrival of every removed
-        // key, at the newest time that went.
+        // key, at the newest time that went. Where it is cut, the file goes
+        // back to the version before the first event that went in the
+        // first generation so cut: not to before the oldest event kept,
+        // which may be a removed key's own version.
         let went = dropped
             .iter()
-            .filter(|went| any_key(&(went.number, went.hash), went.newest_at))
-            .map(|went| went.newest_at)
-            .max();
+            .position(|went| any_key(&(went.number, went.hash), went.newest_at));
         let first = match went {
-            Some(at) => Some((events.first(), at)),
+            Some(at) => {
+                let went = &dropped[at];
+                Some(First {
+                    place: None,
+                    generation: (went.number, went.hash),
+                    at: went.newest_at,
+                    before: went.before.as_ref(),
+                    brought: at > 0,
+                })
+            }
             None => events
                 .iter()
-                .find(|event| {
+                .position(|event| {
                     let generation = (event.number, event.hash);
                     event
                         .arrivals
@@ -227,20 +254,44 @@ pub(crate) fn cut_of_channel(
                         .chain(&event.full_signers)
                         .any(|signer| of_signer(signer, &generation, event.stored_at))
                 })
-                .map(|event| (Some(event), event.stored_at)),
+                .map(|index| {
+                    let event = &events[index];
+                    First {
+                        place: Some(event.place),
+                        generation: (event.number, event.hash),
+                        at: event.stored_at,
+                        before: event.before.as_ref(),
+                        brought: index > 0 || !dropped.is_empty(),
+                    }
+                }),
         };
-        let Some((event, at)) = first else {
+        let Some(first) = first else {
             continue;
         };
-        let target = match event.and_then(|event| event.before.as_ref()) {
+        let target = match first.before {
             Some(before) => version_of(before, from)?,
             None => None,
         };
+        // Where nothing kept brought the version gone back to, its
+        // arrival was never judged: its signers, and every key its chains
+        // name, are judged at the cut's own generation and time, and where
+        // one is cut the file goes back to none. That fails safe.
+        let target = target.filter(|version| {
+            first.brought
+                || !version.entries.iter().any(|one| {
+                    cuts.cuts_key(&one.author, &first.generation, first.at)
+                        || one
+                            .chain
+                            .iter()
+                            .flatten()
+                            .any(|link| of_signer(&link.signer, &first.generation, first.at))
+                })
+        });
         cut.insert(
             slot,
             FileCut {
-                place: event.map(|event| event.place),
-                at,
+                place: first.place,
+                at: first.at,
                 target,
             },
         );
@@ -516,5 +567,214 @@ mod tests {
                 true => assert_eq!(carried.as_deref(), Some("one\n")),
             }
         }
+    }
+
+    /// The rev of the newest entry device `n` stores in `file` of `notes`.
+    fn newest_rev(s: &Several, n: usize, file: &str) -> u64 {
+        let slot = s[n].slot_of("notes", file);
+        s[n].stored_in(&s[n].own("notes"))
+            .iter()
+            .filter(|entry| entry.slot == slot)
+            .map(|entry| entry.rev)
+            .max()
+            .unwrap()
+    }
+
+    /// A flood past the bound (the review of slice 8, its first finding):
+    /// the tablet writes twelve late versions of `w.md`, each with a chain
+    /// of 100 links of its own, 101 arrivals each, so the first late ones
+    /// go past the bound. The cut goes back to before the first event that
+    /// went, the laptop's own `w kept`, and not to before the oldest kept,
+    /// which is the tablet's own late version.
+    #[test]
+    fn a_flood_past_the_bound_never_carries_a_removed_devices_late_writing() {
+        use crate::several::entry_by;
+        // Where `renewed`, the laptop renews before it hears of the removal,
+        // and carries the file with what went past its bound: the version
+        // to go back to is sealed again there.
+        for renewed in [false, true] {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[0, 1, 2], "notes");
+            s.write(1, "notes", "w.md", "w kept");
+            s.meet(&[0, 1, 2]);
+            let made = s.now + 10 * MARGIN;
+            s.now = made - MARGIN / 2;
+            let channel = s[1].own("notes");
+            let rev = newest_rev(&s, 1, "w.md");
+            for k in 1..=12u64 {
+                let chain: Vec<Link> = (0..MAX_ENTRY_LINKS)
+                    .map(|i| Link {
+                        hash: {
+                            let mut hash = [i as u8; 16];
+                            hash[0] = k as u8;
+                            hash
+                        },
+                        signer: Link::signer_of(&s.key(2)),
+                    })
+                    .collect();
+                let late = entry_by(
+                    &s[2].identity,
+                    &channel,
+                    rev + k,
+                    "w.md",
+                    Value::Text(format!("tablet late {k}")),
+                    &chain,
+                );
+                let now = s.tick();
+                crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+            }
+            assert_eq!(
+                s[1].text("notes", "w.md").as_deref(),
+                Some("tablet late 12")
+            );
+            if renewed {
+                s.change(1, &[1, 0, 2], &[]);
+            }
+            let (events, dropped) = kept::of_file(
+                &s[1].conn,
+                &cordelia_crypto::derive::channel_id(&s[1].own("notes")).unwrap(),
+                &s[1].slot_of("notes", "w.md"),
+            )
+            .unwrap();
+            assert!(!dropped.is_empty());
+            // The oldest event kept goes back to a late version of the
+            // tablet's (sealed again as the laptop's own, after a carry).
+            let oldest = version_of(events[0].before.as_ref().unwrap(), &s[1].own("notes"))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&oldest.value, Value::Text(text) if text.starts_with("tablet late")));
+
+            s.now = made - 1;
+            let removal = s.change(0, &[0, 1], &[2]);
+            let now = s.tick();
+            let on = &s[1];
+            let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+            match renewed {
+                false => assert!(matches!(taken, Taken::Shown(Shown::Applied(_)))),
+                true => assert!(matches!(taken, Taken::Shown(Shown::Moved(_))), "{taken:?}"),
+            }
+            assert_eq!(s[1].text("notes", "w.md").as_deref(), Some("w kept"));
+            assert!(texts(&s, 1).iter().all(|text| !text.contains("late")));
+        }
+    }
+
+    /// A version gone back to that nothing kept brought (one taken before
+    /// the arrivals were kept, as on a device stepped to this version) is
+    /// judged at the cut's own time: where its signer is cut there, the
+    /// file goes back to none. The rows are set so by hand.
+    #[test]
+    fn a_version_gone_back_to_that_nothing_kept_brought_is_judged_at_the_cut() {
+        use crate::several::entry_by;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        let made = s.now + 10 * MARGIN;
+        s.now = made - MARGIN / 2;
+        let channel = s[1].own("notes");
+        let first_rev = cordelia_core::revision::next_under(None, 1).unwrap();
+        let late = entry_by(
+            &s[2].identity,
+            &channel,
+            first_rev,
+            "z.md",
+            Value::Text("z late".into()),
+            &[],
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+        // Its arrival is as if it was never kept: the event is gone.
+        let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
+        let slot = s[1].slot_of("notes", "z.md");
+        kept::drop_from(&s[1].conn, &id, &slot, i64::MIN).unwrap();
+        // Device 0 writes over it, with the tablet's link: an arrival of
+        // that link, after the cut time.
+        let over = entry_by(
+            &s[0].identity,
+            &channel,
+            first_rev + 1,
+            "z.md",
+            Value::Text("z over".into()),
+            &[Link::of(&Value::Text("z late".into()), s.key(2))],
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &over, now).unwrap();
+        let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].before.as_ref().unwrap().author, s.key(2));
+
+        s.now = made - 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(s[1].text("notes", "z.md"), None);
+    }
+
+    /// After a removal, honest arrivals are not cut again at a later change
+    /// (the review of slice 8, its second finding). The laptop applies the
+    /// removal. Long after, device 0 writes `w.md` with a full chain that
+    /// holds one old link of the tablet's. The desktop renews, listing the
+    /// tablet as removed again (rule 20), and the laptop applies it: the
+    /// generation of the removal is on the renewal's chain, and what came
+    /// in it is not judged by time.
+    #[test]
+    fn an_honest_edit_after_a_removal_is_not_set_aside_at_a_later_change() {
+        use crate::several::entry_by;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        let tablet_link = Link::of(&Value::Text("the tablet's\n".into()), s.key(2));
+        let first_rev = cordelia_core::revision::next_under(None, 1).unwrap();
+        let first = entry_by(
+            &s[0].identity,
+            &s[1].own("notes"),
+            first_rev,
+            "w.md",
+            Value::Text("one\n".into()),
+            &[tablet_link],
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &first, now).unwrap();
+        s.now += 10 * MARGIN;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let taken = crate::take::take(&s[1].conn, &s[1].identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(s[1].text("notes", "w.md").as_deref(), Some("one\n"));
+
+        // Long after, an honest edit with a full chain.
+        s.now += 100 * MARGIN;
+        let mut chain = vec![tablet_link];
+        chain.extend((0..MAX_ENTRY_LINKS - 1).map(|i| Link {
+            hash: [i as u8; 16],
+            signer: Link::signer_of(&s.key(0)),
+        }));
+        let rev = newest_rev(&s, 1, "w.md");
+        let honest = entry_by(
+            &s[0].identity,
+            &s[1].own("notes"),
+            rev + 1,
+            "w.md",
+            Value::Text("two, long after\n".into()),
+            &chain,
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &honest, now).unwrap();
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("two, long after\n")
+        );
+
+        // The desktop renews, and the laptop applies the renewal.
+        s.now += MARGIN;
+        let renewal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let taken = crate::take::take(&s[1].conn, &s[1].identity, &renewal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("two, long after\n")
+        );
     }
 }

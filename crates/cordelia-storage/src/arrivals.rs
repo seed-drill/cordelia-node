@@ -14,8 +14,8 @@
 //! the new channel and slot ([`move_file`]), and the versions to go back to
 //! are sealed again there by the caller ([`set_before`]). At most
 //! `MAX_FILE_ARRIVALS` a file: past it the oldest events go first, and what
-//! went is kept as the newest time of each generation's
-//! ([`Dropped`]).
+//! went is kept as the newest time of each generation's, with the version
+//! before the first event of it that went ([`Dropped`]).
 //!
 //! Nothing here decides what is cut: that is the carry's.
 
@@ -63,12 +63,51 @@ pub struct Stored {
 }
 
 /// What went past the bound, for one generation of a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dropped {
     pub number: u64,
     pub hash: [u8; 16],
     /// The newest time an event that went was stored.
     pub newest_at: i64,
+    /// The place of the first event of this generation that went.
+    pub first_place: i64,
+    /// The version that was current in the file before that event, as one
+    /// entry: `None` where there was none. Where what went is cut, the file
+    /// goes back to it, and not to before the oldest event kept, which may
+    /// be a removed key's own.
+    pub before: Option<Entry>,
+}
+
+/// The entry of the six columns from `at` (`before_author` to
+/// `before_channel_sig`) of a row, in the file `slot` of `channel`.
+fn before_of(
+    row: &rusqlite::Row<'_>,
+    at: usize,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> rusqlite::Result<Option<Entry>> {
+    let author: Option<Vec<u8>> = row.get(at)?;
+    let Some(author) = author.and_then(|a| <[u8; 32]>::try_from(a).ok()) else {
+        return Ok(None);
+    };
+    let author_sig: Vec<u8> = row.get(at + 4)?;
+    let channel_sig: Vec<u8> = row.get(at + 5)?;
+    let (Ok(author_signature), Ok(channel_signature)) = (
+        <[u8; 64]>::try_from(author_sig),
+        <[u8; 64]>::try_from(channel_sig),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(Entry {
+        channel: *channel,
+        slot: *slot,
+        author,
+        rev: row.get::<_, i64>(at + 1)?.max(0) as u64,
+        delete: row.get::<_, i64>(at + 2)? != 0,
+        content: row.get(at + 3)?,
+        author_signature,
+        channel_signature,
+    }))
 }
 
 /// Keep a store event of the file `slot` in `channel` and its arrivals,
@@ -153,23 +192,30 @@ fn keep_to_the_bound(
     slot: &[u8; 32],
 ) -> rusqlite::Result<()> {
     while counted(conn, channel, slot)? > MAX_FILE_ARRIVALS as i64 {
-        let oldest: Option<(i64, i64, Vec<u8>, i64)> = conn
+        let oldest: Option<i64> = conn
             .query_row(
-                "SELECT place, number, hash, stored_at FROM file_arrivals_stored
+                "SELECT place FROM file_arrivals_stored
                  WHERE channel_id = ?1 AND slot = ?2 ORDER BY place LIMIT 1",
                 params![channel.as_slice(), slot.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((place, number, hash, stored_at)) = oldest else {
+        let Some(place) = oldest else {
             return Ok(());
         };
+        // The first event of a generation that goes keeps the version
+        // before it with what went: a later one leaves it as it was.
         conn.execute(
-            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
+                 first_place, before_author, before_rev, before_delete, before_content,
+                 before_author_sig, before_channel_sig)
+             SELECT channel_id, slot, number, hash, stored_at, place, before_author,
+                    before_rev, before_delete, before_content, before_author_sig,
+                    before_channel_sig
+             FROM file_arrivals_stored WHERE place = ?1
              ON CONFLICT(channel_id, slot, number, hash)
              DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
-            params![channel.as_slice(), slot.as_slice(), number, hash, stored_at],
+            params![place],
         )?;
         drop_event(conn, place)?;
     }
@@ -205,30 +251,7 @@ pub fn of_file(
     let rows = stmt
         .query_map(params![channel.as_slice(), slot.as_slice()], |row| {
             let full: Option<Vec<u8>> = row.get(4)?;
-            let author: Option<Vec<u8>> = row.get(5)?;
-            let before = match author.and_then(|a| <[u8; 32]>::try_from(a).ok()) {
-                None => None,
-                Some(author) => {
-                    let author_sig: Vec<u8> = row.get(9)?;
-                    let channel_sig: Vec<u8> = row.get(10)?;
-                    match (
-                        <[u8; 64]>::try_from(author_sig),
-                        <[u8; 64]>::try_from(channel_sig),
-                    ) {
-                        (Ok(author_signature), Ok(channel_signature)) => Some(Entry {
-                            channel: *channel,
-                            slot: *slot,
-                            author,
-                            rev: row.get::<_, i64>(6)?.max(0) as u64,
-                            delete: row.get::<_, i64>(7)? != 0,
-                            content: row.get(8)?,
-                            author_signature,
-                            channel_signature,
-                        }),
-                        _ => None,
-                    }
-                }
-            };
+            let before = before_of(row, 5, channel, slot)?;
             Ok(Stored {
                 place: row.get(0)?,
                 number: row.get::<_, i64>(1)?.max(0) as u64,
@@ -262,8 +285,10 @@ pub fn of_file(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT number, hash, newest_at FROM file_arrivals_dropped
-             WHERE channel_id = ?1 AND slot = ?2 ORDER BY number, hash",
+            "SELECT number, hash, newest_at, first_place, before_author, before_rev,
+                    before_delete, before_content, before_author_sig, before_channel_sig
+             FROM file_arrivals_dropped
+             WHERE channel_id = ?1 AND slot = ?2 ORDER BY first_place",
         )
         .map_err(storage)?;
     let dropped = stmt
@@ -272,6 +297,8 @@ pub fn of_file(
                 number: row.get::<_, i64>(0)?.max(0) as u64,
                 hash: row.get::<_, Vec<u8>>(1)?.try_into().unwrap_or_default(),
                 newest_at: row.get(2)?,
+                first_place: row.get(3)?,
+                before: before_of(row, 4, channel, slot)?,
             })
         })
         .map_err(storage)?
@@ -361,6 +388,39 @@ pub fn set_before(
          WHERE place = ?1",
         params![
             place,
+            before.map(|entry| entry.author.to_vec()),
+            before.map(|entry| i64::try_from(entry.rev).unwrap_or(i64::MAX)),
+            before.map(|entry| entry.delete),
+            before.map(|entry| entry.content.clone()),
+            before.map(|entry| entry.author_signature.to_vec()),
+            before.map(|entry| entry.channel_signature.to_vec()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// The version to go back to before what went past the bound of the file
+/// `slot` in `channel`, in the generation `number` and `hash`, sealed
+/// again where the file now is (`None`: none).
+pub fn set_dropped_before(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    number: u64,
+    hash: &[u8; 16],
+    before: Option<&Entry>,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_dropped SET before_author = ?5, before_rev = ?6,
+             before_delete = ?7, before_content = ?8, before_author_sig = ?9,
+             before_channel_sig = ?10
+         WHERE channel_id = ?1 AND slot = ?2 AND number = ?3 AND hash = ?4",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            i64::try_from(number).unwrap_or(i64::MAX),
+            hash.as_slice(),
             before.map(|entry| entry.author.to_vec()),
             before.map(|entry| i64::try_from(entry.rev).unwrap_or(i64::MAX)),
             before.map(|entry| entry.delete),
@@ -503,20 +563,59 @@ mod tests {
     fn test_a_file_keeps_its_arrivals_to_the_bound() {
         let conn = db::open_in_memory().unwrap();
         let (c, s) = ([1u8; 32], [2u8; 32]);
+        // Each event holds the version before it: the first, version 0.
+        let version = |rev: u64| Entry {
+            channel: c,
+            slot: s,
+            author: [7; 32],
+            rev,
+            delete: false,
+            content: vec![rev as u8],
+            author_signature: [8; 64],
+            channel_signature: [9; 64],
+        };
+        let mut first = 0;
         for at in 0..MAX_FILE_ARRIVALS as i64 + 3 {
-            note(&conn, &c, &s, 2, &[2; 16], at, &[], None, &[arrival(5)]).unwrap();
+            let place = note(
+                &conn,
+                &c,
+                &s,
+                2,
+                &[2; 16],
+                at,
+                &[],
+                Some(&version(at as u64)),
+                &[arrival(5)],
+            )
+            .unwrap();
+            if at == 0 {
+                first = place;
+            }
         }
         let (events, dropped) = of_file(&conn, &c, &s).unwrap();
         assert_eq!(events.len(), MAX_FILE_ARRIVALS);
         assert_eq!(events[0].stored_at, 3);
+        // What went keeps the version before the first event that went,
+        // and not before the oldest kept (decision 2026-10-24 (removal),
+        // rule 7): the events in between may be a removed key's own.
         assert_eq!(
             dropped,
             vec![Dropped {
                 number: 2,
                 hash: [2; 16],
-                newest_at: 2
+                newest_at: 2,
+                first_place: first,
+                before: Some(version(0)),
             }]
         );
+        // Sealed again at a carry, it is what the carry set.
+        set_dropped_before(&conn, &c, &s, 2, &[2; 16], Some(&version(40))).unwrap();
+        assert_eq!(
+            of_file(&conn, &c, &s).unwrap().1[0].before,
+            Some(version(40))
+        );
+        set_dropped_before(&conn, &c, &s, 2, &[2; 16], None).unwrap();
+        assert_eq!(of_file(&conn, &c, &s).unwrap().1[0].before, None);
         // Another file is not touched.
         note(
             &conn,
