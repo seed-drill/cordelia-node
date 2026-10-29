@@ -858,6 +858,39 @@ mod tests {
         }
     }
 
+    /// A version gone back to that the device wrote itself counts as
+    /// brought (the second read of slice 8, its medium finding): it is no
+    /// arrival. The laptop writes `w.md` over the tablet's early text, so
+    /// that its chain names the tablet; the tablet's late version is cut,
+    /// and the file goes back to the laptop's own text, and not to none.
+    #[test]
+    fn a_version_gone_back_to_that_the_device_wrote_is_carried() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        s.write(2, "notes", "w.md", "the tablet's early text");
+        s.pass(2, 1);
+        s.write(1, "notes", "w.md", "the laptop's, over it");
+        let made = s.now + 10 * MARGIN;
+        s.now = made - MARGIN / 2;
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("the tablet's late text")
+        );
+        s.now = made - 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("the laptop's, over it")
+        );
+    }
+
     /// An index merge (the second read of slice 8, a low finding): the
     /// tablet writes `MEMORY.md` back to its own earlier text, the desktop
     /// merges that with an edit of its own, and the laptop stores only the

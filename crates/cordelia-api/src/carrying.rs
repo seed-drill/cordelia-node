@@ -1822,6 +1822,57 @@ mod tests {
         }
     }
 
+    /// A carry by command knows the generation it reads by its statement's
+    /// commitment, and judges there (the second read of slice 8, its second
+    /// finding): in a generation that is a removal, nothing of the removed
+    /// key is cut. The desktop (0) removes the tablet (2), and the laptop
+    /// (1) applies it, carrying the tablet's early `f.md`, and writes over
+    /// that in the removal's generation: its chain names the tablet. The
+    /// desktop never takes it, and renews. `cordelia sync carry` reads the
+    /// laptop's version in the removal's generation, and brings it in.
+    #[actix_web::test]
+    async fn test_a_carry_by_command_brings_in_from_a_generation_after_the_removal() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], LAB);
+        s.write(2, LAB, "f.md", "the tablet's early text");
+        s.pass(2, 1);
+        s.now += 10 * REMOVAL_TAKEN_MARGIN_SECS as i64;
+        s.change(0, &[0, 1], &[2]);
+        let taken = s.pass(0, 1);
+        assert!(
+            matches!(
+                taken[0],
+                crate::take::Taken::Shown(person::Shown::Applied(_))
+            ),
+            "{:?}",
+            taken[0]
+        );
+        let removals = s[1].own(LAB);
+        s.write(
+            1,
+            LAB,
+            "f.md",
+            "the tablet's early text, and the laptop's line",
+        );
+        let at_the_relay = s[1].stored_in(&removals);
+        s.change(0, &[0, 1], &[]);
+        let node = Node::of(s.machines.remove(0));
+        node.relay_holds(&removals, &at_the_relay);
+
+        let done = carry_name(&node.state, LAB, false).await.unwrap();
+        assert_eq!(
+            (done.tally.carried, done.tally.cut),
+            (1, 0),
+            "{:?}",
+            done.tally
+        );
+        assert_eq!(
+            node.text(LAB, "f.md").as_deref(),
+            Some("the tablet's early text, and the laptop's line")
+        );
+    }
+
     /// A device that comes to sync a name carries it first, where the
     /// new channel holds nothing for it (decision 2026-10-04 §7.3). Where
     /// the new channel holds anything for the name, the mapping carries
