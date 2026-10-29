@@ -308,7 +308,10 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
     let through = PassesOn::to(new.http);
     let mut at = recovers(&new, Some(through.port), &words, &["lost", "lost"]);
     at.says("The change is made (change 2)")
-        .says("It is shown to every relay first, before anything is carried.")
+        .says(
+            "It is shown to every relay first, before anything is carried, and the look brings \
+             only what was read before it was shown.",
+        )
         .says("The look is made: 1 name read, and 2 versions carried, in 1 name.");
     let said = at.done();
     println!("{said}");

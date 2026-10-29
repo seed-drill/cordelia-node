@@ -49,8 +49,11 @@
 //!    (this machine as the only device, and as removed every device that
 //!    is gone), the names that will be carried, and from whom the look
 //!    takes; asks its yes; signs and seals; and hands the node the change
-//!    entry. The node applies it and shows it to every relay at once,
-//!    before anything is carried.
+//!    entry. The node first reads the names' channels in the generations
+//!    before, within `CARRY_READ_MAX_SECS`, before the change is shown to
+//!    any relay (decision 2026-10-24 (removal), the third read of slice 8,
+//!    its third finding); then it applies it and shows it to every relay
+//!    at once, before anything is carried.
 //! 5. The look is made once, by the node. The command goes on in a new
 //!    process, which never held the phrase ([`recover_made`]): it stays
 //!    until the look has ended, and says what it found.
@@ -1836,11 +1839,14 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "word": word,
     });
     drop(statement_key);
+    // The node reads what the look takes before it applies the change, for
+    // `CARRY_READ_MAX_SECS` at most, and then applies it.
+    println!("\nReading what was written before, at every relay, before the change is shown...");
     let made = api_post_told_of(
         config_path,
         "/api/v1/recover/make",
         &body,
-        Some(Duration::from_secs(60)),
+        Some(Duration::from_secs(CARRY_READ_MAX_SECS + 60)),
     );
     // The secrets that the phrase opened are in the request as text:
     // what this process still holds of that text is overwritten.
@@ -1865,7 +1871,8 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
     }
     println!(
         "\nThe change is made (change {}): this machine follows the recovery phrase, alone. It \
-         is shown to every relay first, before anything is carried.",
+         is shown to every relay first, before anything is carried, and the look brings only \
+         what was read before it was shown.",
         signs.number
     );
     goes_on_in_a_new_process(config_path, signs.number, cut_short)
