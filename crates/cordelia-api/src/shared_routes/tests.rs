@@ -728,3 +728,39 @@ fn the_summary_counts_only_what_waits_for_a_subscribed_agent() {
     assert_eq!(count("notes", t + 4), None);
     let _: Option<Usable> = None;
 }
+
+/// Nothing is written in a shared channel before it is fetched since the
+/// node started, at the relays of its card that the device reaches
+/// (decision 2026-10-10 §6.1, `not_fetched`), nor where none of them is
+/// the device's own (§8.3, `not_reached`).
+#[test]
+fn nothing_is_written_in_a_shared_channel_before_it_is_fetched() {
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    let before = s[0].stored_in(&channel.secret);
+    let not_yet = |_: &[u8; 32], _: usize| false;
+    match send_of(
+        &s[0].conn,
+        &s[0].identity,
+        &asking("notes", "review", "x"),
+        &at(t),
+        not_yet,
+    ) {
+        Err(NotSentHere::Refused(why, _)) => assert_eq!(why.word(), "not_fetched"),
+        other => panic!("{other:?}"),
+    }
+    let mut elsewhere = at(t);
+    elsewhere.own_relays.clear();
+    match send_of(
+        &s[0].conn,
+        &s[0].identity,
+        &asking("notes", "review", "x"),
+        &elsewhere,
+        |_, _| true,
+    ) {
+        Err(NotSentHere::Refused(why, _)) => assert_eq!(why.word(), "not_reached"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s[0].stored_in(&channel.secret), before);
+}
