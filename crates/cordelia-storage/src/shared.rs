@@ -70,7 +70,9 @@ pub enum State {
     /// rows of what it showed stay until each expires.
     Moved,
     /// Held by this device's lists, by no act in force: past a bound, or by
-    /// a maker in no list. Its entries stay, and the door takes none.
+    /// a maker in no list. Its entries and index rows are taken out, and its
+    /// other rows stay while the lists carry an act on it; the door takes
+    /// none (decision 2026-10-10 §3.4).
     NotInForce,
 }
 
@@ -751,6 +753,68 @@ pub fn take_out_channel_step(
         }
     }
     Ok(ChannelStep::Done)
+}
+
+/// One step of a take-out of every entry of the channel `channel` (of row
+/// `id`), which a bound left out of what the device writes (decision
+/// 2026-10-10 §3.4, "A channel that is not written keeps no entries"):
+/// one key's entries, with what waits to be opened of it and its index
+/// rows, its rows of first holding kept, marked as taken out, so that a
+/// message is shown under its first holding when it is stored again; the
+/// key's bytes stored go from its row and from the room. Its row stays,
+/// with any revisions it kept. In the caller's write.
+pub fn take_out_left_out_step(
+    conn: &Connection,
+    id: i64,
+    channel: &[u8; 32],
+) -> Result<ChannelStep, CordeliaError> {
+    let author: Option<[u8; 32]> = conn
+        .query_row(
+            "SELECT author FROM entries WHERE channel_id = ?1 LIMIT 1",
+            [&channel[..]],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let signer: Option<[u8; 32]> = match author {
+        Some(author) => Some(author),
+        None => conn
+            .query_row(
+                "SELECT signer FROM shared_index WHERE channel = ?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?,
+    };
+    let Some(key) = signer else {
+        return Ok(ChannelStep::Done);
+    };
+    conn.execute(
+        "DELETE FROM entries WHERE channel_id = ?1 AND author = ?2",
+        params![&channel[..], &key[..]],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM shared_unopened WHERE channel = ?1 AND key = ?2",
+        params![id, &key[..]],
+    )
+    .map_err(storage)?;
+    take_out_index(conn, id, &key)?;
+    if let Some(row) = self::key(conn, id, &key)? {
+        conn.execute(
+            "UPDATE shared_keys SET bytes_stored = 0 WHERE channel = ?1 AND key = ?2",
+            params![id, &key[..]],
+        )
+        .map_err(storage)?;
+        if !row.known {
+            add_to_room(conn, id, -to_sql(row.bytes_stored))?;
+        }
+    }
+    Ok(match author {
+        Some(author) => ChannelStep::Key(author),
+        None => ChannelStep::Signer(key),
+    })
 }
 
 /// The channel of row `id` keeps the rows of at most `kept` keys that

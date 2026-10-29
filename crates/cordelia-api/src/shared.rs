@@ -535,8 +535,14 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                 }
             }
         } else if anywhere.contains(&row.channel) {
+            // A channel a bound leaves out is not written: its entries and
+            // index rows are taken out, in steps, and its rows stay while
+            // the lists carry an act on it (§3.4, "A channel that is not
+            // written keeps no entries"). The take-out is told apart from a
+            // drop's by the channel's state at its end.
             if row.state == State::Held {
                 kept::set_state(conn, row.id, State::NotInForce, now)?;
+                pass_rows::begin_channel(conn, row.id, ChannelOut::Dropped)?;
             }
         } else {
             if matches!(row.state, State::Held | State::NotInForce) {
@@ -760,6 +766,16 @@ pub fn take_out_step(conn: &Connection, now: i64) -> Result<Stepped, PersonError
             pass_rows::channel_ended(conn, id)?;
             return Ok(Stepped::OfAChannel);
         };
+        // A channel a bound left out keeps its rows (§3.4): its entries and
+        // index rows go, and it is read again from its start once it is
+        // back within the bound.
+        if how == ChannelOut::Dropped && row.state == State::NotInForce {
+            if kept::take_out_left_out_step(conn, id, &row.channel)? == ChannelStep::Done {
+                pass_rows::channel_ended(conn, id)?;
+                pass_rows::forget_places(conn, id)?;
+            }
+            return Ok(Stepped::OfAChannel);
+        }
         let index_too = how != ChannelOut::Moved;
         let step = kept::take_out_channel_step(
             conn,

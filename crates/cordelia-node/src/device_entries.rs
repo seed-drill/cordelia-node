@@ -1659,6 +1659,17 @@ impl DeviceEntries {
             return;
         }
         let own = self.state.identity.public_key();
+        // A channel is held again only once its take-out has ended, here:
+        // what was fetched of a channel not held now is forgotten first, so
+        // that one held again is fetched again before its first send
+        // (decision 2026-10-10 §3.4).
+        let forgot = cordelia_api::shared_pass::forget_fetches_of_channels_not_held(
+            &lock(&self.state.db),
+            &self.state.own_channels,
+        );
+        if let Err(e) = forgot {
+            tracing::warn!(error = %e, "could not read the shared channels not held");
+        }
         match cordelia_api::shared::take_out_in_steps(&self.state.db, &own, now) {
             Ok(0) => {}
             Ok(steps) => tracing::info!(steps, "shared channels' entries were taken out"),

@@ -172,6 +172,24 @@ pub fn delivering_at(conn: &Connection, relay: &[u8; 32]) -> Result<Vec<[u8; 32]
     Ok(at)
 }
 
+/// The node forgets that it fetched each shared channel it does not hold
+/// now: dropped, moved from, or left out by a bound (decision 2026-10-10
+/// §3.4: "for sending, a channel held again is as after a start"). Held
+/// again, it is fetched again before the first send there (`not_fetched`,
+/// §6.1). The pass calls this before it ends any take-out, so that a
+/// channel cannot be held again unseen.
+pub fn forget_fetches_of_channels_not_held(
+    conn: &Connection,
+    own_channels: &crate::state::OwnChannels,
+) -> Result<(), PersonError> {
+    for row in kept::channels(conn)? {
+        if row.state != State::Held {
+            own_channels.forget_fetched(&row.channel);
+        }
+    }
+    Ok(())
+}
+
 /// Every shared channel the device holds, wherever it lives: the channels
 /// that the device still proves, which keep their places among a
 /// connection's proofs (decision 2026-10-17 §4; §8.4).
