@@ -819,3 +819,31 @@ fn nothing_is_written_in_a_shared_channel_before_it_is_fetched() {
     }
     assert_eq!(s[0].stored_in(&channel.secret), before);
 }
+
+/// `send --channel` says which keys came since this folder last wrote
+/// there, not since this device did (decision 2026-10-10 §5.4): `notes`
+/// writes; a key is first held; `work` writes and is told of it; `notes`
+/// writes again and is told of it too.
+#[test]
+fn send_says_what_came_since_this_folder_last_wrote() {
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    subscribes(&s, 0, &channel, "work", true, t);
+    let (_, _, first) = sends(&s, 0, &asking("notes", "review", "one"), t + 1).unwrap();
+    assert!(first[0].contains("unchanged since"), "{first:?}");
+    given(
+        &s,
+        0,
+        &message(&member(2), &channel, 1, "new here", t + 2),
+        t + 2,
+    );
+    let new_key = |lines: &[String]| lines.iter().any(|line| line.starts_with("  new: "));
+    let (_, _, work) = sends(&s, 0, &asking("work", "review", "two"), t + 3).unwrap();
+    assert!(new_key(&work), "{work:?}");
+    let (_, _, notes) = sends(&s, 0, &asking("notes", "review", "three"), t + 4).unwrap();
+    assert!(new_key(&notes), "{notes:?}");
+    // And once it has written since, it is not told again.
+    let (_, _, again) = sends(&s, 0, &asking("notes", "review", "four"), t + 5).unwrap();
+    assert!(!new_key(&again), "{again:?}");
+}

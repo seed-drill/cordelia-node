@@ -571,22 +571,41 @@ pub fn date_of(at: i64) -> String {
 
 /// The lines of §5.4 for the shared channel `channel`, filed as `name`:
 /// which keys have written there, and which came since this device last
-/// wrote there, by what it saw itself. Never who reads it.
+/// wrote there, or for `send`, since the folder whose agent is `agent`
+/// last wrote there, by what it saw itself. Never who reads it.
 pub fn who_wrote(
     conn: &Connection,
     held: &Held,
     own: &[u8; 32],
     channel: &[u8; 32],
     name: &str,
+    agent: Option<&str>,
 ) -> Result<Vec<String>, PersonError> {
     let Some(row) = kept::channel(conn, channel)? else {
         return Ok(Vec::new());
     };
-    let since = entries::author_entries(conn, channel, own)?
-        .iter()
-        .map(|stored| stored.stored_at)
-        .max()
-        .unwrap_or(row.first_held);
+    let last = match agent {
+        // The folder's last message there, on any device of the person's,
+        // by its sent mark: when this device first held it.
+        Some(agent) => {
+            let marks = crate::shared_messages::marks_now(conn, &crate::person::who_counts(conn)?)?;
+            let mut last = None;
+            for (id, first_held) in kept::index_first_held(conn, row.id)? {
+                let Ok(id) = crate::shared_messages::id_of(&id) else {
+                    continue;
+                };
+                if marks.sent_by(channel, &id, agent) {
+                    last = last.max(Some(first_held));
+                }
+            }
+            last
+        }
+        None => entries::author_entries(conn, channel, own)?
+            .iter()
+            .map(|stored| stored.stored_at)
+            .max(),
+    };
+    let since = last.unwrap_or(row.first_held);
     let labels: Vec<[u8; 32]> = lists::holds(conn)?
         .labels
         .iter()
@@ -1002,7 +1021,14 @@ pub fn make_share(
             channel_words(&channel)
         ),
     ];
-    lines.extend(who_wrote(conn, &held, &own, &channel, &to.filing.name)?);
+    lines.extend(who_wrote(
+        conn,
+        &held,
+        &own,
+        &channel,
+        &to.filing.name,
+        None,
+    )?);
     Ok(lines)
 }
 
@@ -1600,7 +1626,7 @@ pub fn list(
             "relays": relays,
             "also_a_name": names.contains(&filing.name),
             "rows_let_go": row.as_ref().map_or(0, |row| row.let_go),
-            "wrote": who_wrote(conn, &held, &own, &filing.channel, &filing.name)?,
+            "wrote": who_wrote(conn, &held, &own, &filing.channel, &filing.name, None)?,
         });
         if with_keys {
             let mut shown = Vec::new();

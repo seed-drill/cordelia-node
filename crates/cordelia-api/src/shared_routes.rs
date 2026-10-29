@@ -746,8 +746,16 @@ pub fn send_of(
         .map(|row| card_of(&row).map(|card| reached(&at.own_relays, &card)))
         .transpose()?
         .unwrap_or(0);
-    // What this device saw of who wrote there, since it last wrote there.
-    let wrote = sharing::who_wrote(conn, &held, &identity.public_key(), &channel, &filing.name)?;
+    // What this device saw of who wrote there, since this folder last
+    // wrote there.
+    let wrote = sharing::who_wrote(
+        conn,
+        &held,
+        &identity.public_key(),
+        &channel,
+        &filing.name,
+        Some(&agent),
+    )?;
     let sends_at = At {
         now: at.now,
         fetched: true,
