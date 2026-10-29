@@ -144,6 +144,40 @@ impl Lives {
                 .any(|(at, is)| *at > a && *at <= b && *is != Is::Running)
     }
 
+    /// When it ran again after the last time it was not running in
+    /// [a, b] (from `a`, where it was not running then); `None` where it
+    /// never ran again. For a device that did not run all through [a, b].
+    fn ran_again_after(&self, node: usize, a: f64, b: f64) -> Option<f64> {
+        let of = &self.of[node];
+        let from = of
+            .iter()
+            .rposition(|(at, is)| *at > a && *at <= b && *is != Is::Running)
+            .map_or_else(|| of.partition_point(|(at, _)| *at <= a), |i| i + 1);
+        of[from..]
+            .iter()
+            .find(|(_, is)| *is == Is::Running)
+            .map(|(at, _)| *at)
+    }
+
+    /// When it had first run `secs` without a stop or a freeze from `from`
+    /// on: the end of that stretch, or `None` where it never did. A device
+    /// still running at its last change runs on.
+    fn ran_for_after(&self, node: usize, from: f64, secs: f64) -> Option<f64> {
+        let mut since = (self.at(node, from) == Is::Running).then_some(from);
+        for (at, is) in self.of[node].iter().filter(|(at, _)| *at > from) {
+            if let Some(s) = since
+                && *at - s >= secs
+            {
+                return Some(s + secs);
+            }
+            match is {
+                Is::Running => since = since.or(Some(*at)),
+                _ => since = None,
+            }
+        }
+        since.map(|s| s + secs)
+    }
+
     /// The longest stretch it ran without a stop or a freeze inside [a, b].
     fn longest_run_within(&self, node: usize, a: f64, b: f64) -> f64 {
         let mut longest: f64 = 0.0;
@@ -2433,6 +2467,58 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
     )
 }
 
+/// Whether an edit of a split person held up by the second relay's
+/// outage (stopped at `stopped`, started at `started`) came late (bar 15).
+/// It is owed within 120 s of the start where the device it waits on ran
+/// through those 120 s and its writer ran until it could push: for
+/// [`HELD_BY_A_RUNNING_DEVICE_SECS`] from the edit where it had a relay
+/// that ran then (the first relay, or the second where it ran those
+/// seconds before its stop), and through the 120 s otherwise, as the edit
+/// waits on it until the relay is back. Where either did not, it is owed
+/// once the later of the two, after it ran again, has run
+/// [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's catch-up), and
+/// never sooner; one that never arrives is late there only where both
+/// devices were running at the end.
+fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
+    let person = &read.run.plan.population.people[p.edit.person];
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let pushed = p.edit.at + HELD_BY_A_RUNNING_DEVICE_SECS;
+    let up = person
+        .relays_of(p.edit.writer, read.run.plan.relays)
+        .contains(&0)
+        || (pushed <= stopped && read.lives.ran_through(writer, p.edit.at, pushed));
+    let writer_until = if up { pushed } else { started + 120.0 };
+    let mut deadline = started + 120.0;
+    let mut held = false;
+    for (node, a, b) in [
+        (p.node, started, started + 120.0),
+        (writer, p.edit.at, writer_until),
+    ] {
+        if read.lives.ran_through(node, a, b) {
+            continue;
+        }
+        held = true;
+        // One that never ran again holds nothing up: where it is the
+        // writer and the edit arrived, it had pushed before it stopped.
+        // One that ran again is owed its catch-up once it has run that long
+        // without a stop or a freeze.
+        if let Some(t) = read.lives.ran_again_after(node, a, b) {
+            let caught_up = read.lives.ran_for_after(node, t, CATCH_UP_SECS);
+            deadline = deadline.max(caught_up.unwrap_or(f64::INFINITY));
+        }
+    }
+    match p.arrived {
+        Some(a) => a.at > deadline,
+        None => {
+            !held
+                || (deadline <= read.end
+                    && [writer, p.node]
+                        .iter()
+                        .all(|&n| read.lives.at(n, read.end) == Is::Running))
+        }
+    }
+}
+
 fn bar_15(read: &Read, edits: &Edits) -> Line {
     let outage = read.run.outage.lock().unwrap().clone();
     let (Some(stopped), Some(started)) = (outage.stopped, outage.started) else {
@@ -2471,7 +2557,7 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
         .filter(|p| people[p.edit.person].split)
         .filter(during)
         .filter(|p| !p.gone && !p.replaced)
-        .filter(|p| p.arrived.is_none_or(|a| a.at - started > 120.0))
+        .filter(|p| split_edit_late(read, p, stopped, started))
         .count();
     let keep = |_: f64, _: f64| true;
     // None refused at a relay, and none held back by a device's own pace
@@ -2496,8 +2582,8 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
         format!(
             "{} devices connected again, the slowest {slowest:.0} s after its start; through the \
              outage, {} arrivals at p50 {p50:.1} s, p95 {p95:.1} s, the most {most:.1} s, \
-             {late_both} not within 120 s; {split_late} split people's edits later than 120 s \
-             after the start; {refused:.0} refused for rate at the relays and {held:.0} held \
+             {late_both} not within 120 s; {split_late} split people's edits late (past 120 s \
+             after the start, or 60 s after their devices ran again); {refused:.0} refused for rate at the relays and {held:.0} held \
              back by a device outside its own connection's proofs in the five minutes after; in \
              those minutes the relay was asked {:.0} pulls and {:.0} pushes, held its lock {} of a \
              minute, and its memory was {}",
@@ -2515,8 +2601,9 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
             mm(&rss, "MiB")
         ),
         "each device set up with it connected again within 120 s; bar 2 through the outage for \
-         people with both; held-up split edits within 120 s of its start; none refused for rate \
-         in the five minutes after, and none held back but for what the minute of a \
+         people with both; held-up split edits within 120 s of its start, or within 60 s of \
+         the later of their devices running again where one was held up; none refused for \
+         rate in the five minutes after, and none held back but for what the minute of a \
          connection's proofs holds back",
         holds,
     )
