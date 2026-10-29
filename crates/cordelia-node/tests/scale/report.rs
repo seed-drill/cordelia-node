@@ -7,8 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
-
 use crate::fleet::{Change, Is, KINDS, Sample, What};
 use crate::kept::Kept;
 use crate::population::Profile;
@@ -16,14 +14,11 @@ use crate::run::{Outcome, Plan, Run};
 
 // ── What is counted ─────────────────────────────────────────────────
 
-/// What an edit of `size` bytes of text in `file` counts as at a relay:
-/// its content, the text with its name and its chain about it (taken as
-/// 96 bytes), sealed in a power of two from 256 bytes, and the overhead
-/// every entry is counted with (`entry_cost`).
+/// What an edit of `size` bytes of text in `file` counts as at a relay,
+/// by this build's constants (`Constants::entry_cost_of`): the report reads
+/// the run's own, as they were kept.
 pub fn entry_cost_of(file: &str, size: usize) -> u64 {
-    let said = size + file.len() + 96 + 28;
-    let content = said.next_power_of_two().max(MIN_ENTRY_CONTENT_BYTES);
-    (content + ENTRY_OVERHEAD_BYTES) as u64
+    crate::kept::Constants::of_this_build().entry_cost_of(file, size)
 }
 
 /// The changes the build has (the first line of the summary). Changes C
@@ -262,6 +257,8 @@ fn metric(s: &Sample, key: &str) -> Option<f64> {
 pub(crate) struct Series<'a> {
     samples: Vec<&'a Sample>,
     starts: Vec<f64>,
+    /// The buckets of a histogram, in the run's build.
+    buckets: usize,
 }
 
 impl<'a> std::ops::Deref for Series<'a> {
@@ -325,11 +322,9 @@ fn rise(series: &Series, key: &str, a: f64, b: f64, keep: &dyn Fn(f64, f64) -> b
         .sum()
 }
 
-/// The bounds of a histogram's buckets, in µs, as the route names them.
-fn bounds() -> Vec<String> {
-    let mut b: Vec<String> = (0..cordelia_core::protocol::LOAD_HISTOGRAM_BUCKETS)
-        .map(|i| (1u64 << i).to_string())
-        .collect();
+/// The bounds of a histogram's `buckets`, in µs, as the route names them.
+fn bounds(buckets: usize) -> Vec<String> {
+    let mut b: Vec<String> = (0..buckets).map(|i| (1u64 << i).to_string()).collect();
     b.push("+Inf".into());
     b
 }
@@ -346,7 +341,7 @@ fn quantiles(
     keep: &dyn Fn(f64, f64) -> bool,
     qs: &[f64],
 ) -> (f64, Vec<Option<u64>>) {
-    let cumulative: Vec<(String, f64)> = bounds()
+    let cumulative: Vec<(String, f64)> = bounds(series.buckets)
         .into_iter()
         .map(|le| {
             let key = format!("{name}_bucket{{{label},le=\"{le}\"}}");
@@ -417,6 +412,25 @@ struct Read {
     end: f64,
     apart: Vec<(f64, f64)>,
     tps: f64,
+    /// What the summary says of how it was made, beyond the run's inputs.
+    told: Told,
+}
+
+/// What a summary says of how it was made: by which harness, where not
+/// the run's; with which threshold of bar 6, where not the run's; and
+/// whether its inputs give it again.
+#[derive(Debug, Clone, Default)]
+struct Told {
+    /// The harness that made the report again (its commit and changes),
+    /// where it is not the run's.
+    again_by: Option<String>,
+    /// Where the report made again was given bar 6's threshold
+    /// (`CORDELIA_SCALE_DEVICE_GROWTH`): the run's own, which it was used
+    /// over.
+    growth_over: Option<Option<f64>>,
+    /// Why the run's inputs will not give its summary again: they were not
+    /// kept, or give another.
+    inputs: Option<String>,
 }
 
 impl Read {
@@ -426,6 +440,7 @@ impl Read {
         Series {
             samples: s,
             starts: self.lives.starts(node),
+            buckets: self.run.constants.load_histogram_buckets,
         }
     }
 
@@ -454,10 +469,11 @@ impl Read {
 /// The summary of a run that did not start, and why (step 1).
 pub fn refused(plan: &Plan, out: &Path, why: &str) -> Outcome {
     let summary = format!(
-        "INVALID stage {} seed {} commit {} ({CHANGES})\n\nThe run did not start: {why}.\n",
+        "INVALID stage {} seed {} commit {} ({CHANGES}){}{why}.\n",
         plan.stage.name(),
         plan.seed,
-        commit()
+        commit(),
+        crate::kept::DID_NOT_START,
     );
     std::fs::write(out.join("SUMMARY.md"), &summary).unwrap();
     Outcome {
@@ -502,6 +518,7 @@ fn read_of_kept(mut run: Kept) -> Read {
         None => (run.kept_at, run.kept_at),
     };
     Read {
+        told: Told::default(),
         lives: Lives::new(&run.fleet.changes, run.fleet.made.len()),
         samples: std::mem::take(&mut run.samples),
         machine: std::mem::take(&mut run.machine),
@@ -523,13 +540,35 @@ fn edits_of(read: &Read) -> Edits {
     Edits::of(read, &read.run.observer)
 }
 
+/// The harness this is: its commit and its changes, as a summary's first
+/// line names a run's.
+fn this_harness() -> String {
+    format!("{} ({CHANGES})", commit())
+}
+
 /// The summary of the run whose inputs are in `folder` (`INPUTS_FILE`),
-/// made again: the same `SUMMARY.md` as the run wrote, where the report
-/// has not changed since. A folder of a run that did not keep its inputs,
-/// or kept another version of them, is refused, and the error says why.
-pub fn again(folder: &Path) -> Result<Outcome, String> {
-    let kept = Kept::load(folder)?;
-    let read = read_of_kept(kept);
+/// made again by this harness: the same `SUMMARY.md` as the run wrote,
+/// where the report has not changed since and `device_growth` is not
+/// given. Where it is (`CORDELIA_SCALE_DEVICE_GROWTH`), bar 6 is judged by
+/// it over the run's own, and the summary says so. A folder of a run that
+/// did not keep its inputs, or kept another version of them, is refused,
+/// and the error says why.
+pub fn again(folder: &Path, device_growth: Option<f64>) -> Result<Outcome, String> {
+    again_by(folder, device_growth, this_harness())
+}
+
+/// `again`, by the harness `harness` (its commit and changes): where it is
+/// not the run's, the summary names it.
+fn again_by(folder: &Path, device_growth: Option<f64>, harness: String) -> Result<Outcome, String> {
+    let mut kept = Kept::load(folder)?;
+    let run_harness = format!("{} ({})", kept.commit, kept.built_with);
+    let growth_over = device_growth.map(|g| kept.plan.device_growth.replace(g));
+    let mut read = read_of_kept(kept);
+    read.told = Told {
+        again_by: (harness != run_harness).then_some(harness),
+        growth_over,
+        inputs: None,
+    };
     let edits = edits_of(&read);
     Ok(summary_of(&read, &edits, folder))
 }
@@ -537,26 +576,31 @@ pub fn again(folder: &Path) -> Result<Outcome, String> {
 /// Write what the run leaves, and say what it came to: its inputs, kept
 /// so that the report can be made again from them, `SUMMARY.md` and
 /// `edits.csv` made from them, and each change of each node in
-/// `samples.jsonl`.
+/// `samples.jsonl`. Where the inputs were not kept, or do not give the
+/// same summary again, `SUMMARY.md` says so at its end (step 10).
 pub fn write(run: &Run) -> Outcome {
     let kept = kept_of(run);
     let saved = kept.save(&run.out);
-    let read = read_of_kept(kept);
+    let mut read = read_of_kept(kept);
     let edits = edits_of(&read);
-    let outcome = summary_of(&read, &edits, &run.out);
+    let mut outcome = summary_of(&read, &edits, &run.out);
+    // The inputs give this summary again, or the summary says so.
+    let inputs = match saved.and_then(|()| again(&run.out, None)) {
+        Ok(again) if again.summary == outcome.summary => None,
+        Ok(_) => Some(format!(
+            "the report made again from {} differs from this summary",
+            crate::kept::INPUTS_FILE
+        )),
+        Err(why) => Some(format!("the report's inputs were not kept: {why}")),
+    };
+    if let Some(why) = inputs {
+        eprintln!("{why}: it will not be made again faithfully from them");
+        read.told.inputs = Some(why);
+        outcome = summary_of(&read, &edits, &run.out);
+    }
     std::fs::write(run.out.join("SUMMARY.md"), &outcome.summary).unwrap();
     std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
     changes_written(&read.run, &run.out);
-    // The inputs give this summary again, or the harness says so.
-    match saved.and_then(|()| again(&run.out)) {
-        Ok(again) if again.summary == outcome.summary => {}
-        Ok(_) => eprintln!(
-            "the report made again from {} differs from SUMMARY.md: it will not be made again \
-             faithfully from them",
-            crate::kept::INPUTS_FILE
-        ),
-        Err(why) => eprintln!("the report's inputs were not kept as they should be: {why}"),
-    }
     outcome
 }
 
@@ -614,6 +658,13 @@ fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
         run.commit,
         run.built_with
     );
+    if let Some(harness) = &read.told.again_by {
+        let _ = writeln!(
+            s,
+            "Made again from {} by the harness of commit {harness}.\n",
+            crate::kept::INPUTS_FILE
+        );
+    }
     let setup = &run.setup;
     let _ = writeln!(
         s,
@@ -636,6 +687,9 @@ fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
     );
     if !faults.is_empty() {
         let _ = writeln!(s, "It stopped early: {}.\n", faults.join("; "));
+    }
+    if let Some(why) = &machine_fault {
+        let _ = writeln!(s, "It is INVALID: the harness stopped it, as {why}.\n");
     }
     let _ = writeln!(s, "## The bars (decision 2026-10-22 §3)\n");
     for (n, b) in bars.iter().enumerate() {
@@ -671,6 +725,12 @@ fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
             s,
             "- {said}: **{}**",
             if *well { "as it should" } else { "FAIL" }
+        );
+    }
+    if let Some(why) = &read.told.inputs {
+        let _ = writeln!(
+            s,
+            "- {why}: its report will not be made again faithfully from them"
         );
     }
     let _ = writeln!(s, "\n## The parts treated apart\n");
@@ -770,7 +830,11 @@ fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
              holds too few edits for a tenth"
         );
     }
-    let _ = writeln!(s, "- the threshold of bar 6: {}", growth_said(plan));
+    let _ = writeln!(
+        s,
+        "- the threshold of bar 6: {}",
+        growth_said(plan, read.told.growth_over)
+    );
     let _ = writeln!(
         s,
         "- the p99 of the devices' rises in this run, for bar 6 at a later stage: {}",
@@ -805,11 +869,11 @@ fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
 }
 
 /// How the run ended (step 10): each node told to stop stopped within
-/// NODE_STOP_TIMEOUT_SECS; no pid it started is left; and every key each
-/// relay held a connection from at the end is one of the run's (§4.3,
-/// rule 1).
+/// NODE_STOP_TIMEOUT_SECS of the run's build; no pid it started is left;
+/// and every key each relay held a connection from at the end is one of
+/// the run's (§4.3, rule 1).
 fn the_end(run: &Kept) -> Vec<(String, bool)> {
-    use cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS;
+    let stop_secs = run.constants.node_stop_timeout_secs;
     let mut said = Vec::new();
     let stops = &run.stops_at_end;
     let slowest = stops.iter().map(|(_, took, _)| *took).fold(0.0, f64::max);
@@ -820,7 +884,7 @@ fn the_end(run: &Kept) -> Vec<(String, bool)> {
         .collect();
     said.push((
         format!(
-            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {NODE_STOP_TIMEOUT_SECS} s{}",
+            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {stop_secs} s{}",
             stops.len(),
             badly.len(),
             match badly.is_empty() {
@@ -881,10 +945,22 @@ fn changes_written(run: &Kept, out: &Path) {
     }
 }
 
-fn growth_said(plan: &Plan) -> String {
-    match (plan.stage, plan.device_growth) {
-        (_, Some(g)) => format!("{:.2} MiB an hour (stage 100's p99, given)", g.max(2.0)),
-        (crate::population::Stage::OneNinety, None) => {
+/// Bar 6's threshold, and where it came from: given to the run, or to the
+/// report made again over the run's own (`over`, where it was).
+fn growth_said(plan: &Plan, over: Option<Option<f64>>) -> String {
+    let given = |g: f64| format!("{:.2} MiB an hour", g.max(2.0));
+    match (plan.stage, plan.device_growth, over) {
+        (_, Some(g), Some(run)) => format!(
+            "{} (stage 100's p99, given to the report made again by \
+             CORDELIA_SCALE_DEVICE_GROWTH; the run was given {})",
+            given(g),
+            run.map_or("none".into(), |r| format!("{r:.2} MiB an hour"))
+        ),
+        (_, Some(g), None) => format!(
+            "{} (stage 100's p99, given to the run by CORDELIA_SCALE_DEVICE_GROWTH)",
+            given(g)
+        ),
+        (crate::population::Stage::OneNinety, None, _) => {
             "2 MiB an hour: stage 100's p99 was not given (CORDELIA_SCALE_DEVICE_GROWTH)".into()
         }
         _ => "2 MiB an hour".into(),
@@ -2370,14 +2446,15 @@ fn bar_12(read: &Read, edits: &Edits) -> (Line, Vec<(f64, f64)>) {
 
 /// The pushes relay `r` is sent at the least for the window's edits in
 /// `spans`: a device publishes what one cycle of its adapter found in one
-/// push to each relay (`CYCLE_SECS`), so edits on a device less than a
-/// cycle apart may share one, and edits further apart cannot. Each group
-/// of a writer's edits that begins at least a cycle after the last began
-/// is one push; a group is counted where it and the cycle after it lie in
-/// one span, so that its push falls in that span too.
+/// push to each relay (`CYCLE_SECS` of the run's build), so edits on a
+/// device less than a cycle apart may share one, and edits further apart
+/// cannot. Each group of a writer's edits that begins at least a cycle
+/// after the last began is one push; a group is counted where it and the
+/// cycle after it lie in one span, so that its push falls in that span
+/// too.
 fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> usize {
     let plan = &read.run.plan;
-    let cycle = cordelia_sync::claude::CYCLE_SECS as f64;
+    let cycle = read.run.constants.cycle_secs as f64;
     let mut by_writer: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
     for e in &edits.window {
         if plan.population.people[e.person]
@@ -2411,7 +2488,9 @@ fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> 
 /// The room's model of one person: what a relay holds of them at the
 /// least and at the most, as entries are counted (bar 13).
 fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, f64) {
-    use cordelia_core::protocol::{CHANGE_ENTRY_BYTES, MAX_HAND_OVER_BYTES, entry_cost};
+    let constants = read.run.constants;
+    let entry_cost = |ciphertext: usize| constants.entry_cost(ciphertext);
+    let entry_cost_of = |file: &str, size: usize| constants.entry_cost_of(file, size);
     let plan = &read.run.plan;
     let p = &plan.population.people[k];
     let removal = read
@@ -2460,10 +2539,10 @@ fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, 
     // channel's words.
     let changes = 1.0 + f64::from(u8::from(removal.is_some()));
     let generations = changes;
-    least += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
-    most += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
+    least += changes * entry_cost(constants.change_entry_bytes) as f64;
+    most += changes * entry_cost(constants.change_entry_bytes) as f64;
     least += generations * p.profile.names() as f64 * entry_cost(256) as f64;
-    most += (p.devices - 1) as f64 * entry_cost(MAX_HAND_OVER_BYTES) as f64;
+    most += (p.devices - 1) as f64 * entry_cost(constants.max_hand_over_bytes) as f64;
     most +=
         generations * ((p.profile.names() * 2 + p.devices * 4 + 8) as f64) * entry_cost(512) as f64;
     (least, most)

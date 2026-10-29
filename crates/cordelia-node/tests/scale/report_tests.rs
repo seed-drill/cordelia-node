@@ -3,6 +3,8 @@
 //! person 0's devices 2 and 3; person 1's 4, 5 and 6; person 2's 7 and 8),
 //! given the samples, the changes and the edits each test reads.
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::fleet::{DeviceCounts, MachineSample};
 use crate::observer::{Arrival, Written};
@@ -1443,13 +1445,33 @@ fn split_edit_at_the_outage(
 // ── The report made again from a run's folder ──
 
 /// A made-up run with something of every input the report reads: changes
-/// of state, a window, samples of the relays (with buckets, and counters
-/// that are not finite) and of the devices and the machine, at times that
-/// are no round numbers, edits waited for, arrived and gone, an outage, a
-/// removal and its carry window, the setup, a copy kept beside a file, a
-/// device's log, the end, and faults.
+/// of state, a window that was cut, samples of the relays (with buckets,
+/// and counters that are not finite) and of the devices (counters not
+/// finite among them) and the machine, at times that are no round
+/// numbers, edits waited for, arrived and gone, the observer's pace, an
+/// outage, a removal and its carry window, the setup, a copy kept beside a
+/// file, a device's log, the end, faults, why the harness stopped it, and
+/// the plan's device stopped for good and threshold of bar 6. No field of
+/// its inputs is left at its default
+/// (`every_field_of_the_made_up_inputs_is_set`).
 fn a_run_with_every_input(dir: &Path) -> Run {
-    let mut run = Run::made_up(Plan::small(1), dir);
+    let mut plan = Plan::small(1);
+    plan.stopped_for_good = Some((2, 123.5));
+    plan.device_growth = Some(3.25);
+    plan.timing.removal_spread = 30.0;
+    if let crate::population::Offs::Fixed(offs) = &mut plan.offs {
+        offs.push(crate::population::Off {
+            person: 2,
+            device: 1,
+            start: 610.0,
+            end: 640.0,
+            how: crate::population::How::Freeze,
+        });
+    }
+    // Person 1 at the office, as at stage 190.
+    plan.population.people[1].office = true;
+    plan.population.office_order = vec![(1, 2), (1, 0), (1, 1)];
+    let mut run = Run::made_up(plan, dir);
     all_running(&run, 0.0);
     becomes(&run, 3, 250.123_456_789, Is::Frozen);
     becomes(&run, 3, 260.987_654_321, Is::Running);
@@ -1469,7 +1491,7 @@ fn a_run_with_every_input(dir: &Path) -> Run {
     };
     run.removals.lock().unwrap().push(Removal {
         person: 1,
-        remover: 0,
+        remover: 1,
         removed: 2,
         line_at: Some(900.0 + 1e-9),
         change: Some(2),
@@ -1479,7 +1501,7 @@ fn a_run_with_every_input(dir: &Path) -> Run {
         carried_bytes: 123_456,
         bound: 64.7,
         command_ended: Some((931.0, true)),
-        failed: None,
+        failed: Some("a made-up failure of the removal".into()),
     });
     *run.removals_planned.lock().unwrap() = 1;
     {
@@ -1544,10 +1566,21 @@ fn a_run_with_every_input(dir: &Path) -> Run {
             });
         }
         for node in 2..run.fleet.made.len() {
-            let mut counts = DeviceCounts::default();
-            counts.asked[0][3] = 3.0 * n as f64;
-            counts.asked_bytes[0][3] = 4096.0 * n as f64 / 3.0;
-            counts.open = 2.0;
+            let m = n as f64;
+            let counts = DeviceCounts {
+                asked: [
+                    [m, 0.0, 0.0, 3.0 * m, 0.0, 0.0],
+                    [0.0, m, 0.0, 0.0, 0.0, 0.0],
+                ],
+                asked_bytes: [[4096.0 * m / 3.0; 6], [0.0, 0.0, 0.0, 512.0 * m, 0.0, 0.0]],
+                held_back: [0.0, (n / 10) as f64],
+                refused_for_now: [(n / 10) as f64, 0.0],
+                // A counter of a device read as not a number, or infinite.
+                waits_over_100: if n == 7 { f64::INFINITY } else { 0.0 },
+                given_up: if n == 7 && node == 4 { f64::NAN } else { 1.0 },
+                open: 2.0,
+                closed: (n / 5) as f64,
+            };
             run.samples.lock().unwrap().nodes.push(Sample {
                 t: t + 0.5 + node as f64 / 100.0,
                 node,
@@ -1560,18 +1593,21 @@ fn a_run_with_every_input(dir: &Path) -> Run {
                     ticks: 300 * n,
                 }),
                 device: Some(counts),
-                connections: Some(2.0),
-                outbox_waiting: Some(0.0),
+                connections: Some(if n == 7 && node == 5 { f64::NAN } else { 2.0 }),
+                outbox_waiting: Some(n as f64 / 3.0),
                 ..Sample::default()
             });
         }
-        let mut machine = crate::machine::MachineRead {
+        let machine = crate::machine::MachineRead {
             cpu_all: 100_000 * n,
             cpu_idle: 80_000 * n,
-            ..Default::default()
+            cpu_iowait: 100 * n,
+            mem_available_kib: 10_000_000,
+            disk_free: 50_000_000_000,
+            writes: 30 * n,
+            write_ms: 12 * n,
+            harness_ticks: 7 * n,
         };
-        machine.mem_available_kib = 10_000_000;
-        machine.harness_ticks = 7 * n;
         run.samples
             .lock()
             .unwrap()
@@ -1599,7 +1635,7 @@ fn a_run_with_every_input(dir: &Path) -> Run {
                     number,
                     person,
                     writer,
-                    name: 0,
+                    name: usize::from(number == 4),
                     file: format!("f{number:03}.md"),
                     size: 600 + number as usize,
                     at,
@@ -1632,6 +1668,8 @@ fn a_run_with_every_input(dir: &Path) -> Run {
             },
         );
         o.gone(1, 2, 880.0);
+        // The observer's pace: its reads 317 ms apart.
+        o.gaps = vec![0.317; 40];
     }
     run.next_edit.store(6, std::sync::atomic::Ordering::SeqCst);
     // A copy kept beside a file.
@@ -1668,6 +1706,8 @@ fn a_run_with_every_input(dir: &Path) -> Run {
     *run.stops_at_end.lock().unwrap() = vec![(2, 0.4, true), (0, 31.5, false)];
     *run.pids_left.lock().unwrap() = vec![4242];
     run.fleet.fault("a made-up fault".into());
+    *run.stopped_why.lock().unwrap() = Some("a made-up machine fell short".into());
+    run.cut.store(true, std::sync::atomic::Ordering::SeqCst);
     run
 }
 
@@ -1692,6 +1732,11 @@ fn the_report_made_again_from_a_runs_folder_is_the_same() {
         "devices' connections to a relay closed in the window outside the outage and made \
          again: 1, median 3.25 s",
         "1 of the pids it started are left",
+        "It is INVALID: the harness stopped it, as a made-up machine fell short.",
+        "and was cut: INVALID",
+        "its reads were 317 ms apart at p99",
+        "- the threshold of bar 6: 3.25 MiB an hour (stage 100's p99, given to the run by \
+         CORDELIA_SCALE_DEVICE_GROWTH)",
     ] {
         assert!(
             outcome.summary.contains(said),
@@ -1699,7 +1744,12 @@ fn the_report_made_again_from_a_runs_folder_is_the_same() {
             outcome.summary
         );
     }
-    let made_again = again(dir.path()).unwrap();
+    assert!(
+        outcome.summary.starts_with("INVALID "),
+        "{}",
+        outcome.summary
+    );
+    let made_again = again(dir.path(), None).unwrap();
     assert_eq!(made_again.summary, written);
     assert_eq!(made_again.verdict, outcome.verdict);
     assert_eq!(made_again.bars, outcome.bars);
@@ -1708,16 +1758,298 @@ fn the_report_made_again_from_a_runs_folder_is_the_same() {
     assert_eq!(made_again.waited, outcome.waited);
     // Read back, the inputs are what was kept, and give the same again.
     let kept = crate::kept::Kept::load(dir.path()).unwrap();
+    let mut back = serde_json::to_value(&kept).unwrap();
+    let mut now = kept_value(&run);
+    for v in [&mut back, &mut now] {
+        v.as_object_mut().unwrap().remove("kept_at");
+    }
+    assert_eq!(back, now);
+    assert_eq!(
+        kept.stopped_why.as_deref(),
+        Some("a made-up machine fell short")
+    );
+    assert_eq!(kept.observer.gaps, vec![0.317; 40]);
+    assert_eq!(kept.plan.device_growth, Some(3.25));
+    assert_eq!(kept.plan.stopped_for_good, Some((2, 123.5)));
+    assert!(kept.cut);
+    let given_up = |kept: &crate::kept::Kept| {
+        kept.samples
+            .iter()
+            .filter_map(|s| s.device.map(|d| (d.given_up, d.waits_over_100)))
+            .filter(|(g, w)| g.is_nan() || w.is_infinite())
+            .count()
+    };
+    assert_eq!(
+        given_up(&kept),
+        7,
+        "the device counters not finite are kept"
+    );
+    assert!(
+        kept.samples
+            .iter()
+            .any(|s| s.connections.is_some_and(f64::is_nan))
+    );
     let first = serde_json::to_string(&kept).unwrap();
     kept.save(dir.path()).unwrap();
     let second = serde_json::to_string(&crate::kept::Kept::load(dir.path()).unwrap()).unwrap();
     assert_eq!(first, second);
-    assert_eq!(again(dir.path()).unwrap().summary, written);
+    assert_eq!(again(dir.path(), None).unwrap().summary, written);
 
     // A run with nothing to read.
     let (empty, run) = made_up();
     let outcome = write(&run);
-    assert_eq!(again(empty.path()).unwrap().summary, outcome.summary);
+    assert_eq!(again(empty.path(), None).unwrap().summary, outcome.summary);
+}
+
+/// The inputs a run keeps, as JSON.
+fn kept_value(run: &Run) -> serde_json::Value {
+    serde_json::to_value(kept_of(run)).unwrap()
+}
+
+/// Each place in `value` (array indices left out, so that a list's items
+/// are one place) and whether some value there is not a default: not
+/// null, false, zero, an empty string or an empty list or map.
+fn set_somewhere(value: &serde_json::Value, at: &str, places: &mut BTreeMap<String, bool>) {
+    use serde_json::Value;
+    let set = match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    };
+    *places.entry(at.to_string()).or_default() |= set;
+    match value {
+        Value::Array(a) => a
+            .iter()
+            .for_each(|v| set_somewhere(v, &format!("{at}/[]"), places)),
+        // A relay's counters are keyed by their names: one place.
+        Value::Object(o) if at.ends_with("/metrics") => o
+            .values()
+            .for_each(|v| set_somewhere(v, &format!("{at}/{{}}"), places)),
+        Value::Object(o) => o
+            .iter()
+            .for_each(|(k, v)| set_somewhere(v, &format!("{at}/{k}"), places)),
+        _ => {}
+    }
+}
+
+/// The made-up run sets something of every field of the inputs, at every
+/// depth: a field the report reads and the file dropped would change the
+/// summary made again. The places left at their defaults are the settings
+/// a node is given at their defaults (the report says only what is beyond
+/// them) and the plan's offs and timing that the small run leaves so.
+#[test]
+fn every_field_of_the_made_up_inputs_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    let mut places = BTreeMap::new();
+    set_somewhere(&kept_value(&run), "", &mut places);
+    let unset: Vec<&String> = places
+        .iter()
+        .filter(|(at, set)| !**set && !at.starts_with("/fleet/made/[]/settings/"))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(unset, Vec::<&String>::new());
+}
+
+/// The inputs of the made-up run, written to `dir`, as JSON, and `change`d,
+/// written back.
+fn inputs_changed(dir: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+    let path = dir.join(crate::kept::INPUTS_FILE);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    change(&mut value);
+    std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+}
+
+/// A file with a key missing (an `Option` among them, which serde would
+/// read as `None`) or a key it does not know is refused with a line that
+/// names it, never misread; a key given as null reads as `None`.
+#[test]
+fn a_file_with_a_key_missing_or_not_known_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    let written = write(&run).summary;
+    let original = std::fs::read_to_string(dir.path().join(crate::kept::INPUTS_FILE)).unwrap();
+    let restore = || {
+        std::fs::write(dir.path().join(crate::kept::INPUTS_FILE), &original).unwrap();
+    };
+    for (key, why) in [
+        ("/stopped_why", "the key /stopped_why is missing"),
+        ("/window", "the key /window is missing"),
+        ("/samples/0/room", "the key /samples/0/room is missing"),
+        (
+            "/removals/0/carry_end",
+            "the key /removals/0/carry_end is missing",
+        ),
+        (
+            "/plan/device_growth",
+            "the key /plan/device_growth is missing",
+        ),
+    ] {
+        restore();
+        inputs_changed(dir.path(), |v| {
+            let (parent, last) = key.rsplit_once('/').unwrap();
+            v.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(last)
+                .unwrap();
+        });
+        let refused = again(dir.path(), None).unwrap_err();
+        assert!(refused.contains(why), "{key}: {refused}");
+        assert!(
+            refused.contains("is not as this harness writes version 2"),
+            "{refused}"
+        );
+    }
+    for (parent, why) in [
+        ("", "the key /extra is not one this harness knows"),
+        ("/plan", "the key /plan/extra is not one this harness knows"),
+        (
+            "/samples/3",
+            "the key /samples/3/extra is not one this harness knows",
+        ),
+    ] {
+        restore();
+        inputs_changed(dir.path(), |v| {
+            v.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("extra".into(), 1.into());
+        });
+        let refused = again(dir.path(), None).unwrap_err();
+        assert!(refused.contains(why), "{parent}: {refused}");
+    }
+    // Given as null, the reason the harness stopped it reads as none: the
+    // summary made again is not INVALID for it.
+    restore();
+    assert_eq!(again(dir.path(), None).unwrap().summary, written);
+    inputs_changed(dir.path(), |v| v["stopped_why"] = serde_json::Value::Null);
+    let kept = crate::kept::Kept::load(dir.path()).unwrap();
+    assert_eq!(kept.stopped_why, None);
+    let made_again = again(dir.path(), None).unwrap().summary;
+    assert!(
+        !made_again.contains("It is INVALID: the harness"),
+        "{made_again}"
+    );
+}
+
+/// Bar 6's threshold given to the report made again is used over the
+/// run's, and the summary says which it used and where it came from; not
+/// given, the run's is used, and the summary is the run's.
+#[test]
+fn the_report_made_again_takes_the_threshold_of_bar_6_given_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // A device that rises 3 MiB an hour in both halves: over 2 and 2.5 MiB
+    // an hour, within 3.25.
+    let mut plan = Plan::small(1);
+    plan.device_growth = Some(3.25);
+    let run = Run::made_up(plan, dir.path());
+    all_running(&run, 0.0);
+    window(&run, 600.0, 11_400.0);
+    for t in every_five_minutes() {
+        rss_at(&run, 2, t, 20.0 + 3.0 * (t - 600.0) / 3600.0);
+    }
+    let written = write(&run).summary;
+    let bar_6_of = |summary: &str| {
+        summary
+            .lines()
+            .find(|l| l.starts_with("6. "))
+            .unwrap()
+            .to_string()
+    };
+    assert!(bar_6_of(&written).ends_with("**PASS**"), "{written}");
+    assert_eq!(again(dir.path(), None).unwrap().summary, written);
+    let given = again(dir.path(), Some(2.5)).unwrap().summary;
+    assert!(bar_6_of(&given).ends_with("**FAIL**"), "{given}");
+    assert!(
+        given.contains(
+            "- the threshold of bar 6: 2.50 MiB an hour (stage 100's p99, given to the report \
+             made again by CORDELIA_SCALE_DEVICE_GROWTH; the run was given 3.25 MiB an hour)"
+        ),
+        "{given}"
+    );
+    // A run given none.
+    let dir = tempfile::tempdir().unwrap();
+    let run = Run::made_up(Plan::small(1), dir.path());
+    write(&run);
+    let given = again(dir.path(), Some(4.0)).unwrap().summary;
+    assert!(
+        given.contains(
+            "4.00 MiB an hour (stage 100's p99, given to the report made again by \
+                        CORDELIA_SCALE_DEVICE_GROWTH; the run was given none)"
+        ),
+        "{given}"
+    );
+}
+
+/// The report reads the constants of the run's build, as they were kept,
+/// not this build's.
+#[test]
+fn the_report_reads_the_constants_the_run_was_built_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    let written = write(&run).summary;
+    let ours = cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS;
+    assert!(written.contains(&format!("within {ours} s")), "{written}");
+    inputs_changed(dir.path(), |v| {
+        v["constants"]["node_stop_timeout_secs"] = (ours + 7).into();
+    });
+    let made_again = again(dir.path(), None).unwrap().summary;
+    assert!(
+        made_again.contains(&format!("within {} s", ours + 7)),
+        "{made_again}"
+    );
+}
+
+/// A report made again by another harness names it on its second line;
+/// by the run's own, it does not.
+#[test]
+fn a_report_made_again_by_another_harness_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    let written = write(&run).summary;
+    let by = again_by(dir.path(), None, "0123456789ab (changes of another)".into())
+        .unwrap()
+        .summary;
+    let lines: Vec<&str> = by.lines().collect();
+    assert_eq!(lines[0], written.lines().next().unwrap());
+    assert_eq!(
+        lines[2],
+        "Made again from report-inputs.json by the harness of commit 0123456789ab (changes of \
+         another)."
+    );
+    assert!(!written.contains("Made again from"));
+}
+
+/// Where the inputs could not be kept, `SUMMARY.md` says so at its end, and
+/// a folder without them says why.
+#[test]
+fn a_run_whose_inputs_were_not_kept_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    // A folder where the file is to be: it cannot be written.
+    std::fs::create_dir(dir.path().join(crate::kept::INPUTS_FILE)).unwrap();
+    let outcome = write(&run);
+    let summary = std::fs::read_to_string(dir.path().join("SUMMARY.md")).unwrap();
+    assert_eq!(summary, outcome.summary);
+    let end = summary
+        .split("## The end (step 10)")
+        .nth(1)
+        .unwrap()
+        .split("## The parts treated apart")
+        .next()
+        .unwrap();
+    assert!(
+        end.contains("- the report's inputs were not kept: ")
+            && end.contains("its report will not be made again faithfully from them"),
+        "{end}"
+    );
 }
 
 /// A folder without the inputs (a run of a harness before them), with
@@ -1728,20 +2060,26 @@ fn a_folder_without_the_inputs_of_this_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("SUMMARY.md"), "PASS stage 100\n").unwrap();
     std::fs::write(dir.path().join("samples.jsonl"), "{\"t\":0.0}\n").unwrap();
-    let why = again(dir.path()).unwrap_err();
+    let why = again(dir.path(), None).unwrap_err();
     assert!(why.contains("holds no report-inputs.json"), "{why}");
     assert!(why.contains("run it again"), "{why}");
     let inputs = dir.path().join(crate::kept::INPUTS_FILE);
-    std::fs::write(&inputs, "{\"version\":2,\"plan\":{}}").unwrap();
-    let why = again(dir.path()).unwrap_err();
-    assert!(why.contains("is version 2"), "{why}");
-    assert!(why.contains("reads version 1 only"), "{why}");
-    std::fs::write(&inputs, "[1, 2, 3]").unwrap();
-    let why = again(dir.path()).unwrap_err();
-    assert!(why.contains("is not the inputs of a run's report"), "{why}");
+    // Version 1, the shape before the build's constants were kept.
     std::fs::write(&inputs, "{\"version\":1,\"plan\":{}}").unwrap();
-    let why = again(dir.path()).unwrap_err();
+    let why = again(dir.path(), None).unwrap_err();
+    assert!(why.contains("is version 1"), "{why}");
+    assert!(why.contains("reads version 2 only"), "{why}");
+    std::fs::write(&inputs, "[1, 2, 3]").unwrap();
+    let why = again(dir.path(), None).unwrap_err();
+    assert!(why.contains("is not the inputs of a run's report"), "{why}");
+    std::fs::write(&inputs, "{\"version\":2,\"plan\":{}}").unwrap();
+    let why = again(dir.path(), None).unwrap_err();
     assert!(why.contains("could not be read"), "{why}");
-    let why = again(&dir.path().join("none")).unwrap_err();
+    let why = again(&dir.path().join("none"), None).unwrap_err();
     assert!(why.contains("is not a folder"), "{why}");
+    // A run refused before it started keeps no inputs, and is told apart.
+    let dir = tempfile::tempdir().unwrap();
+    refused(&Plan::small(1), dir.path(), "a made-up refusal");
+    let why = again(dir.path(), None).unwrap_err();
+    assert!(why.contains("the run did not start"), "{why}");
 }

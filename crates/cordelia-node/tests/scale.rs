@@ -37,7 +37,8 @@
 //!
 //! `CORDELIA_SCALE_RELAYS=1` runs a stage with one relay (rule 3
 //! of §2.2). `CORDELIA_SCALE_DEVICE_GROWTH` gives bar 6 the threshold from
-//! stage 100 for stage 190, in MiB an hour. `CORDELIA_E2E_KEEP` keeps each
+//! stage 100 for stage 190, in MiB an hour, to a run or to its report made
+//! again, which then uses it over the run's. `CORDELIA_E2E_KEEP` keeps each
 //! node's directory and log in the output.
 //!
 //! The harness reads `/proc`, so it runs on Linux.
@@ -133,10 +134,7 @@ fn a_stage_of_the_scale_test() {
             ..plan
         };
     }
-    plan.device_growth = std::env::var("CORDELIA_SCALE_DEVICE_GROWTH").ok().map(|g| {
-        g.parse()
-            .expect("CORDELIA_SCALE_DEVICE_GROWTH is MiB an hour")
-    });
+    plan.device_growth = device_growth();
     let name = format!("stage-{}-seed-{seed}-relays-{relays}", stage.name());
     let (out, _kept) = out_for(&name);
     let _one = one_run_at_a_time();
@@ -150,11 +148,22 @@ fn a_stage_of_the_scale_test() {
     );
 }
 
+/// Bar 6's threshold from stage 100, in MiB an hour, where
+/// `CORDELIA_SCALE_DEVICE_GROWTH` gives it.
+fn device_growth() -> Option<f64> {
+    std::env::var("CORDELIA_SCALE_DEVICE_GROWTH").ok().map(|g| {
+        g.parse()
+            .expect("CORDELIA_SCALE_DEVICE_GROWTH is MiB an hour")
+    })
+}
+
 /// The report of a run made again from its folder (§4.4), by this
 /// harness: `SUMMARY-again.md`, beside the run's own `SUMMARY.md`. Without
 /// `CORDELIA_SCALE_REPORT_FROM` it says so and returns at once; a folder
 /// of a run that did not keep its report's inputs, or kept another version
-/// of them, is refused with a line that says why.
+/// of them, is refused with a line that says why. Where
+/// `CORDELIA_SCALE_DEVICE_GROWTH` is set, bar 6 is judged by it over the
+/// threshold the run kept, and the summary says which it used.
 #[test]
 #[ignore = "reads a run's folder: set CORDELIA_SCALE_REPORT_FROM (decision 2026-10-22 §4.4)"]
 fn report_again() {
@@ -166,7 +175,8 @@ fn report_again() {
         return;
     };
     let from = PathBuf::from(from);
-    let outcome = report::again(&from).unwrap_or_else(|why| panic!("refused: {why}"));
+    let outcome =
+        report::again(&from, device_growth()).unwrap_or_else(|why| panic!("refused: {why}"));
     let to = from.join("SUMMARY-again.md");
     std::fs::write(&to, &outcome.summary).unwrap();
     println!("{}", outcome.summary.lines().next().unwrap_or_default());
@@ -870,7 +880,7 @@ fn a_small_run_end_to_end() {
         assert!(out.join(file).exists(), "{file}");
     }
     // Its report made again from its folder alone is the same (§4.4).
-    assert_eq!(report::again(&out).unwrap().summary, summary);
+    assert_eq!(report::again(&out, None).unwrap().summary, summary);
     // The run measured what it says (§6), the edits adding up among the
     // checks: on a machine of its own it does, and where it does not the
     // summary says why.

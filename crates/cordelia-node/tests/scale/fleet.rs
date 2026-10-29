@@ -503,20 +503,30 @@ pub const KINDS: [&str; 6] = [
     "relays",
 ];
 
-/// What a device counts of each relay of the run, as it was read.
+/// What a device counts of each relay of the run, as it was read. Each
+/// value is read from the device's counters as text, and is kept as a
+/// number or, where JSON cannot hold it, as its word (`kept::number`).
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCounts {
+    #[serde(with = "crate::kept::number_rows")]
     pub asked: [[f64; 6]; 2],
+    #[serde(with = "crate::kept::number_rows")]
     pub asked_bytes: [[f64; 6]; 2],
+    #[serde(with = "crate::kept::numbers")]
     pub held_back: [f64; 2],
+    #[serde(with = "crate::kept::numbers")]
     pub refused_for_now: [f64; 2],
     /// Waits for its lock over 100 ms, of every kind.
+    #[serde(with = "crate::kept::number")]
     pub waits_over_100: f64,
     /// Waits given up (a `msg summary` that did not have the lock).
+    #[serde(with = "crate::kept::number")]
     pub given_up: f64,
     /// Its connections open, and those gone so far, as the device counts
     /// them: a connection made or closed is the minute of its proofs.
+    #[serde(with = "crate::kept::number")]
     pub open: f64,
+    #[serde(with = "crate::kept::number")]
     pub closed: f64,
 }
 
@@ -580,7 +590,9 @@ pub struct Sample {
     /// A device's counts.
     pub device: Option<DeviceCounts>,
     /// A device's status: its connections, and what waits to be sent.
+    #[serde(with = "crate::kept::maybe_number")]
     pub connections: Option<f64>,
+    #[serde(with = "crate::kept::maybe_number")]
     pub outbox_waiting: Option<f64>,
     /// A relay's peers: each one's key, and its address.
     pub peers: Option<Vec<(String, String)>>,

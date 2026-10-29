@@ -7,7 +7,10 @@
 //! The file carries its version. A harness reads only the version it
 //! writes, and refuses any other, and a folder without the file (a run of
 //! a harness before this one), with a line that says why: a run is never
-//! misread.
+//! misread. Within its version, a file is read only where it is as this
+//! harness writes it: a key missing (an `Option` among them, which would
+//! otherwise read as `None`) or a key it does not know is refused, and the
+//! line says which.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -25,8 +28,61 @@ pub const INPUTS_FILE: &str = "report-inputs.json";
 
 /// The version of the file this harness writes, and the only one it
 /// reads. A change to what the file holds, or to what a field means, is a
-/// new version.
-pub const INPUTS_VERSION: u32 = 1;
+/// new version. Version 2 keeps the build's constants the report reads,
+/// and a device's counters that are not finite as words.
+pub const INPUTS_VERSION: u32 = 2;
+
+/// The constants of the run's build that the report reads, kept with the
+/// run: a report made again by a later build judges the run by the values
+/// it ran with, not by its own.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Constants {
+    /// `protocol::ENTRY_OVERHEAD_BYTES`: what each entry is counted with.
+    pub entry_overhead_bytes: usize,
+    /// `protocol::MIN_ENTRY_CONTENT_BYTES`: the least content of an entry.
+    pub min_entry_content_bytes: usize,
+    /// `protocol::CHANGE_ENTRY_BYTES`: a change entry's content.
+    pub change_entry_bytes: usize,
+    /// `protocol::MAX_HAND_OVER_BYTES`: the largest hand-over.
+    pub max_hand_over_bytes: usize,
+    /// `protocol::LOAD_HISTOGRAM_BUCKETS`: the buckets of a histogram.
+    pub load_histogram_buckets: usize,
+    /// `protocol::NODE_STOP_TIMEOUT_SECS`: the time a node has to stop.
+    pub node_stop_timeout_secs: u64,
+    /// `cordelia_sync::claude::CYCLE_SECS`: the adapter's cycle.
+    pub cycle_secs: u64,
+}
+
+impl Constants {
+    /// The constants of the build this harness was built with.
+    pub fn of_this_build() -> Constants {
+        use cordelia_core::protocol as p;
+        Constants {
+            entry_overhead_bytes: p::ENTRY_OVERHEAD_BYTES,
+            min_entry_content_bytes: p::MIN_ENTRY_CONTENT_BYTES,
+            change_entry_bytes: p::CHANGE_ENTRY_BYTES,
+            max_hand_over_bytes: p::MAX_HAND_OVER_BYTES,
+            load_histogram_buckets: p::LOAD_HISTOGRAM_BUCKETS,
+            node_stop_timeout_secs: p::NODE_STOP_TIMEOUT_SECS,
+            cycle_secs: cordelia_sync::claude::CYCLE_SECS,
+        }
+    }
+
+    /// What an entry of `ciphertext` bytes counts as (`protocol::entry_cost`).
+    pub fn entry_cost(&self, ciphertext: usize) -> u64 {
+        (ciphertext + self.entry_overhead_bytes) as u64
+    }
+
+    /// What an edit of `size` bytes of text in `file` counts as at a relay:
+    /// its content, the text with its name and its chain about it (taken
+    /// as 96 bytes), sealed in a power of two from the least content, and
+    /// the overhead every entry is counted with.
+    pub fn entry_cost_of(&self, file: &str, size: usize) -> u64 {
+        let said = size + file.len() + 96 + 28;
+        let content = said.next_power_of_two().max(self.min_entry_content_bytes);
+        self.entry_cost(content)
+    }
+}
 
 /// One node, as the report reads it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +189,8 @@ pub struct Kept {
     pub built_with: String,
     /// The clock's ticks a second on the run's machine.
     pub ticks_a_second: f64,
+    /// The constants of the run's build that the report reads.
+    pub constants: Constants,
     pub plan: Plan,
     pub fleet: KeptFleet,
     pub samples: Vec<Sample>,
@@ -226,6 +284,7 @@ impl Kept {
             commit,
             built_with: built_with.to_string(),
             ticks_a_second,
+            constants: Constants::of_this_build(),
             plan: run.plan.clone(),
             fleet: KeptFleet {
                 made,
@@ -265,18 +324,28 @@ impl Kept {
     }
 
     /// Read the inputs a run wrote into `folder`. A folder without them,
-    /// or with another version of them, is refused, and the error says
-    /// why.
+    /// with another version of them, or with a file that is not as this
+    /// harness writes them (a key missing or not known), is refused, and
+    /// the error says why.
     pub fn load(folder: &Path) -> Result<Kept, String> {
         let path = folder.join(INPUTS_FILE);
         if !folder.is_dir() {
             return Err(format!("{} is not a folder", folder.display()));
         }
         if !path.exists() {
+            let summary = std::fs::read_to_string(folder.join("SUMMARY.md")).unwrap_or_default();
+            if summary.contains(DID_NOT_START) {
+                return Err(format!(
+                    "{} holds no {INPUTS_FILE}: the run did not start (its SUMMARY.md says \
+                     why), and has no report to make again",
+                    folder.display()
+                ));
+            }
             return Err(format!(
                 "{} holds no {INPUTS_FILE}: the run was made by a harness that did not keep \
-                 what its report reads, before version {INPUTS_VERSION} of the inputs (decision \
-                 2026-10-22 §4.4), and its report cannot be made again; run it again",
+                 what its report reads (decision 2026-10-22 §4.4), or its inputs were not \
+                 kept (its SUMMARY.md says so), and its report cannot be made again; run it \
+                 again",
                 folder.display()
             ));
         }
@@ -302,11 +371,74 @@ impl Kept {
         }
         let kept: Kept = serde_json::from_str(&text)
             .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        // Read only as it was written: what was read, written again, is
+        // the file. A key missing reads as `None` where it is an `Option`,
+        // and a key not known is passed over: both are refused here.
+        let file: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        let back = serde_json::to_value(&kept)
+            .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        if let Some(why) = first_difference(&file, &back, "") {
+            return Err(format!(
+                "{} is not as this harness writes version {INPUTS_VERSION}: {why}; it is not \
+                 read, so that the run is not misread",
+                path.display()
+            ));
+        }
         Ok(Kept {
             fleet: kept.fleet.indexed(),
             observer: kept.observer.indexed(),
             ..kept
         })
+    }
+}
+
+/// What the summary of a run that did not start says (`report::refused`):
+/// such a run keeps no inputs.
+pub const DID_NOT_START: &str = "\n\nThe run did not start: ";
+
+/// Where `file`, the inputs as read, differs from `back`, what was read of
+/// them written again, at the JSON pointer `at`: a key missing, a key not
+/// known, or a value that does not read as it is written.
+fn first_difference(
+    file: &serde_json::Value,
+    back: &serde_json::Value,
+    at: &str,
+) -> Option<String> {
+    use serde_json::Value;
+    match (file, back) {
+        (Value::Object(f), Value::Object(b)) => {
+            for (k, bv) in b {
+                let here = format!("{at}/{k}");
+                match f.get(k) {
+                    None => return Some(format!("the key {here} is missing")),
+                    Some(fv) => {
+                        if let Some(why) = first_difference(fv, bv, &here) {
+                            return Some(why);
+                        }
+                    }
+                }
+            }
+            f.keys()
+                .find(|k| !b.contains_key(*k))
+                .map(|k| format!("the key {at}/{k} is not one this harness knows"))
+        }
+        (Value::Array(f), Value::Array(b)) if f.len() == b.len() => f
+            .iter()
+            .zip(b)
+            .enumerate()
+            .find_map(|(i, (fv, bv))| first_difference(fv, bv, &format!("{at}/{i}"))),
+        _ if file == back => None,
+        _ => {
+            let mut said = file.to_string();
+            if said.len() > 80 {
+                said = format!("{}...", said.chars().take(80).collect::<String>());
+            }
+            Some(format!(
+                "the value at {} ({said}) does not read as it is written",
+                if at.is_empty() { "/" } else { at }
+            ))
+        }
     }
 }
 
@@ -336,17 +468,36 @@ mod as_pairs {
     }
 }
 
-/// A node's counters: a value JSON cannot hold (not a number, or
-/// infinite) is written as its word, and read back as it was.
+/// A number, or its word where JSON cannot hold it (not a number, or
+/// infinite), read back as it was.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Word {
+    Number(f64),
+    Word(String),
+}
+
+impl Word {
+    fn of(v: f64) -> Word {
+        match v.is_finite() {
+            true => Word::Number(v),
+            false => Word::Word(v.to_string()),
+        }
+    }
+
+    fn read<E: serde::de::Error>(self) -> Result<f64, E> {
+        match self {
+            Word::Number(n) => Ok(n),
+            Word::Word(w) => w
+                .parse()
+                .map_err(|_| E::custom(format!("not a number: {w}"))),
+        }
+    }
+}
+
+/// A node's counters, each a number or its word.
 pub mod counters {
     use super::*;
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(untagged)]
-    enum Value {
-        Number(f64),
-        Word(String),
-    }
 
     pub fn serialize<S>(map: &Option<HashMap<String, f64>>, s: S) -> Result<S::Ok, S::Error>
     where
@@ -355,13 +506,7 @@ pub mod counters {
         map.as_ref()
             .map(|m| {
                 m.iter()
-                    .map(|(k, v)| {
-                        let v = match v.is_finite() {
-                            true => Value::Number(*v),
-                            false => Value::Word(v.to_string()),
-                        };
-                        (k, v)
-                    })
+                    .map(|(k, v)| (k, Word::of(*v)))
                     .collect::<BTreeMap<_, _>>()
             })
             .serialize(s)
@@ -371,18 +516,105 @@ pub mod counters {
     where
         D: serde::Deserializer<'de>,
     {
-        let Some(map) = Option::<HashMap<String, Value>>::deserialize(d)? else {
+        let Some(map) = Option::<HashMap<String, Word>>::deserialize(d)? else {
             return Ok(None);
         };
         map.into_iter()
-            .map(|(k, v)| match v {
-                Value::Number(n) => Ok((k, n)),
-                Value::Word(w) => w
-                    .parse()
-                    .map(|n| (k, n))
-                    .map_err(|_| serde::de::Error::custom(format!("not a number: {w}"))),
-            })
+            .map(|(k, v)| v.read().map(|n| (k, n)))
             .collect::<Result<_, _>>()
             .map(Some)
+    }
+}
+
+/// A number, or its word.
+pub mod number {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        Word::of(*v).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Word::deserialize(d)?.read()
+    }
+}
+
+/// A number or none, the number or its word.
+pub mod maybe_number {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        v.map(Word::of).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        Option::<Word>::deserialize(d)?.map(Word::read).transpose()
+    }
+}
+
+/// Numbers in a row, each the number or its word.
+pub mod numbers {
+    use super::*;
+
+    pub fn serialize<const N: usize, S>(row: &[f64; N], s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        row.iter()
+            .map(|v| Word::of(*v))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, const N: usize, D>(d: D) -> Result<[f64; N], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        row_of(Vec::<Word>::deserialize(d)?)
+    }
+
+    pub(super) fn row_of<const N: usize, E: serde::de::Error>(
+        words: Vec<Word>,
+    ) -> Result<[f64; N], E> {
+        let row: Vec<f64> = words
+            .into_iter()
+            .map(Word::read)
+            .collect::<Result<_, E>>()?;
+        let len = row.len();
+        row.try_into()
+            .map_err(|_| E::invalid_length(len, &format!("{N} numbers").as_str()))
+    }
+}
+
+/// Rows of numbers, each the number or its word.
+pub mod number_rows {
+    use super::*;
+
+    pub fn serialize<const N: usize, const M: usize, S>(
+        rows: &[[f64; M]; N],
+        s: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        rows.iter()
+            .map(|row| row.iter().map(|v| Word::of(*v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, const N: usize, const M: usize, D>(
+        d: D,
+    ) -> Result<[[f64; M]; N], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let rows: Vec<[f64; M]> = Vec::<Vec<Word>>::deserialize(d)?
+            .into_iter()
+            .map(super::numbers::row_of)
+            .collect::<Result<_, _>>()?;
+        let len = rows.len();
+        rows.try_into()
+            .map_err(|_| serde::de::Error::invalid_length(len, &format!("{N} rows").as_str()))
     }
 }
