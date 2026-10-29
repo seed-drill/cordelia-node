@@ -79,7 +79,10 @@ cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
 `CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before
 messages between a person's agents, which
 `a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
-runs beside this build. CI downloads it from the release that `ci.yml`
+runs beside this build, and which `shared_e2e.rs` runs as the version
+before shared channels: as the relay in
+`a_relay_carries_a_shared_channel_with_no_change`, and as a device in
+`a_device_of_the_version_before_ignores_shared_lists`. CI downloads it from the release that `ci.yml`
 names in `VERSION_BEFORE`, and checks it against the SHA-256 that
 `ci.yml` names beside it in `VERSION_BEFORE_SHA256`, and not against a
 checksum taken from the same release, which would not catch an asset
