@@ -126,6 +126,11 @@ fn id_of(column: Option<Vec<u8>>) -> Option<[u8; 32]> {
 /// Keep a store event of the file `slot` in `channel` and its arrivals,
 /// and keep the file to its bound. `stored_id` is the ID of the entry it
 /// stored. Returns its place.
+///
+/// **It is stamped no earlier than the newest event kept,** of any file
+/// (the second read of slice 8, a low finding): `stored_at` is the device's
+/// clock, and a clock stepped back would otherwise stamp a late arrival
+/// before a removal's cut time.
 #[allow(clippy::too_many_arguments)]
 pub fn note(
     conn: &Connection,
@@ -142,6 +147,13 @@ pub fn note(
     conn.execute_batch("SAVEPOINT file_arrivals")
         .map_err(storage)?;
     let noted = (|| {
+        let newest: Option<i64> = conn.query_row(
+            "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
+                                  UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped)",
+            [],
+            |row| row.get(0),
+        )?;
+        let stored_at = newest.map_or(stored_at, |newest| stored_at.max(newest));
         let full = (!full_signers.is_empty()).then(|| full_signers.concat());
         conn.execute(
             "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
@@ -821,6 +833,63 @@ mod tests {
         assert_eq!(drop_from(&conn, &[3; 32], &[4; 32], place + 1).unwrap(), 1);
         forget_channel(&conn, &[3; 32]).unwrap();
         assert!(of_file(&conn, &[3; 32], &[4; 32]).unwrap().0.is_empty());
+    }
+
+    /// An event is stamped no earlier than the newest kept, of any file:
+    /// a clock stepped back stamps nothing before what came already.
+    #[test]
+    fn test_an_event_is_stamped_no_earlier_than_the_newest_kept() {
+        let conn = db::open_in_memory().unwrap();
+        let (c, s) = ([1u8; 32], [2u8; 32]);
+        note(
+            &conn,
+            &c,
+            &s,
+            2,
+            &[2; 16],
+            100,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        note(
+            &conn,
+            &c,
+            &[3; 32],
+            2,
+            &[2; 16],
+            40,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        note(
+            &conn,
+            &c,
+            &s,
+            2,
+            &[2; 16],
+            150,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        let at = |slot: &[u8; 32]| -> Vec<i64> {
+            of_file(&conn, &c, slot)
+                .unwrap()
+                .0
+                .iter()
+                .map(|event| event.stored_at)
+                .collect()
+        };
+        assert_eq!(at(&s), [100, 150]);
+        assert_eq!(at(&[3; 32]), [100]);
     }
 
     /// Past 1,024 arrivals a file, the oldest events go, and the newest
