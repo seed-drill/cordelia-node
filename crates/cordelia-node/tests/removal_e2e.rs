@@ -1432,12 +1432,15 @@ impl HeldBackRelay {
 /// seconds after the laptop has read the removal (rule 5: only a push whose
 /// last byte was already sent), when it is closed, or has moved.
 ///
-/// Taken out: a leave longer than SHOW_LEAVE_SECS (the first fails). Rule
-/// 5's moment and its reset are caught here only where a push at relay C
-/// is open at the commit, which a relay that answers at once makes rare:
+/// Taken out, by hand (the slice's mutation check): none of the three that
+/// the record names is caught here. A leave ten times SHOW_LEAVE_SECS long
+/// is not, since every whole pass shows at each relay whatever its leave,
+/// so the device reads the removal at its next pass all the same; nor is
+/// rule 5's reset, since relay C answers a push at once, and none is open
+/// at the commit. Rule 5's moment is held by slice 5's tests of a move that
+/// waits for the cycle, and the reset by
 /// `a_push_open_at_the_commit_that_closes_the_device_is_reset`
-/// (`device_entries_e2e.rs`) holds the reset, and slice 5's tests the
-/// moment.
+/// (`device_entries_e2e.rs`). What this test holds is the bound itself.
 #[test]
 #[ignore = "waits out the window of section 8, each stage held near its limit: some minutes"]
 fn the_window_before_a_device_reads_a_removal_is_bounded() {
