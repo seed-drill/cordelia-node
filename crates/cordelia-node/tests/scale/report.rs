@@ -7,22 +7,18 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
-
 use crate::fleet::{Change, Is, KINDS, Sample, What};
+use crate::kept::Kept;
 use crate::population::Profile;
 use crate::run::{Outcome, Plan, Run};
 
 // ── What is counted ─────────────────────────────────────────────────
 
-/// What an edit of `size` bytes of text in `file` counts as at a relay:
-/// its content, the text with its name and its chain about it (taken as
-/// 96 bytes), sealed in a power of two from 256 bytes, and the overhead
-/// every entry is counted with (`entry_cost`).
+/// What an edit of `size` bytes of text in `file` counts as at a relay,
+/// by this build's constants (`Constants::entry_cost_of`): the report reads
+/// the run's own, as they were kept.
 pub fn entry_cost_of(file: &str, size: usize) -> u64 {
-    let said = size + file.len() + 96 + 28;
-    let content = said.next_power_of_two().max(MIN_ENTRY_CONTENT_BYTES);
-    (content + ENTRY_OVERHEAD_BYTES) as u64
+    crate::kept::Constants::of_this_build().entry_cost_of(file, size)
 }
 
 /// The changes the build has (the first line of the summary). Changes C
@@ -261,6 +257,8 @@ fn metric(s: &Sample, key: &str) -> Option<f64> {
 pub(crate) struct Series<'a> {
     samples: Vec<&'a Sample>,
     starts: Vec<f64>,
+    /// The buckets of a histogram, in the run's build.
+    buckets: usize,
 }
 
 impl<'a> std::ops::Deref for Series<'a> {
@@ -324,11 +322,9 @@ fn rise(series: &Series, key: &str, a: f64, b: f64, keep: &dyn Fn(f64, f64) -> b
         .sum()
 }
 
-/// The bounds of a histogram's buckets, in µs, as the route names them.
-fn bounds() -> Vec<String> {
-    let mut b: Vec<String> = (0..cordelia_core::protocol::LOAD_HISTOGRAM_BUCKETS)
-        .map(|i| (1u64 << i).to_string())
-        .collect();
+/// The bounds of a histogram's `buckets`, in µs, as the route names them.
+fn bounds(buckets: usize) -> Vec<String> {
+    let mut b: Vec<String> = (0..buckets).map(|i| (1u64 << i).to_string()).collect();
     b.push("+Inf".into());
     b
 }
@@ -345,7 +341,7 @@ fn quantiles(
     keep: &dyn Fn(f64, f64) -> bool,
     qs: &[f64],
 ) -> (f64, Vec<Option<u64>>) {
-    let cumulative: Vec<(String, f64)> = bounds()
+    let cumulative: Vec<(String, f64)> = bounds(series.buckets)
         .into_iter()
         .map(|le| {
             let key = format!("{name}_bucket{{{label},le=\"{le}\"}}");
@@ -406,8 +402,9 @@ fn mm(values: &[f64], unit: &str) -> String {
 
 // ── The run, as the report reads it ─────────────────────────────────
 
-struct Read<'a> {
-    run: &'a Run,
+struct Read {
+    /// The run, as its inputs were kept: every input the report reads.
+    run: Kept,
     lives: Lives,
     samples: Vec<Sample>,
     machine: Vec<crate::fleet::MachineSample>,
@@ -415,15 +412,35 @@ struct Read<'a> {
     end: f64,
     apart: Vec<(f64, f64)>,
     tps: f64,
+    /// What the summary says of how it was made, beyond the run's inputs.
+    told: Told,
 }
 
-impl Read<'_> {
+/// What a summary says of how it was made: by which harness, where not
+/// the run's; with which threshold of bar 6, where not the run's; and
+/// whether its inputs give it again.
+#[derive(Debug, Clone, Default)]
+struct Told {
+    /// The harness that made the report again (its commit and changes),
+    /// where it is not the run's.
+    again_by: Option<String>,
+    /// Where the report made again was given bar 6's threshold
+    /// (`CORDELIA_SCALE_DEVICE_GROWTH`): the run's own, which it was used
+    /// over.
+    growth_over: Option<Option<f64>>,
+    /// Why the run's inputs will not give its summary again: they were not
+    /// kept, or give another.
+    inputs: Option<String>,
+}
+
+impl Read {
     fn series(&self, node: usize) -> Series<'_> {
         let mut s: Vec<&Sample> = self.samples.iter().filter(|s| s.node == node).collect();
         s.sort_by(|a, b| a.t.total_cmp(&b.t));
         Series {
             samples: s,
             starts: self.lives.starts(node),
+            buckets: self.run.constants.load_histogram_buckets,
         }
     }
 
@@ -452,10 +469,11 @@ impl Read<'_> {
 /// The summary of a run that did not start, and why (step 1).
 pub fn refused(plan: &Plan, out: &Path, why: &str) -> Outcome {
     let summary = format!(
-        "INVALID stage {} seed {} commit {} ({CHANGES})\n\nThe run did not start: {why}.\n",
+        "INVALID stage {} seed {} commit {} ({CHANGES}){}{why}.\n",
         plan.stage.name(),
         plan.seed,
-        commit()
+        commit(),
+        crate::kept::DID_NOT_START,
     );
     std::fs::write(out.join("SUMMARY.md"), &summary).unwrap();
     Outcome {
@@ -468,13 +486,13 @@ pub fn refused(plan: &Plan, out: &Path, why: &str) -> Outcome {
 
 /// The parts treated apart: each relay's outage and the five minutes
 /// after it, and each removal's carry window (§3).
-fn parts_apart(run: &Run) -> Vec<(f64, f64)> {
+fn parts_apart(run: &Kept) -> Vec<(f64, f64)> {
     let mut apart = Vec::new();
-    let outage = run.outage.lock().unwrap().clone();
+    let outage = &run.outage;
     if let (Some(a), Some(b)) = (outage.stopped, outage.started) {
         apart.push((a, b + run.plan.timing.after_start));
     }
-    for r in run.removals.lock().unwrap().iter() {
+    for r in &run.removals {
         if let Some(line) = r.line_at {
             apart.push((line, r.carry_end.unwrap_or(line + r.bound)));
         }
@@ -482,62 +500,139 @@ fn parts_apart(run: &Run) -> Vec<(f64, f64)> {
     apart
 }
 
-/// Write what the run leaves, and say what it came to.
-/// What the report reads of a run: its window, where each node was, its
-/// samples, and the parts treated apart.
-fn read_of(run: &Run) -> Read<'_> {
-    let (start, end) = match *run.window.lock().unwrap() {
-        Some((s, e)) => (s, e.unwrap_or_else(|| run.fleet.clock.now())),
-        None => (run.fleet.clock.now(), run.fleet.clock.now()),
-    };
-    let samples = run.samples.lock().unwrap();
-    Read {
+/// What a run keeps for its report, as it is now.
+fn kept_of(run: &Run) -> Kept {
+    Kept::of(
         run,
-        lives: Lives::new(&run.fleet.changes.lock().unwrap(), run.fleet.made.len()),
-        samples: samples.nodes.clone(),
-        machine: samples.machine.clone(),
+        commit(),
+        CHANGES,
+        crate::machine::ticks_a_second() as f64,
+    )
+}
+
+/// What the report reads of a run's inputs: its window, where each node
+/// was, its samples, and the parts treated apart.
+fn read_of_kept(mut run: Kept) -> Read {
+    let (start, end) = match run.window {
+        Some((s, e)) => (s, e.unwrap_or(run.kept_at)),
+        None => (run.kept_at, run.kept_at),
+    };
+    Read {
+        told: Told::default(),
+        lives: Lives::new(&run.fleet.changes, run.fleet.made.len()),
+        samples: std::mem::take(&mut run.samples),
+        machine: std::mem::take(&mut run.machine),
         start,
         end,
-        apart: parts_apart(run),
-        tps: crate::machine::ticks_a_second() as f64,
+        apart: parts_apart(&run),
+        tps: run.ticks_a_second,
+        run,
     }
+}
+
+/// What the report reads of a run, as it is now.
+fn read_of(run: &Run) -> Read {
+    read_of_kept(kept_of(run))
 }
 
 /// The edits, as the report reads them of `read`'s run.
 fn edits_of(read: &Read) -> Edits {
-    let observer = read.run.observer.lock().unwrap();
-    Edits::of(read, &observer)
+    Edits::of(read, &read.run.observer)
 }
 
-pub fn write(run: &Run) -> Outcome {
-    let read = read_of(run);
+/// The harness this is: its commit and its changes, as a summary's first
+/// line names a run's.
+fn this_harness() -> String {
+    format!("{} ({CHANGES})", commit())
+}
+
+/// The summary of the run whose inputs are in `folder` (`INPUTS_FILE`),
+/// made again by this harness: the same `SUMMARY.md` as the run wrote,
+/// where the report has not changed since and `device_growth` is not
+/// given. Where it is (`CORDELIA_SCALE_DEVICE_GROWTH`), bar 6 is judged by
+/// it over the run's own, and the summary says so. A folder of a run that
+/// did not keep its inputs, or kept another version of them, is refused,
+/// and the error says why.
+pub fn again(folder: &Path, device_growth: Option<f64>) -> Result<Outcome, String> {
+    again_by(folder, device_growth, this_harness())
+}
+
+/// `again`, by the harness `harness` (its commit and changes): where it is
+/// not the run's, the summary names it.
+fn again_by(folder: &Path, device_growth: Option<f64>, harness: String) -> Result<Outcome, String> {
+    let mut kept = Kept::load(folder)?;
+    let run_harness = format!("{} ({})", kept.commit, kept.built_with);
+    let growth_over = device_growth.map(|g| kept.plan.device_growth.replace(g));
+    let mut read = read_of_kept(kept);
+    read.told = Told {
+        again_by: (harness != run_harness).then_some(harness),
+        growth_over,
+        inputs: None,
+    };
     let edits = edits_of(&read);
+    Ok(summary_of(&read, &edits, folder))
+}
+
+/// Write what the run leaves, and say what it came to: its inputs, kept
+/// so that the report can be made again from them, `SUMMARY.md` and
+/// `edits.csv` made from them, and each change of each node in
+/// `samples.jsonl`. Where the inputs were not kept, or do not give the
+/// same summary again, `SUMMARY.md` says so at its end (step 10).
+pub fn write(run: &Run) -> Outcome {
+    let kept = kept_of(run);
+    let saved = kept.save(&run.out);
+    let mut read = read_of_kept(kept);
+    let edits = edits_of(&read);
+    let mut outcome = summary_of(&read, &edits, &run.out);
+    // The inputs give this summary again, or the summary says so.
+    let inputs = match saved.and_then(|()| again(&run.out, None)) {
+        Ok(again) if again.summary == outcome.summary => None,
+        Ok(_) => Some(format!(
+            "the report made again from {} differs from this summary",
+            crate::kept::INPUTS_FILE
+        )),
+        Err(why) => Some(format!("the report's inputs were not kept: {why}")),
+    };
+    if let Some(why) = inputs {
+        eprintln!("{why}: it will not be made again faithfully from them");
+        read.told.inputs = Some(why);
+        outcome = summary_of(&read, &edits, &run.out);
+    }
+    std::fs::write(run.out.join("SUMMARY.md"), &outcome.summary).unwrap();
+    std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
+    changes_written(&read.run, &run.out);
+    outcome
+}
+
+/// The summary of `read`'s run, and what it came to.
+fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
+    let run = &read.run;
     let (start, end) = (read.start, read.end);
 
-    let (b6, rises) = bar_6(&read);
-    let (b12, pulls) = bar_12(&read, &edits);
+    let (b6, rises) = bar_6(read);
+    let (b12, pulls) = bar_12(read, edits);
     let b12_holds = b12.verdict != Verdict::Fail;
     let bars = vec![
-        bar_1(&read),
-        bar_2(&read, &edits),
-        bar_3(&read, &edits),
-        bar_4(&read),
-        bar_5(&read),
+        bar_1(read),
+        bar_2(read, edits),
+        bar_3(read, edits),
+        bar_4(read),
+        bar_5(read),
         b6,
-        bar_7(&read),
-        bar_8(&read),
-        bar_9(&read),
-        bar_10(&read, &edits),
-        bar_11(&read),
+        bar_7(read),
+        bar_8(read),
+        bar_9(read),
+        bar_10(read, edits),
+        bar_11(read),
         b12,
-        bar_13(&read, &edits),
-        bar_14(&read, &edits),
-        bar_15(&read, &edits),
+        bar_13(read, edits),
+        bar_14(read, edits),
+        bar_15(read, edits),
     ];
-    let checks = checks(&read, &edits, b12_holds);
+    let checks = checks(read, edits, b12_holds);
 
-    let faults = run.fleet.faults.lock().unwrap().clone();
-    let machine_fault = run.stopped_why.lock().unwrap().clone();
+    let faults = run.fleet.faults.clone();
+    let machine_fault = run.stopped_why.clone();
     let ending = the_end(run);
     let invalid = checks.iter().any(|c| c.verdict == Verdict::Fail) || machine_fault.is_some();
     let failed = bars.iter().any(|b| b.verdict == Verdict::Fail)
@@ -557,12 +652,20 @@ pub fn write(run: &Run) -> Outcome {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "{verdict} stage {} seed {} commit {} ({CHANGES})\n",
+        "{verdict} stage {} seed {} commit {} ({})\n",
         plan.stage.name(),
         plan.seed,
-        commit()
+        run.commit,
+        run.built_with
     );
-    let setup = run.setup.lock().unwrap().clone();
+    if let Some(harness) = &read.told.again_by {
+        let _ = writeln!(
+            s,
+            "Made again from {} by the harness of commit {harness}.\n",
+            crate::kept::INPUTS_FILE
+        );
+    }
+    let setup = &run.setup;
     let _ = writeln!(
         s,
         "Stage {}, seed {}: {} relays, {} devices of {} people, on {}. The window ran from {:.0} s \
@@ -576,7 +679,7 @@ pub fn write(run: &Run) -> Outcome {
         start,
         end,
         (end - start) / 60.0,
-        if run.cut.load(std::sync::atomic::Ordering::SeqCst) {
+        if run.cut {
             ", and was cut: INVALID"
         } else {
             ""
@@ -584,6 +687,9 @@ pub fn write(run: &Run) -> Outcome {
     );
     if !faults.is_empty() {
         let _ = writeln!(s, "It stopped early: {}.\n", faults.join("; "));
+    }
+    if let Some(why) = &machine_fault {
+        let _ = writeln!(s, "It is INVALID: the harness stopped it, as {why}.\n");
     }
     let _ = writeln!(s, "## The bars (decision 2026-10-22 §3)\n");
     for (n, b) in bars.iter().enumerate() {
@@ -612,7 +718,7 @@ pub fn write(run: &Run) -> Outcome {
             c.bar
         );
     }
-    measures(&mut s, &read, &edits);
+    measures(&mut s, read, edits);
     let _ = writeln!(s, "\n## The end (step 10)\n");
     for (said, well) in &ending {
         let _ = writeln!(
@@ -621,8 +727,14 @@ pub fn write(run: &Run) -> Outcome {
             if *well { "as it should" } else { "FAIL" }
         );
     }
+    if let Some(why) = &read.told.inputs {
+        let _ = writeln!(
+            s,
+            "- {why}: its report will not be made again faithfully from them"
+        );
+    }
     let _ = writeln!(s, "\n## The parts treated apart\n");
-    let outage = run.outage.lock().unwrap().clone();
+    let outage = &run.outage;
     match (outage.stopped, outage.started) {
         (Some(a), Some(b)) => {
             let _ = writeln!(
@@ -636,7 +748,7 @@ pub fn write(run: &Run) -> Outcome {
             let _ = writeln!(s, "- no outage of a relay");
         }
     }
-    for r in run.removals.lock().unwrap().iter() {
+    for r in &run.removals {
         let _ = writeln!(
             s,
             "- the carry window of person {}'s removal: from {} to {}",
@@ -684,17 +796,13 @@ pub fn write(run: &Run) -> Outcome {
     }
     let _ = writeln!(s, "- threads: {}", setup.thread_plan);
     let _ = writeln!(s, "\n## Every setting beyond the defaults\n");
-    let relay = run.fleet.made[run.fleet.relays[0]]
-        .settings
-        .lock()
-        .unwrap()
-        .clone();
+    let relay = &run.fleet.made[run.fleet.relays[0]].settings;
     let device = run
         .fleet
         .made
         .iter()
         .find(|m| matches!(m.what, What::Device { .. }))
-        .map(|m| m.settings.lock().unwrap().clone());
+        .map(|m| &m.settings);
     let _ = writeln!(s, "A relay:");
     for said in relay.beyond_defaults() {
         let _ = writeln!(s, "- {said}");
@@ -722,15 +830,16 @@ pub fn write(run: &Run) -> Outcome {
              holds too few edits for a tenth"
         );
     }
-    let _ = writeln!(s, "- the threshold of bar 6: {}", growth_said(plan));
+    let _ = writeln!(
+        s,
+        "- the threshold of bar 6: {}",
+        growth_said(plan, read.told.growth_over)
+    );
     let _ = writeln!(
         s,
         "- the p99 of the devices' rises in this run, for bar 6 at a later stage: {}",
         quantile(&rises, 0.99).map_or("no value".into(), |r| format!("{r:.2} MiB an hour"))
     );
-    std::fs::write(run.out.join("SUMMARY.md"), &s).unwrap();
-    std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
-    changes_written(run);
     let arrived = edits.pairs.iter().filter(|p| p.arrived.is_some()).count();
     let gone = edits
         .pairs
@@ -740,7 +849,7 @@ pub fn write(run: &Run) -> Outcome {
     Outcome {
         verdict: verdict.into(),
         summary: s,
-        out: run.out.clone(),
+        out: out.to_path_buf(),
         bars: bars
             .iter()
             .map(|b| (b.title.clone(), b.verdict.word().to_string()))
@@ -760,13 +869,13 @@ pub fn write(run: &Run) -> Outcome {
 }
 
 /// How the run ended (step 10): each node told to stop stopped within
-/// NODE_STOP_TIMEOUT_SECS; no pid it started is left; and every key each
-/// relay held a connection from at the end is one of the run's (§4.3,
-/// rule 1).
-fn the_end(run: &Run) -> Vec<(String, bool)> {
-    use cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS;
+/// NODE_STOP_TIMEOUT_SECS of the run's build; no pid it started is left;
+/// and every key each relay held a connection from at the end is one of
+/// the run's (§4.3, rule 1).
+fn the_end(run: &Kept) -> Vec<(String, bool)> {
+    let stop_secs = run.constants.node_stop_timeout_secs;
     let mut said = Vec::new();
-    let stops = run.stops_at_end.lock().unwrap().clone();
+    let stops = &run.stops_at_end;
     let slowest = stops.iter().map(|(_, took, _)| *took).fold(0.0, f64::max);
     let badly: Vec<String> = stops
         .iter()
@@ -775,7 +884,7 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         .collect();
     said.push((
         format!(
-            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {NODE_STOP_TIMEOUT_SECS} s{}",
+            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {stop_secs} s{}",
             stops.len(),
             badly.len(),
             match badly.is_empty() {
@@ -785,13 +894,13 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         ),
         badly.is_empty(),
     ));
-    let left = run.pids_left.lock().unwrap().clone();
+    let left = &run.pids_left;
     said.push((
         format!("{} of the pids it started are left", left.len()),
         left.is_empty(),
     ));
     let ours: HashSet<String> = run.fleet.made.iter().map(|m| m.key.clone()).collect();
-    for (r, keys) in run.peers_at_end.lock().unwrap().iter() {
+    for (r, keys) in &run.peers_at_end {
         let strangers = keys.iter().filter(|k| !ours.contains(*k)).count();
         said.push((
             format!(
@@ -808,15 +917,15 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
 /// Each start, freeze, going on and stop of each node, and how each stop
 /// ended, as lines of `samples.jsonl` (§1.3): what the harness did to each
 /// process, beside what it read of it.
-fn changes_written(run: &Run) {
+fn changes_written(run: &Kept, out: &Path) {
     use std::io::Write as _;
     let Ok(mut file) = std::fs::OpenOptions::new()
         .append(true)
-        .open(run.out.join("samples.jsonl"))
+        .open(out.join("samples.jsonl"))
     else {
         return;
     };
-    for c in run.fleet.changes.lock().unwrap().iter() {
+    for c in &run.fleet.changes {
         let became = match c.is {
             Is::NotStarted => "not started",
             Is::Running => "running",
@@ -836,10 +945,22 @@ fn changes_written(run: &Run) {
     }
 }
 
-fn growth_said(plan: &Plan) -> String {
-    match (plan.stage, plan.device_growth) {
-        (_, Some(g)) => format!("{:.2} MiB an hour (stage 100's p99, given)", g.max(2.0)),
-        (crate::population::Stage::OneNinety, None) => {
+/// Bar 6's threshold, and where it came from: given to the run, or to the
+/// report made again over the run's own (`over`, where it was).
+fn growth_said(plan: &Plan, over: Option<Option<f64>>) -> String {
+    let given = |g: f64| format!("{:.2} MiB an hour", g.max(2.0));
+    match (plan.stage, plan.device_growth, over) {
+        (_, Some(g), Some(run)) => format!(
+            "{} (stage 100's p99, given to the report made again by \
+             CORDELIA_SCALE_DEVICE_GROWTH; the run was given {})",
+            given(g),
+            run.map_or("none".into(), |r| format!("{r:.2} MiB an hour"))
+        ),
+        (_, Some(g), None) => format!(
+            "{} (stage 100's p99, given to the run by CORDELIA_SCALE_DEVICE_GROWTH)",
+            given(g)
+        ),
+        (crate::population::Stage::OneNinety, None, _) => {
             "2 MiB an hour: stage 100's p99 was not given (CORDELIA_SCALE_DEVICE_GROWTH)".into()
         }
         _ => "2 MiB an hour".into(),
@@ -926,7 +1047,7 @@ const CATCH_UP_SECS: f64 = 60.0;
 const HELD_BY_A_RUNNING_DEVICE_SECS: f64 = 20.0;
 
 impl Edits {
-    fn of(read: &Read, observer: &crate::observer::Observer) -> Edits {
+    fn of(read: &Read, observer: &crate::kept::KeptObserver) -> Edits {
         let mut by: HashMap<u64, Vec<&crate::observer::Written>> = HashMap::new();
         for e in &observer.edits {
             if let Some(n) = e.replaced {
@@ -949,8 +1070,6 @@ impl Edits {
             let gone_at = read
                 .run
                 .removals
-                .lock()
-                .unwrap()
                 .iter()
                 .find(|r| r.person == edit.person && r.removed == *device)
                 .and_then(|r| r.line_at);
@@ -964,15 +1083,7 @@ impl Edits {
                 gone: gone.contains(&(*number, *device)),
             });
         }
-        let mut conflict_copies = 0;
-        for folder in read.run.folders.values() {
-            conflict_copies += std::fs::read_dir(folder)
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .filter(|e| e.file_name().to_string_lossy().contains(".conflict-"))
-                .count();
-        }
+        let conflict_copies = read.run.conflict_copies.len();
         Edits {
             written: window.len(),
             window,
@@ -980,11 +1091,7 @@ impl Edits {
             conflict_copies,
             gaps: observer.gaps.clone(),
             counted: Counted {
-                numbered: read
-                    .run
-                    .next_edit
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    .saturating_sub(1) as usize,
+                numbered: read.run.next_edit.saturating_sub(1) as usize,
                 recorded: observer.edits.len(),
                 waited: observer.waited.len(),
                 arrived: observer.arrivals.len(),
@@ -1054,8 +1161,6 @@ fn relay_series<'a>(read: &'a Read, r: usize) -> Series<'a> {
 fn carry_windows(read: &Read, k: usize) -> Vec<(f64, f64)> {
     read.run
         .removals
-        .lock()
-        .unwrap()
         .iter()
         .filter(|r| r.person == k)
         .filter_map(|r| Some((r.line_at?, r.carry_end.unwrap_or(r.line_at? + r.bound))))
@@ -1874,7 +1979,7 @@ fn bar_9(read: &Read) -> Line {
                     _ => {}
                 }
             }
-            if has_office && read.run.setup.lock().unwrap().office_moved.is_some() {
+            if has_office && read.run.setup.office_moved.is_some() {
                 lo += 5.0;
                 hi += 5.0;
             }
@@ -1993,8 +2098,8 @@ fn warm_churn_closed_lately(read: &Read, relay: usize, t: f64) -> bool {
 }
 
 fn bar_10(read: &Read, edits: &Edits) -> Line {
-    let removals = read.run.removals.lock().unwrap().clone();
-    let planned = *read.run.removals_planned.lock().unwrap();
+    let removals = read.run.removals.clone();
+    let planned = read.run.removals_planned;
     if removals.is_empty() {
         return line(
             "A removal reaches every device, and its carry ends within its bound",
@@ -2085,20 +2190,19 @@ fn reconnects(read: &Read) -> Vec<f64> {
             )
         })
         .collect();
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let in_outage = |t: f64| {
         outage.stopped.is_some_and(|a| t >= a - 5.0) && outage.started.is_none_or(|b| t <= b + 5.0)
     };
     let mut gaps = Vec::new();
     for i in read.devices() {
-        let log = std::fs::read_to_string(read.run.fleet.made[i].node.log()).unwrap_or_default();
         let mut closed: HashMap<String, f64> = HashMap::new();
-        for raw in log.lines() {
+        for raw in &read.run.fleet.made[i].log {
             let text = strip_ansi(raw);
             let Some(t) = text.split_whitespace().next().and_then(log_time) else {
                 continue;
             };
-            let t = read.run.fleet.clock.of_wall(t);
+            let t = read.run.fleet.of_wall(t);
             let Some(peer) = text
                 .split("peer=")
                 .nth(1)
@@ -2125,7 +2229,7 @@ fn reconnects(read: &Read) -> Vec<f64> {
     gaps
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -2342,14 +2446,15 @@ fn bar_12(read: &Read, edits: &Edits) -> (Line, Vec<(f64, f64)>) {
 
 /// The pushes relay `r` is sent at the least for the window's edits in
 /// `spans`: a device publishes what one cycle of its adapter found in one
-/// push to each relay (`CYCLE_SECS`), so edits on a device less than a
-/// cycle apart may share one, and edits further apart cannot. Each group
-/// of a writer's edits that begins at least a cycle after the last began
-/// is one push; a group is counted where it and the cycle after it lie in
-/// one span, so that its push falls in that span too.
+/// push to each relay (`CYCLE_SECS` of the run's build), so edits on a
+/// device less than a cycle apart may share one, and edits further apart
+/// cannot. Each group of a writer's edits that begins at least a cycle
+/// after the last began is one push; a group is counted where it and the
+/// cycle after it lie in one span, so that its push falls in that span
+/// too.
 fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> usize {
     let plan = &read.run.plan;
-    let cycle = cordelia_sync::claude::CYCLE_SECS as f64;
+    let cycle = read.run.constants.cycle_secs as f64;
     let mut by_writer: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
     for e in &edits.window {
         if plan.population.people[e.person]
@@ -2383,14 +2488,14 @@ fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> 
 /// The room's model of one person: what a relay holds of them at the
 /// least and at the most, as entries are counted (bar 13).
 fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, f64) {
-    use cordelia_core::protocol::{CHANGE_ENTRY_BYTES, MAX_HAND_OVER_BYTES, entry_cost};
+    let constants = read.run.constants;
+    let entry_cost = |ciphertext: usize| constants.entry_cost(ciphertext);
+    let entry_cost_of = |file: &str, size: usize| constants.entry_cost_of(file, size);
     let plan = &read.run.plan;
     let p = &plan.population.people[k];
     let removal = read
         .run
         .removals
-        .lock()
-        .unwrap()
         .iter()
         .find(|r| r.person == k)
         .and_then(|r| r.line_at.map(|t| (t, r.removed)));
@@ -2434,17 +2539,17 @@ fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, 
     // channel's words.
     let changes = 1.0 + f64::from(u8::from(removal.is_some()));
     let generations = changes;
-    least += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
-    most += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
+    least += changes * entry_cost(constants.change_entry_bytes) as f64;
+    most += changes * entry_cost(constants.change_entry_bytes) as f64;
     least += generations * p.profile.names() as f64 * entry_cost(256) as f64;
-    most += (p.devices - 1) as f64 * entry_cost(MAX_HAND_OVER_BYTES) as f64;
+    most += (p.devices - 1) as f64 * entry_cost(constants.max_hand_over_bytes) as f64;
     most +=
         generations * ((p.profile.names() * 2 + p.devices * 4 + 8) as f64) * entry_cost(512) as f64;
     (least, most)
 }
 
 fn bar_13(read: &Read, edits: &Edits) -> Line {
-    let observer = read.run.observer.lock().unwrap();
+    let observer = &read.run.observer;
     let all: Vec<&crate::observer::Written> = observer.edits.iter().collect();
     let (mut least, mut most) = (0.0, 0.0);
     for k in 0..read.run.plan.population.people.len() {
@@ -2452,7 +2557,6 @@ fn bar_13(read: &Read, edits: &Edits) -> Line {
         least += l;
         most += m;
     }
-    drop(observer);
     // The conflict copies, each once.
     let copies = edits.conflict_copies as f64 * 2048.0;
     least += copies / 2.0;
@@ -2505,7 +2609,7 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
     let keep = |_: f64, _: f64| true;
     let mut said = Vec::new();
     let mut holds = true;
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     for r in 0..read.run.plan.relays {
         let i = read.run.fleet.relays[r];
         let series = read.series(i);
@@ -2639,7 +2743,7 @@ fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
 }
 
 fn bar_15(read: &Read, edits: &Edits) -> Line {
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let (Some(stopped), Some(started)) = (outage.stopped, outage.started) else {
         return line(
             "A relay that stops is come back to",
@@ -2858,8 +2962,6 @@ fn checks(read: &Read, edits: &Edits, bar_12: bool) -> Vec<Line> {
         .map(|e| {
             read.run
                 .removals
-                .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.person == e.person && r.line_at.is_some_and(|line| line <= e.at))
                 .count()
@@ -2951,9 +3053,9 @@ fn checks(read: &Read, edits: &Edits, bar_12: bool) -> Vec<Line> {
     ));
     // 7. Churn had its chance.
     let keep = |_: f64, _: f64| true;
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let mut said = Vec::new();
-    let mut had = !read.run.cut.load(std::sync::atomic::Ordering::SeqCst);
+    let mut had = !read.run.cut;
     let mut closed = 0.0;
     for r in 0..read.run.plan.relays {
         let series = relay_series(read, r);
@@ -3422,7 +3524,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
         );
     }
     let _ = writeln!(s, "### Across the mesh\n");
-    let removals = read.run.removals.lock().unwrap().clone();
+    let removals = read.run.removals.clone();
     let spread: Vec<String> = removals
         .iter()
         .map(|r| {
@@ -3522,7 +3624,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
         gaps.len(),
         mm(&gaps, "s")
     );
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let back: Vec<f64> = outage
         .back
         .iter()
