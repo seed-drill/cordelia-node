@@ -1822,6 +1822,64 @@ mod tests {
         }
     }
 
+    /// A carry by command never trusts a chain that may have dropped links
+    /// (the third read of slice 8, its second finding). The desktop (0)
+    /// removes the tablet (2). The tablet writes `f.md` late, the laptop
+    /// (1), which has not heard, writes over it, and then edits it 100 times
+    /// more: the tablet's link falls off the end of the chain, which holds
+    /// the laptop's 100. `cordelia sync carry` on the desktop leaves it out:
+    /// a chain at the most a chain keeps names every removed key. The same
+    /// for the carry of `cordelia sync map`.
+    #[actix_web::test]
+    async fn test_a_carry_by_command_leaves_out_a_version_whose_chain_is_full() {
+        use cordelia_core::protocol::MAX_ENTRY_LINKS;
+        for mapped in [false, true] {
+            let mut s = Several::of_one_person(3);
+            s.now = now() - 3600;
+            match mapped {
+                false => s.hold(&[0, 1, 2], LAB),
+                true => s.hold(&[1, 2], LAB),
+            }
+            let old = s[1].own(LAB);
+            s.change(0, &[0, 1], &[2]);
+            s.write(2, LAB, "f.md", "the tablet's late text");
+            s.pass(2, 1);
+            s.write(1, LAB, "f.md", "the tablet's late text, and a line");
+            for edit in 0..MAX_ENTRY_LINKS {
+                let edited = format!("the tablet's late text, and a line, edited {edit}");
+                s.write(1, LAB, "f.md", &edited);
+            }
+            s.write(1, LAB, "g.md", "the laptop's own");
+            let at_the_relay = s[1].stored_in(&old);
+            // What the relay holds of the laptop's `f.md` is its newest
+            // version, whose chain is full and does not name the tablet.
+            let tablet = cordelia_crypto::entry::Link::signer_of(&s.key(2));
+            let laptop = s.key(1);
+            let of_f: Vec<_> = at_the_relay
+                .iter()
+                .filter(|entry| entry.author == laptop)
+                .map(|entry| entry.open(&old).unwrap())
+                .filter(|inside| inside.name == "f.md")
+                .collect();
+            assert_eq!(of_f.len(), 1);
+            let chain = of_f[0].chain.clone().unwrap();
+            assert_eq!(chain.len(), MAX_ENTRY_LINKS);
+            assert!(chain.iter().all(|link| link.signer != tablet));
+            let node = Node::of(s.machines.remove(0));
+            node.relay_holds(&old, &at_the_relay);
+
+            let done = carry_name(&node.state, LAB, mapped).await.unwrap();
+            assert_eq!(
+                (done.tally.carried, done.tally.cut),
+                (1, 1),
+                "{mapped}: {:?}",
+                done.tally
+            );
+            assert_eq!(node.text(LAB, "f.md"), None);
+            assert_eq!(node.text(LAB, "g.md").as_deref(), Some("the laptop's own"));
+        }
+    }
+
     /// A carry by command knows the generation it reads by its statement's
     /// commitment, and judges there (the second read of slice 8, its second
     /// finding): in a generation that is a removal, nothing of the removed

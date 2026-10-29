@@ -399,10 +399,10 @@ fn judged(
     }
     if let Rule::Counts(read_in) = rule {
         let signers: Vec<[u8; 32]> = version.entries.iter().map(|one| one.author).collect();
-        let chains: Vec<&[Link]> = version
+        let chains: Vec<Option<&[Link]>> = version
             .entries
             .iter()
-            .filter_map(|one| one.chain.as_deref())
+            .map(|one| one.chain.as_deref())
             .collect();
         let cuts = crate::cut::Cuts::read(conn)?;
         if cuts.leaves_out(&signers, &chains, read_in.as_ref(), now, named) {

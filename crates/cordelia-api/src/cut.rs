@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+use cordelia_core::protocol::{MAX_ENTRY_LINKS, REMOVAL_TAKEN_MARGIN_SECS};
 use cordelia_crypto::entry::Link as EntryLink;
 use cordelia_storage::person::{self as held_rows, NotedChange};
 
@@ -172,10 +172,20 @@ impl Cuts {
     /// A key of `named` is not judged: the person named it, with the
     /// phrase, as one whose writing is theirs (a recovery's look takes what
     /// a device lost or broken wrote, decision 2026-10-04 §9).
+    ///
+    /// `chains` has the chain of each entry of the version, `None` for one
+    /// that lacks it. **A chain that may have dropped links names every
+    /// removed key** (the third read of slice 8, its second finding): one of
+    /// `MAX_ENTRY_LINKS` links, the most a chain keeps, from which the
+    /// oldest fall off as it is written over, and one that is missing. So a
+    /// version that a remaining device wrote over a removed key's late text
+    /// 100 times or more is left out wherever any removed key is cut, which
+    /// fails safe, at the cost of honest busy files: that device carries
+    /// them itself when it applies the change (rule 7, by its arrivals).
     pub(crate) fn leaves_out(
         &self,
         signers: &[[u8; 32]],
-        chains: &[&[EntryLink]],
+        chains: &[Option<&[EntryLink]>],
         generation: Option<&Change>,
         now: i64,
         named: &[[u8; 32]],
@@ -187,15 +197,21 @@ impl Cuts {
                     None => true,
                 }
         };
-        signers
-            .iter()
-            .filter_map(|signer| self.of_key(signer))
-            .any(cut)
-            || chains.iter().flat_map(|chain| chain.iter()).any(|link| {
+        let names = |links: &[EntryLink]| {
+            links.iter().any(|link| {
                 self.keys
                     .iter()
                     .filter(|key| key.signer == link.signer)
                     .any(cut)
+            })
+        };
+        signers
+            .iter()
+            .filter_map(|signer| self.of_key(signer))
+            .any(cut)
+            || chains.iter().any(|chain| match chain {
+                Some(links) if links.len() < MAX_ENTRY_LINKS => names(links),
+                _ => self.keys.iter().any(cut),
             })
     }
 
@@ -621,17 +637,37 @@ mod tests {
         }];
         let honest: [[u8; 32]; 1] = [[4; 32]];
         let now = 1_000_000;
+        let over = Some(&named[..]);
         // Signed by it, or over it, in the generation before: left out.
         assert!(cuts.leaves_out(&[[9; 32]], &[], Some(&at(2)), now, &[]));
-        assert!(cuts.leaves_out(&honest, &[&named], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, &[over], Some(&at(2)), now, &[]));
         // In the removal's generation: nothing.
-        assert!(!cuts.leaves_out(&honest, &[&named], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, &[over], Some(&at(3)), now, &[]));
         // Not known: everything of the key's.
-        assert!(cuts.leaves_out(&honest, &[&named], None, now, &[]));
+        assert!(cuts.leaves_out(&honest, &[over], None, now, &[]));
         // What names no removed key is never left out.
         assert!(!cuts.leaves_out(&honest, &[], None, now, &[]));
+        assert!(!cuts.leaves_out(&honest, &[Some(&[])], Some(&at(2)), now, &[]));
         // Nor what the person named the key to take from.
-        assert!(!cuts.leaves_out(&[[9; 32]], &[&named], None, now, &[[9; 32]]));
+        assert!(!cuts.leaves_out(&[[9; 32]], &[over], None, now, &[[9; 32]]));
+
+        // A chain that may have dropped links names every removed key (the
+        // third read of slice 8, its second finding): one at the most a
+        // chain keeps, and one that is missing. One link fewer is read.
+        let honest_link = EntryLink {
+            hash: [2; 16],
+            signer: EntryLink::signer_of(&[4; 32]),
+        };
+        let full = vec![honest_link; MAX_ENTRY_LINKS];
+        let short = vec![honest_link; MAX_ENTRY_LINKS - 1];
+        assert!(cuts.leaves_out(&honest, &[Some(&full)], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, &[None], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, &[Some(&short)], Some(&at(2)), now, &[]));
+        // Where nothing of a removed key is cut, it is carried all the same.
+        assert!(!cuts.leaves_out(&honest, &[Some(&full)], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, &[None], Some(&at(3)), now, &[]));
+        // And a key the person named is not among those it names.
+        assert!(!cuts.leaves_out(&honest, &[Some(&full)], Some(&at(2)), now, &[[9; 32]]));
     }
 
     /// A key that no noted change removes has everything cut.
