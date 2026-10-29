@@ -547,10 +547,11 @@ thread_local! {
 pub(crate) fn know_removed(
     conn: &Connection,
     statement: &Statement,
+    own: &[u8; 32],
     now: i64,
 ) -> Result<(), PersonError> {
     if held_rows::keep_removed(conn, &statement.removed, now)? > 0 {
-        judge_records_by_their_cut(conn, now)?;
+        judge_records_by_their_cut(conn, own, now)?;
     }
     Ok(())
 }
@@ -565,7 +566,11 @@ pub(crate) fn know_removed(
 /// before the removal stays the person's. Done from the moment the device
 /// knows, and again whenever what it knows grows. Says whether anything
 /// changed.
-pub(crate) fn judge_records_by_their_cut(conn: &Connection, now: i64) -> Result<bool, PersonError> {
+pub(crate) fn judge_records_by_their_cut(
+    conn: &Connection,
+    own: &[u8; 32],
+    now: i64,
+) -> Result<bool, PersonError> {
     let Some(held) = held(conn)? else {
         return Ok(false);
     };
@@ -591,6 +596,15 @@ pub(crate) fn judge_records_by_their_cut(conn: &Connection, now: i64) -> Result<
             // phrase, it is theirs by their answer, and is added again by
             // the record of 2026-10-04, section 9, step 6.
             if held_rows::is_kept_by_answer(conn, &record.key)? {
+                continue;
+            }
+            // Nor, on this device, its own key: rule 6 is against keys
+            // that the removed device holds by its record alone, and this
+            // device knows it holds its own. The others judge it by what
+            // each took, and a recovery adds it again (the record of
+            // 2026-10-04, section 9, step 6), which a removed key could
+            // never be.
+            if record.key == *own {
                 continue;
             }
             if record.counted {
@@ -641,7 +655,7 @@ pub(crate) fn know_removed_if_signed(
     {
         removes.removed.retain(|key| *key != own);
     }
-    know_removed(conn, &removes, now)
+    know_removed(conn, &removes, &own, now)
 }
 
 /// Whether the secret of `statement`'s change is clear on this device
@@ -1442,7 +1456,7 @@ pub(crate) fn decide(
     });
     if judgement == Judgement::Behind || behind_a_head {
         note_time(conn, entry, shown)?;
-        know_removed(conn, shown, now)?;
+        know_removed(conn, shown, &own, now)?;
         return Ok(Shown::Behind);
     }
 
@@ -1456,7 +1470,7 @@ pub(crate) fn decide(
         removes.removed.retain(|key| *key != own);
     }
     note_time(conn, entry, shown)?;
-    know_removed(conn, &removes, now)?;
+    know_removed(conn, &removes, &own, now)?;
     let mut left = heads.len();
     for head in &heads {
         if shown.has_on_chain(&head.statement.statement.link()?) {
@@ -2592,9 +2606,14 @@ fn come_to(
             followed.as_ref().map(|entry| entry.content.as_slice()),
             &before.statement.statement,
         )?;
-        know_removed(conn, &before.statement.statement, now)?;
+        know_removed(
+            conn,
+            &before.statement.statement,
+            &identity.public_key(),
+            now,
+        )?;
     }
-    know_removed(conn, statement, now)?;
+    know_removed(conn, statement, &identity.public_key(), now)?;
     if !is_clear(conn, statement, false)? {
         // Where this device's own key is among the removed, no change that
         // lists it is clear, and its way on is a new key: it says so, and
@@ -8949,9 +8968,12 @@ mod tests {
         held_rows::keep_removed(&conn, &[key(2)], made).unwrap();
         assert_eq!(counted(&conn), [true]);
         note_change(&conn, Some(&entry.content), &three).unwrap();
-        assert!(judge_records_by_their_cut(&conn, made).unwrap());
+        // On the device whose key it is, its own key is not removed.
+        assert!(!judge_records_by_their_cut(&conn, &key(6), made).unwrap());
+        assert_eq!(counted(&conn), [true]);
+        assert!(judge_records_by_their_cut(&conn, &key(0), made).unwrap());
         assert_eq!(counted(&conn), [false]);
-        assert!(!judge_records_by_their_cut(&conn, made).unwrap());
+        assert!(!judge_records_by_their_cut(&conn, &key(0), made).unwrap());
     }
 
     /// A device that leaves its phrase forgets what it knew of removals:
