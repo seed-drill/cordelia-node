@@ -29,12 +29,12 @@ use crate::error::ApiError;
 use crate::sharing::{self, Failed, Out, OwnRelay, Plan};
 use crate::state::AppState;
 
-fn db(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, rusqlite::Connection> {
+pub(crate) fn db(state: &AppState) -> cordelia_core::lock::TimedGuard<'_, rusqlite::Connection> {
     state.db.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The answer of a refusal, or the node's own failure.
-fn answer_of(failed: Failed) -> Result<HttpResponse, ApiError> {
+pub(crate) fn answer_of(failed: Failed) -> Result<HttpResponse, ApiError> {
     match failed {
         Failed::Refused(refusal) => Ok(HttpResponse::Conflict().json(json!({
             "error": {
@@ -51,7 +51,7 @@ pub const CHANGED: &str = "What this would do changed while you were answering: 
 
 /// A route asked a yes for: with `look`, what the yes is for; otherwise,
 /// where the person said yes to what the plan asks now, `then` it.
-fn asked_then<T>(
+pub(crate) fn asked_then<T>(
     state: &AppState,
     look: bool,
     said_yes_to: Option<&str>,

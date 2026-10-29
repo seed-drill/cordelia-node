@@ -165,6 +165,16 @@ pub const MESSAGES_START: &str = "messages.start";
 /// read_held_lists`, decision 2026-10-25, rule 1).
 pub const MESSAGES_LISTS_READ: &str = "messages.lists_read";
 
+/// How many times in a row the device's list of shared marks, `sread/`,
+/// was written again for a relay's answer of another (`cordelia_api::marks`,
+/// decision 2026-10-10 §6.1): counted apart from the other lists.
+pub const MESSAGES_SREAD_AGAIN: &str = "messages.sread_again";
+
+/// That the `sread/` lists that the store held before step 25 were read
+/// once, with the time (`cordelia_api::reader::read_held_shared_lists`,
+/// decision 2026-10-10 §14, "lists stored before the upgrade").
+pub const MESSAGES_SREAD_LISTS_READ: &str = "messages.sread_lists_read";
+
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {
     conn.execute("DELETE FROM node_meta WHERE key = ?1", params![key])

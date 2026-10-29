@@ -124,7 +124,7 @@ fn all_own(relays: &[OwnRelay], card: &Card) -> bool {
 
 /// Whether any relay of `card` is, by key, one of `relays`: the channel is
 /// reached from this device (§8.3).
-fn any_own(relays: &[OwnRelay], card: &Card) -> bool {
+pub(crate) fn any_own(relays: &[OwnRelay], card: &Card) -> bool {
     card.relays()
         .keys()
         .iter()
@@ -170,7 +170,7 @@ impl From<cordelia_crypto::CryptoError> for Failed {
 /// What a step gives, or why nothing was done.
 pub type Out<T> = Result<T, Failed>;
 
-fn refused<T>(word: &'static str, line: String) -> Out<T> {
+pub(crate) fn refused<T>(word: &'static str, line: String) -> Out<T> {
     Err(Failed::Refused(Refusal { word, line }))
 }
 
@@ -204,7 +204,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
 /// The device stands applied under the latest statement it has seen, with
 /// sync on (§5.5, the second row): the messages record's lines, said of a
 /// shared channel. What it holds of its person, where it does.
-fn standing(conn: &Connection) -> Out<Held> {
+pub(crate) fn standing(conn: &Connection) -> Out<Held> {
     match may_open(conn)? {
         Ok(()) => {}
         Err(NotUsable::SyncOff) => {
@@ -253,7 +253,10 @@ fn key_typed(typed: &str) -> Out<[u8; 32]> {
 
 /// The label the person gave `key` in shared channels, where it has one
 /// in force (§3.4).
-fn label_given(conn: &Connection, key: &[u8; 32]) -> Result<Option<String>, PersonError> {
+pub(crate) fn label_given(
+    conn: &Connection,
+    key: &[u8; 32],
+) -> Result<Option<String>, PersonError> {
     Ok(lists::holds(conn)?
         .labels
         .into_iter()
@@ -283,7 +286,7 @@ fn label_to_undo(
 }
 
 /// A label as it is shown: cleaned, and quoted.
-fn quoted(label: &str) -> String {
+pub(crate) fn quoted(label: &str) -> String {
     format!("{:?}", crate::messages::cleaned(label))
 }
 
@@ -405,7 +408,7 @@ pub fn channel_words(channel: &[u8; 32]) -> String {
 /// With `past`, this device's key and the time, a filing that a bound
 /// leaves out is found too: a rename and a drop act on it (§3.4), and
 /// `share` does not, since its channel is not held.
-fn find(
+pub(crate) fn find(
     conn: &Connection,
     name: &str,
     words: Option<&str>,
@@ -544,7 +547,13 @@ fn act_refused(conn: &Connection, held: &Held, own: &[u8; 32], why: Refused) -> 
 }
 
 /// Do `what` in the person's list, or refuse as §5.5 says.
-fn act(conn: &Connection, identity: &NodeIdentity, held: &Held, what: Do, now: i64) -> Out<()> {
+pub(crate) fn act(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    held: &Held,
+    what: Do,
+    now: i64,
+) -> Out<()> {
     match lists::act(conn, identity, what, now)? {
         Done::Made(_) => Ok(()),
         Done::Refused(why) => act_refused(conn, held, &identity.public_key(), why),
@@ -562,22 +571,41 @@ pub fn date_of(at: i64) -> String {
 
 /// The lines of §5.4 for the shared channel `channel`, filed as `name`:
 /// which keys have written there, and which came since this device last
-/// wrote there, by what it saw itself. Never who reads it.
+/// wrote there, or for `send`, since the folder whose agent is `agent`
+/// last wrote there, by what it saw itself. Never who reads it.
 pub fn who_wrote(
     conn: &Connection,
     held: &Held,
     own: &[u8; 32],
     channel: &[u8; 32],
     name: &str,
+    agent: Option<&str>,
 ) -> Result<Vec<String>, PersonError> {
     let Some(row) = kept::channel(conn, channel)? else {
         return Ok(Vec::new());
     };
-    let since = entries::author_entries(conn, channel, own)?
-        .iter()
-        .map(|stored| stored.stored_at)
-        .max()
-        .unwrap_or(row.first_held);
+    let last = match agent {
+        // The folder's last message there, on any device of the person's,
+        // by its sent mark: when this device first held it.
+        Some(agent) => {
+            let marks = crate::shared_messages::marks_now(conn, &crate::person::who_counts(conn)?)?;
+            let mut last = None;
+            for (id, first_held) in kept::index_first_held(conn, row.id)? {
+                let Ok(id) = crate::shared_messages::id_of(&id) else {
+                    continue;
+                };
+                if marks.sent_by(channel, &id, agent) {
+                    last = last.max(Some(first_held));
+                }
+            }
+            last
+        }
+        None => entries::author_entries(conn, channel, own)?
+            .iter()
+            .map(|stored| stored.stored_at)
+            .max(),
+    };
+    let since = last.unwrap_or(row.first_held);
     let labels: Vec<[u8; 32]> = lists::holds(conn)?
         .labels
         .iter()
@@ -993,7 +1021,14 @@ pub fn make_share(
             channel_words(&channel)
         ),
     ];
-    lines.extend(who_wrote(conn, &held, &own, &channel, &to.filing.name)?);
+    lines.extend(who_wrote(
+        conn,
+        &held,
+        &own,
+        &channel,
+        &to.filing.name,
+        None,
+    )?);
     Ok(lines)
 }
 
@@ -1591,7 +1626,7 @@ pub fn list(
             "relays": relays,
             "also_a_name": names.contains(&filing.name),
             "rows_let_go": row.as_ref().map_or(0, |row| row.let_go),
-            "wrote": who_wrote(conn, &held, &own, &filing.channel, &filing.name)?,
+            "wrote": who_wrote(conn, &held, &own, &filing.channel, &filing.name, None)?,
         });
         if with_keys {
             let mut shown = Vec::new();
@@ -1654,11 +1689,21 @@ pub fn list(
         .into_iter()
         .map(|filing| filing.name)
         .collect();
+    // Each subscription in force, by its agent and the channel's name, for
+    // `cordelia sync status` (§5.1).
+    let subscriptions: Vec<serde_json::Value> = crate::shared_messages::in_force(conn)?
+        .into_iter()
+        .filter_map(|(channel, agent)| {
+            let filing = filings.iter().find(|filing| filing.channel == channel)?;
+            Some(json!({ "agent": agent, "channel": filing.name }))
+        })
+        .collect();
     Ok(json!({
         "channels": channels,
         "typed": typed,
         "shares": shares,
         "past_a_bound": past,
+        "subscriptions": subscriptions,
     }))
 }
 

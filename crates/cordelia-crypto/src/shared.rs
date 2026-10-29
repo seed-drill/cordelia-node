@@ -523,7 +523,7 @@ pub fn take(
             is_clearing(value)?;
             Ok(SharedTaken::Clearing { number })
         }
-        Some(Place::List | Place::PersonList | Place::Bounds) | None => {
+        Some(Place::List | Place::PersonList | Place::Bounds | Place::SharedList) | None => {
             Err(NotShared::NotInItsSlots)
         }
     }

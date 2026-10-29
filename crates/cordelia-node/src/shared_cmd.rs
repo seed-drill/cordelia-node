@@ -208,6 +208,41 @@ pub fn label(config_path: &str, key: &str, label: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+// ── cordelia subscribe and unsubscribe ───────────────────────────────
+
+/// `cordelia subscribe <name> [--words <four words>]` (§4.1, §5.2): the
+/// agent of the folder it runs in, at a terminal, with a yes. No other
+/// command subscribes.
+pub fn subscribe(config_path: &str, name: &str, words: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
+    let body = json!({ "folder": folder, "name": name, "words": words });
+    if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/subscribe", body)? {
+        print_said(&done);
+    }
+    Ok(())
+}
+
+/// `cordelia unsubscribe <name> [--agent <agent>] [--words <four words>]`
+/// (§4.1, §5.2): no yes; in the folder, or for the agent named from
+/// anywhere.
+pub fn unsubscribe(
+    config_path: &str,
+    name: &str,
+    agent: Option<&str>,
+    words: Option<&str>,
+) -> anyhow::Result<()> {
+    refuse_another_version(config_path)?;
+    let folder = match agent {
+        Some(_) => None,
+        None => Some(crate::msg_cmd::folder_of(config_path)?.0),
+    };
+    let body = json!({ "folder": folder, "agent": agent, "name": name, "words": words });
+    print_said(&asked(config_path, "/api/v1/shared/unsubscribe", &body)?);
+    Ok(())
+}
+
 // ── cordelia shared rename, drop and list ────────────────────────────
 
 /// `cordelia shared rename <name> <new name> [--words <four words>]`

@@ -67,7 +67,10 @@ pub mod sender;
 #[cfg(test)]
 mod several;
 pub mod shared;
+pub mod shared_messages;
 pub mod shared_pass;
+pub mod shared_routes;
+pub mod shared_sender;
 pub mod sharing;
 pub mod sharing_routes;
 pub mod state;
@@ -172,7 +175,20 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/label", web::post().to(sharing_routes::label))
             .route("/rename", web::post().to(sharing_routes::rename))
             .route("/drop", web::post().to(sharing_routes::drop))
-            .route("/list", web::post().to(sharing_routes::list)),
+            .route("/list", web::post().to(sharing_routes::list))
+            // Subscribing and messages in a shared channel (§4, §5.6).
+            .route(
+                "/subscribe",
+                web::post().to(crate::shared_routes::subscribe),
+            )
+            .route(
+                "/unsubscribe",
+                web::post().to(crate::shared_routes::unsubscribe),
+            )
+            .route("/read", web::post().to(crate::shared_routes::read))
+            .route("/send", web::post().to(crate::shared_routes::send))
+            .route("/summary", web::post().to(crate::shared_routes::summary))
+            .route("/log", web::post().to(crate::shared_routes::log)),
     );
     shared_routes(cfg);
 }

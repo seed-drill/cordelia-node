@@ -1261,6 +1261,17 @@ pub fn index_signers(conn: &Connection, id: i64) -> Result<Vec<[u8; 32]>, Cordel
     Ok(signers)
 }
 
+/// The ID of each index row of the channel of row `id`, with when this
+/// device first held it, whether or not it is shown.
+pub fn index_first_held(conn: &Connection, id: i64) -> Result<Vec<(Vec<u8>, i64)>, CordeliaError> {
+    conn.prepare("SELECT id, first_held FROM shared_index WHERE channel = ?1 ORDER BY id")
+        .map_err(storage)?
+        .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?
+        .collect::<Result<_, _>>()
+        .map_err(storage)
+}
+
 /// The IDs of the index rows of the channel of row `id`, of `signer` only
 /// where it is given.
 fn index_ids(

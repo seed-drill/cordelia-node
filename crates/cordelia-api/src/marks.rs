@@ -72,7 +72,9 @@ use cordelia_core::protocol::{AGENT_MESSAGE_SENDS_MAX, REV_BAND_HALF};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Value};
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_crypto::message::{self, PersonReads, ReadMarks, hold_name, person_name, read_name};
+use cordelia_crypto::message::{
+    self, PersonReads, ReadMarks, hold_name, person_name, read_name, sread_name,
+};
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::StorageError;
 use cordelia_storage::entries::{self, Outcome};
@@ -287,6 +289,12 @@ pub fn answered(
         if let Some(rev) = another(&bounds.slot) {
             crate::bounds::answered_another(conn, identity, now, fetched, rev)?;
         }
+        // The list of shared marks is matched by its own slot too, and
+        // written again apart (decision 2026-10-10 §6.1).
+        let shared = HeldList::of(conn, &own, PersonList::SharedReads)?;
+        if let Some(rev) = another(&shared.slot) {
+            crate::shared_messages::list_written(conn, identity, now, fetched, Some(rev))?;
+        }
         match another(&held.slot) {
             Some(rev) => list_written(conn, identity, now, fetched, Some(rev)),
             None => Ok(None),
@@ -441,6 +449,9 @@ pub(crate) enum PersonList {
     Reads,
     /// The bounds a person set on it, in `hold/<its key>`.
     Bounds,
+    /// The shared messages its agents read and sent, in `sread/<its key>`
+    /// (decision 2026-10-10 §6.1).
+    SharedReads,
 }
 
 impl PersonList {
@@ -448,6 +459,7 @@ impl PersonList {
         Ok(match self {
             Self::Reads => person_name(own)?,
             Self::Bounds => hold_name(own)?,
+            Self::SharedReads => sread_name(own)?,
         })
     }
 
@@ -457,6 +469,7 @@ impl PersonList {
         match self {
             Self::Reads => meta::MESSAGES_PERSON_AGAIN,
             Self::Bounds => meta::MESSAGES_BOUNDS_AGAIN,
+            Self::SharedReads => meta::MESSAGES_SREAD_AGAIN,
         }
     }
 }
@@ -728,7 +741,7 @@ mod tests {
     use cordelia_crypto::message::{To, read_mark};
     use cordelia_storage::entries::StoredEntry;
 
-    use crate::sender::{At, Request, no_reply, send};
+    use crate::sender::{Address, At, Request, no_reply, send};
     use crate::several::Several;
     use crate::take::{Taken, take};
 
@@ -760,13 +773,15 @@ mod tests {
             no_place: false,
             mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+            shared_fetched: false,
+            shared_reached: false,
         };
         let request = Request {
             from: from.into(),
-            to: match to {
+            address: Address::Own(match to {
                 "*" => To::All,
                 name => To::Name(name.into()),
-            },
+            }),
             asks: false,
             link: None,
             body: body.into(),

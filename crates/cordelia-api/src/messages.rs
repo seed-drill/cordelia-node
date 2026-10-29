@@ -67,7 +67,7 @@ use crate::error::ApiError;
 use crate::marks;
 use crate::person::{PersonError, in_one, who_counts};
 use crate::publish::Standing;
-use crate::sender::{self, At, NotSent, Refused, Reply, Request};
+use crate::sender::{self, Address, At, NotSent, Refused, Reply, Request};
 use crate::state::{AppState, OwnChannels};
 
 // ── Text that another device chose ───────────────────────────────────
@@ -250,7 +250,7 @@ pub fn answering(
         _ => id,
     };
     Ok(Some(Reply {
-        to: To::Name(message.from),
+        to: Address::Own(To::Name(message.from)),
         thread,
         answers: id,
     }))
@@ -906,15 +906,20 @@ pub fn send_of(
         no_place: at.no_place,
         mapped: name.is_some(),
         per_folder_per_hour: at.per_folder_per_hour,
+        shared_fetched: false,
+        shared_reached: false,
     };
     let from = name.unwrap_or_default();
     let to = match &request.to {
         Some(name) => To::Name(name.clone()),
         None => To::All,
     };
+    // The messages record's route builds only an address of the person's
+    // own (decision 2026-10-10 §4.2): its body has no field that names a
+    // shared channel.
     let asked = Request {
         from: from.clone(),
-        to: to.clone(),
+        address: Address::Own(to.clone()),
         asks: request.asks,
         link: request.link.clone(),
         body: request.body.clone(),
@@ -926,7 +931,10 @@ pub fn send_of(
     let reply = |conn: &Connection| match &request.reply {
         Some(given) => {
             let reply = answering(conn, identity, &from, given, at.now)?;
-            *replied_to.borrow_mut() = reply.as_ref().map(|reply| reply.to.clone());
+            *replied_to.borrow_mut() = reply.as_ref().and_then(|reply| match &reply.to {
+                Address::Own(to) => Some(to.clone()),
+                Address::Shared(_) => None,
+            });
             Ok(reply)
         }
         None => sender::no_reply(conn),
@@ -2109,6 +2117,19 @@ fn refusal(conn: &Connection, why: &Refused) -> Result<HttpResponse, ApiError> {
             json!({ "id": id })
         }
         Refused::MoreThanOne { id, ids } => json!({ "id": id, "ids": ids }),
+        // A reply to a message of a shared channel (decision 2026-10-10
+        // §4.2): the name the person files that channel under.
+        Refused::ReplyElsewhere { id, channel } => {
+            let name = match channel {
+                Some(channel) => crate::sharing::filed(conn)
+                    .map_err(refused)?
+                    .into_iter()
+                    .find(|filing| filing.channel == *channel)
+                    .map(|filing| filing.name),
+                None => None,
+            };
+            json!({ "id": id, "channel": name })
+        }
         _ => json!({}),
     };
     Ok(refused_with(why.word(), &why.to_string(), details))
@@ -2130,9 +2151,13 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
 /// before step 20 are read before any route of messages answers, where
 /// they were not yet (decision 2026-10-25, rule 1). An error is logged:
 /// the next asks again.
-fn lists_read(db: &Connection, state: &AppState) {
+pub(crate) fn lists_read(db: &Connection, state: &AppState) {
     if let Err(e) = crate::reader::read_held_lists(db, &state.identity, state.sync_control.now()) {
         tracing::warn!(error = %e, "messages: could not read the lists held");
+    }
+    let now = state.sync_control.now();
+    if let Err(e) = crate::reader::read_held_shared_lists(db, &state.identity, now) {
+        tracing::warn!(error = %e, "messages: could not read the lists of shared marks held");
     }
 }
 

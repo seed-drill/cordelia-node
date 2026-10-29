@@ -140,6 +140,40 @@ pub enum Refused {
     /// when it leaves the list.
     #[error("this device's list of bounds is full")]
     BoundsFull(Vec<(held::Pair, i64)>),
+    /// The device holds no shared channel of that ID (decision 2026-10-10
+    /// §5.5): it is not filed, or is dropped or moved from.
+    #[error("no shared channel of this device's has that ID")]
+    NoSuchChannel,
+    /// The folder's agent does not subscribe to the shared channel
+    /// (decision 2026-10-10 §4.1, §5.5).
+    #[error("this agent does not subscribe to that shared channel")]
+    NotSubscribed,
+    /// The shared channel is held and not reached from this device: none of
+    /// its card's relays is, by key, one of the device's own (§8.3).
+    #[error("the shared channel is not reached from this device")]
+    NotReached,
+    /// A reply to a message of another kind of address than the one given
+    /// (decision 2026-10-10 §4.2): of the shared channel `channel`, or of
+    /// the person's own agents where it is `None`.
+    #[error("message {id} is of another kind of address than the one given")]
+    ReplyElsewhere {
+        id: String,
+        channel: Option<[u8; 32]>,
+    },
+    /// The device has written 60 numbers in the shared channel in the hour,
+    /// its first sends and its sends again together (decision 2026-10-10
+    /// §6.4).
+    #[error("this device has written {sends} messages, and {again} again, in the channel")]
+    ChannelRate {
+        sends: usize,
+        again: usize,
+        next_at: i64,
+    },
+    /// The agent's loop in the shared channel is held (decision 2026-10-10
+    /// §6.4): `waiting` of its own messages there, and of those answering
+    /// it or in its threads, wait to be read by a person on this device.
+    #[error("messages of this agent's loop in the channel wait to be read by a person")]
+    SharedHeld { from: String, waiting: u64 },
 }
 
 impl Refused {
@@ -163,6 +197,12 @@ impl Refused {
             Self::DeviceRate { .. } => "device_rate",
             Self::PairHeld { .. } => "pair_held",
             Self::BoundsFull(_) => "bounds_full",
+            Self::NoSuchChannel => "no_such_channel",
+            Self::NotSubscribed => "not_subscribed",
+            Self::NotReached => "not_reached",
+            Self::ReplyElsewhere { .. } => "reply_elsewhere",
+            Self::ChannelRate { .. } => "channel_rate",
+            Self::SharedHeld { .. } => "pair_held",
         }
     }
 }
@@ -201,6 +241,25 @@ pub struct At {
     /// per_folder_per_hour`). It may lower `AGENT_MESSAGES_PER_FOLDER_
     /// PER_HOUR`, and is never taken above it.
     pub per_folder_per_hour: usize,
+    /// For a send to a shared channel (decision 2026-10-10 §6.1): whether
+    /// the channel was fetched since the node started, at the relays of its
+    /// card that the device reaches (`OwnChannels::shared_fetch_done`).
+    pub shared_fetched: bool,
+    /// For a send to a shared channel: whether any relay of its card is, by
+    /// key, one of the device's own (§8.3).
+    pub shared_reached: bool,
+}
+
+/// Where a message goes (decision 2026-10-10 §4.2): one of two kinds, and
+/// no other. **The person's own agents** (`--to` and `--all`), looked up by
+/// `names::listed` alone, into the messages channel; or **a shared channel**
+/// (`--channel`), by its ID, looked up in the table of shared channels
+/// alone. The messages record's route builds only the first, and this
+/// record's only the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    Own(To),
+    Shared([u8; 32]),
 }
 
 /// A message that the agent of a folder asks to send: its addressing
@@ -210,7 +269,7 @@ pub struct At {
 pub struct Request {
     /// The agent of the folder the command was run in.
     pub from: String,
-    pub to: To,
+    pub address: Address,
     pub asks: bool,
     pub link: Option<String>,
     pub body: String,
@@ -223,7 +282,7 @@ pub struct Request {
 /// `answers` (§3). These replace the request's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
-    pub to: To,
+    pub to: Address,
     pub thread: Id,
     pub answers: Id,
 }
@@ -366,6 +425,15 @@ fn sends(
     {
         return refused(Refused::SyncOff);
     }
+    // A shared channel's address is looked up in the table of shared
+    // channels alone, and its message written there alone (decision
+    // 2026-10-10 §4.2).
+    let to = match &request.address {
+        Address::Own(to) => to.clone(),
+        Address::Shared(channel) => {
+            return crate::shared_sender::sends(conn, identity, at, request, channel, reply);
+        }
+    };
     // 6. Room for proofs.
     if at.no_place {
         return refused(Refused::NoPlace);
@@ -392,10 +460,41 @@ fn sends(
     if kept(held::newest_own_sent(conn, &ring.own, now))?.is_some_and(|newest| newest > now) {
         return refused(Refused::ClockBehind);
     }
-    // 9. The message a reply answers.
+    // 9. The message a reply answers: one of the person's own, and never
+    // a shared channel's (decision 2026-10-10 §4.2).
     let (to, thread, answers) = match reply(conn) {
-        Ok(Some(reply)) => (reply.to, reply.thread, reply.answers),
-        Ok(None) => (request.to.clone(), request.thread, request.answers),
+        Ok(Some(Reply {
+            to: Address::Own(to),
+            thread,
+            answers,
+        })) => (to, thread, answers),
+        Ok(Some(Reply {
+            to: Address::Shared(channel),
+            ..
+        })) => {
+            return refused(Refused::ReplyElsewhere {
+                id: String::new(),
+                channel: Some(channel),
+            });
+        }
+        Ok(None) => (to, request.thread, request.answers),
+        Err(Refused::NoSuchMessage(given)) => {
+            return refused(
+                match crate::shared_messages::names_a_shared_message(
+                    conn,
+                    identity,
+                    &request.from,
+                    &given,
+                    now,
+                )? {
+                    Some(channel) => Refused::ReplyElsewhere {
+                        id: given,
+                        channel: Some(channel),
+                    },
+                    None => Refused::NoSuchMessage(given),
+                },
+            );
+        }
         Err(why) => return refused(why),
     };
     // 10. The recipient: a name that the personal channel lists.
@@ -470,14 +569,14 @@ fn sends(
 /// When a count of `limit` within the hour, of rows at `times` oldest
 /// first, next has room: the hour after the row whose going leaves fewer
 /// than `limit`.
-fn frees_at(times: &[i64], limit: usize) -> i64 {
+pub(crate) fn frees_at(times: &[i64], limit: usize) -> i64 {
     let leaves = times.len().saturating_sub(limit);
     times.get(leaves).map_or(0, |at| at + HOUR_SECS)
 }
 
 /// Where the device has sent 60 in the hour, sends again included, when
 /// the next can go (decision 2026-10-09 §6).
-fn device_full(lately: &held::SentLately) -> Option<i64> {
+pub(crate) fn device_full(lately: &held::SentLately) -> Option<i64> {
     let mut all: Vec<i64> = lately.sends.iter().chain(&lately.again).copied().collect();
     if all.len() < AGENT_MESSAGES_PER_DEVICE_PER_HOUR {
         return None;
@@ -539,7 +638,7 @@ pub fn held_pair(
 
 /// Sixteen random bytes, so that two messages with the same words are two
 /// messages (§2.2).
-fn nonce() -> Result<[u8; 16], PersonError> {
+pub(crate) fn nonce() -> Result<[u8; 16], PersonError> {
     let random = cordelia_crypto::generate_psk()?;
     let mut nonce = [0; 16];
     nonce.copy_from_slice(&random[..16]);
@@ -901,7 +1000,7 @@ pub fn clear_expired(
 }
 
 /// What the store answered, with its error as the device's.
-fn kept<T>(answer: Result<T, StorageError>) -> Result<T, PersonError> {
+pub(crate) fn kept<T>(answer: Result<T, StorageError>) -> Result<T, PersonError> {
     answer.map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))
 }
 
@@ -957,6 +1056,8 @@ mod tests {
             no_place: false,
             mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+            shared_fetched: false,
+            shared_reached: false,
         }
     }
 
@@ -965,10 +1066,10 @@ mod tests {
     fn says(from: &str, to: &str, body: &str) -> Request {
         Request {
             from: from.into(),
-            to: match to {
+            address: Address::Own(match to {
                 "*" => To::All,
                 name => To::Name(name.into()),
-            },
+            }),
             asks: false,
             link: None,
             body: body.into(),
@@ -1534,6 +1635,8 @@ mod tests {
             no_place: true,
             mapped: false,
             per_folder_per_hour: 0,
+            shared_fetched: false,
+            shared_reached: false,
         };
         // Step 9's own words are a later slice's: the lookup of a reply
         // here refuses with this, which `send` gives back as it is.
@@ -1585,7 +1688,7 @@ mod tests {
         let request = says("notes", "nobody", "x");
         let reply = |_: &Connection| {
             Ok(Some(Reply {
-                to: To::Name("plans".into()),
+                to: Address::Own(To::Name("plans".into())),
                 thread: [1; 16],
                 answers: [2; 16],
             }))
@@ -1631,6 +1734,8 @@ mod tests {
         let s = devices(2);
         let lowered = |per_folder_per_hour| At {
             per_folder_per_hour,
+            shared_fetched: false,
+            shared_reached: false,
             ..at(t + 10)
         };
         for k in 0..5 {
@@ -1680,6 +1785,8 @@ mod tests {
         let s = devices(2);
         let off = At {
             per_folder_per_hour: 0,
+            shared_fetched: false,
+            shared_reached: false,
             ..at(s.now)
         };
         let refusal = send(

@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1266,6 +1266,89 @@ CREATE TABLE shared_share_sent (
 );
 "#;
 
+/// Migration v25: what a device keeps of subscribing and of messages in a
+/// shared channel (decision 2026-10-10 §4.1, §6.1, §6.2, §6.4, §14). Each
+/// column takes only its type and its bound.
+///
+/// - `shared_msg_subscribed`: each subscription in force on this device, by the
+///   channel's ID and the agent's name, with its start: when this device
+///   first took it in that state (§4.1). It goes when the subscription is
+///   no longer in force, so one taken again starts again.
+/// - `shared_msg_marks`: this device's own table of the marks of shared
+///   messages read and sent by its agents (§6.1), each binding the channel,
+///   in the order made, with when.
+/// - `shared_msg_lists`: the latest `sread/` list of each other device, one
+///   list for each key, as `message_lists` keeps the `read/` lists.
+/// - `shared_msg_read_by_a_person`: the shared messages a person read on this
+///   device (§6.1: never said to the other devices), going with the
+///   message's row.
+/// - `shared_msg_sends`: each number this device wrote in a shared channel, by
+///   its clock, a send again among them: the channel's hour (§6.4).
+/// - `shared_msg_kept`, `shared_msg_kept_numbers`: each message of the device's own
+///   in a shared channel that not every relay of its card has taken, its
+///   value as it was sent and the numbers it was sent under, and whether it
+///   waits to be sent again (§6.1, as step 19's `message_kept`).
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V25: &str = r#"
+CREATE TABLE shared_msg_subscribed (
+    channel  BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    agent    TEXT NOT NULL CHECK(typeof(agent) = 'text'
+                                 AND length(CAST(agent AS BLOB)) >= 1
+                                 AND length(CAST(agent AS BLOB)) <= 200),
+    start    INTEGER NOT NULL CHECK(typeof(start) = 'integer'),
+    PRIMARY KEY (channel, agent)
+);
+
+CREATE TABLE shared_msg_marks (
+    mark     BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
+    seq      INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
+    made_at  INTEGER NOT NULL CHECK(typeof(made_at) = 'integer')
+);
+
+CREATE TABLE shared_msg_lists (
+    key   BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
+    PRIMARY KEY (key, mark)
+);
+
+CREATE INDEX idx_shared_msg_lists_mark ON shared_msg_lists(mark);
+
+CREATE TABLE shared_msg_read_by_a_person (
+    channel  INTEGER NOT NULL,
+    id       BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    FOREIGN KEY (channel, id) REFERENCES shared_index(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, id)
+);
+
+CREATE TABLE shared_msg_sends (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id) ON DELETE CASCADE,
+    sent_at  INTEGER NOT NULL CHECK(typeof(sent_at) = 'integer'),
+    again    INTEGER NOT NULL CHECK(again IN (0, 1))
+);
+
+CREATE INDEX idx_shared_msg_sends ON shared_msg_sends(channel, sent_at);
+
+CREATE TABLE shared_msg_kept (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id) ON DELETE CASCADE,
+    id       BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    value    BLOB NOT NULL CHECK(typeof(value) = 'blob' AND length(value) = 1936),
+    sent     INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    kept_at  INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer'),
+    again    INTEGER NOT NULL DEFAULT 0 CHECK(again IN (0, 1)),
+    PRIMARY KEY (channel, id)
+);
+
+CREATE TABLE shared_msg_kept_numbers (
+    channel  INTEGER NOT NULL,
+    id       BLOB NOT NULL,
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                    AND number >= 1 AND number <= 4398046511103),
+    FOREIGN KEY (channel, id) REFERENCES shared_msg_kept(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, id, number)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1503,6 +1586,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 24 {
         tracing::info!("applying migration v24 (making, sharing and taking a shared channel)");
         migrate_in_one(conn, MIGRATION_V24, 24)?;
+    }
+
+    if current < 25 {
+        tracing::info!("applying migration v25 (subscribing, and messages in a shared channel)");
+        migrate_in_one(conn, MIGRATION_V25, 25)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -4889,7 +4977,7 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 24, own: 20 })
+                Err(StorageError::LaterVersion { found: 25, own: 20 })
             ),
             "{refused:?}"
         );
@@ -4945,6 +5033,7 @@ mod tests {
                AND name NOT LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
                AND name NOT LIKE 'shared_relay_%' AND name NOT LIKE 'shared_take_out_%'
                AND name NOT LIKE 'shared_typed_%' AND name NOT LIKE 'shared_share%'
+               AND name NOT LIKE '%shared_msg_%'
              ORDER BY name",
         )
         .unwrap()
@@ -4967,6 +5056,7 @@ mod tests {
             NEW_IN_V22.contains(&name)
                 || NEW_IN_V23.contains(&name)
                 || NEW_IN_V24.contains(&name)
+                || name.contains("shared_msg_")
                 || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
         })
     }
@@ -5000,6 +5090,7 @@ mod tests {
         everything_but(conn, |name| {
             NEW_IN_V23.contains(&name)
                 || NEW_IN_V24.contains(&name)
+                || name.contains("shared_msg_")
                 || name.starts_with("sqlite_autoindex_shared_relay_")
                 || name.starts_with("sqlite_autoindex_shared_typed_")
                 || name.starts_with("sqlite_autoindex_shared_share")
@@ -5154,6 +5245,7 @@ mod tests {
         let but = |conn: &Connection| {
             everything_but(conn, |name| {
                 NEW_IN_V24.contains(&name)
+                    || name.contains("shared_msg_")
                     || name.starts_with("sqlite_autoindex_shared_typed_")
                     || name.starts_with("sqlite_autoindex_shared_share")
             })
@@ -5168,8 +5260,9 @@ mod tests {
             new_in_v24(&conn).is_empty(),
             "the tables go with the version"
         );
-        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
         assert_eq!(version(&conn), 24);
+        init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v24(&conn), NEW_IN_V24);
         assert_eq!(but(&conn), before);
@@ -5226,6 +5319,158 @@ mod tests {
             "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(32), 'taken', NULL)",
             "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(65), 9, 9, 1)",
             "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 25 adds: seven tables.
+    const NEW_IN_V25: [&str; 7] = [
+        "shared_msg_kept",
+        "shared_msg_kept_numbers",
+        "shared_msg_lists",
+        "shared_msg_marks",
+        "shared_msg_read_by_a_person",
+        "shared_msg_sends",
+        "shared_msg_subscribed",
+    ];
+
+    /// What a database holds of the step to version 25, by name.
+    fn new_in_v25(conn: &Connection) -> Vec<String> {
+        let mut names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.retain(|name: &String| NEW_IN_V25.contains(&name.as_str()));
+        names
+    }
+
+    /// The step to version 25 (decision 2026-10-10 §4.1, §6.1, §6.4, §14):
+    /// from a database at step 24 that holds rows of the steps before it, it
+    /// adds the tables of subscriptions, shared marks, a person's reads of
+    /// shared messages, the channel's hour and the kept values, empty, and
+    /// changes no older row or definition; a failure leaves none of it, and
+    /// the step asked for twice is run once. Each column takes only its type
+    /// and its bound.
+    #[test]
+    fn step_25_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v20();
+        for (sql, at) in [
+            (MIGRATION_V21, 21),
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);
+             INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(16), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 0,
+                         NULL, 'b', 9, 9);
+             INSERT INTO shared_typed_keys (key, name, typed_at) VALUES (zeroblob(32), 'r', 9);",
+        )
+        .unwrap();
+        let but = |conn: &Connection| everything_but(conn, |name| name.contains("shared_msg_"));
+        let before = but(&conn);
+        assert!(new_in_v25(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V25} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 25).is_err());
+        assert_eq!(version(&conn), 24);
+        assert!(
+            new_in_v25(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 25);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v25(&conn), NEW_IN_V25);
+        assert_eq!(but(&conn), before);
+
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V25
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 7]);
+        conn.execute_batch(
+            "INSERT INTO shared_msg_kept (channel, id, value, sent, kept_at)
+                 VALUES (1, zeroblob(16), zeroblob(1936), 9, 9);
+             INSERT INTO shared_msg_kept_numbers (channel, id, number) VALUES (1, zeroblob(16), 1);
+             INSERT INTO shared_msg_lists (key, mark) VALUES (zeroblob(32), zeroblob(16));
+             INSERT INTO shared_msg_marks (mark, seq, made_at) VALUES (zeroblob(16), 1, 9);
+             INSERT INTO shared_msg_read_by_a_person (channel, id) VALUES (1, zeroblob(16));
+             INSERT INTO shared_msg_sends (channel, sent_at, again) VALUES (1, 9, 0);
+             INSERT INTO shared_msg_subscribed (channel, agent, start) VALUES (zeroblob(32), 'r', 9);"
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [1; 7]);
+        migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(but(&conn), before);
+
+        // A person's read goes with the message's row; a number kept goes
+        // with its kept value.
+        conn.execute("DELETE FROM shared_index", []).unwrap();
+        conn.execute("DELETE FROM shared_msg_kept", []).unwrap();
+        assert_eq!(counted(&conn), [0, 0, 1, 1, 0, 1, 1]);
+
+        conn.execute_batch(
+            "DELETE FROM shared_msg_lists; DELETE FROM shared_msg_marks; DELETE FROM shared_msg_sends;
+             DELETE FROM shared_msg_subscribed;",
+        )
+        .unwrap();
+        let refused = [
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(31), 'r', 9)",
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), '', 9)",
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), 'r', 'nine')",
+            "INSERT INTO shared_msg_marks VALUES (zeroblob(15), 1, 9)",
+            "INSERT INTO shared_msg_lists VALUES (zeroblob(32), zeroblob(17))",
+            "INSERT INTO shared_msg_read_by_a_person VALUES (1, zeroblob(16))",
+            "INSERT INTO shared_msg_sends VALUES (2, 9, 0)",
+            "INSERT INTO shared_msg_sends VALUES (1, 9, 2)",
+            "INSERT INTO shared_msg_kept VALUES (1, zeroblob(16), zeroblob(1935), 9, 9, 0)",
+            "INSERT INTO shared_msg_kept VALUES (2, zeroblob(16), zeroblob(1936), 9, 9, 0)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 1)",
+        ];
+        for refused in refused {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        conn.execute(
+            "INSERT INTO shared_msg_kept VALUES (1, zeroblob(16), zeroblob(1936), 9, 9, 1)",
+            [],
+        )
+        .unwrap();
+        for refused in [
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 0)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 4398046511104)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), 'github.com/owner/repo', 9)",
+            "INSERT INTO shared_msg_marks VALUES (zeroblob(16), 1, 9)",
+            "INSERT INTO shared_msg_sends VALUES (1, 9, 1)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 4398046511103)",
         ] {
             assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
         }

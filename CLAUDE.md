@@ -50,7 +50,7 @@ cordelia-node/
                          #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 24). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 25). entries; person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -68,7 +68,10 @@ cordelia-node/
                          #   and the take-outs begun and not ended); shared_sharing
                          #   (step 24: the keys typed for a channel and what became of
                          #   each, the shares this device wrote and what each relay
-                         #   answered of them); db
+                         #   answered of them); shared_messages (step 25:
+                         #   subscriptions' starts, the table of shared marks and
+                         #   the other devices' sread/ lists, a person's reads of
+                         #   shared messages, the channel's hour, the kept values); db
                          #   (secure_delete, set
                          #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
@@ -88,7 +91,13 @@ cordelia-node/
                          #   their routes under /api/v1/shared/),
                          #   shared_pass (what the shared pass reads and writes
                          #   under the lock: where a channel lives, its door's
-                         #   checks, pages, places and what waits), at_relays (and
+                         #   checks, pages, places and what waits), shared_messages
+                         #   (subscriptions, who is shown what, the sread/ list, the
+                         #   hold), shared_sender (Address::Shared in sender::send:
+                         #   form 6 in the device's ring, the channel's hour, sending
+                         #   again, clearing) and shared_routes (`subscribe`,
+                         #   `unsubscribe`, and `read`, `send`, `summary` and `log`
+                         #   of shared channels, under /api/v1/shared/), at_relays (and
                          #   known: what a device knows of which relay holds which change),
                          #   local (the local
                          #   API for the names a device holds), commands (the routes behind
@@ -126,7 +135,8 @@ cordelia-node/
                          #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
                          #   log`: the folder, the frame, the cleaning, the lines and
                          #   log's question), shared_cmd (the commands that make,
-                         #   share and take a shared channel, and `id --words`),
+                         #   share and take a shared channel, `subscribe`,
+                         #   `unsubscribe`, and `id --words`),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
                          #   device_entries (a device's passes, the pass of shared
@@ -168,7 +178,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
