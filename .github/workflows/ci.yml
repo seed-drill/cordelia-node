@@ -112,9 +112,11 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    # The test job runs every test; this one only measures. Two hours is
-    # well above what it takes without the sequences below.
-    timeout-minutes: 120
+    # The test job runs every test; this one only measures. The shared
+    # channel's library tests run slowly under coverage: on slice 8 the
+    # job passed two hours with the next crate still running, so it has
+    # four.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
