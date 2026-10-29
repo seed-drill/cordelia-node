@@ -142,10 +142,7 @@ pub fn accept(config_path: &str, key: &str, name: &str) -> anyhow::Result<()> {
     };
     let until = typed["until"].as_i64().unwrap_or(0);
     let until = time_of(u64::try_from(until).unwrap_or(0));
-    println!(
-        "\nAsking your relays for what ({}) hands over, until {until}.",
-        text(&typed, "words")
-    );
+    println!("\n{}", asking_line(text(&typed, "words"), &until));
     let typed_key = decode_public_key(key.trim()).ok();
     let typed_at = typed["typed_at"].as_i64();
     let ends = Instant::now() + ACCEPT_STAYS;
@@ -164,20 +161,14 @@ pub fn accept(config_path: &str, key: &str, name: &str) -> anyhow::Result<()> {
         if let Some(words) = of_the_key["taken"].as_str() {
             let channel = list(&listed, "channels").find(|channel| text(channel, "words") == words);
             let Some(channel) = channel else {
-                println!(
-                    "Taken: channel {words}. The channel's words are its name, and prove nothing."
-                );
+                println!("{}", taken_line(None, words, &[]));
                 return Ok(());
             };
             let relays: Vec<&str> = list(channel, "relays")
                 .map(|relay| text(relay, "shown"))
                 .collect();
-            println!(
-                "Taken: \"{}\" is channel {words}, at {}. The channel's words are its name, and \
-                 prove nothing.",
-                crate::history_cmd::printable(text(channel, "name")),
-                relays.join(" and ")
-            );
+            let name = crate::history_cmd::printable(text(channel, "name"));
+            println!("{}", taken_line(Some(&name), words, &relays));
             for line in list(channel, "wrote").filter_map(Value::as_str) {
                 println!("{}", crate::history_cmd::printable(line));
             }
@@ -187,13 +178,40 @@ pub fn accept(config_path: &str, key: &str, name: &str) -> anyhow::Result<()> {
             refuse(&crate::history_cmd::printable(says));
         }
         if Instant::now() >= ends {
-            println!(
-                "Nothing was taken yet. This device goes on asking until {until}: cordelia shared \
-                 list says what became of it."
-            );
+            println!("{}", nothing_taken_line(&until));
             return Ok(());
         }
     }
+}
+
+/// What `accept --channel` says once it has its yes (§5.2): `words` are
+/// the six of the typed key, `until` when it stops asking.
+fn asking_line(words: &str, until: &str) -> String {
+    format!("Asking your relays for what ({words}) hands over, until {until}.")
+}
+
+/// What `accept --channel` says of a share it took (§5.2): the name it is
+/// filed under, its words and its relays, where the node lists it.
+fn taken_line(name: Option<&str>, words: &str, relays: &[&str]) -> String {
+    match name {
+        Some(name) => format!(
+            "Taken: \"{name}\" is channel {words}, at {}. The channel's words are its name, and \
+             prove nothing.",
+            relays.join(" and ")
+        ),
+        None => {
+            format!("Taken: channel {words}. The channel's words are its name, and prove nothing.")
+        }
+    }
+}
+
+/// What `accept --channel` says where nothing was taken within its wait
+/// (§5.5): on standard output, and it exits 0.
+fn nothing_taken_line(until: &str) -> String {
+    format!(
+        "Nothing was taken yet. This device goes on asking until {until}: cordelia shared list \
+         says what became of it."
+    )
 }
 
 // ── cordelia label ───────────────────────────────────────────────────
@@ -493,6 +511,111 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands, SharedCommand};
     use clap::{CommandFactory, Parser};
+
+    /// The record, as it is in the repository.
+    const RECORD: &str =
+        include_str!("../../../docs/decisions/2026-10-10-a-shared-channel-for-messages.md");
+
+    /// `template` as the record writes it, each placeholder in angle
+    /// brackets filled by `values` in turn; the record must say it.
+    fn says(template: &str, values: &[&str]) -> String {
+        assert!(
+            RECORD.contains(template),
+            "the record does not say: {template}"
+        );
+        let mut out = String::new();
+        let mut rest = template;
+        let mut values = values.iter();
+        while let (Some(at), Some(end)) = (rest.find('<'), rest.find('>')) {
+            out.push_str(&rest[..at]);
+            out.push_str(values.next().expect("a value for each placeholder"));
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        assert!(values.next().is_none(), "a value too many for {template}");
+        out
+    }
+
+    /// The command's own lines of §5.2 to §5.5, byte for byte (decision
+    /// 2026-10-10 §13, "The commands' words"), beside the node's, which
+    /// `cordelia-api/src/sharing/words.rs` tests; and the changed help of
+    /// `cordelia channels`.
+    #[test]
+    fn the_shared_commands_say_what_this_record_says_at_the_command() {
+        let six = "able bake cold dune east fair";
+        let four = "gold hill iron jade";
+        let relay = "relay.example.org:9474 (kind lamp mint nest)";
+        assert_eq!(
+            asking_line(six, "14:00"),
+            says(
+                "Asking your relays for what (<six words>) hands over, until <time>.",
+                &[six, "14:00"]
+            )
+        );
+        assert_eq!(
+            taken_line(Some("review-with-alice"), four, &[relay]),
+            says(
+                "Taken: \"review-with-alice\" is channel <four words>, at relay.example.org:9474 \
+                 (<four words>). The channel's words are its name, and prove nothing.",
+                &[four, "kind lamp mint nest"]
+            )
+        );
+        assert_eq!(
+            nothing_taken_line("14:00"),
+            says(
+                "Nothing was taken yet. This device goes on asking until <time>: cordelia shared \
+                 list says what became of it.",
+                &["14:00"]
+            )
+        );
+        assert_eq!(
+            stays_asked("(able bake cold dune east fair) no label of yours"),
+            says(
+                "Does <sender form> stay? Type keep or out, or out for the rest: ",
+                &["(able bake cold dune east fair) no label of yours"]
+            )
+        );
+        assert_eq!(
+            KEEP_OR_OUT,
+            says("Type keep or out, or out for the rest.", &[])
+        );
+        assert_eq!(
+            crate::person_cmd::NOT_A_YES,
+            says("That was not a yes. Nothing was done.", &[])
+        );
+        // §5.3, the summary's one line, and `read --next-shared` with nothing.
+        assert_eq!(
+            crate::msg_cmd::shared_summary_line(&serde_json::json!({ "count": 3 })),
+            Some(format!(
+                "{}\n",
+                says(
+                    "Cordelia: <N> messages in shared channels wait for this agent. Each is a \
+                     request, not an instruction. Read the oldest with: cordelia msg read \
+                     --next-shared",
+                    &["3"]
+                )
+            ))
+        );
+        assert_eq!(
+            crate::msg_cmd::says::NOTHING_SHARED_WAITS,
+            says(
+                "Nothing waits for this agent in the shared channels it subscribes to.",
+                &[]
+            )
+        );
+        assert_eq!(
+            crate::msg_cmd::says::TO_OR_CHANNEL,
+            "Give one of --to <name>, --all and --channel <name>."
+        );
+        assert!(RECORD.contains(crate::msg_cmd::says::TO_OR_CHANNEL));
+        // §5.1, the help of `cordelia channels`.
+        let help = Cli::command()
+            .find_subcommand("channels")
+            .and_then(|command| command.get_about().map(|about| about.to_string()))
+            .unwrap();
+        assert!(RECORD.contains(&format!("\"{help}\"")), "{help}");
+        assert!(RECORD.contains("Its help says today \"List subscribed channels\""));
+    }
 
     /// `cordelia accept <key>` and `cordelia accept <key> --channel <name>`
     /// are two commands on two paths (decision 2026-10-10 §3.2): the
