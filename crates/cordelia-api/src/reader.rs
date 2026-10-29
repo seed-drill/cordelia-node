@@ -285,8 +285,9 @@ pub fn read_held_lists(
 /// upgrade"), as [`read_held_lists`] reads the lists of step 20: where the
 /// device stands applied, the entry its store holds in `sread/<key>` of
 /// each key that counts is read through the reader, as though the store had
-/// just kept it, with the time the store kept it as its first holding; each
-/// signer's count of entries that were not messages is set to 0; and the
+/// just kept it, with the time the store kept it as its first holding; the
+/// count of entries that were not messages of each signer whose list it
+/// read is set to 0, and no other signer's; and the
 /// key of `node_meta` that says it was done is written: all three in one
 /// transaction, at `now`. Where the device does not stand applied, nothing
 /// is done, and it is done at a later call once it does. Returns whether it
@@ -325,9 +326,15 @@ pub fn read_held_shared_lists(
             };
             let entry = stored.entry.check()?;
             taken(conn, &own, &secret, statement, &entry, stored.stored_at)?;
-        }
-        conn.execute("UPDATE message_signers SET not_messages = 0", [])
+            // Only a signer whose list the version before counted: the
+            // count of any other signer, made before or after the step,
+            // stays.
+            conn.execute(
+                "UPDATE message_signers SET not_messages = 0 WHERE signer = ?1",
+                [&key[..]],
+            )
             .map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))?;
+        }
         meta::set(conn, meta::MESSAGES_SREAD_LISTS_READ, &now.to_string())?;
         Ok(true)
     })

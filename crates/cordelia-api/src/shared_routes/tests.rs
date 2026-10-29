@@ -718,7 +718,7 @@ fn a_reply_goes_only_where_its_message_came_from() {
 /// (decision 2026-10-10 §14): an `sread/` list that a device stored while
 /// it was of the version before, counted then among its signer's entries
 /// that were not messages, is read through the reader at the first start
-/// after the step, and that count is 0.
+/// after the step, and that signer's count is 0, and no other's.
 #[test]
 fn sread_lists_held_before_the_upgrade_are_read_after_it() {
     let (s, channel) = devices(2);
@@ -739,21 +739,41 @@ fn sread_lists_held_before_the_upgrade_are_read_after_it() {
     });
     let list = list.expect("device 0's sread list");
     cordelia_storage::entries::store(&s[1].conn, &list, t + 2).unwrap();
+    // Device 1 counted it as no message of device 0's; and another
+    // signer's count of its own stays.
     s[1].conn
-        .execute("UPDATE message_signers SET not_messages = 1", [])
+        .execute(
+            "INSERT OR IGNORE INTO message_generations (id, channel, statement, first_held)
+             VALUES (99, zeroblob(32), 1, 0)",
+            [],
+        )
         .unwrap();
+    for signer in [s.key(0), member(1).public_key()] {
+        s[1].conn
+            .execute(
+                "INSERT INTO message_signers (signer, generation, highest, not_messages)
+                 VALUES (?1, 99, 0, 1)",
+                [&signer[..]],
+            )
+            .unwrap();
+    }
     assert_eq!(unread(&s, 1, "notes", t + 3), std::slice::from_ref(&id));
     assert!(crate::reader::read_held_shared_lists(&s[1].conn, &s[1].identity, t + 3).unwrap());
     assert!(unread(&s, 1, "notes", t + 4).is_empty());
-    let not_messages: i64 = s[1]
+    // Only the count of the signer whose list it read is 0: another
+    // signer's stays.
+    let counts: Vec<([u8; 32], i64)> = s[1]
         .conn
-        .query_row(
-            "SELECT COALESCE(SUM(not_messages), 0) FROM message_signers",
-            [],
-            |row| row.get(0),
-        )
+        .prepare("SELECT signer, not_messages FROM message_signers")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(not_messages, 0);
+    assert!(counts.len() >= 2, "{counts:?}");
+    for (signer, count) in counts {
+        assert_eq!(count, i64::from(signer != s.key(0)), "{signer:?}");
+    }
     // Once.
     assert!(!crate::reader::read_held_shared_lists(&s[1].conn, &s[1].identity, t + 5).unwrap());
 }
