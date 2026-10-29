@@ -1793,6 +1793,24 @@ impl DeviceEntries {
         }
     }
 
+    /// On the machine of a recovery, make anew each shared channel it owes
+    /// that, once it was read since the node started (decision 2026-10-10
+    /// §3.5; [`cordelia_api::shared_anew::make_owed`]): so that every key
+    /// of its table stays.
+    fn shared_make_owed(&self) {
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        match cordelia_api::shared_anew::make_owed(&db, &self.state.identity, self.unix(), &fetched)
+        {
+            Ok(0) => {}
+            Ok(made) => {
+                tracing::info!(made, "made shared channels anew after a recovery");
+                self.state.own_channels.written();
+            }
+            Err(e) => tracing::debug!(error = %e, "could not make a shared channel anew"),
+        }
+    }
+
     /// Read once the lists of a person's reads and of bounds that the store
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
@@ -3562,7 +3580,7 @@ impl DeviceEntries {
         // §6.1).
         self.shared_write_again();
         let channels = self.shared_at(link);
-        if channels.is_empty() {
+        if channels.is_empty() && self.shared_delivering_at(link).is_empty() {
             return;
         }
         if kind == Pass::Whole {
@@ -3584,8 +3602,23 @@ impl DeviceEntries {
             if !self.shared_pages(link, &proved).await {
                 return;
             }
+            self.shared_make_owed();
         }
-        self.shared_pushes(link, &channels).await;
+        // A channel moved from whose offer waits to be at this relay is
+        // pushed there, its offer alone (decision 2026-10-10 §7).
+        let mut pushed = channels.clone();
+        pushed.extend(self.shared_delivering_at(link));
+        self.shared_pushes(link, &pushed).await;
+    }
+
+    /// The shared channels moved from whose offer waits to be at the relay
+    /// of `link`, known there by its key.
+    fn shared_delivering_at(&self, link: &Link) -> Vec<[u8; 32]> {
+        let key = link.relay().0;
+        if self.id_of(link).key != Some(key) {
+            return Vec::new();
+        }
+        shared_pass::delivering_at(&lock(&self.state.db), &key).unwrap_or_default()
     }
 
     /// Prove the key of the shared channel `channel` at `link`, where it was

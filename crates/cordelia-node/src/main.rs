@@ -648,6 +648,46 @@ enum SharedCommand {
         #[arg(long, value_name = "FOUR WORDS")]
         words: Option<String>,
     },
+    /// Make a shared channel anew, choosing who stays, key by key
+    ///
+    /// Run it in a terminal. It lists every key this device has held or
+    /// refused in the channel, and asks of each whether it stays. Those
+    /// who stay move with `cordelia shared move` on one of their devices.
+    Anew {
+        name: String,
+        /// A relay of yours for the new channel, as your configuration
+        /// names it (host:port); with none, the old channel's
+        #[arg(long = "relay", value_name = "RELAY")]
+        relays: Vec<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Move to a channel made anew, in the old one's place
+    ///
+    /// Run it in a terminal, on a device the new channel is sealed to.
+    Move {
+        name: String,
+        /// The new channel's four words, where it was made anew twice
+        #[arg(long, value_name = "CHANNEL WORDS")]
+        to: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Go on writing in a channel paused by an offer to move
+    ///
+    /// Run it in a terminal. The keys the offer leaves out read what is
+    /// written there.
+    Stay {
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
     /// Stop holding a shared channel, on every device of yours
     ///
     /// Run it in a terminal. Its other members are not told.
@@ -895,6 +935,17 @@ fn main() -> anyhow::Result<()> {
             } => shared_cmd::rename(&cli.config, &name, &new_name, words.as_deref()),
             SharedCommand::Drop { name, words } => {
                 shared_cmd::drop(&cli.config, &name, words.as_deref())
+            }
+            SharedCommand::Anew {
+                name,
+                relays,
+                words,
+            } => shared_cmd::anew(&cli.config, &name, &relays, words.as_deref()),
+            SharedCommand::Move { name, to, words } => {
+                shared_cmd::move_to(&cli.config, &name, to.as_deref(), words.as_deref())
+            }
+            SharedCommand::Stay { name, words } => {
+                shared_cmd::stay(&cli.config, &name, words.as_deref())
             }
         },
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
