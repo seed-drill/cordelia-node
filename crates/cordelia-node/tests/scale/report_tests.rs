@@ -246,8 +246,9 @@ fn histogram(
     lines
 }
 
-/// The waits and the holds of one kind, pull, at relay 1.
+/// The waits and the holds of one kind, pull unless it says, at relay 1.
 struct Takes<'a> {
+    kind: &'a str,
     waits: &'a [(u64, f64)],
     wait_over: &'a [(u64, f64)],
     wait_most: Option<f64>,
@@ -260,6 +261,7 @@ const FAST: [(u64, f64); 1] = [(64, 100.0)];
 impl Default for Takes<'_> {
     fn default() -> Self {
         Takes {
+            kind: "pull",
             waits: &FAST,
             wait_over: &[(5, 0.0), (10, 0.0), (50, 0.0)],
             wait_most: None,
@@ -275,14 +277,14 @@ fn bar_4_with(takes: Takes) -> Line {
     window(&run, 0.0, 200.0);
     let mut lines = histogram(
         &format!("{LOCK}_wait_microseconds"),
-        "pull",
+        takes.kind,
         takes.waits,
         takes.wait_over,
         takes.wait_most,
     );
     lines.extend(histogram(
         &format!("{LOCK}_hold_microseconds"),
-        "pull",
+        takes.kind,
         takes.holds,
         &[(5, 0.0), (10, 0.0), (50, 0.0)],
         takes.hold_most,
@@ -423,6 +425,54 @@ fn the_most_held_settles_a_p99_in_the_bucket_that_holds_the_bar_where_it_is_with
     };
     assert_eq!(waited(10_000.0).verdict, Verdict::Pass);
     assert_eq!(waited(10_001.0).verdict, Verdict::NotResolved);
+}
+
+/// Stage 190's relay 1, seed 1: its waits of kind sweep, 131 takes, 2 over
+/// 10 ms (the most 10,648 µs), in the minute of its hourly sweep. Bar 4 (a)
+/// bars the waits of a device's requests alone: the sweep's p99 is over
+/// 10 ms and is reported, and the bar passes. A request's kind with the
+/// same waits fails it.
+#[test]
+fn bar_4_bars_the_wait_of_a_devices_request_and_reports_the_relays_own() {
+    let waits = [(4096, 129.0), (16384, 2.0)];
+    let of = |kind| {
+        bar_4_with(Takes {
+            kind,
+            waits: &waits,
+            wait_over: &[(5, 2.0), (10, 2.0), (50, 0.0)],
+            wait_most: Some(10_648.0),
+            ..Takes::default()
+        })
+    };
+    let sweep = of("sweep");
+    assert_eq!(sweep.verdict, Verdict::Pass, "{}", sweep.figure);
+    assert!(
+        sweep.figure.contains(
+            "the relay's own wait p99 at most 16.4 ms (sweep, fail; 2 of 131 over 10 ms; \
+             reported, not barred)"
+        ),
+        "{}",
+        sweep.figure
+    );
+    for kind in ["show_whole", "show_short", "proof", "pull", "push"] {
+        let request = of(kind);
+        assert_eq!(request.verdict, Verdict::Fail, "{kind}: {}", request.figure);
+        assert!(
+            request.figure.contains(&format!(
+                "a request's wait p99 at most 16.4 ms ({kind}, fail; 2 of 131 over 10 ms)"
+            )),
+            "{}",
+            request.figure
+        );
+    }
+    for kind in ["relays", "checkpoint", "api", "other"] {
+        assert_eq!(
+            of(kind).verdict,
+            Verdict::Pass,
+            "{kind}: {}",
+            of(kind).figure
+        );
+    }
 }
 
 // ── Medium 8: a device is excused only by its own proofs and carry ──

@@ -1319,6 +1319,13 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
 
 const LOCK: &str = "cordelia_lock";
 const READS: [&str; 3] = ["pull", "show_short", "proof"];
+/// The kinds of take of the requests a device makes of a relay, on the
+/// streams of entries 0x10 to 0x13: the kinds whose waits bar 4 (a) bars.
+/// A device gives each up after STREAM_TIMEOUT_SECS. The relay's other
+/// kinds (the streams between relays and its own passing on and pulls,
+/// its sweeps and the uses it writes, its checkpoint, its API and any
+/// other) have their waits reported: no device's request waits on them.
+const REQUESTS: [&str; 5] = ["show_whole", "show_short", "proof", "pull", "push"];
 const RELAY_TAKES: [&str; 10] = [
     "show_whole",
     "show_short",
@@ -1434,9 +1441,12 @@ fn bar_4(read: &Read) -> Line {
     let mut verdict = Verdict::Pass;
     for r in 0..read.run.plan.relays {
         let series = relay_series(read, r);
-        let mut worst_wait = (0u64, "", Verdict::Pass);
+        // The worst wait p99 of a request's kind, which is barred, and of
+        // the relay's own, which is reported: each with its kind, its
+        // verdict and its count over 10 ms of its waits.
+        let mut worst_wait = (0u64, "", Verdict::Pass, None);
+        let mut worst_own = (0u64, "", Verdict::Pass, None);
         let mut worst_read = (0u64, "", Verdict::Pass);
-        let mut worst_over_10 = None;
         let (mut over_250, mut over_50) = (0.0, 0.0);
         for kind in RELAY_TAKES {
             let label = format!("kind=\"{kind}\"");
@@ -1481,11 +1491,20 @@ fn bar_4(read: &Read) -> Line {
                     _ => p99_against(n, w[0], 10_000, over_10, most),
                 };
                 let w99 = w[0].unwrap_or(u64::MAX);
-                if w99 > worst_wait.0 {
-                    worst_wait = (w99, kind, judged);
-                    worst_over_10 = over_10.map(|ten| (ten, n));
+                let request = REQUESTS.contains(&kind);
+                let worst = match request {
+                    true => &mut worst_wait,
+                    false => &mut worst_own,
+                };
+                if w99 > worst.0 {
+                    *worst = (w99, kind, judged, over_10.map(|ten| (ten, n)));
                 }
-                verdict = worse(verdict, judged);
+                // Only a request's wait is barred (bar 4 (a)): nothing
+                // waits on the relay's own takes, whose holds (c) and (d)
+                // bar for the requests they hold up.
+                if request {
+                    verdict = worse(verdict, judged);
+                }
             }
             if READS.contains(&kind) {
                 let (n, h) = quantiles(
@@ -1520,35 +1539,42 @@ fn bar_4(read: &Read) -> Line {
         if over_250 > 0.0 || over_50 > 10.0 || most_share > 0.25 {
             verdict = Verdict::Fail;
         }
-        let named = |worst: &(u64, &str, Verdict)| match worst.1.is_empty() {
+        let named = |kind: &str, verdict: Verdict| match kind.is_empty() {
             true => "none".to_string(),
-            false => format!("{}, {}", worst.1, worst.2.word().to_lowercase()),
+            false => format!("{kind}, {}", verdict.word().to_lowercase()),
         };
-        let counted = match worst_over_10 {
+        let counted = |over_10: Option<(f64, f64)>| match over_10 {
             Some((ten, n)) => format!("; {ten:.0} of {n:.0} over 10 ms"),
             None => String::new(),
         };
         said.push(format!(
-            "relay {}: wait p99 at most {} ({}{counted}), a read's hold p99 at most {} ({}), \
-             {over_250:.0} other holds over 250 ms and {over_50:.0} over 50 ms, the lock held at \
-             most {:.1}% of a minute",
+            "relay {}: a request's wait p99 at most {} ({}{}), the relay's own wait p99 at most {} \
+             ({}{}; reported, not barred), a read's hold p99 at most {} ({}), {over_250:.0} other \
+             holds over 250 ms and {over_50:.0} over 50 ms, the lock held at most {:.1}% of a \
+             minute",
             r + 1,
             us(Some(worst_wait.0)),
-            named(&worst_wait),
+            named(worst_wait.1, worst_wait.2),
+            counted(worst_wait.3),
+            us(Some(worst_own.0)),
+            named(worst_own.1, worst_own.2),
+            counted(worst_own.3),
             us(Some(worst_read.0)),
-            named(&worst_read),
+            named(worst_read.1, worst_read.2),
             most_share * 100.0
         ));
     }
     Line {
         title: "A relay's lock, by kind".into(),
         figure: said.join("; "),
-        bar: "each kind's wait p99 at most 10 ms; a read's hold p99 at most 1 ms; every other \
-              hold under 250 ms and at most 10 over 50 ms; held at most a quarter of any minute \
-              (a p99 is read as its bucket's bound, a power of two of µs; where its bucket holds \
-              the bar, a wait's p99 is settled by the count over 10 ms, within the bar where at \
-              most 1% are over it, and a read's hold by its most, where that is at most 1 ms; NOT \
-              RESOLVED only where nothing counted settles it)"
+        bar: "the wait p99 of each kind of a device's request (show_whole, show_short, proof, \
+              pull, push) at most 10 ms, the relay's own kinds' waits reported and not barred; a \
+              read's hold p99 at most 1 ms; every other hold under 250 ms and at most 10 over 50 \
+              ms; held at most a quarter of any minute (a p99 is read as its bucket's bound, a \
+              power of two of µs; where its bucket holds the bar, a wait's p99 is settled by the \
+              count over 10 ms, within the bar where at most 1% are over it, and a read's hold by \
+              its most, where that is at most 1 ms; NOT RESOLVED only where nothing counted \
+              settles it)"
             .into(),
         verdict,
     }
