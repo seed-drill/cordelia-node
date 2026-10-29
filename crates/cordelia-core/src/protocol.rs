@@ -1532,7 +1532,8 @@ pub const REMOVAL_TAKEN_MARGIN_SECS: u64 = 2 * MAX_CLOCK_SKEW_SECS;
 /// and each link that stands in a stored chain more times than in any
 /// chain of the file stored before, with its key, generation and time.
 /// The oldest go first past it, and a cut time before the oldest kept
-/// takes the file back to before it, which fails safe.
+/// takes the file back to the version before the first event that went,
+/// which fails safe.
 pub const MAX_FILE_ARRIVALS: usize = 1024;
 
 /// How long a device keeps the secret of a generation it left (decision

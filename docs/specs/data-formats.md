@@ -1163,11 +1163,18 @@ CREATE TABLE file_arrivals (                        -- v24
 CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
 
 CREATE TABLE file_arrivals_dropped (                -- v24
-    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
-    slot        BLOB NOT NULL CHECK(length(slot) = 32),
-    number      INTEGER NOT NULL,
-    hash        BLOB NOT NULL CHECK(length(hash) = 16),
-    newest_at   INTEGER NOT NULL,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL,
+    hash                BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at           INTEGER NOT NULL,
+    first_place         INTEGER NOT NULL,
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB,
     PRIMARY KEY (channel_id, slot, number, hash)
 );
 
@@ -1192,7 +1199,7 @@ CREATE TABLE person_clear_mark (                    -- v21
 | `person_removed_keys_by` | For a key that rule 6 removed, the removed key whose record added it after that key's cut time, or in a generation made apart from its removal. Its cut is that key's | decision 2026-10-24 (removal), rule 6 |
 | `person_removed_keys_spared` | A key that the person said, at the terminal of a recovery made on this device, is a device they still have, with that change's number. Rule 6 does not remove it: it is added again (decision 2026-10-04 §9, step 6) | decision 2026-10-24 (removal), rule 6 |
 | `file_arrivals_stored`, `file_arrivals` | For each file, by its channel and slot, each entry the door stored that made arrivals: the generation it came in (the change followed, by number and hash), when it was stored, the version current before it as one entry (sealed again as this device's own at each carry), and, where its chain was full, the other keys its links name; and each arrival, a key's first 16 bytes and, for a link, its hash and how many times it stands. A carry goes back to the version before the first arrival it cuts, and leaves out that arrival and everything after it. At most 1,024 arrivals a file (`MAX_FILE_ARRIVALS`), the oldest going first | decision 2026-10-24 (removal), rule 7 |
-| `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound: judged as an arrival of every removed key, so that a cut time before the oldest kept takes the file back to before it | decision 2026-10-24 (removal), rule 7 |
+| `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound, judged as an arrival of every removed key, and the place of the first event of it that went with the version current before that event (sealed again at each carry, as the events' are): where what went is cut, the file goes back to that version, and not to before the oldest event kept, which a removed key may have written | decision 2026-10-24 (removal), rule 7 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |
@@ -1335,7 +1342,9 @@ CREATE TABLE sync_files (
   mark goes when the record is saved again. `file_line_from (folder,
   channel_id, file, from_signers)` holds, for a record of `index_lines`, the
   keys (32 bytes each) that signed the version its line was removed from:
-  no line is put back from a version that a removed key signed. Both move
+  no line is put back from a version that a removed key signed, where the
+  cut would leave out what that key wrote in the generation the device
+  follows, judged at the time of the put-back. Both move
   with the folder's records, and go with them.
 
 ### 10.7 Messages Between the Person's Own Agents (v19; decision 2026-10-09 §2.3, §2.5, §6, §7, §9.2)

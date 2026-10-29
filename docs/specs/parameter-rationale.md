@@ -1853,8 +1853,13 @@ signed, and each link that stands in a stored chain more times than in any
 chain of the file stored before, with its key, the generation and the time
 the device stored it, and the version current before it, to go back to.
 Kept per file across carries. Past the bound the oldest go first, and the
-newest time of what went is kept for each generation: a cut time before
-the oldest kept takes the file back to before it, which fails safe.
+newest time of what went is kept for each generation, with the version
+before the first event of it that went: where what went is cut, the file
+goes back to that version, which fails safe. Not to before the oldest
+event kept: the bound counts arrivals, and a removed key chooses its own
+chain, so one version with 100 links of its own is 101 arrivals, and a
+dozen late versions push its first one out; the oldest kept would then go
+back to its own late version.
 
 **What it costs:** a busy file that other devices write fills it faster,
 each version of theirs being one or two arrivals; the device's own versions
