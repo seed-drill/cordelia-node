@@ -1378,3 +1378,146 @@ fn a_message_from_your_own_device_is_your_own() {
         out_of(&next)
     );
 }
+
+/// The agents of the folders of the person's own in
+/// [`a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_the_device_that_made_them`].
+const NOTES: &str = "github.com/owner/notes";
+const WORK: &str = "github.com/owner/work";
+
+/// The subscriptions in force on `n`, as `(agent, channel's name)`, in
+/// order.
+fn subscriptions_on(n: &Node) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = listed(n)["subscriptions"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["agent"].as_str().unwrap_or_default().to_string(),
+                        row["channel"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// The starts of the subscriptions `node` holds, by agent, read from its
+/// database.
+fn starts_at(node: &Node) -> Vec<(String, i64)> {
+    let db = rusqlite::Connection::open_with_flags(
+        node.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.prepare("SELECT agent, start FROM shared_msg_subscribed ORDER BY agent")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A subscription and an unsubscription survive a statement and the
+/// removal of the device that made them (decision 2026-10-10 §3.4, §4.1,
+/// T16): Alice's tablet subscribes her `notes` folder to a channel shared
+/// with Bob, and unsubscribes her `work` folder, which her laptop had
+/// subscribed. Her laptop then makes a change, and then removes the
+/// tablet. On the laptop and the phone, `notes` still subscribes with the
+/// start each took, `work` does not, and a message Bob sends after is
+/// unread for `notes` alone.
+#[test]
+fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_the_device_that_made_them()
+ {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let bob = person("desktop", &relay);
+    let phone = device_started_with_its_relays_key("phone", &relay);
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let all = [&relay, &laptop, &bob, &phone, &tablet];
+    for (device, label) in [(&phone, "phone"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    makes(&laptop, "review", &[]);
+    shares(&laptop, "review", &key_of(&bob));
+    accepting(&bob, &key_of(&laptop), "review").ends();
+    holds_in_the_end(&all, &bob, "review");
+    for device in [&phone, &tablet] {
+        holds_in_the_end(&all, device, "review");
+    }
+    let bob_dir = maps_folder(&bob, "repo", AGENT);
+    let notes: Vec<_> = [&laptop, &phone, &tablet]
+        .iter()
+        .map(|n| maps_folder(n, "notes", NOTES))
+        .collect();
+    let work: Vec<_> = [&laptop, &phone, &tablet]
+        .iter()
+        .map(|n| maps_folder(n, "work", WORK))
+        .collect();
+    subscribes(&bob, &bob_dir, "review");
+
+    // The laptop subscribes `work`; the tablet takes it, subscribes
+    // `notes`, and unsubscribes `work`.
+    subscribes(&laptop, &work[0], "review");
+    let only_work = vec![(WORK.to_string(), "review".to_string())];
+    wait_for("the tablet holds work's subscription", &all, 300, || {
+        (subscriptions_on(&tablet) == only_work).then_some(())
+    });
+    subscribes(&tablet, &notes[2], "review");
+    let said = tablet.cli(&["unsubscribe", "review", "--agent", WORK]);
+    assert!(said.starts_with("Unsubscribed: "), "{said}");
+    let only_notes = vec![(NOTES.to_string(), "review".to_string())];
+    for device in [&laptop, &phone] {
+        wait_for("the tablet's acts are held", &all, 300, || {
+            (subscriptions_on(device) == only_notes).then_some(())
+        });
+    }
+    let before: Vec<_> = [&laptop, &phone].iter().map(|n| starts_at(n)).collect();
+    for starts in &before {
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0].0, NOTES);
+    }
+
+    // A statement, and then the tablet's removal.
+    let mut at = renews(&laptop, &["stays", "stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    has_applied(&phone, 2, &all);
+    let mut at = removes(&laptop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3)");
+    drop(at);
+    has_applied(&phone, 3, &all);
+    let after_removal = [&relay, &laptop, &bob, &phone];
+    for (n, device) in [&laptop, &phone].into_iter().enumerate() {
+        assert_eq!(subscriptions_on(device), only_notes);
+        assert_eq!(
+            starts_at(device),
+            before[n],
+            "{}: the start is kept",
+            device.name
+        );
+    }
+
+    // A message Bob sends after is unread for `notes` alone.
+    sends_into(
+        &[&relay, &bob],
+        &bob,
+        &bob_dir,
+        "review",
+        &[],
+        "after the removal",
+    );
+    for (n, device) in [&laptop, &phone].into_iter().enumerate() {
+        wait_for("notes is shown Bob's message", &after_removal, 300, || {
+            (summary_in(device, &notes[n]) == shared_line(1)).then_some(())
+        });
+        assert_eq!(summary_in(device, &work[n]), "");
+    }
+}
