@@ -1418,7 +1418,7 @@ which change was made after which (decision 2026-10-24 rule 13). Each
 sealed part is one size whatever it says.
 
 **Why the part for the devices is fixed, and not derived:** a device of
-the version before (0.2.0-alpha.16) opens that part at this place and of
+the version before (`v0.2.0-alpha.17` or earlier) opens that part at this place and of
 this size. It was derived there as what the part for the phrase leaves;
 left so, it would grow to 31,744 bytes when the part for the phrase
 shrinks, and every device of the version before would refuse every new
@@ -1690,8 +1690,9 @@ with a label at its longest and the signature.
 
 #### CHANGE_ENTRY_NAME = "change", HAND_OVER_NAME = "hand-over"
 
-**Rationale:** The phrase's channel holds one entry, and a pair channel is
-read for one. Each has one name, so that nothing else there is read. The
+**Rationale:** The phrase's channel holds the change entry (one, or one for
+each head a relay keeps, decision 2026-10-24 (removal), rule 14), and a
+pair channel is read for one. Each has one name, so that nothing else there is read. The
 change entry's slot is under the channel's ID and not under a key of the
 channel: a device holds no key of the phrase's channel, and has to know the
 change entry's slot from any other.
@@ -1977,9 +1978,13 @@ new one starts with none (decision 2026-10-17 §4).
 #### MAX_SLOTS_SHOWN_ON_A_CONNECTION = 8
 
 **Rationale:** The most slots for which a relay remembers, for one
-connection, the last entry it was shown whole there. A device shows one
-entry, the change entry of the phrase it follows, so 8 is room to spare. A
-ninth is not remembered, and is shown whole each time.
+connection, the entries it was shown whole or handed whole there. In each
+slot it remembers up to 16: twice `MAX_CHANGE_HEADS`, for the 8 heads a
+relay can keep there and the 8 a device can keep. That 16 has no constant
+of its own. A device shows the entries of one slot, the change
+entries of the phrase it follows, so 8 slots is room to spare. A ninth slot
+is not remembered: a short show there is answered `whole`, so the device
+shows whole each time.
 
 #### CHANNEL_MARK_BYTES = 8
 

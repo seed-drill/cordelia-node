@@ -34,8 +34,9 @@
 //! ```
 //!
 //! The part for the devices is where, and as large as, it is in the layout
-//! of the version before (0.2.0-alpha.16), whose part for the phrase was
-//! the last 4096 bytes and which had no lineage ([`Layout::Before`]). A
+//! of the version before (v0.2.0-alpha.17 and earlier), whose part for
+//! the phrase was the last 4096 bytes and which had no lineage
+//! ([`Layout::Before`]). A
 //! device of that version opens the part for the devices of an entry of
 //! this layout as it opens its own; its commands, which open the part for
 //! the phrase at 4096 bytes, find that it does not open, and refuse
@@ -245,9 +246,9 @@ pub enum DeviceSecret {
 /// The layout of a change entry's content (decision 2026-10-24 rule 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
-    /// The layout of the version before (0.2.0-alpha.16): the part for the
-    /// devices, and the part for the phrase in the last 4096 bytes. No
-    /// lineage.
+    /// The layout of the version before (v0.2.0-alpha.17 and earlier):
+    /// the part for the devices, and the part for the phrase in the last
+    /// 4096 bytes. No lineage.
     Before,
     /// The part for the devices where it was, the part for the phrase in
     /// 1024 bytes after it, and the lineage in the last 3072.
@@ -946,8 +947,8 @@ impl fmt::Debug for DeviceSecret {
     }
 }
 
-/// The change entry as the version before (0.2.0-alpha.16) makes and opens
-/// it, for the tests of the two layouts (decision 2026-10-24 rule 13, §6).
+/// The change entry as the version before (v0.2.0-alpha.17 and earlier)
+/// makes and opens it, for the tests of the two layouts (decision 2026-10-24 rule 13, §6).
 ///
 /// Its rules are those of that version's `change_entry.rs`, with its sizes
 /// written out as it derived them: the content is 32768 bytes, the part for

@@ -825,8 +825,8 @@ fn of_its_person(
             made_on(conn, held)?
         )),
         // Closed with no head set aside: what it knows of removals grew
-        // with no change kept, and its way on in this slice of the build
-        // is a change made here (decision 2026-10-24 (removal), rule 10).
+        // with no change kept, and its way on is a change made here
+        // (decision 2026-10-24 (removal), rule 10).
         State::Fork if look.set_aside.is_empty() => {
             look.short = Some(CLOSED_SHORT.into());
             look.says.push(CLOSED_WHY.into());
@@ -863,14 +863,12 @@ pub const SET_ASIDE_SHORT: &str = "a change made apart is set aside";
 /// command that a closed device refuses says.
 pub const CLOSED_SHORT: &str = "a removed device holds the secret this device follows";
 
-/// Why a closed device cannot go on, and the way on (decision 2026-10-24
-/// (removal), rules 3, 4 and 10). In this slice of its build the way on is
-/// a change made with the phrase on this device, which lists no removed
-/// device.
-pub const CLOSED_WHY: &str = "a device that was removed holds the secret of the change this \
-     device follows, as far as it knows: this device seals nothing, sends nothing and takes \
-     nothing in a channel of its own, and keeps new content in its folders. Make a change \
-     with the recovery phrase here (`cordelia renew`)";
+/// Why a closed device that keeps no change made apart cannot go on, and
+/// the way on (decision 2026-10-24 (removal), rules 3, 4 and 10): a change
+/// made here with the phrase, which lists no removed device.
+pub const CLOSED_WHY: &str = "a removed device holds the secret of the change this device \
+     follows, so this device sends nothing and takes nothing, and keeps what is new in its \
+     folders. To go on, run `cordelia renew` here and type your recovery phrase";
 
 /// Why a device whose own key is among those it knows to be removed
 /// cannot go on, in a few words (decision 2026-10-24 (removal), rule 2).

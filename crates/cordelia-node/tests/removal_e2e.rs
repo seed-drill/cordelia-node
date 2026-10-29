@@ -212,7 +212,7 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
     });
     let (_, why) = stands(&laptop);
     assert!(
-        why.contains("a device that was removed holds the secret"),
+        why.contains("a removed device holds the secret of the change"),
         "{why}"
     );
     assert_eq!(person_of(&laptop)["change"].as_u64(), Some(2));

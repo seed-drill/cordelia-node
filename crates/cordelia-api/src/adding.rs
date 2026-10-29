@@ -3933,7 +3933,7 @@ mod tests {
         s.hold(&[0, 1, 2, 3], "notes");
         s.write(1, "notes", "a.md", "one");
         // Device 1 knows device 2 to be removed, on a branch it has seen
-        // (set so by hand: no branch is kept in this slice).
+        // (set so by hand: the test keeps no branch).
         held_rows::keep_removed(&s[1].conn, &[s.key(2)], s.now).unwrap();
         let before = s[1].everything();
         let removed_before = held_rows::removed_keys(&s[1].conn).unwrap();

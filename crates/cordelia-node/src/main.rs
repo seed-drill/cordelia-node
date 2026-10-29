@@ -253,8 +253,9 @@ enum Commands {
     /// without saying that you can. Any status other than 0, 1 and 2 means
     /// that the change is made: do not make it again.
     Renew,
-    /// Settle two changes that were made apart, with the recovery
-    /// phrase, on a device that has seen both. Asks at a terminal.
+    /// Join changes that were made apart, with your recovery phrase.
+    /// Run it on a device that keeps a change made apart. Asks at a
+    /// terminal.
     ///
     /// Keep this machine on until the command says you can close it.
     /// Where a relay that is not known to hold the change cannot be

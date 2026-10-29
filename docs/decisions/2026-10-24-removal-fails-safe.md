@@ -1,13 +1,13 @@
 # Decision: a removal fails safe
 
 **Date**: 2026-10-24
-**Status**: Proposed. Not built. Revised three times after its reviews. Settled for build after the third read (25 October).
+**Status**: Built, but for shared channels (rules 23 to 26, test 9), which are built with the shared record. Revised three times after its reviews. Settled for build after the third read (25 October), and built in nine slices (section 14). Of section 5, items 1 to 28 and 34 to 36 are made in the records and documents named; items 29 to 33 and 37 are of the shared record, which is not on this branch, and are made where it is built. Test 3 of section 7 was not built in any slice (section 14).
 **Cited as**: "decision 2026-10-24 rule 7", "decision 2026-10-24 §8". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
 
 - **The record of 2026-10-04** is [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md). **The record of 2026-10-19** is [`2026-10-19-a-relay-out-of-reach.md`](2026-10-19-a-relay-out-of-reach.md). **The record of relays** is [`2026-10-17-a-devices-relays-and-connections.md`](2026-10-17-a-devices-relays-and-connections.md). **The messages record** is [`2026-10-09-messages-between-your-own-agents.md`](2026-10-09-messages-between-your-own-agents.md). **The shared record** is `2026-10-10-a-shared-channel-for-messages.md`, on the branch `docs/shared-converge`: settled, and not built.
-- **This version** is the first that carries what is below. **The version before** is 0.2.0-alpha.16. **Main** is commit abcc079d: every file and line below is of main.
+- **This version** is the first that carries what is below. **The version before** is any version before this one: `v0.2.0-alpha.17` or earlier. **Main** is commit abcc079d: every file and line below is of main.
 - **A change** is a statement and its change entry (the record of 2026-10-04, 4.1 and 4.6). **Change n** is a change whose statement is numbered n. Two changes can have one number.
 - **Made after.** A change is made after each change on its chain. **Made apart:** neither is on the other's chain (the record of 2026-10-04, 4.5).
 - **A head,** on a device or at a relay, is a change that it keeps and that no other change it keeps was made after.
@@ -167,7 +167,7 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 
 - It keeps new content on the device: its folders keep their files, and nothing is published. What waits stays in its store.
 - It shows each relay the heads that rule 18 says, and has no leave anywhere.
-- It says, in red on its status line and in `cordelia devices`: "two changes were made apart, and none that lists this device is clear of a removed device: settle it with the phrase (`cordelia settle`)", with the lists of each head.
+- It says, in red on its status line and in `cordelia devices`: "two changes were made apart, and none that lists this device is clear of a removed device: settle it with the phrase (`cordelia settle`)", with the lists of each head. Where it keeps no head set aside (what it knows of removals grew, with no change kept), `settle` has nothing to join and refuses; the device says instead that a removed device holds the secret of the change it follows, and asks for a change made with the phrase there (`cordelia renew`).
 - It leaves the state by rule 8, when it is shown a clear change that counts it: the settlement, or a change made after it.
 - `cordelia add-device` and the commands of `msg` refuse there, as in a fork today. `cordelia accept` takes there only a hand-over whose change is clear and counts this device (rule 8): it is how a closed device is added again. `cordelia remove-device`, `cordelia renew` and `cordelia settle` there make the settlement (rule 21).
 - **Where:** `held_rows::set_state`, `at_relays::stands` (`at_relays.rs` 123), `device_entries::pass_at` (`device_entries.rs` 1006) and `say` (2921).
@@ -368,7 +368,7 @@ Each is given as it reads today, and as it would read. Where this is built, it a
 
 ## 6. A device of the version before
 
-**What a device of 0.2.0-alpha.16 meets.**
+**What a device of `v0.2.0-alpha.17` or earlier meets.**
 
 - **A change entry made on this version.** It opens the part for the devices, which has not moved and keeps its size (rule 13), and applies the change as any; its check of the zeros is inside that part. Its node never opens the part for the phrase. **Its commands cannot make a change over such an entry:** `cordelia remove-device`, `renew`, `settle`, `sync carry --phrase` and `recover` of the version before open the part for the phrase at its old place, find that it does not open, and refuse. A change is made on a device of this version.
 - **A relay of this version that keeps two heads.** It is handed the other with today's answer (`Another`), judges a fork as today, and stops. It fails closed. A device behind both is handed the lower first, applies it where it can, and is then handed the other, and stops. A relay of this version hands no change that is behind another it keeps, nor one behind the entry shown, which it takes first (rules 14 and 16).
@@ -432,7 +432,7 @@ Each is given as it reads today, and as it would read. Where this is built, it a
 
 18. **`a_closed_device_shows_every_head_at_a_relay_that_keeps_heads`** (with real processes). The laptop uses relays A and B; a work laptop uses relay A alone; the desktop uses relay B; the relays are not listed together. The laptop removes the phone (its change 3); the desktop removes the tablet (its change 3), and then renews (change 4). It asserts: the laptop is closed; the work laptop is handed the desktop's change 4 at relay A and closes; no entry that the work laptop signed reaches relay A in a channel of the laptop's change 3 after that. Then relay A is replaced by a stand-in that names no role `heads`: the laptop does not show it change 4 there. Taken out: rule 18's showing at a relay that names the role (the work laptop goes on: the second fails); its bar at one that does not (the last fails).
 
-The threat model's T16 names tests 1, 2, 6, 7 and 18, and T20 names tests 3 and 5.
+The threat model's T16 lists tests 1, 2, 7 and 18, and names test 6 in its row, which says that CI runs it in its job of the ignored tests: the threat model's check refuses an ignored test in a list. T20 lists test 5, and says that test 3 is not built (section 14).
 
 ## 8. The window, for the threat model
 
