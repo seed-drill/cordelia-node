@@ -2354,7 +2354,11 @@ device lists yet in the new generation are shown for as long. A relay not
 known to hold the latest change is shown for as long (decision 2026-10-19,
 rule 11), from the latest of when the device came to keep the change entry,
 when this version first started on it, and that relay's latest answer about
-the entry. `protocol.rs`
+the entry. A removed device that still holds a shared channel the person
+has not made anew is amber for as long, from when this device applied that
+removal (decision 2026-10-10 §9): the one fact of a shared channel that sets
+a level, and after that it is in `cordelia devices` only, so that a channel
+in a drawer does not keep every status line amber for good. `protocol.rs`
 asserts that it is shorter than a left secret is kept
 (`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
 known.
@@ -2953,6 +2957,43 @@ messages channel, 76 bytes with its key, so that a device has 68 slots of
 and a key a device's list in the personal channel. None of `sread/`,
 `read/`, `msg/`, `person/` and `hold/` begins another, and `shared/`
 begins no other prefix of the personal channel, nor does any begin it.
+
+#### What a shared channel reuses
+
+**Rationale:** A shared channel adds no constant where one of an earlier
+record already says what is needed (record §14), and each keeps its own
+reason there:
+
+- **A key typed for a channel** is kept for `PAIR_KEY_TYPED_SECS` (an hour),
+  at most `MAX_TYPED_KEYS` (8) at one time, counted apart from the keys
+  typed to join devices, and forgotten after `TYPED_KEY_KEPT_SECS` (a day),
+  as a key typed at `accept` is (§12.6): a share is taken only within the
+  hour of its typing, as a hand-over is.
+- **The shares waiting** are at most `MAX_TYPED_KEYS`, each kept for
+  `HAND_OVER_KEPT_SECS` (two hours), as a hand-over is: one share waits for
+  a key at a time, so eight is eight people being handed a channel at once.
+- **A quiet key** is let go after `AGENT_MESSAGE_KEPT_DAYS` (30) with no
+  entry of it first held: by then every message it wrote has expired
+  (§12.12), so nothing it wrote is still shown.
+- **The amber of a removed device that holds a shared channel** lasts
+  `REMOVAL_NOT_APPLIED_SHOWN_DAYS` (7, §12.10), counted from when this
+  device applied the removal, as the amber of a removal not yet applied is:
+  a person who has not made the channel anew in a week is told in
+  `cordelia devices` from then, and the line goes back to what memory says.
+- **A channel's hour** is `AGENT_MESSAGES_PER_DEVICE_PER_HOUR` (60) numbers
+  of a device in one channel, its first sends and its sends again
+  together, so that its ring of `AGENT_MESSAGE_RING` (64) never goes round
+  in an hour; a sending again counts there alone.
+- **The unlabelled hour** is `AGENT_MESSAGE_RING` (64) places in an hour
+  for every key the person has not labelled, together, the person's own
+  devices aside, given newest first as for one signer (§12.12): many keys
+  that one member made cost the reader what one key costs.
+- **The hold** in a shared channel is `AGENT_MESSAGE_PAIR_UNREAD_MAX` (10),
+  fixed: no bound a person sets with `cordelia msg allow` reaches a shared
+  channel.
+- **The status's `shared` object** adds no constant: it says what the
+  device holds and what the shared pass said since the node started, and
+  sets no level but by the amber above.
 
 ---
 

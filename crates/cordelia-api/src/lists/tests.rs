@@ -1814,6 +1814,21 @@ fn which_makers_are_valid_comes_from_the_statement_alone() {
             holds.passed_over.contains(&stranger.public_key()),
             "device {n}"
         );
+        // With how many acts of each the lists carry, each once (the
+        // status's `passed_over`, decision 2026-10-10 §9).
+        assert!(
+            holds.passed_over_acts.contains(&(stranger.public_key(), 1)),
+            "device {n}: {:?}",
+            holds.passed_over_acts
+        );
+        assert!(
+            holds
+                .passed_over_acts
+                .iter()
+                .any(|(key, acts)| *key == s.key(2) && *acts > 0),
+            "device {n}"
+        );
+        assert_eq!(holds.passed_over_acts.len(), holds.passed_over.len());
     }
     all_fetch(&s, &[0, 1, 3], now, 3);
     for n in [0, 1, 3] {

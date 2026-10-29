@@ -395,17 +395,71 @@ pub fn delivering(conn: &Connection, row: &Channel) -> Result<bool, PersonError>
 
 // ── A removal ────────────────────────────────────────────────────────
 
-/// This device applied, at `now`, a statement that removes a key that the
-/// one before did not (decision 2026-10-24, rule 23): every shared channel
-/// it holds is not yet clean, since every device of the person held every
-/// one. In the transaction that applies it.
-pub(crate) fn removal_applied(conn: &Connection, now: i64) -> Result<(), PersonError> {
+/// This device applied, at `now`, a statement that removes `removed`, the
+/// keys that the one before did not (decision 2026-10-24, rule 23): every
+/// shared channel it holds is not yet clean, since every device of the
+/// person held every one. In the transaction that applies it.
+pub(crate) fn removal_applied(
+    conn: &Connection,
+    removed: &[[u8; 32]],
+    now: i64,
+) -> Result<(), PersonError> {
     for row in st(kept::channels(conn))? {
         if matches!(row.state, State::Held | State::NotInForce) {
             st(rows::not_clean(conn, &row.channel, now, false))?;
         }
     }
+    note_removal(conn, removed, now)
+}
+
+/// The latest removal or recovery that marked channels not clean: when,
+/// and the keys it removed that the statement before it did not.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Removal {
+    at: i64,
+    keys: Vec<String>,
+}
+
+/// Keep `removed` as the keys of the removal at `at` (decision 2026-10-10
+/// §9): a mark set then names them. Each mark takes the time of the latest
+/// removal ([`rows::not_clean`]), so the latest is all that is kept; two at
+/// the same second are one.
+fn note_removal(conn: &Connection, removed: &[[u8; 32]], at: i64) -> Result<(), PersonError> {
+    let mut keys: Vec<String> = match removal_kept(conn)? {
+        Some(kept) if kept.at == at => kept.keys,
+        _ => Vec::new(),
+    };
+    for key in removed {
+        let key = hex::encode(key);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let kept = serde_json::to_string(&Removal { at, keys })
+        .map_err(|e| PersonError::Held(format!("the keys of a removal: {e}")))?;
+    cordelia_storage::meta::set(conn, cordelia_storage::meta::PERSON_REMOVAL_KEYS, &kept)?;
     Ok(())
+}
+
+fn removal_kept(conn: &Connection) -> Result<Option<Removal>, PersonError> {
+    Ok(
+        cordelia_storage::meta::get(conn, cordelia_storage::meta::PERSON_REMOVAL_KEYS)?
+            .and_then(|kept| serde_json::from_str(&kept).ok()),
+    )
+}
+
+/// The keys that the removal or recovery whose marks are of `since`
+/// removed, and the statement before it did not; `None` where none kept is
+/// of that time.
+pub fn removed_at(conn: &Connection, since: i64) -> Result<Option<Vec<[u8; 32]>>, PersonError> {
+    Ok(removal_kept(conn)?
+        .filter(|kept| kept.at == since)
+        .map(|kept| {
+            kept.keys
+                .iter()
+                .filter_map(|key| hex::decode(key).ok()?.try_into().ok())
+                .collect()
+        }))
 }
 
 /// What a removal or a recovery left out of a channel it made anew, beside
@@ -578,13 +632,14 @@ pub fn make_owed(
 /// The machine of a recovery that removed a key holds each channel it
 /// brought back not yet clean, and owes each its making anew once read
 /// (decision 2026-10-10 §3.5; decision 2026-10-24, rule 24).
-pub(crate) fn recovered(conn: &Connection, now: i64) -> Result<(), PersonError> {
+/// `gone` is the keys the recovery removed.
+pub(crate) fn recovered(conn: &Connection, gone: &[[u8; 32]], now: i64) -> Result<(), PersonError> {
     for row in st(kept::channels(conn))? {
         if matches!(row.state, State::Held | State::NotInForce) {
             st(rows::not_clean(conn, &row.channel, now, true))?;
         }
     }
-    Ok(())
+    note_removal(conn, gone, now)
 }
 
 // ── Making anew ──────────────────────────────────────────────────────
@@ -1619,7 +1674,7 @@ pub(crate) fn notice_of_channel(channel: &[u8; 32], removed: usize) -> [u8; 32] 
 /// What `act` is, in words, and the command that undoes it (§3.5, the
 /// table of what undoes each act in force): its kind, the item, the undo.
 /// `filings` name the channels.
-fn described(
+pub(crate) fn described(
     act: &AnyAct,
     filings: &[Filing],
 ) -> Result<(&'static str, String, String), PersonError> {

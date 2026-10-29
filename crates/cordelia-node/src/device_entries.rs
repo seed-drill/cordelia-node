@@ -3651,9 +3651,16 @@ impl DeviceEntries {
                     relay = link.name(),
                     "a shared channel is not proved: no room for more proofs on the connection"
                 );
+                // Said in the status's `shared` object (§8.4, §9).
+                self.state
+                    .own_channels
+                    .say_no_proof_room(channel, &link.relay().0, true);
                 return Some(false);
             }
         }
+        self.state
+            .own_channels
+            .say_no_proof_room(channel, &link.relay().0, false);
         let done = self
             .leave
             .shared(&self.state, link, channel, SharedAsk::Prove, |_| ())

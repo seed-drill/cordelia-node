@@ -2071,6 +2071,15 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     drop(at);
     let new = id_filed(&desktop, "review").unwrap();
     assert_ne!(new, old);
+    // The desktop made it anew in the same act: no channel of its is held
+    // by a removed device, and the status is not amber for it (§9).
+    let status = status_json(&desktop);
+    assert_eq!(
+        status["shared"]["removed_device_holds"],
+        json!([]),
+        "{status}"
+    );
+    assert!(!holds_of(&status).contains(&"shared_removed_device_holds".to_string()));
     // The laptop follows the filing, with no yes.
     let after_removal = [&relay, &laptop, &desktop, &bob];
     has_applied(&laptop, 2, &after_removal);
@@ -2225,8 +2234,15 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     );
     drop(at);
     assert_eq!(id_filed(&desktop, "review"), Some(old));
+    // The desktop holds a channel not clean that the tablet held: its
+    // status is amber for it, from the node to the command (§9, property
+    // 16), and names the tablet as the device removed.
+    removed_device_holds_review(&desktop, "tablet");
     let after = [&one, &two, &laptop, &desktop, &bob];
     has_applied(&laptop, 2, &after);
+    // So is the laptop's, which applied the removal and has not made the
+    // channel anew.
+    removed_device_holds_review(&laptop, "tablet");
 
     // Bob makes the channel anew, keeping the laptop and the tablet.
     makes_anew(
@@ -2272,6 +2288,43 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert!(!sealed.contains(&key_of(&tablet)), "{sealed:?}");
     assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
     assert_ne!(id_filed(&laptop, "review"), Some(old));
+    // Made anew and moved from, it is amber no more there.
+    let status = status_json(&laptop);
+    assert_eq!(
+        status["shared"]["removed_device_holds"],
+        json!([]),
+        "{status}"
+    );
+    assert!(!holds_of(&status).contains(&"shared_removed_device_holds".to_string()));
+    let plain = laptop.cli(&["status"]);
+    assert!(!plain.contains("Shared:"), "{plain}");
+}
+
+/// `n` applied a removal of the device labelled `removed` and holds
+/// "review" not clean: `cordelia status --json` has the amber hold
+/// `shared_removed_device_holds` and names the device of that removal, and
+/// the plain status says it on its `Shared:` line (decision 2026-10-10 §9).
+fn removed_device_holds_review(n: &Node, removed: &str) {
+    let status = status_json(n);
+    let holds_it = status["shared"]["removed_device_holds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(holds_it.len(), 1, "{status}");
+    assert_eq!(holds_it[0]["channels"], json!(["review"]), "{status}");
+    let device = holds_it[0]["device"].as_str().unwrap();
+    assert!(device.starts_with(&format!("\"{removed}\" (")), "{device}");
+    assert!(
+        holds_of(&status).contains(&"shared_removed_device_holds".to_string()),
+        "{status}"
+    );
+    let plain = n.cli(&["status"]);
+    assert!(
+        plain.contains(
+            "  Shared:    a removed device still holds 1 shared channel: make each anew \
+             (cordelia devices)"
+        ),
+        "{plain}"
+    );
 }
 
 /// A removal lists what the removed key did, with the command that undoes
@@ -2521,4 +2574,65 @@ fn an_honest_node_writes_only_messages_clearings_and_anew_records() {
             }
         }
     }
+}
+
+/// `cordelia status --json` on `n`.
+fn status_json(n: &Node) -> serde_json::Value {
+    serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+}
+
+/// What holds in a status, each by its word.
+fn holds_of(status: &serde_json::Value) -> Vec<String> {
+    status["holds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|holds| holds["what"].as_str().map(String::from))
+        .collect()
+}
+
+/// `cordelia status --json` carries the node's `shared` object (decision
+/// 2026-10-10 §9), apart from `messages`, and nothing of it sets a level:
+/// a device that holds a shared channel says it, by its name, its words
+/// and its relay by the configuration's address; a device that follows no
+/// phrase, and so stands nowhere, has no `shared` object. The plain status
+/// has no `Shared:` line where no removed device holds one.
+#[test]
+fn the_status_carries_the_shared_object_and_no_level_of_it() {
+    let relay = relay_started();
+    let alice = person("laptop", &relay);
+    let words = makes(&alice, "review", &[]);
+    let status = wait_for(
+        "the status names the channel",
+        &[&relay, &alice],
+        120,
+        || {
+            let status = status_json(&alice);
+            (status["shared"]["channels"][0]["relays"][0]["connected"] == true).then_some(status)
+        },
+    );
+    let shared = &status["shared"];
+    let channel = &shared["channels"][0];
+    assert_eq!(channel["name"], "review", "{shared}");
+    assert_eq!(channel["words"], words.as_str());
+    assert_eq!(channel["reached"], true);
+    assert_eq!(channel["keys"], 0);
+    assert_eq!(
+        channel["relays"][0]["relay"].as_str(),
+        Some(format!("127.0.0.1:{}", relay.p2p).as_str()),
+        "{shared}"
+    );
+    assert_eq!(shared["removed_device_holds"], json!([]));
+    assert!(
+        holds_of(&status)
+            .iter()
+            .all(|what| !what.starts_with("shared")),
+        "{status}"
+    );
+    let plain = alice.cli(&["status"]);
+    assert!(!plain.contains("Shared:"), "{plain}");
+    // A device that follows no phrase says nothing of shared channels.
+    let other = device_started_with_its_relays_key("desktop", &relay);
+    let status = status_json(&other);
+    assert!(status.get("shared").is_none(), "{status}");
 }

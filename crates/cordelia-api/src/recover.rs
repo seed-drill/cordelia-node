@@ -1201,7 +1201,7 @@ pub fn follow(
             let gone: Vec<[u8; 32]> = shown.gone.iter().map(|(key, _)| *key).collect();
             crate::lists::write_recovered(conn, identity, shared_lists, &gone, at)?;
             if !gone.is_empty() {
-                crate::shared_anew::recovered(conn, at)?;
+                crate::shared_anew::recovered(conn, &gone, at)?;
             }
             Ok(applied.number)
         });

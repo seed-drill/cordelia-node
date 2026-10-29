@@ -332,8 +332,10 @@ fn not_clean_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NotClean> {
     })
 }
 
-/// `channel` is not clean from `since`; a mark kept already keeps its time,
-/// and is owed where either says so.
+/// `channel` is not clean from `since`: a mark kept already takes the later
+/// of the two times, since a later removal that leaves it not clean counts
+/// its seven days again (decision 2026-10-10 §9), and is owed where either
+/// says so.
 pub fn not_clean(
     conn: &Connection,
     channel: &[u8; 32],
@@ -342,7 +344,8 @@ pub fn not_clean(
 ) -> Result<(), CordeliaError> {
     conn.execute(
         "INSERT INTO shared_anew_not_clean (channel, since, owed) VALUES (?1, ?2, ?3)
-             ON CONFLICT (channel) DO UPDATE SET owed = MAX(owed, excluded.owed)",
+             ON CONFLICT (channel) DO UPDATE SET
+                 since = MAX(since, excluded.since), owed = MAX(owed, excluded.owed)",
         params![&channel[..], since, owed as i64],
     )
     .map_err(storage)?;
@@ -463,14 +466,18 @@ mod tests {
         assert!(offers_in(&conn, &[1; 32]).unwrap().is_empty());
     }
 
-    /// A mark of not clean keeps its first time; owed once, it stays owed.
+    /// A mark of not clean takes the later time, as a later removal counts
+    /// its seven days again, and never an earlier one; owed once, it stays
+    /// owed.
     #[test]
-    fn a_mark_of_not_clean_keeps_its_time() {
+    fn a_mark_of_not_clean_takes_the_later_time() {
         let conn = conn();
         not_clean(&conn, &[1; 32], 5, true).unwrap();
         not_clean(&conn, &[1; 32], 9, false).unwrap();
         let mark = not_clean_of(&conn, &[1; 32]).unwrap().unwrap();
-        assert_eq!((mark.since, mark.owed, mark.unreached), (5, true, false));
+        assert_eq!((mark.since, mark.owed, mark.unreached), (9, true, false));
+        not_clean(&conn, &[1; 32], 7, false).unwrap();
+        assert_eq!(not_clean_of(&conn, &[1; 32]).unwrap().unwrap().since, 9);
         unreached(&conn, &[1; 32]).unwrap();
         not_clean(&conn, &[1; 32], 9, false).unwrap();
         assert!(not_clean_of(&conn, &[1; 32]).unwrap().unwrap().unreached);

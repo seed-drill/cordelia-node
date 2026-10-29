@@ -1660,15 +1660,24 @@ fn come_to(
     // removal is not yet applied by every device only where it does. A
     // renewal removes nobody, and a device that comes to its first
     // statement saw nobody removed.
-    let removes_a_key = before.is_some_and(|before| {
-        let had = &before.statement.statement;
-        statement.removed.iter().any(|key| !had.removes(key))
-    });
+    let removed_now: Vec<[u8; 32]> = match &before {
+        Some(before) => {
+            let had = &before.statement.statement;
+            statement
+                .removed
+                .iter()
+                .filter(|key| !had.removes(key))
+                .copied()
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let removes_a_key = !removed_now.is_empty();
     crate::look::note_removed_a_key(conn, removes_a_key)?;
     // A removal makes every shared channel this device holds not yet clean
     // (decision 2026-10-24, rule 23; decision 2026-10-10 §3.5).
     if removes_a_key {
-        crate::shared_anew::removal_applied(conn, now)?;
+        crate::shared_anew::removal_applied(conn, &removed_now, now)?;
     }
     // The look of a recovery was of the statement that is left: under
     // this one the device carried what it holds, in this transaction.

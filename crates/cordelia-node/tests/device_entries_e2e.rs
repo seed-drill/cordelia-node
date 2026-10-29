@@ -11324,6 +11324,11 @@ async fn a_shared_channel_refused_for_room_waits_its_turn_to_push() {
     device.passes().await;
     let all: Vec<usize> = (0..SHARED_MAX_CHANNELS).collect();
     assert_eq!(pushes(&relay.requests()), all);
+    // The refusal for room goes to the status's `shared` object, of that
+    // channel at that relay, and to no level (decision 2026-10-10 §9).
+    let said = device.state.own_channels.shared_said();
+    assert_eq!(said.refused_at.get(&(first, relay.key)), Some(&1));
+    assert_eq!(said.refused_at.len(), 1, "{:?}", said.refused_at);
     device.sends().await;
     assert_eq!(pushes(&relay.requests()), [0]);
     for (_, secret) in &filed[1..] {
@@ -11332,6 +11337,42 @@ async fn a_shared_channel_refused_for_room_waits_its_turn_to_push() {
     device.sends().await;
     assert_eq!(pushes(&relay.requests()), [1, 2, 3, 4, 5]);
     assert_eq!(device.shared_counts("relay").pushed, 22);
+}
+
+/// What the door does not store of a shared channel, since no honest member
+/// writes it (decision 2026-10-10 §2.3, rule 3), is said in the status's
+/// `shared` object (§9), of that channel: a member's delete in its anew
+/// slot, handed by the relay, is counted there once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_the_door_does_not_store_of_a_shared_channel_is_said_for_the_status() {
+    use cordelia_crypto::shared::anew_name;
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.syncs(true);
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.knows_key_of("relay");
+    let (shared, secret) = device.files_shared("review", &[relay.key]);
+    let member = NodeIdentity::from_seed([0x4d; 32]).unwrap();
+    let name = anew_name(&member.public_key()).unwrap();
+    let delete = sealed(&member, &secret, 2, &name, Value::Delete).to_wire();
+    relay.pulls(move |pull| EntryPulled {
+        entries: match pull.channel == shared {
+            true => vec![delete.clone().into()],
+            false => Vec::new(),
+        },
+        next: pull.after,
+        mark: pull.mark,
+    });
+    device.passes().await;
+    let said = device.state.own_channels.shared_said();
+    assert_eq!(
+        said.not_stored.get(&shared),
+        Some(&1),
+        "{:?}",
+        said.not_stored
+    );
 }
 
 /// **The door of a share pair channel** (decision 2026-10-10 §2.3, §8.4):

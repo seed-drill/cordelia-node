@@ -497,6 +497,10 @@ pub struct Computed {
     /// Each key whose acts the lists carry, signed, and passed over: a key
     /// that is no valid maker, or a removed key's act taken after its cut.
     pub passed_over: BTreeSet<[u8; 32]>,
+    /// Each act passed over, once, by its maker and its bytes: how many
+    /// acts of each key passed over the lists carry (decision 2026-10-10
+    /// §9, `passed_over`).
+    passed: BTreeSet<([u8; 32], Vec<u8>)>,
     /// The signatures of the acts of valid makers that the lists carry
     /// ([`carried`]): what is kept of when each was taken.
     taken: BTreeSet<[u8; 64]>,
@@ -543,6 +547,7 @@ pub fn compute(
             let Some(of) = makers.maker(&maker) else {
                 if checked.holds(&act) {
                     computed.passed_over.insert(maker);
+                    computed.passed.insert((maker, act.written()));
                 }
                 continue;
             };
@@ -556,6 +561,7 @@ pub fn compute(
             }
             if of == Maker::Removed && makers.cut(&maker, takings.of(&act)) {
                 computed.passed_over.insert(maker);
+                computed.passed.insert((maker, act.written()));
                 continue;
             }
             let written = act.written();
@@ -623,6 +629,16 @@ fn kept_for_something(acts: &[AnyAct]) -> bool {
 pub struct HeldAtBound(pub [u8; 32]);
 
 impl Computed {
+    /// Each key whose acts the lists carry and that are passed over, with
+    /// how many of its acts they carry, each once (§9).
+    pub fn passed_over_acts(&self) -> Vec<([u8; 32], usize)> {
+        let mut counted: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        for (maker, _) in &self.passed {
+            *counted.entry(*maker).or_default() += 1;
+        }
+        counted.into_iter().collect()
+    }
+
     /// The newest valid act on `key`.
     pub fn newest(&self, key: &Key) -> Option<&AnyAct> {
         self.valid.get(key).and_then(|acts| acts.first())
@@ -1247,6 +1263,8 @@ pub struct Holds {
     pub labels: Vec<(Act<Label>, Maker)>,
     pub left_out: Vec<(AnyAct, Maker)>,
     pub passed_over: Vec<[u8; 32]>,
+    /// Of those, each with how many of its acts the lists carry (§9).
+    pub passed_over_acts: Vec<([u8; 32], usize)>,
 }
 
 impl Holds {
@@ -1299,6 +1317,7 @@ pub fn holds_worked_out(conn: &Connection, own: &[u8; 32], now: i64) -> Result<H
     let reading = Reading::of(conn, standing, own, now)?;
     let computed = reading.compute();
     let mut holds = Holds::of(&computed.written, &computed.past_bound, &reading.makers);
+    holds.passed_over_acts = computed.passed_over_acts();
     holds.passed_over = computed.passed_over.into_iter().collect();
     Ok(holds)
 }

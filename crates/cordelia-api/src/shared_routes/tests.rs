@@ -1007,3 +1007,35 @@ fn a_send_waits_where_the_channel_is_not_clean_or_paused() {
         .is_ok()
     );
 }
+
+/// The status's `unread_by_an_agent` counts, for each subscribed folder,
+/// the messages unread by its agent (decision 2026-10-10 §9, section 19
+/// item 83), as the `messages` object counts its own: a message neither of
+/// two subscribed folders has read counts twice; read by one, once.
+#[test]
+fn unread_by_an_agent_counts_for_each_subscribed_folder() {
+    let (s, channel) = devices(1);
+    let t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t + 1);
+    subscribes(&s, 0, &channel, "work", true, t + 1);
+    let id = id_given(&s, 0, &channel, 1, "to both", t + 2);
+    assert_eq!(unread(&s, 0, "notes", t + 3), std::slice::from_ref(&id));
+    assert_eq!(unread(&s, 0, "work", t + 3), std::slice::from_ref(&id));
+    let unread_by_an_agent = |now: i64| {
+        let own = at(now).own_relays;
+        let said = crate::state::SharedSaid::default();
+        let beside = crate::shared_status::Beside {
+            own_relays: &own,
+            connected: &[AT],
+            said: &said,
+        };
+        crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
+            .unwrap()
+            .unwrap()["channels"][0]["unread_by_an_agent"]
+            .clone()
+    };
+    assert_eq!(unread_by_an_agent(t + 3), 2);
+    reads(&s, 0, "notes", &id, t + 4).unwrap();
+    assert!(unread(&s, 0, "notes", t + 5).is_empty());
+    assert_eq!(unread_by_an_agent(t + 5), 1);
+}

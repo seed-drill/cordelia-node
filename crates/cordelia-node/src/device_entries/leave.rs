@@ -1380,6 +1380,24 @@ impl Leave {
                         "a page holds an entry of another channel".into(),
                     ));
                 };
+                // What the door did not store, as no honest member writes
+                // it, is said in the status's `shared` object (§9).
+                let not_stored = taken
+                    .each
+                    .iter()
+                    .filter(|taken| {
+                        matches!(
+                            taken,
+                            cordelia_api::take::Taken::Refused(
+                                cordelia_api::take::NotTaken::NotAShared
+                                    | cordelia_api::take::NotTaken::NotInBandZero
+                            )
+                        )
+                    })
+                    .count();
+                state
+                    .own_channels
+                    .say_not_stored(channel, not_stored as u64);
                 Ok(SharedDone::Page {
                     entries: entries.len(),
                     handed,
@@ -1399,6 +1417,11 @@ impl Leave {
                 let refused =
                     shared_pass::pushed(&conn, identity, &usable, &relay, &batch, &answers, now)
                         .map_err(store)?;
+                // A refusal for room of a shared push goes to the status's
+                // `shared` object, and sets no level (§9).
+                state
+                    .own_channels
+                    .say_refused_at(channel, &relay, refused as u64);
                 Ok(SharedDone::Pushed {
                     sent: batch.len(),
                     refused,

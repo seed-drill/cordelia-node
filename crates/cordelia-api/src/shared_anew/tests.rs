@@ -624,8 +624,11 @@ fn a_removal_makes_each_shared_channel_anew_without_the_removed_key() {
 /// A channel not yet clean is written in by nobody (decision 2026-10-24,
 /// rules 23 and 25): the device that made the removal is lost before its
 /// offer; the desktop applies the removal, writes nothing of its own there,
-/// names the channel in `cordelia devices`; `shared anew` there goes
-/// through and ends both.
+/// names the channel in `cordelia devices` and in the status's
+/// `removed_device_holds`, the fact the amber is read from (the amber
+/// itself, from the node to the command, is checked in `shared_e2e.rs`,
+/// `no_move_goes_into_a_channel_a_removed_key_reads`); `shared anew` there
+/// goes through and ends both.
 #[test]
 fn a_channel_not_yet_clean_is_written_in_by_nobody() {
     let mut s = bob(3);
@@ -667,6 +670,11 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
             .unwrap()
             .is_empty()
     );
+    // The status says it as held by the removed device.
+    assert_eq!(
+        removed_device_holds(&s, 1, now),
+        serde_json::json!([["review"]])
+    );
     // `cordelia devices` names it.
     let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
     let line = not_clean_line("review");
@@ -706,6 +714,28 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
     .unwrap();
     make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
     assert!(!is_not_clean(conn, &channel.id).unwrap());
+    assert_eq!(removed_device_holds(&s, 1, now), serde_json::json!([]));
+}
+
+/// The channels of each group of the status's `removed_device_holds` on
+/// device `n` of `s` at `now`.
+fn removed_device_holds(s: &Several, n: usize, now: i64) -> serde_json::Value {
+    let own = relays();
+    let said = crate::state::SharedSaid::default();
+    let beside = crate::shared_status::Beside {
+        own_relays: &own,
+        connected: &[AT],
+        said: &said,
+    };
+    let shared = crate::shared_status::status_of(&s[n].conn, &s[n].identity, &beside, now)
+        .unwrap()
+        .unwrap();
+    shared["removed_device_holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["channels"].clone())
+        .collect()
 }
 
 /// A recovery takes and names the acts of a device in someone else's hands
@@ -1456,7 +1486,7 @@ fn a_recovery_makes_a_channel_anew_only_once_it_has_read_it() {
     s.change(0, &[0], &[1]);
     let now = s.now + 20;
     let conn = &s[0].conn;
-    recovered(conn, now).unwrap();
+    recovered(conn, &[], now).unwrap();
     assert_eq!(make_owed(conn, &s[0].identity, now, &|_| false).unwrap(), 0);
     assert!(
         st(rows::made_of_channel(conn, &channel.id))
