@@ -2648,6 +2648,72 @@ fn an_act_made_with_no_relay_survives() {
     }
 }
 
+/// An act made with no relay survives coming back (decision 2026-10-10
+/// §3.4, property 25, §13, T16): the desktop files a channel on day 0, and
+/// every device takes it; from then the laptop reaches no relay, and goes
+/// on running, its fetches finding nothing new, while the desktop and the
+/// phone go on fetching and the desktop labels a key on day 50; on day 95
+/// the laptop subscribes a folder; on day 100 it reaches a relay. The
+/// subscription is in force on every device, and so are the filing of day
+/// 0 and the label of day 50: no act and no list is passed over for its
+/// age, or for how long its writer was away.
+#[test]
+fn an_act_made_with_no_relay_survives_coming_back() {
+    let s = person(3, 3);
+    let (desktop, laptop, phone) = (0, 1, 2);
+    let day_0 = s.now + 10;
+    on(&s, desktop, Do::File(filing(1, "review")), day_0);
+    all_fetch(&s, &[desktop, laptop, phone], day_0 + 1, 2);
+    for n in [desktop, laptop, phone] {
+        assert_eq!(filed(&s, n), ["review"], "device {n}, day 0");
+    }
+    // The laptop reaches no relay from day 0; the others meet.
+    on(
+        &s,
+        desktop,
+        Do::Label(label(4, Some("bob"))),
+        day_0 + 50 * DAY,
+    );
+    for day in [30, 60, 90] {
+        assert!(!fetch(&s, laptop, day_0 + day * DAY), "day {day}");
+        all_fetch(&s, &[desktop, phone], day_0 + day * DAY, 1);
+    }
+    assert_eq!(labelled(&s, laptop, 4), None);
+    on(
+        &s,
+        laptop,
+        Do::Subscribe(subscription(1, "notes", true)),
+        day_0 + 95 * DAY,
+    );
+    assert!(!fetch(&s, laptop, day_0 + 97 * DAY));
+    assert_eq!(subscribes(&s, laptop, 1, "notes"), Some(true));
+    for n in [desktop, phone] {
+        assert_eq!(subscribes(&s, n, 1, "notes"), None, "device {n}");
+    }
+
+    // Day 100: the laptop reaches a relay.
+    all_fetch(&s, &[desktop, laptop, phone], day_0 + 100 * DAY, 3);
+    for n in [desktop, laptop, phone] {
+        assert_eq!(
+            subscribes(&s, n, 1, "notes"),
+            Some(true),
+            "device {n}, day 100"
+        );
+        assert_eq!(filed(&s, n), ["review"], "device {n}, day 100");
+        assert_eq!(
+            labelled(&s, n, 4),
+            Some(Some("bob".into())),
+            "device {n}, day 100"
+        );
+    }
+    // A year on, nothing of it has gone.
+    all_fetch(&s, &[desktop, laptop, phone], day_0 + 465 * DAY, 2);
+    for n in [desktop, laptop, phone] {
+        assert_eq!(subscribes(&s, n, 1, "notes"), Some(true), "device {n}");
+        assert_eq!(filed(&s, n), ["review"], "device {n}");
+    }
+}
+
 /// What a thief past a bound leaves after its removal (decision
 /// 2026-10-10 §3.4, the costs, and §13, T23), alone and with a device it
 /// added by a record of addition (T20): with 14 channels, 25
@@ -2935,4 +3001,363 @@ fn a_whole_fetch_that_finds_nothing_new_writes_nothing() {
         });
         assert_eq!(written, 0, "device {n}");
     }
+}
+
+// ── A channel that is not written ────────────────────────────────────────
+
+/// Sync on, on each device of `s`: the door takes a shared channel's
+/// entries only where it is.
+fn sync_on(s: &Several) {
+    for machine in &s.machines {
+        cordelia_storage::meta::set(
+            &machine.conn,
+            cordelia_storage::meta::SYNC_CLAUDE_DIR,
+            "/home/bob/.claude",
+        )
+        .unwrap();
+    }
+}
+
+/// Device `n` makes a whole fetch at `now`, having been given what each of
+/// `from` holds, and ends the take-outs it began, as its next pass does.
+fn fetch_out(s: &Several, from: &[usize], n: usize, now: i64) {
+    fetch_from(s, from, n, now);
+    crate::shared::tests::out(s, n, now);
+}
+
+/// How many rows of first holding device `n` keeps of `channel`.
+fn first_held_rows(s: &Several, n: usize, channel: &crate::shared::tests::Shared) -> i64 {
+    let id = crate::shared::tests::row(s, n, channel).id;
+    s[n].conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_first_held WHERE channel = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A channel that is not written keeps no entries (decision 2026-10-10
+/// §3.4, property 22, §13 under property 25). The phone files `review`,
+/// and every device holds it; a member writes there, and another key of
+/// a member, quiet for 30 days, is let go, its row keeping its revisions;
+/// the phone is shut, its list still carrying the filing. The laptop and
+/// the desktop, apart, file sixteen more between them: the filing of
+/// `review`, the oldest, is pushed past the bound on both. Each takes its
+/// entries and index rows out of its store, and keeps its table of keys,
+/// with the let-go key's revisions, and its rows of first holding, while
+/// a list carries an act on it; it can be dropped. Back within the bound,
+/// once the laptop drops a channel, it is read again from its start: the
+/// let-go key's old entry is refused, a message shown before is shown
+/// under its first holding and not as new, and what was fetched of it is
+/// forgotten, so the first send there fetches first (`not_fetched`).
+/// Pushed past the bound once more, `shared anew` on it writes its offer
+/// there. A channel the laptop filed, pushed past the bound by its own
+/// filings and carried by no list once each device wrote its list again,
+/// keeps no entry and no row on any device.
+///
+/// **The drop path:** a drop that is the newest valid act empties the
+/// channel's entries; with five old lists carrying 80 filings and 65
+/// drops, the oldest drop, the channel's, is let go, its filing comes back
+/// where the 16 have room, and the channel is then as newly held: a
+/// message under 30 days old is shown as new, and the empty anew record is
+/// written again.
+#[test]
+fn a_channel_not_written_keeps_no_entries() {
+    use crate::shared::tests::{
+        Shared, given, hourly, indexed, key_row, key_rows, member, message, row, stores,
+    };
+    use crate::state::OwnChannels;
+    use cordelia_storage::shared::State;
+    use std::time::Instant;
+
+    let s = person(3, 3);
+    sync_on(&s);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let t0 = s.now + 10;
+    on(&s, phone, Do::File(filing(1, "review")), t0);
+    all_fetch(&s, &[laptop, desktop, phone], t0 + 1, 2);
+    let review = Shared::of(1);
+    for n in [laptop, desktop] {
+        crate::shared::tests::out(&s, n, t0 + 1);
+        assert_eq!(row(&s, n, &review).state, State::Held, "device {n}");
+    }
+    // A member's key writes, and goes quiet; another writes 31 days on.
+    let (quiet, writer) = (member(2), member(1));
+    let old = message(&quiet, &review, 1, "quiet", t0 + 2);
+    let t1 = t0 + 31 * DAY;
+    let fresh = message(&writer, &review, 1, "fresh", t1);
+    let mut first_shown = 0;
+    for n in [laptop, desktop] {
+        stores(&s, n, &old, t0 + 2);
+        stores(&s, n, &fresh, t1);
+        hourly(&s[n].conn, &s.key(n), t1 + 1).unwrap();
+        let kept = key_row(&s, n, &review, &quiet.public_key()).unwrap();
+        assert!(kept.kept_message_rev.is_some(), "device {n}");
+        let shown = crate::shared::shown(&s[n].conn, &s[n].identity, &review.id, t1 + 2).unwrap();
+        assert_eq!(shown.len(), 1, "device {n}");
+        assert_eq!(shown[0].body, "fresh");
+        first_shown = shown[0].first_held;
+    }
+    assert_eq!(first_shown, t1);
+    // The pass fetched it, and kept a place at its relay.
+    let own_channels = OwnChannels::default();
+    own_channels.fetched_from(&review.id, "relay.example.org:9474", Instant::now());
+    assert!(own_channels.shared_fetch_done(&review.id, 1, Instant::now()));
+    for n in [laptop, desktop] {
+        let id = row(&s, n, &review).id;
+        cordelia_storage::shared_pass::keep_place(&s[n].conn, id, &[3; 32], &[1; 8], 7).unwrap();
+    }
+
+    // The phone is shut. The laptop files `b`, then the laptop and the
+    // desktop file eight each, apart.
+    let t2 = t1 + 10;
+    on(&s, laptop, Do::File(filing(2, "b")), t2);
+    let b = Shared::of(2);
+    crate::shared::tests::out(&s, laptop, t2);
+    stores(&s, laptop, &message(&writer, &b, 1, "in b", t2), t2);
+    for k in 0..8u8 {
+        on(
+            &s,
+            laptop,
+            Do::File(filing(10 + k, &format!("l{k}"))),
+            t2 + 1 + i64::from(k),
+        );
+        on(
+            &s,
+            desktop,
+            Do::File(filing(20 + k, &format!("d{k}"))),
+            t2 + 1 + i64::from(k),
+        );
+    }
+    for round in 0..3 {
+        let now = t2 + 20 + round;
+        fetch_out(&s, &[desktop], laptop, now);
+        fetch_out(&s, &[laptop], desktop, now);
+    }
+    let t3 = t2 + 30;
+    for n in [laptop, desktop] {
+        assert!(!filed(&s, n).contains(&"review".to_string()), "device {n}");
+        assert_eq!(filed(&s, n).len(), 16, "device {n}");
+        assert_eq!(row(&s, n, &review).state, State::NotInForce, "device {n}");
+        assert!(s[n].stored_in(&review.secret).is_empty(), "device {n}");
+        assert_eq!(indexed(&s, n, &review), 0, "device {n}");
+        // Its rows stay: the table of keys, the let-go key's revisions,
+        // and the rows of first holding.
+        assert_eq!(key_rows(&s, n, &review).len(), 2, "device {n}");
+        let kept = key_row(&s, n, &review, &quiet.public_key()).unwrap();
+        assert!(kept.kept_message_rev.is_some(), "device {n}");
+        assert!(first_held_rows(&s, n, &review) > 0, "device {n}");
+        assert!(
+            crate::shared::shown(&s[n].conn, &s[n].identity, &review.id, t3)
+                .unwrap()
+                .is_empty()
+        );
+        // It can be dropped.
+        assert!(
+            crate::sharing::drop_plan(&s[n].conn, &s[n].identity, "review", None, t3).is_ok(),
+            "device {n}"
+        );
+        // `b`, carried by no list, keeps no entry and no row.
+        assert!(
+            cordelia_storage::shared::channel(&s[n].conn, &b.id)
+                .unwrap()
+                .is_none(),
+            "device {n}"
+        );
+        assert!(s[n].stored_in(&b.secret).is_empty(), "device {n}");
+    }
+    // The pass forgets what it fetched of a channel not held.
+    crate::shared_pass::forget_fetches_of_channels_not_held(&s[laptop].conn, &own_channels)
+        .unwrap();
+    assert!(!own_channels.shared_fetch_done(&review.id, 1, Instant::now()));
+
+    // Back within the bound: the laptop drops one of its own.
+    on(&s, laptop, Do::Drop(channel(10)), t3 + 1);
+    for round in 0..3 {
+        let now = t3 + 2 + round;
+        fetch_out(&s, &[desktop], laptop, now);
+        fetch_out(&s, &[laptop], desktop, now);
+    }
+    let t4 = t3 + 10;
+    for n in [laptop, desktop] {
+        assert!(filed(&s, n).contains(&"review".to_string()), "device {n}");
+        let held = row(&s, n, &review);
+        assert_eq!(held.state, State::Held, "device {n}");
+        // Read again from its start.
+        assert!(
+            cordelia_storage::shared_pass::place(&s[n].conn, held.id, &[3; 32])
+                .unwrap()
+                .is_none(),
+            "device {n}"
+        );
+        // The let-go key's old entry is refused, with no new row.
+        let before = key_row(&s, n, &review, &quiet.public_key());
+        assert_eq!(
+            given(&s, n, &old, t4),
+            crate::take::Taken::Refused(crate::take::NotTaken::SharedFull),
+            "device {n}"
+        );
+        assert_eq!(key_row(&s, n, &review, &quiet.public_key()), before);
+        // A message shown before is shown under its first holding.
+        stores(&s, n, &fresh, t4);
+        let shown = crate::shared::shown(&s[n].conn, &s[n].identity, &review.id, t4).unwrap();
+        assert_eq!(shown.len(), 1, "device {n}");
+        assert_eq!(shown[0].body, "fresh");
+        assert_eq!(shown[0].first_held, first_shown, "device {n}: shown as new");
+    }
+    // For sending it is as after a start: fetched again first.
+    assert!(!own_channels.shared_fetch_done(&review.id, 1, Instant::now()));
+
+    // Past the bound once more, `shared anew` on it writes its offer.
+    on(&s, laptop, Do::Drop(channel(11)), t4 + 1);
+    for round in 0..2 {
+        let now = t4 + 2 + round;
+        fetch_out(&s, &[desktop], laptop, now);
+        fetch_out(&s, &[laptop], desktop, now);
+    }
+    on(&s, laptop, Do::File(filing(30, "x1")), t4 + 5);
+    on(&s, desktop, Do::File(filing(31, "x2")), t4 + 5);
+    for round in 0..3 {
+        let now = t4 + 6 + round;
+        fetch_out(&s, &[desktop], laptop, now);
+        fetch_out(&s, &[laptop], desktop, now);
+    }
+    let t5 = t4 + 10;
+    assert_eq!(row(&s, laptop, &review).state, State::NotInForce);
+    let own_relays = vec![crate::sharing::OwnRelay {
+        name: "relay.example.org:9474".into(),
+        key: [3; 32],
+    }];
+    let conn = &s[laptop].conn;
+    let identity = &s[laptop].identity;
+    let (listing, _) =
+        crate::shared_anew::anew_plan(conn, identity, &own_relays, "review", None, &[], None, t5)
+            .unwrap();
+    let asked: Vec<String> = listing
+        .asked
+        .iter()
+        .map(|key| cordelia_crypto::bech32::encode_public_key(key).unwrap())
+        .collect();
+    let (_, plan) = crate::shared_anew::anew_plan(
+        conn,
+        identity,
+        &own_relays,
+        "review",
+        None,
+        &[],
+        Some((&asked, &asked)),
+        t5,
+    )
+    .unwrap();
+    crate::shared_anew::make_anew(conn, identity, &own_relays, &plan.unwrap().what, t5).unwrap();
+    let offers: Vec<_> = s[laptop]
+        .stored_in(&review.secret)
+        .into_iter()
+        .filter(|entry| entry.author == s.key(laptop))
+        .collect();
+    assert_eq!(offers.len(), 1, "the offer, in the channel past the bound");
+    let opened = offers[0].open(&review.secret).unwrap();
+    assert!(matches!(
+        cordelia_crypto::shared::Anew::from_value(&opened.value),
+        Ok(cordelia_crypto::shared::Anew::Offer(_))
+    ));
+
+    drop_path();
+}
+
+/// The drop path of [`a_channel_not_written_keeps_no_entries`], as
+/// `past_a_bound_in_one_pass` has it in its units: devices 1 to 5 are shut,
+/// and their old lists, written by hand, carry 80 filings, sixteen each;
+/// device 0 reads them and makes 65 drops, one of each of 65 of them, the
+/// first that of the channel of seed 1, which it held and was written in.
+fn drop_path() {
+    use crate::shared::tests::{Shared, message, row, stores};
+    use cordelia_storage::shared::State;
+
+    let s = person(6, 6);
+    sync_on(&s);
+    let t = s.now + 10;
+    let seeds = |k: usize| (16 * (k as u8 - 1) + 1)..=(16 * k as u8);
+    let list_of_device = |k: usize| -> Vec<AnyAct> {
+        seeds(k)
+            .map(|seed| filing(seed, &format!("c{seed}")).by(&s[k].identity, t as u64, 0))
+            .collect()
+    };
+    let d = Shared::of(1);
+    let member = crate::shared::tests::member(1);
+    let said = message(&member, &d, 1, "in d", t);
+
+    // Device 1's list: the channel of seed 1 is held, and written in.
+    write_by_hand(&s, 1, list_of_device(1), t);
+    fetch_out(&s, &[1], 0, t + 1);
+    assert!(filed(&s, 0).contains(&"c1".to_string()));
+    stores(&s, 0, &said, t + 2);
+    assert!(!s[0].stored_in(&d.secret).is_empty());
+
+    // Its drop, the newest valid act on it, empties it.
+    on(&s, 0, Do::Drop(d.id), t + 3);
+    crate::shared::tests::out(&s, 0, t + 3);
+    assert_eq!(row(&s, 0, &d).state, State::Dropped);
+    assert!(s[0].stored_in(&d.secret).is_empty());
+
+    // The other four lists, and 64 drops more: 65 in all, each kept for
+    // something. The oldest, the channel's, is let go.
+    for k in 2..=5 {
+        write_by_hand(&s, k, list_of_device(k), t);
+    }
+    fetch_out(&s, &[2, 3, 4, 5], 0, t + 4);
+    for seed in 17..=80u8 {
+        on(&s, 0, Do::Drop(channel(seed)), t + 5 + i64::from(seed));
+    }
+    let now = t + 100;
+    fetch_out(&s, &[1, 2, 3, 4, 5], 0, now);
+    let written = kept(&s, 0);
+    assert_eq!(written.drops.len(), 64);
+    assert!(!written.drops.iter().any(|drop| drop.item.channel == d.id));
+    assert_eq!(filed(&s, 0).len(), 16, "{:?}", filed(&s, 0));
+    assert!(filed(&s, 0).contains(&"c1".to_string()));
+    assert_eq!(row(&s, 0, &d).state, State::Held);
+    // As newly held: its message, under 30 days old, is shown as new...
+    let later = t + 6 * DAY;
+    stores(&s, 0, &said, later);
+    let shown = crate::shared::shown(&s[0].conn, &s[0].identity, &d.id, later).unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].first_held, later, "shown as new");
+    // ...and its empty anew record is written again.
+    assert!(
+        crate::sharing::write_empty_anew_records(&s[0].conn, &s[0].identity, later).unwrap() >= 1
+    );
+    assert!(
+        s[0].stored_in(&d.secret)
+            .iter()
+            .any(|entry| entry.author == s.key(0))
+    );
+}
+
+/// A drop that is the newest valid act keeps the channel's rows while it
+/// is written (decision 2026-10-10 §13 under property 25,
+/// `a_channel_not_written_keeps_no_entries`, the drop path; §3.4: "Its rows
+/// stay while the device writes a valid act on the channel, a filing or a
+/// drop"). The record says otherwise at §6.3 ("After a drop, every row of
+/// it goes too") and in `a_drop_or_a_move_takes_its_entries` ("at a drop
+/// the device holds no entry and no row of that channel"), which the code
+/// follows: the two cannot both hold.
+#[test]
+#[ignore = "the record contradicts itself: §13's drop path and §3.4 keep a dropped channel's rows while the drop is written; §6.3 and a_drop_or_a_move_takes_its_entries say every row goes at a drop"]
+fn a_drop_keeps_its_channels_rows_while_it_is_written() {
+    use crate::shared::tests::{Shared, key_rows, message, stores};
+
+    let s = person(2, 2);
+    sync_on(&s);
+    let t = s.now + 10;
+    on(&s, 1, Do::File(filing(1, "review")), t);
+    fetch_out(&s, &[1], 0, t + 1);
+    let channel = Shared::of(1);
+    let member = crate::shared::tests::member(1);
+    stores(&s, 0, &message(&member, &channel, 1, "one", t + 2), t + 2);
+    on(&s, 0, Do::Drop(channel.id), t + 3);
+    crate::shared::tests::out(&s, 0, t + 3);
+    assert!(s[0].stored_in(&channel.secret).is_empty());
+    assert!(!key_rows(&s, 0, &channel).is_empty());
 }

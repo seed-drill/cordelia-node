@@ -1039,3 +1039,407 @@ fn unread_by_an_agent_counts_for_each_subscribed_folder() {
     assert!(unread(&s, 0, "notes", t + 5).is_empty());
     assert_eq!(unread_by_an_agent(t + 5), 1);
 }
+
+// ── A device's room ──────────────────────────────────────────────────
+
+/// A relay of a test, as its store takes what a device pushes in a shared
+/// channel: every entry is taken as a relay takes it, and what it holds of
+/// one author is counted as a relay counts it.
+struct RelayStore {
+    conn: rusqlite::Connection,
+    room: cordelia_storage::relay::Room,
+    /// The size each slot was first written at.
+    sizes: std::collections::HashMap<[u8; 32], usize>,
+    /// The most it held of the device at any push.
+    most: u64,
+}
+
+impl RelayStore {
+    fn new() -> Self {
+        Self {
+            conn: cordelia_storage::db::open_in_memory().unwrap(),
+            room: cordelia_storage::relay::Room::new(u64::MAX),
+            sizes: std::collections::HashMap::new(),
+            most: 0,
+        }
+    }
+
+    /// The bytes it holds of `author` in `channel`, each entry counted as
+    /// a relay counts it.
+    fn held_of(&self, channel: &[u8; 32], author: &[u8; 32]) -> u64 {
+        let mut rows = self
+            .conn
+            .prepare("SELECT length(content) FROM entries WHERE channel_id = ?1 AND author = ?2")
+            .unwrap();
+        rows.query_map(rusqlite::params![&channel[..], &author[..]], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+        .map(|len| cordelia_core::protocol::entry_cost(usize::try_from(len.unwrap()).unwrap()))
+        .sum()
+    }
+
+    /// Device 0 of `s` pushes what waits for the relay in `channel_id`,
+    /// every entry taken by this store; where `another`, the relay answers
+    /// that it holds another entry at each message's revision, as a relay
+    /// of somebody else's choosing may. Each entry is of one of the two
+    /// sizes, and of its slot's first size; what the store holds of the
+    /// device is within its room after each. Returns how many it pushed.
+    fn pushed(&mut self, s: &Several, channel_id: &[u8; 32], another: bool, now: i64) -> usize {
+        use crate::at_relays::Pushed;
+        use cordelia_core::protocol::{AGENT_MESSAGE_CONTENT_BYTES, SHARED_ANEW_CONTENT_BYTES};
+        use cordelia_storage::relay::{self, Taken};
+        let (conn, identity, own) = (&s[0].conn, &s[0].identity, s.key(0));
+        let usable = crate::shared_pass::usable(conn, channel_id, &AT)
+            .unwrap()
+            .unwrap();
+        let batch = crate::shared_pass::to_send(
+            conn,
+            identity,
+            &usable,
+            &AT,
+            crate::at_relays::Most {
+                entries: 1_000,
+                bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let asker = relay::Asker::Address("127.0.0.1".parse().unwrap());
+        let mut answers = Vec::new();
+        for entry in &batch {
+            assert_eq!(entry.author, own);
+            let size = entry.content.len();
+            assert!(
+                size == AGENT_MESSAGE_CONTENT_BYTES || size == SHARED_ANEW_CONTENT_BYTES,
+                "an entry of {size} bytes"
+            );
+            let first = *self.sizes.entry(entry.slot).or_insert(size);
+            assert_eq!(size, first, "a slot written again at another size");
+            let said = match relay::take(&self.conn, &mut self.room, entry, &asker, now).unwrap() {
+                Taken::Stored | Taken::AlreadyHeld => Pushed::Holds,
+                Taken::OlderThanHeld => Pushed::HoldsLater,
+                Taken::HeldAnother => Pushed::HoldsAnother,
+                other => panic!("{other:?}"),
+            };
+            let is_a_message = size == AGENT_MESSAGE_CONTENT_BYTES;
+            answers.push(match another && is_a_message {
+                true => Pushed::HoldsAnother,
+                false => said,
+            });
+            let held = self.held_of(channel_id, &own);
+            assert!(held <= ROOM, "the relay holds {held} bytes of the device");
+            self.most = self.most.max(held);
+        }
+        crate::shared_pass::pushed(conn, identity, &usable, &AT, &batch, &answers, now).unwrap();
+        batch.len()
+    }
+}
+
+/// The room of one device in a shared channel, as a relay counts it: 64
+/// messages and one anew record (decision 2026-10-10 §6.3).
+const ROOM: u64 = 214_016;
+
+/// A device never has more than its room in a shared channel (decision
+/// 2026-10-10 §1, property 21; §6.3; T23): whatever it sends, every entry
+/// it writes there is of its slot's one size, 2,048 bytes in `msg/` and
+/// 16,384 in `anew/`, a slot written again is never larger, and a relay
+/// that takes everything it pushes holds of its key at most 64 × 3,072 +
+/// 17,408 = 214,016 bytes as counted, at every push. It sends more
+/// messages than its ring holds, from two agents over many hours; a relay
+/// answers that it holds another entry at a third of them, so each is
+/// written again under the next number; at 30 days it clears what it sent;
+/// and it makes the channel anew with 63 keys of others and its own, an
+/// offer at its largest, over its empty anew record. Its room is whole from
+/// its first message on.
+#[test]
+fn a_device_never_has_more_than_its_room_in_a_shared_channel() {
+    use cordelia_core::protocol::{
+        AGENT_MESSAGE_CONTENT_BYTES, AGENT_MESSAGE_RING, SHARED_ANEW_CONTENT_BYTES, entry_cost,
+    };
+    assert_eq!(
+        AGENT_MESSAGE_RING as u64 * entry_cost(AGENT_MESSAGE_CONTENT_BYTES)
+            + entry_cost(SHARED_ANEW_CONTENT_BYTES),
+        ROOM
+    );
+    let (s, channel) = devices(1);
+    let identity = &s[0].identity;
+    let conn = &s[0].conn;
+    let own = s.key(0);
+    let mut t = s.now + 10;
+    subscribes(&s, 0, &channel, "notes", true, t);
+    subscribes(&s, 0, &channel, "work", true, t);
+    assert_eq!(
+        sharing::write_empty_anew_records(conn, identity, t).unwrap(),
+        1
+    );
+    let mut relay = RelayStore::new();
+    assert_eq!(relay.pushed(&s, &channel.id, false, t), 1);
+    assert_eq!(
+        relay.held_of(&channel.id, &own),
+        entry_cost(SHARED_ANEW_CONTENT_BYTES)
+    );
+
+    // More messages than the ring holds, two agents, many hours; a third
+    // of the pushes answered "another", and each such message written
+    // again under the next number.
+    let mut sent = 0;
+    let mut pushes = 0;
+    let mut again = 0;
+    while sent < 3 * AGENT_MESSAGE_RING {
+        t += 60;
+        let from = ["notes", "work"][sent % 2];
+        match sends(
+            &s,
+            0,
+            &asking(from, "review", &format!("message {sent}")),
+            t,
+        ) {
+            Ok(_) => sent += 1,
+            Err(NotSentHere::Refused(why, _)) if why.word() == "pair_held" => {
+                // A person reads what waits here, which frees the loop.
+                let row = kept::channel(conn, &channel.id).unwrap().unwrap();
+                for shown in crate::shared::shown(conn, identity, &channel.id, t).unwrap() {
+                    rows::mark_read_by_a_person(conn, row.id, &id_of(&shown.id).unwrap()).unwrap();
+                }
+                for kept_value in rows::kept(conn).unwrap() {
+                    rows::mark_read_by_a_person(conn, row.id, &kept_value.id).unwrap();
+                }
+                continue;
+            }
+            Err(_) => {
+                // An hour is full: the next.
+                t += 60 * 60;
+                continue;
+            }
+        }
+        pushes += 1;
+        relay.pushed(&s, &channel.id, pushes % 3 == 0, t);
+        again += crate::shared_sender::write_again(conn, identity, t, &|_| true).unwrap();
+        relay.pushed(&s, &channel.id, false, t);
+    }
+    assert!(again >= AGENT_MESSAGE_RING / 2, "written again: {again}");
+    let highest: i64 = relay
+        .conn
+        .query_row(
+            "SELECT MAX(rev) FROM entries WHERE channel_id = ?1 AND author = ?2",
+            rusqlite::params![&channel.id[..], &own[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let past = message_rev(3 * AGENT_MESSAGE_RING as u64).unwrap();
+    assert!(
+        u64::try_from(highest).unwrap() >= past,
+        "the ring went round more than twice: {highest}"
+    );
+    assert_eq!(relay.most, ROOM, "the ring was written whole");
+
+    // At 30 days, what it sent is cleared, in the same slots.
+    t += 31 * 24 * 60 * 60;
+    assert!(crate::shared_sender::clear_expired(conn, identity, t, &|_| true).unwrap() > 0);
+    relay.pushed(&s, &channel.id, false, t);
+
+    // Made anew with 63 other keys staying: its offer at its largest, over
+    // its empty anew record.
+    for k in 0..63 {
+        given(
+            &s,
+            0,
+            &crate::shared::tests::anew(&member(10 + k), &channel, 1),
+            t,
+        );
+    }
+    let own_relays = at(t).own_relays;
+    let (listing, _) =
+        crate::shared_anew::anew_plan(conn, identity, &own_relays, "review", None, &[], None, t)
+            .unwrap();
+    let listed: Vec<String> = listing
+        .asked
+        .iter()
+        .map(|key| encode_public_key(key).unwrap())
+        .collect();
+    assert_eq!(listed.len(), 63);
+    let (_, plan) = crate::shared_anew::anew_plan(
+        conn,
+        identity,
+        &own_relays,
+        "review",
+        None,
+        &[],
+        Some((&listed, &listed)),
+        t,
+    )
+    .unwrap();
+    let plan = plan.unwrap();
+    assert_eq!(plan.what.stay.len(), 64);
+    crate::shared_anew::make_anew(conn, identity, &own_relays, &plan.what, t).unwrap();
+    assert_eq!(relay.pushed(&s, &channel.id, false, t + 1), 1, "the offer");
+    assert!(relay.held_of(&channel.id, &own) <= ROOM);
+    assert_eq!(relay.held_of(&channel.id, &own), ROOM);
+}
+
+// ── A name that is both ──────────────────────────────────────────────
+
+/// A name that is both, across two devices, goes nowhere wrong (decision
+/// 2026-10-10 §2.2, §4.2; T10): the laptop syncs `review`, a name of the
+/// person's own, while the desktop, apart, files a shared channel as
+/// `review`; once they meet, each holds both. On each, `--to review` and a
+/// publish under `review` look among the names alone, and write nothing in
+/// the shared channel; `--channel review`, `share` and `subscribe` look
+/// among the shared alone, and `share` hands the shared channel and is not
+/// refused as a name of the person's own; `msg send --channel review`
+/// writes in the shared channel and in no channel of the person's own; and
+/// `shared list` says that the name is also a name the person syncs.
+#[test]
+fn a_name_that_is_both_across_two_devices_goes_nowhere_wrong() {
+    let mut s = crate::shared::tests::bob(2);
+    let (laptop, desktop) = (0, 1);
+    let now = s.now + 10;
+    for n in [laptop, desktop] {
+        crate::names::say(&s[n].conn, &s[n].identity, "notes", now).unwrap();
+    }
+    // Apart: the laptop syncs `review`, the desktop files a shared channel
+    // under that name.
+    crate::names::say(&s[laptop].conn, &s[laptop].identity, "review", now).unwrap();
+    let channel = holds(&s, desktop, 7, "review", now);
+    for n in [laptop, desktop] {
+        let mapped: Vec<Value> = ["notes", "review"]
+            .iter()
+            .map(|name| json!({ "folder": folder(name), "name": name }))
+            .collect();
+        meta::set(
+            &s[n].conn,
+            meta::SYNC_CLAUDE_MAPPINGS,
+            &Value::from(mapped).to_string(),
+        )
+        .unwrap();
+    }
+    s.meet(&[laptop, desktop]);
+    // Each syncs the name: a folder of each is mapped to it.
+    s.hold(&[laptop, desktop], "review");
+    follow_all(&s, now + 1);
+    let t = s.now + 2;
+    let others = |n: usize| -> Vec<cordelia_crypto::entry::CheckedEntry> {
+        s[n].stored()
+            .into_iter()
+            .filter(|entry| entry.channel != channel.id)
+            .collect()
+    };
+    for n in [laptop, desktop] {
+        let conn = &s[n].conn;
+        let identity = &s[n].identity;
+        let names: Vec<String> = crate::names::listed(conn)
+            .unwrap()
+            .into_iter()
+            .map(|listed| listed.name)
+            .collect();
+        assert!(
+            names.contains(&"review".to_string()),
+            "device {n}: {names:?}"
+        );
+        assert!(crate::lists::is_filed_under(conn, "review").unwrap());
+        let filing = sharing::find(conn, "review", None, None).unwrap();
+        assert_eq!(filing.channel, channel.id, "device {n}");
+        let listed = sharing::list(conn, identity, &at(t).own_relays, false, t).unwrap();
+        assert_eq!(listed["channels"][0]["name"], "review", "device {n}");
+        assert_eq!(listed["channels"][0]["also_a_name"], true, "device {n}");
+
+        // `--to review`: a name of the person's own, and nothing in the
+        // shared channel.
+        let in_shared = s[n].stored_in(&channel.secret);
+        let own_before = others(n).len();
+        let request = Request {
+            from: "notes".into(),
+            address: Address::Own(To::Name("review".into())),
+            asks: false,
+            link: None,
+            body: format!("to the name, on device {n}"),
+            thread: [0; 16],
+            answers: [0; 16],
+        };
+        let sends_at = At {
+            now: t,
+            fetched: true,
+            no_place: false,
+            mapped: true,
+            per_folder_per_hour: 20,
+            shared_fetched: true,
+            shared_reached: true,
+        };
+        sender::send(conn, identity, &sends_at, &request, sender::no_reply)
+            .unwrap_or_else(|e| panic!("device {n}: {e:?}"));
+        assert_eq!(others(n).len(), own_before + 1, "device {n}");
+        assert_eq!(s[n].stored_in(&channel.secret), in_shared, "device {n}");
+
+        // A publish under `review`: the name's channel, and nothing in the
+        // shared channel.
+        let write = crate::publish::Write {
+            name: "review",
+            file: &format!("from-{n}.md"),
+            value: EntryValue::Text("memory".into()),
+            planned: crate::publish::PlannedAgainst::NoVersion,
+            merge: None,
+        };
+        let own_before = others(n).len();
+        crate::publish::publish(conn, identity, &write, t).unwrap();
+        assert_eq!(others(n).len(), own_before + 1, "device {n}");
+        assert_eq!(s[n].stored_in(&channel.secret), in_shared, "device {n}");
+
+        // `share review <key>`: the shared channel, not refused as a name
+        // of the person's own.
+        let to = encode_public_key(&member(1).public_key()).unwrap();
+        let plan = sharing::share_plan(conn, identity, &at(t).own_relays, "review", &to, None, t)
+            .unwrap_or_else(|e| panic!("device {n}: {e:?}"));
+        assert_eq!(plan.what.filing.channel, channel.id, "device {n}");
+
+        // `subscribe review`, in the folder of `notes`: the shared channel.
+        let plan = subscribe_plan(conn, identity, &folder("notes"), "review", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.what.channel, channel.id, "device {n}");
+    }
+    // Subscribed, on the laptop, `send --channel review` writes in the
+    // shared channel, and in no channel of the person's own.
+    subscribes(&s, laptop, &channel, "notes", true, t + 1);
+    let before = others(laptop);
+    let in_shared = s[laptop].stored_in(&channel.secret).len();
+    sends(
+        &s,
+        laptop,
+        &asking("notes", "review", "into the channel"),
+        t + 2,
+    )
+    .unwrap();
+    assert_eq!(others(laptop), before);
+    assert!(s[laptop].stored_in(&channel.secret).len() > in_shared);
+    // And `--to review` there is still the name's.
+    let request = Request {
+        from: "notes".into(),
+        address: Address::Own(To::Name("review".into())),
+        asks: false,
+        link: None,
+        body: "to the name again".into(),
+        thread: [0; 16],
+        answers: [0; 16],
+    };
+    let sends_at = At {
+        now: t + 3,
+        fetched: true,
+        no_place: false,
+        mapped: true,
+        per_folder_per_hour: 20,
+        shared_fetched: true,
+        shared_reached: true,
+    };
+    let in_shared = s[laptop].stored_in(&channel.secret);
+    let own_before = others(laptop).len();
+    sender::send(
+        &s[laptop].conn,
+        &s[laptop].identity,
+        &sends_at,
+        &request,
+        sender::no_reply,
+    )
+    .unwrap();
+    assert_eq!(others(laptop).len(), own_before + 1);
+    assert_eq!(s[laptop].stored_in(&channel.secret), in_shared);
+}
