@@ -1,7 +1,7 @@
 # Decision: a removal fails safe
 
 **Date**: 2026-10-24
-**Status**: Proposed. Not built. Revised three times after its reviews. Settled for build after the third read (25 October).
+**Status**: Built, but for shared channels (rules 23 to 26, test 9), which are built with the shared record. Revised three times after its reviews. Settled for build after the third read (25 October), and built in nine slices (section 14). Of section 5, items 1 to 28 and 34 to 36 are made in the records and documents named; items 29 to 33 and 37 are of the shared record, which is not on this branch, and are made where it is built. Test 3 of section 7 was not built in any slice (section 14).
 **Cited as**: "decision 2026-10-24 rule 7", "decision 2026-10-24 §8". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
