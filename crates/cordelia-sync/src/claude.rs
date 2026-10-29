@@ -4390,10 +4390,12 @@ mod tests {
         let of_the_bytes = Link::of(&bytes, them.identity.public_key());
         assert_eq!(said("api.md"), Some(vec![of_the_bytes]));
 
-        // A conflict file is a new file: over nothing. And an index merged
-        // with the channel's is over the channel's. The version that this
-        // device's own file held is in that version's chain already, and
-        // nothing is added for it.
+        // A conflict file is written after the text it keeps (decision
+        // 2026-10-24 (removal), rule 7): an edit not yet published, over
+        // the version its folder agreed. And an index merged with the
+        // channel's is over the channel's. The version that this device's
+        // own file held is in that version's chain already, and nothing is
+        // added for it.
         let index = crate::memory_md::INDEX_FILE;
         p.file(index, "- a\n");
         p.file("both.md", "base\n");
@@ -4405,7 +4407,10 @@ mod tests {
         let report = p.cycle();
         assert_eq!((report.conflicts, report.published), (1, 1), "{report:?}");
         assert_eq!(p.cycle().published, 1);
-        assert_eq!(said("both.conflict-abcd.md"), Some(Vec::new()));
+        assert_eq!(
+            said("both.conflict-abcd.md"),
+            Some(vec![link(Some("base\n"), me)])
+        );
         let first = link(Some("- a\n"), me);
         let second = link(Some("- a\n- theirs\n"), them);
         assert_eq!(said(index), Some(vec![second, first]));
