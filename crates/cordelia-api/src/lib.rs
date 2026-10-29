@@ -46,6 +46,7 @@ pub mod carrying;
 pub mod change;
 pub mod commands;
 pub(crate) mod cut;
+pub use cut::CutNow;
 pub mod entries;
 pub mod error;
 pub mod first_start;

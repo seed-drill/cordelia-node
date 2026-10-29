@@ -141,23 +141,23 @@ impl Cuts {
     }
 
     /// Whether `key`, which the removed key `adder` added by a record, is
-    /// listed as a device by a noted change that removes `adder`, or by one
-    /// on the chain of such a change (rule 6): the person put it in the
-    /// history that leads to the removal, with the phrase, and it is not a
-    /// key that `adder` added alone. A key that only a change made apart
-    /// from every removal lists is not.
+    /// listed as a device by a noted change that removes `adder` (rule 6):
+    /// the person kept it with the phrase in the change that removed its
+    /// adder, and it is not a key that `adder` added alone. For a key that
+    /// rule 6 removed, the changes are those that remove the key it goes
+    /// back to. A key that only a change on such a change's chain lists, or
+    /// a change made apart from every removal, is not: one the person
+    /// dropped from the list, and the removed device added again, holds the
+    /// secret by its record alone.
     pub(crate) fn listed_toward_a_removal(&self, adder: &[u8; 32], key: &[u8; 32]) -> bool {
         let Some(cut) = self.of_key(adder) else {
             return false;
         };
-        let lists = |change: &Change| {
+        cut.removals.iter().any(|(removal, _)| {
             self.devices
-                .get(change)
+                .get(removal)
                 .is_some_and(|devices| devices.contains(key))
-        };
-        cut.removals
-            .iter()
-            .any(|(removal, chain)| lists(removal) || chain.iter().any(lists))
+        })
     }
 
     /// The cut of `key`, where the device knows it to be removed.
@@ -212,6 +212,60 @@ impl Cuts {
     pub(crate) fn cuts_key(&self, key: &[u8; 32], generation: &Change, at: i64) -> bool {
         self.of_key(key)
             .is_some_and(|cut| self.cuts(cut, generation, at))
+    }
+}
+
+/// What a device cuts now, in the generation it follows (rules 6 and 7),
+/// for a reader that knows no time of arrival: the put-back of an index
+/// line. It judges at `now`, the latest anything came, which fails safe. In
+/// a generation that is a removal of a key, or made after one, nothing of
+/// that key is cut (the key was known removed there, and its entries were
+/// refused); before it, what such a key signed or a chain names is cut.
+/// Where the device follows no change, every removed key is cut.
+#[derive(Debug, Clone)]
+pub struct CutNow {
+    cuts: Cuts,
+    generation: Option<Change>,
+    now: i64,
+}
+
+impl CutNow {
+    /// What the device whose database is `conn` cuts at `now`.
+    pub fn read(conn: &Connection, now: i64) -> Result<Self, PersonError> {
+        let generation = match crate::person::held(conn)? {
+            Some(held) => {
+                let link = held.statement.statement.link()?;
+                Some((link.number, link.hash))
+            }
+            None => None,
+        };
+        Ok(Self {
+            cuts: Cuts::read(conn)?,
+            generation,
+            now,
+        })
+    }
+
+    /// Whether what `key` signed is cut.
+    pub fn key(&self, key: &[u8; 32]) -> bool {
+        self.cuts.of_key(key).is_some_and(|cut| self.cut(cut))
+    }
+
+    /// Whether what the key whose first 16 bytes are `signer` signed, as a
+    /// link names it, is cut.
+    pub fn signer(&self, signer: &[u8; 16]) -> bool {
+        self.cuts
+            .keys()
+            .iter()
+            .filter(|cut| cut.signer == *signer)
+            .any(|cut| self.cut(cut))
+    }
+
+    fn cut(&self, cut: &KeyCut) -> bool {
+        match &self.generation {
+            Some(generation) => self.cuts.cuts(cut, generation, self.now),
+            None => true,
+        }
     }
 }
 
@@ -353,6 +407,53 @@ mod tests {
         // Before the first removal it is still cut by time.
         assert!(cuts.cuts_key(&[9; 32], &at(2), long_after));
         assert!(!cuts.cuts_key(&[9; 32], &at(2), 5_000 - MARGIN - 1));
+    }
+
+    /// Rule 6 spares a key that a removal of its adder lists, and not one
+    /// that only a change on that removal's chain lists: one the person
+    /// dropped from the list there, and the removed key added again.
+    #[test]
+    fn a_key_is_spared_only_where_a_removal_of_its_adder_lists_it() {
+        let mut dropped_later = change(3, Some(4_000), &[], &[1, 2]);
+        dropped_later.devices = Some(vec![[6; 32]]);
+        let mut removal = change(4, Some(5_000), &[9], &[1, 2, 3]);
+        removal.devices = Some(vec![[0; 32], [5; 32]]);
+        let noted = [change(2, Some(100), &[], &[1]), dropped_later, removal];
+        let cuts = Cuts::of(&noted, &[([9; 32], None), ([7; 32], Some([9; 32]))]);
+        assert!(cuts.listed_toward_a_removal(&[9; 32], &[5; 32]));
+        assert!(!cuts.listed_toward_a_removal(&[9; 32], &[6; 32]));
+        // A key that rule 6 removed goes back to its adder's removals.
+        assert!(cuts.listed_toward_a_removal(&[7; 32], &[5; 32]));
+        assert!(!cuts.listed_toward_a_removal(&[8; 32], &[5; 32]));
+    }
+
+    /// What the put-back of an index line judges by (`CutNow`): in a
+    /// generation before the removal, what the key signed or a chain names
+    /// is cut at the time now; in the removal's generation, or one made
+    /// after it, nothing; where the device follows no change, everything.
+    #[test]
+    fn what_is_cut_now_goes_by_the_generation_followed() {
+        let noted = [
+            change(2, Some(100), &[], &[1]),
+            change(3, Some(5_000), &[9], &[1, 2]),
+            change(4, Some(9_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        let now = |generation: Option<Change>| CutNow {
+            cuts: cuts.clone(),
+            generation,
+            now: 1_000_000,
+        };
+        let signer = EntryLink::signer_of(&[9; 32]);
+        for generation in [Some(at(2)), None] {
+            assert!(now(generation).key(&[9; 32]));
+            assert!(now(generation).signer(&signer));
+        }
+        for generation in [at(3), at(4)] {
+            assert!(!now(Some(generation)).key(&[9; 32]));
+            assert!(!now(Some(generation)).signer(&signer));
+        }
+        assert!(!now(Some(at(2))).key(&[8; 32]));
     }
 
     /// A key that no noted change removes has everything cut.

@@ -1182,7 +1182,7 @@ CREATE TABLE relay_head_rooms (
 ///   in 8 bytes, big-endian, then its hash) and the keys it lists as
 ///   devices (`devices`, 32 bytes each): the cut time of a removed key is
 ///   worked out from them (rule 2), and a key that rule 6 would remove is
-///   spared where a change on the chain of the removal lists it. A change noted before
+///   spared where a removal of its adder lists it. A change noted before
 ///   the step has none, and is asked of nothing that needs them: that
 ///   fails safe.
 /// - `person_removed_keys_by`: beside a removed key, for one that rule 6

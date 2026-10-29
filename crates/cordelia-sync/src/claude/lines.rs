@@ -510,27 +510,25 @@ fn put_back(
         };
         // On a device that knows of a removal, no line is taken from a
         // version that a removed key signed, or that names one in its chain,
-        // nor a line removed from such a version (decision 2026-10-24
-        // (removal), rule 7): what a carry left out is put back by nobody.
-        let removed = cordelia_storage::person::removed_keys(&db)?;
-        let removed_signers: Vec<[u8; 16]> = removed
-            .iter()
-            .map(cordelia_crypto::entry::Link::signer_of)
-            .collect();
+        // nor a line removed from such a version, where the cut of rule 7
+        // (decision 2026-10-24 (removal)) would leave it out: what a carry
+        // left out is put back by nobody. It is judged in the generation
+        // followed, at the time now, which fails safe: in a generation made
+        // after the key's removal nothing of it is cut, and honest lines
+        // whose chains still name the key are put back.
+        let cut = cordelia_api::CutNow::read(&db, chrono::Utc::now().timestamp())
+            .map_err(super::of_person)?;
         let stands: Vec<Beside> = stands
             .into_iter()
             .filter(|version| {
-                !version.signers.iter().any(|key| removed.contains(key))
-                    && !version
-                        .links
-                        .iter()
-                        .any(|link| removed_signers.contains(link))
+                !version.signers.iter().any(|key| cut.key(key))
+                    && !version.links.iter().any(|link| cut.signer(link))
             })
             .collect();
         let (due, of_removed): (Vec<&index_lines::Record>, Vec<&index_lines::Record>) = due
             .iter()
             .copied()
-            .partition(|record| !record.from.iter().any(|key| removed.contains(key)));
+            .partition(|record| !record.from.iter().any(|key| cut.key(key)));
         for record in &of_removed {
             index_lines::drop_record(&db, folder, channel, &record.file)?;
         }
