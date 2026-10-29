@@ -155,3 +155,57 @@ fn a_channel_not_yet_clean_is_said_as_held_by_a_removed_device() {
     assert_eq!(shared["removed_device_holds"], json!([]), "{shared}");
     assert_eq!(shared["channels"], json!([]));
 }
+
+/// The `since` of a group, by the node's clock.
+fn since_of(group: &Value) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(group["since"].as_str().unwrap())
+        .unwrap()
+        .timestamp()
+}
+
+/// Two removals (decision 2026-10-10 §9): the phone is removed, and later
+/// the tablet, while the channel stays not clean on the desktop. The entry
+/// names the device that each removal removed, and not every key removed
+/// so far; and its seven days count from the later removal.
+#[test]
+fn a_later_removal_names_its_own_device_and_counts_from_itself() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2, 3]);
+    for n in 0..4 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    // The laptop removes the phone.
+    s.change(0, &[0, 1, 2], &[3]);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
+    let first = shared["removed_device_holds"].as_array().unwrap().clone();
+    assert_eq!(first.len(), 1, "{shared}");
+    let device = first[0]["device"].as_str().unwrap();
+    assert_eq!(
+        device,
+        format!("\"device 3\" ({})", fingerprint::shown(&s.key(3)))
+    );
+    let first_since = since_of(&first[0]);
+    // Later, the laptop removes the tablet.
+    s.now += 9 * 86_400;
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
+    let second = shared["removed_device_holds"].as_array().unwrap();
+    assert_eq!(second.len(), 1, "{shared}");
+    assert_eq!(second[0]["channels"], json!(["review"]));
+    let device = second[0]["device"].as_str().unwrap();
+    assert_eq!(
+        device,
+        format!("\"device 2\" ({})", fingerprint::shown(&s.key(2)))
+    );
+    assert!(
+        since_of(&second[0]) > first_since + 8 * 86_400,
+        "{shared}, first since {first_since}"
+    );
+}

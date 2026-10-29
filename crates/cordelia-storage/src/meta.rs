@@ -103,6 +103,14 @@ pub const PERSON_RELAYS_KNOWN: &str = "person.relays_known";
 /// knew by a label is not in it.
 pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
 
+/// JSON object of the latest removal or recovery that made this device's
+/// shared channels not yet clean (decision 2026-10-10 §9): `at`, the time
+/// of the marks it set, and `keys`, each key in hex that it removed and the
+/// statement before it did not (`cordelia_api::shared_anew`). The status
+/// names these as the device of `removed_device_holds`. 256 keys at most,
+/// as a statement removes. It goes when the device leaves its phrase.
+pub const PERSON_REMOVAL_KEYS: &str = "person.removal_keys";
+
 /// JSON array of the keys, each in hex, that a recovery made on this
 /// machine left out without showing them (decision 2026-10-04 §9, step
 /// 3): rows beyond the 256 that its prompt shows. Each is kept as left

@@ -122,7 +122,9 @@ pub fn status_of(
             ),
             _ => format!("({})", fingerprint::shown(key)),
         };
-        let removed: Vec<String> = held.statement.statement.removed.iter().map(named).collect();
+        // Every key removed so far, where none is kept of the removal of
+        // a mark's time.
+        let every_removed: Vec<[u8; 32]> = held.statement.statement.removed.clone();
         let mut by_since: BTreeMap<i64, Vec<String>> = BTreeMap::new();
         for mark in st(anew_rows::not_clean_all(conn))? {
             if !shared_anew::is_not_clean(conn, &mark.channel)? {
@@ -132,16 +134,19 @@ pub fn status_of(
                 by_since.entry(mark.since).or_default().push(row.name);
             }
         }
-        let removed_device_holds: Vec<Value> = by_since
-            .into_iter()
-            .map(|(since, channels)| {
-                json!({
-                    "device": removed.join(", "),
-                    "channels": channels,
-                    "since": rfc3339(since),
-                })
-            })
-            .collect();
+        // Each group names the keys that the removal of its time removed,
+        // and the statement before it did not.
+        let mut removed_device_holds: Vec<Value> = Vec::new();
+        for (since, channels) in by_since {
+            let removed =
+                shared_anew::removed_at(conn, since)?.unwrap_or_else(|| every_removed.clone());
+            let device: Vec<String> = removed.iter().map(named).collect();
+            removed_device_holds.push(json!({
+                "device": device.join(", "),
+                "channels": channels,
+                "since": rfc3339(since),
+            }));
+        }
 
         let mut acts_of_removed_devices = Vec::new();
         for act in shared_anew::acts_of_removed(conn)? {

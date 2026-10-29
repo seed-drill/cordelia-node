@@ -1456,7 +1456,7 @@ fn a_recovery_makes_a_channel_anew_only_once_it_has_read_it() {
     s.change(0, &[0], &[1]);
     let now = s.now + 20;
     let conn = &s[0].conn;
-    recovered(conn, now).unwrap();
+    recovered(conn, &[], now).unwrap();
     assert_eq!(make_owed(conn, &s[0].identity, now, &|_| false).unwrap(), 0);
     assert!(
         st(rows::made_of_channel(conn, &channel.id))

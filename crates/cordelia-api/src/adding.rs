@@ -1273,6 +1273,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NAMES_BROUGHT_IN)?;
     meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
+    meta::remove(conn, meta::PERSON_REMOVAL_KEYS)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     // What it knew of which relay holds which change was of entries of
