@@ -159,6 +159,25 @@ impl Lives {
             .map(|(at, _)| *at)
     }
 
+    /// When it had first run `secs` without a stop or a freeze from `from`
+    /// on: the end of that stretch, or `None` where it never did. A device
+    /// still running at its last change runs on.
+    fn ran_for_after(&self, node: usize, from: f64, secs: f64) -> Option<f64> {
+        let mut since = (self.at(node, from) == Is::Running).then_some(from);
+        for (at, is) in self.of[node].iter().filter(|(at, _)| *at > from) {
+            if let Some(s) = since
+                && *at - s >= secs
+            {
+                return Some(s + secs);
+            }
+            match is {
+                Is::Running => since = since.or(Some(*at)),
+                _ => since = None,
+            }
+        }
+        since.map(|s| s + secs)
+    }
+
     /// The longest stretch it ran without a stop or a freeze inside [a, b].
     fn longest_run_within(&self, node: usize, a: f64, b: f64) -> f64 {
         let mut longest: f64 = 0.0;
@@ -2453,12 +2472,13 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
 /// It is owed within 120 s of the start where the device it waits on ran
 /// through those 120 s and its writer ran until it could push: for
 /// [`HELD_BY_A_RUNNING_DEVICE_SECS`] from the edit where it had a relay
-/// that ran then (the first relay, or the second before its stop), and
-/// through the 120 s otherwise, as the edit waits on it until the relay is
-/// back. Where either did not, it is owed within [`CATCH_UP_SECS`] of the
-/// later of the two running again after that (bar 3's catch-up), and never
-/// sooner; one that never arrives is late there only where both devices
-/// were running at the end.
+/// that ran then (the first relay, or the second where it ran those
+/// seconds before its stop), and through the 120 s otherwise, as the edit
+/// waits on it until the relay is back. Where either did not, it is owed
+/// once the later of the two, after it ran again, has run
+/// [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's catch-up), and
+/// never sooner; one that never arrives is late there only where both
+/// devices were running at the end.
 fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
     let person = &read.run.plan.population.people[p.edit.person];
     let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
@@ -2466,7 +2486,7 @@ fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
     let up = person
         .relays_of(p.edit.writer, read.run.plan.relays)
         .contains(&0)
-        || pushed <= stopped;
+        || (pushed <= stopped && read.lives.ran_through(writer, p.edit.at, pushed));
     let writer_until = if up { pushed } else { started + 120.0 };
     let mut deadline = started + 120.0;
     let mut held = false;
@@ -2480,8 +2500,11 @@ fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
         held = true;
         // One that never ran again holds nothing up: where it is the
         // writer and the edit arrived, it had pushed before it stopped.
+        // One that ran again is owed its catch-up once it has run that long
+        // without a stop or a freeze.
         if let Some(t) = read.lives.ran_again_after(node, a, b) {
-            deadline = deadline.max(t + CATCH_UP_SECS);
+            let caught_up = read.lives.ran_for_after(node, t, CATCH_UP_SECS);
+            deadline = deadline.max(caught_up.unwrap_or(f64::INFINITY));
         }
     }
     match p.arrived {

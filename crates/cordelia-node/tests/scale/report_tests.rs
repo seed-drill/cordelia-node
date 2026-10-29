@@ -887,7 +887,36 @@ fn bar_15_gives_a_held_up_split_edit_a_later_deadline_and_never_drops_it() {
         Option<f64>,
         bool,
     );
-    let cases: [Case; 20] = [
+    let cases: [Case; 23] = [
+        (
+            "the receiver frozen 630 to 639, off 645 to 1500, arrived at 1510",
+            0,
+            &[
+                (1, 630.0, Frozen),
+                (1, 639.0, Running),
+                (1, 645.0, Stopped),
+                (1, 1500.0, Running),
+            ],
+            None,
+            Some(1510.0),
+            false,
+        ),
+        (
+            "the writer stopped 600 to 610, after it pushed, arrived at 660",
+            0,
+            &[(0, 600.0, Stopped), (0, 610.0, Running)],
+            None,
+            Some(660.0),
+            true,
+        ),
+        (
+            "the receiver off 460 to 2480, never arrived (the window ends at 2500)",
+            0,
+            &[(1, 460.0, Stopped), (1, 2480.0, Running)],
+            None,
+            None,
+            false,
+        ),
         ("both ran", 0, &[], None, Some(700.0), true),
         ("both ran, on time", 0, &[], None, Some(630.0), false),
         (
@@ -1067,6 +1096,32 @@ fn bar_15_gives_a_held_up_split_edit_a_later_deadline_and_never_drops_it() {
     assert!(
         bar.figure.contains("1 split people's edits late") && bar.verdict == Verdict::Fail,
         "a writer that pushed before the stop: {}",
+        bar.figure
+    );
+}
+
+/// A writer on the second relay alone that wrote 30 s before the stop but
+/// froze before it could push, then was off from before the start to
+/// 1000, holds its edit until it runs again: arriving at 1010, it is not
+/// late, as no relay could have handed it sooner.
+#[test]
+fn bar_15_waits_for_a_writer_that_froze_before_it_pushed() {
+    use Is::{Frozen, Running, Stopped};
+    let bar = split_edit_at_the_outage(
+        1,
+        370.0,
+        &[
+            (1, 375.0, Frozen),
+            (1, 398.0, Running),
+            (1, 519.0, Stopped),
+            (1, 1000.0, Running),
+        ],
+        None,
+        Some(1010.0),
+    );
+    assert!(
+        bar.figure.contains("0 split people's edits late"),
+        "{}",
         bar.figure
     );
 }
