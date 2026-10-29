@@ -5593,7 +5593,7 @@ fn shell_arg(path: &str) -> String {
 /// A word as a shell argument: as it is where that is safe, quoted
 /// otherwise. Names from other devices are printed inside commands to
 /// copy, so nothing in one may be read by the shell.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && !word.starts_with('-')
         && word

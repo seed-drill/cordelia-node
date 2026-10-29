@@ -2117,6 +2117,19 @@ fn refusal(conn: &Connection, why: &Refused) -> Result<HttpResponse, ApiError> {
             json!({ "id": id })
         }
         Refused::MoreThanOne { id, ids } => json!({ "id": id, "ids": ids }),
+        // A reply to a message of a shared channel (decision 2026-10-10
+        // §4.2): the name the person files that channel under.
+        Refused::ReplyElsewhere { id, channel } => {
+            let name = match channel {
+                Some(channel) => crate::sharing::filed(conn)
+                    .map_err(refused)?
+                    .into_iter()
+                    .find(|filing| filing.channel == *channel)
+                    .map(|filing| filing.name),
+                None => None,
+            };
+            json!({ "id": id, "channel": name })
+        }
         _ => json!({}),
     };
     Ok(refused_with(why.word(), &why.to_string(), details))

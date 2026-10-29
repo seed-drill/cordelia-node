@@ -743,6 +743,22 @@ pub fn refusal_line(word: &str, said: &Value, folder: &str, does: Does) -> Optio
             }
             line
         }
+        // A reply where its message did not come from (decision
+        // 2026-10-10 §4.2).
+        "reply_elsewhere" => match said["channel"].as_str() {
+            Some(channel) => format!(
+                "Message {} came from the shared channel \"{}\": a reply goes there only with \
+                 --channel {}, so nothing was sent.",
+                id(),
+                cleaned(channel),
+                crate::shell_word(channel)
+            ),
+            None => format!(
+                "Message {} came from your own agents: a reply goes to them with --to or --all, \
+                 never to a shared channel, so nothing was sent.",
+                id()
+            ),
+        },
         "bad_link" => format!(
             "{} is not a link of the form owner/repo#number.",
             cleaned(&text("link"))
