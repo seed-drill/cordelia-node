@@ -877,7 +877,17 @@ fn bar_7_says_where_growth_was_not_tested() {
 fn bar_15_gives_a_held_up_split_edit_a_later_deadline_and_never_drops_it() {
     use Is::{Frozen, Running, Stopped};
     type Changes = &'static [(usize, f64, Is)];
-    let cases: [(&str, usize, Changes, Option<usize>, Option<f64>, bool); 20] = [
+    /// The case, the writer, the changes, the device never started, the
+    /// arrival, and whether it is late.
+    type Case = (
+        &'static str,
+        usize,
+        Changes,
+        Option<usize>,
+        Option<f64>,
+        bool,
+    );
+    let cases: [Case; 20] = [
         ("both ran", 0, &[], None, Some(700.0), true),
         ("both ran, on time", 0, &[], None, Some(630.0), false),
         (
