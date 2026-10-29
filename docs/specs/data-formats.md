@@ -97,6 +97,15 @@
 >   its first start on this version it notes the time of each entry it kept,
 >   and a device in a fork judges the one it kept apart by rule 8 (rule 12).
 >
+> Step 23, per the same record (set out in §10.1 and §10.2):
+>
+> - **v23:** a relay keeps every head. `entries` made again, with a column
+>   `head` in its key: empty for the row kept by the store's rule (every
+>   row a device keeps, and every row at the step), and the entry's ID for
+>   a head that a relay keeps beside it by its lineage. Every row carried
+>   with its places. `relay_head_rooms`, empty: each author's slot whose
+>   room for a second head a relay counts.
+>
 > Step 24, per the same record (set out in §10.3 and §10.6):
 >
 > - **v24:** what a device took before it knew of a removal (decision
@@ -829,14 +838,25 @@ phrase's channel and each has to know the change entry's slot from any other.
 It is signed by the phrase's key and by the key of the phrase's channel, as
 every entry is by its author and its channel.
 
-**Its content is always 32,768 bytes,** in two parts. Each part is a nonce
+**Its content is always 32,768 bytes,** in two sealed parts and a lineage
+in the clear (decision 2026-10-24 (removal), rule 13). Each part is a nonce
 (12), a ciphertext and a tag (16), and is one size whatever it says: what it
 says is filled up with zeros inside the encryption.
 
 ```text
-the part for the devices   28672 bytes, under the statement key
-the part for the phrase     4096 bytes, under the phrase's sealing key
+offset     0  the part for the devices  28672 bytes, under the statement key
+offset 28672  the part for the phrase    1024 bytes, under the phrase's sealing key
+offset 29696  the lineage                3072 bytes, in the clear
 ```
+
+**The part for the devices does not move or grow** (`CHANGE_ENTRY_DEVICES_PART_BYTES`
+is fixed, not derived). In the layout of 0.2.0-alpha.16 the part for the
+phrase was the last 4,096 bytes, and there was no lineage. A device of that
+version opens the part for the devices of an entry of this layout as it
+opens its own, and applies the change. Its commands open the part for the
+phrase at its old place, find that it does not open, and refuse: a change
+made over an entry of this layout is made on a device of this version.
+`change-entry-test-vectors.json` pins the three sizes.
 
 The associated data of the part for the devices is
 `cordelia v2 change devices`, the statement's number and the phrase's public
@@ -850,7 +870,27 @@ for the devices   the signed statement's length, the signed statement,
 for the phrase    the secret (32), a count from 0 to 8, and for each
                   earlier generation its number (8) and its secret (32),
                   the newest first
+the lineage       a mark (8: the first bytes of SHA-256 of the label
+                  `cordelia v2 lineage`), the time the change was made by
+                  its maker's clock (8, in seconds), the first 8 bytes of
+                  the statement's hash, a count (2), and the first 8 bytes
+                  of the hash of each statement on its chain, in the
+                  chain's order; then zeros
 ```
+
+A count or a length is two bytes and a number eight, the higher byte
+first. At every bound the part for the phrase needs 382 bytes, and the
+lineage of a chain of 256 needs 2,074 (`MAX_LINEAGE_BYTES`).
+
+- **The lineage is in the clear,** and a relay reads it: it keeps every head
+  of the phrase's channel by it (decision 2026-10-24 (removal), rule 14).
+  The entry's two signatures cover it, so only the phrase writes one. It
+  tells a relay how the person's statements follow each other, when two
+  were made apart, and when each was made.
+- **An entry whose lineage region does not open with the mark has no
+  lineage:** it was made on 0.2.0-alpha.16, and is judged by its statement
+  alone. A lineage that does not match its statement (another statement's
+  hash, or another chain), or is not in its form, is refused, whoever reads.
 
 - **A secret sealed to a device** is 92 bytes: an ephemeral X25519 key (32),
   a nonce (12), the 32 bytes and a tag (16), as the node seals to a key
@@ -937,11 +977,14 @@ Times are in seconds, in UTC, by the clock of the node that writes them. A
 key, a channel's ID and a slot are each 32 bytes, and a signature 64: in the
 tables of §10.1 to §10.5 each such column is checked for its length.
 
-### 10.1 entries (v11, v13; decision §2.3, §2.4)
+### 10.1 entries (v11, v13, v23; decision §2.3, §2.4)
 
 One row for each author in each slot of each channel: the newest revision
 that author signed there. A relay holds here what it carries, and a device
-what it holds of its own channels.
+what it holds of its own channels. **A relay also keeps every head** where
+entries carry a lineage (decision 2026-10-24 (removal), rule 14): up to
+eight (`MAX_CHANGE_HEADS`) for an author in a slot, each with its ID in
+`head`.
 
 ```sql
 CREATE TABLE entries (
@@ -956,7 +999,9 @@ CREATE TABLE entries (
     seq          INTEGER NOT NULL,
     stored_at    INTEGER NOT NULL,
     channel_place INTEGER NOT NULL DEFAULT 0,      -- v13
-    PRIMARY KEY (channel_id, slot, author)
+    head         BLOB NOT NULL DEFAULT x''         -- v23
+                 CHECK(typeof(head) = 'blob' AND length(head) IN (0, 32)),
+    PRIMARY KEY (channel_id, slot, author, head)   -- v23: was (channel_id, slot, author)
 );
 
 CREATE UNIQUE INDEX idx_entries_channel_seq   ON entries(channel_id, seq);
@@ -968,6 +1013,29 @@ CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_pla
 - **A row is replaced only by a higher revision** from that author in that
   slot. An entry at the revision of the one held is not stored. Nothing
   compares one author's entries with another's.
+- **A head** (`head` holds its ID) is kept by a relay where the entry
+  carries a lineage (§9.6): one that no other entry it keeps there was made
+  after. An entry that one it keeps was made after is not stored; one made
+  after some that it keeps replaces them; one made apart from all is kept
+  beside them; the highest numbers are kept first. An entry with no lineage
+  is kept as before, only where every entry of that author in the slot has
+  a lower revision, and it replaces the row of the store's rule, never a
+  head. A device's rows all have `head` empty.
+- **`relay_head_rooms`** (v23) names each author's slot where a relay counts
+  the entry with a lineage at twice its size, from when it took the first
+  one there with the room: so a second head always has room (rule 15). A
+  relay makes no room by dropping channels. Where it had no room at the
+  first, it counts the share at a later entry with a lineage taken there,
+  if it then has the room.
+
+  ```sql
+  CREATE TABLE relay_head_rooms (
+      channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+      slot        BLOB NOT NULL CHECK(length(slot) = 32),
+      author      BLOB NOT NULL CHECK(length(author) = 32),
+      PRIMARY KEY (channel_id, slot, author)
+  );
+  ```
 - `seq` is the order in which this node stored all of its entries, from the
   counter `entry_seq`, which never goes backwards.
 - `channel_place` is the entry's place in its channel alone: a count from 1.
@@ -1192,7 +1260,7 @@ CREATE TABLE person_clear_mark (                    -- v21
 | Table | What it holds | Decision |
 |---|---|---|
 | `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it is closed: it follows no clear change, decision 2026-10-24 (removal), rule 10; the name is a fork's of before); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
-| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
+| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after two changes made apart. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
 | `person_change_entries` | The change entry of the change it follows (`followed` 1), whole, to show to a relay: on a device that stopped, the one that stopped it. And up to seven heads it sets aside (`followed` 0), each with when it set it aside: eight in all (`MAX_CHANGE_HEADS`). Step 22 made it again: the latest entry was carried as the change followed, and the one made apart as a head set aside at the step's time | §4.5, §4.6; decision 2026-10-24 (removal), rule 1 |
 | `person_change_times` | For each change it applied or kept, by its statement's number and hash, the time its lineage says it was made, or none for a change made on the version before. Kept after the change goes, until the device leaves its phrase, for the cut time of rule 2 | decision 2026-10-24 (removal), rule 2 |
 | `person_change_times_lists` | Beside a change's time, the keys its statement lists as removed, its chain (each link its number in 8 bytes, big-endian, then its hash) and the keys it lists as devices. A removed key's cut time is worked out from them: the time of the change that first removes it, where it and the change before it are noted, and otherwise of the newest earlier change noted, less ten minutes; a key that a change on the chain of its adder's removal lists is not removed by rule 6 | decision 2026-10-24 (removal), rules 2 and 6 |
