@@ -1504,13 +1504,19 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
                     generation.number,
                     |key| to_look.takes.contains(key),
                 )?;
+                // Judged by the cut where it was read (decision 2026-10-24
+                // (removal), rule 7), but for the keys the person said are
+                // lost or broken, whose writing the look takes by their
+                // word: a version that a removed key the person did not
+                // name signed, or wrote what it was written over, is left.
                 for version in &was.versions {
-                    let brought = carry::bring_by_command(
+                    let brought = carry::bring_by_word(
                         &conn,
                         &state.identity,
                         name,
                         version,
-                        Rule::Counts,
+                        Rule::Counts(generation.change),
+                        &to_look.takes,
                         now(),
                     )?;
                     tally.count(&format!("{name}: {}", version.name), brought);
@@ -1590,6 +1596,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
         "carried_names": carried_names,
         "held": tally.held,
         "higher": tally.higher,
+        "cut": tally.cut,
         "ties": tally.ties,
         "not_read": not_read,
         "failed": failed,
@@ -4170,9 +4177,18 @@ mod tests {
         assert_eq!(number, 4);
         assert_eq!(to_look.takes, [first_key]);
         let found = the_look(&second.state, number, &to_look).await;
-        // What the first machine had sent comes back: one file.
-        assert_eq!(found["carried"], 1, "{found}");
-        assert_eq!(second.text(LAB, "a.md").as_deref(), Some("of device 0"));
+        // What the first machine had sent is its carry of what device 0
+        // wrote, and its chain names device 0, which a change read
+        // removes: the look leaves it out (decision 2026-10-24 (removal),
+        // rules 7 and 22; the second read of slice 8, its second finding).
+        // This machine does not know the generation it read it in, so the
+        // cut fails safe there. `--from` brings it in, below.
+        assert_eq!(
+            (&found["carried"], &found["cut"]),
+            (&json!(0), &json!(1)),
+            "{found}"
+        );
+        assert_eq!(second.text(LAB, "a.md"), None);
         assert_eq!(second.text(LAB, "b.md"), None);
         assert_eq!(second.text("desk", "d.md"), None);
         // And it says, for each removed key, how much the new channels
@@ -4192,8 +4208,10 @@ mod tests {
                     .collect(),
             )
         };
-        assert_eq!(lacking.len(), 2, "{found}");
-        assert_eq!(lacks(&k0), (1, vec![LAB.to_string()]));
+        // The first machine among them: what it carried is said as its.
+        assert_eq!(lacking.len(), 3, "{found}");
+        assert_eq!(lacks(&first_key), (1, vec![LAB.to_string()]));
+        assert_eq!(lacks(&k0), (2, vec![LAB.to_string()]));
         assert_eq!(lacks(&k1), (2, vec!["desk".to_string(), LAB.to_string()]));
 
         // Both gone devices are named in one run, each by the first six
@@ -4203,7 +4221,7 @@ mod tests {
         let said = carrying::look_from(&second.state, LAB, &named)
             .await
             .unwrap();
-        assert_eq!(said["empty"], 2, "{said}");
+        assert_eq!(said["empty"], 3, "{said}");
         assert_eq!(said["above"], json!([]));
         let by_label = carrying::look_from(&second.state, LAB, &["device 0".to_string()]).await;
         assert!(matches!(by_label, Err(PersonError::NotCarried(_))));
@@ -4216,7 +4234,8 @@ mod tests {
             },
         );
         let done = carrying::take_from(&second.state, &word).await.unwrap();
-        assert_eq!(done["carried"], 2, "{done}");
+        assert_eq!(done["carried"], 3, "{done}");
+        assert_eq!(second.text(LAB, "a.md").as_deref(), Some("of device 0"));
         assert_eq!(second.text(LAB, "b.md").as_deref(), Some("of device 1"));
         assert_eq!(second.text(LAB, "old.md").as_deref(), Some("from before"));
         // A third recovery would bring back what the first machine had

@@ -1083,7 +1083,14 @@ fn batches(versions: &[Handed], max_bytes: usize) -> Vec<&[Handed]> {
 
 /// Add what the node said of one batch to what it said of those before.
 fn add_to(total: &mut Value, done: &Value) {
-    for field in ["carried", "held", "higher", "deletes", "by_other_keys"] {
+    for field in [
+        "carried",
+        "held",
+        "higher",
+        "deletes",
+        "cut",
+        "by_other_keys",
+    ] {
         let sum = total[field].as_u64().unwrap_or(0) + done[field].as_u64().unwrap_or(0);
         total[field] = sum.into();
     }
@@ -1093,6 +1100,26 @@ fn add_to(total: &mut Value, done: &Value) {
             all.extend(more);
         }
     }
+}
+
+/// What is said of the versions a carry left out because a removed device
+/// wrote them, or wrote what they were written over (decision 2026-10-24
+/// (removal), rule 7): only `--from` brings in what a removed device wrote.
+pub(crate) fn left_out_line(how_many: usize, name: &str) -> String {
+    format!(
+        "  {} left out: a removed device wrote {}, or what {} written over. What a removed \
+         device wrote comes in only with the recovery phrase: `cordelia sync carry {name} \
+         --from <its label>`.",
+        counted(how_many, "version"),
+        match how_many {
+            1 => "it",
+            _ => "them",
+        },
+        match how_many {
+            1 => "it was",
+            _ => "they were",
+        }
+    )
 }
 
 /// A number of seconds, as minutes, in words.
@@ -1207,6 +1234,9 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
                 n => format!("{n} deletes were"),
             }
         ));
+    }
+    if number("cut") > 0 {
+        lines.push(left_out_line(number("cut"), &name));
     }
     // What could not be read, by generation and relay.
     lines.extend(not_read_lines(done));
@@ -1928,20 +1958,45 @@ mod tests {
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],
-            "deletes": 0, "by_other_keys": 2,
+            "deletes": 0, "cut": 0, "by_other_keys": 2,
         });
         let done = json!({
             "carried": 2, "held": 1, "higher": 3, "ties": ["b.md"], "above": ["c.md"],
-            "deletes": 1, "by_other_keys": 1,
+            "deletes": 1, "cut": 2, "by_other_keys": 1,
         });
         add_to(&mut total, &done);
         assert_eq!(
             total,
             json!({
                 "carried": 3, "held": 1, "higher": 3, "ties": ["a.md", "b.md"],
-                "above": ["c.md"], "deletes": 1, "by_other_keys": 3,
+                "above": ["c.md"], "deletes": 1, "cut": 2, "by_other_keys": 3,
             })
         );
+    }
+
+    /// A carry says how many versions it left out because a removed
+    /// device wrote them, or what they were written over (decision
+    /// 2026-10-24 (removal), rule 7), and that only `--from` brings that
+    /// in.
+    #[test]
+    fn test_what_a_carry_left_out_for_a_removed_device_is_said() {
+        let done = json!({
+            "name": "lab", "generations": [], "carried": 1, "higher": 0, "ties": [],
+            "above": [], "deletes": 0, "cut": 2, "by_other_keys": 0, "nothing": null,
+        });
+        let all = carried_lines(&done).join("\n");
+        assert!(
+            all.contains(
+                "  2 versions left out: a removed device wrote them, or what they were written \
+                 over. What a removed device wrote comes in only with the recovery phrase: \
+                 `cordelia sync carry lab --from <its label>`."
+            ),
+            "{all}"
+        );
+        let one = left_out_line(1, "lab");
+        assert!(one.contains("1 version left out: a removed device wrote it, or what it was"));
+        let none = json!({ "name": "lab", "carried": 1, "cut": 0, "nothing": null });
+        assert!(!carried_lines(&none).join("\n").contains("left out"));
     }
 
     /// What a carry with the phrase left is said too: what stands above

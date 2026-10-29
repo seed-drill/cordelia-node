@@ -1950,6 +1950,7 @@ pub(crate) fn note_change(
         Some(&statement.removed),
         Some(&chain),
         Some(&devices),
+        Some(&statement.commitment),
     )?)
 }
 

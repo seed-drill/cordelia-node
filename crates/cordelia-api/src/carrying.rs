@@ -388,6 +388,10 @@ const HOLDS_NO_LEFT_SECRET: &str = "this device holds the secret of no generatio
 pub(crate) struct Generation {
     /// The number of the generation's statement.
     pub(crate) number: u64,
+    /// Its change, where the device noted it with its commitment: what a
+    /// version read there is judged by ([`Rule::Counts`]). `None` where
+    /// it is not known.
+    pub(crate) change: Option<carry::Generation>,
     /// The secret of the name's channel in it.
     pub(crate) secret: Zeroizing<[u8; 32]>,
     pub(crate) entries: Vec<CheckedEntry>,
@@ -421,8 +425,10 @@ pub(crate) async fn read_generations(
     left: &[(u64, Zeroizing<[u8; 32]>)],
     until: Instant,
 ) -> Result<Vec<Generation>, PersonError> {
+    let cuts = crate::cut::Cuts::read(&db(state))?;
     let mut read = Vec::new();
     for (number, secret) in left {
+        let change = cuts.generation_of(*number, secret);
         let of_the_name = Zeroizing::new(derive::own_secret(secret, name)?);
         let channel = derive::channel_id(&of_the_name)?;
         let by = ProvedBy::Secret(of_the_name.clone());
@@ -430,6 +436,7 @@ pub(crate) async fn read_generations(
         let (entries, said) = handed(&at);
         read.push(Generation {
             number: *number,
+            change,
             secret: of_the_name,
             entries,
             said,
@@ -494,6 +501,7 @@ impl Carried {
             "ties": self.tally.ties,
             "above": self.tally.above,
             "deletes": self.tally.deletes,
+            "cut": self.tally.cut,
             "by_other_keys": self.by_other_keys,
             "read_all": self.read_all,
             "nothing": self.nothing,
@@ -544,7 +552,7 @@ pub async fn carry_name(
     }
 
     let counts = |key: &[u8; 32]| counting.counts(key);
-    let mut read: Vec<WasRead> = Vec::new();
+    let mut read: Vec<(WasRead, Option<carry::Generation>)> = Vec::new();
     for generation in read_generations(state, name, &left, deadline).await? {
         done.read_all &= generation.read_all();
         let was = carry::read(
@@ -556,7 +564,7 @@ pub async fn carry_name(
         let other_keys = was.signed_by(|key| !counts(key));
         done.by_other_keys += other_keys;
         done.generations.push(generation.says(other_keys));
-        read.push(was);
+        read.push((was, generation.change));
     }
 
     // Each version to the one function that judges it, the newest
@@ -576,9 +584,13 @@ pub async fn carry_name(
             true => carry::bring,
             false => carry::bring_by_command,
         };
-        for was in &read {
+        // Each judged where it was read: what the cut would leave out of
+        // that generation is not brought into this one (decision 2026-10-24
+        // (removal), rule 7).
+        for (was, read_in) in &read {
             for version in &was.versions {
-                let brought = bring(&conn, &state.identity, name, version, Rule::Counts, now())?;
+                let rule = Rule::Counts(*read_in);
+                let brought = bring(&conn, &state.identity, name, version, rule, now())?;
                 done.tally.count(&version.name, brought);
             }
         }
@@ -1511,12 +1523,15 @@ pub fn take_handed(
                     by_other_keys += 1;
                     continue;
                 }
+                // Read in a generation this device never held: not known,
+                // so nothing a removed key signed or a chain names of one
+                // comes in by it (decision 2026-10-24 (removal), rule 7).
                 let brought = carry::bring_by_command(
                     &conn,
                     &state.identity,
                     &name,
                     &version,
-                    Rule::Counts,
+                    Rule::Counts(None),
                     now(),
                 )?;
                 tally.count(&version.name, brought);
@@ -1754,6 +1769,57 @@ mod tests {
             part.says(LAB)["generations"][0]["relays"],
             json!([{ "relay": "relay", "read": "part", "entries": 2, "bytes": smallest(2) }])
         );
+    }
+
+    /// A carry by command never brings a removed device's late writing into
+    /// a later generation (the second read of slice 8, its second finding).
+    /// The desktop (0) removes the tablet (2). The tablet writes `f.md` in
+    /// the generation left, and the laptop (1), which has not heard, writes
+    /// over it; the laptop also writes `g.md`, which names nothing of the
+    /// tablet's. `cordelia sync carry` on the desktop reads the laptop's
+    /// `f.md`, since the laptop counts and its revision is higher: it is
+    /// left out, and counted so. `g.md` is brought in. The same for the
+    /// carry of `cordelia sync map`, of a name the desktop does not hold.
+    #[actix_web::test]
+    async fn test_a_carry_by_command_leaves_out_what_the_cut_would() {
+        for mapped in [false, true] {
+            let mut s = Several::of_one_person(3);
+            // A carry by command judges by the wall clock: the fixture's is
+            // set behind it.
+            s.now = now() - 3600;
+            match mapped {
+                false => s.hold(&[0, 1, 2], LAB),
+                true => s.hold(&[1, 2], LAB),
+            }
+            let old = s[1].own(LAB);
+            s.change(0, &[0, 1], &[2]);
+            s.write(2, LAB, "f.md", "the tablet's late text");
+            s.pass(2, 1);
+            s.write(
+                1,
+                LAB,
+                "f.md",
+                "the tablet's late text, and the laptop's line",
+            );
+            s.write(1, LAB, "g.md", "the laptop's own");
+            let mut at_the_relay = s[1].stored_in(&old);
+            at_the_relay.extend(s[2].stored_in(&old));
+            let node = Node::of(s.machines.remove(0));
+            node.relay_holds(&old, &at_the_relay);
+
+            let done = carry_name(&node.state, LAB, mapped).await.unwrap();
+            assert_eq!(done.held_anew, mapped);
+            assert_eq!(done.nothing, None);
+            assert_eq!(
+                (done.tally.carried, done.tally.cut),
+                (1, 1),
+                "{:?}",
+                done.tally
+            );
+            assert_eq!(done.says(LAB)["cut"], 1);
+            assert_eq!(node.text(LAB, "f.md"), None);
+            assert_eq!(node.text(LAB, "g.md").as_deref(), Some("the laptop's own"));
+        }
     }
 
     /// A device that comes to sync a name carries it first, where the

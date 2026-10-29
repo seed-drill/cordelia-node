@@ -58,6 +58,9 @@ pub(crate) struct Cuts {
     chains: BTreeMap<Change, Option<Vec<Change>>>,
     /// The keys each noted change lists as devices.
     devices: BTreeMap<Change, Vec<[u8; 32]>>,
+    /// Each noted change by its number and its statement's commitment to
+    /// its secret, where that was noted.
+    by_commitment: BTreeMap<(u64, [u8; 32]), Change>,
 }
 
 impl Cuts {
@@ -82,6 +85,15 @@ impl Cuts {
         let devices = noted
             .iter()
             .filter_map(|change| Some(((change.number, change.hash), change.devices.clone()?)))
+            .collect();
+        let by_commitment = noted
+            .iter()
+            .filter_map(|change| {
+                Some((
+                    (change.number, change.commitment?),
+                    (change.number, change.hash),
+                ))
+            })
             .collect();
         let own_cut = |key: &[u8; 32]| -> (Option<i64>, Vec<(Change, Vec<Change>)>) {
             let mut removals = Vec::new();
@@ -137,7 +149,54 @@ impl Cuts {
             keys,
             chains,
             devices,
+            by_commitment,
         }
+    }
+
+    /// The change of the generation numbered `number` whose person secret
+    /// is `secret`, where the device noted it with its commitment: `None`
+    /// where it did not, and the generation is not known.
+    pub(crate) fn generation_of(&self, number: u64, secret: &[u8; 32]) -> Option<Change> {
+        let commitment = cordelia_crypto::statement::commitment(secret);
+        self.by_commitment.get(&(number, commitment)).copied()
+    }
+
+    /// Whether a version read in `generation` of a channel left, by a
+    /// carry that a command makes at `now`, is left out (the second read
+    /// of slice 8, its second finding): a key that `signers` names, or that
+    /// a link of `chains` names, is cut there at that time. What a command
+    /// reads there has no time of arrival, so it is judged at its own: in a
+    /// generation that a removal of the key was made after, everything of
+    /// the key's is left out; in one that is a removal, or made after one,
+    /// nothing; and in one made apart, or not known (`None`), everything.
+    /// A key of `named` is not judged: the person named it, with the
+    /// phrase, as one whose writing is theirs (a recovery's look takes what
+    /// a device lost or broken wrote, decision 2026-10-04 §9).
+    pub(crate) fn leaves_out(
+        &self,
+        signers: &[[u8; 32]],
+        chains: &[&[EntryLink]],
+        generation: Option<&Change>,
+        now: i64,
+        named: &[[u8; 32]],
+    ) -> bool {
+        let cut = |key: &KeyCut| {
+            !named.contains(&key.key)
+                && match generation {
+                    Some(generation) => self.cuts(key, generation, now),
+                    None => true,
+                }
+        };
+        signers
+            .iter()
+            .filter_map(|signer| self.of_key(signer))
+            .any(cut)
+            || chains.iter().flat_map(|chain| chain.iter()).any(|link| {
+                self.keys
+                    .iter()
+                    .filter(|key| key.signer == link.signer)
+                    .any(cut)
+            })
     }
 
     /// Whether `key`, which the removed key `adder` added by a record, is
@@ -326,6 +385,7 @@ mod tests {
             removed: Some(removed.iter().map(|k| [*k; 32]).collect()),
             chain: Some(chain.iter().map(|n| (*n, [*n as u8; 16])).collect()),
             devices: Some(Vec::new()),
+            commitment: None,
         }
     }
 
@@ -483,6 +543,41 @@ mod tests {
             assert!(!now(Some(generation)).signer(&signer));
         }
         assert!(!now(Some(at(2))).key(&[8; 32]));
+    }
+
+    /// What a carry by command leaves out (the second read of slice 8, its
+    /// second finding): a version read in a generation the removal was made
+    /// after, whose signer or a link of whose chain is the removed key, at
+    /// the command's own time; in the removal's generation, nothing; in a
+    /// generation not known, everything of the key's. A generation is known
+    /// by its statement's commitment to its secret.
+    #[test]
+    fn a_carry_by_command_judges_where_the_version_was_read() {
+        let mut removal = change(3, Some(5_000), &[9], &[1, 2]);
+        removal.commitment = Some(cordelia_crypto::statement::commitment(&[3; 32]));
+        let mut before = change(2, Some(100), &[], &[1]);
+        before.commitment = Some(cordelia_crypto::statement::commitment(&[2; 32]));
+        let cuts = Cuts::of(&[before, removal], &[([9; 32], None)]);
+        assert_eq!(cuts.generation_of(2, &[2; 32]), Some(at(2)));
+        assert_eq!(cuts.generation_of(3, &[3; 32]), Some(at(3)));
+        assert_eq!(cuts.generation_of(3, &[2; 32]), None);
+        let named = [EntryLink {
+            hash: [1; 16],
+            signer: EntryLink::signer_of(&[9; 32]),
+        }];
+        let honest: [[u8; 32]; 1] = [[4; 32]];
+        let now = 1_000_000;
+        // Signed by it, or over it, in the generation before: left out.
+        assert!(cuts.leaves_out(&[[9; 32]], &[], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, &[&named], Some(&at(2)), now, &[]));
+        // In the removal's generation: nothing.
+        assert!(!cuts.leaves_out(&honest, &[&named], Some(&at(3)), now, &[]));
+        // Not known: everything of the key's.
+        assert!(cuts.leaves_out(&honest, &[&named], None, now, &[]));
+        // What names no removed key is never left out.
+        assert!(!cuts.leaves_out(&honest, &[], None, now, &[]));
+        // Nor what the person named the key to take from.
+        assert!(!cuts.leaves_out(&[[9; 32]], &[&named], None, now, &[[9; 32]]));
     }
 
     /// A key that no noted change removes has everything cut.

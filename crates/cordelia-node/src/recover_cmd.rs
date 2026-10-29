@@ -2337,6 +2337,9 @@ fn look_lines(found: &Value) -> Vec<String> {
             counted(number("higher"), "version")
         ));
     }
+    if number("cut") > 0 {
+        lines.push(crate::carry_cmd::left_out_line(number("cut"), "<name>"));
+    }
     let ties: Vec<String> = list(found, "ties")
         .filter_map(Value::as_str)
         .map(file_shown)

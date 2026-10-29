@@ -160,13 +160,22 @@ pub fn newest(versions: Vec<Version>) -> Vec<Version> {
     by_name.into_values().collect()
 }
 
+/// A generation, by its statement's number and hash.
+pub type Generation = (u64, [u8; 16]);
+
 /// By which rule a version is brought in ([`bring`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// A key that counts signed it: it comes in where the new channel
     /// holds, in that slot, neither that version nor an entry at a
-    /// higher revision.
-    Counts,
+    /// higher revision. **And where the cut would not leave it out**
+    /// (decision 2026-10-24 (removal), rule 7; the second read of slice 8,
+    /// its second finding): it was read in the generation it names, or in
+    /// one this device does not know (`None`), and it is left out where a
+    /// removed key signed it, or a link of its chain names one, and that
+    /// key is cut there at the command's own time ([`Brought::Cut`]).
+    /// Only `--from` brings in what a removed device wrote.
+    Counts(Option<Generation>),
     /// A key that does not count signed it, and a person named that key
     /// with the phrase: it comes in only where the new channel holds
     /// nothing in that slot.
@@ -198,6 +207,10 @@ pub enum Brought {
     /// A key that does not count signed it, and it is a delete: it is
     /// never taken. Nothing was written.
     Delete,
+    /// A removed key signed it, or a link of its chain names one, and the
+    /// cut leaves that key out where it was read ([`Rule::Counts`]).
+    /// Nothing was written.
+    Cut,
 }
 
 /// Judge one version for a carry, and bring it in where it may come
@@ -221,10 +234,27 @@ pub fn bring(
     rule: Rule,
     now: i64,
 ) -> Result<Brought, PersonError> {
+    bring_named(conn, identity, name, version, rule, &[], now)
+}
+
+/// [`bring`], where the person named `named`, with the phrase, as keys
+/// whose writing is theirs: the cut does not judge them ([`Rule::Counts`]).
+/// It is the look of a recovery, which takes what a device lost or broken
+/// wrote (decision 2026-10-04 §9).
+fn bring_named(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    version: &Version,
+    rule: Rule,
+    named: &[[u8; 32]],
+    now: i64,
+) -> Result<Brought, PersonError> {
     in_one(conn, || {
         let standing = Standing::to_write(conn)?;
         let secret = standing.name_secret(conn, name)?;
-        if let Some(left) = judged(conn, identity, &standing, &secret, version, rule)? {
+        let judging = Judging { rule, named, now };
+        if let Some(left) = judged(conn, identity, &standing, &secret, version, &judging)? {
             return Ok(left);
         }
         let entry = carried_entry(identity, &secret, version)?;
@@ -250,8 +280,25 @@ pub fn bring_by_command(
     rule: Rule,
     now: i64,
 ) -> Result<Brought, PersonError> {
+    bring_by_word(conn, identity, name, version, rule, &[], now)
+}
+
+/// [`bring_by_command`], for the look of a recovery: the keys of `named`
+/// are those the person said, at its terminal, are lost or broken, whose
+/// writing the look takes. The cut does not judge them, and judges every
+/// other key, those that may be in someone else's hands among them
+/// ([`Rule::Counts`]).
+pub fn bring_by_word(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    version: &Version,
+    rule: Rule,
+    named: &[[u8; 32]],
+    now: i64,
+) -> Result<Brought, PersonError> {
     in_one(conn, || {
-        let brought = bring(conn, identity, name, version, rule, now)?;
+        let brought = bring_named(conn, identity, name, version, rule, named, now)?;
         if brought == Brought::Carried {
             crate::names::note_brought_in(conn, name)?;
         }
@@ -272,7 +319,14 @@ pub fn would_bring(
 ) -> Result<Brought, PersonError> {
     let standing = Standing::to_write(conn)?;
     let secret = standing.name_secret(conn, name)?;
-    let left = judged(conn, identity, &standing, &secret, version, rule)?;
+    // Judged as late as any time: what the cut leaves out then, it leaves
+    // out at any later carry.
+    let judging = Judging {
+        rule,
+        named: &[],
+        now: i64::MAX,
+    };
+    let left = judged(conn, identity, &standing, &secret, version, &judging)?;
     Ok(left.unwrap_or(Brought::Carried))
 }
 
@@ -318,6 +372,14 @@ pub fn later_by_its_author(
     Ok(slot.current.iter().chain(&slot.lost).any(by_them))
 }
 
+/// How a version is judged for a carry: by `rule`, with the keys of
+/// `named` not judged by the cut, at the command's own time `now`.
+struct Judging<'a> {
+    rule: Rule,
+    named: &'a [[u8; 32]],
+    now: i64,
+}
+
 /// The one judgement of a version for a carry: why it is left, or `None`
 /// where it may be carried into the channel whose secret is `secret`,
 /// which is the name's in the generation applied.
@@ -327,12 +389,25 @@ fn judged(
     standing: &Standing,
     secret: &[u8; 32],
     version: &Version,
-    rule: Rule,
+    judging: &Judging,
 ) -> Result<Option<Brought>, PersonError> {
+    let Judging { rule, named, now } = *judging;
     let rev = lifted(version.rev);
-    let of_a_key_that_counts = rule == Rule::Counts;
+    let of_a_key_that_counts = matches!(rule, Rule::Counts(_));
     if !of_a_key_that_counts && version.value == Value::Delete {
         return Ok(Some(Brought::Delete));
+    }
+    if let Rule::Counts(read_in) = rule {
+        let signers: Vec<[u8; 32]> = version.entries.iter().map(|one| one.author).collect();
+        let chains: Vec<&[Link]> = version
+            .entries
+            .iter()
+            .filter_map(|one| one.chain.as_deref())
+            .collect();
+        let cuts = crate::cut::Cuts::read(conn)?;
+        if cuts.leaves_out(&signers, &chains, read_in.as_ref(), now, named) {
+            return Ok(Some(Brought::Cut));
+        }
     }
     let slot = standing.slot(conn, secret, &version.name)?;
     let is_it = |held: &Version| held.rev == rev && held.value == version.value;
@@ -379,6 +454,9 @@ pub struct Tally {
     pub above: Vec<String>,
     /// Of a key that does not count: deletes, which are never taken.
     pub deletes: usize,
+    /// Left out by the cut: a removed key signed them, or wrote what they
+    /// were written over ([`Brought::Cut`]).
+    pub cut: usize,
 }
 
 impl Tally {
@@ -391,6 +469,7 @@ impl Tally {
             Brought::Tie => self.ties.push(file.to_string()),
             Brought::Above => self.above.push(file.to_string()),
             Brought::Delete => self.deletes += 1,
+            Brought::Cut => self.cut += 1,
         }
     }
 }
@@ -941,7 +1020,7 @@ mod tests {
         assert_eq!(was.signed_by(|key| !s[0].counts(key)), 0);
         let mut tally = Tally::default();
         for version in &was.versions {
-            let brought = bring_on(&mut s, 0, version, Rule::Counts);
+            let brought = bring_on(&mut s, 0, version, Rule::Counts(None));
             tally.count(&version.name, brought);
         }
         assert_eq!((tally.carried, tally.held, tally.higher), (2, 0, 0));
@@ -964,7 +1043,10 @@ mod tests {
         // written.
         let before = s[0].stored().len();
         for version in &was.versions {
-            assert_eq!(bring_on(&mut s, 0, version, Rule::Counts), Brought::Held);
+            assert_eq!(
+                bring_on(&mut s, 0, version, Rule::Counts(None)),
+                Brought::Held
+            );
         }
         assert_eq!(s[0].stored().len(), before);
     }
@@ -995,7 +1077,7 @@ mod tests {
         assert_eq!(was.versions[0].rev, 2);
         let before = s[0].stored();
         assert_eq!(
-            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts(None)),
             Brought::Higher
         );
         assert_eq!(s[0].stored(), before);
@@ -1007,14 +1089,17 @@ mod tests {
         assert_eq!(s[0].slot(LAB, FILE).current.unwrap().rev, 4);
         let before = s[0].stored();
         assert_eq!(
-            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts(None)),
             Brought::Higher
         );
         let fourth = Version {
             rev: 4,
             ..was.versions[0].clone()
         };
-        assert_eq!(bring_on(&mut s, 0, &fourth, Rule::Counts), Brought::Tie);
+        assert_eq!(
+            bring_on(&mut s, 0, &fourth, Rule::Counts(None)),
+            Brought::Tie
+        );
         assert_eq!(s[0].stored(), before);
         assert_eq!(s[0].text(LAB, FILE).as_deref(), Some("the last"));
     }
@@ -1038,7 +1123,7 @@ mod tests {
         let version = &was.versions[0];
         assert_eq!((version.rev, &version.value), (2, &text("of device 2")));
         let before = s[0].stored();
-        let brought = bring_on(&mut s, 0, version, Rule::Counts);
+        let brought = bring_on(&mut s, 0, version, Rule::Counts(None));
         assert_eq!(brought, Brought::Tie);
         assert_eq!(s[0].stored(), before);
         let mut tally = Tally::default();
@@ -1051,7 +1136,10 @@ mod tests {
         let change = s[0].latest();
         let now = s.tick();
         crate::take::take(&s[1].conn, &s[1].identity, &change, now).unwrap();
-        assert_eq!(bring_on(&mut s, 1, version, Rule::Counts), Brought::Carried);
+        assert_eq!(
+            bring_on(&mut s, 1, version, Rule::Counts(None)),
+            Brought::Carried
+        );
         s.pass(0, 1);
         let slot = s[1].slot(LAB, FILE);
         assert_eq!(slot.current.as_ref().unwrap().rev, 2);
@@ -1089,7 +1177,7 @@ mod tests {
         signed.sort();
         assert_eq!(was.signed, signed);
         assert_eq!(
-            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts(None)),
             Brought::Carried
         );
         assert_eq!(s[0].text(LAB, FILE).as_deref(), Some("kept"));
@@ -1322,7 +1410,7 @@ mod tests {
         s.change(0, &[0, 1, 2], &[]);
         let was = read_on(&s, 0, &[entry], &old, 1);
         assert_eq!(
-            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts(None)),
             Brought::Carried
         );
         let current = s[0].slot(LAB, "jumped.md").current.unwrap();
@@ -1331,7 +1419,7 @@ mod tests {
         // Brought again, the new channel holds it: it is the version at
         // the revision that the renumbering gave it.
         assert_eq!(
-            bring_on(&mut s, 0, &was.versions[0], Rule::Counts),
+            bring_on(&mut s, 0, &was.versions[0], Rule::Counts(None)),
             Brought::Held
         );
     }
@@ -1353,7 +1441,14 @@ mod tests {
         let change = s[0].latest();
         crate::take::take(&s[2].conn, &s[2].identity, &change, now).unwrap();
         assert_eq!(s[2].state(), State::Removed);
-        let stopped = bring(&s[2].conn, &s[2].identity, LAB, version, Rule::Counts, now);
+        let stopped = bring(
+            &s[2].conn,
+            &s[2].identity,
+            LAB,
+            version,
+            Rule::Counts(None),
+            now,
+        );
         assert!(
             matches!(stopped, Err(PersonError::Stopped(State::Removed))),
             "{stopped:?}"
@@ -1364,7 +1459,7 @@ mod tests {
             &s[0].identity,
             "another",
             version,
-            Rule::Counts,
+            Rule::Counts(None),
             now,
         );
         assert!(
@@ -1378,7 +1473,7 @@ mod tests {
             &alone.identity,
             LAB,
             version,
-            Rule::Counts,
+            Rule::Counts(None),
             now,
         );
         assert!(
@@ -1824,8 +1919,11 @@ mod tests {
         assert_eq!(handed.chain.as_ref().unwrap().len(), 1);
         // Brought in, it is what the version itself would have been.
         let there = handed.version().unwrap();
-        assert_eq!(bring_on(&mut s, 0, &there, Rule::Counts), Brought::Carried);
-        assert_eq!(bring_on(&mut s, 0, late, Rule::Counts), Brought::Held);
+        assert_eq!(
+            bring_on(&mut s, 0, &there, Rule::Counts(None)),
+            Brought::Carried
+        );
+        assert_eq!(bring_on(&mut s, 0, late, Rule::Counts(None)), Brought::Held);
         // What is no key, and what is no link.
         let no_key = Handed {
             signer: "zz".into(),

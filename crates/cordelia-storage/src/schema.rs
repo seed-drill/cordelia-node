@@ -1182,9 +1182,13 @@ CREATE TABLE relay_head_rooms (
 ///   in 8 bytes, big-endian, then its hash) and the keys it lists as
 ///   devices (`devices`, 32 bytes each): the cut time of a removed key is
 ///   worked out from them (rule 2), and a key that rule 6 would remove is
-///   spared where a removal of its adder lists it. A change noted before
-///   the step has none, and is asked of nothing that needs them: that
-///   fails safe.
+///   spared where every removal of its adder lists it. A change noted
+///   before the step has none, and is asked of nothing that needs them:
+///   that fails safe. With them its statement's commitment to its secret
+///   (`commitment`), by which a carry by command knows which change a
+///   generation it left is (the second read of slice 8, its second
+///   finding); where it is not noted, the generation is not known, and
+///   everything of a removed key read there is left out.
 /// - `person_removed_keys_by`: beside a removed key, for one that rule 6
 ///   removes, the removed key whose record added it after that key's cut
 ///   time. Its cut is that key's.
@@ -1233,6 +1237,7 @@ CREATE TABLE person_change_times_lists (
     removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
     chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
     devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    commitment  BLOB CHECK(commitment IS NULL OR length(commitment) = 32),
     PRIMARY KEY (number, hash)
 );
 
@@ -5635,6 +5640,18 @@ mod tests {
                 format!(
                     "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
                      VALUES (1, {hash}, x'', zeroblob(24), x'')"
+                ),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(32))"
                 ),
             ),
             (

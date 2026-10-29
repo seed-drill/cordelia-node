@@ -552,7 +552,7 @@ pub fn note_change_time(
     hash: &[u8; 16],
     made_at: Option<i64>,
 ) -> Result<(), CordeliaError> {
-    note_change(conn, number, hash, made_at, None, None, None).map(|_| ())
+    note_change(conn, number, hash, made_at, None, None, None, None).map(|_| ())
 }
 
 /// A change as the device noted it ([`note_change`]).
@@ -570,6 +570,8 @@ pub struct NotedChange {
     pub chain: Option<Vec<(u64, [u8; 16])>>,
     /// The keys its statement lists as devices, where they were noted.
     pub devices: Option<Vec<[u8; 32]>>,
+    /// Its statement's commitment to its secret, where it was noted.
+    pub commitment: Option<[u8; 32]>,
 }
 
 /// Note the change whose statement is numbered `number` and hashes to
@@ -580,6 +582,9 @@ pub struct NotedChange {
 /// It is kept after the change goes, for the cut time of rules 6 and 7.
 /// Says whether anything was filled that was not noted before, its time or
 /// its lists: a cut time may then have moved, and records are judged again.
+/// With its lists, `commitment` is its statement's commitment to its
+/// secret, noted where it was not.
+#[allow(clippy::too_many_arguments)]
 pub fn note_change(
     conn: &Connection,
     number: u64,
@@ -588,6 +593,7 @@ pub fn note_change(
     removed: Option<&[[u8; 32]]>,
     chain: Option<&[(u64, [u8; 16])]>,
     devices: Option<&[[u8; 32]]>,
+    commitment: Option<&[u8; 32]>,
 ) -> Result<bool, CordeliaError> {
     let number = i64::try_from(number).unwrap_or(i64::MAX);
     let had: Option<Option<i64>> = conn
@@ -625,6 +631,14 @@ pub fn note_change(
             )
             .map_err(storage)?
             > 0;
+        if let Some(commitment) = commitment {
+            conn.execute(
+                "UPDATE person_change_times_lists SET commitment = ?3
+                 WHERE number = ?1 AND hash = ?2 AND commitment IS NULL",
+                params![number, hash.as_slice(), commitment.as_slice()],
+            )
+            .map_err(storage)?;
+        }
     }
     Ok(filled)
 }
@@ -634,7 +648,7 @@ pub fn note_change(
 pub fn changes_noted(conn: &Connection) -> Result<Vec<NotedChange>, CordeliaError> {
     let mut stmt = conn
         .prepare(
-            "SELECT t.number, t.hash, t.made_at, l.removed, l.chain, l.devices
+            "SELECT t.number, t.hash, t.made_at, l.removed, l.chain, l.devices, l.commitment
              FROM person_change_times t
              LEFT JOIN person_change_times_lists l ON l.number = t.number AND l.hash = t.hash
              ORDER BY t.number, t.hash",
@@ -649,12 +663,13 @@ pub fn changes_noted(conn: &Connection) -> Result<Vec<NotedChange>, CordeliaErro
                 row.get::<_, Option<Vec<u8>>>(3)?,
                 row.get::<_, Option<Vec<u8>>>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })
         .map_err(storage)?;
     let mut noted = Vec::new();
     for row in rows {
-        let (number, hash, made_at, removed, chain, devices) = row.map_err(storage)?;
+        let (number, hash, made_at, removed, chain, devices, commitment) = row.map_err(storage)?;
         let Ok(hash) = <[u8; 16]>::try_from(hash) else {
             continue;
         };
@@ -686,6 +701,7 @@ pub fn changes_noted(conn: &Connection) -> Result<Vec<NotedChange>, CordeliaErro
             removed,
             chain,
             devices,
+            commitment: commitment.and_then(|bytes| bytes.try_into().ok()),
         });
     }
     Ok(noted)
@@ -2128,15 +2144,20 @@ mod tests {
                 Some(&[[9; 32]]),
                 Some(&[(2, [2; 16])]),
                 Some(&[]),
+                Some(&[5; 32]),
             )
             .unwrap()
         };
-        assert!(!note_change(&conn, 3, &[3; 16], None, None, None, None).unwrap());
+        assert!(!note_change(&conn, 3, &[3; 16], None, None, None, None, None).unwrap());
         assert!(lists(&conn, None));
         assert!(!lists(&conn, None));
         assert!(lists(&conn, Some(NOW)));
         assert!(!lists(&conn, Some(NOW + 9)));
-        assert!(note_change(&conn, 4, &[4; 16], Some(NOW), None, None, None).unwrap());
+        assert!(note_change(&conn, 4, &[4; 16], Some(NOW), None, None, None, None).unwrap());
+        // The commitment is noted with the lists.
+        let noted = changes_noted(&conn).unwrap();
+        assert_eq!(noted[0].commitment, Some([5; 32]));
+        assert_eq!(noted[1].commitment, None);
     }
 
     /// The time of each change is kept by its number and hash, once, as
