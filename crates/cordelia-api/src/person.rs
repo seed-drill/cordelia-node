@@ -9067,6 +9067,80 @@ mod tests {
         });
     }
 
+    /// Rule 6's spare takes every removal of the adder (the second read of
+    /// slice 8, its third finding). The desktop removes device 2; device 2,
+    /// still holding the old secret, adds device 6, and this device (the
+    /// tablet) takes the record. The person removes device 2 here too, and
+    /// keeps device 6: that removal, made apart, lists it. Noted alone, it
+    /// spares device 6, which existed when it was made. Once the desktop's
+    /// removal is noted, made before device 6 was added and so not listing
+    /// it, device 6 is spared no more: it is removed, and its record counts
+    /// for nothing. And one removal alone never spares a key added after it.
+    #[test]
+    fn test_a_key_is_spared_only_where_every_removal_of_its_adder_lists_it() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let margin = REMOVAL_TAKEN_MARGIN_SECS as i64;
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let made = NOW + 50_000;
+        let late = made + 10;
+        let counted = |conn: &Connection| -> Vec<bool> {
+            held_rows::additions(conn)
+                .unwrap()
+                .iter()
+                .map(|record| record.counted)
+                .collect()
+        };
+        let desktops = two
+            .next(key(1), &secret(33), listed(&[0, 1]), &[key(2)])
+            .unwrap();
+        let desktops_entry = change_made_at(&phrase, &desktops, secret(33), made);
+        let tablets = two
+            .next(key(0), &secret(34), listed(&[0, 1, 6]), &[key(2)])
+            .unwrap();
+        let tablets_entry = change_made_at(&phrase, &tablets, secret(34), late + margin / 2);
+
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), late).unwrap();
+        assert_eq!(counted(&conn), [true]);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&tablets, &phrase),
+            Some(&tablets_entry.content),
+            late + margin,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [true], "the removal here lists device 6");
+        assert_eq!(removed(&conn), vec![key(2)]);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&desktops, &phrase),
+            Some(&desktops_entry.content),
+            late + margin + 1,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [false]);
+        let mut both = vec![key(2), key(6)];
+        both.sort();
+        assert_eq!(removed(&conn), both);
+
+        // One removal alone, made before device 6 was added: not spared.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), late).unwrap();
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&desktops, &phrase),
+            Some(&desktops_entry.content),
+            late + 1,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [false]);
+        assert_eq!(removed(&conn), both);
+    }
+
     /// The change followed is noted with its lists when a change is shown
     /// (the review of slice 8, its sixth finding): on a device stepped to
     /// this version, which noted none, rule 6 would otherwise find no time

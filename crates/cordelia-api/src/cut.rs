@@ -141,23 +141,34 @@ impl Cuts {
     }
 
     /// Whether `key`, which the removed key `adder` added by a record, is
-    /// listed as a device by a noted change that removes `adder` (rule 6):
-    /// the person kept it with the phrase in the change that removed its
-    /// adder, and it is not a key that `adder` added alone. For a key that
-    /// rule 6 removed, the changes are those that remove the key it goes
-    /// back to. A key that only a change on such a change's chain lists, or
-    /// a change made apart from every removal, is not: one the person
-    /// dropped from the list, and the removed device added again, holds the
-    /// secret by its record alone.
+    /// listed as a device by **every** noted change that removes `adder`
+    /// (rule 6): the person kept it with the phrase in each change that
+    /// removed its adder, and it is not a key that `adder` added alone. For
+    /// a key that rule 6 removed, the changes are those that remove the key
+    /// it goes back to. A key that only a change on such a change's chain
+    /// lists, or a change made apart from every removal, is not: one the
+    /// person dropped from the list, and the removed device added again,
+    /// holds the secret by its record alone.
+    ///
+    /// **Every, and not any** (the second read of slice 8, its third
+    /// finding). A removal can list a key only where the key existed when
+    /// it was made, so a removal made before `adder` added `key` never
+    /// lists it: a key that `adder` added after one of its removals is
+    /// spared nowhere that removal is noted, whatever another removal made
+    /// apart lists. One removal alone spares only a key that existed when
+    /// it was made, and that the person kept there: `cordelia
+    /// remove-device` asks of each key the device removed added, and says
+    /// that the device being removed added it.
     pub(crate) fn listed_toward_a_removal(&self, adder: &[u8; 32], key: &[u8; 32]) -> bool {
         let Some(cut) = self.of_key(adder) else {
             return false;
         };
-        cut.removals.iter().any(|(removal, _)| {
-            self.devices
-                .get(removal)
-                .is_some_and(|devices| devices.contains(key))
-        })
+        !cut.removals.is_empty()
+            && cut.removals.iter().all(|(removal, _)| {
+                self.devices
+                    .get(removal)
+                    .is_some_and(|devices| devices.contains(key))
+            })
     }
 
     /// The cut of `key`, where the device knows it to be removed.
@@ -425,6 +436,24 @@ mod tests {
         // A key that rule 6 removed goes back to its adder's removals.
         assert!(cuts.listed_toward_a_removal(&[7; 32], &[5; 32]));
         assert!(!cuts.listed_toward_a_removal(&[8; 32], &[5; 32]));
+    }
+
+    /// Of two removals made apart, a key is spared only where both list it
+    /// (the second read of slice 8, its third finding): one that lists the
+    /// key does not spare it where the other, made before the key was
+    /// added, cannot.
+    #[test]
+    fn a_key_is_spared_only_where_every_removal_of_its_adder_lists_it() {
+        let mut here = change(3, Some(6_000), &[9], &[1, 2]);
+        here.hash = [0x33; 16];
+        here.devices = Some(vec![[0; 32], [5; 32]]);
+        let mut apart = change(3, Some(5_000), &[9], &[1, 2]);
+        apart.devices = Some(vec![[0; 32]]);
+        let noted = [change(2, Some(100), &[], &[1]), here.clone()];
+        let removed = [([9; 32], None)];
+        assert!(Cuts::of(&noted, &removed).listed_toward_a_removal(&[9; 32], &[5; 32]));
+        let noted = [change(2, Some(100), &[], &[1]), here, apart];
+        assert!(!Cuts::of(&noted, &removed).listed_toward_a_removal(&[9; 32], &[5; 32]));
     }
 
     /// What the put-back of an index line judges by (`CutNow`): in a
