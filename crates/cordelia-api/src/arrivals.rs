@@ -168,6 +168,7 @@ pub(crate) fn noted_at_the_door(
         now,
         &full,
         before.current.as_ref(),
+        Some(&entry.id()),
         &arrivals,
     )?;
     Ok(())
@@ -182,9 +183,11 @@ struct First<'a> {
     at: i64,
     /// The version current in the file before it.
     before: Option<&'a Entry>,
-    /// Whether an event kept, or one that went and is not cut, came
-    /// before it: what it goes back to was then judged when it arrived.
-    brought: bool,
+    /// The IDs of the entries that the events before it stored, of those
+    /// kept and of the first of each generation that went and is not cut:
+    /// a version gone back to that one of them stored was judged when it
+    /// came.
+    stored_before: Vec<[u8; 32]>,
 }
 
 /// What the cut leaves of a file at a carry (rule 7).
@@ -205,6 +208,7 @@ pub(crate) struct FileCut {
 /// slot (rule 7). A file that is not in it is carried as it is.
 pub(crate) fn cut_of_channel(
     conn: &Connection,
+    own: &[u8; 32],
     from: &[u8; 32],
     cuts: &Cuts,
 ) -> Result<BTreeMap<[u8; 32], FileCut>, PersonError> {
@@ -240,7 +244,10 @@ pub(crate) fn cut_of_channel(
                     generation: (went.number, went.hash),
                     at: went.newest_at,
                     before: went.before.as_ref(),
-                    brought: at > 0,
+                    stored_before: dropped[..at]
+                        .iter()
+                        .filter_map(|went| went.first_stored_id)
+                        .collect(),
                 })
             }
             None => events
@@ -256,12 +263,14 @@ pub(crate) fn cut_of_channel(
                 })
                 .map(|index| {
                     let event = &events[index];
+                    let stored = events[..index].iter().map(|event| event.stored_id);
+                    let went = dropped.iter().map(|went| went.first_stored_id);
                     First {
                         place: Some(event.place),
                         generation: (event.number, event.hash),
                         at: event.stored_at,
                         before: event.before.as_ref(),
-                        brought: index > 0 || !dropped.is_empty(),
+                        stored_before: stored.chain(went).flatten().collect(),
                     }
                 }),
         };
@@ -272,12 +281,24 @@ pub(crate) fn cut_of_channel(
             Some(before) => version_of(before, from)?,
             None => None,
         };
-        // Where nothing kept brought the version gone back to, its
-        // arrival was never judged: its signers, and every key its chains
-        // name, are judged at the cut's own generation and time, and where
-        // one is cut the file goes back to none. That fails safe.
+        // The version gone back to was judged when it came only where the
+        // device wrote it itself, or a kept event stored exactly it (the
+        // second read of slice 8, its medium finding). That an earlier
+        // event was kept says nothing of it: an honest entry at a lower
+        // revision makes an event and leaves the version current as it was,
+        // which may be one taken before this version kept arrivals.
+        let brought = first.before.is_some_and(|before| {
+            first.stored_before.contains(&before.id())
+                || target
+                    .as_ref()
+                    .is_some_and(|version| is_own_writing(version, own))
+        });
+        // Where nothing kept brought it, its arrival was never judged: its
+        // signers, and every key its chains name, are judged at the cut's
+        // own generation and time, and where one is cut the file goes back
+        // to none. That fails safe.
         let target = target.filter(|version| {
-            first.brought
+            brought
                 || !version.entries.iter().any(|one| {
                     cuts.cuts_key(&one.author, &first.generation, first.at)
                         || one
@@ -297,6 +318,25 @@ pub(crate) fn cut_of_channel(
         );
     }
     Ok(cut)
+}
+
+/// Whether `version`, of one entry, is what the device whose key is `own`
+/// wrote itself: it signed it, and it is no carry of another key's
+/// version. A carry's chain begins with links whose hash is the value's,
+/// one for each key it was carried from ([`crate::carry::later_by_its_author`]);
+/// so it is the device's own writing where none of those is another key's.
+pub(crate) fn is_own_writing(version: &Version, own: &[u8; 32]) -> bool {
+    let signer = Link::signer_of(own);
+    let hash = version.value.chain_hash();
+    version.entries.iter().all(|one| {
+        one.author == *own
+            && one
+                .chain
+                .iter()
+                .flatten()
+                .take_while(|link| link.hash == hash)
+                .all(|link| link.signer == signer)
+    })
 }
 
 /// The version that `entry`, sealed under `secret`, is: `None` where it is
@@ -483,6 +523,7 @@ mod tests {
                         s.now + 1 + i as i64,
                         &[],
                         Some(&own),
+                        None,
                         &[honest],
                     )
                     .unwrap();
@@ -709,6 +750,85 @@ mod tests {
         let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
         assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
         assert_eq!(s[1].text("notes", "z.md"), None);
+    }
+
+    /// A version gone back to counts as brought only where a kept event
+    /// stored exactly it (the second read of slice 8, its medium finding).
+    /// The laptop took the tablet's late `z late` before it kept arrivals
+    /// (its event is taken out by hand, as on a device stepped to this
+    /// version). Device 0 writes `z.md` at a lower revision: that makes an
+    /// event, and `z late` stays current. The tablet's next late version
+    /// is cut, and goes back to `z late`, which no kept event stored: it is
+    /// judged at the cut, and the file goes back to none. Where device 0's
+    /// entry is the one gone back to, the event that stored it brought it,
+    /// and it is carried.
+    #[test]
+    fn a_version_gone_back_to_is_brought_only_where_a_kept_event_stored_it() {
+        use crate::several::entry_by;
+        for over_honest in [false, true] {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[0, 1, 2], "notes");
+            s.meet(&[0, 1, 2]);
+            let made = s.now + 10 * MARGIN;
+            s.now = made - MARGIN / 2;
+            let channel = s[1].own("notes");
+            let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
+            let rev = cordelia_core::revision::next_under(None, 1).unwrap();
+            let take = |s: &mut Several, entry: &CheckedEntry| {
+                let now = s.tick();
+                crate::take::take(&s[1].conn, &s[1].identity, entry, now).unwrap();
+            };
+            let late = entry_by(
+                &s[2].identity,
+                &channel,
+                rev + 5,
+                "z.md",
+                Value::Text("z late".into()),
+                &[],
+            );
+            let honest = entry_by(
+                &s[0].identity,
+                &channel,
+                match over_honest {
+                    false => rev + 1,
+                    true => rev + 6,
+                },
+                "z.md",
+                Value::Text("z honest".into()),
+                &[],
+            );
+            take(&mut s, &late);
+            let slot = s[1].slot_of("notes", "z.md");
+            kept::drop_from(&s[1].conn, &id, &slot, i64::MIN).unwrap();
+            take(&mut s, &honest);
+            let current = match over_honest {
+                false => "z late",
+                true => "z honest",
+            };
+            assert_eq!(s[1].text("notes", "z.md").as_deref(), Some(current));
+            let later = entry_by(
+                &s[2].identity,
+                &channel,
+                rev + 7,
+                "z.md",
+                Value::Text("z later".into()),
+                &[],
+            );
+            take(&mut s, &later);
+            let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
+            assert_eq!(events.len(), 2);
+
+            s.now = made - 1;
+            let removal = s.change(0, &[0, 1], &[2]);
+            let now = s.tick();
+            let on = &s[1];
+            let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+            assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+            match over_honest {
+                false => assert_eq!(s[1].text("notes", "z.md"), None),
+                true => assert_eq!(s[1].text("notes", "z.md").as_deref(), Some("z honest")),
+            }
+        }
     }
 
     /// After a removal, honest arrivals are not cut again at a later change

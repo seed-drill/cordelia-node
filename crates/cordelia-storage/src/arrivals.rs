@@ -59,6 +59,11 @@ pub struct Stored {
     /// The version that was current in the file before it, as one entry:
     /// `None` where there was none.
     pub before: Option<Entry>,
+    /// The ID of the entry it stored, as sealed where the file is now:
+    /// `None` where no entry the store holds, or a carry sealed again, is
+    /// that entry. A version gone back to counts as brought where it is
+    /// one of these (decision 2026-10-24 (removal), rule 7).
+    pub stored_id: Option<[u8; 32]>,
     pub arrivals: Vec<Arrival>,
 }
 
@@ -76,6 +81,8 @@ pub struct Dropped {
     /// goes back to it, and not to before the oldest event kept, which may
     /// be a removed key's own.
     pub before: Option<Entry>,
+    /// The ID of the entry that first event stored, as [`Stored::stored_id`].
+    pub first_stored_id: Option<[u8; 32]>,
 }
 
 /// The entry of the six columns from `at` (`before_author` to
@@ -110,8 +117,15 @@ fn before_of(
     }))
 }
 
+/// An entry's ID, as a column holds it: `None` where it holds none, or
+/// what is no ID.
+fn id_of(column: Option<Vec<u8>>) -> Option<[u8; 32]> {
+    column.and_then(|id| id.try_into().ok())
+}
+
 /// Keep a store event of the file `slot` in `channel` and its arrivals,
-/// and keep the file to its bound. Returns its place.
+/// and keep the file to its bound. `stored_id` is the ID of the entry it
+/// stored. Returns its place.
 #[allow(clippy::too_many_arguments)]
 pub fn note(
     conn: &Connection,
@@ -122,6 +136,7 @@ pub fn note(
     stored_at: i64,
     full_signers: &[[u8; 16]],
     before: Option<&Entry>,
+    stored_id: Option<&[u8; 32]>,
     arrivals: &[Arrival],
 ) -> Result<i64, CordeliaError> {
     conn.execute_batch("SAVEPOINT file_arrivals")
@@ -131,8 +146,8 @@ pub fn note(
         conn.execute(
             "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
                  full_signers, before_author, before_rev, before_delete, before_content,
-                 before_author_sig, before_channel_sig)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 before_author_sig, before_channel_sig, stored_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 channel.as_slice(),
                 slot.as_slice(),
@@ -146,6 +161,7 @@ pub fn note(
                 before.map(|entry| entry.content.clone()),
                 before.map(|entry| entry.author_signature.to_vec()),
                 before.map(|entry| entry.channel_signature.to_vec()),
+                stored_id.map(|id| id.to_vec()),
             ],
         )?;
         let place = conn.last_insert_rowid();
@@ -208,10 +224,10 @@ fn keep_to_the_bound(
         conn.execute(
             "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
                  first_place, before_author, before_rev, before_delete, before_content,
-                 before_author_sig, before_channel_sig)
+                 before_author_sig, before_channel_sig, first_stored_id)
              SELECT channel_id, slot, number, hash, stored_at, place, before_author,
                     before_rev, before_delete, before_content, before_author_sig,
-                    before_channel_sig
+                    before_channel_sig, stored_id
              FROM file_arrivals_stored WHERE place = ?1
              ON CONFLICT(channel_id, slot, number, hash)
              DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
@@ -244,7 +260,8 @@ pub fn of_file(
     let mut stmt = conn
         .prepare(
             "SELECT place, number, hash, stored_at, full_signers, before_author, before_rev,
-                    before_delete, before_content, before_author_sig, before_channel_sig
+                    before_delete, before_content, before_author_sig, before_channel_sig,
+                    stored_id
              FROM file_arrivals_stored WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
         )
         .map_err(storage)?;
@@ -261,6 +278,7 @@ pub fn of_file(
                     .map(|bytes| bytes.as_chunks::<16>().0.to_vec())
                     .unwrap_or_default(),
                 before,
+                stored_id: id_of(row.get(11)?),
                 arrivals: Vec::new(),
             })
         })
@@ -286,7 +304,8 @@ pub fn of_file(
     let mut stmt = conn
         .prepare(
             "SELECT number, hash, newest_at, first_place, before_author, before_rev,
-                    before_delete, before_content, before_author_sig, before_channel_sig
+                    before_delete, before_content, before_author_sig, before_channel_sig,
+                    first_stored_id
              FROM file_arrivals_dropped
              WHERE channel_id = ?1 AND slot = ?2 ORDER BY first_place",
         )
@@ -299,6 +318,7 @@ pub fn of_file(
                 newest_at: row.get(2)?,
                 first_place: row.get(3)?,
                 before: before_of(row, 4, channel, slot)?,
+                first_stored_id: id_of(row.get(10)?),
             })
         })
         .map_err(storage)?
@@ -433,6 +453,46 @@ pub fn set_dropped_before(
     .map_err(storage)
 }
 
+/// The ID of the entry that the event at `place` stored, as sealed where
+/// the file now is (`None`: no entry is that one any more).
+pub fn set_stored_id(
+    conn: &Connection,
+    place: i64,
+    stored_id: Option<&[u8; 32]>,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_stored SET stored_id = ?2 WHERE place = ?1",
+        params![place, stored_id.map(|id| id.to_vec())],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// The same, for the first event that went past the bound of the file
+/// `slot` in `channel`, in the generation `number` and `hash`.
+pub fn set_dropped_stored_id(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    number: u64,
+    hash: &[u8; 16],
+    stored_id: Option<&[u8; 32]>,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_dropped SET first_stored_id = ?5
+         WHERE channel_id = ?1 AND slot = ?2 AND number = ?3 AND hash = ?4",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            i64::try_from(number).unwrap_or(i64::MAX),
+            hash.as_slice(),
+            stored_id.map(|id| id.to_vec()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
 /// The file `from_slot` in `from` is the file `to_slot` in `to` from now
 /// on, with every event and what went past its bound: a carry (rule 7).
 pub fn move_file(
@@ -534,10 +594,11 @@ mod tests {
             100,
             &[],
             Some(&before),
+            Some(&[3; 32]),
             &[arrival(5), link],
         )
         .unwrap();
-        note(&conn, &c, &s, 2, &[2; 16], 101, &[[4; 16]], None, &[]).unwrap();
+        note(&conn, &c, &s, 2, &[2; 16], 101, &[[4; 16]], None, None, &[]).unwrap();
         assert_eq!(link_times(&conn, &c, &s, &[6; 16], &[5; 16]).unwrap(), 2);
         assert_eq!(link_times(&conn, &c, &s, &[6; 16], &[4; 16]).unwrap(), 0);
         let (events, dropped) = of_file(&conn, &c, &s).unwrap();
@@ -545,7 +606,9 @@ mod tests {
         assert_eq!(events[0].place, place);
         assert_eq!(events[0].before.as_ref(), Some(&before));
         assert_eq!(events[0].arrivals, vec![arrival(5), link]);
+        assert_eq!(events[0].stored_id, Some([3; 32]));
         assert_eq!(events[1].before, None);
+        assert_eq!(events[1].stored_id, None);
         assert_eq!(events[1].full_signers, vec![[4; 16]]);
         assert!(dropped.is_empty());
 
@@ -585,6 +648,7 @@ mod tests {
                 at,
                 &[],
                 Some(&version(at as u64)),
+                Some(&[at as u8; 32]),
                 &[arrival(5)],
             )
             .unwrap();
@@ -606,6 +670,7 @@ mod tests {
                 newest_at: 2,
                 first_place: first,
                 before: Some(version(0)),
+                first_stored_id: Some([0; 32]),
             }]
         );
         // Sealed again at a carry, it is what the carry set.
@@ -625,6 +690,7 @@ mod tests {
             &[2; 16],
             9,
             &[],
+            None,
             None,
             &[arrival(5)],
         )

@@ -1207,11 +1207,16 @@ CREATE TABLE relay_head_rooms (
 ///   full, the other keys its links name; and each arrival of it, a key
 ///   (the first 16 bytes) and, for a link, its hash and how many times it
 ///   stands. Kept per file, by its channel and slot, across carries; at
-///   most `MAX_FILE_ARRIVALS` a file.
+///   most `MAX_FILE_ARRIVALS` a file. `stored_id` is the ID of the entry
+///   it stored, made anew at each carry where that version is sealed
+///   again: a version gone back to counts as brought, and judged when it
+///   came, only where it is the device's own writing or a kept event
+///   stored exactly it (the second read of slice 8, its medium finding).
 /// - `file_arrivals_dropped`: for each file and generation, the newest
 ///   time of an arrival dropped past the bound, and the first event that
-///   went with the version current before it (sealed as this device's own):
-///   where what went is cut, the file goes back to that version.
+///   went with the version current before it (sealed as this device's own)
+///   and the ID of the entry it stored (`first_stored_id`): where what
+///   went is cut, the file goes back to that version.
 const MIGRATION_V24: &str = r#"
 CREATE TABLE person_change_times_lists (
     number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
@@ -1261,7 +1266,8 @@ CREATE TABLE file_arrivals_stored (
     before_delete       INTEGER,
     before_content      BLOB,
     before_author_sig   BLOB,
-    before_channel_sig  BLOB
+    before_channel_sig  BLOB,
+    stored_id           BLOB CHECK(stored_id IS NULL OR length(stored_id) = 32)
 );
 CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
 
@@ -1286,6 +1292,7 @@ CREATE TABLE file_arrivals_dropped (
     before_content      BLOB,
     before_author_sig   BLOB,
     before_channel_sig  BLOB,
+    first_stored_id     BLOB CHECK(first_stored_id IS NULL OR length(first_stored_id) = 32),
     PRIMARY KEY (channel_id, slot, number, hash)
 );
 "#;
