@@ -3216,6 +3216,14 @@ mod tests {
         // The next cycle has nothing to do.
         let again = cycle(&channel);
         assert_eq!((again.set_aside, again.published, again.pulled), (0, 0, 0));
+        // It is put back once: an edit made after is published, and stays.
+        std::fs::write(mem.join("notes.md"), "mine\nafter\n").unwrap();
+        let edited = cycle(&channel);
+        assert_eq!((edited.set_aside, edited.published), (0, 1), "{edited:?}");
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\nafter\n"
+        );
 
         // The desktop is given what the laptop carried: none of it.
         deliver(&st, &desktop, NAME);

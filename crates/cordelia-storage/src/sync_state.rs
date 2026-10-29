@@ -188,6 +188,15 @@ pub fn save(
         ],
     )
     .map_err(storage)?;
+    // A record saved is what the folder and the channel agree on: a file
+    // that a carry left out is put back no more (decision 2026-10-24
+    // (removal), rule 7). Put back again, it would overwrite every later
+    // edit with the version the carry went back to.
+    conn.execute(
+        "DELETE FROM file_put_back WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
     Ok(())
 }
 
