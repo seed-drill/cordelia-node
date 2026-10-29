@@ -38,16 +38,6 @@ impl Clock {
     pub fn now(&self) -> f64 {
         self.zero.elapsed().as_secs_f64()
     }
-
-    /// The run's second of a time on the wall clock (a log's), in seconds
-    /// since the epoch.
-    pub fn of_wall(&self, epoch_secs: f64) -> f64 {
-        let zero = self
-            .wall
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
-        epoch_secs - zero
-    }
 }
 
 // ── The thread that starts every node ───────────────────────────────
@@ -116,14 +106,14 @@ pub fn as_a_node(command: &mut Command) {
 // ── The nodes ───────────────────────────────────────────────────────
 
 /// Which node a process is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum What {
     Relay(usize),
     Device { person: usize, device: usize },
 }
 
 /// Where a node is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Is {
     NotStarted,
     Running,
@@ -140,7 +130,7 @@ pub struct State {
 }
 
 /// What a change of a node's state was, for the summary and the bars.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Change {
     pub t: f64,
     pub node: usize,
@@ -514,7 +504,7 @@ pub const KINDS: [&str; 6] = [
 ];
 
 /// What a device counts of each relay of the run, as it was read.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCounts {
     pub asked: [[f64; 6]; 2],
     pub asked_bytes: [[f64; 6]; 2],
@@ -578,13 +568,14 @@ impl DeviceCounts {
 // ── Samples ─────────────────────────────────────────────────────────
 
 /// One sample of one node.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Sample {
     pub t: f64,
     pub node: usize,
     pub frozen: bool,
     pub proc: Option<ProcRead>,
     /// A relay's every counter.
+    #[serde(with = "crate::kept::counters")]
     pub metrics: Option<HashMap<String, f64>>,
     /// A device's counts.
     pub device: Option<DeviceCounts>,
@@ -598,7 +589,7 @@ pub struct Sample {
 }
 
 /// One sample of the machine.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct MachineSample {
     pub t: f64,
     pub read: machine::MachineRead,

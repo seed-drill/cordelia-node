@@ -1311,3 +1311,307 @@ fn split_edit_at_the_outage(
     let edits = edits_of(&read);
     bar_15(&read, &edits)
 }
+
+// ── The report made again from a run's folder ──
+
+/// A made-up run with something of every input the report reads: changes
+/// of state, a window, samples of the relays (with buckets, and counters
+/// that are not finite) and of the devices and the machine, at times that
+/// are no round numbers, edits waited for, arrived and gone, an outage, a
+/// removal and its carry window, the setup, a copy kept beside a file, a
+/// device's log, the end, and faults.
+fn a_run_with_every_input(dir: &Path) -> Run {
+    let mut run = Run::made_up(Plan::small(1), dir);
+    all_running(&run, 0.0);
+    becomes(&run, 3, 250.123_456_789, Is::Frozen);
+    becomes(&run, 3, 260.987_654_321, Is::Running);
+    becomes(&run, 5, 400.0, Is::Stopped);
+    run.fleet.changes.lock().unwrap().push(Change {
+        t: 401.5,
+        node: 5,
+        is: Is::Stopped,
+        ended: Some((1.234_567_890_123, "exit status: 0".into())),
+    });
+    becomes(&run, 5, 470.0, Is::Running);
+    window(&run, 60.0 + 0.1 + 0.2, 1_260.000_000_001);
+    *run.outage.lock().unwrap() = Outage {
+        stopped: Some(500.0 + 1.0 / 3.0),
+        started: Some(620.0 + 2.0 / 3.0),
+        back: vec![(2, Some(640.5)), (3, None)],
+    };
+    run.removals.lock().unwrap().push(Removal {
+        person: 1,
+        remover: 0,
+        removed: 2,
+        line_at: Some(900.0 + 1e-9),
+        change: Some(2),
+        applied: vec![(1, Some(905.25))],
+        relays_hold: vec![("127.0.0.1:21000".into(), Some(906.75))],
+        carry_end: Some(930.0 / 7.0 + 800.0),
+        carried_bytes: 123_456,
+        bound: 64.7,
+        command_ended: Some((931.0, true)),
+        failed: None,
+    });
+    *run.removals_planned.lock().unwrap() = 1;
+    {
+        let mut setup = run.setup.lock().unwrap();
+        setup.started = 1.5;
+        setup.ended = 40.0 / 3.0;
+        setup.office_moved = Some((45.0, false));
+        setup.thread_plan = "unmasked: room for every thread".into();
+        setup.machine = "a machine of 16 cores and 64 GiB".into();
+    }
+    // Every relay: counters of each kind, buckets, and words for a value.
+    for n in 0..=20 {
+        let t = 60.0 * n as f64 + 0.123_456_789;
+        for relay in [0, 1] {
+            let m = n as f64 * (relay as f64 + 1.0);
+            let mut metrics: HashMap<String, f64> = HashMap::from([
+                (PULLS.to_string(), 30.0 * m),
+                ("cordelia_churns_total".to_string(), (n / 5) as f64),
+                (
+                    "cordelia_lock_held_microseconds_sum{kind=\"pull\"}".to_string(),
+                    1e6 * m / 7.0,
+                ),
+                (
+                    "cordelia_lock_held_microseconds_count{kind=\"pull\"}".to_string(),
+                    100.0 * m,
+                ),
+                (
+                    "cordelia_lock_wait_microseconds_bucket{kind=\"pull\",le=\"1024\"}".to_string(),
+                    90.0 * m,
+                ),
+                (
+                    "cordelia_lock_wait_microseconds_bucket{kind=\"pull\",le=\"+Inf\"}".to_string(),
+                    100.0 * m,
+                ),
+                ("cordelia_connections_open".to_string(), 7.0),
+                ("cordelia_made_up{value=\"subnormal\"}".to_string(), 1e-310),
+                ("cordelia_made_up{value=\"third\"}".to_string(), 1.0 / 3.0),
+            ]);
+            if n == 7 {
+                metrics.insert("cordelia_made_up{value=\"nan\"}".into(), f64::NAN);
+                metrics.insert("cordelia_made_up{value=\"inf\"}".into(), f64::INFINITY);
+                metrics.insert("cordelia_made_up{value=\"-inf\"}".into(), f64::NEG_INFINITY);
+            }
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t: t + relay as f64 * 0.01,
+                node: relay,
+                frozen: false,
+                proc: Some(crate::machine::ProcRead {
+                    rss_kib: 40_000 + 37 * n,
+                    hwm_kib: 50_000,
+                    threads: 20,
+                    fds: 64,
+                    ticks: 1000 * n,
+                }),
+                metrics: Some(metrics),
+                peers: Some(vec![(
+                    run.fleet.made[2].key.clone(),
+                    "127.20.0.1:5000".into(),
+                )]),
+                room: (n % 5 == 0).then_some((1_000_000 + n, 29)),
+                ..Sample::default()
+            });
+        }
+        for node in 2..run.fleet.made.len() {
+            let mut counts = DeviceCounts::default();
+            counts.asked[0][3] = 3.0 * n as f64;
+            counts.asked_bytes[0][3] = 4096.0 * n as f64 / 3.0;
+            counts.open = 2.0;
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t: t + 0.5 + node as f64 / 100.0,
+                node,
+                frozen: node == 3 && n == 4,
+                proc: Some(crate::machine::ProcRead {
+                    rss_kib: 20_000 + 13 * n * node as u64,
+                    hwm_kib: 30_000,
+                    threads: 12,
+                    fds: 40,
+                    ticks: 300 * n,
+                }),
+                device: Some(counts),
+                connections: Some(2.0),
+                outbox_waiting: Some(0.0),
+                ..Sample::default()
+            });
+        }
+        let mut machine = crate::machine::MachineRead {
+            cpu_all: 100_000 * n,
+            cpu_idle: 80_000 * n,
+            ..Default::default()
+        };
+        machine.mem_available_kib = 10_000_000;
+        machine.harness_ticks = 7 * n;
+        run.samples
+            .lock()
+            .unwrap()
+            .machine
+            .push(MachineSample { t, read: machine });
+    }
+    // Edits: arrived, arrived in a copy, still waited for, and gone.
+    {
+        let mut o = run.observer.lock().unwrap();
+        let folder = run.out.clone();
+        for (number, person, writer, at) in [
+            (1u64, 0usize, 0usize, 100.1),
+            (2, 0, 1, 200.2),
+            (3, 1, 0, 300.3),
+            (4, 1, 1, 880.8),
+            (5, 2, 0, 1000.0 / 3.0),
+        ] {
+            let devices = run.plan.population.people[person].devices;
+            let others: Vec<(usize, std::path::PathBuf)> = (0..devices)
+                .filter(|d| *d != writer)
+                .map(|d| (d, folder.clone()))
+                .collect();
+            o.wrote(
+                Written {
+                    number,
+                    person,
+                    writer,
+                    name: 0,
+                    file: format!("f{number:03}.md"),
+                    size: 600 + number as usize,
+                    at,
+                    burst: number == 2,
+                    new: number % 2 == 1,
+                    replaced: (number == 2).then_some(1),
+                },
+                others,
+            );
+        }
+        o.arrivals.insert(
+            (1, 1),
+            Arrival {
+                at: 101.7,
+                in_copy: false,
+            },
+        );
+        o.arrivals.insert(
+            (2, 0),
+            Arrival {
+                at: 203.9,
+                in_copy: true,
+            },
+        );
+        o.arrivals.insert(
+            (3, 1),
+            Arrival {
+                at: 301.0 + 1.0 / 7.0,
+                in_copy: false,
+            },
+        );
+        o.gone(1, 2, 880.0);
+    }
+    run.next_edit.store(6, std::sync::atomic::Ordering::SeqCst);
+    // A copy kept beside a file.
+    let folder = dir.join("p001-d1-n01");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f003.conflict-abcd.md"), "a copy").unwrap();
+    run.folders.insert((1, 1, 0), folder);
+    // A device's log: its connection to the first relay closed and made
+    // again, in the window and outside the outage.
+    let relay_hex = run.fleet.made[0].key_hex.clone();
+    let at = |secs: f64| {
+        let t = run.fleet.clock.wall + std::time::Duration::from_secs_f64(secs);
+        chrono::DateTime::<chrono::Utc>::from(t)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    };
+    let log = format!(
+        "{}  INFO cordelia_network: peer connection closed peer={relay_hex}\n\
+         {}  INFO cordelia_network: an unrelated line\n\
+         {}  INFO cordelia_network: post_connect: checking peer roles peer={relay_hex}\n",
+        at(700.25),
+        at(701.0),
+        at(703.5)
+    );
+    let device_log = run.fleet.made[4].node.log();
+    std::fs::create_dir_all(device_log.parent().unwrap()).unwrap();
+    std::fs::write(device_log, log).unwrap();
+    // The end.
+    *run.peers_at_end.lock().unwrap() = vec![
+        (0, vec![run.fleet.made[2].key.clone(), "a stranger".into()]),
+        (1, vec![run.fleet.made[3].key.clone()]),
+    ];
+    *run.stops_at_end.lock().unwrap() = vec![(2, 0.4, true), (0, 31.5, false)];
+    *run.pids_left.lock().unwrap() = vec![4242];
+    run.fleet.fault("a made-up fault".into());
+    run
+}
+
+/// A run's folder holds every input of its report: reported from it again,
+/// it gives the same summary, byte for byte, as the run wrote; and a run
+/// that has nothing in it the report reads gives the same too.
+#[test]
+fn the_report_made_again_from_a_runs_folder_is_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run_with_every_input(dir.path());
+    let outcome = write(&run);
+    // Compared as text, byte for byte: a difference shows as lines.
+    let written = std::fs::read_to_string(dir.path().join("SUMMARY.md")).unwrap();
+    assert_eq!(written, outcome.summary);
+    assert!(dir.path().join(crate::kept::INPUTS_FILE).exists());
+    // What the made-up inputs come to, so that the round trip is of a
+    // summary with something in it.
+    for said in [
+        "the second relay's outage: stopped at 500 s",
+        "the carry window of person 1's removal: from 900 s to 933 s",
+        "It stopped early: a made-up fault.",
+        "devices' connections to a relay closed in the window outside the outage and made \
+         again: 1, median 3.25 s",
+        "1 of the pids it started are left",
+    ] {
+        assert!(
+            outcome.summary.contains(said),
+            "{said}\n{}",
+            outcome.summary
+        );
+    }
+    let made_again = again(dir.path()).unwrap();
+    assert_eq!(made_again.summary, written);
+    assert_eq!(made_again.verdict, outcome.verdict);
+    assert_eq!(made_again.bars, outcome.bars);
+    assert_eq!(made_again.checks, outcome.checks);
+    assert_eq!(made_again.pulls, outcome.pulls);
+    assert_eq!(made_again.waited, outcome.waited);
+    // Read back, the inputs are what was kept, and give the same again.
+    let kept = crate::kept::Kept::load(dir.path()).unwrap();
+    let first = serde_json::to_string(&kept).unwrap();
+    kept.save(dir.path()).unwrap();
+    let second = serde_json::to_string(&crate::kept::Kept::load(dir.path()).unwrap()).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(again(dir.path()).unwrap().summary, written);
+
+    // A run with nothing to read.
+    let (empty, run) = made_up();
+    let outcome = write(&run);
+    assert_eq!(again(empty.path()).unwrap().summary, outcome.summary);
+}
+
+/// A folder without the inputs (a run of a harness before them), with
+/// another version of them, or with something else in their place, is
+/// refused with a line that says why: never misread.
+#[test]
+fn a_folder_without_the_inputs_of_this_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("SUMMARY.md"), "PASS stage 100\n").unwrap();
+    std::fs::write(dir.path().join("samples.jsonl"), "{\"t\":0.0}\n").unwrap();
+    let why = again(dir.path()).unwrap_err();
+    assert!(why.contains("holds no report-inputs.json"), "{why}");
+    assert!(why.contains("run it again"), "{why}");
+    let inputs = dir.path().join(crate::kept::INPUTS_FILE);
+    std::fs::write(&inputs, "{\"version\":2,\"plan\":{}}").unwrap();
+    let why = again(dir.path()).unwrap_err();
+    assert!(why.contains("is version 2"), "{why}");
+    assert!(why.contains("reads version 1 only"), "{why}");
+    std::fs::write(&inputs, "[1, 2, 3]").unwrap();
+    let why = again(dir.path()).unwrap_err();
+    assert!(why.contains("is not the inputs of a run's report"), "{why}");
+    std::fs::write(&inputs, "{\"version\":1,\"plan\":{}}").unwrap();
+    let why = again(dir.path()).unwrap_err();
+    assert!(why.contains("could not be read"), "{why}");
+    let why = again(&dir.path().join("none")).unwrap_err();
+    assert!(why.contains("is not a folder"), "{why}");
+}

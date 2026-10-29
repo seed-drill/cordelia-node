@@ -89,7 +89,9 @@ impl Rng {
 
 // ── The profiles (§2.1) ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Profile {
     Casual,
     Developer,
@@ -209,7 +211,7 @@ pub const OFF_SECS: (f64, f64) = (300.0, 1500.0);
 /// A stage. Stages 100 and 190 are gate 10 for R1; 250 and 500 come
 /// after change B (rule 7 of §2.2) and are not built here. The small
 /// stage is section 6's test 4: two relays and seven devices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stage {
     Small,
     Hundred,
@@ -296,7 +298,7 @@ pub fn person_address(k: usize) -> Ipv4Addr {
     Ipv4Addr::new(127, 20 + (k / 256) as u8, (k % 256) as u8, 1)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Person {
     pub index: usize,
     pub profile: Profile,
@@ -329,7 +331,7 @@ impl Person {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Population {
     pub people: Vec<Person>,
     /// The order the office's devices start in at step 4: (person,
@@ -417,7 +419,7 @@ impl Population {
 
 // ── What a person does ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum How {
     /// SIGTERM, and a start again on the same data directory.
     Stop,
@@ -426,7 +428,7 @@ pub enum How {
 }
 
 /// A device off for a time, in seconds from the window's start.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Off {
     pub person: usize,
     pub device: usize,
@@ -479,7 +481,7 @@ pub fn first_file(k: usize) -> String {
 
 /// The times off are given: drawn as item 4 of §2.1 says, or fixed (test
 /// 4's one device off and on).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Offs {
     Drawn,
     Fixed(Vec<Off>),
