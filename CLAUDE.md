@@ -329,7 +329,7 @@ The constants of the counters of the scale test (decision 2026-10-22 §1,
 | Parameter | Value | Spec Section |
 |-----------|-------|-------------|
 | `LOAD_HISTOGRAM_BUCKETS` | 25 (powers of two of µs from 1 µs to 16 s, and one more) | parameter-rationale.md §14 |
-| `LOCK_COUNTED_OVER_MS` | 5, 50, 100, 250 (waits and holds counted apart, for bars 4 and 5) | parameter-rationale.md §14 |
+| `LOCK_COUNTED_OVER_MS` | 5, 10, 50, 100, 250 (waits and holds counted apart, for bars 4 and 5; 10 ms settles bar 4 (a): a kind's wait p99 is at most 10 ms where at most 1% of its waits are over 10 ms) | parameter-rationale.md §14 |
 | `LOAD_RELAYS_COUNTED` | 16 (derived: the relays counted apart by key) | parameter-rationale.md §14 |
 | `LOCK_HOLD_MEDIAN_NANOS`, `LOCK_TIMING_COST_MAX_NANOS` | 12,000, 120 (derived: what timing a take may cost) | parameter-rationale.md §14 |
 
