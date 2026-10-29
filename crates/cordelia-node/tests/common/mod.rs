@@ -775,6 +775,35 @@ pub fn node_run_by(bin: PathBuf, name: &'static str, relay_p2p: u16) -> Node {
     node_made(name, "personal", &relays, Some(bin))
 }
 
+/// A relay of the test's own, made, run and asked by the binary at `bin`:
+/// a version before this one ([`node_run_by`]), started.
+pub fn relay_run_by(bin: PathBuf) -> Node {
+    let mut relay = node_made("relay", "relay", &[], Some(bin));
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    relay
+}
+
+/// The binary of the version before this one, which CI names in
+/// `CORDELIA_TEST_BINARY_BEFORE` (`.github/workflows/ci.yml`, TESTING.md).
+/// Where it is not given, `None`, and the test that asks says so and
+/// passes without running; but where `CI` is set, which it is on every CI
+/// runner, it fails, so that CI never passes it by.
+pub fn binary_before() -> Option<PathBuf> {
+    const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
+    let Some(before) = std::env::var_os(BINARY_BEFORE) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{BINARY_BEFORE} is not set: CI gives this test the binary of the version before"
+        );
+        eprintln!("{BINARY_BEFORE} is not set: this test did not run");
+        return None;
+    };
+    let before = PathBuf::from(before);
+    assert!(before.is_file(), "{}", before.display());
+    Some(before)
+}
+
 fn node_made(
     name: &'static str,
     role: &str,
