@@ -299,6 +299,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/shared_e2e.rs`: `shared_anew_asks_of_each_key_and_suggests_nothing`
 - `crates/cordelia-api/src/shared_anew/tests.rs`: `out_for_the_rest_comes_only_after_the_whole_list`
 - `crates/cordelia-api/src/lists/tests.rs`: `shared_anew_past_a_bound_lists_only_the_keys_it_holds`
+- `crates/cordelia-api/src/lists/tests.rs`: `shared_move_past_a_bound_judges_the_offers_read_before`
 - `crates/cordelia-api/src/lists/tests.rs`: `an_act_whose_signature_fails_or_whose_maker_was_never_a_device_is_not_taken`
 - `crates/cordelia-node/tests/shared_e2e.rs`: `a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each`
 - `crates/cordelia-api/src/shared_anew/tests.rs`: `a_recovery_takes_and_names_the_acts_of_a_device_in_someone_elses_hands`
