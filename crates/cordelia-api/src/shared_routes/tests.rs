@@ -286,6 +286,21 @@ fn only_subscribe_subscribes() {
         "{}",
         plan.asks
     );
+    // The lines of who wrote there say it so too.
+    let held = crate::person::held(conn).unwrap().unwrap();
+    let wrote = sharing::who_wrote(
+        conn,
+        &held,
+        &identity.public_key(),
+        &channel.id,
+        "review",
+        None,
+    )
+    .unwrap();
+    assert!(
+        wrote[0].contains(": 1 key, 1 of them labelled by you."),
+        "{wrote:?}"
+    );
     assert_eq!(plan.what.agent, "notes");
     assert_eq!(count(&s), 0, "the look subscribes nothing");
     subscribes(&s, 0, &channel, "notes", true, now + 4);
