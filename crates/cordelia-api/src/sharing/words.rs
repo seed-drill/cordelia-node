@@ -159,9 +159,9 @@ fn the_shared_commands_say_what_this_record_says() {
     assert_eq!(
         lines[4],
         says(
-            "Keys that wrote here, in \"<name>\": unchanged since <date>: <n> keys, <m> of them \
+            "Keys that wrote here, in \"<name>\": unchanged since <date>: <n keys>, <m> of them \
              labelled by you. Anyone a member handed the channel to reads it too, unseen.",
-            &["design-review", &date_of(now), "0", "0"]
+            &["design-review", &date_of(now), "0 keys", "0"]
         )
     );
 
@@ -240,9 +240,9 @@ fn the_shared_commands_say_what_this_record_says() {
              messages in the shared channel \"review-with-alice\", on every device of yours \
              where github.com/owner/repo is mapped. It can read them, and write there with \
              --channel review-with-alice.\n\
-             They come from other people's agents: <n> keys wrote there, <m> of them labelled \
+             They come from other people's agents: <n keys> wrote there, <m> of them labelled \
              by you. Anyone a member handed the channel to reads it too, unseen.",
-            &["0", "0"]
+            &["0 keys", "0"]
         )
     );
     act(
@@ -573,14 +573,31 @@ fn the_shared_commands_say_what_this_record_says() {
             &["review-with-alice", "review-with-alice"]
         )
     );
-    // `shared anew` on a channel past a bound (§3.4, §7).
+    // `shared anew` on a channel past a bound (§3.4, §7), with rows let go
+    // and with none.
+    for (let_go, n) in [(1, "1 key"), (3, "3 keys")] {
+        assert_eq!(
+            crate::shared_anew::past_a_bound_line("review-with-alice", let_go),
+            says(
+                "You could not list everyone in \"<name>\" since it went past a bound: up to <n \
+                 keys> you no longer hold, and anyone who wrote there since. Share the new \
+                 channel with them again.",
+                &["review-with-alice", n]
+            )
+        );
+    }
     assert_eq!(
-        crate::shared_anew::past_a_bound_line("review-with-alice", 3),
+        crate::shared_anew::past_a_bound_line("review-with-alice", 0),
         says(
-            "You could not list <n> keys of \"<name>\", nor anyone who wrote there after it went \
-             past a bound: share the new channel with them again.",
-            &["3", "review-with-alice"]
+            "You could not list everyone in \"<name>\" since it went past a bound: anyone who \
+             wrote there since. Share the new channel with them again.",
+            &["review-with-alice"]
         )
+    );
+    // A count and its noun (§5).
+    assert_eq!(
+        [0, 1, 2].map(|n| counted(n, "key")),
+        ["0 keys", "1 key", "2 keys"]
     );
     // With sync off, every command is refused so.
     meta::remove(conn, meta::SYNC_CLAUDE_DIR).unwrap();

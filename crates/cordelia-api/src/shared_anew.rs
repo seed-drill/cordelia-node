@@ -510,12 +510,21 @@ fn made_anew_line(name: &str, new: &[u8; 32], left: LeftOut) -> String {
         crate::messages::cleaned(name),
         channel_words(new)
     );
-    if left != LeftOut::default() {
-        line.push_str(&format!(
-            " Left out besides: {} keys past the 64 that stay, and {} no longer known on this \
-             device.",
-            left.past_64, left.let_go
+    let mut besides = Vec::new();
+    if left.past_64 > 0 {
+        besides.push(format!(
+            "{} past the 64 that stay",
+            sharing::counted(left.past_64, "key")
         ));
+    }
+    if left.let_go > 0 {
+        besides.push(format!(
+            "up to {} no longer known on this device",
+            sharing::counted(left.let_go, "key")
+        ));
+    }
+    if !besides.is_empty() {
+        line.push_str(&format!(" Left out besides: {}.", besides.join(", and ")));
     }
     line
 }
@@ -863,8 +872,8 @@ fn listing_of(
         listing.lines.push(past_a_bound_line(&row.name, row.let_go));
     } else if row.let_go > 0 {
         listing.lines.push(format!(
-            "  no longer known on this device, so left out: {}",
-            row.let_go
+            "  no longer known on this device, so left out: up to {}",
+            sharing::counted(row.let_go, "key")
         ));
     }
     listing.lines.push(LABEL_FIRST.into());
@@ -872,16 +881,27 @@ fn listing_of(
 }
 
 /// What `shared anew` says of a channel past a bound (§3.4, the person's
-/// ruling for R1): this device has not read it since its filing went past
-/// the bound, so it lists only the keys of its table of keys. `let_go`
-/// counts the rows the table let go; a key that first wrote there since is
-/// not in the table and cannot be counted. None of them is asked about, and
-/// the offer seals to none of them: they need the new channel shared with
-/// them again. Reading the channel again first waits for after R1.
+/// ruling for R1): this device has not read it since its filing went
+/// past the bound, so it lists only the keys of its table of keys. `let_go`
+/// counts the rows the table let go, and is an upper bound on the keys of
+/// them it could not list: a key whose row went and that wrote again since
+/// is in the table, listed, and still counted, since the table keeps no
+/// record of which keys it let go (§6.3). A key that first wrote there
+/// since the bound is not in the table and cannot be counted. None of them
+/// is asked about, and the offer seals to none of them: they need the new
+/// channel shared with them again. Reading the channel again first waits
+/// for after R1. At 0 rows let go the count is not said.
 pub fn past_a_bound_line(name: &str, let_go: u64) -> String {
+    let let_go = match let_go {
+        0 => String::new(),
+        n => format!(
+            "up to {} you no longer hold, and ",
+            sharing::counted(n, "key")
+        ),
+    };
     format!(
-        "You could not list {let_go} keys of \"{}\", nor anyone who wrote there after it went \
-         past a bound: share the new channel with them again.",
+        "You could not list everyone in \"{}\" since it went past a bound: {let_go}anyone who \
+         wrote there since. Share the new channel with them again.",
         crate::messages::cleaned(name)
     )
 }
@@ -987,20 +1007,25 @@ pub fn anew_plan(
     let asks = format!(
         "{A_PERSONS_DEVICES}\nThose who stay move with cordelia shared move {} on one of their \
          devices. Until each does, what they write in the old channel is read by the keys you \
-         leave out.\nThis makes \"{shown}\" anew, at {}: {} keys stay, your own devices among \
-         them, and {} are left out.",
+         leave out.\nThis makes \"{shown}\" anew, at {}. Staying: {}, your own devices among \
+         them. Left out: {}{}.",
         crate::shared_routes::shell_word(name),
         at.join(" and "),
-        stay.len(),
-        left_out
-            + listing.let_go as usize
-            + held
-                .statement
-                .statement
-                .removed
-                .iter()
-                .filter(|key| st(kept::key(conn, row.id, key)).ok().flatten().is_some())
-                .count()
+        sharing::counted(stay.len() as u64, "key"),
+        // The rows the table let go are an upper bound (`past_a_bound_line`).
+        if listing.let_go > 0 { "up to " } else { "" },
+        sharing::counted(
+            (left_out
+                + held
+                    .statement
+                    .statement
+                    .removed
+                    .iter()
+                    .filter(|key| st(kept::key(conn, row.id, key)).ok().flatten().is_some())
+                    .count()) as u64
+                + listing.let_go,
+            "key"
+        )
     );
     Ok((
         listing,
@@ -1098,8 +1123,8 @@ fn offer_line(
             sender_form(conn, held, own, other)?
         ),
         OfferIs::ForThisDevice(_) => format!(
-            "made anew by {by} on {on} into channel {new}, without {} keys",
-            judged.left_out.len()
+            "made anew by {by} on {on} into channel {new}, without {}",
+            sharing::counted(judged.left_out.len() as u64, "key")
         ),
     })
 }
@@ -1448,11 +1473,11 @@ pub(crate) fn after_who_wrote(
                 continue;
             }
             lines.push(format!(
-                "This channel was made anew by {} on {}, without {left_out} keys. You have not \
-                 moved: what you write here is read by those keys too. Move with: cordelia shared \
-                 move {}",
+                "This channel was made anew by {} on {}, without {}. You have not moved: what \
+                 you write here is read by those keys too. Move with: cordelia shared move {}",
                 sender_form(conn, held, own, &offer.maker)?,
                 date_of(i64::try_from(offer.made).unwrap_or(i64::MAX)),
+                sharing::counted(left_out as u64, "key"),
                 crate::shared_routes::shell_word(name)
             ));
         }
@@ -1560,10 +1585,10 @@ pub fn stay_plan(
         left.push(sender_form(conn, &held, &own, key)?);
     }
     let asks = format!(
-        "\"{shown_name}\" was made anew by {by} on {on}, without {} keys. Your devices send \
-         nothing more in the old channel until you move (cordelia shared move {}) or stay. If \
-         you stay, what your agents write there is read by the keys left out: {}",
-        pause.left_out.len(),
+        "\"{shown_name}\" was made anew by {by} on {on}, without {}. Your devices send nothing \
+         more in the old channel until you move (cordelia shared move {}) or stay. If you stay, \
+         what your agents write there is read by the keys left out: {}",
+        sharing::counted(pause.left_out.len() as u64, "key"),
         crate::shared_routes::shell_word(name),
         left.join(", ")
     );

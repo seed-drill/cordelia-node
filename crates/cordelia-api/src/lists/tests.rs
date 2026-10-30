@@ -3588,8 +3588,8 @@ fn shared_anew_past_a_bound_lists_only_the_keys_it_holds() {
     let line = crate::shared_anew::past_a_bound_line("review", 1);
     assert_eq!(
         line,
-        "You could not list 1 keys of \"review\", nor anyone who wrote there after it went \
-         past a bound: share the new channel with them again."
+        "You could not list everyone in \"review\" since it went past a bound: up to 1 key you \
+         no longer hold, and anyone who wrote there since. Share the new channel with them again."
     );
     assert_eq!(
         listing
@@ -3633,7 +3633,7 @@ fn shared_anew_past_a_bound_lists_only_the_keys_it_holds() {
     let plan = plan.unwrap();
     assert!(
         plan.asks
-            .ends_with("4 keys stay, your own devices among them, and 1 are left out."),
+            .ends_with("Staying: 4 keys, your own devices among them. Left out: up to 1 key."),
         "{}",
         plan.asks
     );
