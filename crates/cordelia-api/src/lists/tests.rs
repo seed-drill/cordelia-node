@@ -3481,3 +3481,181 @@ fn a_channel_shared_again_while_its_drop_is_written_shows_nothing_old_as_new() {
     assert_eq!(shown[0].body, "fresh");
     assert_eq!(shown[0].first_held, t1, "shown as new");
 }
+
+/// `shared anew` on a channel past its bound (decision 2026-10-10 §3.4, the
+/// person's ruling for R1): the device does not read the channel again, so
+/// it lists and asks about only the keys of its table of keys. The phone
+/// files `review` and is shut, and two members write there; the laptop and
+/// the desktop
+/// then file eight each, apart, and `review` is pushed past the bound. The
+/// table lets go the row of the member that wrote first, and a third
+/// member, Dave, comes to the channel after it went past the bound: the
+/// door takes nothing of his. `shared anew` lists and asks about the one
+/// key it holds, says in one line that you could not list 1 key, nor
+/// anyone who wrote there since, and that they need the channel shared
+/// with them again; it takes no `keep` of a key it did not list; and the
+/// offer seals to the person's three devices and the key it holds, and to
+/// no other.
+#[test]
+fn shared_anew_past_a_bound_lists_only_the_keys_it_holds() {
+    use crate::shared::tests::{Shared, anew, given, key_row, key_rows, member, row, stores};
+    use cordelia_crypto::bech32::encode_public_key;
+    use cordelia_crypto::shared::Anew;
+    use cordelia_storage::shared::State;
+
+    let s = person(3, 3);
+    sync_on(&s);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let t0 = s.now + 10;
+    // The phone files `review`, and is then shut, its list still carrying
+    // the filing: the channel's rows stay while a list carries an act on it.
+    on(&s, phone, Do::File(filing(1, "review")), t0);
+    all_fetch(&s, &[laptop, desktop, phone], t0 + 1, 2);
+    let review = Shared::of(1);
+    crate::shared::tests::out(&s, laptop, t0 + 1);
+    assert_eq!(row(&s, laptop, &review).state, State::Held);
+    // Two members write there: the first is let go below, the second held.
+    let (gone, kept) = (member(2), member(1));
+    stores(&s, laptop, &anew(&gone, &review, 1), t0 + 2);
+    stores(&s, laptop, &anew(&kept, &review, 1), t0 + 3);
+
+    // The laptop and the desktop file eight each, apart: `review` is the
+    // oldest of 17, past the bound.
+    let t1 = t0 + 10;
+    for k in 0..8u8 {
+        let at = t1 + i64::from(k);
+        on(&s, laptop, Do::File(filing(10 + k, &format!("l{k}"))), at);
+        on(&s, desktop, Do::File(filing(20 + k, &format!("d{k}"))), at);
+    }
+    for round in 0..3 {
+        let now = t1 + 10 + round;
+        fetch_out(&s, &[desktop], laptop, now);
+        fetch_out(&s, &[laptop], desktop, now);
+    }
+    let t2 = t1 + 20;
+    assert!(!filed(&s, laptop).contains(&"review".to_string()));
+    let id = row(&s, laptop, &review).id;
+    assert_eq!(row(&s, laptop, &review).state, State::NotInForce);
+    assert!(s[laptop].stored_in(&review.secret).is_empty());
+    assert_eq!(key_rows(&s, laptop, &review).len(), 2);
+    // The table lets go the row of the key that wrote first.
+    let conn = &s[laptop].conn;
+    assert_eq!(
+        cordelia_storage::shared::keep_rows_within(conn, id, 1).unwrap(),
+        1
+    );
+    assert!(key_row(&s, laptop, &review, &gone.public_key()).is_none());
+    assert!(key_row(&s, laptop, &review, &kept.public_key()).is_some());
+    // Dave writes there after it went past the bound: the door takes
+    // nothing of his, and the table has no row of him.
+    let dave = member(9);
+    assert!(!matches!(
+        given(&s, laptop, &anew(&dave, &review, 1), t2),
+        crate::take::Taken::Shared {
+            stored: cordelia_storage::entries::Outcome::Stored,
+            ..
+        }
+    ));
+    assert!(key_row(&s, laptop, &review, &dave.public_key()).is_none());
+
+    let own_relays = vec![crate::sharing::OwnRelay {
+        name: "relay.example.org:9474".into(),
+        key: [3; 32],
+    }];
+    let identity = &s[laptop].identity;
+    let plan_of = |keep: &[String], asked: &[String]| {
+        crate::shared_anew::anew_plan(
+            conn,
+            identity,
+            &own_relays,
+            "review",
+            None,
+            &[],
+            Some((keep, asked)),
+            t2,
+        )
+    };
+    let (listing, _) =
+        crate::shared_anew::anew_plan(conn, identity, &own_relays, "review", None, &[], None, t2)
+            .unwrap();
+    // It lists and asks about the one key it holds.
+    assert_eq!(listing.asked, vec![kept.public_key()]);
+    assert_eq!(
+        listing.own_devices,
+        vec![s.key(laptop), s.key(desktop), s.key(phone)]
+    );
+    // One line says how many it could not list, and what to do.
+    let line = crate::shared_anew::past_a_bound_line("review", 1);
+    assert_eq!(
+        line,
+        "You could not list 1 keys of \"review\", nor anyone who wrote there after it went \
+         past a bound: share the new channel with them again."
+    );
+    assert_eq!(
+        listing
+            .lines
+            .iter()
+            .filter(|said| said.contains("could not list"))
+            .collect::<Vec<_>>(),
+        vec![&line],
+        "{:?}",
+        listing.lines
+    );
+    assert!(
+        !listing
+            .lines
+            .iter()
+            .any(|said| said.contains("no longer known on this device")),
+        "{:?}",
+        listing.lines
+    );
+    let asked: Vec<String> = listing
+        .asked
+        .iter()
+        .map(|key| encode_public_key(key).unwrap())
+        .collect();
+    // A `keep` of a key it did not list is taken for nobody: Dave's, and
+    // the key the table let go.
+    for not_listed in [&dave, &gone] {
+        let keep = vec![encode_public_key(&not_listed.public_key()).unwrap()];
+        match plan_of(&keep, &asked) {
+            Err(crate::sharing::Failed::Refused(refusal)) => assert!(
+                refusal.line.contains("is not a key that this asks about"),
+                "{}",
+                refusal.line
+            ),
+            other => panic!("taken: {other:?}"),
+        }
+    }
+    // Every key kept: the offer seals to the person's own devices and the
+    // key it holds, and to no other.
+    let (_, plan) = plan_of(&asked, &asked).unwrap();
+    let plan = plan.unwrap();
+    assert!(
+        plan.asks
+            .ends_with("4 keys stay, your own devices among them, and 1 are left out."),
+        "{}",
+        plan.asks
+    );
+    crate::shared_anew::make_anew(conn, identity, &own_relays, &plan.what, t2).unwrap();
+    let offers: Vec<_> = s[laptop]
+        .stored_in(&review.secret)
+        .into_iter()
+        .filter(|entry| entry.author == s.key(laptop))
+        .collect();
+    assert_eq!(offers.len(), 1, "the offer, in the channel past the bound");
+    let opened = offers[0].open(&review.secret).unwrap();
+    let Ok(Anew::Offer(offer)) = Anew::from_value(&opened.value) else {
+        panic!("no offer");
+    };
+    let mut sealed: Vec<[u8; 32]> = offer.seals.iter().map(|seal| seal.key).collect();
+    sealed.sort();
+    let mut expected = vec![
+        s.key(laptop),
+        s.key(desktop),
+        s.key(phone),
+        kept.public_key(),
+    ];
+    expected.sort();
+    assert_eq!(sealed, expected);
+}
