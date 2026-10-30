@@ -702,13 +702,16 @@ pub(crate) fn newest_of(
     Ok(carry::newest(all))
 }
 
+/// A version, with each generation it was read in ([`newest_read_in`]).
+pub(crate) type ReadIn = (Version, Vec<Option<carry::Generation>>);
+
 /// [`newest_of`], each with every generation it was read in, by its change
 /// where this device knows it ([`Generation::change`]): what `--from`
 /// brings is judged by the cut where it was read ([`left_out_from`]).
 pub(crate) fn newest_read_in(
     read: &[Generation],
     keys: &[[u8; 32]],
-) -> Result<Vec<(Version, Vec<Option<carry::Generation>>)>, PersonError> {
+) -> Result<Vec<ReadIn>, PersonError> {
     let mut all: Vec<(Version, Option<carry::Generation>)> = Vec::new();
     for generation in read {
         let was = carry::read(
