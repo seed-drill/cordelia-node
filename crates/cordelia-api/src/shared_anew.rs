@@ -549,6 +549,13 @@ pub fn unreached_line(name: &str) -> String {
 /// store, read by none of the others in it, while the person's devices
 /// followed the filing out of it. Returns the lines said of each, and the
 /// names of those that could not be made anew, with why.
+///
+/// A channel past its bound (§3.5) is taken under the lists of the
+/// generation before: its row is past the bound when this device applies
+/// the removal. Every such channel is read, and its keys that stay worked
+/// out, before anything is made anew, and all are made anew first, in one
+/// act ([`make_anew_past_bound`]); each channel held follows. So the order
+/// of the channels decides nothing.
 pub fn anew_at_removal(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -556,6 +563,8 @@ pub fn anew_at_removal(
     now: i64,
 ) -> Result<Vec<String>, PersonError> {
     let mut said = Vec::new();
+    let mut held_rows = Vec::new();
+    let mut past: Vec<PastBound> = Vec::new();
     for channel in st(rows::not_clean_all(conn))? {
         let Some(row) = st(kept::channel(conn, &channel.channel))? else {
             continue;
@@ -563,14 +572,85 @@ pub fn anew_at_removal(
         if !matches!(row.state, State::Held | State::NotInForce) || channel.owed {
             continue;
         }
+        let past_bound = row.state == State::NotInForce;
         if !sharing::any_own(own_relays, &card_of(&row)?) {
             st(rows::unreached(conn, &row.channel))?;
-            said.push(unreached_line(&row.name));
+            said.push(match past_bound {
+                true => unreached_past_a_bound_line(&row.name),
+                false => unreached_line(&row.name),
+            });
             continue;
         }
+        if past_bound {
+            let Some(held) = held(conn)? else {
+                return Err(PersonError::FollowsNoPhrase);
+            };
+            let (stay, left) = staying_with_no_question(conn, &held, &identity.public_key(), &row)?;
+            past.push((row, stay, left));
+        } else {
+            held_rows.push(row);
+        }
+    }
+    if !past.is_empty() {
+        match make_anew_past_bound(conn, identity, &past, now) {
+            Ok(made) => {
+                for ((row, _, left), new) in past.iter().zip(&made) {
+                    said.push(made_anew_past_a_bound_line(&row.name, new, *left));
+                }
+            }
+            Err(Failed::Refused(refusal)) => {
+                for (row, _, _) in &past {
+                    said.push(could_not_be_made_anew(&row.name, &refusal.line));
+                }
+            }
+            Err(Failed::Error(e)) => return Err(e),
+        }
+    }
+    for row in held_rows {
         said.push(anew_one_at_removal(conn, identity, &row, now)?);
     }
     Ok(said)
+}
+
+fn could_not_be_made_anew(name: &str, why: &str) -> String {
+    format!(
+        "\"{}\" could not be made anew: {why}",
+        crate::messages::cleaned(name)
+    )
+}
+
+/// The line said of a channel past its bound that a removal made anew
+/// (§3.5): the new channel takes the old one's place past the bound, so the
+/// person's devices hold neither; how many keys past the 64 it left out;
+/// and, in the words of `shared anew` there, how many it could not list.
+pub fn made_anew_past_a_bound_line(name: &str, new: &[u8; 32], left: LeftOut) -> String {
+    let mut line = format!(
+        "\"{}\" is made anew without the device removed: it is channel {} now. It was past a \
+         bound, and the new channel takes its place there: your devices do not hold it. Ask \
+         someone in it to share it with you again.",
+        crate::messages::cleaned(name),
+        channel_words(new)
+    );
+    if left.past_64 > 0 {
+        line.push_str(&format!(
+            " Left out besides: {} past the 64 that stay.",
+            sharing::counted(left.past_64, "key")
+        ));
+    }
+    line.push(' ');
+    line.push_str(&past_a_bound_line(name, left.let_go));
+    line
+}
+
+/// The line of a channel past its bound that a removal does not make anew,
+/// since this device does not reach its relays (§3.5): no device of the
+/// person's holds it to make it anew.
+pub fn unreached_past_a_bound_line(name: &str) -> String {
+    format!(
+        "\"{}\" was past a bound and is not reached from this device, so it is not made anew: \
+         ask someone in it to make it anew without the device removed.",
+        crate::messages::cleaned(name)
+    )
 }
 
 fn anew_one_at_removal(
@@ -602,11 +682,7 @@ fn anew_one_at_removal(
         now,
     ) {
         Ok(new) => Ok(made_anew_line(&row.name, &new, left)),
-        Err(Failed::Refused(refusal)) => Ok(format!(
-            "\"{}\" could not be made anew: {}",
-            crate::messages::cleaned(&row.name),
-            refusal.line
-        )),
+        Err(Failed::Refused(refusal)) => Ok(could_not_be_made_anew(&row.name, &refusal.line)),
         Err(Failed::Error(e)) => Err(e),
     }
 }
@@ -671,62 +747,26 @@ fn make_anew_of(
     now: i64,
 ) -> Out<[u8; 32]> {
     let held = standing(conn)?;
-    let card = Card::make(relays).map_err(|e| PersonError::Held(e.to_string()))?;
-    let new_channel = card.channel_id()?;
-    let offer = Offer::make(u64::try_from(now).unwrap_or(0), &row.channel, &card, stay)
-        .map_err(|e| PersonError::Held(format!("an offer: {e}")))?;
-    let value = Anew::Offer(offer)
-        .to_value()
-        .map_err(|e| PersonError::Held(e.to_string()))?;
-    let own = identity.public_key();
-    let secret = card_of(row)?.secret()?;
-    let name = anew_name(&own)?;
-    let slot = slot_id(&derive::slot_key(&secret)?, &name);
     let agents: Vec<String> = crate::shared_messages::in_force(conn)?
         .into_iter()
         .filter(|(channel, _)| *channel == row.channel)
         .map(|(_, agent)| agent)
         .collect();
-    let to = Filing {
-        channel: new_channel,
-        card,
-        name: filing.name.clone(),
-        came: Came::Moved(row.channel),
-    };
     // A refusal of the act undoes the whole transaction, the offer and the
     // row of what was made among it: a refused `shared anew` writes and
     // sends nothing.
     let mut refusal = None;
+    let mut new_channel = None;
     let done = in_one(conn, || -> Result<(), PersonError> {
-        let rev = entries::author_entry(conn, &row.channel, &slot, &own)?
-            .map_or(1, |held| held.entry.rev + 1);
-        let inside = Inside {
-            name: name.clone(),
-            value: Value::Other(value.clone()),
-            chain: Some(Vec::new()),
+        let card = write_offer(conn, identity, row, relays.clone(), stay, at_removal, now)?;
+        let new = card.channel_id()?;
+        new_channel = Some(new);
+        let to = Filing {
+            channel: new,
+            card,
+            name: filing.name.clone(),
+            came: Came::Moved(row.channel),
         };
-        let entry = Entry::seal(&secret, identity, rev, &inside)?.check()?;
-        match row.state {
-            State::Held => {
-                crate::take::take(conn, identity, &entry, now)?;
-            }
-            _ => {
-                entries::store(conn, &entry, now)?;
-            }
-        }
-        st(rows::made(
-            conn,
-            &MadeRow {
-                channel: row.channel,
-                new_channel,
-                rev,
-                made_at: now,
-                at_removal: at_removal.is_some(),
-                delivering: true,
-                past_64: at_removal.unwrap_or_default().past_64,
-                let_go: at_removal.unwrap_or_default().let_go,
-            },
-        ))?;
         let what = Do::MoveWith {
             from: row.channel,
             to: to.clone(),
@@ -748,7 +788,116 @@ fn make_anew_of(
         return Err(Failed::Refused(refused));
     }
     done?;
-    Ok(new_channel)
+    new_channel.ok_or_else(|| Failed::Error(PersonError::Held("no channel was made".into())))
+}
+
+/// What making the channel of `row` anew writes before its act (§7, steps
+/// 1 and 2): a new card at `relays`, and the offer, its seed sealed to each
+/// of `stay`, written in the old channel over this device's anew record,
+/// with the row of what was made. In the caller's transaction. Returns the
+/// new card.
+fn write_offer(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    row: &Channel,
+    relays: Relays,
+    stay: &[[u8; 32]],
+    at_removal: Option<LeftOut>,
+    now: i64,
+) -> Result<Card, PersonError> {
+    let card = Card::make(relays).map_err(|e| PersonError::Held(e.to_string()))?;
+    let new_channel = card.channel_id()?;
+    let offer = Offer::make(u64::try_from(now).unwrap_or(0), &row.channel, &card, stay)
+        .map_err(|e| PersonError::Held(format!("an offer: {e}")))?;
+    let value = Anew::Offer(offer)
+        .to_value()
+        .map_err(|e| PersonError::Held(e.to_string()))?;
+    let own = identity.public_key();
+    let secret = card_of(row)?.secret()?;
+    let name = anew_name(&own)?;
+    let slot = slot_id(&derive::slot_key(&secret)?, &name);
+    // Past a bound the store holds no entry of the channel, this device's
+    // empty anew record among them, which its relays hold at revision 1: an
+    // offer whose record the store does not hold goes above it (§3.5).
+    let rev = entries::author_entry(conn, &row.channel, &slot, &own)?
+        .map_or(2, |held| held.entry.rev + 1);
+    let inside = Inside {
+        name,
+        value: Value::Other(value),
+        chain: Some(Vec::new()),
+    };
+    let entry = Entry::seal(&secret, identity, rev, &inside)?.check()?;
+    match row.state {
+        State::Held => {
+            crate::take::take(conn, identity, &entry, now)?;
+        }
+        _ => {
+            entries::store(conn, &entry, now)?;
+        }
+    }
+    st(rows::made(
+        conn,
+        &MadeRow {
+            channel: row.channel,
+            new_channel,
+            rev,
+            made_at: now,
+            at_removal: at_removal.is_some(),
+            delivering: true,
+            past_64: at_removal.unwrap_or_default().past_64,
+            let_go: at_removal.unwrap_or_default().let_go,
+        },
+    ))?;
+    Ok(card)
+}
+
+/// A channel past its bound that a removal makes anew: its row, the keys
+/// that stay, and what it left out besides the removed keys.
+type PastBound = (Channel, Vec<[u8; 32]>, LeftOut);
+
+/// Make each channel of `past`, each past its bound, anew at a removal
+/// (§3.5), in one transaction: for each, a new card at its relays and its
+/// offer in the old channel; then one act of the person's list, a drop of
+/// each old channel and no filing of a new one, which takes the old one's
+/// place past the bound, so that no other channel goes past it. One act
+/// for all: an act writes a list of the new generation, in which a channel
+/// past a bound that it does not drop is carried by no list, and is
+/// forgotten. Returns the new channels, in the order of `past`.
+fn make_anew_past_bound(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    past: &[PastBound],
+    now: i64,
+) -> Out<Vec<[u8; 32]>> {
+    let held = standing(conn)?;
+    let mut refusal = None;
+    let mut made = Vec::new();
+    let done = in_one(conn, || -> Result<(), PersonError> {
+        made.clear();
+        for (row, stay, left) in past {
+            let relays = card_of(row)?.relays().clone();
+            let card = write_offer(conn, identity, row, relays, stay, Some(*left), now)?;
+            made.push(card.channel_id()?);
+        }
+        let what = Do::DropPastBound(past.iter().map(|(row, _, _)| row.channel).collect());
+        match sharing::act(conn, identity, &held, what, now) {
+            Ok(()) => {}
+            Err(Failed::Error(e)) => return Err(e),
+            Err(Failed::Refused(refused)) => {
+                refusal = Some(refused);
+                return Err(PersonError::Held("refused, and undone".into()));
+            }
+        }
+        for (row, _, _) in past {
+            st(rows::clean(conn, &row.channel))?;
+        }
+        Ok(())
+    });
+    if let Some(refused) = refusal {
+        return Err(Failed::Refused(refused));
+    }
+    done?;
+    Ok(made)
 }
 
 /// What `shared anew` lists of a channel's table of keys before it asks
@@ -1871,12 +2020,21 @@ pub fn recovery_lines(
             ),
         }
     };
-    let (written, _) = lists::recovered(lists, |key| {
+    let (written, past_bound) = lists::recovered(lists, |key| {
         gone.iter()
             .any(|(of, _)| of == key)
             .then_some(Maker::Removed)
     });
     let acts = lists::acts_of(&written);
+    let past: Vec<String> = lists::acts_of(&past_bound)
+        .iter()
+        .filter_map(|act| match act {
+            AnyAct::Filing(act) => {
+                Some(format!("\"{}\"", crate::messages::cleaned(&act.item.name)))
+            }
+            _ => None,
+        })
+        .collect();
     let filings: Vec<Filing> = acts
         .iter()
         .filter_map(|act| match act {
@@ -1939,7 +2097,23 @@ pub fn recovery_lines(
                 .to_string(),
         );
     }
+    // A channel past a bound is not made anew: this machine never read it,
+    // and holds no table of its keys to seal to (§3.5).
+    if !past.is_empty() && !gone.is_empty() {
+        lines.push(past_a_bound_at_a_recovery(&past));
+    }
     Ok(lines)
+}
+
+/// What a recovery says of the channels its lists leave past a bound, each
+/// quoted (§3.5).
+fn past_a_bound_at_a_recovery(names: &[String]) -> String {
+    format!(
+        "Past a bound, so not brought back or made anew: {}. A device you said is gone may still \
+         read what is written in each: ask someone in each to make it anew without your old \
+         devices, and to share it with you again.",
+        names.join(", ")
+    )
 }
 
 /// The acts of the removed keys that are in force (§3.5): what `cordelia
@@ -2009,16 +2183,51 @@ pub(crate) fn made_at_the_last_removal(
         if !made.at_removal || made.made_at < applied_at {
             continue;
         }
-        let name = st(kept::channel(conn, &made.new_channel))?
+        let left = LeftOut {
+            past_64: made.past_64,
+            let_go: made.let_go,
+        };
+        match st(kept::channel(conn, &made.new_channel))? {
+            Some(row) => lines.push(made_anew_line(&row.name, &made.new_channel, left)),
+            // Past a bound, the new channel is not filed (§3.5).
+            None => {
+                let name = st(kept::channel(conn, &made.channel))?
+                    .map(|row| row.name)
+                    .unwrap_or_default();
+                lines.push(made_anew_past_a_bound_line(&name, &made.new_channel, left));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Each channel past its bound that a removal on this device made anew at
+/// `since` or after it (§3.5, §9): the old channel's name, what was made,
+/// and the line said of it. The new channel is not filed, so no row of it
+/// is held.
+pub(crate) fn made_anew_past_a_bound(
+    conn: &Connection,
+    since: i64,
+) -> Result<Vec<(String, MadeRow, String)>, PersonError> {
+    let mut found = Vec::new();
+    for made in st(rows::made_all(conn))? {
+        if !made.at_removal || made.made_at < since {
+            continue;
+        }
+        if st(kept::channel(conn, &made.new_channel))?.is_some() {
+            continue;
+        }
+        let name = st(kept::channel(conn, &made.channel))?
             .map(|row| row.name)
             .unwrap_or_default();
         let left = LeftOut {
             past_64: made.past_64,
             let_go: made.let_go,
         };
-        lines.push(made_anew_line(&name, &made.new_channel, left));
+        let line = made_anew_past_a_bound_line(&name, &made.new_channel, left);
+        found.push((name, made, line));
     }
-    Ok(lines)
+    Ok(found)
 }
 
 /// The line of a channel not yet clean (decision 2026-10-24, rule 25).
@@ -2032,23 +2241,31 @@ pub fn not_clean_line(name: &str) -> String {
 }
 
 /// What a removal names of the shared channels before its yes: the names
-/// of those it makes anew, of those it leaves not clean, and the acts.
-pub type AtARemoval = (Vec<String>, Vec<String>, Vec<Named>);
+/// of those it makes anew, of those it leaves not clean, of those past a
+/// bound, and the acts.
+pub type AtARemoval = (Vec<String>, Vec<String>, Vec<String>, Vec<Named>);
 
 /// What the device of `identity` names of its shared channels at a removal,
 /// before its yes (§3.5): each shared channel the person holds that one of
 /// `own_relays` reaches, by name, which the removal makes anew; each that
 /// none does, which it leaves not clean (decision 2026-10-24, rules 24 and
-/// 25); and each act in force of any device of the person's that counts,
-/// each with its maker and what undoes it, for the command to name those of
-/// the device it removes.
+/// 25); each channel past a bound, which it makes anew where it reaches
+/// it, and which the person's devices hold neither before nor after; and
+/// each act in force of any device of the person's that counts, each with
+/// its maker and what undoes it, for the command to name those of the
+/// device it removes.
 pub fn at_a_removal(conn: &Connection, own_relays: &[OwnRelay]) -> Result<AtARemoval, PersonError> {
     let (reached, unreached): (Vec<Filing>, Vec<Filing>) = sharing::filed(conn)?
         .into_iter()
         .partition(|filing| sharing::any_own(own_relays, &filing.card));
     let names = |filings: Vec<Filing>| filings.into_iter().map(|filing| filing.name).collect();
+    let past: Vec<String> = st(kept::channels(conn))?
+        .into_iter()
+        .filter(|row| row.state == State::NotInForce)
+        .map(|row| row.name)
+        .collect();
     let acts = acts_named(conn, |_, maker| maker == Maker::Counts)?;
-    Ok((names(reached), names(unreached), acts))
+    Ok((names(reached), names(unreached), past, acts))
 }
 
 #[cfg(test)]

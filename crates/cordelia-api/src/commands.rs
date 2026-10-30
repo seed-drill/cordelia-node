@@ -1209,7 +1209,7 @@ pub async fn change_prepare(
     // that counts, with what undoes it; the command names those of the
     // devices it removes.
     let own_relays = crate::sharing::own_relays(&state);
-    let (shared_names, shared_unreached, shared_acts) =
+    let (shared_names, shared_unreached, shared_past_bound, shared_acts) =
         crate::shared_anew::at_a_removal(&conn, &own_relays).map_err(refused)?;
     let mut acts_handed = Vec::new();
     for named in shared_acts {
@@ -1237,6 +1237,7 @@ pub async fn change_prepare(
         "received": received(&state, now()),
         "shared_channels": shared_names,
         "shared_unreached": shared_unreached,
+        "shared_past_bound": shared_past_bound,
         "shared_acts": acts_handed,
         "look": seen,
     })))

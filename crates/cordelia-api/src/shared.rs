@@ -516,9 +516,16 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
         // state, so that the door stores nothing more of the channel, and
         // the take-out begun. Its entries go in steps ([`take_out_step`]).
         if dropped.contains(&row.channel) {
+            let made = cordelia_storage::shared_anew::made_of_channel(conn, &row.channel)?;
+            // A channel past its bound that a removal made anew is moved
+            // from too, though no filing of the new channel takes its place
+            // (§3.5): its offer waits to go to each relay of its card.
             let moved = filed
                 .iter()
-                .any(|filing| filing.came == FiledAs::Moved(row.channel));
+                .any(|filing| filing.came == FiledAs::Moved(row.channel))
+                || made
+                    .as_ref()
+                    .is_some_and(|made| made.at_removal && made.delivering);
             if matches!(row.state, State::Held | State::NotInForce) {
                 let (state, how) = match moved {
                     true => (State::Moved, ChannelOut::Moved),
@@ -528,9 +535,7 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                 // A channel this device made anew keeps its entries until
                 // its offer is at each relay of its card (§7): they are
                 // taken out then ([`crate::shared_anew::deliveries`]).
-                let offer_waits = moved
-                    && cordelia_storage::shared_anew::made_of_channel(conn, &row.channel)?
-                        .is_some_and(|made| made.delivering);
+                let offer_waits = moved && made.is_some_and(|made| made.delivering);
                 if !offer_waits {
                     pass_rows::begin_channel(conn, row.id, how)?;
                 }
