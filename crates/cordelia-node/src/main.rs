@@ -2767,20 +2767,16 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
 
     let adapter: std::sync::Arc<Mutex<Option<ClaudeAdapter>>> =
         std::sync::Arc::new(Mutex::new(None));
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+    let mut timer = CycleTimer::every(std::time::Duration::from_secs(
         cordelia_sync::claude::CYCLE_SECS,
     ));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sweep = Every::from(
         std::time::Instant::now(),
         std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS),
     );
 
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = state.sync_control.woken() => {}
-        }
+        timer.next_turn(&state.sync_control).await;
         let state = state.clone();
         let adapter = adapter.clone();
         let sweep = sweep.is_due(std::time::Instant::now());
@@ -2878,6 +2874,38 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             counted.sync_control.cycle_was_cut_short(cycle);
         }
         counted.sync_control.cycle_ended(cycle);
+        timer.turn_ended();
+    }
+}
+
+/// When the sync loop takes its next turn: once its timer has run a
+/// cycle's time, or as soon as it is woken. The timer runs from the end
+/// of the last turn, whatever began it, so that a turn that a wake began
+/// just before a tick is not followed at the tick by one more with
+/// nothing to do.
+struct CycleTimer {
+    interval: tokio::time::Interval,
+}
+
+impl CycleTimer {
+    /// A timer of `period`, whose first turn is at once.
+    fn every(period: std::time::Duration) -> Self {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { interval }
+    }
+
+    /// Wait for the next turn: a tick, or a wake of `control`.
+    async fn next_turn(&mut self, control: &cordelia_api::state::SyncControl) {
+        tokio::select! {
+            _ = self.interval.tick() => {}
+            _ = control.woken() => {}
+        }
+    }
+
+    /// A turn has ended: the next tick is a whole period from now.
+    fn turn_ended(&mut self) {
+        self.interval.reset();
     }
 }
 
@@ -9476,5 +9504,34 @@ mod tests {
         assert_eq!(format_uptime(40), "40s");
         assert_eq!(format_uptime(245), "4m 05s");
         assert_eq!(format_uptime(3 * 3600 + 12 * 60 + 9), "3h 12m");
+    }
+
+    /// **The sync loop's timer runs from the end of each turn**: a turn
+    /// that a wake began just before a tick is not followed at the tick
+    /// by another with nothing to do. The next is a whole cycle's time
+    /// after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_cycle_timer_runs_from_the_end_of_each_turn() {
+        use std::time::Duration;
+        let control = cordelia_api::state::SyncControl::default();
+        let mut timer = CycleTimer::every(Duration::from_secs(5));
+        let began = tokio::time::Instant::now();
+        let at = || began.elapsed();
+        // The first turn is at once.
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::ZERO);
+        timer.turn_ended();
+        // A wake just before the tick begins a turn then.
+        tokio::time::sleep(Duration::from_millis(4_900)).await;
+        control.ask_cycle();
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(4_900));
+        timer.turn_ended();
+        // The next is a cycle's time after that turn, and not at the tick.
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(9_900));
+        timer.turn_ended();
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(14_900));
     }
 }
