@@ -2309,29 +2309,80 @@ fn bar_3_passes_over_an_edit_only_where_its_writer_stopped_within_a_cycle() {
             false,
         ),
     ] {
-        for reader_off in [false, true] {
-            let bar = bar_3_of_a_writer(&lives, reader_off);
-            let want = match lost {
-                true => Verdict::Fail,
-                false => Verdict::Pass,
-            };
-            let case = format!("{case}, the reader off: {reader_off}");
-            assert_eq!(bar.verdict, want, "{case}: {}", bar.figure);
-            let (found, passed) = match lost {
-                true => ("1 not found by the end", "0 not found and passed over"),
-                false => ("0 not found by the end", "1 not found and passed over"),
-            };
-            assert!(bar.figure.contains(found), "{case}: {}", bar.figure);
-            assert!(bar.figure.contains(passed), "{case}: {}", bar.figure);
-            // An edit passed over is not one the reader failed to catch up
-            // on; one lost is.
-            let slow = match lost && reader_off {
-                true => "1 edits not held within 60 s",
-                false => "0 edits not held within 60 s",
-            };
-            assert!(bar.figure.contains(slow), "{case}: {}", bar.figure);
-        }
+        bar_3_reads(case, &lives, lost);
     }
+}
+
+/// Bar 3 of [`bar_3_of_a_writer`], with the reader on and off: the edit
+/// is lost (and, with the reader off, not held within 60 s) or passed
+/// over, as `lost` says.
+fn bar_3_reads(case: &str, lives: &[(f64, Is)], lost: bool) {
+    for reader_off in [false, true] {
+        let bar = bar_3_of_a_writer(lives, reader_off);
+        let want = match lost {
+            true => Verdict::Fail,
+            false => Verdict::Pass,
+        };
+        let case = format!("{case}, the reader off: {reader_off}");
+        assert_eq!(bar.verdict, want, "{case}: {}", bar.figure);
+        let (found, passed) = match lost {
+            true => ("1 not found by the end", "0 not found and passed over"),
+            false => ("0 not found by the end", "1 not found and passed over"),
+        };
+        assert!(bar.figure.contains(found), "{case}: {}", bar.figure);
+        assert!(bar.figure.contains(passed), "{case}: {}", bar.figure);
+        // An edit passed over is not one the reader failed to catch up
+        // on; one lost is.
+        let slow = match lost && reader_off {
+            true => "1 edits not held within 60 s",
+            false => "0 edits not held within 60 s",
+        };
+        assert!(bar.figure.contains(slow), "{case}: {}", bar.figure);
+    }
+}
+
+/// An edit written while its writer was already off (stopped or frozen),
+/// as when a removed device is left as it is and the person edits on in
+/// its folder: nothing could read it before the writer ran, so it is
+/// passed over where the writer did not then run 60 s ending 120 s or more
+/// before the end (the hand-off bar 2 makes, "left to bar 3"), and lost
+/// where it did. Bar 2 leaves the first to bar 3, and bar 3 passes over it.
+#[test]
+fn bar_3_passes_over_an_edit_written_while_its_writer_was_off() {
+    let stopped = (900.0, Is::Stopped);
+    for (case, lives, lost) in [
+        ("stopped before, never back", vec![stopped], false),
+        (
+            "frozen before, then stopped for good",
+            vec![(900.0, Is::Frozen), (1100.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "stopped before, back for 30 s only",
+            vec![stopped, (1300.0, Is::Running), (1330.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "stopped before, back too late to send before the end",
+            vec![stopped, (1850.0, Is::Running)],
+            false,
+        ),
+        (
+            "stopped before, back in time",
+            vec![stopped, (1300.0, Is::Running)],
+            true,
+        ),
+        (
+            "frozen before, went on in time",
+            vec![(900.0, Is::Frozen), (1300.0, Is::Running)],
+            true,
+        ),
+    ] {
+        bar_3_reads(case, &lives, lost);
+    }
+    // Bar 2 leaves the edit whose writer never ran again to bar 3.
+    let (_, l) = bar_2_of_a_writer(0, 2, &[stopped], &[], None);
+    assert_eq!((l.not_judged, l.late), (1, 0));
 }
 
 // ── Bar 2 after stage 100: an edit written while its writer was off ──
@@ -2339,16 +2390,25 @@ fn bar_3_passes_over_an_edit_only_where_its_writer_stopped_within_a_cycle() {
 /// Edit 10 of `person`, written at 1000 s by its first device (`writer`),
 /// which then `lives` as the case says, and arriving at its second device
 /// (`writer` + 1, which runs all through but where `reader` says) at
-/// `arrived`. The window is 0 to 2000 s. Bar 2 and its figures over the
-/// person's edits.
-fn bar_2_of_a_writer(
+/// `arrived`; and edit 11 of person 1 (set up with both relays, not in the
+/// office), written at 500 s by its first device and arriving at its second
+/// 5 s later, so that bar 2 never fails for want of an edit. The window is
+/// 0 to 2000 s, and `then` adds to the run what a case needs (a part
+/// treated apart, a removal, an outage). The run, as the report reads it.
+#[allow(clippy::too_many_arguments)]
+fn an_edit_of_a_writer(
+    plan: Plan,
     person: usize,
     writer: usize,
     lives: &[(f64, Is)],
     reader: &[(f64, Is)],
     arrived: Option<f64>,
-) -> (Line, Latencies) {
-    let (_dir, run) = made_up();
+    then: impl FnOnce(&Run),
+) -> (Read, Edits) {
+    let dir = tempfile::tempdir().unwrap();
+    let run = Run::made_up(plan, dir.path());
+    let other = &run.plan.population.people[1];
+    assert!(!other.split && !other.office);
     all_running(&run, 0.0);
     window(&run, 0.0, 2000.0);
     for (t, is) in lives {
@@ -2359,27 +2419,60 @@ fn bar_2_of_a_writer(
     }
     {
         let mut o = run.observer.lock().unwrap();
-        o.wrote(
-            Written {
-                number: 10,
-                person,
-                writer: 0,
-                name: 0,
-                file: "f001.md".into(),
-                size: 600,
-                at: 1000.0,
-                burst: false,
-                new: false,
-                replaced: None,
-            },
-            vec![(1, run.out.clone())],
-        );
+        let edit = |number: u64, person: usize, at: f64| Written {
+            number,
+            person,
+            writer: 0,
+            name: 0,
+            file: format!("f{number:03}.md"),
+            size: 600,
+            at,
+            burst: false,
+            new: false,
+            replaced: None,
+        };
+        o.wrote(edit(10, person, 1000.0), vec![(1, run.out.clone())]);
         if let Some(at) = arrived {
             o.arrivals.insert((10, 1), Arrival { at, in_copy: false });
         }
+        o.wrote(edit(11, 1, 500.0), vec![(1, run.out.clone())]);
+        o.arrivals.insert(
+            (11, 1),
+            Arrival {
+                at: 505.0,
+                in_copy: false,
+            },
+        );
     }
+    then(&run);
     let read = read_of(&run);
     let edits = edits_of(&read);
+    (read, edits)
+}
+
+/// Bar 2 of [`an_edit_of_a_writer`] in a run of section 6's small
+/// population, and its figures over `person`'s edits.
+fn bar_2_of_a_writer(
+    person: usize,
+    writer: usize,
+    lives: &[(f64, Is)],
+    reader: &[(f64, Is)],
+    arrived: Option<f64>,
+) -> (Line, Latencies) {
+    bar_2_of_a_writer_and(person, writer, lives, reader, arrived, |_| {})
+}
+
+/// [`bar_2_of_a_writer`], with `then` adding to the run.
+fn bar_2_of_a_writer_and(
+    person: usize,
+    writer: usize,
+    lives: &[(f64, Is)],
+    reader: &[(f64, Is)],
+    arrived: Option<f64>,
+    then: impl FnOnce(&Run),
+) -> (Line, Latencies) {
+    let plan = Plan::small(1);
+    let (read, edits) = an_edit_of_a_writer(plan, person, writer, lives, reader, arrived, then);
     let l = latencies(
         &read,
         edits.pairs.iter().filter(|p| p.edit.person == person),
@@ -2392,8 +2485,9 @@ fn bar_2_of_a_writer(
 /// after its writer ran again. An edit written while its writer was off
 /// (stopped or frozen) is timed from its writer's return: within 120 s of
 /// it, and inside p50 and p95, it passes; beyond 120 s of it, it fails.
-/// One whose writer never ran again is left to bar 3. One not arrived is
-/// late only where its device ran the 120 s after its writer's return.
+/// One whose writer never ran again is left to bar 3, and bar 2 passes
+/// (its other edit within the bars). One not arrived is late only where
+/// its device ran the 120 s after its writer's return.
 #[test]
 fn bar_2_times_an_edit_written_while_its_writer_was_off_from_its_return() {
     let off = |is: Is| vec![(900.0, is), (1300.0, Is::Running)];
@@ -2442,7 +2536,7 @@ fn bar_2_times_an_edit_written_while_its_writer_was_off_from_its_return() {
             "stopped, never back, never arrived",
             vec![(900.0, Is::Stopped)],
             None,
-            Verdict::Fail,
+            Verdict::Pass,
             None,
             0,
             0,
@@ -2524,4 +2618,211 @@ fn bar_2_times_an_edit_written_while_its_writer_ran_from_the_write() {
     let (bar, l) = bar_2_of_a_writer(0, 2, &[(1005.0, Is::Stopped)], &[], None);
     assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
     assert_eq!((l.late, l.from_return), (1, 0));
+}
+
+// ── Bar 2's writer off: the fix round ──
+
+/// An edit written after its writer was told to stop that arrived before
+/// its writer ran again was sent by the stopping process (a stop is
+/// recorded when the node is told, and its process may run on while it
+/// shuts down): it is timed from the write, not from the return, so it
+/// counts no negative latency. The same where its writer never ran again:
+/// it arrived, and bar 2 judges it.
+#[test]
+fn an_edit_that_arrived_before_its_writers_return_is_timed_from_the_write() {
+    for (case, lives) in [
+        (
+            "back at 1300 s",
+            vec![(990.0, Is::Stopped), (1300.0, Is::Running)],
+        ),
+        ("never back", vec![(990.0, Is::Stopped)]),
+    ] {
+        let (bar, l) = bar_2_of_a_writer(0, 2, &lives, &[], Some(1003.0));
+        assert_eq!(l.of.len(), 1, "{case}");
+        assert!((l.of[0] - 3.0).abs() < 1e-6, "{case}: {:?}", l.of);
+        assert_eq!((l.from_return, l.not_judged), (0, 0), "{case}");
+        assert_eq!(bar.verdict, Verdict::Pass, "{case}: {}", bar.figure);
+        assert!(
+            bar.figure.contains("2 arrivals, p50 3.0 s"),
+            "{case}: {}",
+            bar.figure
+        );
+    }
+}
+
+/// A part treated apart (here another person's carry window) is read over
+/// the edit's way from when it is timed: a window while its writer was off
+/// holds nothing up, and the edit is judged from its writer's return. One
+/// that arrived 300 s after the return fails; one 6.7 s after passes, and
+/// is timed. A window after the return, over the 120 s of an edit not
+/// arrived, treats it apart (it is not late).
+#[test]
+fn bar_2_reads_the_parts_apart_from_when_an_edit_is_timed() {
+    let off = [(900.0, Is::Stopped), (1300.0, Is::Running)];
+    let carry = |line: f64, end: f64| {
+        move |run: &Run| {
+            run.removals.lock().unwrap().push(Removal {
+                person: 1,
+                removed: 2,
+                line_at: Some(line),
+                carry_end: Some(end),
+                ..Removal::default()
+            })
+        }
+    };
+    let (bar, l) = bar_2_of_a_writer_and(0, 2, &off, &[], Some(1600.0), carry(1100.0, 1200.0));
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    assert!(bar.figure.contains("the most 300.0 s"), "{}", bar.figure);
+    assert_eq!((l.of.len(), l.from_return), (1, 1));
+    let (bar, _) = bar_2_of_a_writer_and(0, 2, &off, &[], Some(1306.7), carry(1100.0, 1200.0));
+    assert_eq!(bar.verdict, Verdict::Pass, "{}", bar.figure);
+    assert!(bar.figure.contains("2 arrivals"), "{}", bar.figure);
+    // Not arrived: its way ends 120 s after the return (1420 s), and a
+    // window from 1350 s crosses it.
+    let (bar, l) = bar_2_of_a_writer_and(0, 2, &off, &[], None, carry(1350.0, 1400.0));
+    assert_eq!(l.late, 1, "late, were it judged");
+    assert_eq!(bar.verdict, Verdict::Pass, "{}", bar.figure);
+    assert!(
+        bar.figure.contains("0 not arrived within 120 s"),
+        "{}",
+        bar.figure
+    );
+}
+
+/// A device removed later is owed what it ran 120 s through before its
+/// removal's line, from when the edit is timed: written while its writer
+/// was off (back at 1300 s), the edit is owed by a line at 1500 s, and not
+/// by one at 1400 s, where its 120 s from the return reach past the line.
+#[test]
+fn a_device_removed_later_is_owed_an_edit_from_its_writers_return() {
+    let off = [(900.0, Is::Stopped), (1300.0, Is::Running)];
+    for (line, late) in [(1400.0, 0), (1500.0, 1)] {
+        let (_, l) = bar_2_of_a_writer_and(0, 2, &off, &[], None, |run| {
+            run.observer.lock().unwrap().gone(0, 1, 950.0);
+            run.removals.lock().unwrap().push(Removal {
+                person: 0,
+                removed: 1,
+                line_at: Some(line),
+                carry_end: Some(line + 50.0),
+                ..Removal::default()
+            });
+        });
+        assert_eq!((l.late, l.from_return), (late, late), "line at {line} s");
+    }
+}
+
+/// Bar 3's catch-up takes an edit not arrived when its device's off
+/// began, where it could be sent by the time the device ran again: bar 2
+/// skips it (its device did not run from the writer's return to the
+/// arrival), so bar 3 judges it. Written at 1000 s while its writer was off
+/// (back at 1300 s), the reader off from 1100 s to 1400 s: arrived 100 s
+/// after the reader's return, it is slow; 10 s after, it is not. One that
+/// arrived before the off began, and one whose writer came back after the
+/// reader did (bar 2 times it), are no part of the off's catch-up.
+#[test]
+fn bar_3_catches_up_on_an_edit_not_arrived_when_the_off_began() {
+    let reader = [(1100.0, Is::Stopped), (1400.0, Is::Running)];
+    let bar_3_of = |lives: &[(f64, Is)], arrived: f64| {
+        let plan = Plan::small(1);
+        let (read, edits) = an_edit_of_a_writer(plan, 0, 2, lives, &reader, Some(arrived), |_| {});
+        bar_3(&read, &edits)
+    };
+    let off = [(900.0, Is::Stopped), (1300.0, Is::Running)];
+    for (case, lives, arrived, verdict, said) in [
+        (
+            "writer back at 1300 s, arrived at 1500 s",
+            &off[..],
+            1500.0,
+            Verdict::Fail,
+            "the slowest catch-up 100.0 s, 1 edits not held within 60 s",
+        ),
+        (
+            "writer back at 1300 s, arrived at 1410 s",
+            &off[..],
+            1410.0,
+            Verdict::Pass,
+            "the slowest catch-up 10.0 s, 0 edits not held",
+        ),
+        (
+            "writer ran, arrived at 1090 s",
+            &[][..],
+            1090.0,
+            Verdict::Pass,
+            "the slowest catch-up 0.0 s, 0 edits not held",
+        ),
+        (
+            "writer back at 1500 s, arrived at 1600 s",
+            &[(900.0, Is::Stopped), (1500.0, Is::Running)][..],
+            1600.0,
+            Verdict::Pass,
+            "the slowest catch-up 0.0 s, 0 edits not held",
+        ),
+    ] {
+        let bar = bar_3_of(lives, arrived);
+        assert_eq!(bar.verdict, verdict, "{case}: {}", bar.figure);
+        assert!(bar.figure.contains(said), "{case}: {}", bar.figure);
+    }
+}
+
+/// The office's line in bar 14 times an edit written while its writer was
+/// off from its writer's return, and counts it; and one whose writer never
+/// ran again is counted as not judged.
+#[test]
+fn bar_14_times_the_offices_edit_from_its_writers_return() {
+    let mut plan = Plan::small(1);
+    plan.stage = crate::population::Stage::OneNinety;
+    plan.population.people[0].office = true;
+    for (lives, arrived, said) in [
+        (
+            vec![(900.0, Is::Stopped), (1300.0, Is::Running)],
+            Some(1306.7),
+            "the office's people: 1 arrivals, median 6.70 s, worst 6.70 s, 0 not arrived within \
+             120 s, 1 timed from their writer's return, 0 not judged",
+        ),
+        (
+            vec![(900.0, Is::Stopped)],
+            None,
+            "the office's people: 0 arrivals, no value, 0 not arrived within 120 s, 0 timed from \
+             their writer's return, 1 not judged",
+        ),
+    ] {
+        let (read, edits) = an_edit_of_a_writer(plan.clone(), 0, 2, &lives, &[], arrived, |_| {});
+        let bar = bar_14(&read, &edits);
+        assert!(bar.figure.contains(said), "{}", bar.figure);
+    }
+}
+
+/// Bar 15's bar 2 through the outage (the second relay stopped from
+/// 1100 s to 1220 s) times an edit written while its writer was off from
+/// its writer's return (at 1150 s, during the outage): it arrived 7 s
+/// after, and passes; timed from the write it would be 157 s.
+#[test]
+fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
+    let outage = |run: &Run| {
+        *run.outage.lock().unwrap() = Outage {
+            stopped: Some(1100.0),
+            started: Some(1220.0),
+            back: Vec::new(),
+        };
+    };
+    let off = [(900.0, Is::Stopped), (1150.0, Is::Running)];
+    let (read, edits) = an_edit_of_a_writer(Plan::small(1), 0, 2, &off, &[], Some(1157.0), outage);
+    let bar = bar_15(&read, &edits);
+    assert_eq!(bar.verdict, Verdict::Pass, "{}", bar.figure);
+    assert!(
+        bar.figure.contains(
+            "1 arrivals at p50 7.0 s, p95 7.0 s, the most 7.0 s, 0 not within 120 s, 1 timed \
+             from their writer's return, 0 left to bar 3"
+        ),
+        "{}",
+        bar.figure
+    );
+    let (read, edits) = an_edit_of_a_writer(Plan::small(1), 0, 2, &off[..1], &[], None, outage);
+    let bar = bar_15(&read, &edits);
+    assert!(
+        bar.figure
+            .contains("0 timed from their writer's return, 1 left to bar 3"),
+        "{}",
+        bar.figure
+    );
 }
