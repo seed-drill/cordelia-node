@@ -327,6 +327,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/src/lists/tests.rs`: `three_reviews_of_slice_3_converge`
 - `crates/cordelia-api/src/shared_routes/tests.rs`: `a_device_never_has_more_than_its_room_in_a_shared_channel`
 - `crates/cordelia-api/src/lists/tests.rs`: `a_channel_not_written_keeps_no_entries`
+- `crates/cordelia-api/src/lists/tests.rs`: `a_channel_shared_again_while_its_drop_is_written_shows_nothing_old_as_new`
 
 ## How CI checks this
 
