@@ -705,6 +705,35 @@ pub fn open_for_device(
     Ok(ForDevice { statement, secret })
 }
 
+/// The secret that `device`'s key opens at any place in a change entry's
+/// list of sealed secrets, whichever device the statement lists there; or
+/// `None` where it opens at none.
+///
+/// [`open_for_device`] tries only the place of a device that the statement
+/// lists, as a device that keeps the rules reads. This asks what a key
+/// could take from the entry whatever it does: a key that the statement
+/// does not list, or removes, takes the secret where it was sealed to it
+/// at another device's place (decision 2026-10-24 (removal), T20). The
+/// threat model's tests ask it of a removed key.
+///
+/// `entry`, `phrase_key`, `phrase_channel` and `statement_key` are as
+/// [`open_for_device`] takes them, and it refuses what that refuses.
+pub fn opens_at_any_place(
+    entry: &CheckedEntry,
+    phrase_key: &[u8; 32],
+    phrase_channel: &[u8; 32],
+    statement_key: &[u8; 32],
+    device: &NodeIdentity,
+) -> Result<Option<[u8; 32]>, ChangeEntryError> {
+    let (_, sealed) = open_devices_part(entry, phrase_key, phrase_channel, statement_key)?;
+    let SealedList::Whole(sealed) = sealed else {
+        return Err(ChangeEntryError::Malformed);
+    };
+    Ok(sealed
+        .iter()
+        .find_map(|one| open_sealed(one, device, entry.rev, phrase_key)))
+}
+
 /// Open the part of a change entry that is for the phrase, with the key
 /// that only the phrase gives. `entry`, `phrase_key` and `phrase_channel`
 /// are as [`open_statement`] takes them.
@@ -1478,6 +1507,56 @@ mod tests {
     }
 
     // ── Opening for a device ─────────────────────────────────────────
+
+    /// A secret sealed to a key that the statement does not list, at
+    /// another device's place: the device reading as the rules say is told
+    /// it is not listed, and the key opens it all the same, which
+    /// `opens_at_any_place` says. A key sealed to nowhere opens nothing.
+    #[test]
+    fn a_key_opens_what_is_sealed_to_it_at_another_devices_place() {
+        let phrase = phrase();
+        let keys = keys(&phrase);
+        let [_, two, ..] = statements(&phrase);
+        let sealed = [
+            sealed_for(2, 0, &secret(2)),
+            sealed_for(2, 1, &secret(2)),
+            sealed_for(2, 9, &secret(2)),
+        ];
+        let said = statement_and(&signed(&two, &phrase), &counted(3, &sealed));
+        let content = content_saying(&said, 2, &keys);
+        let at_any = |n: u16| {
+            opens_at_any_place(
+                &carrying(&content, 2),
+                &keys.phrase_key,
+                &keys.channel,
+                &keys.statement_key,
+                &identity(n),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            opened_by(&content, 2, &keys, 9).secret,
+            DeviceSecret::NotListed
+        );
+        assert_eq!(at_any(9), Some(secret(2)));
+        assert_eq!(at_any(0), Some(secret(2)));
+        assert_eq!(at_any(8), None);
+
+        // In an entry made as `build` makes it, a key not listed opens
+        // nothing.
+        let content = entry(&phrase, &two, &for_phrase_of(2));
+        assert_eq!(
+            opens_at_any_place(
+                &carrying(&content, 2),
+                &keys.phrase_key,
+                &keys.channel,
+                &keys.statement_key,
+                &identity(9),
+            )
+            .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn a_listed_device_reads_the_statement_and_opens_the_secret() {

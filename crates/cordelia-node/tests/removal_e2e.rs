@@ -25,6 +25,7 @@ use common::*;
 
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::bech32::decode_public_key;
+use cordelia_crypto::change_entry::{self, DeviceSecret};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
@@ -685,20 +686,28 @@ fn a_removal_made_apart_from_a_renewal_takes_effect_without_settle() {
 /// them again: from then they pass entries between them (decision
 /// 2026-10-04 §2.4 item 6).
 fn lists_together(f: &mut Fault) {
-    let (key_a, key_b) = (key_of(&f.relay_a), key_of(&f.relay_b));
-    let (port_a, port_b) = (f.relay_a.p2p, f.relay_b.p2p);
-    f.relay_a.stop();
-    f.relay_b.stop();
-    f.relay_a
-        .add_relay(&format!("127.0.0.1:{port_b}"), Some(&key_b));
-    f.relay_b
-        .add_relay(&format!("127.0.0.1:{port_a}"), Some(&key_a));
-    f.relay_a.start();
-    f.relay_b.start();
-    wait_for("both relays are healthy", &f.nodes(), 30, || {
-        healthy(&f.relay_a)?;
-        healthy(&f.relay_b)
-    });
+    relays_listed_together(&mut f.relay_a, &mut f.relay_b);
+}
+
+/// [`lists_together`], for any two relays.
+fn relays_listed_together(relay_a: &mut Node, relay_b: &mut Node) {
+    let (key_a, key_b) = (key_of(relay_a), key_of(relay_b));
+    let (port_a, port_b) = (relay_a.p2p, relay_b.p2p);
+    relay_a.stop();
+    relay_b.stop();
+    relay_a.add_relay(&format!("127.0.0.1:{port_b}"), Some(&key_b));
+    relay_b.add_relay(&format!("127.0.0.1:{port_a}"), Some(&key_a));
+    relay_a.start();
+    relay_b.start();
+    wait_for(
+        "both relays are healthy",
+        &[&*relay_a, &*relay_b],
+        30,
+        || {
+            healthy(relay_a)?;
+            healthy(relay_b)
+        },
+    );
 }
 
 /// Test 2 of decision 2026-10-24 (removal), section 7: as test 1, with
@@ -798,6 +807,410 @@ fn relays_that_work_together_spread_a_removal_made_apart() {
         );
     }
     desktop_applied(&f.desktop);
+}
+
+// ── Test 3: two removals made apart ──────────────────────────────────
+
+/// `n` is closed among heads set aside (rule 10): stored as `fork`, the
+/// change it follows still `followed`, the change made apart set aside and
+/// not clear, as it lists the key `listed` that `followed` removes; and it
+/// says the words of rule 10, in red, with `cordelia settle` as its way on,
+/// since it keeps a change made apart to join (look.rs; a closed device
+/// that keeps none is told `cordelia renew`).
+fn closed_among_heads(n: &Node, followed: &str, listed: &[u8; 32]) {
+    let seen = person_of(n);
+    assert_eq!(seen["state"], "fork", "{seen}");
+    assert_eq!(seen["latest"].as_str(), Some(followed), "{seen}");
+    assert_eq!(seen["change"].as_u64(), Some(3), "{seen}");
+    let set_aside = seen["set_aside"].as_array().cloned().unwrap_or_default();
+    assert_eq!(set_aside.len(), 1, "{seen}");
+    assert_eq!(set_aside[0]["number"].as_u64(), Some(3), "{seen}");
+    assert_eq!(set_aside[0]["clear"], false, "{seen}");
+    let listed = cordelia_crypto::bech32::encode_public_key(listed).unwrap();
+    assert!(
+        set_aside[0]["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["key"] == listed.as_str()),
+        "{seen}"
+    );
+    let why = "two changes were made apart, and none that lists this device is clear of a \
+               removed device: settle it with the phrase (`cordelia settle`)";
+    assert_eq!(seen["cannot_go_on"].as_str(), Some(why), "{seen}");
+    let status: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
+    assert_eq!(status["level"], "red", "{status}");
+    let listed = n.cli(&["devices"]);
+    assert!(listed.contains(why), "{listed}");
+}
+
+/// The signatures of every entry that `author` signed and either relay
+/// holds.
+fn held_at_either(relays: [&Node; 2], author: &[u8; 32]) -> HashSet<Vec<u8>> {
+    relays
+        .iter()
+        .flat_map(|relay| signed_at(relay, author))
+        .map(|(signature, _, _)| signature)
+        .collect()
+}
+
+/// The channel of each entry that `author` signed, at either relay, that
+/// neither held when `before` was read.
+fn new_at_either(
+    relays: [&Node; 2],
+    author: &[u8; 32],
+    before: &HashSet<Vec<u8>>,
+) -> Vec<[u8; 32]> {
+    relays
+        .iter()
+        .flat_map(|relay| signed_at(relay, author))
+        .filter(|(signature, _, _)| !before.contains(signature))
+        .map(|(_, channel, _)| channel)
+        .collect()
+}
+
+/// Test 3 of decision 2026-10-24 (removal), section 7: two removals made
+/// apart close both sides until `settle`. Four devices: the laptop and the
+/// tablet use relay A, the desktop and the phone use relay B. All four are
+/// on change 2. While the relays are not yet listed together, the laptop
+/// removes the phone (its change 3, which the tablet applies), and the
+/// desktop removes the tablet (its change 3, which the phone applies). The
+/// relays are then listed together: listed from the start, they would pass
+/// the first removal to the other side before the second was made, and the
+/// two would not be made apart.
+///
+/// It asserts:
+///
+/// - (a) the laptop and the desktop are each closed (rule 8, step 8, and
+///   rule 10): each change 3 lists a key that the other removes, so none
+///   that lists either is clear; each says the words of rule 10 in red,
+///   with `cordelia settle`;
+/// - (b) a file edited on each while closed stays in its folder and
+///   reaches no relay: no entry that either signed, and that neither relay
+///   held once it was closed, arrives at either relay, in a channel of
+///   either change 3 or any other;
+/// - (c) the tablet and the phone are each removed: each reads the change
+///   that removes it, at the relay it uses alone (rule 8, step 3, and rules
+///   14 to 17);
+/// - (d) `cordelia settle` on the laptop makes change 4, which lists the
+///   laptop and the desktop, and both the tablet and the phone as removed
+///   (rules 20 and 21); the prompt asks of the desktop alone, and shows the
+///   tablet as removed by the change made apart;
+/// - (e) the desktop applies change 4, with no phrase typed there;
+/// - (f) the file edited on each while closed arrives on the other;
+/// - (g) change 4's entry, as relay A holds it, gives neither the tablet's
+///   key nor the phone's its secret: not as a device reads it
+///   (`open_for_device`), and not at any place of its list of sealed
+///   secrets (`opens_at_any_place`), as a device taken over could read it
+///   (T20); and neither device's database holds the secret. A removed
+///   device asks for no change, so the database alone would hold nothing
+///   whatever change 4 sealed. The entry is checked as soon as change 4 is
+///   made, before (e).
+///
+/// Not checked here: rule 5's reset of a push open at the commit. (b)
+/// counts what either relay holds 15 seconds after both devices closed, so
+/// what was sent in those seconds is counted as held before. It catches
+/// rule 10 undone, as the files are written after the count.
+///
+/// Taken out, each run once by hand when the test was built:
+///
+/// - rule 10 (no device closes, and every gate takes the change followed
+///   as clear): (a) fails, as no device is closed; with (a)'s checks set
+///   aside for the run, (b) fails, as the laptop sends in a channel of its
+///   change 3;
+/// - rule 10's gates of a seal and a send alone (`Standing::to_write` and
+///   `at_relays::stands` taking a closed device as applied): (a) fails, as
+///   its status is no longer red; with (a)'s checks set aside, nothing is
+///   sent all the same, since other gates read the stored state;
+/// - rule 20 (the command lists no key that the node hands, and the node
+///   does not refuse a change that leaves one out): not caught here, since
+///   a settlement lists every key that a head it joins removes (the record
+///   of 2026-10-04, 4.5, "undoes no removal"), and here both removals are
+///   on a head; with that union taken out of `Statement::settle` too,
+///   change 4 lacks a removal, the command is refused by the check that no
+///   change undoes a removal, and (d) fails; with that check taken out of
+///   `statement::judge` as well, `person::judged` refuses it for the head
+///   set aside that it joins, and (d) fails;
+/// - rule 8, step 3 (a change made apart that removes a device is a fork
+///   there, as on the version before): (c) fails;
+/// - change 4 sealed to the tablet's key, its statement's lists unchanged
+///   (`change_entry::build` sealing the desktop's place to it: a list has
+///   one place for each device listed, and one more is no list): (g)
+///   fails, at `opens_at_any_place`. `open_for_device` alone does not catch
+///   it, as it tries only the place of a device the statement lists, nor
+///   does the database check. The laptop's own place sealed so is refused
+///   by `cordelia settle` itself.
+#[test]
+fn two_removals_made_apart_close_both_sides_until_settle() {
+    let mut relay_a = relay_started();
+    let mut relay_b = relay_started();
+    let laptop = device_started("laptop", &relay_a);
+    let tablet = device_started("tablet", &relay_a);
+    let mut desktop = device_started("desktop", &relay_a);
+    let mut phone = device_started("phone", &relay_a);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    adds(&laptop, &tablet, "tablet");
+    adds(&laptop, &phone, "phone");
+    let (l_notes, l_mem) = notes_of(&laptop);
+    let (d_notes, d_mem) = notes_of(&desktop);
+    std::fs::write(l_mem.join("first.md"), "what both hold\n").unwrap();
+    syncs_lab(&laptop, &l_notes);
+    syncs_lab(&desktop, &d_notes);
+    // The nodes whose logs a wait prints, as they are when it waits.
+    macro_rules! all {
+        () => {
+            [&relay_a, &relay_b, &laptop, &desktop, &tablet, &phone]
+        };
+    }
+    wait_for("the desktop has the laptop's file", &all!(), 120, || {
+        (read(&d_mem.join("first.md"))?.as_str() == "what both hold\n").then_some(())
+    });
+    // All on change 2, which lists each.
+    let mut at = renews(&laptop, &["stays"; 3], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    for device in [&desktop, &tablet, &phone] {
+        has_applied(device, 2, &all!());
+    }
+
+    // The desktop and the phone use relay B alone from here.
+    moves_relay(&mut desktop, &relay_a, &relay_b);
+    moves_relay(&mut phone, &relay_a, &relay_b);
+    let (laptop_key, desktop_key) = (key_bytes(&laptop), key_bytes(&desktop));
+    let (tablet_key, phone_key) = (key_bytes(&tablet), key_bytes(&phone));
+
+    // The laptop removes the phone, through relay A: its change 3, which
+    // the tablet applies.
+    let mut at = removes(&laptop, &key_of(&phone), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let laptops_3 = person_of(&laptop)["latest"].as_str().unwrap().to_string();
+    has_applied(&tablet, 3, &all!());
+    assert_eq!(
+        person_of(&tablet)["latest"].as_str(),
+        Some(laptops_3.as_str())
+    );
+    // The desktop removes the tablet, through relay B: its change 3, which
+    // the phone applies.
+    let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
+    at.says("The change is made (change 3).");
+    drop(at);
+    let desktops_3 = person_of(&desktop)["latest"].as_str().unwrap().to_string();
+    assert_ne!(laptops_3, desktops_3);
+    has_applied(&phone, 3, &all!());
+    assert_eq!(
+        person_of(&phone)["latest"].as_str(),
+        Some(desktops_3.as_str())
+    );
+    let threes = [applied_secret_of(&laptop), applied_secret_of(&desktop)];
+    assert!(secrets_of(&tablet).contains(&threes[0]));
+    assert!(secrets_of(&phone).contains(&threes[1]));
+
+    // The relays are listed together: each passes the other its change 3.
+    relays_listed_together(&mut relay_a, &mut relay_b);
+
+    // (a) Both are closed, with the words of rule 10 in red.
+    wait_for(
+        "the laptop and the desktop are closed",
+        &all!(),
+        180,
+        || (stands(&laptop).0 == "fork" && stands(&desktop).0 == "fork").then_some(()),
+    );
+    closed_among_heads(&laptop, &laptops_3, &phone_key);
+    closed_among_heads(&desktop, &desktops_3, &tablet_key);
+
+    // (c) The tablet and the phone are each removed.
+    wait_for("the tablet and the phone are removed", &all!(), 180, || {
+        (stands(&tablet).0 == "removed" && stands(&phone).0 == "removed").then_some(())
+    });
+    for removed in [&tablet, &phone] {
+        let status = removed.cli(&["status"]);
+        assert!(status.contains("this device was removed"), "(c): {status}");
+    }
+
+    // (b) What was on its way when each closed has had its ten seconds,
+    // and the relays have passed each other what they held of it.
+    std::thread::sleep(Duration::from_secs(15));
+    let relays = [&relay_a, &relay_b];
+    let held = (
+        held_at_either(relays, &laptop_key),
+        held_at_either(relays, &desktop_key),
+    );
+    std::fs::write(
+        l_mem.join("laptop-closed.md"),
+        "written on the laptop, closed\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d_mem.join("desktop-closed.md"),
+        "written on the desktop, closed\n",
+    )
+    .unwrap();
+    // Several passes, and several cycles of the adapter.
+    std::thread::sleep(Duration::from_secs(30));
+    let threes_channels: Vec<[u8; 32]> = threes.iter().flat_map(channels_of).collect();
+    for (who, key, before) in [
+        ("laptop", &laptop_key, &held.0),
+        ("desktop", &desktop_key, &held.1),
+    ] {
+        let new = new_at_either(relays, key, before);
+        for channel in &new {
+            assert!(
+                !threes_channels.contains(channel),
+                "(b): the {who} sent in a channel of a change 3 while closed: {}",
+                hex::encode(channel)
+            );
+        }
+        assert!(
+            new.is_empty(),
+            "(b): the {who} sent {} entries while closed",
+            new.len()
+        );
+    }
+    for device in [&laptop, &desktop] {
+        assert_eq!(stands(device).0, "fork", "(b)");
+    }
+    assert_eq!(
+        read(&l_mem.join("laptop-closed.md")).as_deref(),
+        Some("written on the laptop, closed\n"),
+        "(b): the folder keeps what was written there"
+    );
+    assert_eq!(
+        read(&d_mem.join("desktop-closed.md")).as_deref(),
+        Some("written on the desktop, closed\n"),
+        "(b): the folder keeps what was written there"
+    );
+    assert_eq!(read(&d_mem.join("laptop-closed.md")), None, "(b)");
+    assert_eq!(read(&l_mem.join("desktop-closed.md")), None, "(b)");
+
+    // (d) `cordelia settle` on the laptop: the prompt asks of the desktop
+    // alone; the tablet and the phone are removed, and asked of by no one.
+    let mut at = laptop.at_terminal(&["settle"]);
+    at.says("This device knows 1 key to be removed by a change made apart");
+    at.says("2 changes were made apart. Each is shown from its signed bytes.");
+    at.says("undoes no removal");
+    at.says(&format!(
+        "({}) {:?}, a device of every change shown:",
+        cordelia_crypto::fingerprint::shown(&desktop_key),
+        desktop.name
+    ));
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("The change that the recovery phrase will sign (change 4):");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says(ASKS_THE_PHRASE).types(&words);
+    at.says("The change is made (change 4).");
+    drop(at);
+    let seen = person_of(&laptop);
+    assert_eq!(seen["state"], "applied", "(d): {seen}");
+    assert_eq!(seen["change"].as_u64(), Some(4), "(d): {seen}");
+    let keys = |field: &str, seen: &serde_json::Value| -> HashSet<[u8; 32]> {
+        seen[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|shown| decode_public_key(shown["key"].as_str().unwrap()).unwrap())
+            .collect()
+    };
+    assert_eq!(
+        keys("removed", &seen),
+        HashSet::from([tablet_key, phone_key]),
+        "(d): change 4 lists both as removed: {seen}"
+    );
+    assert_eq!(
+        keys("devices", &seen),
+        HashSet::from([laptop_key, desktop_key]),
+        "(d): {seen}"
+    );
+    assert!(
+        seen["set_aside"]
+            .as_array()
+            .is_none_or(|heads| heads.is_empty()),
+        "(d): {seen}"
+    );
+    let change_4 = seen["latest"].as_str().unwrap().to_string();
+    let four = applied_secret_of(&laptop);
+
+    // (g) Change 4's entry gives neither removed key its secret, at any
+    // place: a device taken over reads what it likes, and a removed device
+    // that keeps the rules asks for no change at all.
+    wait_for("relay A holds change 4", &all!(), 120, || {
+        holds_change(&relay_a, &change_4).then_some(())
+    });
+    let entry = change_entries_at(&relay_a)
+        .iter()
+        .map(|bytes| Entry::from_wire(bytes).unwrap())
+        .find(|entry| hex::encode(entry.id()) == change_4)
+        .unwrap()
+        .check()
+        .unwrap();
+    let following = cordelia_storage::person::person(&store_of(&laptop))
+        .unwrap()
+        .unwrap()
+        .following;
+    for (who, removed) in [("tablet", &tablet), ("phone", &phone)] {
+        let identity = NodeIdentity::from_file(&removed.data_dir().join("identity.key")).unwrap();
+        let opened = change_entry::open_for_device(
+            &entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            &identity,
+        )
+        .unwrap();
+        assert!(
+            !matches!(opened.secret, DeviceSecret::Opened(_)),
+            "(g): change 4 opens for the {who}"
+        );
+        assert_eq!(
+            change_entry::opens_at_any_place(
+                &entry,
+                &following.phrase_key,
+                &following.phrase_channel,
+                &following.statement_key,
+                &identity,
+            )
+            .unwrap(),
+            None,
+            "(g): change 4 seals its secret to the {who}'s key"
+        );
+    }
+
+    // (e) The desktop applies it, with no phrase.
+    wait_for("the desktop applies change 4", &all!(), 180, || {
+        let seen = person_of(&desktop);
+        (seen["latest"].as_str() == Some(change_4.as_str())).then_some(())
+    });
+    let seen = person_of(&desktop);
+    assert_eq!(seen["state"], "applied", "(e): {seen}");
+    assert_eq!(seen["change"].as_u64(), Some(4), "(e): {seen}");
+    assert_eq!(applied_secret_of(&desktop), four, "(e)");
+
+    // (f) What each wrote while closed arrives on the other.
+    wait_for(
+        "each has the file the other wrote while closed",
+        &all!(),
+        180,
+        || {
+            let on_desktop = read(&d_mem.join("laptop-closed.md"))?;
+            let on_laptop = read(&l_mem.join("desktop-closed.md"))?;
+            (on_desktop == "written on the laptop, closed\n"
+                && on_laptop == "written on the desktop, closed\n")
+                .then_some(())
+        },
+    );
+
+    // (g), as the databases hold it: neither removed device holds change
+    // 4's secret, and each is still removed.
+    for (who, removed) in [("tablet", &tablet), ("phone", &phone)] {
+        assert!(
+            !secrets_of(removed).contains(&four),
+            "(g): the {who} holds change 4's secret"
+        );
+        assert_eq!(stands(removed).0, "removed", "(g): the {who}");
+    }
 }
 
 /// A client of a relay that is not a node: it connects as any node may,
