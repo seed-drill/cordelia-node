@@ -574,6 +574,15 @@ pub fn date_of(at: i64) -> String {
         .unwrap_or_else(|| at.to_string())
 }
 
+/// A count and its noun, as every line of the shared commands says one
+/// (the record's `<n keys>`): `1 key`, `2 keys`, `0 keys`.
+pub fn counted(n: u64, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
+}
+
 /// The lines of §5.4 for the shared channel `channel`, filed as `name`:
 /// which keys have written there, and which came since this device last
 /// wrote there, or for `send`, since the folder whose agent is `agent`
@@ -645,9 +654,8 @@ pub fn who_wrote(
         }
     }
     let counted = format!(
-        "{} key{}, {labelled} of them labelled by you",
-        wrote.len(),
-        if wrote.len() == 1 { "" } else { "s" }
+        "{}, {labelled} of them labelled by you",
+        counted(wrote.len() as u64, "key")
     );
     let unseen = "Anyone a member handed the channel to reads it too, unseen.";
     let shown = crate::messages::cleaned(name);

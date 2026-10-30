@@ -1590,7 +1590,7 @@ fn makes_anew(n: &Node, name: &str, answers: &[(String, &str)], again: &[&str]) 
         }
         at.types(answers[which].1);
     }
-    at.says("are left out.")
+    at.says("own devices among them. Left out: ")
         .says("Type yes to go on")
         .types("yes");
     let said = at.done();
@@ -1735,7 +1735,7 @@ fn shared_anew_asks_of_each_key_and_suggests_nothing() {
         "A device of a person who stays is left out only once that person removes it from their \
          own devices"
     ));
-    assert!(said.contains("3 keys stay, your own devices among them, and 1 are left out."));
+    assert!(said.contains("Staying: 3 keys, your own devices among them. Left out: 1 key."));
     // The offer, as the relay holds it, seals to Bob, the laptop and the
     // phone.
     let card = card_of_node(&three.alice, &old);

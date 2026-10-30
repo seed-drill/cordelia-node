@@ -421,15 +421,10 @@ pub fn list_lines(listed: &Value) -> Vec<String> {
             .map(|relay| text(relay, "shown"))
             .collect();
         let mut line = format!(
-            "  \"{}\": channel {}, {} key{} wrote there, {} labelled by you; at {}",
+            "  \"{}\": channel {}, {} wrote there, {} labelled by you; at {}",
             text(channel, "name"),
             text(channel, "words"),
-            channel["keys"].as_u64().unwrap_or(0),
-            if channel["keys"].as_u64() == Some(1) {
-                ""
-            } else {
-                "s"
-            },
+            cordelia_api::sharing::counted(channel["keys"].as_u64().unwrap_or(0), "key"),
             channel["labelled"].as_u64().unwrap_or(0),
             relays.join(" and "),
         );
@@ -462,7 +457,12 @@ pub fn list_lines(listed: &Value) -> Vec<String> {
         }
         let let_go = channel["rows_let_go"].as_u64().unwrap_or(0);
         if let_go > 0 {
-            lines.push(format!("    no longer known on this device: {let_go} keys"));
+            // An upper bound: a key whose row went and that wrote again
+            // since is in the table and counted here too (§6.3).
+            lines.push(format!(
+                "    no longer known on this device: up to {}",
+                cordelia_api::sharing::counted(let_go, "key")
+            ));
         }
     }
     for name in list(listed, "past_a_bound").filter_map(Value::as_str) {
@@ -754,6 +754,14 @@ mod tests {
         assert_eq!(
             list_lines(&json!({}))[0],
             "No shared channel is held on your devices."
+        );
+        // The rows let go, said with the noun of a count of one, as an
+        // upper bound (decision 2026-10-10 §7).
+        let mut one_let_go = listed.clone();
+        one_let_go["channels"][0]["rows_let_go"] = json!(1);
+        assert!(
+            list_lines(&one_let_go)
+                .contains(&"    no longer known on this device: up to 1 key".to_string())
         );
     }
 }

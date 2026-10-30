@@ -162,9 +162,10 @@ pub fn subscribe_plan(
         "The agent of this folder, {shown_agent}, will be shown a count of the messages in the \
          shared channel \"{shown}\", on every device of yours where {shown_agent} is mapped. It \
          can read them, and write there with --channel {}.\nThey come from other people's \
-         agents: {keys} keys wrote there, {labelled} of them labelled by you. Anyone a member \
-         handed the channel to reads it too, unseen.",
-        shell_word(&filing.name)
+         agents: {} wrote there, {labelled} of them labelled by you. Anyone a member handed \
+         the channel to reads it too, unseen.",
+        shell_word(&filing.name),
+        sharing::counted(keys as u64, "key")
     );
     Ok(Ok(Plan {
         asks,
@@ -568,9 +569,10 @@ fn refusal_of(conn: &Connection, why: &Refused, name: &str) -> Result<HttpRespon
             again,
             next_at,
         } => line(format!(
-            "This device has written {sends} messages, and {again} again after a relay's answer, \
-             in \"{shown}\" in the last hour: 60 in all, which is the most for one channel, so \
+            "This device has written {}, and {again} again after a relay's answer, in \
+             \"{shown}\" in the last hour: 60 in all, which is the most for one channel, so \
              nothing was sent. The next can go at {}.",
+            sharing::counted(*sends as u64, "message"),
             time_of(*next_at)
         )),
         Refused::SharedHeld { .. } => line(format!(
@@ -590,10 +592,11 @@ fn refusal_of(conn: &Connection, why: &Refused, name: &str) -> Result<HttpRespon
                 None => format!("({})", sharing::six_words(maker)),
             };
             line(format!(
-                "\"{shown}\" was made anew by {form} on {} without {left_out} keys, so your devices \
-                 send nothing more there: move with cordelia shared move {word}, or go on there, \
-                 where those keys read, with cordelia shared stay {word} (at a terminal).",
+                "\"{shown}\" was made anew by {form} on {} without {}, so your devices send \
+                 nothing more there: move with cordelia shared move {word}, or go on there, where \
+                 those keys read, with cordelia shared stay {word} (at a terminal).",
                 sharing::date_of(i64::try_from(*made).unwrap_or(i64::MAX)),
+                sharing::counted(*left_out as u64, "key"),
                 word = shell_word(name)
             ))
         }

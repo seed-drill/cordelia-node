@@ -269,9 +269,38 @@ fn only_subscribe_subscribes() {
         "not_subscribed"
     );
     assert_eq!(count(&s), 0);
+    // One key wrote there, the one labelled: its count is said with its
+    // noun (§5.2).
+    crate::shared::tests::stores(
+        &s,
+        0,
+        &crate::shared::tests::anew(&member(1), &channel, 1),
+        now + 2,
+    );
     let plan = subscribe_plan(conn, identity, &folder("notes"), "review", None)
         .unwrap()
         .unwrap();
+    assert!(
+        plan.asks
+            .contains("other people's agents: 1 key wrote there, 1 of them labelled by you."),
+        "{}",
+        plan.asks
+    );
+    // The lines of who wrote there say it so too.
+    let held = crate::person::held(conn).unwrap().unwrap();
+    let wrote = sharing::who_wrote(
+        conn,
+        &held,
+        &identity.public_key(),
+        &channel.id,
+        "review",
+        None,
+    )
+    .unwrap();
+    assert!(
+        wrote[0].contains(": 1 key, 1 of them labelled by you."),
+        "{wrote:?}"
+    );
     assert_eq!(plan.what.agent, "notes");
     assert_eq!(count(&s), 0, "the look subscribes nothing");
     subscribes(&s, 0, &channel, "notes", true, now + 4);
@@ -1445,4 +1474,39 @@ fn a_name_that_is_both_across_two_devices_goes_nowhere_wrong() {
     .unwrap();
     assert_eq!(others(laptop).len(), own_before + 1);
     assert_eq!(s[laptop].stored_in(&channel.secret), in_shared);
+}
+
+/// A refusal of `msg send --channel` says each count with its noun
+/// (decision 2026-10-10 §5.2, §5.5): one message written in the channel's
+/// hour, and one key left out by an offer that pauses the device.
+#[test]
+fn a_refusals_counts_are_said_with_their_nouns() {
+    let (s, _) = devices(1);
+    let conn = &s[0].conn;
+    let line_of = |why: Refused| -> String {
+        let response = refusal_of(conn, &why, "review").unwrap();
+        let body = actix_web::rt::System::new()
+            .block_on(actix_web::body::to_bytes(response.into_body()))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        body["error"]["message"].as_str().unwrap().to_string()
+    };
+    let rate = line_of(Refused::ChannelRate {
+        sends: 1,
+        again: 0,
+        next_at: 0,
+    });
+    assert!(
+        rate.starts_with("This device has written 1 message, and 0 again"),
+        "{rate}"
+    );
+    let paused = line_of(Refused::Paused {
+        maker: member(1).public_key(),
+        made: 0,
+        left_out: 1,
+    });
+    assert!(
+        paused.contains(" without 1 key, so your devices send nothing more there"),
+        "{paused}"
+    );
 }

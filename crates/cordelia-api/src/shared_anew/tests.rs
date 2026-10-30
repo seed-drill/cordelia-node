@@ -333,6 +333,17 @@ fn a_move_lists_your_own_devices_as_following() {
         "{}",
         plan.asks
     );
+    // The offer's line says the one key it leaves out with its noun (§5.2).
+    let lines = offer_lines(
+        &s[1].conn,
+        &s[1].identity,
+        &judged(&s[1].conn, &s[1].identity, &row(&s, 1, &channel), Some(now)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        lines.iter().any(|line| line.ends_with(", without 1 key")),
+        "{lines:?}"
+    );
 }
 
 /// A channel full at the device's room can still be made anew (decision
@@ -439,7 +450,7 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
     assert!(
         listing
             .lines
-            .contains(&"  no longer known on this device, so left out: 3".to_string())
+            .contains(&"  no longer known on this device, so left out: up to 3 keys".to_string())
     );
     assert_eq!(listing.lines.last().unwrap(), LABEL_FIRST);
 
@@ -500,7 +511,7 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
     let plan = plan.unwrap();
     assert!(
         plan.asks
-            .ends_with("3 keys stay, your own devices among them, and 104 are left out."),
+            .ends_with("Staying: 3 keys, your own devices among them. Left out: up to 104 keys."),
         "{}",
         plan.asks
     );
@@ -882,14 +893,14 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
     assert!(
         said.iter()
             .any(|line| line.starts_with("This channel was made anew by")
-                && line.contains("without 1 keys. You have not moved")),
+                && line.contains("without 1 key. You have not moved")),
         "{said:?}"
     );
     // A stay ends it here.
     let plan = stay_plan(conn, identity, "review", None).unwrap().unwrap();
     assert!(
         plan.asks
-            .contains("without 1 keys. Your devices send nothing more")
+            .contains("without 1 key. Your devices send nothing more")
     );
     make_stay(conn, &channel.id, "review").unwrap();
     assert!(
@@ -1302,8 +1313,8 @@ fn a_removal_says_how_many_keys_the_cap_and_the_rows_let_go_left_out() {
     )
     .unwrap();
     let said = anew_at_removal(conn, &s[0].identity, &relays(), now).unwrap();
-    let besides = "Left out besides: 38 keys past the 64 that stay, and 3 no longer known on \
-                   this device.";
+    let besides = "Left out besides: 38 keys past the 64 that stay, and up to 3 keys no longer \
+                   known on this device.";
     assert!(said[0].ends_with(besides), "{said:?}");
     let at_the_end = made_at_the_last_removal(conn, Some(0)).unwrap();
     assert_eq!(at_the_end, said);
