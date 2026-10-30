@@ -333,6 +333,17 @@ fn a_move_lists_your_own_devices_as_following() {
         "{}",
         plan.asks
     );
+    // The offer's line says the one key it leaves out with its noun (§5.2).
+    let lines = offer_lines(
+        &s[1].conn,
+        &s[1].identity,
+        &judged(&s[1].conn, &s[1].identity, &row(&s, 1, &channel), Some(now)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        lines.iter().any(|line| line.ends_with(", without 1 key")),
+        "{lines:?}"
+    );
 }
 
 /// A channel full at the device's room can still be made anew (decision

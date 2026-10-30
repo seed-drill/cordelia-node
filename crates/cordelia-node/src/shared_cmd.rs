@@ -755,5 +755,13 @@ mod tests {
             list_lines(&json!({}))[0],
             "No shared channel is held on your devices."
         );
+        // The rows let go, said with the noun of a count of one, as an
+        // upper bound (decision 2026-10-10 §7).
+        let mut one_let_go = listed.clone();
+        one_let_go["channels"][0]["rows_let_go"] = json!(1);
+        assert!(
+            list_lines(&one_let_go)
+                .contains(&"    no longer known on this device: up to 1 key".to_string())
+        );
     }
 }
