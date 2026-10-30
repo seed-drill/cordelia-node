@@ -1206,11 +1206,14 @@ fn a_device_never_has_more_than_its_room_in_a_shared_channel() {
                 }
                 continue;
             }
-            Err(_) => {
+            Err(NotSentHere::Refused(why, _))
+                if ["folder_rate", "device_rate", "channel_rate"].contains(&why.word()) =>
+            {
                 // An hour is full: the next.
                 t += 60 * 60;
                 continue;
             }
+            Err(other) => panic!("message {sent} was refused: {other:?}"),
         }
         pushes += 1;
         relay.pushed(&s, &channel.id, pushes % 3 == 0, t);
