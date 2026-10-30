@@ -2333,3 +2333,195 @@ fn bar_3_passes_over_an_edit_only_where_its_writer_stopped_within_a_cycle() {
         }
     }
 }
+
+// ── Bar 2 after stage 100: an edit written while its writer was off ──
+
+/// Edit 10 of `person`, written at 1000 s by its first device (`writer`),
+/// which then `lives` as the case says, and arriving at its second device
+/// (`writer` + 1, which runs all through but where `reader` says) at
+/// `arrived`. The window is 0 to 2000 s. Bar 2 and its figures over the
+/// person's edits.
+fn bar_2_of_a_writer(
+    person: usize,
+    writer: usize,
+    lives: &[(f64, Is)],
+    reader: &[(f64, Is)],
+    arrived: Option<f64>,
+) -> (Line, Latencies) {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    for (t, is) in lives {
+        becomes(&run, writer, *t, *is);
+    }
+    for (t, is) in reader {
+        becomes(&run, writer + 1, *t, *is);
+    }
+    {
+        let mut o = run.observer.lock().unwrap();
+        o.wrote(
+            Written {
+                number: 10,
+                person,
+                writer: 0,
+                name: 0,
+                file: "f001.md".into(),
+                size: 600,
+                at: 1000.0,
+                burst: false,
+                new: false,
+                replaced: None,
+            },
+            vec![(1, run.out.clone())],
+        );
+        if let Some(at) = arrived {
+            o.arrivals.insert((10, 1), Arrival { at, in_copy: false });
+        }
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    let l = latencies(
+        &read,
+        edits.pairs.iter().filter(|p| p.edit.person == person),
+    );
+    (bar_2(&read, &edits), l)
+}
+
+/// The run of stage 100, seed 1: the person went on editing while a
+/// device's sync was off, and the edit reached the other device 6.7 s
+/// after its writer ran again. An edit written while its writer was off
+/// (stopped or frozen) is timed from its writer's return: within 120 s of
+/// it, and inside p50 and p95, it passes; beyond 120 s of it, it fails.
+/// One whose writer never ran again is left to bar 3. One not arrived is
+/// late only where its device ran the 120 s after its writer's return.
+#[test]
+fn bar_2_times_an_edit_written_while_its_writer_was_off_from_its_return() {
+    let off = |is: Is| vec![(900.0, is), (1300.0, Is::Running)];
+    for (case, lives, arrived, verdict, l50, late, from_return, not_judged) in [
+        (
+            "stopped, back at 1300 s, arrived 6.7 s after",
+            off(Is::Stopped),
+            Some(1306.7),
+            Verdict::Pass,
+            Some(6.7),
+            0,
+            1,
+            0,
+        ),
+        (
+            "frozen, back at 1300 s, arrived 6.7 s after",
+            off(Is::Frozen),
+            Some(1306.7),
+            Verdict::Pass,
+            Some(6.7),
+            0,
+            1,
+            0,
+        ),
+        (
+            "stopped, back at 1300 s, arrived 130 s after",
+            off(Is::Stopped),
+            Some(1430.0),
+            Verdict::Fail,
+            Some(130.0),
+            0,
+            1,
+            0,
+        ),
+        (
+            "stopped, back at 1300 s, never arrived",
+            off(Is::Stopped),
+            None,
+            Verdict::Fail,
+            None,
+            1,
+            1,
+            0,
+        ),
+        (
+            "stopped, never back, never arrived",
+            vec![(900.0, Is::Stopped)],
+            None,
+            Verdict::Fail,
+            None,
+            0,
+            0,
+            1,
+        ),
+    ] {
+        let (bar, l) = bar_2_of_a_writer(0, 2, &lives, &[], arrived);
+        assert_eq!(bar.verdict, verdict, "{case}: {}", bar.figure);
+        match l50 {
+            Some(want) => {
+                assert_eq!(l.of.len(), 1, "{case}");
+                assert!((l.of[0] - want).abs() < 1e-6, "{case}: {:?}", l.of);
+            }
+            None => assert!(l.of.is_empty(), "{case}: {:?}", l.of),
+        }
+        assert_eq!(l.late, late, "{case}");
+        assert_eq!(l.from_return, from_return, "{case}");
+        assert_eq!(l.not_judged, not_judged, "{case}");
+        let said = format!("{from_return} timed from their writer's return, {not_judged} left");
+        assert!(bar.figure.contains(&said), "{case}: {}", bar.figure);
+    }
+    // Not arrived, and its device stopped 50 s after the writer's return:
+    // it did not run the 120 s, and nothing is late.
+    let (_, l) = bar_2_of_a_writer(0, 2, &off(Is::Stopped), &[(1350.0, Is::Stopped)], None);
+    assert_eq!((l.late, l.from_return), (0, 0));
+    // Arrived 6.7 s after its writer's return, its device off between the
+    // write and the return: it ran from the return to the arrival, and is
+    // timed.
+    let (bar, l) = bar_2_of_a_writer(
+        0,
+        2,
+        &off(Is::Stopped),
+        &[(1100.0, Is::Stopped), (1200.0, Is::Running)],
+        Some(1306.7),
+    );
+    assert_eq!(bar.verdict, Verdict::Pass, "{}", bar.figure);
+    assert_eq!((l.of.len(), l.from_return), (1, 1));
+    // A person split between the relays: the same, in their figures.
+    let (bar, l) = bar_2_of_a_writer(2, 7, &off(Is::Stopped), &[], Some(1306.7));
+    assert_eq!((l.of.len(), l.from_return), (1, 1));
+    assert!((l.of[0] - 6.7).abs() < 1e-6, "{:?}", l.of);
+    assert!(
+        bar.figure.contains(
+            "split between the relays: 1 arrivals, p95 6.7 s, the most 6.7 s, 0 not arrived \
+             within 120 s, 1 timed from their writer's return"
+        ),
+        "{}",
+        bar.figure
+    );
+}
+
+/// An edit written while its writer ran is timed from the write, as
+/// before, whatever its writer did after: a writer that ran on, and one
+/// that stopped 5 s after the write and ran again at 1300 s, each with the
+/// edit arriving at 1306.7 s, are 306.7 s and fail bar 2. A slow relay or
+/// reader is not hidden by a stop after the write. Within the bars they
+/// pass, and none is timed from a return.
+#[test]
+fn bar_2_times_an_edit_written_while_its_writer_ran_from_the_write() {
+    let later = vec![(1005.0, Is::Stopped), (1300.0, Is::Running)];
+    for (case, lives) in [("ran on", vec![]), ("stopped 5 s after, back later", later)] {
+        let (bar, l) = bar_2_of_a_writer(0, 2, &lives, &[], Some(1306.7));
+        assert_eq!(bar.verdict, Verdict::Fail, "{case}: {}", bar.figure);
+        assert_eq!(l.of.len(), 1, "{case}");
+        assert!((l.of[0] - 306.7).abs() < 1e-6, "{case}: {:?}", l.of);
+        assert_eq!((l.from_return, l.not_judged), (0, 0), "{case}");
+        assert!(
+            bar.figure.contains("the most 306.7 s"),
+            "{case}: {}",
+            bar.figure
+        );
+        let (bar, l) = bar_2_of_a_writer(0, 2, &lives, &[], Some(1008.0));
+        assert_eq!(bar.verdict, Verdict::Pass, "{case}: {}", bar.figure);
+        assert!((l.of[0] - 8.0).abs() < 1e-6, "{case}: {:?}", l.of);
+        assert_eq!(l.from_return, 0, "{case}");
+    }
+    // Never arrived, its writer ran at the write and its device ran the
+    // 120 s after: late, timed from the write.
+    let (bar, l) = bar_2_of_a_writer(0, 2, &[(1005.0, Is::Stopped)], &[], None);
+    assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
+    assert_eq!((l.late, l.from_return), (1, 0));
+}
