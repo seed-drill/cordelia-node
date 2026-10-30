@@ -669,7 +669,9 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
 /// answered with the change, stops, and says that it is not in a change
 /// made on the new machine and is to be added again from there. The new
 /// machine shows it as not in the last change. Added again by the two
-/// commands, it carries what it holds, and its unsent edit arrives.
+/// commands, it carries what it holds; its unsent edit, stored after it
+/// took the laptop's writing of the minutes before the recovery and before
+/// it knew, is set aside by rule 27 of decision 2026-10-24 (removal).
 #[test]
 fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     let mut first = relay_named("relay-one");
@@ -779,14 +781,25 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
         let seen = person_of(&two.desktop);
         (seen["state"] == "applied" && seen["change"] == 2).then_some(())
     });
-    wait_for(
-        "the desktop's unsent edit reaches the new machine",
-        &all,
-        180,
-        || (text_of(&new, "late.md")? == "not sent yet\n").then_some(()),
-    );
+    // Its unsent edit was stored after it took the laptop's writing, which
+    // came within ten minutes of the recovery and so is late by rule 7's
+    // margin, and before it knew: rule 27 sets it aside, to its local
+    // history, and the new machine never has it (decision 2026-10-24
+    // (removal), rule 27, the person's ruling of 30 October, which
+    // reverses what this test held before it).
+    wait_for("the desktop's unsent edit is set aside", &all, 180, || {
+        read(&two.desktop_memory.join("late.md"))
+            .is_none()
+            .then_some(())
+    });
+    let history = two.desktop.cli(&["history", "lab"]);
+    assert!(history.contains("late.md"), "{history}");
+    assert!(history.contains("set aside"), "{history}");
+    wait_for("the new machine has what the look brought", &all, 60, || {
+        (text_of(&new, "b.md")? == ON_THE_DESKTOP).then_some(())
+    });
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
-    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
+    assert_eq!(text_of(&new, "late.md"), None);
 }
 
 /// Put in the store of `device`, which is stopped, `count` records of
