@@ -1357,11 +1357,46 @@ fn bar_2(read: &Read, edits: &Edits) -> Line {
     )
 }
 
+/// The time an edit sent has to arrive: `CHANGE_FETCH_MAX_SECS`, the 120 s
+/// within which bar 2 and bar 15 hold every edit.
+const ARRIVES_WITHIN_SECS: f64 = 120.0;
+
+/// When the writer of `p`'s edit had first had the time to send it: where
+/// it ran [`HELD_BY_A_RUNNING_DEVICE_SECS`] from the edit without a stop or
+/// a freeze, the end of those 20 s (its cycle reads the file within
+/// `CYCLE_SECS`, 5 s, and the push goes at once at publish, the time bar 15
+/// gives a writer to push); where it did not, once it ran again and then
+/// ran [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's catch-up: it
+/// waits for its relays for up to `WAKE_WAIT_SECS`, then a cycle sends what
+/// it holds). `None` where it never did.
+fn writer_could_send_by(read: &Read, p: &Pair) -> Option<f64> {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let pushed = p.edit.at + HELD_BY_A_RUNNING_DEVICE_SECS;
+    if read.lives.ran_through(writer, p.edit.at, pushed) {
+        return Some(pushed);
+    }
+    let again = read.lives.ran_again_after(writer, p.edit.at, pushed)?;
+    read.lives.ran_for_after(writer, again, CATCH_UP_SECS)
+}
+
+/// Whether an edit not found by the end was owed there: its writer had the
+/// time to send it, [`ARRIVES_WITHIN_SECS`] or more before the end of the
+/// run (the harness turns every device on after the window, and waits for
+/// what was written, §4.2 step 10). One whose writer stopped too soon after
+/// writing and never ran long enough again is still on its writer: it is
+/// passed over, and counted.
+fn owed_by_the_end(read: &Read, p: &Pair) -> bool {
+    let end = read.end.max(read.run.kept_at);
+    writer_could_send_by(read, p).is_some_and(|t| t + ARRIVES_WITHIN_SECS <= end)
+}
+
 fn bar_3(read: &Read, edits: &Edits) -> Line {
-    let lost: Vec<&Pair> = edits
+    let missing: Vec<&Pair> = edits
         .of_person(read, false)
         .filter(|p| p.edit.at >= read.start && p.arrived.is_none() && !p.gone && !p.replaced)
         .collect();
+    let (lost, passed_over): (Vec<&Pair>, Vec<&Pair>) =
+        missing.into_iter().partition(|p| owed_by_the_end(read, p));
     // Catching up: each time a device was off in the window, the edits its
     // person made meanwhile, within 60 s of its running again.
     let mut worst: f64 = 0.0;
@@ -1387,7 +1422,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                             slow += 1;
                         }
                     }
-                    None => slow += 1,
+                    None if owed_by_the_end(read, p) => slow += 1,
+                    None => {}
                 }
             }
         }
@@ -1405,8 +1441,10 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     line(
         "No edit is lost, and a device catches up",
         format!(
-            "{} edits of the window on other devices; {} not found by the end{}; after {} times \
-             off, the slowest catch-up {:.1} s, {} edits not held within 60 s",
+            "{} edits of the window on other devices; {} not found by the end{}; {} not found \
+             and passed over, their writer stopped too soon after writing to send them and did \
+             not run long enough again; after {} times off, the slowest catch-up {:.1} s, {} \
+             edits not held within 60 s",
             edits
                 .of_person(read, false)
                 .filter(|p| p.edit.at >= read.start && !p.gone)
@@ -1416,12 +1454,14 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                 true => String::new(),
                 false => format!(" ({})", examples.join(", ")),
             },
+            passed_over.len(),
             times_off,
             worst,
             slow
         ),
-        "every edit's own line on every other device by the end; a device that was off holds \
-         its person's edits within 60 s of running again",
+        "every edit's own line on every other device by the end, where its writer ran 20 s \
+         after writing it, or 60 s once it ran again, 120 s or more before the end; a device \
+         that was off holds its person's edits within 60 s of running again",
         lost.is_empty() && slow == 0,
     )
 }

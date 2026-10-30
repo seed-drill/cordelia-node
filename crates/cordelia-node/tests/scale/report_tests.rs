@@ -2123,3 +2123,98 @@ fn bar_9_counts_a_device_stopped_in_the_last_90_seconds_in_its_high_end() {
         "stopped 100 s before"
     );
 }
+
+/// Edit 10 of person 0, written at 1000 s by its first device (node 2),
+/// which then `lives` as the case says; it never reaches the second device
+/// (node 3), which runs all through. The window is 0 to 2000 s. Bar 3, as
+/// the case reads it. With `reader_off`, the second device is off from
+/// 990 s to 1100 s, so the edit is one of its catch-up too.
+fn bar_3_of_a_writer(lives: &[(f64, Is)], reader_off: bool) -> Line {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    for (t, is) in lives {
+        becomes(&run, 2, *t, *is);
+    }
+    if reader_off {
+        becomes(&run, 3, 990.0, Is::Stopped);
+        becomes(&run, 3, 1100.0, Is::Running);
+    }
+    run.observer.lock().unwrap().wrote(
+        Written {
+            number: 10,
+            person: 0,
+            writer: 0,
+            name: 0,
+            file: "f001.md".into(),
+            size: 600,
+            at: 1000.0,
+            burst: false,
+            new: false,
+            replaced: None,
+        },
+        vec![(1, run.out.clone())],
+    );
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_3(&read, &edits)
+}
+
+/// An edit not found by the end is lost only where its writer had the time
+/// to send it. Its writer stopped 36 ms after writing and off to the end
+/// (as at stage 190, seed 2), or back only for 30 s, or back too late for
+/// its catch-up and 120 s: passed over, and counted. Its writer ran on, or
+/// ran again a minute and more in time: lost. Either way with the reader
+/// off when it was written, as the catch-up reads it.
+#[test]
+fn bar_3_owes_an_edit_only_where_its_writer_had_the_time_to_send_it() {
+    let stopped = (1000.036, Is::Stopped);
+    for (case, lives, lost) in [
+        ("stopped 36 ms after, off to the end", vec![stopped], false),
+        (
+            "back for 30 s only",
+            vec![stopped, (1300.0, Is::Running), (1330.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "back too late to send before the end",
+            vec![stopped, (1850.0, Is::Running)],
+            false,
+        ),
+        ("ran on", vec![], true),
+        ("ran 20 s, then stopped", vec![(1020.5, Is::Stopped)], true),
+        (
+            "ran again in time",
+            vec![stopped, (1300.0, Is::Running)],
+            true,
+        ),
+        (
+            "frozen, then went on in time",
+            vec![(1000.036, Is::Frozen), (1300.0, Is::Running)],
+            true,
+        ),
+    ] {
+        for reader_off in [false, true] {
+            let bar = bar_3_of_a_writer(&lives, reader_off);
+            let want = match lost {
+                true => Verdict::Fail,
+                false => Verdict::Pass,
+            };
+            let case = format!("{case}, the reader off: {reader_off}");
+            assert_eq!(bar.verdict, want, "{case}: {}", bar.figure);
+            let (found, passed) = match lost {
+                true => ("1 not found by the end", "0 not found and passed over"),
+                false => ("0 not found by the end", "1 not found and passed over"),
+            };
+            assert!(bar.figure.contains(found), "{case}: {}", bar.figure);
+            assert!(bar.figure.contains(passed), "{case}: {}", bar.figure);
+            // An edit passed over is not one the reader failed to catch up
+            // on; one lost is.
+            let slow = match lost && reader_off {
+                true => "1 edits not held within 60 s",
+                false => "0 edits not held within 60 s",
+            };
+            assert!(bar.figure.contains(slow), "{case}: {}", bar.figure);
+        }
+    }
+}
