@@ -2828,3 +2828,184 @@ fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
         bar.figure
     );
 }
+
+// ── Bar 15: the first relay's warm churn during the outage ──
+
+/// Edit 10 of person 0 (set up with both relays), written at 1000 s by
+/// device 2 and arriving at device 3 at `arrived`, through the second
+/// relay's outage (stopped from 1100 s to 1220 s). The first relay is
+/// sampled every 10 s from 1000 s to 1300 s, listing every device; `cut`
+/// leaves `node` out of its list from `gone` until `back` (to the end where
+/// it is `None`), and where `churned` the relay's count of devices'
+/// connections closed by warm churn rises by 16 at `gone`. Bar 15, and its
+/// figures over person 0's edit, as bar 15 times it.
+fn bar_15_through_a_churn(
+    cut: Option<(usize, f64, Option<f64>)>,
+    churned: bool,
+    arrived: Option<f64>,
+) -> (Line, Latencies) {
+    let (stopped, started) = (1100.0, 1220.0);
+    let then = |run: &Run| {
+        *run.outage.lock().unwrap() = Outage {
+            stopped: Some(stopped),
+            started: Some(started),
+            back: Vec::new(),
+        };
+        let relay = run.fleet.relays[0];
+        for step in 0..=30 {
+            let t = 1000.0 + 10.0 * step as f64;
+            let off = |node: usize| {
+                cut.is_some_and(|(n, gone, back)| {
+                    n == node && t >= gone && back.is_none_or(|b| t < b)
+                })
+            };
+            let peers = (2..run.fleet.made.len())
+                .filter(|node| !off(*node))
+                .map(|node| (run.fleet.made[node].key.clone(), "127.0.0.1:1".into()))
+                .collect();
+            let closed = match cut {
+                Some((_, gone, _)) if churned && t >= gone => 16.0,
+                _ => 0.0,
+            };
+            run.samples.lock().unwrap().nodes.push(Sample {
+                t,
+                node: relay,
+                proc: Some(crate::machine::ProcRead::default()),
+                metrics: Some([(CLOSED_BY_WARM_CHURN.to_string(), closed)].into()),
+                peers: Some(peers),
+                ..Sample::default()
+            });
+        }
+    };
+    let (read, edits) = an_edit_of_a_writer(Plan::small(1), 0, 2, &[], &[], arrived, then);
+    let l = latencies_after(
+        &read,
+        edits.pairs.iter().filter(|p| p.edit.person == 0),
+        |p, from| timed_after_a_churn(&read, p, from, stopped, started),
+    );
+    (bar_15(&read, &edits), l)
+}
+
+/// The runs of stage 100, seed 3: the first relay's hourly warm churn fell
+/// inside the second relay's outage and closed the one path of people set
+/// up with both relays; they connected again about 5 s later and caught
+/// up. An edit whose reader or writer the churn cut off during the outage
+/// is timed from when that device was connected to the first relay again
+/// (here the sample at 1150 s, the last that does not list it before the
+/// one at 1160 s that does): arriving 10 s after, it passes, and is
+/// counted; arriving 130 s after, it fails; not arrived (cut at 1110 s,
+/// within the 120 s from its write), it is late, timed so. Where
+/// the relay is never seen to list it again, it is timed from the last
+/// sample that listed it and bars 9 and 14's 150 s.
+#[test]
+fn bar_15_times_an_edit_cut_off_by_a_churn_in_the_outage_from_the_connection_again() {
+    for (case, cut, arrived, verdict, latency, late) in [
+        (
+            "reader cut, arrived 10 s after",
+            (3, 1150.0, Some(1160.0)),
+            Some(1160.0),
+            Verdict::Pass,
+            Some(10.0),
+            0,
+        ),
+        (
+            "writer cut, arrived 10 s after",
+            (2, 1150.0, Some(1160.0)),
+            Some(1160.0),
+            Verdict::Pass,
+            Some(10.0),
+            0,
+        ),
+        (
+            "reader cut, arrived 130 s after",
+            (3, 1150.0, Some(1160.0)),
+            Some(1280.0),
+            Verdict::Fail,
+            Some(130.0),
+            0,
+        ),
+        (
+            "reader cut at 1110 s, never arrived",
+            (3, 1110.0, Some(1120.0)),
+            None,
+            Verdict::Fail,
+            None,
+            1,
+        ),
+        (
+            "reader cut, not seen again: 150 s from the last sample that listed it",
+            (3, 1150.0, None),
+            Some(1300.0),
+            Verdict::Pass,
+            Some(10.0),
+            0,
+        ),
+    ] {
+        let (bar, l) = bar_15_through_a_churn(Some(cut), true, arrived);
+        assert_eq!(bar.verdict, verdict, "{case}: {}", bar.figure);
+        match latency {
+            Some(want) => {
+                assert_eq!(l.of.len(), 1, "{case}: {:?}", l.of);
+                assert!((l.of[0] - want).abs() < 1e-6, "{case}: {:?}", l.of);
+            }
+            None => assert!(l.of.is_empty(), "{case}: {:?}", l.of),
+        }
+        assert_eq!(
+            (l.late, l.from_churn, l.from_return),
+            (late, 1, 0),
+            "{case}"
+        );
+        assert!(
+            bar.figure.contains(
+                "1 timed from their device's connection to the first relay made again after its \
+                 warm churn closed it in the outage"
+            ),
+            "{case}: {}",
+            bar.figure
+        );
+    }
+}
+
+/// An edit no churn cut off is timed from its write, as before: with no
+/// closure, and with its reader's connection closed in the outage while
+/// the relay's warm churn closed nothing (a closure for another reason),
+/// arriving at 1170 s it is 170 s, fails, and none is timed from a
+/// connection again.
+#[test]
+fn bar_15_times_an_edit_no_churn_cut_off_from_the_write() {
+    for (case, cut) in [
+        ("no closure", None),
+        ("closed without a churn", Some((3, 1150.0, Some(1160.0)))),
+    ] {
+        let (bar, l) = bar_15_through_a_churn(cut, false, Some(1170.0));
+        assert_eq!(bar.verdict, Verdict::Fail, "{case}: {}", bar.figure);
+        assert_eq!(l.of.len(), 1, "{case}");
+        assert!((l.of[0] - 170.0).abs() < 1e-6, "{case}: {:?}", l.of);
+        assert_eq!(l.from_churn, 0, "{case}");
+        assert!(
+            bar.figure
+                .contains("0 timed from their device's connection"),
+            "{case}: {}",
+            bar.figure
+        );
+    }
+}
+
+/// A churn outside the outage changes nothing in bar 15: one that closed
+/// the reader after the second relay's start (at 1250 s, back at 1260 s),
+/// and one before its stop (at 1080 s, back at 1090 s), each with the edit
+/// arriving 10 s after the connection again, are timed from the write and
+/// fail, and none is timed from a connection again.
+#[test]
+fn bar_15_is_not_changed_by_a_churn_outside_the_outage() {
+    for (case, cut, arrived, latency) in [
+        ("after the start", (3, 1250.0, Some(1260.0)), 1260.0, 260.0),
+        ("before the stop", (3, 1080.0, Some(1090.0)), 1100.0, 100.0),
+    ] {
+        let (bar, l) = bar_15_through_a_churn(Some(cut), true, Some(arrived));
+        assert_eq!(bar.verdict, Verdict::Fail, "{case}: {}", bar.figure);
+        assert_eq!(l.of.len(), 1, "{case}");
+        assert!((l.of[0] - latency).abs() < 1e-6, "{case}: {:?}", l.of);
+        assert_eq!(l.from_churn, 0, "{case}");
+    }
+}
