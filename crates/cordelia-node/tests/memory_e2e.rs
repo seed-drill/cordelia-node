@@ -1018,8 +1018,10 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     wait_for("the relay holds the change", &[&relay, &a], 30, || {
         let seen = person_of(&a);
         let relays = seen["relays"].as_array()?;
-        (seen["change"] == 2 && relays.iter().all(|relay| relay["holds_latest"] == true))
-            .then_some(())
+        (seen["change"] == 2
+            && !relays.is_empty()
+            && relays.iter().all(|relay| relay["holds_latest"] == true))
+        .then_some(())
     });
     let seen = person_of(&a);
     assert_eq!(seen["names"]["to_go"], json!(["lab"]), "{seen}");
@@ -1298,4 +1300,309 @@ fn an_edit_made_while_sync_was_off_is_sent_when_it_comes_back_with_no_conflict_f
         (read(&b_mem.join("plan.md")).as_ref() == Some(&plan)).then_some(())
     });
     assert_eq!(conflict_files(&b_mem), Vec::<String>::new());
+}
+
+/// **An edit written just before a clean stop is sent when the device runs
+/// again** (the property bar 3 of the scale test leaves to this test,
+/// decision 2026-10-22 §3, bar 3). A device writes a file of a name, a
+/// new one and one over an earlier file, and is told to stop cleanly soon
+/// after; started again, it sends both, and the other device takes each,
+/// with nothing kept beside it. Two ways:
+///
+/// - stopped at once, 0, 25 and 50 ms after the writes, as at stage 190,
+///   seed 2: its cycle has most likely not read the files yet (each round
+///   says whether it had), so the files are read after the start;
+/// - stopped once its store holds the edits and before it can have pushed
+///   them: the relay is stopped first, the files written, the store
+///   watched until it holds the new file, the device stopped, the relay
+///   started, and the device started. This round asserts that the store
+///   held the edit before the stop: what the device sends after its start
+///   is what it stored, not what it reads again.
+#[test]
+fn an_edit_written_just_before_a_clean_stop_is_sent_when_the_device_runs_again() {
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let (a_notes, a_mem) = notes_of(&a);
+    let (b_notes, b_mem) = notes_of(&b);
+    std::fs::write(a_mem.join("notes.md"), "as both had it\n").unwrap();
+    syncs_notes_as_lab(&a, &a_notes);
+    syncs_notes_as_lab(&b, &b_notes);
+    makes_a_phrase(&a, "desktop");
+    adds(&a, &b, "laptop");
+    has_applied(&b, 1, &[&relay, &a, &b]);
+    wait_for(
+        "the file reaches the laptop",
+        &[&relay, &a, &b],
+        120,
+        || (read(&b_mem.join("notes.md")).as_deref() == Some("as both had it\n")).then_some(()),
+    );
+    wait_for(
+        "the desktop has sent what it holds",
+        &[&relay, &a, &b],
+        90,
+        || has_sent_everything(&a),
+    );
+
+    // The slots `n` holds entries in under `lab`, read from its store.
+    let slots_of = |n: &Node| {
+        let conn = rusqlite::Connection::open_with_flags(
+            n.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let lab = cordelia_storage::person::channel_of_name(&conn, "lab")
+            .unwrap()
+            .unwrap();
+        cordelia_storage::entries::channel_slots(&conn, &lab)
+            .unwrap()
+            .len()
+    };
+    for (round, wait_ms) in [0u64, 25, 50].into_iter().enumerate() {
+        let before = slots_of(&a);
+        let edited = format!("edited just before a stop, round {round}\n");
+        let new = format!("new.{round}.md");
+        let made = format!("made just before a stop, round {round}\n");
+        std::fs::write(a_mem.join("notes.md"), &edited).unwrap();
+        std::fs::write(a_mem.join(&new), &made).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        // Told to stop with SIGTERM: `stop` fails the test where the node
+        // does not exit with success.
+        a.stop();
+        // Whether its cycle had read the new file before the stop: its slot
+        // is then in the store. Said, not asserted: a cycle every 5 s may
+        // fall within the 50 ms; the edits must arrive either way.
+        eprintln!(
+            "round {round}: stopped {wait_ms} ms after the writes; the new file {} in the store",
+            match slots_of(&a) > before {
+                true => "was already",
+                false => "was not yet",
+            }
+        );
+        // Off for a few seconds, as a device turned off is.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        a.start();
+        let all = [&relay, &a, &b];
+        wait_for("the desktop is healthy again", &all, 30, || healthy(&a));
+        wait_for("both edits reach the laptop", &all, 120, || {
+            (read(&b_mem.join("notes.md")).as_ref() == Some(&edited)
+                && read(&b_mem.join(&new)).as_ref() == Some(&made))
+            .then_some(())
+        });
+        assert!(conflict_files(&a_mem).is_empty(), "{:?}", files(&a_mem));
+        assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
+        assert_eq!(files(&a_mem), files(&b_mem));
+        wait_for("the desktop has sent what it holds", &all, 90, || {
+            has_sent_everything(&a)
+        });
+    }
+    // In the store, not yet pushed: the relay is stopped, so nothing the
+    // device stores can leave it.
+    let round = 3;
+    let before = slots_of(&a);
+    relay.stop();
+    let edited = format!("edited just before a stop, round {round}\n");
+    let new = format!("new.{round}.md");
+    let made = format!("made just before a stop, round {round}\n");
+    std::fs::write(a_mem.join("notes.md"), &edited).unwrap();
+    std::fs::write(a_mem.join(&new), &made).unwrap();
+    wait_for("the desktop stores the new file", &[&a, &b], 60, || {
+        (slots_of(&a) > before).then_some(())
+    });
+    a.stop();
+    let stored = slots_of(&a);
+    assert!(
+        stored > before,
+        "round {round}: the store held {stored} slots at the stop, {before} before the writes"
+    );
+    eprintln!("round {round}: the new file was in the store at the stop, and not yet pushed");
+    relay.start();
+    wait_for("the relay is healthy again", &[&relay], 30, || {
+        healthy(&relay)
+    });
+    a.start();
+    let all = [&relay, &a, &b];
+    wait_for("the desktop is healthy again", &all, 30, || healthy(&a));
+    wait_for("both edits reach the laptop", &all, 120, || {
+        (read(&b_mem.join("notes.md")).as_ref() == Some(&edited)
+            && read(&b_mem.join(&new)).as_ref() == Some(&made))
+        .then_some(())
+    });
+    assert!(conflict_files(&a_mem).is_empty(), "{:?}", files(&a_mem));
+    assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
+    assert_eq!(files(&a_mem), files(&b_mem));
+}
+
+/// How long an edit took: from its writing to its arrival in the other
+/// device's file, and from the moment that device's store held it to that
+/// arrival.
+struct Took {
+    whole: std::time::Duration,
+    store_to_file: std::time::Duration,
+}
+
+/// Time `edits` edits written on `from`, each to the file `edit.md` of
+/// its folder `from_mem`, until `to` holds the same text in its folder
+/// `to_mem`. The next edit is written a varying while after each arrival,
+/// so that the writes fall at every point of the reader's pass of ten
+/// seconds and not always just after it. `nodes` are the nodes whose logs
+/// a failure shows.
+fn edit_times(
+    (from_mem, to): (&Path, &Node),
+    to_mem: &Path,
+    tag: &str,
+    edits: usize,
+    nodes: &[&Node],
+) -> Vec<Took> {
+    use std::time::{Duration, Instant};
+    let mut times = Vec::new();
+    for n in 0..edits {
+        // 0 to 9.1 s, by steps of 1.3 s that are spread over the pass.
+        std::thread::sleep(Duration::from_millis(((n * 1300) % 10_400) as u64));
+        let text = format!("{tag} edit {n}\n");
+        std::fs::write(from_mem.join("edit.md"), &text).unwrap();
+        let written = Instant::now();
+        let mut in_store = None;
+        let whole = loop {
+            let arrived = read(&to_mem.join("edit.md")).as_ref() == Some(&text);
+            let now = written.elapsed();
+            if in_store.is_none()
+                && (arrived
+                    || held(to)
+                        .iter()
+                        .any(|(key, _, held)| key == "edit.md" && held.as_ref() == Some(&text)))
+            {
+                in_store = Some(now);
+            }
+            if arrived {
+                break now;
+            }
+            if now > Duration::from_secs(120) {
+                let logs: String = nodes
+                    .iter()
+                    .map(|n| format!("\n===== {} =====\n{}", n.name, n.log_tail()))
+                    .collect();
+                panic!("{tag} edit {n} did not arrive within 120 s{logs}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let store_to_file = whole - in_store.unwrap_or(whole);
+        eprintln!(
+            "{tag} edit {n}: {:.1} s, {:.1} s of it from the reader's store to its file",
+            whole.as_secs_f64(),
+            store_to_file.as_secs_f64(),
+        );
+        times.push(Took {
+            whole,
+            store_to_file,
+        });
+    }
+    times
+}
+
+/// The median of `times`.
+fn median(mut times: Vec<std::time::Duration>) -> std::time::Duration {
+    times.sort();
+    let middle = times.len() / 2;
+    if times.len().is_multiple_of(2) {
+        (times[middle - 1] + times[middle]) / 2
+    } else {
+        times[middle]
+    }
+}
+
+/// **A relay that is down holds up nothing at the relay that is up, and
+/// an edit taken is written at once** (decision 2026-10-22, bar 2, and
+/// bar 15: a person set up with both relays keeps bar 2 through the
+/// outage). Two devices of one person, each set up with two relays. Edits
+/// are timed from one to the other with both relays up, and then with the
+/// second stopped as the scale test stops it, before a device would take
+/// it for out of reach (OUT_OF_REACH_SECS).
+///
+/// - With one relay down the edits arrive no slower, at the median, than
+///   a cycle over those with both up: the passes at the relay that is up
+///   wait on nothing at the relay that is down.
+/// - Through the outage the median is within bar 2's 12 s.
+/// - Each edit is written to the reader's file within half a cycle of its
+///   store taking it: the pass that took it wakes the sync cycle. Without
+///   that the cycle's timer, which runs in step with the pass's, had every
+///   edit wait the whole of a cycle there.
+///
+/// The last two catch the wake undone: without it the median through the
+/// outage was about 14 s, above 12 s, and every edit waited about 5 s in
+/// the reader's store. The first does not, since both medians grow
+/// alike; it holds that the relay that is down holds up nothing.
+#[test]
+fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
+    use cordelia_core::protocol::OUT_OF_REACH_SECS;
+    use cordelia_sync::claude::CYCLE_SECS;
+    use std::time::Duration;
+    const EDITS: usize = 8;
+    let first = relay_named("first");
+    let mut second = relay_named("second");
+    let a = device_at("a", &[&first, &second]);
+    let b = device_at("b", &[&first, &second]);
+    let (a_notes, a_mem) = notes_of(&a);
+    let (b_notes, b_mem) = notes_of(&b);
+    std::fs::write(a_mem.join("edit.md"), "the first text\n").unwrap();
+    let both = {
+        let all = [&first, &second, &a, &b];
+        syncs_notes_as_lab(&a, &a_notes);
+        syncs_notes_as_lab(&b, &b_notes);
+        makes_a_phrase(&a, "desktop");
+        adds(&a, &b, "laptop");
+        has_applied(&b, 1, &all);
+        wait_for("the two folders hold the same files", &all, 150, || {
+            (read(&b_mem.join("edit.md")).as_deref() == Some("the first text\n")).then_some(())
+        });
+        for device in [&a, &b] {
+            wait_for("each device has sent what it holds", &all, 120, || {
+                has_sent_everything(device)
+            });
+        }
+        edit_times((&a_mem, &b), &b_mem, "both up", EDITS, &all)
+    };
+
+    second.stop();
+    let stopped = std::time::Instant::now();
+    let all = [&first, &a, &b];
+    for device in [&a, &b] {
+        wait_for("the device sees the second relay gone", &all, 60, || {
+            let relays = relays_of(device);
+            let connected = relays.iter().filter(|r| r["state"] == "connected");
+            (relays.len() == 2 && connected.count() == 1).then_some(())
+        });
+    }
+    let one = edit_times((&a_mem, &b), &b_mem, "one down", EDITS, &all);
+    let outage = stopped.elapsed();
+
+    let whole = |times: &[Took]| median(times.iter().map(|t| t.whole).collect());
+    let (with_both, with_one) = (whole(&both), whole(&one));
+    eprintln!(
+        "median with both relays up {:.1} s, with one down {:.1} s; the outage lasted {:.0} s",
+        with_both.as_secs_f64(),
+        with_one.as_secs_f64(),
+        outage.as_secs_f64(),
+    );
+    // The outage was timed before either device would take the relay for
+    // out of reach: it was still a relay to try throughout.
+    assert!(outage.as_secs() < OUT_OF_REACH_SECS, "{outage:?}");
+    let cycle = Duration::from_secs(CYCLE_SECS);
+    assert!(
+        with_one <= with_both + cycle,
+        "with one relay down the median was {with_one:?}, against {with_both:?} with both up"
+    );
+    assert!(
+        with_one <= Duration::from_secs(12),
+        "through the outage the median was {with_one:?}, above bar 2's 12 s"
+    );
+    for took in both.iter().chain(&one) {
+        assert!(
+            took.store_to_file < cycle / 2,
+            "an edit waited {:?} in the reader's store before its file",
+            took.store_to_file
+        );
+    }
 }
