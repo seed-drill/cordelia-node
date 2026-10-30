@@ -2710,6 +2710,7 @@ impl DeviceEntries {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
+                                stored: stored_one(&each),
                                 // A page asked from a place forgotten
                                 // since is no end of the channel: the pull
                                 // goes on, from the start.
@@ -2734,6 +2735,17 @@ impl DeviceEntries {
             match taken {
                 Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
+                    // What the store took of a name is written to its
+                    // folder at once: the sync cycle is woken, and not
+                    // waited for. Its timer and the pass's run in step,
+                    // so a page taken just after the cycle's tick waited
+                    // for the whole of the next one, a cycle's time
+                    // added to every edit (decision 2026-10-22, bars 2
+                    // and 15). A publish wakes the pass that sends in the
+                    // same way.
+                    if page.stored && matches!(channel.kind, Kind::Name(_)) {
+                        self.state.sync_control.ask_cycle();
+                    }
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;
@@ -3192,6 +3204,22 @@ struct PageSeen {
     /// Whether it was asked from a place that is no longer the one kept:
     /// every place was forgotten while it was asked for.
     stale: bool,
+    /// Whether the store took an entry of it that it did not hold.
+    stored: bool,
+}
+
+/// Whether the store took one of `each`, the entries of a page, that it
+/// did not hold: a new entry, or a later revision of one it held.
+fn stored_one(each: &[Taken]) -> bool {
+    each.iter().any(|taken| {
+        matches!(
+            taken,
+            Taken::Own {
+                stored: Outcome::Stored,
+                ..
+            }
+        )
+    })
 }
 
 /// What the answer `done` to a push of a channel of `kind` says of what of
@@ -3597,6 +3625,14 @@ mod tests {
             256 + 1024
         );
         assert_eq!(counted_as_handed(3), entry_cost(0));
+        // A page wakes the sync cycle only where the store took something
+        // it did not hold.
+        assert!(stored_one(&stored));
+        assert!(stored_one(&held_and_stored));
+        assert!(!stored_one(&held));
+        assert!(!stored_one(&held_and_refused));
+        assert!(!stored_one(&[own(Outcome::OlderThanHeld)]));
+        assert!(!stored_one(&[]));
     }
 
     /// What a push's answer says of what waits at a relay (decision

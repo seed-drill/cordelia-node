@@ -2754,8 +2754,9 @@ fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
     }
 }
 
-/// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
-/// adapter cycle (if sync is on) off the async runtime, and store its
+/// Every `CYCLE_SECS`, as soon as a sync setting changes, and as soon as
+/// a pass has stored an entry of a name that the store did not hold, run
+/// one adapter cycle (if sync is on) off the async runtime, and store its
 /// report for `cordelia sync status`. Once in every
 /// `HISTORY_SWEEP_INTERVAL_SECS` it sweeps local history first.
 ///

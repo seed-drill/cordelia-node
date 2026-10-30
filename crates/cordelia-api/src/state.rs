@@ -1429,7 +1429,9 @@ impl SyncControl {
     /// Ask for a cycle now, with no setting changed: a command that
     /// prepares a change has the folders made as current as they can be
     /// first (decision 2026-10-04 §7.1, step 1). Whoever asks waits for a
-    /// cycle that began after it asked ([`Self::cycles`]).
+    /// cycle that began after it asked ([`Self::cycles`]). A pass that
+    /// stored an entry of a name asks too, waiting for nothing, so that
+    /// the entry is written to its folder at once.
     pub fn ask_cycle(&self) {
         self.wake.notify_one();
     }
