@@ -199,7 +199,9 @@ pub fn answer(
 /// §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelOut {
-    /// It was dropped: every row of it goes at the end.
+    /// It was dropped, or a bound left its filing out: its entries go, and
+    /// its index rows; its other rows stay while the device writes an act
+    /// on it (decision 2026-10-10 §3.4).
     Dropped,
     /// It was moved from: its index stays.
     Moved,

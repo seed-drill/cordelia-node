@@ -63,11 +63,13 @@ pub type Id = [u8; AGENT_MESSAGE_ID_BYTES];
 pub enum State {
     /// Filed by an act in force: the door takes its entries.
     Held,
-    /// Dropped: every entry and every row of it went, and its seed is kept
-    /// until the drop is freed.
+    /// Dropped: its entries and index rows go, and its seed; its other rows
+    /// stay while the device writes an act on it (decision 2026-10-10 §3.4,
+    /// the person's ruling of 30 October).
     Dropped,
     /// Moved from to a channel made anew: its entries went, and the index
-    /// rows of what it showed stay until each expires.
+    /// rows of what it showed stay until each expires, for the 16 moved
+    /// from last; its other rows stay as a drop's.
     Moved,
     /// Held by this device's lists, by no act in force: past a bound, or by
     /// a maker in no list. Its entries and index rows are taken out, and its
@@ -303,9 +305,8 @@ pub fn read_again_begun(conn: &Connection, id: i64, now: i64) -> Result<(), Cord
 
 /// Every row of the channel of row `id` but its own goes: its table of
 /// keys, what waits to be opened, and, unless `index_stays`, its index
-/// and the reader's rows (decision 2026-10-10 §6.3). A move keeps the
-/// index; a drop keeps nothing.
-pub fn drop_rows(conn: &Connection, id: i64, index_stays: bool) -> Result<(), CordeliaError> {
+/// and the reader's rows: when the channel is forgotten ([`forget`]).
+fn drop_rows(conn: &Connection, id: i64, index_stays: bool) -> Result<(), CordeliaError> {
     for table in ["shared_keys", "shared_unopened"] {
         conn.execute(&format!("DELETE FROM {table} WHERE channel = ?1"), [id])
             .map_err(storage)?;
@@ -318,9 +319,42 @@ pub fn drop_rows(conn: &Connection, id: i64, index_stays: bool) -> Result<(), Co
     Ok(())
 }
 
+/// The index rows of the channel of row `id` go, each overwritten first;
+/// the rows of first holding, of H and of places stay (decision 2026-10-10
+/// §3.4: while the device writes an act on the channel). A message whose
+/// row of first holding stays is not shown again where it is stored again
+/// ([`index`], `Indexed::NotAgain`). Of a channel moved from, past the 16
+/// moved from last.
+pub fn drop_index_rows(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
+    for message in index_ids(conn, id, None)? {
+        drop_row(conn, id, &message)?;
+    }
+    Ok(())
+}
+
+/// The seed of the channel of row `id` is forgotten (decision 2026-10-10
+/// §3.4, §6.3: a device that takes a drop forgets the channel's seed; a
+/// filing made later carries its card again, which [`hold`] writes): the
+/// card keeps its relays, and its seed is written over with zeros, under
+/// `secure_delete`. A card so written opens nothing of the channel.
+pub fn forget_seed(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
+    let Some(row) = channel_of_row(conn, id)? else {
+        return Ok(());
+    };
+    let mut card = row.card;
+    let seed = card.len().min(cordelia_core::protocol::SHARED_SEED_BYTES);
+    card[..seed].fill(0);
+    conn.execute(
+        "UPDATE shared_channels SET card = ?2 WHERE id = ?1",
+        params![id, card],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
 /// The index of the channel of row `id` goes, each row overwritten first,
-/// and the reader's rows with it.
-pub fn drop_index(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
+/// and the reader's rows with it: when the channel is forgotten.
+fn drop_index(conn: &Connection, id: i64) -> Result<(), CordeliaError> {
     for message in index_ids(conn, id, None)? {
         drop_row(conn, id, &message)?;
     }
@@ -756,17 +790,22 @@ pub fn take_out_channel_step(
 }
 
 /// One step of a take-out of every entry of the channel `channel` (of row
-/// `id`), which a bound left out of what the device writes (decision
-/// 2026-10-10 §3.4, "A channel that is not written keeps no entries"):
-/// one key's entries, with what waits to be opened of it and its index
-/// rows, its rows of first holding kept, marked as taken out, so that a
-/// message is shown under its first holding when it is stored again; the
-/// key's bytes stored go from its row and from the room. Its row stays,
-/// with any revisions it kept. In the caller's write.
-pub fn take_out_left_out_step(
+/// `id`) that a device writes an act on and does not hold: a channel that
+/// a bound left out, one dropped, or one moved from (decision 2026-10-10
+/// §3.4, "A channel that is not written keeps no entries"; §6.3; the
+/// person's ruling of 30 October on a drop). One key's entries, with what
+/// waits to be opened of it and, where `index_too`, its index rows, its
+/// rows of first holding kept, marked as taken out, so that a message is
+/// shown under its first holding when it is stored again; the key's bytes
+/// stored go from its row and from the room. Its row stays, with any
+/// revisions it kept; so do the rows of first holding and of H. A move
+/// keeps its index rows (`index_too` false). In the caller's write.
+pub fn take_out_whole_step(
     conn: &Connection,
     id: i64,
     channel: &[u8; 32],
+    index_too: bool,
+    most: usize,
 ) -> Result<ChannelStep, CordeliaError> {
     let author: Option<[u8; 32]> = conn
         .query_row(
@@ -778,6 +817,7 @@ pub fn take_out_left_out_step(
         .map_err(storage)?;
     let signer: Option<[u8; 32]> = match author {
         Some(author) => Some(author),
+        None if !index_too => None,
         None => conn
             .query_row(
                 "SELECT signer FROM shared_index WHERE channel = ?1 LIMIT 1",
@@ -790,17 +830,33 @@ pub fn take_out_left_out_step(
     let Some(key) = signer else {
         return Ok(ChannelStep::Done);
     };
+    // At most `most` entries a step: the door stores no more than that of
+    // one key, and a store that holds more is taken out over more steps,
+    // the key's index rows and bytes with its last.
     conn.execute(
-        "DELETE FROM entries WHERE channel_id = ?1 AND author = ?2",
-        params![&channel[..], &key[..]],
+        "DELETE FROM entries WHERE rowid IN (
+             SELECT rowid FROM entries WHERE channel_id = ?1 AND author = ?2 LIMIT ?3)",
+        params![&channel[..], &key[..], to_sql(most as u64)],
     )
     .map_err(storage)?;
+    let left: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM entries WHERE channel_id = ?1 AND author = ?2)",
+            params![&channel[..], &key[..]],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if left {
+        return Ok(ChannelStep::Key(key));
+    }
     conn.execute(
         "DELETE FROM shared_unopened WHERE channel = ?1 AND key = ?2",
         params![id, &key[..]],
     )
     .map_err(storage)?;
-    take_out_index(conn, id, &key)?;
+    if index_too {
+        take_out_index(conn, id, &key)?;
+    }
     if let Some(row) = self::key(conn, id, &key)? {
         conn.execute(
             "UPDATE shared_keys SET bytes_stored = 0 WHERE channel = ?1 AND key = ?2",
@@ -1605,9 +1661,9 @@ pub fn held_back(
 /// 2026-10-09 §7.1, as the messages record has it, for a shared channel):
 /// each index row whose 30 days are up, and each held at no live number,
 /// is overwritten and dropped; the rows of first holding of numbers that
-/// are not live go, and the places from before the hour. Of a channel
-/// moved from, once its index holds nothing, the reader's rows go too.
-/// Returns how many rows went.
+/// are not live go, and the places from before the hour. The other rows
+/// of a channel moved from stay while the device writes an act on it
+/// (§3.4). Returns how many rows went.
 pub fn drop_gone(conn: &Connection, now: i64) -> Result<usize, CordeliaError> {
     let ids = |condition: String| -> Result<Vec<(i64, Vec<u8>)>, CordeliaError> {
         conn.prepare(&format!(
@@ -1640,19 +1696,6 @@ pub fn drop_gone(conn: &Connection, now: i64) -> Result<usize, CordeliaError> {
         [now - HOUR_SECS],
     )
     .map_err(storage)?;
-    let emptied: Vec<i64> = conn
-        .prepare(
-            "SELECT c.id FROM shared_channels c WHERE c.state = 3
-             AND NOT EXISTS (SELECT 1 FROM shared_index i WHERE i.channel = c.id)",
-        )
-        .map_err(storage)?
-        .query_map([], |row| row.get(0))
-        .map_err(storage)?
-        .collect::<Result<_, _>>()
-        .map_err(storage)?;
-    for channel in emptied {
-        drop_index(conn, channel)?;
-    }
     Ok(gone)
 }
 

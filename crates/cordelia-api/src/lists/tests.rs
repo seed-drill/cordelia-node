@@ -3027,10 +3027,15 @@ fn fetch_out(s: &Several, from: &[usize], n: usize, now: i64) {
 
 /// How many rows of first holding device `n` keeps of `channel`.
 fn first_held_rows(s: &Several, n: usize, channel: &crate::shared::tests::Shared) -> i64 {
+    rows_in(s, n, channel, "shared_first_held")
+}
+
+/// How many rows of `table` device `n` keeps of `channel`.
+fn rows_in(s: &Several, n: usize, channel: &crate::shared::tests::Shared, table: &str) -> i64 {
     let id = crate::shared::tests::row(s, n, channel).id;
     s[n].conn
         .query_row(
-            "SELECT COUNT(*) FROM shared_first_held WHERE channel = ?1",
+            &format!("SELECT COUNT(*) FROM {table} WHERE channel = ?1"),
             [id],
             |row| row.get(0),
         )
@@ -3057,11 +3062,14 @@ fn first_held_rows(s: &Several, n: usize, channel: &crate::shared::tests::Shared
 /// keeps no entry and no row on any device.
 ///
 /// **The drop path:** a drop that is the newest valid act empties the
-/// channel's entries; with five old lists carrying 80 filings and 65
-/// drops, the oldest drop, the channel's, is let go, its filing comes back
-/// where the 16 have room, and the channel is then as newly held: a
-/// message under 30 days old is shown as new, and the empty anew record is
-/// written again.
+/// channel's entries and index rows, and keeps its other rows while it is
+/// written; with five old lists carrying 80 filings and 65 drops, the
+/// oldest drop, the channel's, is let go, and its filing comes back where
+/// the 16 have room. The device wrote an act on the channel throughout, so
+/// its rows stayed (the person's ruling of 30 October): a message under 30
+/// days old is shown under its first holding, not as new, and the empty
+/// anew record is written again. The rows go only where no list carries an
+/// act on the channel (`b`, above).
 #[test]
 fn a_channel_not_written_keeps_no_entries() {
     use crate::shared::tests::{
@@ -3130,11 +3138,23 @@ fn a_channel_not_written_keeps_no_entries() {
             t2 + 1 + i64::from(k),
         );
     }
+    // The laptop ends its take-outs as the node does, and forgets what it
+    // fetched of each channel whose take-out ended.
+    let fetch_out_at_laptop = |now: i64| {
+        fetch_from(&s, &[desktop], laptop, now);
+        let done = crate::shared::take_out_all(&s[laptop].conn, &s.key(laptop), now).unwrap();
+        for channel in &done.ended {
+            own_channels.forget_fetched(channel);
+        }
+        done.ended
+    };
+    let mut ended = Vec::new();
     for round in 0..3 {
         let now = t2 + 20 + round;
-        fetch_out(&s, &[desktop], laptop, now);
+        ended.extend(fetch_out_at_laptop(now));
         fetch_out(&s, &[laptop], desktop, now);
     }
+    assert!(ended.contains(&review.id), "the take-out of review ended");
     let t3 = t2 + 30;
     for n in [laptop, desktop] {
         assert!(!filed(&s, n).contains(&"review".to_string()), "device {n}");
@@ -3143,11 +3163,13 @@ fn a_channel_not_written_keeps_no_entries() {
         assert!(s[n].stored_in(&review.secret).is_empty(), "device {n}");
         assert_eq!(indexed(&s, n, &review), 0, "device {n}");
         // Its rows stay: the table of keys, the let-go key's revisions,
-        // and the rows of first holding.
+        // and the rows of first holding and of H.
         assert_eq!(key_rows(&s, n, &review).len(), 2, "device {n}");
         let kept = key_row(&s, n, &review, &quiet.public_key()).unwrap();
         assert!(kept.kept_message_rev.is_some(), "device {n}");
         assert!(first_held_rows(&s, n, &review) > 0, "device {n}");
+        assert_eq!(rows_in(&s, n, &review, "shared_signers"), 2, "device {n}");
+        assert_eq!(rows_in(&s, n, &review, "shared_numbers"), 0, "device {n}");
         assert!(
             crate::shared::shown(&s[n].conn, &s[n].identity, &review.id, t3)
                 .unwrap()
@@ -3158,18 +3180,38 @@ fn a_channel_not_written_keeps_no_entries() {
             crate::sharing::drop_plan(&s[n].conn, &s[n].identity, "review", None, t3).is_ok(),
             "device {n}"
         );
-        // `b`, carried by no list, keeps no entry and no row.
+        // `b`, carried by no list, keeps no entry and no row: its row in
+        // the table is gone, and with it every row keyed by it.
         assert!(
             cordelia_storage::shared::channel(&s[n].conn, &b.id)
                 .unwrap()
                 .is_none(),
             "device {n}"
         );
+        for table in [
+            "shared_keys",
+            "shared_index",
+            "shared_first_held",
+            "shared_signers",
+            "shared_places",
+        ] {
+            let left: i64 = s[n]
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE channel NOT IN
+                         (SELECT id FROM shared_channels)"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "device {n}, {table}");
+        }
         assert!(s[n].stored_in(&b.secret).is_empty(), "device {n}");
     }
-    // The pass forgets what it fetched of a channel not held.
-    crate::shared_pass::forget_fetches_of_channels_not_held(&s[laptop].conn, &own_channels)
-        .unwrap();
+    // What it fetched of the channel was forgotten where its take-out
+    // ended.
     assert!(!own_channels.shared_fetch_done(&review.id, 1, Instant::now()));
 
     // Back within the bound: the laptop drops one of its own.
@@ -3295,11 +3337,15 @@ fn drop_path() {
     stores(&s, 0, &said, t + 2);
     assert!(!s[0].stored_in(&d.secret).is_empty());
 
-    // Its drop, the newest valid act on it, empties it.
+    // Its drop, the newest valid act on it, empties it, and keeps its
+    // rows while it is written.
     on(&s, 0, Do::Drop(d.id), t + 3);
     crate::shared::tests::out(&s, 0, t + 3);
     assert_eq!(row(&s, 0, &d).state, State::Dropped);
     assert!(s[0].stored_in(&d.secret).is_empty());
+    assert_eq!(crate::shared::tests::indexed(&s, 0, &d), 0);
+    assert!(!crate::shared::tests::key_rows(&s, 0, &d).is_empty());
+    assert!(first_held_rows(&s, 0, &d) > 0);
 
     // The other four lists, and 64 drops more: 65 in all, each kept for
     // something. The oldest, the channel's, is let go.
@@ -3318,12 +3364,15 @@ fn drop_path() {
     assert_eq!(filed(&s, 0).len(), 16, "{:?}", filed(&s, 0));
     assert!(filed(&s, 0).contains(&"c1".to_string()));
     assert_eq!(row(&s, 0, &d).state, State::Held);
-    // As newly held: its message, under 30 days old, is shown as new...
+    // The device wrote an act on it throughout, the drop and then the
+    // filing below it: its rows stayed, and its message, under 30 days
+    // old, is shown under its first holding, not as new...
+    assert!(!crate::shared::tests::key_rows(&s, 0, &d).is_empty());
     let later = t + 6 * DAY;
     stores(&s, 0, &said, later);
     let shown = crate::shared::shown(&s[0].conn, &s[0].identity, &d.id, later).unwrap();
     assert_eq!(shown.len(), 1);
-    assert_eq!(shown[0].first_held, later, "shown as new");
+    assert_eq!(shown[0].first_held, t + 2, "shown as new");
     // ...and its empty anew record is written again.
     assert!(
         crate::sharing::write_empty_anew_records(&s[0].conn, &s[0].identity, later).unwrap() >= 1
@@ -3336,17 +3385,13 @@ fn drop_path() {
 }
 
 /// A drop that is the newest valid act keeps the channel's rows while it
-/// is written (decision 2026-10-10 §13 under property 25,
-/// `a_channel_not_written_keeps_no_entries`, the drop path; §3.4: "Its rows
-/// stay while the device writes a valid act on the channel, a filing or a
-/// drop"). The record says otherwise at §6.3 ("After a drop, every row of
-/// it goes too") and in `a_drop_or_a_move_takes_its_entries` ("at a drop
-/// the device holds no entry and no row of that channel"), which the code
-/// follows: the two cannot both hold.
+/// is written (decision 2026-10-10 §3.4: "Its rows stay while the device
+/// writes a valid act on the channel, a filing or a drop"; §6.3; §13
+/// under property 25; the person's ruling of 30 October): its entries,
+/// its index rows and its seed go; its table of keys stays.
 #[test]
-#[ignore = "the record contradicts itself: §13's drop path and §3.4 keep a dropped channel's rows while the drop is written; §6.3 and a_drop_or_a_move_takes_its_entries say every row goes at a drop"]
 fn a_drop_keeps_its_channels_rows_while_it_is_written() {
-    use crate::shared::tests::{Shared, key_rows, message, stores};
+    use crate::shared::tests::{Shared, indexed, key_rows, message, row, stores};
 
     let s = person(2, 2);
     sync_on(&s);
@@ -3359,5 +3404,80 @@ fn a_drop_keeps_its_channels_rows_while_it_is_written() {
     on(&s, 0, Do::Drop(channel.id), t + 3);
     crate::shared::tests::out(&s, 0, t + 3);
     assert!(s[0].stored_in(&channel.secret).is_empty());
+    assert_eq!(indexed(&s, 0, &channel), 0);
     assert!(!key_rows(&s, 0, &channel).is_empty());
+    assert!(first_held_rows(&s, 0, &channel) > 0);
+    assert_eq!(
+        &row(&s, 0, &channel).card[..32],
+        &[0; 32],
+        "the seed is forgotten"
+    );
+}
+
+/// A channel shared again while its drop is written shows nothing old as
+/// new (decision 2026-10-10 §1, property 22; §3.4; the person's ruling of
+/// 30 October): the desktop holds `review`, a member's message shown
+/// there, and a quiet key let go, its row keeping its revisions; it drops
+/// the channel, and files it again, as a member's share brings it back,
+/// while the drop is still the act its list carried. Its card comes back
+/// with the filing; the let-go key's old entry is refused; the message,
+/// stored again from the relay, is shown under its first holding, not as
+/// new.
+#[test]
+fn a_channel_shared_again_while_its_drop_is_written_shows_nothing_old_as_new() {
+    use crate::shared::tests::{Shared, given, hourly, key_row, member, message, row, stores};
+    use cordelia_storage::shared::State;
+
+    let s = person(2, 2);
+    sync_on(&s);
+    let t = s.now + 10;
+    on(&s, 1, Do::File(filing(1, "review")), t);
+    fetch_out(&s, &[1], 0, t + 1);
+    let review = Shared::of(1);
+    let card = row(&s, 0, &review).card;
+    let (quiet, writer) = (member(2), member(1));
+    let old = message(&quiet, &review, 1, "quiet", t + 2);
+    let t1 = t + 31 * DAY;
+    let fresh = message(&writer, &review, 1, "fresh", t1);
+    stores(&s, 0, &old, t + 2);
+    stores(&s, 0, &fresh, t1);
+    hourly(&s[0].conn, &s.key(0), t1 + 1).unwrap();
+    assert!(
+        key_row(&s, 0, &review, &quiet.public_key())
+            .unwrap()
+            .kept_message_rev
+            .is_some()
+    );
+    let shown = crate::shared::shown(&s[0].conn, &s[0].identity, &review.id, t1 + 1).unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].first_held, t1);
+
+    on(&s, 0, Do::Drop(review.id), t1 + 2);
+    crate::shared::tests::out(&s, 0, t1 + 2);
+    assert_eq!(row(&s, 0, &review).state, State::Dropped);
+    assert!(s[0].stored_in(&review.secret).is_empty());
+    assert!(
+        kept(&s, 0)
+            .drops
+            .iter()
+            .any(|drop| drop.item.channel == review.id)
+    );
+
+    // Shared again: a filing above the drop.
+    on(&s, 0, Do::File(filing(1, "review")), t1 + 3);
+    crate::shared::tests::out(&s, 0, t1 + 3);
+    let held = row(&s, 0, &review);
+    assert_eq!(held.state, State::Held);
+    assert_eq!(held.card, card, "the filing carries the card again");
+    let before = key_row(&s, 0, &review, &quiet.public_key());
+    assert_eq!(
+        given(&s, 0, &old, t1 + 4),
+        crate::take::Taken::Refused(crate::take::NotTaken::SharedFull)
+    );
+    assert_eq!(key_row(&s, 0, &review, &quiet.public_key()), before);
+    stores(&s, 0, &fresh, t1 + 5);
+    let shown = crate::shared::shown(&s[0].conn, &s[0].identity, &review.id, t1 + 5).unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].body, "fresh");
+    assert_eq!(shown[0].first_held, t1, "shown as new");
 }
