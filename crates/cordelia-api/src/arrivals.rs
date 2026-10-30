@@ -233,18 +233,22 @@ pub(crate) fn noted_at_the_door(
 /// device first kept it as removed.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Windows {
-    opens: BTreeMap<(Change, [u8; 32]), i64>,
+    /// When each opens: the time and place of its first arrival, so that a
+    /// version stored in the same second before it is not in it; what went
+    /// past the bound has no place, and opens at `i64::MIN` (fails safe).
+    opens: BTreeMap<(Change, [u8; 32]), (i64, i64)>,
     closes: BTreeMap<[u8; 32], i64>,
 }
 
 impl Windows {
-    /// Whether a version of the device's own, stored at `at` in
-    /// `generation`, is in a window: at or after it opens for some removed
-    /// key, and before the device knew of that key's removal.
-    pub(crate) fn sets_aside(&self, generation: &Change, at: i64) -> bool {
+    /// Whether a version of the device's own, stored at `at` and `place` in
+    /// `generation`, is in a window: stored after it opens for some removed
+    /// key (later, or in the same second after it), and before the device
+    /// knew of that key's removal.
+    pub(crate) fn sets_aside(&self, generation: &Change, at: i64, place: i64) -> bool {
         self.opens.iter().any(|((change, key), opens)| {
             change == generation
-                && at >= *opens
+                && (at, place) > *opens
                 && self.closes.get(key).is_none_or(|closes| at < *closes)
         })
     }
@@ -256,7 +260,7 @@ impl Windows {
     fn may_have_set_aside(&self, generation: &Change, newest_at: i64) -> bool {
         self.opens
             .iter()
-            .any(|((change, _), opens)| change == generation && newest_at >= *opens)
+            .any(|((change, _), opens)| change == generation && newest_at >= opens.0)
     }
 
     /// When the first window opens in `generation`.
@@ -264,11 +268,11 @@ impl Windows {
         self.opens
             .iter()
             .filter(|((change, _), _)| change == generation)
-            .map(|(_, opens)| *opens)
+            .map(|(_, opens)| opens.0)
             .min()
     }
 
-    fn open(&mut self, generation: Change, key: [u8; 32], at: i64) {
+    fn open(&mut self, generation: Change, key: [u8; 32], at: (i64, i64)) {
         let opens = self.opens.entry((generation, key)).or_insert(at);
         *opens = (*opens).min(at);
     }
@@ -310,7 +314,7 @@ pub(crate) fn windows(
                             .chain(&event.full_signers)
                             .any(|signer| *signer == key.signer);
                     if names_it && cuts.cuts(key, &generation, event.stored_at) {
-                        windows.open(generation, key.key, event.stored_at);
+                        windows.open(generation, key.key, (event.stored_at, event.place));
                     }
                 }
             }
@@ -327,7 +331,7 @@ pub(crate) fn windows(
                         true => i64::MIN,
                         false => key.at.unwrap_or(i64::MIN),
                     };
-                    windows.open(generation, key.key, opens);
+                    windows.open(generation, key.key, (opens, i64::MIN));
                 }
             }
         }
@@ -510,7 +514,8 @@ pub(crate) fn cut_of_channel(
             .find(|went| windows.may_have_set_aside(&(went.number, went.hash), went.newest_at));
         // The first version of the device's own in a window (rule 27).
         let own_first = events.iter().position(|event| {
-            event.own && windows.sets_aside(&(event.number, event.hash), event.stored_at)
+            event.own
+                && windows.sets_aside(&(event.number, event.hash), event.stored_at, event.place)
         });
         if let Some(index) = own_first {
             set_aside_in.insert((events[index].number, events[index].hash));
@@ -1831,6 +1836,56 @@ mod tests {
         assert_eq!(s[1].text("notes", "notes.md"), None);
     }
 
+    /// Rule 27, past the bound of the device's own versions: the laptop
+    /// writes `notes.md` after it took the tablet's late text, and then more
+    /// than `MAX_FILE_ARRIVALS` versions of its own follow in that file (set
+    /// by hand), so the first goes past the bound with the version before
+    /// it. Its time is inside the window: the file goes back to none, and
+    /// not to the laptop's first version, which the events kept go back to.
+    #[test]
+    fn a_version_of_its_own_past_the_bound_in_a_window_goes_back_to_none() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        let first = s.write(1, "notes", "notes.md", "the late text, written down");
+        let generation = generation_of(&s, 1);
+        let on = &s[1];
+        let channel = cordelia_crypto::derive::channel_id(&on.own("notes")).unwrap();
+        let slot = on.slot_of("notes", "notes.md");
+        for i in 0..MAX_FILE_ARRIVALS {
+            kept::note_own(
+                &on.conn,
+                &channel,
+                &slot,
+                generation.0,
+                &generation.1,
+                s.now + 1 + i as i64,
+                Some(&first),
+                &first.id(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            kept::own_dropped_of_file(&on.conn, &channel, &slot)
+                .unwrap()
+                .len(),
+            1
+        );
+        s.now += MAX_FILE_ARRIVALS as i64 + 2;
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+    }
+
     /// Rule 27, the window closes when the device knew: a version of its
     /// own stored then, or after, is not set aside; one stored before it,
     /// at or after the first late arrival, is.
@@ -1841,13 +1896,15 @@ mod tests {
             opens: BTreeMap::new(),
             closes: [([9; 32], 200)].into_iter().collect(),
         };
-        windows.open(generation, [9; 32], 120);
-        windows.open(generation, [9; 32], 100);
-        assert!(!windows.sets_aside(&generation, 99));
-        assert!(windows.sets_aside(&generation, 100));
-        assert!(windows.sets_aside(&generation, 199));
-        assert!(!windows.sets_aside(&generation, 200));
-        assert!(!windows.sets_aside(&(3, [3; 16]), 150));
+        windows.open(generation, [9; 32], (120, 7));
+        windows.open(generation, [9; 32], (100, 5));
+        assert!(!windows.sets_aside(&generation, 99, 9));
+        // In the second it opens, only what was stored after its arrival.
+        assert!(!windows.sets_aside(&generation, 100, 4));
+        assert!(windows.sets_aside(&generation, 100, 6));
+        assert!(windows.sets_aside(&generation, 199, 9));
+        assert!(!windows.sets_aside(&generation, 200, 9));
+        assert!(!windows.sets_aside(&(3, [3; 16]), 150, 9));
         // What went past the bound may have been in it from when it opens.
         assert!(windows.may_have_set_aside(&generation, 100));
         assert!(!windows.may_have_set_aside(&generation, 99));
