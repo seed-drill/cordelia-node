@@ -47,7 +47,7 @@ cordelia-node/
                          #   reached (the value of the carried word, decision 2026-10-19);
                          #   slots (a name's slot, for both kinds).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 26). entries; arrivals (the arrivals of
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 27). entries; arrivals (the arrivals of
                          #   each file, decision 2026-10-24 rule 7); person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays

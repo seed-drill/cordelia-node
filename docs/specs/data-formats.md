@@ -130,6 +130,10 @@
 >   and the newest time of such a version that went past its bound, and
 >   the newest place among them. `file_own_set_aside`:
 >   each generation where a carry set the device's own writing aside.
+> - **v27:** why a carry left a file out (the review of the removal build,
+>   its M4). `file_put_back.own`: 1 where the device wrote what is left out
+>   itself (rule 27), 0 where a removed device wrote it, or it was written
+>   over what one wrote (rule 7); 0 on every row kept before.
 >
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
@@ -1426,7 +1430,12 @@ CREATE TABLE sync_files (
   out: the record names the version the carry went back to (a NULL hash and
   revision 0 for none), and the next cycle puts that version into the file,
   whatever it holds, with what it held kept in local history alone; the
-  mark goes when the record is saved again. `file_line_from (folder,
+  mark goes when the record is saved again. Step 27 adds `own` (0 or 1):
+  1 where the device wrote what is left out itself, in a window of rule 27,
+  and 0 where a removed device wrote it or it was written over what one
+  wrote (rule 7). The status counts the two apart, and local history keeps
+  each as a record of its own (`set_aside`, `set_aside_own`), neither of
+  which `cordelia restore` puts back. `file_line_from (folder,
   channel_id, file, from_signers)` holds, for a record of `index_lines`, the
   keys (32 bytes each) that signed the version its line was removed from:
   no line is put back from a version that a removed key signed, where the
