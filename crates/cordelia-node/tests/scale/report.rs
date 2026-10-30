@@ -1301,8 +1301,8 @@ struct Latencies {
     /// Of those judged (in `of` or `late`), the ones written while their
     /// writer was off, timed from its return.
     from_return: usize,
-    /// Written while their writer was off, and their writer never ran
-    /// again: bar 2 does not judge them, bar 3 does.
+    /// Written while their writer was off, their writer never ran again,
+    /// and not arrived: bar 2 does not judge them, bar 3 does.
     not_judged: usize,
 }
 
@@ -1314,11 +1314,22 @@ struct Latencies {
 /// ran again: bar 2 does not judge the edit, and bar 3 does. An edit
 /// written while its writer ran is timed from the write, whatever its
 /// writer did after, so that a slow relay or reader is never hidden.
+///
+/// An edit that arrived before its writer ran again (or whose writer never
+/// did) is timed from the write too: its writer plainly sent it. A stop is
+/// recorded when the node is told, and its process may run on for up to
+/// `NODE_STOP_TIMEOUT_SECS` while it shuts down (a frozen one going on
+/// first), so it can read and push an edit written then; timed from the
+/// return, that edit would count a negative latency.
 fn timed_from(read: &Read, p: &Pair) -> Option<f64> {
     let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
-    match read.lives.at(writer, p.edit.at) {
-        Is::Running => Some(p.edit.at),
+    let back = match read.lives.at(writer, p.edit.at) {
+        Is::Running => return Some(p.edit.at),
         _ => read.lives.ran_again_after(writer, p.edit.at, p.edit.at),
+    };
+    match p.arrived {
+        Some(a) if back.is_none_or(|b| a.at < b) => Some(p.edit.at),
+        _ => back,
     }
 }
 
@@ -1374,9 +1385,14 @@ fn journey_end(read: &Read, p: &Pair) -> f64 {
 
 fn bar_2(read: &Read, edits: &Edits) -> Line {
     let people = &read.run.plan.population.people;
-    // An edit whose way from its writing to its arrival (or to 120 s, where
-    // it did not arrive) crosses a part treated apart is treated apart.
-    let outside = |p: &&Pair| !read.is_apart(p.edit.at, journey_end(read, p));
+    // An edit whose way from when it is timed (its writing, or its writer's
+    // return) to its arrival (or to 120 s, where it did not arrive) crosses
+    // a part treated apart is treated apart. The time its writer was off is
+    // no part of its latency, and a part apart then holds nothing up.
+    let outside = |p: &&Pair| {
+        let from = timed_from(read, p).unwrap_or(p.edit.at);
+        !read.is_apart(from, journey_end(read, p))
+    };
     let b = latencies(
         read,
         edits
@@ -1432,18 +1448,22 @@ const ARRIVES_WITHIN_SECS: f64 = cordelia_core::protocol::CHANGE_FETCH_MAX_SECS 
 
 /// Whether an edit not found by the end is passed over, not lost: its
 /// writer was told to stop within `CYCLE_SECS` of writing it, so its cycle
-/// had at most that one turn to read the file, and it never ran again in
-/// time to send it, [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's
-/// catch-up) ending [`ARRIVES_WITHIN_SECS`] or more before the run's end.
-/// Every other edit not found is lost: one whose writer ran on, froze, or
-/// stopped later, its cycle having had the time to read it and push it.
+/// had at most that one turn to read the file, or it was not running when
+/// the edit was written (stopped or frozen: as when a removed device is
+/// left as it is, the person editing on in its folder), so nothing could
+/// read it; and it never ran again in time to send it, [`CATCH_UP_SECS`]
+/// without a stop or a freeze (bar 3's catch-up) ending
+/// [`ARRIVES_WITHIN_SECS`] or more before the run's end. Every other edit
+/// not found is lost: one whose writer ran on, froze, or stopped later, its
+/// cycle having had the time to read it and push it.
 fn passed_over(read: &Read, p: &Pair) -> bool {
     let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
     let read_by = p.edit.at + read.run.constants.cycle_secs as f64;
+    let off = read.lives.at(writer, p.edit.at) != Is::Running;
     let stopped = read.lives.stops[writer]
         .iter()
         .any(|(told, _)| *told > p.edit.at && *told <= read_by);
-    if !stopped {
+    if !off && !stopped {
         return false;
     }
     let end = read.end.max(read.run.kept_at);
@@ -1463,7 +1483,20 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     let (passed, lost): (Vec<&Pair>, Vec<&Pair>) =
         missing.into_iter().partition(|p| passed_over(read, p));
     // Catching up: each time a device was off in the window, the edits its
-    // person made meanwhile, within 60 s of its running again.
+    // person made meanwhile, within 60 s of its running again; and those
+    // made before the off that had not arrived when it began, where they
+    // could be sent by the time it ran again (timed, as bar 2 times them,
+    // from no later than its return). Bar 2 judges an edit only where its
+    // device ran from when it is timed to its arrival, or the 120 s after;
+    // each it skips for its device's off is one of these, so none is left
+    // to "found by the end" alone.
+    let owed_at = |p: &Pair, off: f64, on: f64| {
+        (p.edit.at >= off && p.edit.at <= on)
+            || (p.edit.at >= read.start
+                && p.edit.at < off
+                && p.arrived.is_none_or(|a| a.at > off)
+                && timed_from(read, p).is_some_and(|from| from <= on))
+    };
     let mut worst: f64 = 0.0;
     let mut slow = 0;
     let mut times_off = 0;
@@ -1477,9 +1510,11 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         for (off, on) in read.lives.downs(i, read.start, read.end) {
             let Some(on) = on else { continue };
             times_off += 1;
-            for p in edits.pairs.iter().filter(|p| {
-                p.node == i && p.edit.at >= off && p.edit.at <= on && !p.replaced && !p.gone
-            }) {
+            for p in edits
+                .pairs
+                .iter()
+                .filter(|p| p.node == i && owed_at(p, off, on) && !p.replaced && !p.gone)
+            {
                 match p.arrived {
                     Some(a) => {
                         worst = worst.max(a.at - on);
@@ -1507,9 +1542,9 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         "No edit is lost, and a device catches up",
         format!(
             "{} edits of the window on other devices; {} not found by the end{}; {} not found \
-             and passed over, their writer told to stop within a cycle of writing them and not \
-             run long enough again; after {} times off, the slowest catch-up {:.1} s, {} edits \
-             not held within 60 s",
+             and passed over, their writer told to stop within a cycle of writing them or off \
+             when they were written, and not run long enough again; after {} times off, the \
+             slowest catch-up {:.1} s, {} edits not held within 60 s",
             edits
                 .of_person(read, false)
                 .filter(|p| p.edit.at >= read.start && !p.gone)
@@ -1525,9 +1560,9 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
             slow
         ),
         "every edit's own line on every other device by the end, but one whose writer was told \
-         to stop within a cycle (5 s) of writing it and did not run 60 s again 120 s or more \
-         before the end; a device that was off holds its person's edits within 60 s of running \
-         again",
+         to stop within a cycle (5 s) of writing it, or was off when it was written, and did not \
+         run 60 s again 120 s or more before the end; a device that was off holds its person's \
+         edits within 60 s of running again",
         lost.is_empty() && slow == 0,
     )
 }
@@ -2815,11 +2850,12 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
     let office = latencies(read, edits.of_person(read, true));
     said.push(format!(
         "the office's people: {} arrivals, {}, {} not arrived within 120 s, {} timed from \
-         their writer's return",
+         their writer's return, {} not judged, their writer off and never run again",
         office.of.len(),
         mm(&office.of, "s"),
         office.late,
-        office.from_return
+        office.from_return,
+        office.not_judged
     ));
     line(
         "The office is as expected",
@@ -2909,7 +2945,8 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
     let Latencies {
         of: both,
         late: late_both,
-        ..
+        from_return,
+        not_judged,
     } = latencies(
         read,
         edits
@@ -2950,7 +2987,8 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
         format!(
             "{} devices connected again, the slowest {slowest:.0} s after its start; through the \
              outage, {} arrivals at p50 {p50:.1} s, p95 {p95:.1} s, the most {most:.1} s, \
-             {late_both} not within 120 s; {split_late} split people's edits late (past 120 s \
+             {late_both} not within 120 s, {from_return} timed from their writer's return, \
+             {not_judged} left to bar 3; {split_late} split people's edits late (past 120 s \
              after the start, or 60 s after their devices ran again); {refused:.0} refused for rate at the relays and {held:.0} held \
              back by a device outside its own connection's proofs in the five minutes after; in \
              those minutes the relay was asked {:.0} pulls and {:.0} pushes, held its lock {} of a \
@@ -3555,10 +3593,17 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             .iter()
             .filter(|p| nodes.contains(&p.node))
             .collect();
-        let Latencies { of: l, late, .. } = latencies(read, of.iter().copied());
+        let Latencies {
+            of: l,
+            late,
+            from_return,
+            not_judged,
+        } = latencies(read, of.iter().copied());
         let _ = writeln!(
             s,
-            "- sync latency: {} arrivals, p50 {}, p95 {}, the most {}; {late} not within 120 s",
+            "- sync latency: {} arrivals, p50 {}, p95 {}, the most {}; {late} not within 120 s; \
+             {from_return} timed from their writer's return, {not_judged} not judged, their \
+             writer off and never run again",
             l.len(),
             quantile(&l, 0.5).map_or("no value".into(), |v| format!("{v:.1} s")),
             quantile(&l, 0.95).map_or("no value".into(), |v| format!("{v:.1} s")),
