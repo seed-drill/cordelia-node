@@ -1304,6 +1304,10 @@ struct Latencies {
     /// Written while their writer was off, their writer never ran again,
     /// and not arrived: bar 2 does not judge them, bar 3 does.
     not_judged: usize,
+    /// Of those judged, the ones timed from a device's connection to the
+    /// first relay made again after that relay's warm churn closed it
+    /// during the second relay's outage (bar 15 alone; [`bar_15`]).
+    from_churn: usize,
 }
 
 /// When bar 2 times an edit from (amended after stage 100): its writing,
@@ -1337,16 +1341,35 @@ fn timed_from(read: &Read, p: &Pair) -> Option<f64> {
 /// not arrive within 120 s while their device ran, each timed from
 /// [`timed_from`].
 fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> Latencies {
+    latencies_after(read, pairs, |_, _| None)
+}
+
+/// [`latencies`], where `later` may time an edit from later than
+/// [`timed_from`] says (given that time): bar 15's warm churn during the
+/// outage ([`timed_after_a_churn`]). Each edit it times so is counted in
+/// `from_churn`.
+fn latencies_after<'a>(
+    read: &Read,
+    pairs: impl Iterator<Item = &'a Pair>,
+    later: impl Fn(&Pair, f64) -> Option<f64>,
+) -> Latencies {
     let mut out = Latencies::default();
     for p in pairs {
         if p.edit.at < read.start {
             continue;
         }
-        let Some(from) = timed_from(read, p) else {
+        let Some(written) = timed_from(read, p) else {
             out.not_judged += 1;
             continue;
         };
-        let returned = usize::from(from > p.edit.at);
+        let after_churn = later(p, written);
+        let from = after_churn.unwrap_or(written);
+        let returned = usize::from(written > p.edit.at);
+        let churned = usize::from(after_churn.is_some());
+        let judged = |out: &mut Latencies| {
+            out.from_return += returned;
+            out.from_churn += churned;
+        };
         // A device removed later was still owed what it ran 120 s through
         // before its removal's line.
         if p.gone {
@@ -1355,18 +1378,20 @@ fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> Latencie
                 && p.gone_at.is_some_and(|line| from + 120.0 <= line)
                 && read.lives.ran_through(p.node, from, from + 120.0);
             out.late += usize::from(owed);
-            out.from_return += returned * usize::from(owed);
+            if owed {
+                judged(&mut out);
+            }
             continue;
         }
         match p.arrived.map(|a| a.at - from) {
             Some(latency) if read.lives.ran_through(p.node, from, from + latency) => {
                 out.of.push(latency);
-                out.from_return += returned;
+                judged(&mut out);
             }
             Some(_) => {}
             None if !p.replaced && read.lives.ran_through(p.node, from, from + 120.0) => {
                 out.late += 1;
-                out.from_return += returned;
+                judged(&mut out);
             }
             None => {}
         }
@@ -2261,8 +2286,8 @@ fn churned_lately(read: &Read, relay: usize, t: f64) -> bool {
 /// 150 s before `t`, read as [`churned_lately`] reads it: from its last
 /// sample that carries the count before then to its first at or after `t`.
 fn warm_churn_closed_lately(read: &Read, relay: usize, t: f64) -> bool {
-    let from = t - 150.0;
-    let key = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+    let from = t - AFTER_A_CHURN_SECS;
+    let key = CLOSED_BY_WARM_CHURN;
     let series = read.series(relay);
     let carrying = || series.iter().filter(|s| metric(s, key).is_some());
     let a = carrying().rev().find(|s| s.t < from).map_or(from, |s| s.t);
@@ -2919,6 +2944,100 @@ fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
     }
 }
 
+/// The time bars 9 and 14 allow after a relay's warm churn closed a
+/// device's connection, before the device is looked for again: its next
+/// dial is 10 s later at the soonest (the record of a relay out of reach
+/// §2), and a sample may fall between. Bar 15 gives the same where it
+/// cannot see the device connected again.
+const AFTER_A_CHURN_SECS: f64 = 150.0;
+
+/// The counter of devices' connections a relay's warm churn closed.
+const CLOSED_BY_WARM_CHURN: &str = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
+
+/// Each time the first relay's warm churn closed device `node`'s
+/// connection to it within [a, b], read from the relay's samples of its
+/// peers: one sample lists the device's key and the next does not, the
+/// device ran between them, and the relay's count of devices' connections
+/// closed by warm churn rose between them (read from its last sample that
+/// carries the count at or before the first to its first at or after the
+/// second, as [`warm_churn_closed_lately`] reads it). A device that left
+/// the list without such a rise (it stopped, or its connection closed for
+/// another reason) is not counted. Each is given as the last sample that
+/// listed it, and when it was connected to the relay again, no later than
+/// it was: the last sample that did not list it before the first that
+/// lists it again; or, where no later sample lists it, the last that did
+/// and [`AFTER_A_CHURN_SECS`], the allowance of bars 9 and 14.
+fn cut_by_churn(read: &Read, node: usize, a: f64, b: f64) -> Vec<(f64, f64)> {
+    let relay = read.run.fleet.relays[0];
+    let key = &read.run.fleet.made[node].key;
+    let series = read.series(relay);
+    let listed: Vec<(f64, bool)> = series
+        .iter()
+        .filter_map(|s| {
+            let peers = s.peers.as_ref()?;
+            Some((s.t, peers.iter().any(|(k, _)| k == key)))
+        })
+        .collect();
+    let carrying = || {
+        series
+            .iter()
+            .filter(|s| metric(s, CLOSED_BY_WARM_CHURN).is_some())
+    };
+    let mut cuts = Vec::new();
+    for (j, w) in listed.windows(2).enumerate() {
+        let ((seen, true), (gone, false)) = (w[0], w[1]) else {
+            continue;
+        };
+        if gone < a || seen > b || !read.lives.ran_through(node, seen, gone) {
+            continue;
+        }
+        let from = carrying().rev().find(|s| s.t <= seen).map_or(seen, |s| s.t);
+        let to = carrying().find(|s| s.t >= gone).map_or(gone, |s| s.t);
+        if rise(&series, CLOSED_BY_WARM_CHURN, from, to, &|_, _| true) == 0.0 {
+            continue;
+        }
+        // `listed[j + 1]` does not list it; the first that does is
+        // `listed[j + 1 + k]`, and the one before it the last that does not.
+        let back = listed[j + 1..]
+            .iter()
+            .position(|(_, l)| *l)
+            .map_or(seen + AFTER_A_CHURN_SECS, |k| listed[j + k].0);
+        cuts.push((seen, back));
+    }
+    cuts
+}
+
+/// When bar 15 times an edit of a person set up with both relays through
+/// the second relay's outage (stopped at `stopped`, started at `started`),
+/// where its writer or its reader had its connection to the first relay,
+/// its only path then, closed by that relay's warm churn during the outage
+/// ([`cut_by_churn`]): from when that device was connected to it again,
+/// where that is later than `from` (when [`timed_from`] times it) and the
+/// closure came before the edit's arrival (or the 120 s after `from`,
+/// where it did not arrive). Of two such, the later. `None` where there is
+/// none, and where the edit arrived before the device was connected again:
+/// it was plainly not held up, and is timed from `from`.
+fn timed_after_a_churn(
+    read: &Read,
+    p: &Pair,
+    from: f64,
+    stopped: f64,
+    started: f64,
+) -> Option<f64> {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let end = p.arrived.map_or(from + ARRIVES_WITHIN_SECS, |a| a.at);
+    let back = [writer, p.node]
+        .into_iter()
+        .flat_map(|node| cut_by_churn(read, node, stopped, started))
+        .filter(|(seen, back)| *seen < end && *back > from)
+        .map(|(_, back)| back)
+        .reduce(f64::max)?;
+    match p.arrived {
+        Some(a) if a.at < back => None,
+        _ => Some(back),
+    }
+}
+
 fn bar_15(read: &Read, edits: &Edits) -> Line {
     let outage = read.run.outage.clone();
     let (Some(stopped), Some(started)) = (outage.stopped, outage.started) else {
@@ -2942,17 +3061,23 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
     // Held up by the outage: its way from its writing to its arrival
     // crosses the outage.
     let during = |p: &&Pair| p.edit.at <= started && journey_end(read, p) >= stopped;
+    // Bar 2 through the outage, but that an edit whose writer or reader had
+    // its one path, its connection to the first relay, closed by that
+    // relay's warm churn during the outage is timed from when that device
+    // was connected again (amended after stage 100): two faults at once.
     let Latencies {
         of: both,
         late: late_both,
         from_return,
         not_judged,
-    } = latencies(
+        from_churn,
+    } = latencies_after(
         read,
         edits
             .of_person(read, false)
             .filter(|p| !people[p.edit.person].split)
             .filter(during),
+        |p, from| timed_after_a_churn(read, p, from, stopped, started),
     );
     let p50 = quantile(&both, 0.5).unwrap_or(0.0);
     let p95 = quantile(&both, 0.95).unwrap_or(0.0);
@@ -2988,7 +3113,9 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
             "{} devices connected again, the slowest {slowest:.0} s after its start; through the \
              outage, {} arrivals at p50 {p50:.1} s, p95 {p95:.1} s, the most {most:.1} s, \
              {late_both} not within 120 s, {from_return} timed from their writer's return, \
-             {not_judged} left to bar 3; {split_late} split people's edits late (past 120 s \
+             {from_churn} timed from their device's connection to the first relay made again \
+             after its warm churn closed it in the outage, {not_judged} left to bar 3; \
+             {split_late} split people's edits late (past 120 s \
              after the start, or 60 s after their devices ran again); {refused:.0} refused for rate at the relays and {held:.0} held \
              back by a device outside its own connection's proofs in the five minutes after; in \
              those minutes the relay was asked {:.0} pulls and {:.0} pushes, held its lock {} of a \
@@ -3007,7 +3134,9 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
             mm(&rss, "MiB")
         ),
         "each device set up with it connected again within 120 s; bar 2 through the outage for \
-         people with both; held-up split edits within 120 s of its start, or within 60 s of \
+         people with both (an edit whose writer or reader had its connection to the first relay \
+         closed by that relay's warm churn in the outage timed from when that device was \
+         connected to it again); held-up split edits within 120 s of its start, or within 60 s of \
          the later of their devices running again where one was held up; none refused for \
          rate in the five minutes after, and none held back but for what the minute of a \
          connection's proofs holds back",
@@ -3598,6 +3727,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             late,
             from_return,
             not_judged,
+            ..
         } = latencies(read, of.iter().copied());
         let _ = writeln!(
             s,

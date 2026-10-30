@@ -2812,7 +2812,8 @@ fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
     assert!(
         bar.figure.contains(
             "1 arrivals at p50 7.0 s, p95 7.0 s, the most 7.0 s, 0 not within 120 s, 1 timed \
-             from their writer's return, 0 left to bar 3"
+             from their writer's return, 0 timed from their device's connection to the first \
+             relay made again after its warm churn closed it in the outage, 0 left to bar 3"
         ),
         "{}",
         bar.figure
@@ -2821,7 +2822,8 @@ fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
     let bar = bar_15(&read, &edits);
     assert!(
         bar.figure
-            .contains("0 timed from their writer's return, 1 left to bar 3"),
+            .contains("0 timed from their writer's return, 0 timed from their device's")
+            && bar.figure.contains("in the outage, 1 left to bar 3"),
         "{}",
         bar.figure
     );
