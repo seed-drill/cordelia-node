@@ -195,11 +195,15 @@ impl Lives {
         longest
     }
 
-    fn frozen_within(&self, node: usize, t: f64, secs: f64) -> bool {
-        self.at(node, t - secs) == Is::Frozen
+    /// Whether it was running or frozen at any moment of [t - secs, t]:
+    /// a device stopped since among them, whose connection a relay may
+    /// not yet have seen close.
+    fn up_within(&self, node: usize, t: f64, secs: f64) -> bool {
+        let up = |is: &Is| matches!(is, Is::Running | Is::Frozen);
+        up(&self.at(node, t - secs))
             || self.of[node]
                 .iter()
-                .any(|(at, is)| *at > t - secs && *at <= t && *is == Is::Frozen)
+                .any(|(at, is)| *at > t - secs && *at <= t && up(is))
     }
 
     /// Each time it was not running within [a, b]: from when, to when it
@@ -1975,7 +1979,10 @@ fn bar_9(read: &Read) -> Line {
                             lo += 1.0;
                         }
                     }
-                    _ if read.lives.frozen_within(node, s.t, 90.0) => hi += 1.0,
+                    // Frozen or stopped since: the relay may hold its
+                    // connection until QUIC's idle time and its own tick
+                    // close it, or until it reads a clean close.
+                    _ if read.lives.up_within(node, s.t, 90.0) => hi += 1.0,
                     _ => {}
                 }
             }

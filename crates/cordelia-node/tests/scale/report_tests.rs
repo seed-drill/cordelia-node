@@ -2083,3 +2083,43 @@ fn a_folder_without_the_inputs_of_this_version_is_refused() {
     let why = again(dir.path(), None).unwrap_err();
     assert!(why.contains("the run did not start"), "{why}");
 }
+
+// ── After stage 190, seed 2: bars 3 and 9 read what the record means ──
+
+/// The high end of bar 9's band for relay 1 at 1000 s, where person 0's
+/// first device (node 2) is told to stop at `stopped` (none: it runs on).
+fn bar_9_ceiling(stopped: Option<f64>) -> f64 {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 150.0, 1500.0);
+    if let Some(t) = stopped {
+        becomes(&run, 2, t, Is::Stopped);
+    }
+    relay_at(&run, 0, 1000.0, Some(&[("cordelia_connections_open", 0.0)]));
+    let read = read_of(&run);
+    let bar = bar_9(&read);
+    let said = "0 at 1000 s (band ";
+    let from = bar.figure.find(said).expect(&bar.figure);
+    let rest = &bar.figure[from + said.len()..];
+    let hi = rest.split(" to ").nth(1).unwrap();
+    hi.split(')').next().unwrap().parse().unwrap()
+}
+
+/// Bar 9's high end counts every device running or frozen at any moment of
+/// the last 90 s (the record's words): one stopped cleanly 0.5 s before the
+/// sample, whose connection the relay has not yet seen close, counts; one
+/// stopped 100 s before does not. At stage 190, seed 2, relay 2 held 178
+/// against a band of 174 to 177, two devices having stopped 0.2 s and
+/// 0.5 s before.
+#[test]
+fn bar_9_counts_a_device_stopped_in_the_last_90_seconds_in_its_high_end() {
+    let running = bar_9_ceiling(None);
+    assert_eq!(bar_9_ceiling(Some(999.5)), running, "stopped 0.5 s before");
+    assert_eq!(bar_9_ceiling(Some(999.8)), running, "stopped 0.2 s before");
+    assert_eq!(bar_9_ceiling(Some(911.0)), running, "stopped 89 s before");
+    assert_eq!(
+        bar_9_ceiling(Some(900.0)),
+        running - 1.0,
+        "stopped 100 s before"
+    );
+}
