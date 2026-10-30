@@ -89,6 +89,11 @@ pub struct OwnDropped {
     pub hash: [u8; 16],
     /// The newest time a version of the device's own that went was stored.
     pub newest_at: i64,
+    /// The oldest time one was stored: where that is after the device knew
+    /// of every removal whose window could hold them, none was in one.
+    pub oldest_at: i64,
+    /// The newest place among them.
+    pub newest_place: i64,
 }
 
 /// What went past the bound, for one generation of a file.
@@ -246,6 +251,23 @@ pub fn note_own(
     noted.map_err(storage)
 }
 
+/// The newest time any event of any file was stamped, of either kind,
+/// with what went past either bound: `None` where none is kept. When the
+/// device first keeps a key as removed, that is stamped no earlier than
+/// this (decision 2026-10-24 (removal), rule 27), so that a clock once
+/// ahead, which stamped events ahead, cannot put the close of a window
+/// before what the device stored in it.
+pub fn newest_stamp(conn: &Connection) -> Result<Option<i64>, CordeliaError> {
+    conn.query_row(
+        "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
+                              UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped
+                              UNION ALL SELECT MAX(newest_at) FROM file_own_dropped)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
 /// Insert one event, stamped no earlier than the newest kept, and return
 /// its place.
 #[allow(clippy::too_many_arguments)]
@@ -366,8 +388,8 @@ fn keep_to_the_bound(
 }
 
 /// Past `MAX_FILE_ARRIVALS` versions of the device's own in a file, the
-/// oldest go, and the newest time of what went is kept for each generation
-/// (rule 27).
+/// oldest go, and the oldest and newest time of what went, and its newest
+/// place, are kept for each generation (rule 27).
 fn keep_own_to_the_bound(
     conn: &Connection,
     channel: &[u8; 32],
@@ -390,11 +412,14 @@ fn keep_own_to_the_bound(
             |row| row.get(0),
         )?;
         conn.execute(
-            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
-             SELECT channel_id, slot, number, hash, stored_at
+            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
+                 oldest_at, newest_place)
+             SELECT channel_id, slot, number, hash, stored_at, stored_at, place
              FROM file_arrivals_stored WHERE place = ?1
              ON CONFLICT(channel_id, slot, number, hash)
-             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
+                           oldest_at = MIN(oldest_at, excluded.oldest_at),
+                           newest_place = MAX(newest_place, excluded.newest_place)",
             params![place],
         )?;
         drop_event(conn, place)?;
@@ -501,7 +526,7 @@ pub fn own_dropped_of_file(
 ) -> Result<Vec<OwnDropped>, CordeliaError> {
     let mut stmt = conn
         .prepare(
-            "SELECT number, hash, newest_at FROM file_own_dropped
+            "SELECT number, hash, newest_at, oldest_at, newest_place FROM file_own_dropped
              WHERE channel_id = ?1 AND slot = ?2 ORDER BY newest_at",
         )
         .map_err(storage)?;
@@ -511,6 +536,8 @@ pub fn own_dropped_of_file(
                 number: row.get::<_, i64>(0)?.max(0) as u64,
                 hash: row.get::<_, Vec<u8>>(1)?.try_into().unwrap_or_default(),
                 newest_at: row.get(2)?,
+                oldest_at: row.get(3)?,
+                newest_place: row.get(4)?,
             })
         })
         .map_err(storage)?;
@@ -791,11 +818,14 @@ pub fn copy_file(
             params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
         )?;
         conn.execute(
-            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
-             SELECT channel_id, ?3, number, hash, newest_at
+            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
+                 oldest_at, newest_place)
+             SELECT channel_id, ?3, number, hash, newest_at, oldest_at, newest_place
              FROM file_own_dropped WHERE channel_id = ?1 AND slot = ?2
              ON CONFLICT(channel_id, slot, number, hash)
-             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
+                           oldest_at = MIN(oldest_at, excluded.oldest_at),
+                           newest_place = MAX(newest_place, excluded.newest_place)",
             params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
         )?;
         keep_to_the_bound(conn, channel, to_slot)?;

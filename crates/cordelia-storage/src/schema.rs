@@ -1369,10 +1369,11 @@ UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 ///   it. Counted apart from the arrivals, so that the device's own writing
 ///   pushes no arrival past the bound; every event kept before the step is
 ///   an arrival, 0.
-/// - `file_own_dropped`: for each file and generation, the newest time of
-///   a version of the device's own whose event went past its bound
-///   (`MAX_FILE_ARRIVALS` of them a file): where that is inside a window,
-///   the file goes back to none.
+/// - `file_own_dropped`: for each file and generation, the oldest and the
+///   newest time of a version of the device's own whose event went past
+///   its bound (`MAX_FILE_ARRIVALS` of them a file), and the newest place
+///   among them: where they may be inside a window, the file goes back to
+///   none.
 /// - `file_own_set_aside`: each generation in which a carry set aside what
 ///   the device wrote itself: a carry by command on this device leaves out
 ///   what it wrote there, which is at the relays.
@@ -1385,6 +1386,8 @@ CREATE TABLE file_own_dropped (
     number      INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
     hash        BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
     newest_at   INTEGER NOT NULL CHECK(typeof(newest_at) = 'integer'),
+    oldest_at   INTEGER NOT NULL CHECK(typeof(oldest_at) = 'integer'),
+    newest_place INTEGER NOT NULL CHECK(typeof(newest_place) = 'integer'),
     PRIMARY KEY (channel_id, slot, number, hash)
 );
 CREATE TABLE file_own_set_aside (
@@ -5900,13 +5903,15 @@ mod tests {
         }
         for (sql, taken) in [
             (
-                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
-                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9)",
+                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
+                     oldest_at, newest_place)
+                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9, 8, 7)",
                 true,
             ),
             (
-                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
-                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(15), 9)",
+                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
+                     oldest_at, newest_place)
+                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(15), 9, 8, 7)",
                 false,
             ),
             (
