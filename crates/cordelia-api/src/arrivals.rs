@@ -1966,12 +1966,13 @@ mod tests {
     /// from the removal: the laptop renews (its change 3, apart), writes
     /// `before.md` there, and then more than `MAX_FILE_ARRIVALS` arrivals of
     /// the tablet's come in `w.md` (set by hand), so the first go past the
-    /// bound, and the laptop writes `notes.md`. Everything of the tablet's
+    /// bound, and the laptop writes `notes.md` (and `between.md`, after the
+    /// first, which went, and before those kept). Everything of the tablet's
     /// is cut there, at any time, and the times of what went are not kept
     /// but the newest: the window opens at any time, at the place of the
-    /// first that went, so `notes.md` goes back to none, though it was
-    /// written long before the desktop's removal and its cut time.
-    /// `before.md`, stored before any of them, is kept.
+    /// first that went, so `notes.md` and `between.md` go back to none,
+    /// though they were written long before the desktop's removal and its
+    /// cut time. `before.md`, stored before any of them, is kept.
     #[test]
     fn what_went_past_the_bound_in_a_change_made_apart_opens_the_window_at_any_time() {
         let mut s = Several::of_one_person(3);
@@ -1981,29 +1982,35 @@ mod tests {
         s.change(1, &[1, 0, 2], &[]);
         s.write(1, "notes", "before.md", "written before the arrivals");
         let generation = generation_of(&s, 1);
-        let on = &s[1];
-        let channel = cordelia_crypto::derive::channel_id(&on.own("notes")).unwrap();
-        let slot = on.slot_of("notes", "w.md");
+        let channel = cordelia_crypto::derive::channel_id(&s[1].own("notes")).unwrap();
+        let slot = s[1].slot_of("notes", "w.md");
         let tablet = Arrival {
             signer: Link::signer_of(&s.key(2)),
             link: None,
             times: 1,
         };
+        let base = s.now;
         for i in 0..=MAX_FILE_ARRIVALS {
             kept::note(
-                &on.conn,
+                &s[1].conn,
                 &channel,
                 &slot,
                 generation.0,
                 &generation.1,
-                s.now + 1 + i as i64,
+                base + 1 + i as i64,
                 &[],
                 None,
                 None,
                 &[tablet],
             )
             .unwrap();
+            // Between the first arrival, which goes past the bound, and
+            // those kept: only what went opens the window for it.
+            if i == 0 {
+                s.write(1, "notes", "between.md", "written after the first arrival");
+            }
         }
+        let on = &s[1];
         assert_eq!(kept::of_file(&on.conn, &channel, &slot).unwrap().1.len(), 1);
         s.now += MAX_FILE_ARRIVALS as i64 + 2;
         s.write(1, "notes", "notes.md", "written after the arrivals");
@@ -2015,6 +2022,7 @@ mod tests {
         let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
         assert!(matches!(taken, Taken::Shown(Shown::Moved(_))), "{taken:?}");
         assert_eq!(s[1].text("notes", "notes.md"), None);
+        assert_eq!(s[1].text("notes", "between.md"), None);
         assert_eq!(
             s[1].text("notes", "before.md").as_deref(),
             Some("written before the arrivals")
